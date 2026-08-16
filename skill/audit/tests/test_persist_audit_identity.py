@@ -63,19 +63,18 @@ def _make_runner(
     }
 
     def _runner(cmd, **kwargs):
-        # Build a simple key from the command tokens
-        key_parts = tuple(cmd)
-        # Check for exact match first
-        if key_parts in responses:
-            return responses[key_parts]
-        # Fallback: check prefix match (first two tokens)
-        prefix = key_parts[:2] if len(key_parts) >= 2 else key_parts
-        if prefix in responses:
-            return responses[prefix]
-        # Last resort: look for the wl subcommand anywhere
-        for k, v in responses.items():
-            if len(key_parts) >= len(k) and key_parts[:len(k)] == k:
-                return v
+        # Key on the wl subcommand anywhere in the argv (persist_audit may
+        # inject a resolved ``--worklog-dir <value>`` pair at position 1
+        # since SA-0MSKQERKH002IBLG).
+        cmd_str = " ".join(cmd)
+        if "audit-set" in cmd_str:
+            return responses[("wl", "audit-set")]
+        if "--audit-text" in cmd_str:
+            return responses[("wl", "update")]
+        if "show" in cmd_str:
+            return responses[("wl", "show")]
+        if "update" in cmd_str:
+            return responses[("wl", "update")]
         return MagicMock(returncode=0, stdout="{}", stderr="")
 
     mock.side_effect = _runner

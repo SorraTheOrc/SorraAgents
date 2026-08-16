@@ -9,6 +9,13 @@ Usage:
 The script calls:
   wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json
 
+Cwd-independence (SA-0MSKQERKH002IBLG): every ``wl`` command built here
+resolves ``--worklog-dir`` exactly like the audit runner's READ path —
+explicit ``--worklog-dir`` > prefix-to-sibling scan > cwd-chain fallback >
+no flag — reusing the shared ``skill.shared.status_lifecycle`` helpers so
+the PERSIST path targets the work item's own worklog store regardless of
+the caller's cwd (e.g. the skill install directory).
+
 Returns non-zero on failure.
 """  # noqa: EXE001
 from __future__ import annotations
@@ -18,8 +25,16 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
+
+# Ensure the repo root is on sys.path so the shared status_lifecycle module
+# is importable when this script is executed directly from any cwd.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.shared.status_lifecycle import resolve_worklog_flags
 
 
 def _build_fallback_text(issue_id: str, ready: str) -> str:
@@ -299,6 +314,19 @@ def check_report_identity(issue_id: str, report_text: str) -> tuple[str | None, 
     return None, None
 
 
+def _worklog_flags(cmd: Sequence[str], worklog_dir: str | None) -> list[str]:
+    """Resolve ``--worklog-dir`` flags for a wl command built by this module.
+
+    Mirrors the audit runner's READ path (SA-0MSG48MEI0083K82): resolution
+    order is explicit ``worklog_dir`` > prefix-to-sibling scan (the work-item
+    id prefix is matched against ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml``)
+    > cwd-chain fallback > no flag. The shared resolution is reused — no scan
+    logic is duplicated here (SA-0MSKQERKH002IBLG). Returns an empty list
+    when no worklog directory is resolvable (wl resolves from cwd).
+    """
+    return resolve_worklog_flags(list(cmd), explicit_dir=worklog_dir)
+
+
 def _maybe_lower_priority(issue_id: str, wl_bin: str, runner: Callable,
                         worklog_dir: str | None, ready_to_close: bool) -> None:
     """Best-effort: lower a critical work item's priority to high.
@@ -317,8 +345,7 @@ def _maybe_lower_priority(issue_id: str, wl_bin: str, runner: Callable,
 
     try:
         fetch_cmd = [wl_bin, "show", issue_id, "--json"]
-        if worklog_dir:
-            fetch_cmd[1:1] = ["--worklog-dir", worklog_dir]
+        fetch_cmd[1:1] = _worklog_flags(fetch_cmd, worklog_dir)
         fetch_proc = runner(fetch_cmd, check=False, text=True, capture_output=True)
         if getattr(fetch_proc, "returncode", 1) != 0:
             stderr = getattr(fetch_proc, "stderr", "") or ""
@@ -339,8 +366,7 @@ def _maybe_lower_priority(issue_id: str, wl_bin: str, runner: Callable,
         return
 
     update_cmd = [wl_bin, "update", issue_id, "--priority", "high", "--json"]
-    if worklog_dir:
-        update_cmd[1:1] = ["--worklog-dir", worklog_dir]
+    update_cmd[1:1] = _worklog_flags(update_cmd, worklog_dir)
     try:
         update_proc = runner(update_cmd, check=False, text=True, capture_output=True)
     except Exception as exc:  # noqa: BLE001 - best-effort; never block persistence
@@ -378,8 +404,12 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
       failure.  This allows tests to verify the fallback behaviour of
       callers (e.g. audit_runner.py).
     * worklog_dir: optional explicit ``--worklog-dir`` value injected into
-      every wl command so the store is targeted regardless of the caller's
-      cwd (used by the audit runner; standalone CLI usage is unaffected).
+      every wl command (highest precedence). When None, every wl command
+      resolves the worklog store itself via the shared prefix-to-sibling
+      scan / cwd-chain fallback (:func:`_worklog_flags`) — so the persist
+      path is cwd-independent exactly like the runner's READ path
+      (SA-0MSKQERKH002IBLG), for the runner, child audits, the re-ask
+      path, and the standalone CLI alike.
 
     The report is checked against *issue_id* before persisting (identity
     guard): a report that clearly references a different work item (one
@@ -422,8 +452,7 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
         "--raw-output", report_text,
         "--json"
     ]
-    if worklog_dir:
-        cmd[1:1] = ["--worklog-dir", worklog_dir]
+    cmd[1:1] = _worklog_flags(cmd, worklog_dir)
 
     proc = runner(cmd, check=False, text=True, capture_output=True)
 
@@ -459,8 +488,7 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     current_stage = ""
     try:
         fetch_cmd = [wl_bin, "show", issue_id, "--json"]
-        if worklog_dir:
-            fetch_cmd[1:1] = ["--worklog-dir", worklog_dir]
+        fetch_cmd[1:1] = _worklog_flags(fetch_cmd, worklog_dir)
         fetch_proc = runner(fetch_cmd, check=False, text=True, capture_output=True)
         if fetch_proc.returncode == 0:
             fetch_data = json.loads(fetch_proc.stdout)
@@ -471,8 +499,7 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
 
     def _run_audit_text_update(text: str):
         cmd = [wl_bin, "update", issue_id, "--audit-text", text]
-        if worklog_dir:
-            cmd[1:1] = ["--worklog-dir", worklog_dir]
+        cmd[1:1] = _worklog_flags(cmd, worklog_dir)
         if current_stage:
             cmd.extend(["--stage", current_stage])
         cmd.append("--json")
@@ -541,6 +568,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--report", "-r", help="Direct audit report text (if not provided, read from stdin or --file)")
     p.add_argument("--file", "-f", type=Path, help="Path to a file containing the audit report")
     p.add_argument("--wl-bin", default="wl", help="Path to the wl CLI (default: wl)")
+    p.add_argument(
+        "--worklog-dir", default=None,
+        help="Explicit worklog directory (highest precedence). When omitted, "
+             "the worklog store is auto-resolved from the work-item id prefix "
+             "(prefix-to-sibling scan) or the cwd-chain fallback.",
+    )
     return p
 
 
@@ -576,7 +609,10 @@ def main(argv: list[str] | None = None) -> int:
         print("Empty report text; nothing to persist", file=sys.stderr)
         return 2
 
-    rc = persist_audit(args.issue_id, report_text, wl_bin=args.wl_bin)
+    rc = persist_audit(
+        args.issue_id, report_text,
+        wl_bin=args.wl_bin, worklog_dir=args.worklog_dir,
+    )
     return rc
 
 

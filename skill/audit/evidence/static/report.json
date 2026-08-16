@@ -1,0 +1,17 @@
+{
+  "check": "static",
+  "passed": true,
+  "bound_tokens": 10000,
+  "bytes_per_token_estimate": 4.0,
+  "without_flags": {
+    "bytes": 14914,
+    "skills": 17
+  },
+  "with_flags": {
+    "bytes": 1721,
+    "skills": 0
+  },
+  "token_estimate_with_flags": 430.2,
+  "reduction_bytes": 13193,
+  "reduction_pct": 88.5
+}

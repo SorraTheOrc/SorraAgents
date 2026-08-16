@@ -6,7 +6,7 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--run-tests]
+  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--run-tests] [--no-execute]
   audit_runner.py project [--pi-bin pi] [--model <name>]
 
 Verdicts:
@@ -17,14 +17,24 @@ Verdicts:
               (does not block ready-to-close, recorded in variance decisions)
 
 Execution-dependent criteria (e.g. 'full project test suite passes'):
-  by default the runner never executes the suite (read-only mandate).
-  Evidence is supplied either by the operator-attested ``--green-run`` path
-  or, automatically, by a green full-suite run found READ-ONLY in the
-  per-repo test cache (query_cached — see SA-0MSIU5HFI0024D7W). With the
-  explicit ``--run-tests`` flag (SA-0MSJELSWS002UF60) the runner instead
-  invokes the test skill (run_tests.py) to execute the full suite when the
-  cache is missing/stale, triaging failures per the test skill. All paths
-  are fail-closed: missing/mismatched evidence leaves such ACs partial.
+  by default the runner AUTO-EXECUTES the repo's actual suite on a
+  full-suite cache miss (F3, SA-0MSTN5KRF0097TVP): it invokes the test
+  skill (run_tests.py) to run the suite resolved by full_suite_commands
+  (F2 AC4 — including vitest/npm repos like Tableau-Card-Engine),
+  triaging failures per the test skill. A green executed run injects the
+  TEST-SKILL GREEN RUN evidence block; a red run is fail-open (no block,
+  ACs stay partial with failure evidence). Evidence is also supplied by
+  the operator-attested ``--green-run`` path or, automatically, by a green
+  full-suite run found READ-ONLY in the per-repo test cache
+  (query_cached — see SA-0MSIU5HFI0024D7W). F4 (SA-0MSTN8CWM003AAU9)
+  guarantees the audit NEVER hard-blocks solely because it cannot run tests
+  (no cache, no test runner, no configured suite commands, execution
+  impossible): every such case degrades to a fail-open partial verdict with
+  a documented reason in the report (the old pre-flight hard gate,
+  SA-0MSQ72BVV0011SRU, was removed). ``--no-execute`` /
+  ``AUDIT_NO_EXECUTE=1`` opts out of auto-execution and proceeds fail-open
+  partial instead. All paths are fail-closed on EVIDENCE: missing evidence
+  leaves execution-dependent ACs partial (never a degraded 'met').
 
 Persist + verify invariant:
   Unless ``--do-not-persist`` is given, the runner ALWAYS persists the
@@ -55,6 +65,8 @@ import time
 import urllib.request
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -66,6 +78,7 @@ from skill.audit.scripts.persist_audit import (
     persist_audit,
 )
 from skill.scripts.failure_notice import FailureNotice
+from skill.scripts.pi_utils import extract_pi_text
 from skill.shared.process_semaphore import (
     DEFAULT_MAX_WORKERS,
     ENV_MAX_WORKERS,
@@ -90,7 +103,7 @@ from skill.test.scripts.run_tests import (
     full_suite_commands,
     parse_node_failures,
     parse_pytest_failures,
-    pytest_command,
+    suite_timeout_per_command,
 )
 from skill.test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
@@ -215,12 +228,96 @@ a genuinely hung call well before its 1800 s budget (LP-0MSQ32S2M001EA74 AC2).
 """
 
 
+FP_SCREEN_CONTEXT = "false-positive-screen"
+"""Debug-log context label for the model-judged false-positive screen.
+
+The screen classifies ruff code-quality findings via a single batched Pi
+call (SA-0MST01NPD007MYG4 / SA-0MST01O4G002VPBR). Tests assert on this
+context to prove the screen is (not) invoked.
+"""
+
+FP_SCREEN_VALID_CLASSIFICATIONS = frozenset(
+    {"genuine", "confident-false-positive", "uncertain"}
+)
+"""Valid per-finding screen classifications.
+
+``uncertain`` is the caution-first default: a finding that is missing from
+the batch response, unparseable, or degraded by a provider failure is never
+classified ``confident-false-positive`` (T1 AC1/AC2).
+"""
+
+FP_CANDIDATE_ANNOTATION = "candidate false positive — producer decision required"
+"""Annotation appended to uncertain-screen findings that still block.
+
+An ``uncertain`` classification never triggers remediation; the finding
+remains blocking under ``_has_phase1_blocking_issues`` and is annotated so
+a producer makes the final call (SA-0MST01O4G002VPBR AC4).
+"""
+
+FP_SCREEN_FAILED_JUSTIFICATION = (
+    "Screen output could not be parsed or the Pi call failed — all findings "
+    "defaulted to uncertain (caution-first)."
+)
+"""Justification recorded when the whole screen degrades (T1 AC2)."""
+
+FP_CHORE_ANNOTATION = FP_CANDIDATE_ANNOTATION
+"""Annotation for medium/low confident-false-positive tracking chores.
+
+The chore links the finding for a producer decision but carries NO commit
+link (no config change happened — SA-0MST01PQQ009T0CI AC2).
+"""
+
+FP_SCREEN_MISSING_JUSTIFICATION = (
+    "Finding missing from the screen response — defaulted to uncertain "
+    "(caution-first)."
+)
+"""Justification recorded for a finding absent from the batch response.
+
+Never ``confident-false-positive``: a finding the model did not see cannot
+be declared a confident false positive (T1 AC1).
+"""
+
+
+AUDIT_REMEDIATION_MAX_ITERATIONS_ENV = "AUDIT_REMEDIATION_MAX_ITERATIONS"
+"""Environment variable name for the config-fix iteration cap.
+
+The remediation loop (T2/F2) applies at most this many minimal ruff config
+edits per audit run. Default ``REMEDIATION_MAX_ITERATIONS_DEFAULT`` = 3;
+invalid values fail closed to the default.
+"""
+
+REMEDIATION_MAX_ITERATIONS_DEFAULT = 3
+"""Default cap on config-fix iterations per audit run (T2 AC5)."""
+
+REMEDIATION_EXHAUSTED_ANNOTATION = "remediation loop exhausted"
+"""Annotation for a finding still present after the iteration cap.
+
+A confident-false-positive finding that persists after ``max_iterations``
+config-fix iterations is demoted to blocking ``genuine`` with this
+annotation (T2 AC5) — the audit never suppresses it silently.
+"""
+
+REMEDIATION_COMMIT_MESSAGE = "audit: remediate ruff false positives (per-file-ignores)"
+"""Local (no-push) commit message for each applied config fix (T2 AC3)."""
+
+
 AUDIT_GREEN_RUN_ENV = "AUDIT_GREEN_RUN"
 """Environment variable name for the operator-attested green test run.
 
 When set (and ``--green-run`` is not passed), this value (an exact commit
 sha or the alias ``HEAD``) is used as the green-run attestation. Precedence:
 ``--green-run`` flag > ``AUDIT_GREEN_RUN`` env var > unset (no attestation).
+"""
+
+
+AUDIT_NO_EXECUTE_ENV = "AUDIT_NO_EXECUTE"
+"""Environment variable name for the automatic suite-execution hatch (F3).
+
+When set to ``1`` (or ``--no-execute`` is passed), the audit does NOT
+auto-execute the test suite on a full-suite cache miss — it proceeds with a
+fail-open partial (execution-dependent ACs stay partial) instead of
+invoking the test skill. Precedence: ``--no-execute`` flag > env var >
+auto-execute on cache miss (default).
 """
 
 AUTO_GREEN_RUN_BLOCK_HEADER = "AUTO-VERIFIED GREEN RUN"
@@ -283,6 +380,17 @@ no longer silently spawn an unbounded number of child audit subprocesses
 (SA-0MSKB6V5Q007YDHE).
 """
 
+_DEFAULT_MAX_CITATIONS_PER_AC = 5
+"""Default cap on file:line evidence citations per AC in Phase 2 deep prompts.
+
+Phase 2 deep analysis is 66% of audit model time; the dominant cost is long
+evidence-JSON generation on the local model, not context size. Bounding the
+number of file:line references the model may cite per criterion (default 5,
+minimum 1) shortens evidence generation without changing the model or
+verdict semantics (LP-0MSQ32WM5000NCB7 AC1). Prompt-level only: parsed
+evidence/verdicts are never mutated.
+"""
+
 _PI_MAX_RETRIES = 2
 """Number of retries for transient provider errors in ``_call_pi``.
 
@@ -312,20 +420,23 @@ applied update is harmless.
 _STATUS_RESTORE_RETRY_DELAY_S = 0.5
 """Base delay (seconds) between status-restore retries; grows linearly."""
 
-_PHASE1_SCANNING_BLOCK = (
+_SCANNING_BLOCK = (
     "SCANNING — When you need to look something up, use the bounded helpers:\n"
     "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
     "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
     "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
     "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
 )
-"""Bounded-scanning guidance injected into Phase 1 AC review prompts (P7).
+"""Canonical bounded-scanning guidance injected into every audit prompt.
 
-Phase 1 (automated screening) now mirrors the Phase 2 performance pattern:
-the model reads only in-scope files and uses the bounded ``scan.py`` helpers
-instead of unbounded repository exploration. The parent Phase 2 prompt also
-includes the ``list-files`` bullet; we reuse that fuller version for both
-Phase 1 parent and child prompts for consistency.
+The single SCANNING block reused by ALL phases (SA-0MSL1Z6M7002EDS0):
+Phase 1 parent + child AC reviews and Phase 2 parent deep / child deep /
+batch prompts all interpolate this one constant so the guidance can never
+drift between sites (previously three inline copies had already diverged).
+It is the fuller version with the ``list-files`` bullet and the
+single-file ``.worklog`` grep note; the model reads only in-scope files and
+uses the bounded ``scan.py`` helpers instead of unbounded repository
+exploration (P7 / Phase 2 performance pattern).
 """
 
 _PHASE2_MAX_RETRIES = 1
@@ -339,8 +450,8 @@ still giving transient provider glitches a chance to recover. Short Phase 1
 bare calls keep ``_PI_MAX_RETRIES`` (2).
 """
 
-AUDIT_PHASE2_PARALLELISM_ENV = "AUDIT_PHASE2_PARALLELISM"
-"""Environment variable controlling Phase 2 child deep-analysis concurrency.
+AUDIT_PARALLELISM_ENV = "AUDIT_PARALLELISM"
+"""Environment variable controlling child deep-analysis concurrency.
 
 When set (an integer >= 1), this is the maximum number of independent child
 ``phase2_child:<i>`` Pi calls that may run concurrently inside
@@ -349,12 +460,40 @@ first and is never parallelized. Setting this to 1 restores the historical
 strictly-sequential behavior. Invalid values are ignored with a warning.
 """
 
-_PHASE2_DEFAULT_PARALLELISM = 2
-"""Default bounded concurrency cap for Phase 2 child deep-analysis calls.
+AUDIT_PHASE2_PARALLELISM_ENV_LEGACY = "AUDIT_PHASE2_PARALLELISM"
+"""Legacy name for ``AUDIT_PARALLELISM_ENV`` — kept for backward compatibility.
+
+When ``AUDIT_PARALLELISM`` is not set, the runner falls back to this legacy
+name so existing scripts and automation are not broken."""
+
+_PARALLELISM_DEFAULT = 2
+"""Default bounded concurrency cap for child deep-analysis calls.
 
 Chosen conservatively so the local model proxy is not overwhelmed while
 still collapsing the N-sequential-calls wall-clock to N/cap. Operators can
-override via ``AUDIT_PHASE2_PARALLELISM``.
+override via ``AUDIT_PARALLELISM``.
+"""
+
+AUDIT_PROXY_BASE_URL_ENV = "AUDIT_PROXY_BASE_URL"
+"""Environment variable name for the llm-manager proxy base URL.
+
+The runner queries ``GET <base>/admin/mode`` at start to detect the proxy's
+operating mode (fast/cheap) and serialize parallelism when cheap
+(SA-0MSN04X2S006ONH0). Defaults to ``AUDIT_PROXY_BASE_URL_DEFAULT``.
+"""
+
+AUDIT_PROXY_BASE_URL_DEFAULT = "http://192.168.0.199:8000"
+"""Default llm-manager proxy base URL (matches pi ``models.json`` "Local Proxy").
+
+Overridable via ``AUDIT_PROXY_BASE_URL`` if the proxy address changes — no
+code change required.
+"""
+
+AUDIT_PROXY_MODE_TIMEOUT = 3.0
+"""Short timeout (seconds) for the proxy-mode query (fail-open).
+
+The mode query is best-effort: a timeout/unreachable proxy must never block
+or fail the audit, so the wait is capped at ~3 s.
 """
 
 AUDIT_SLOT_STATUS_URL_ENV = "AUDIT_SLOT_STATUS_URL"
@@ -384,7 +523,7 @@ AUDIT_MAX_CHILD_CONCURRENCY_ENV = "AUDIT_MAX_CHILD_CONCURRENCY"
 """Environment variable name for the max child-call concurrency cap.
 
 Caps the dynamic slot-aware ceiling (LP-0MSQ32S2M001EA74 AC3). Defaults to
-``_resolve_phase2_parallelism()`` (``AUDIT_PHASE2_PARALLELISM`` env or 2),
+``_resolve_parallelism()`` (``AUDIT_PARALLELISM`` env or 2),
 preserving the existing static knob as the floor/fallback.
 """
 
@@ -538,6 +677,29 @@ _INFRA_FALLBACK_MARKERS = (
 )
 
 
+def _evidence_text(value) -> str:
+    """Render an evidence value as text, whatever its type.
+
+    Phase 2 models occasionally emit ``evidence`` as a structured JSON
+    object (e.g. ``{"file": ..., "line": ..., "note": ...}``) instead of
+    the ``path/file:line`` string the prompt requests. Every evidence
+    consumer must tolerate that: dicts/lists are json-serialized (so file
+    references inside remain regex-salvageable) and any other non-string
+    scalar is str()-ed — nothing may reach ``re.finditer`` or a substring
+    check as a non-string (SA-0MSKM2LSP006L0K8).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 def _evidence_has_infra_failure_markers(ac_results: list[dict],
                                         child_results: list[dict]) -> bool:
     """Return True when any parent/child AC evidence carries an infra-failure marker.
@@ -550,12 +712,12 @@ def _evidence_has_infra_failure_markers(ac_results: list[dict],
     infrastructure failure is still restored rather than demoted.
     """
     for r in ac_results:
-        evidence = r.get("evidence", "") or ""
+        evidence = _evidence_text(r.get("evidence"))
         if any(marker in evidence for marker in _INFRA_FALLBACK_MARKERS):
             return True
     for cr in child_results:
         for r in cr.get("ac_results", []):
-            evidence = r.get("evidence", "") or ""
+            evidence = _evidence_text(r.get("evidence"))
             if any(marker in evidence for marker in _INFRA_FALLBACK_MARKERS):
                 return True
     return False
@@ -563,6 +725,34 @@ def _evidence_has_infra_failure_markers(ac_results: list[dict],
 
 def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, text=True, capture_output=True)
+
+
+def _cwd_aware_runner(git_root: Path,
+                      base_runner: Runner | None = None) -> Runner:
+    """Wrap *base_runner* so git commands resolve against *git_root*.
+
+    When *git_root* equals the launch cwd's project root
+    (``TARGET_PROJECT_ROOT``) — an owning-project or worktree launch — the
+    base runner is returned unchanged (commands pass through byte-identical;
+    zero regression for the standard path). When they differ (a non-owning
+    launch whose ownership was resolved from the worklog), every ``git``
+    command gets ``git -C <git_root>`` prepended so file-scope manifests,
+    HEAD shas, working-tree hashes, and green-run evidence resolve against
+    the owning project's repository — never the launch cwd's
+    (SA-0MSLLGDW00098UCC).
+    """
+    base = base_runner if base_runner is not None else _default_runner
+    launch_root = TARGET_PROJECT_ROOT.resolve()
+    git_root = git_root.resolve()
+    if git_root == launch_root:
+        return base
+
+    def _run(cmd: Sequence[str]) -> subprocess.CompletedProcess:
+        if cmd and cmd[0] == "git":
+            cmd = ["git", "-C", str(git_root)] + list(cmd[1:])
+        return base(cmd)
+
+    return _run
 
 
 def _extract_work_item_prefix(cmd: Sequence[str]) -> str | None:
@@ -882,8 +1072,41 @@ def _validate_file_scope_manifest(file_scope: str,
 # ---------------------------------------------------------------------------
 
 
+def _parse_iso_utc(value) -> datetime | None:
+    """Parse an ISO-8601 timestamp into a tz-aware UTC ``datetime``.
+
+    Normalizes the ``Z`` suffix for Python 3.10 compatibility, parses via
+    ``datetime.fromisoformat``, and treats naive timestamps as UTC. Returns
+    ``None`` when the value cannot be parsed (``ValueError``/``TypeError``
+    swallowed). Shared by the freshness gates in ``_check_audit_freshness``
+    and ``_get_child_audit_verdict`` (SA-0MSL1Z70C007B9VZ) — the single
+    timestamp-parse implementation both callers use.
+    """
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
+    """Whether an audit is newer than the freshness threshold.
+
+    True when ``audit_time > update_time + AUDIT_FRESHNESS_BUFFER_SECONDS``,
+    i.e. the audit was persisted after the item's last update plus the
+    freshness buffer. Shared by the item-level and child freshness gates
+    (SA-0MSL1Z70C007B9VZ); the child gate additionally applies the
+    persistence-write tolerance when this returns False.
+    """
+    threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
+    return audit_time > threshold
+
+
 def _check_audit_freshness(runner: Runner, issue_id: str,
-                           worklog_dir: str | None = None) -> str | None:
+                           worklog_dir: str | None = None,
+                           work_item: dict | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
@@ -908,8 +1131,12 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     The gate gracefully falls through on any failure (no audit data, command
     error, parse error) so that the normal audit pipeline always runs when
     freshness cannot be determined.
+
+    *work_item* may be passed in to avoid a redundant ``wl show`` when the
+    caller already fetched the work item (SA-0MSL1Z7E9005TLBA): it is used
+    for the fingerprint computation and the time-gate ``updatedAt``.
+    When omitted, the work item is fetched via ``wl show``.
     """
-    from datetime import datetime, timedelta, timezone
 
     try:
         data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
@@ -937,7 +1164,7 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     stored_fingerprint = _extract_content_fingerprint(raw_output)
     if stored_fingerprint is not None:
         current_fingerprint = _compute_content_fingerprint(
-            runner, issue_id, worklog_dir=worklog_dir,
+            runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
         )
         if current_fingerprint is None:
             # Fingerprint cannot be computed now (e.g. git unavailable) —
@@ -949,39 +1176,28 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return None
 
     # ── Time gate (floor): legacy audits without a fingerprint ──────────
-    # Get the work item's updatedAt
-    try:
-        wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
-                          worklog_dir=worklog_dir)
-    except RuntimeError:
-        return None
+    # Get the work item's updatedAt (reuse an already-fetched work_item
+    # when the caller has it — SA-0MSL1Z7E9005TLBA).
+    if work_item is None:
+        try:
+            wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                              worklog_dir=worklog_dir)
+        except RuntimeError:
+            return None
 
-    work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
+        work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
     updated_at = work_item.get("updatedAt")
     if not updated_at:
         return None
 
     # Compare ISO-8601 timestamps
-    try:
-        # Normalize Z suffix for Python 3.10 compatibility
-        audit_time_str = str(audited_at).replace("Z", "+00:00")
-        update_time_str = str(updated_at).replace("Z", "+00:00")
+    audit_time = _parse_iso_utc(audited_at)
+    update_time = _parse_iso_utc(updated_at)
+    if audit_time is None or update_time is None:
+        return None  # Unparseable timestamps → not fresh (fail open)
 
-        audit_time = datetime.fromisoformat(audit_time_str)
-        update_time = datetime.fromisoformat(update_time_str)
-
-        # Ensure both are timezone-aware for comparison
-        if audit_time.tzinfo is None:
-            audit_time = audit_time.replace(tzinfo=timezone.utc)
-        if update_time.tzinfo is None:
-            update_time = update_time.replace(tzinfo=timezone.utc)
-
-        freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
-
-        if audit_time > freshness_threshold:
-            return raw_output
-    except (ValueError, TypeError):
-        return None
+    if _audit_time_is_fresh(audit_time, update_time):
+        return raw_output
 
     return None
 
@@ -1176,6 +1392,69 @@ def _resolve_max_child_audits(cli_value: int | None = None) -> int:
     return _DEFAULT_MAX_CHILD_AUDITS
 
 
+def _resolve_max_citations_per_ac(cli_value: int | None = None) -> int:
+    """Resolve the max file:line citations per AC for Phase 2 deep prompts.
+
+    Precedence:
+      1. ``--max-citations-per-ac`` CLI flag (explicit override)
+      2. ``audit.max_citations_per_ac`` key in the CWD ``.ralph.json`` /
+         ``ralph.config.json`` (dotted form first, then the nested
+         ``audit: {max_citations_per_ac: N}`` form)
+      3. ``_DEFAULT_MAX_CITATIONS_PER_AC`` (5)
+
+    An invalid value (non-positive integer) fails closed to the default with
+    a warning so a misconfigured config cannot break the audit run (mirrors
+    ``_resolve_max_child_audits``; LP-0MSQ32WM5000NCB7 AC1/AC6).
+    """
+    if cli_value is not None:
+        if cli_value < 1:
+            print(
+                f"Warning: invalid --max-citations-per-ac value {cli_value}; "
+                f"using the default cap ({_DEFAULT_MAX_CITATIONS_PER_AC})",
+                file=sys.stderr,
+            )
+            return _DEFAULT_MAX_CITATIONS_PER_AC
+        return cli_value
+    config = _load_config()
+    config_value = config.get("audit.max_citations_per_ac")
+    if config_value is None:
+        audit_section = config.get("audit")
+        if isinstance(audit_section, dict):
+            config_value = audit_section.get("max_citations_per_ac")
+    if config_value is not None:
+        try:
+            parsed = int(config_value)
+            if parsed < 1:
+                raise ValueError
+            return parsed
+        except (ValueError, TypeError):
+            print(
+                f"Warning: invalid audit.max_citations_per_ac value "
+                f"{config_value!r}; using the default cap "
+                f"({_DEFAULT_MAX_CITATIONS_PER_AC})",
+                file=sys.stderr,
+            )
+    return _DEFAULT_MAX_CITATIONS_PER_AC
+
+
+def _max_citations_prompt_snippet(max_citations: int) -> str:
+    """Build the Phase-2 evidence citation-cap instruction.
+
+    Injected into all three deep-analysis prompts (parent ``phase2_deep``,
+    child ``phase2_child``, batch ``phase2_batch``) so evidence-JSON
+    generation is bounded while every AC keeps at least one specific
+    file:line reference (LP-0MSQ32WM5000NCB7 AC1/AC4). Prompt-level only:
+    never mutates parsed evidence or verdicts; the canonical report format
+    is untouched.
+    """
+    return (
+        f"EVIDENCE SCOPE — For each criterion, cite AT MOST "
+        f"{max_citations} specific file:line references as evidence "
+        f"(minimum 1). Prefer fewer, stronger references over exhaustive "
+        f"lists; this bound keeps deep analysis fast.\n"
+    )
+
+
 def _resolve_parent_timeout(cli_value: int | None) -> int | None:
     """Resolve an explicit cumulative elapsed-time guard override (seconds).
 
@@ -1295,9 +1574,10 @@ def _green_run_prompt_block(sha: str) -> str:
         "GREEN-RUN ATTESTATION — The operator attests the full project test "
         f"suite passed at commit {sha} (== current HEAD). "
         "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
-        "marked met based on this attestation. Do NOT execute the test suite "
-        "or any other state-modifying command — the read-only mandate "
-        "otherwise remains in force.\n\n"
+        "marked met based on this attestation. The audit runner manages test "
+        "execution: Do NOT execute tests yourself — the runner decides when "
+        "the suite runs. Do NOT execute any other state-modifying command "
+        "(wl, git, …) — the read-only mandate otherwise remains in force.\n\n"
     )
 
 
@@ -1387,17 +1667,20 @@ def _auto_green_run_prompt_block(sha: str) -> str:
     return (
         f"{AUTO_GREEN_RUN_BLOCK_HEADER} — A cached full test-suite run at "
         f"commit {sha} (== current HEAD) was verified green from the per-repo "
-        "test cache (read-only query; the audit never executes the suite). "
+        "test cache (read-only query; the audit never executes the suite on "
+        "this path). "
         "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
-        "marked met based on this verified cached result. Do NOT execute the "
-        "test suite or any other state-modifying command — the read-only "
-        "mandate otherwise remains in force.\n\n"
+        "marked met based on this verified cached result. The audit runner "
+        "manages test execution: Do NOT execute tests yourself — the runner "
+        "decides when the suite runs. Do NOT execute any other "
+        "state-modifying command (wl, git, …) — the read-only mandate "
+        "otherwise remains in force.\n\n"
     )
 
 
 # ---------------------------------------------------------------------------
-# Full-suite cache classification (shared by the automatic verification path
-# and the pre-flight gate, SA-0MSQ72BVV0011SRU)
+# Full-suite cache classification (shared by the automatic verification path,
+# SA-0MSIU5HFI0024D7W / F4 SA-0MSTN8CWM003AAU9)
 # ---------------------------------------------------------------------------
 
 # Classification statuses returned by _classify_full_suite_cache.
@@ -1405,69 +1688,12 @@ _FULL_SUITE_CACHE_GREEN = "green"
 _FULL_SUITE_CACHE_MISS = "miss"
 _FULL_SUITE_CACHE_RED = "red"
 _FULL_SUITE_CACHE_ERROR = "error"
-
-# pytest config markers, mirroring implement.py's _has_pytest_markers so the
-# audit and the implement/test skills agree on whether a repo has a pytest
-# suite (SA-0MSQ72BVV0011SRU AC3).
-_PYTEST_CONFIG_MARKERS = (
-    ("pyproject.toml", "[tool.pytest.ini_options]"),
-    ("setup.cfg", "[tool:pytest]"),
-    ("tox.ini", "[pytest]"),
-)
-
-
-def _repo_has_pytest_suite(project_root: Path) -> bool:
-    """Whether *project_root* declares a runnable pytest suite.
-
-    True when the repo carries a pytest config marker (pytest.ini, or the
-    pytest section of pyproject.toml / setup.cfg / tox.ini) or pytest-style
-    test files (``tests/``/``test/`` dirs containing ``*.py``, or root-level
-    ``test_*.py`` / ``*_test.py``). Importability is deliberately NOT probed:
-    the audit process runs from the framework interpreter which always
-    provides pytest, so the presence of markers or test files is the
-    discriminator that decides whether the pytest suite command applies to
-    this repo.
-
-    Mirrors implement.py's pytest-suite detection so a repo the implement
-    skill treats as having no pytest suite is never falsely gated on a
-    phantom pytest cache miss (AC3).
-    """
-    if (project_root / "pytest.ini").is_file():
-        return True
-    for name, marker in _PYTEST_CONFIG_MARKERS:
-        path = project_root / name
-        if not path.is_file():
-            continue
-        try:
-            if marker in path.read_text(encoding="utf-8"):
-                return True
-        except OSError:
-            continue
-    for dirname in ("tests", "test"):
-        test_dir = project_root / dirname
-        if test_dir.is_dir() and any(test_dir.rglob("*.py")):
-            return True
-    return bool(
-        any(project_root.glob("test_*.py")) or any(project_root.glob("*_test.py"))
-    )
-
-
-def _effective_suite_commands(project_root: Path) -> list[str]:
-    """The full-suite command set that actually applies to *project_root*.
-
-    ``full_suite_commands`` is already node-dir-aware: node suite commands
-    are emitted only for ``tests/node``, ``tests/cli`` and ``tests/unit``
-    dirs that exist in the repo (SA-0MSJELL44009XYIL). The pytest command is
-    additionally dropped when the repo does not declare a pytest suite
-    (SA-0MSQ72BVV0011SRU AC3) — a phantom pytest command would otherwise
-    produce a permanent cache miss that falsely blocks audits of no-pytest
-    repos (e.g. a docs-only repo) even after the real suites ran green.
-    """
-    commands = full_suite_commands(project_root)
-    if _repo_has_pytest_suite(project_root):
-        return commands
-    pytest_cmd = pytest_command()
-    return [c for c in commands if c != pytest_cmd]
+# No suite command is resolvable for this project (no pytest config, no
+# node suite dirs, no npm test script, no .pi/test-config.json). Introduced
+# with F2 (SA-0MSTMYE79006NA61): once full_suite_commands stops emitting the
+# phantom pytest, an empty command set must NOT classify as vacuously green
+# (parent AC3 — never ship a partial verdict with zero evidence).
+_FULL_SUITE_CACHE_EMPTY = "empty"
 
 
 def _classify_full_suite_cache(
@@ -1480,9 +1706,8 @@ def _classify_full_suite_cache(
     Queries the per-repo test cache (``query_cached``) for each command in
     the canonical full-suite set at *cwd* (default ``TARGET_PROJECT_ROOT``)
     — never executing anything, so the audit's read-only mandate is preserved
-    unconditionally (SA-0MSIU5HFI0024D7W). *commands* overrides the set
-    (the pre-flight gate passes ``_effective_suite_commands``); the default
-    is ``full_suite_commands`` — already node-dir-aware
+    unconditionally (SA-0MSIU5HFI0024D7W). *commands* overrides the set; the
+    default is ``full_suite_commands`` — already node-dir-aware
     (SA-0MSJELL44009XYIL), so a repo without tests/node is never asked
     about a phantom tests/node command.
 
@@ -1492,14 +1717,20 @@ def _classify_full_suite_cache(
       state within the cache TTL AND every entry's exit code is 0
       (``head_sha`` set, ``problems`` empty).
     - ``"miss"``  — at least one command has NO cached entry at HEAD
-      (``head_sha`` set; ``problems`` name the missing commands). This is
-      the state the pre-flight gate blocks on.
+      (``head_sha`` set; ``problems`` name the missing commands). F3
+      (SA-0MSTN5KRF0097TVP) auto-executes the suite on this state; F4
+      (SA-0MSTN8CWM003AAU9) guarantees it never hard-blocks.
     - ``"red"``   — every command is cached but at least one entry exited
       non-zero (``head_sha`` set; ``problems`` name the failing commands).
-      Keeps the historical partial + diagnostic behavior — NOT a gate state.
+      Keeps the historical partial + diagnostic behavior — never a block.
     - ``"error"`` — HEAD could not be resolved (``head_sha`` None). A cache
       query exception propagates to the caller, which decides fail-closed
-      (``_resolve_auto_green_run``) vs fail-open (the pre-flight gate).
+      (``_resolve_auto_green_run``).
+    - ``"empty"`` — no suite command is resolvable for this project
+      (F2 AC4 single source of truth via ``full_suite_commands``). NEVER
+      vacuously green: ``_resolve_auto_green_run`` fails closed (no
+      evidence), and the audit proceeds with execution-dependent ACs
+      partial + a documented reason (parent AC3 / F4 AC2 — never block).
     """
     head_sha = _resolve_audited_head(runner)
     if head_sha is None:
@@ -1508,6 +1739,12 @@ def _classify_full_suite_cache(
     project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
     if commands is None:
         commands = full_suite_commands(project_root)
+    if not commands:
+        return _FULL_SUITE_CACHE_EMPTY, head_sha, [
+            ("no suite commands resolvable for this project (no pytest config, "
+             "no tests/{unit,node,cli} dirs, no npm test script); add "
+             ".pi/test-config.json or run /skill:test at HEAD")
+        ]
     problems: list[str] = []
     for command in commands:
         entry = query_cached(
@@ -1529,31 +1766,46 @@ def _classify_full_suite_cache(
     return _FULL_SUITE_CACHE_RED, head_sha, problems
 
 
-def _resolve_auto_green_run(
+def _auto_green_run_outcome(
     runner: Runner,
     cwd: str | Path | None = None,
-) -> tuple[str | None, str | None]:
-    """Resolve an automatically-verified green full-suite run, read-only.
+) -> tuple[str | None, str | None, str]:
+    """Resolve automatically-verified green full-suite evidence, read-only.
 
     Delegates the cache query to :func:`_classify_full_suite_cache` (the
-    single source of truth shared with the pre-flight gate) and maps the
-    classification onto the historical contract:
+    single source of truth shared across the execution-dependent verification
+    paths) and maps the
+    classification onto the historical contract. Same behavior as the
+    historical :func:`_resolve_auto_green_run` (which remains a thin
+    wrapper), plus the raw classification *status* so the caller can
+    distinguish a cache MISS (F3 auto-execution trigger) from RED / ERROR /
+    EMPTY (fail-open partial, no auto-execution — F3, SA-0MSTN5KRF0097TVP).
 
-    Returns ``(prompt_block, head_sha)`` when the cache is GREEN (every
-    suite command has a cached entry at the audited git state within the
-    cache TTL AND every entry's exit code is 0). Otherwise prints a clear
-    diagnostic to stderr — distinguishing a cache miss ('run /skill:test
-    once to populate the cache') from a non-zero cached run ('suite is red;
-    fix or attest with --green-run HEAD') — and returns ``(None, None)``,
-    fail-closed: no evidence, the audit completes normally, and
-    execution-dependent ACs stay partial.
+    Returns ``(prompt_block, head_sha, status)`` when the cache is GREEN
+    (every suite command has a cached entry at the audited git state within
+    the cache TTL AND every entry's exit code is 0). Otherwise prints a
+    clear diagnostic to stderr — distinguishing a cache miss ('run
+    /skill:test once to populate the cache') from a non-zero cached run
+    ('suite is red; fix or attest with --green-run HEAD') — and returns
+    ``(None, None, status)``, fail-closed: no evidence, the audit completes
+    normally, and execution-dependent ACs stay partial.
     """
     try:
         status, head_sha, problems = _classify_full_suite_cache(runner, cwd=cwd)
         if status == _FULL_SUITE_CACHE_GREEN and head_sha is not None:
-            return _auto_green_run_prompt_block(head_sha), head_sha
+            return _auto_green_run_prompt_block(head_sha), head_sha, status
+        if status == _FULL_SUITE_CACHE_EMPTY:
+            print(
+                "Automatic full-suite verification unavailable: no suite "
+                "commands resolvable for this project (no pytest config, no "
+                "tests/{unit,node,cli} dirs, no npm test script). Add "
+                ".pi/test-config.json or run the suite at this commit. "
+                "Execution-dependent criteria stay partial.",
+                file=sys.stderr,
+            )
+            return None, None, status
         if head_sha is None:
-            return None, None
+            return None, None, status
         commands = full_suite_commands(Path(cwd or TARGET_PROJECT_ROOT).resolve())
         print(
             "Automatic full-suite verification unavailable: "
@@ -1571,57 +1823,21 @@ def _resolve_auto_green_run(
             "Execution-dependent criteria stay partial.",
             file=sys.stderr,
         )
-    return None, None
+        return None, None, _FULL_SUITE_CACHE_ERROR
+    return None, None, status
 
 
-def _preflight_cache_gate(
+def _resolve_auto_green_run(
     runner: Runner,
     cwd: str | Path | None = None,
-) -> str | None:
-    """Return an actionable blocking message when the full-suite cache is MISSING at HEAD.
+) -> tuple[str | None, str | None]:
+    """Resolve an automatically-verified green full-suite run, read-only.
 
-    The pre-flight gate (SA-0MSQ72BVV0011SRU): turns the cache-miss
-    *diagnostic* into an *early exit* so the audit can never ship a report
-    with degraded 'met' verdicts on execution-dependent ACs when no
-    full-suite evidence exists and the caller did not explicitly opt out
-    (``--run-tests`` executes the suite; ``--green-run`` attests it).
-
-    Fires ONLY on a cache **miss** — at least one command in the repo's
-    effective suite set has no cached run at HEAD. It is repo-aware: the
-    pytest command is not required for repos without a pytest suite
-    (``_effective_suite_commands``, AC3), so a docs-only or vitest-only repo
-    is never falsely blocked. A **red** cached run keeps the historical
-    partial + diagnostic behavior (evidence exists that the suite ran; it
-    just failed), a **green** cache proceeds, and cache errors fail open
-    (an infra hiccup must not block an audit that today proceeds partial).
-
-    Returns the message for the caller to print (and exit non-zero with),
-    or None to proceed.
+    Thin wrapper over :func:`_auto_green_run_outcome` (historical 2-tuple
+    contract). See that function for the full behavior and diagnostics.
     """
-    project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
-    try:
-        status, head_sha, problems = _classify_full_suite_cache(
-            runner, cwd=str(project_root),
-            commands=_effective_suite_commands(project_root),
-        )
-    except Exception:  # noqa: BLE001 -- fail-open: infra hiccups never block
-        return None
-    if status != _FULL_SUITE_CACHE_MISS:
-        return None
-    missing = [p for p in problems if p.startswith("no cached full-suite run")]
-    detail = "; ".join(missing) if missing else "; ".join(problems)
-    return (
-        "Audit blocked: no green full-suite run is cached at HEAD "
-        f"{head_sha or 'unknown'} (full-suite cache miss: {detail}). The "
-        "audit cannot verify execution-dependent acceptance criteria "
-        "without evidence, so it will NOT produce a report or persist an "
-        "audit — degraded 'met' verdicts are not allowed. Run the full "
-        "suite once at this commit (/skill:test or run_tests.py --force) to "
-        "populate the test cache, then re-audit — or explicitly opt out "
-        "with --run-tests (executes the suite and populates the cache) or "
-        "--green-run HEAD (operator attestation). The pre-audit work-item "
-        "status/stage were left untouched."
-    )
+    block, sha, _status = _auto_green_run_outcome(runner, cwd=cwd)
+    return block, sha
 
 
 def _test_skill_run_prompt_block(sha: str) -> str:
@@ -1629,21 +1845,24 @@ def _test_skill_run_prompt_block(sha: str) -> str:
 
     The block tells the model that the full project test suite was EXECUTED
     via the test skill (``run_tests.py``) at *sha* (== the audited HEAD) and
-    passed (``--run-tests`` path, SA-0MSJELSWS002UF60), so execution-
-    dependent criteria (e.g. 'full test suite passes') MAY be marked met
-    based on that executed green run — while the read-only mandate otherwise
-    remains in force and the suite must NOT be executed again. Returns a
-    string ending in a blank line so callers can splice it between existing
-    prompt sections.
+    passed (F3 auto-execution or the ``--run-tests`` path, SA-0MSJELSWS002UF60),
+    so execution-dependent criteria (e.g. 'full test suite passes') MAY be
+    marked met based on that executed green run. The runner manages test
+    execution — the model must NOT execute tests itself (F3 AC7: the
+    read-only suite-execution mandate is replaced by runner-managed
+    execution). Returns a string ending in a blank line so callers can
+    splice it between existing prompt sections.
     """
     return (
         f"{TEST_SKILL_RUN_BLOCK_HEADER} — The full project test suite was "
         f"executed via the test skill (/skill:test / run_tests.py) at commit "
-        f"{sha} (== current HEAD) and passed (--run-tests). "
+        f"{sha} (== current HEAD) and passed. "
         "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
-        "marked met based on this executed green run. Do NOT execute the test "
-        "suite again or any other state-modifying command — the read-only "
-        "mandate otherwise remains in force.\n\n"
+        "marked met based on this executed green run. The audit runner has "
+        "auto-executed the suite on your behalf. Do NOT execute tests "
+        "yourself — the runner manages execution. Do NOT execute any other "
+        "state-modifying command (wl, git, …) — the read-only mandate for "
+        "non-suite commands otherwise remains in force.\n\n"
     )
 
 
@@ -1655,12 +1874,14 @@ def _run_tests_via_test_skill(
 ) -> dict:
     """Execute the full project test suite via the test skill's runner.
 
-    The ``--run-tests`` path (SA-0MSJELSWS002UF60): an explicit,
-    operator-authorized deviation from the audit's read-only mandate. The
-    runner delegates to the test skill's machinery (``run_tests.py``) —
-    executing each command in ``full_suite_commands()`` at *cwd* in quiet
-    mode through the per-repo test cache with ``force=True`` (execute fresh,
-    refresh the stored entries so subsequent audits auto-verify).
+    The ``--run-tests`` path (SA-0MSJELSWS002UF60) and the F3 default
+    auto-execution path (SA-0MSTN5KRF0097TVP) both funnel here: an explicit
+    suite-execution deviation from the audit's read-only mandate for
+    NON-suite commands. The runner delegates to the test skill's machinery
+    (``run_tests.py``) — executing each command in ``full_suite_commands()``
+    at *cwd* in quiet mode through the per-repo test cache with
+    ``force=True`` (execute fresh, refresh the stored entries so subsequent
+    audits auto-verify read-only).
 
     Failures are triaged per the test skill, never silently ignored: each
     structured failure record is passed to the triage helper
@@ -1678,10 +1899,13 @@ def _run_tests_via_test_skill(
       notice    — error string when the suite could not be executed at all
     """
     project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
+    # The extension file's timeoutPerCommand (F2 AC1) overrides the default
+    # per-command timeout — single source of truth via run_tests.py.
+    timeout = suite_timeout_per_command(project_root) or timeout
     print(
-        f"Invoking test skill (run_tests.py) — --run-tests enabled: executing "
-        f"the full project test suite at {project_root} in quiet mode "
-        f"(cache refresh, per-command timeout {timeout}s)...",
+        f"Invoking test skill (run_tests.py) — suite execution: "
+        f"executing the full project test suite at {project_root} in quiet "
+        f"mode (cache refresh, per-command timeout {timeout}s)...",
         file=sys.stderr,
     )
     results: list[dict] = []
@@ -1839,28 +2063,33 @@ def _acquire_audit_slot(max_concurrency: int | None = None) -> Semaphore:
     return sem
 
 
-def _resolve_phase2_parallelism() -> int:
-    """Resolve the bounded concurrency cap for Phase 2 child deep analysis.
+def _resolve_parallelism() -> int:
+    """Resolve the bounded concurrency cap for child deep analysis.
+
     Precedence:
-      1. ``AUDIT_PHASE2_PARALLELISM`` environment variable (integer >= 1)
-      2. ``_PHASE2_DEFAULT_PARALLELISM`` (2)
+      1. ``AUDIT_PARALLELISM`` environment variable (integer >= 1)
+      2. ``AUDIT_PHASE2_PARALLELISM`` (legacy fallback — integer >= 1)
+      3. ``_PARALLELISM_DEFAULT`` (2)
 
     Values below 1 are clamped to 1. An invalid (non-integer) value is
     ignored with a warning so a misconfigured environment cannot break the
     audit run.
     """
-    env_value = os.environ.get(AUDIT_PHASE2_PARALLELISM_ENV)
+    env_value = os.environ.get(AUDIT_PARALLELISM_ENV)
+    if not env_value:
+        # Legacy fallback: honor the old name when the new one is unset.
+        env_value = os.environ.get(AUDIT_PHASE2_PARALLELISM_ENV_LEGACY)
     if env_value:
         try:
             parsed = int(env_value)
             return max(1, parsed)
         except ValueError:
             print(
-                f"Warning: invalid {AUDIT_PHASE2_PARALLELISM_ENV} value {env_value!r}; "
+                f"Warning: invalid {AUDIT_PARALLELISM_ENV} value {env_value!r}; "
                 "using default parallelism",
                 file=sys.stderr,
             )
-    return _PHASE2_DEFAULT_PARALLELISM
+    return _PARALLELISM_DEFAULT
 
 
 def _query_slot_status(url: str | None = None,
@@ -1889,12 +2118,76 @@ def _query_slot_status(url: str | None = None,
         return None, None
 
 
+def _query_proxy_mode(base_url: str | None = None,
+                      timeout: float = AUDIT_PROXY_MODE_TIMEOUT) -> str | None:
+    """Best-effort query of the llm-manager proxy operating mode.
+
+    GETs ``<base>/admin/mode`` and returns the ``mode`` field (e.g.
+    ``"fast"`` / ``"cheap"``), or ``None`` when the endpoint is unreachable,
+    times out, returns non-JSON, a non-200 status, or lacks the ``mode``
+    field (fail-open — the caller leaves parallelism settings unchanged).
+
+    Read-only by mandate: this function never issues ``POST /admin/set-mode``
+    (mode switching is operator/herdr territory; the audit mandate stays
+    read-only, SA-0MSN04X2S006ONH0).
+
+    The query uses a short timeout (``AUDIT_PROXY_MODE_TIMEOUT`` = 3 s) and
+    never raises: the mode check must never block or fail the audit.
+    """
+    target = base_url or os.environ.get(
+        AUDIT_PROXY_BASE_URL_ENV, AUDIT_PROXY_BASE_URL_DEFAULT
+    )
+    endpoint = target.rstrip("/") + "/admin/mode"
+    try:
+        with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+        mode = data.get("mode")
+        return mode if isinstance(mode, str) else None
+    except Exception:  # noqa: BLE001 — best-effort, fail-open
+        return None
+
+
+def _apply_proxy_mode_serialization() -> None:
+    """Serialize parallelism when the proxy is in ``cheap`` mode.
+
+    Called once at runner start (before any pi call). When the proxy reports
+    mode exactly ``"cheap"`` (case-sensitive), this run's pi launches are
+    capped to one at a time by setting both ``AUDIT_PARALLELISM=1`` and
+    ``AUDIT_MAX_CONCURRENCY=1`` in this process's environment — so the
+    audit does not race the proxy's single-slot cheap-mode pool.
+
+    Fail-open: any other mode (including ``"fast"``) or a failed query
+    (unreachable / timeout / non-200 / unparseable) leaves all parallelism
+    settings unchanged; a warning is logged to stderr only on query
+    failure. The change is per-process (``os.environ``) — it affects only
+    this run's spawned pi subprocesses, never other processes or audits.
+    """
+    mode = _query_proxy_mode()
+    if mode == "cheap":
+        os.environ[AUDIT_PARALLELISM_ENV] = "1"
+        os.environ[ENV_MAX_WORKERS] = "1"
+        print(
+            "Proxy mode is 'cheap' — serializing audit pi calls "
+            "(AUDIT_PARALLELISM=1, AUDIT_MAX_CONCURRENCY=1).",
+            file=sys.stderr,
+        )
+    elif mode is None:
+        print(
+            "Warning: could not determine proxy mode (fail-open — "
+            "parallelism settings unchanged).",
+            file=sys.stderr,
+        )
+    # Any other reported mode (e.g. "fast") → unchanged, no log noise.
+
+
 def _resolve_max_child_concurrency() -> int:
     """Resolve the max child-call concurrency cap (static floor).
 
     Precedence:
       1. ``AUDIT_MAX_CHILD_CONCURRENCY`` environment variable (integer >= 1)
-      2. ``_resolve_phase2_parallelism()`` (``AUDIT_PHASE2_PARALLELISM`` env or 2)
+      2. ``_resolve_parallelism()`` (``AUDIT_PARALLELISM`` env or 2)
 
     Values below 1 are clamped to 1. An invalid (non-integer) value is
     ignored with a warning so a misconfigured environment cannot break the
@@ -1911,7 +2204,7 @@ def _resolve_max_child_concurrency() -> int:
                 "using default max child concurrency",
                 file=sys.stderr,
             )
-    return _resolve_phase2_parallelism()
+    return _resolve_parallelism()
 
 
 def _resolve_child_concurrency() -> int:
@@ -1925,7 +2218,7 @@ def _resolve_child_concurrency() -> int:
 
     - When the slot query fails (unreachable/timeout/error), the runner
       degrades gracefully to the configured static ceiling
-      (``AUDIT_MAX_CHILD_CONCURRENCY`` > ``AUDIT_PHASE2_PARALLELISM`` > 2)
+      (``AUDIT_MAX_CHILD_CONCURRENCY`` > ``AUDIT_PARALLELISM`` > 2)
       — the dynamic ceiling never blocks or fails the audit (fail-open).
     - The result is always at least 1 (never 0) so a saturated pool
       degrades to sequential execution rather than stalling the audit.
@@ -2350,7 +2643,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
 
     # Parse JSON lines looking for the final agent_end message
-    text = _extract_pi_text(raw)
+    text = extract_pi_text(raw)
     if not text:
         return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
 
@@ -2367,7 +2660,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         if isinstance(obj, dict):
             return {
                 "verdict": _normalize_verdict(obj.get("verdict", "unmet")),
-                "evidence": obj.get("evidence", ""),
+                "evidence": _evidence_text(obj.get("evidence")),
                 "raw_stdout": stdout,
                 "raw_stderr": stderr,
                 "extracted_text": text,
@@ -2416,129 +2709,6 @@ def _extract_input_tokens(raw: str) -> int | None:
                 if isinstance(input_tokens, int) and input_tokens >= 0:
                     return input_tokens
         return None
-    return None
-
-
-def _extract_pi_text(raw: str) -> str:
-    """Extract user-facing text from pi --mode json output.
-
-    Uses the same parsing logic as ralph_loop._parse_pi_json_line.
-    """
-    delta_parts: list[str] = []
-    complete_blocks: list[str] = []
-
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        stream_text, _, complete_text = _parse_pi_json_line(stripped)
-        if stream_text is None and complete_text is None:
-            continue  # not valid JSON
-        if complete_text is not None:
-            complete_blocks.append(complete_text)
-        elif stream_text:
-            delta_parts.append(stream_text)
-
-    # Prefer complete blocks (agent_end, text_end) over accumulated deltas
-    if complete_blocks:
-        return complete_blocks[-1]
-    return "".join(delta_parts)
-
-
-def _parse_pi_json_line(line: str):
-    """Parse a single JSON line from pi --mode json.
-
-    Returns (stream_text, should_print, complete_text), same as ralph.
-    """
-    try:
-        obj = json.loads(line)
-    except (json.JSONDecodeError, ValueError):
-        return None, False, None
-    if not isinstance(obj, dict):
-        return None, False, None
-
-    event_type = obj.get("type", "")
-
-    if event_type == "message_update":
-        assistant = obj.get("assistantMessageEvent")
-        if isinstance(assistant, dict):
-            inner = assistant.get("type", "")
-            if inner == "text_delta":
-                delta = assistant.get("delta", "")
-                return (delta, bool(delta), None) if delta else ("", False, None)
-            if inner == "text_end":
-                content = assistant.get("content", "")
-                return ("", False, content) if content else ("", False, None)
-            if inner in ("thinking_start", "thinking_delta", "thinking_end",
-                         "toolcall_start", "toolcall_delta", "toolcall_end",
-                         "text_start"):
-                return "", False, None
-            content_text = _extract_text_from_content(assistant.get("content"))
-            if content_text:
-                return "", False, content_text
-            return "", False, None
-        return "", False, None
-
-    if event_type in ("message_start", "message_end", "turn_end"):
-        message = obj.get("message")
-        # Only extract text from assistant messages. The user prompt echo
-        # (message_start with role=user) must never be treated as model
-        # output — it caused false parse failures when the model errored out
-        # mid-stream and the prompt was the last complete text block.
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            return "", False, None
-        text = _extract_text_from_assistant_message(message)
-        if text:
-            return "", False, text
-        return "", False, None
-
-    if event_type == "agent_end":
-        text = _extract_last_assistant_message_text(obj.get("messages"))
-        if text:
-            return "", False, text
-        return "", False, None
-
-    if event_type in ("session", "agent_start", "turn_start",
-                       "tool_execution_start", "tool_execution_update",
-                       "tool_execution_end"):
-        return "", False, None
-
-    # Fallback
-    for key in ("content", "text", "delta"):
-        val = obj.get(key)
-        if isinstance(val, str) and val:
-            return val, True, None
-    return "", False, None
-
-
-def _extract_text_from_content(content) -> str | None:
-    if isinstance(content, str) and content:
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                t = item.get("text", "")
-                if t:
-                    parts.append(t)
-        return "".join(parts) if parts else None
-    return None
-
-
-def _extract_text_from_assistant_message(message) -> str | None:
-    if not isinstance(message, dict):
-        return None
-    return _extract_text_from_content(message.get("content"))
-
-
-def _extract_last_assistant_message_text(messages) -> str | None:
-    if not isinstance(messages, list):
-        return None
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "assistant":
-            text = _extract_text_from_content(msg.get("content"))
-            if text:
-                return text
     return None
 
 
@@ -2768,20 +2938,35 @@ def _strip_checkbox(text: str) -> str:
     return _CHECKBOX_MARKER_RE.sub("", text, count=1)
 
 
+def _normalize_heading_line(line: str) -> str:
+    """Strip markdown heading / bold / angle-bracket markers from *line* so
+    heading variants all match the core Acceptance / Success Criteria
+    pattern (SA-0MSJLC8XA00178YD).
+    """
+    line = line.strip()
+    line = re.sub(r"^#{0,3}\s*", "", line)
+    line = line.replace("**", "")
+    line = re.sub(r"<<([^>]*)>>", r"\1", line)
+    return line.strip()
+
+
 def _extract_acs(description: str) -> list[str]:
     """Extract acceptance criteria lines from a markdown description."""
-    pattern = re.compile(
-        r"^#{0,3}\s*(?:Acceptance|Success)\s+Criteria:?\s*$",
-        re.MULTILINE | re.IGNORECASE,
+    heading_re = re.compile(
+        r"^(?:Acceptance|Success)\s+Criteria:?\s*(?:\([^)]*\))?\s*$",
+        re.IGNORECASE,
     )
-    match = pattern.search(description)
-    if not match:
+    lines = description.splitlines()
+    heading_idx = None
+    for idx, raw in enumerate(lines):
+        if heading_re.search(_normalize_heading_line(raw)):
+            heading_idx = idx
+            break
+    if heading_idx is None:
         return ["No acceptance criteria defined."]
 
-    start = match.end()
-    lines = description[start:].splitlines()
     acs: list[str] = []
-    for line in lines:
+    for line in lines[heading_idx + 1 :]:
         stripped = line.strip()
         if re.match(r"^#{1,6}\s", stripped):
             break
@@ -2929,7 +3114,7 @@ def _phase1_evidence_refs(ac_results: list[dict],
     refs: list[str] = []
     seen: set[str] = set()
     for r in ac_results:
-        evidence = r.get("evidence", "") or ""
+        evidence = _evidence_text(r.get("evidence"))
         for m in re.finditer(r"([\w./-]+\.\w+):(\d+)", evidence):
             ref = f"{m.group(1)}:{m.group(2)}"
             if ref not in seen:
@@ -2994,9 +3179,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            code_quality_findings: list[dict] | None = None,
                            code_quality_fixes_applied: int = 0,
                            code_quality_skipped_reason: str | None = None,
+                           fp_screen_results: list[dict] | None = None,
+                           remediation_results: dict | None = None,
                            model: str | None = _MISSING,
                            model_source: str | None = _MISSING,
                            phase2_completed: bool = False,
+                           phase2_skip_note: str | None = None,
                            green_run_sha: str | None = None,
                            auto_green_run_sha: str | None = None,
                            test_skill_run_sha: str | None = None,
@@ -3011,6 +3199,16 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       ``message``, ``linter``, ``code`` keys.
     *code_quality_skipped_reason* is an optional string explaining why
       code quality was not run (e.g., no linters available).
+    *fp_screen_results* is the optional list of false-positive screen
+      entries (see ``_parse_fp_screen_response``). When provided, the Code
+      Quality section lists each screened finding's classification +
+      justification, and only critical/high findings NOT classified
+      ``confident-false-positive`` block closure (SA-0MST01O4G002VPBR AC4).
+    *remediation_results* is the optional dict from ``_run_remediation_loop``
+      (T2/F2). When the loop ran (iterations > 0 or exhaustion), the Code
+      Quality section gains a ``#### Remediation loop`` subsection listing
+      the applied config-fix commits, the fingerprint re-hash, and the
+      cap-exhaustion outcome.
     *model* is the name of the model used for the audit (e.g.,
       ``"opencode-go/deepseek-v4-flash"``). When not provided, no model
       line is emitted (backward compatibility). When provided as ``None``
@@ -3095,11 +3293,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     )
 
     # Code quality blocking: critical or high findings block closure
+    # unless the false-positive screen classified them
+    # confident-false-positive (uncertain findings stay blocking).
     cq_findings = code_quality_findings or []
-    has_blocking_cq = any(
-        f.get("severity") in ("critical", "high")
-        for f in cq_findings
-    )
+    has_blocking_cq = bool(_effective_blocking_findings(
+        cq_findings, fp_screen_results or []
+    ))
 
     ready_before_cq = "Yes" if (all_ac_acceptable and all_children_reviewed and not any_child_audit_not_ready) else "No"
     if ready_before_cq == "Yes" and has_blocking_cq:
@@ -3136,7 +3335,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append("")
             lines.append(
                 f"Test skill run evidence: {test_skill_run_sha} "
-                "(executed full-suite run, --run-tests)"
+                "(executed full-suite run)"
             )
         if content_fingerprint:
             lines.append("")
@@ -3161,7 +3360,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append("")
             lines.append(
                 f"Test skill run evidence: {test_skill_run_sha} "
-                "(executed full-suite run, --run-tests)"
+                "(executed full-suite run)"
             )
         if content_fingerprint:
             lines.append("")
@@ -3195,13 +3394,15 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             if adjusted_count > 0:
                 parts.append(f"({adjusted_count} with acceptable variance)")
             parts.append(". All children are in in_review or done stage.")
-            if phase2_completed:
+            if phase2_skip_note:
+                parts.append(f" Phase 2 deep analysis skipped: {phase2_skip_note}.")
+            elif phase2_completed:
                 parts.append(" Deep code analysis (Phase 2) completed and confirmed all verdicts.")
             lines.append(" ".join(parts))
     else:
         if not phase2_completed and any(
             r["verdict"] == VERDICT_PARTIAL
-            and "pending deep code review" in r.get("evidence", "")
+            and "pending deep code review" in _evidence_text(r.get("evidence"))
             for r in ac_results
         ):
             lines.append(
@@ -3341,6 +3542,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
 
     cq_findings = code_quality_findings or []
     cq_fixes = code_quality_fixes_applied
+    fp_results = fp_screen_results or []
+    rem = remediation_results or {}
 
     if code_quality_skipped_reason:
         lines.append(f"Code quality check skipped: {code_quality_skipped_reason}")
@@ -3350,13 +3553,18 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         lines.append(f"All issues auto-fixed by **{cq_fixes}** linter(s).")
         lines.append("No remaining issues.")
     else:
-        has_critical_or_high = any(
-            f.get("severity") in ("critical", "high") for f in cq_findings
-        )
-        if has_critical_or_high:
+        effective_blocking = _effective_blocking_findings(cq_findings, fp_results)
+        if effective_blocking:
             lines.append(
                 "**Critical and/or high severity findings detected — "
                 "these block closure.**"
+            )
+        elif any(
+            f.get("severity") in ("critical", "high") for f in cq_findings
+        ):
+            lines.append(
+                "**Critical/high severity findings were screened as "
+                "confident false positives — they no longer block closure.**"
             )
         else:
             lines.append(
@@ -3372,6 +3580,78 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"{f.get('file', '?')} | {f.get('line', 0)} | "
                 f"{f.get('message', '')} | {f.get('linter', '?')} | "
                 f"{f.get('code', '')} |"
+            )
+
+        # False-positive screen section (SA-0MST01O4G002VPBR AC3/AC4):
+        # per-finding classifications + justifications surface in the
+        # human-readable report. Screen-failed runs annotate every entry.
+        if fp_results:
+            lines.append("")
+            lines.append("#### False-positive screen")
+            lines.append("")
+            any_failed = any(e.get("screen_failed") for e in fp_results)
+            if any_failed:
+                lines.append(
+                    "**Screen degraded (provider error / timeout / unparseable "
+                    "output) — all findings defaulted to uncertain (caution-first).**"
+                )
+                lines.append("")
+            lines.append("| # | File | Line | Code | Classification | Justification |")
+            lines.append("|---|------|------|------|----------------|---------------|")
+            for e in fp_results:
+                f = e.get("finding", {})
+                lines.append(
+                    f"| {e.get('index', 0) + 1} | {f.get('file', '?')} | "
+                    f"{f.get('line', 0)} | {f.get('code', '?')} | "
+                    f"{e.get('classification', '?')} | "
+                    f"{e.get('justification', '')} |"
+                )
+
+    # Remediation loop section (SA-0MST01OIN008MXYT / F2): applied
+    # config-fix commits + fingerprint re-hash + cap-exhaustion outcome.
+    # Rendered outside the findings branch so a successful remediation
+    # (which clears the findings) still surfaces the loop record.
+    if (rem.get("iterations") or rem.get("exhausted")
+            or rem.get("chore_items") or rem.get("chore_failures")):
+        lines.append("")
+        lines.append("#### Remediation loop")
+        lines.append("")
+        lines.append(
+            f"Config-fix iterations: {rem.get('iterations', 0)} / "
+            f"{rem.get('max_iterations', REMEDIATION_MAX_ITERATIONS_DEFAULT)}"
+        )
+        if rem.get("exhausted"):
+            lines.append(
+                f"**Cap exhausted — persisting findings remain blocking "
+                f"'genuine' ({REMEDIATION_EXHAUSTED_ANNOTATION}).**"
+            )
+        for c in rem.get("commits", []):
+            fp_after = c.get("fingerprint_after") or "unavailable"
+            change = c.get("change") or "per-file-ignores"
+            lines.append(
+                f"- Commit {c.get('sha') or 'n/a'} ({c.get('file', '?')}) "
+                f"— {change}; fingerprint re-hashed after commit: {fp_after}"
+            )
+        for ci in rem.get("chore_items", []):
+            commit_ref = ci.get("commit_sha")
+            if commit_ref:
+                lines.append(
+                    f"- Chore work item {ci.get('id', '?')} tracks the "
+                    f"config fix (commit {commit_ref})"
+                )
+            else:
+                lines.append(
+                    f"- Chore work item {ci.get('id', '?')} tracks a "
+                    f"medium/low false positive — {FP_CHORE_ANNOTATION}"
+                )
+        for f in rem.get("chore_failures", []):
+            ref = (f.get("change")
+                   or (f.get("finding", {}).get("code", "?") if isinstance(
+                       f.get("finding"), dict) else "?"))
+            lines.append(
+                f"- ⚠ Chore tracking failed ({f.get('error', '')}) — "
+                f"{ref}; the commit stands, the finding stays blocking "
+                f"'genuine'"
             )
 
     lines.append("")
@@ -3606,7 +3886,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            timeout: int | None = None,
                            max_retries: int | None = None,
                            ac_fallback_used: threading.Event | None = None,
-                           child_screen: bool = False) -> dict:
+                           child_screen: bool = False,
+                           ac_count: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -3625,6 +3906,12 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         child_screen: If True, forwards to _call_pi() so child Phase-1
             AC-review screens use the short per-call budget
             (LP-0MSQ32S2M001EA74 AC1).
+        ac_count: Number of acceptance criteria covered by this call. When
+            supplied, the per-call timing line appends ``ac_count=N`` and
+            ``avg_ac_elapsed_seconds`` (elapsed / N) so Phase-2 per-AC
+            latency is visible and regressions surface (LP-0MSQ32WM5000NCB7
+            F4 AC1). A count of 0 is emitted without the avg field; a
+            missing count keeps the legacy timing format byte-for-byte.
 
         # Context reduction: every forwarded pi call runs with
         ``--no-context-files --no-skills`` (see _call_pi) so audit sessions
@@ -3643,7 +3930,9 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     # measurable and regressions are visible without a debug log. When the pi
     # stream reported usage, the initial input-token count is appended so the
     # context-reduction bound (<10K tokens, SA-0MSISKM8F004NW1U AC2) is
-    # verifiable from the timing line alone.
+    # verifiable from the timing line alone. Phase-2 call sites additionally
+    # pass an AC count so the line surfaces per-AC latency
+    # (``ac_count`` + ``avg_ac_elapsed_seconds``, LP-0MSQ32WM5000NCB7 F4).
     elapsed = result.get("elapsed_seconds")
     if elapsed is not None:
         timing = (
@@ -3653,6 +3942,12 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         input_tokens = result.get("input_tokens")
         if input_tokens is not None:
             timing += f" input_tokens={input_tokens}"
+        if ac_count is not None:
+            timing += f" ac_count={ac_count}"
+            if ac_count > 0:
+                timing += (
+                    f" avg_ac_elapsed_seconds={float(elapsed) / ac_count:.2f}"
+                )
         print(timing, file=sys.stderr)
 
     # Decide whether to write a debug line
@@ -3712,7 +4007,8 @@ def _demote_met_to_partial(results: list[dict]) -> list[dict]:
 
 def _get_child_audit_verdict(runner: Runner, child_id: str,
                              worklog_dir: str | None = None,
-                             force: bool = False) -> tuple[bool | None, str, str | None]:
+                             force: bool = False,
+                             child: dict | None = None) -> tuple[bool | None, str, str | None]:
     """Check a child's persisted audit verdict via wl audit-show.
 
     Returns a (verdict, reason, audited_at) tuple:
@@ -3736,8 +4032,13 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
 
     The child's auditedAt is returned so callers can record the reuse
     marker ("reused from <auditedAt>") in the parent report.
+
+    *child* may be passed in to avoid a redundant ``wl show`` when the
+    caller already fetched the child via ``wl show --children``
+    (SA-0MSL1Z7E9005TLBA): it supplies the description for the fingerprint
+    computation and the updatedAt for the legacy time gate. When omitted,
+    the child is fetched via ``wl show``.
     """
-    from datetime import datetime, timedelta, timezone
 
     try:
         data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
@@ -3775,7 +4076,7 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
     stored_fingerprint = _extract_content_fingerprint(raw_output)
     if stored_fingerprint is not None:
         current_fingerprint = _compute_content_fingerprint(
-            runner, child_id, worklog_dir=worklog_dir,
+            runner, child_id, worklog_dir=worklog_dir, work_item=child,
         )
         if current_fingerprint is None:
             # Fingerprint cannot be computed now (e.g. git unavailable) —
@@ -3788,40 +4089,35 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
         return _parse_child_audit_verdict(raw_output, audited_at)
 
     # ── Time gate (floor): legacy audits without a fingerprint ──────────
-    # Get the work item's updatedAt
-    try:
-        wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"],
-                          worklog_dir=worklog_dir)
-    except RuntimeError:
-        # Can't check freshness; treat as fresh since we have an audit
-        pass
+    # Get the work item's updatedAt (reuse an already-fetched child dict
+    # when the caller has it — SA-0MSL1Z7E9005TLBA).
+    if child is not None:
+        updated_at = child.get("updatedAt")
     else:
-        work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
-        updated_at = work_item.get("updatedAt")
-        if updated_at:
-            try:
-                audit_time_str = str(audited_at).replace("Z", "+00:00")
-                update_time_str = str(updated_at).replace("Z", "+00:00")
-                audit_time = datetime.fromisoformat(audit_time_str)
-                update_time = datetime.fromisoformat(update_time_str)
-                if audit_time.tzinfo is None:
-                    audit_time = audit_time.replace(tzinfo=timezone.utc)
-                if update_time.tzinfo is None:
-                    update_time = update_time.replace(tzinfo=timezone.utc)
-                freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
-                if not (audit_time > freshness_threshold):
-                    # The child's own persistence write bumps its updatedAt to
-                    # ~the audit's auditedAt. When the two timestamps coincide
-                    # within the persistence tolerance, the bump is the audit's
-                    # own write, so the audit reflects current state and is
-                    # trusted (prevents the parent runner from re-triggering
-                    # child audits forever — SA-0MSI3XH34001LLU4).
-                    write_delta = update_time - audit_time
-                    if not (timedelta(0) <= write_delta
-                            <= timedelta(seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS)):
-                        return None, "stale", audited_at
-            except (ValueError, TypeError):
-                pass  # Can't parse timestamps; treat as fresh since we have an audit
+        try:
+            wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"],
+                              worklog_dir=worklog_dir)
+        except RuntimeError:
+            # Can't check freshness; treat as fresh since we have an audit
+            updated_at = None
+        else:
+            work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
+            updated_at = work_item.get("updatedAt")
+    if updated_at:
+        audit_time = _parse_iso_utc(audited_at)
+        update_time = _parse_iso_utc(updated_at)
+        if (audit_time is not None and update_time is not None
+                and not _audit_time_is_fresh(audit_time, update_time)):
+            # The child's own persistence write bumps its updatedAt to
+            # ~the audit's auditedAt. When the two timestamps coincide
+            # within the persistence tolerance, the bump is the audit's
+            # own write, so the audit reflects current state and is
+            # trusted (prevents the parent runner from re-triggering
+            # child audits forever — SA-0MSI3XH34001LLU4).
+            write_delta = update_time - audit_time
+            if not (timedelta(0) <= write_delta
+                    <= timedelta(seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS)):
+                return None, "stale", audited_at
 
     return _parse_child_audit_verdict(raw_output, audited_at)
 
@@ -3983,7 +4279,7 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
             f"or `ls -R` across the repo). If a criterion requires a file not listed "
             f"here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
-            f"{_PHASE1_SCANNING_BLOCK}"
+            f"{_SCANNING_BLOCK}"
             f"If a criterion has acceptable variance (implementation differs from original "
             f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
             f"Include justification in the evidence field.\n\n"
@@ -4021,7 +4317,7 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                 child_ac_results.append({
                     "text": ac,
                     "verdict": _normalize_verdict(item.get("verdict", "unmet")),
-                    "evidence": item.get("evidence", ""),
+                    "evidence": _evidence_text(item.get("evidence")),
                 })
         else:
             # Fallback: this path is reached when the Pi response was not a
@@ -4072,7 +4368,7 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                     "criterion could not be evaluated."
                 )
             else:
-                outer_evidence = result.get("evidence", "")
+                outer_evidence = _evidence_text(result.get("evidence"))
                 if outer_evidence:
                     evidence = (
                         f"Pi model output could not be parsed — raw output logged. "
@@ -4103,7 +4399,8 @@ def _parent_has_gaps(ac_results: list[dict]) -> bool:
 
 
 def _child_content_changed(runner: Runner, child_id: str,
-                           worklog_dir: str | None = None) -> bool:
+                           worklog_dir: str | None = None,
+                           work_item: dict | None = None) -> bool:
     """Return True when a child's own content changed since its last audit.
 
     Uses the Feature 1 content-based freshness gate (SA-0MSKB6US1009CNHT): a
@@ -4114,7 +4411,7 @@ def _child_content_changed(runner: Runner, child_id: str,
     safe. A child with a content-fresh audit returns False too.
     """
     fresh_report = _check_audit_freshness(
-        runner, child_id, worklog_dir=worklog_dir,
+        runner, child_id, worklog_dir=worklog_dir, work_item=work_item,
     )
     if fresh_report is not None:
         return False  # content-fresh audit exists → unchanged
@@ -4144,7 +4441,7 @@ def _map_gaps_to_children(ac_results: list[dict],
     for r in ac_results:
         if r.get("verdict") in _ACCEPTABLE_VERDICTS:
             continue
-        evidence = r.get("evidence", "") or ""
+        evidence = _evidence_text(r.get("evidence"))
         for m in re.finditer(r"([\w./-]+\.\w+)(?::\d+)?", evidence):
             gap_refs.add(m.group(1))
     if not gap_refs:
@@ -4162,14 +4459,65 @@ def _map_gaps_to_children(ac_results: list[dict],
     return mapped
 
 
-def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
+# ---------------------------------------------------------------------------
+# Small/low-risk Phase 2 skip helper (SA-0MSQ026T3009QY2L)
+# ---------------------------------------------------------------------------
+
+_SMALL_EFFORTS = frozenset({"Extra Small", "Small", "XS", "S"})
+_LOW_RISK = frozenset({"Low", "low", "L"})
+
+
+def _is_low_risk_small(effort: str | None, risk: str | None) -> bool:
+    """Return True when effort is XS/Small AND risk is Low.
+
+    This is the **only** exception to "Phase 2 mandatory": when a work item
+    is both small (Extra Small or Small effort) **and** low risk, deep code
+    analysis is skipped — Phase 1 verdicts stand unchanged with a skip
+    diagnostic.
+
+    Fail-closed: when either value is missing or unknown the function
+    returns ``False`` so Phase 2 runs as usual.
+    """
+    if effort is None or risk is None:
+        return False
+    effort_stripped = effort.strip()
+    risk_stripped = risk.strip()
+    return (
+        effort_stripped in _SMALL_EFFORTS and risk_stripped in _LOW_RISK
+    )
+
+
+def _annotate_skip_evidence(ac_results: list[dict], note: str) -> list[dict]:
+    """Append a Phase 2 skip note to each AC's evidence (verdicts unchanged).
+
+    Returns a new list; the verdict of every AC is preserved verbatim — the
+    skip only records why deep analysis did not run (SA-0MSQ026T3009QY2L).
+    """
+    updated: list[dict] = []
+    for ac in ac_results:
+        item = dict(ac)
+        evidence = item.get("evidence", "") or ""
+        if evidence:
+            evidence = f"{evidence}; {note}"
+        else:
+            evidence = note
+        item["evidence"] = evidence
+        updated.append(item)
+    return updated
+
+
+def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict],
+                                fp_screen_results: list[dict] | None = None) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
     Returns (blocked, reason). If blocked, Phase 2 deep analysis should be
     skipped and all 'met' verdicts demoted to 'partial'.
 
     Blocking issues include:
-    - Critical/high code quality findings
+    - Critical/high code quality findings (unless the false-positive screen
+      classified them ``confident-false-positive``; ``uncertain`` findings
+      remain blocking with the candidate-false-positive annotation,
+      SA-0MST01O4G002VPBR AC4)
     - Children not in in_review/done stage
     - Active children in pre-review stages whose persisted audit says
       "Ready to close: No" (children in ``in_review`` stage are exempt
@@ -4177,8 +4525,17 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
       pre-review stages block)
     """
     # Check code quality findings
+    fp_results = fp_screen_results or []
     for f in cq_findings:
         if f.get("severity") in ("critical", "high"):
+            classification = _fp_classification_for(f, fp_results)
+            if classification == "confident-false-positive":
+                continue
+            if classification == "uncertain":
+                return True, (
+                    f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} "
+                    f"— {f.get('message', '')} — {FP_CANDIDATE_ANNOTATION}"
+                )
             return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
 
     # Check children stages — skip deleted children and inherited-pass
@@ -4218,13 +4575,18 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict],
                       code_quality_findings: list[dict] | None = None,
                       code_quality_fixes_applied: int = 0,
-                      phase2_completed: bool = False) -> dict:
+                      fp_screen_results: list[dict] | None = None,
+                      remediation_results: dict | None = None,
+                      phase2_completed: bool = False,
+                      phase2_skip_note: str | None = None) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
-      - Critical/high code quality findings block closure.
+      - Critical/high code quality findings block closure, unless the
+        false-positive screen classified them ``confident-false-positive``
+        (uncertain findings stay blocking; SA-0MST01O4G002VPBR AC4).
       - Children in ``in_review`` or ``done`` stage are exempt from child
         audit verdict checks. Per the audit spec, children in ``in_review``
         do NOT block closure — only pre-review stages (``idea``,
@@ -4265,10 +4627,9 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
 
     # Code quality blocking
     cq_findings = code_quality_findings or []
-    has_blocking_cq = any(
-        f.get("severity") in ("critical", "high")
-        for f in cq_findings
-    )
+    has_blocking_cq = bool(_effective_blocking_findings(
+        cq_findings, fp_screen_results or []
+    ))
 
     ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq and not any_child_audit_not_ready
 
@@ -4276,7 +4637,11 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
     adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
 
-    phase2_note = " Deep analysis completed." if phase2_completed else " Phase 2 skipped."
+    phase2_note = (
+        f" Phase 2 deep analysis skipped: {phase2_skip_note}."
+        if phase2_skip_note
+        else (" Deep analysis completed." if phase2_completed else " Phase 2 skipped.")
+    )
     if all_ac_acceptable:
         if adjusted_count > 0:
             summary = (
@@ -4299,6 +4664,22 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
             "total_findings": len(cq_findings),
             "fixes_applied": code_quality_fixes_applied,
             "findings": cq_findings,
+            "false_positive_screen": [
+                {
+                    "index": e.get("index", 0),
+                    "file": e.get("finding", {}).get("file", "?"),
+                    "line": e.get("finding", {}).get("line", 0),
+                    "code": e.get("finding", {}).get("code", "?"),
+                    "linter": e.get("finding", {}).get("linter", "?"),
+                    "severity": e.get("finding", {}).get("severity", "?"),
+                    "classification": e.get("classification", "uncertain"),
+                    "justification": e.get("justification", ""),
+                    "remediable": e.get("remediable", False),
+                    "screen_failed": e.get("screen_failed", False),
+                }
+                for e in (fp_screen_results or [])
+            ],
+            "remediation": (remediation_results or {}),
         },
         "pipeline": {
             "phase1_completed": True,
@@ -4317,6 +4698,7 @@ def _deep_analyze_child(
     runner: Runner,
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
+    max_citations_per_ac: int = _DEFAULT_MAX_CITATIONS_PER_AC,
 ) -> tuple[int, dict, bool]:
     """Run Phase 2 deep analysis for a single child (worker for parallelism).
 
@@ -4329,6 +4711,9 @@ def _deep_analyze_child(
     *green_run_block* is the GREEN-RUN attestation block (or ``None``); when
     set it is injected into the child deep-analysis prompt so the model may
     mark execution-dependent criteria met based on the operator attestation.
+
+    *max_citations_per_ac* bounds the file:line evidence citations the model
+    may emit per criterion (prompt-level only, LP-0MSQ32WM5000NCB7).
     """
     child_acs = child.get("ac_results", [])
     if not child_acs:
@@ -4349,11 +4734,9 @@ def _deep_analyze_child(
         "file not listed here, state that in the evidence instead of "
         "searching for it.\n\n"
         f"{child_file_scope}\n\n"
-        "SCANNING — When you need to look something up, use the bounded helpers:\n"
-        "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
-        "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-        "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
+        f"{_SCANNING_BLOCK}"
         f"{green_run_block or ''}"
+        f"{_max_citations_prompt_snippet(max_citations_per_ac)}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirements. "
         "Use the same verdict guidance as the parent deep analysis.\n\n"
@@ -4367,6 +4750,7 @@ def _deep_analyze_child(
             enable_tools=True, timeout=timeout,
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
+            ac_count=len(child_acs),
         )
     except RuntimeError:
         return ci, child, False
@@ -4437,7 +4821,7 @@ def _deep_analyze_child(
         for i in range(len(updated_child_acs)):
             item = reviewed.get(i, {})
             deep_verdict = _normalize_verdict(item.get("verdict", ""))
-            deep_evidence = item.get("evidence", "")
+            deep_evidence = _evidence_text(item.get("evidence"))
             if deep_verdict:
                 initial = updated_child_acs[i]["verdict"]
                 if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
@@ -4479,7 +4863,7 @@ def _apply_deep_verdicts(
     for i in range(len(updated)):
         item = reviewed.get(i, {})
         deep_verdict = _normalize_verdict(item.get("verdict", ""))
-        deep_evidence = item.get("evidence", "")
+        deep_evidence = _evidence_text(item.get("evidence"))
         if not deep_verdict:
             continue
         initial = updated[i]["verdict"]
@@ -4519,6 +4903,7 @@ def _run_batch_phase2(
     runner: Runner,
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
+    max_citations_per_ac: int = _DEFAULT_MAX_CITATIONS_PER_AC,
 ) -> tuple[list[dict], list[dict], bool] | None:
     """Attempt Phase 2 batch deep analysis (P6).
 
@@ -4533,6 +4918,9 @@ def _run_batch_phase2(
 
     *green_run_block* is the GREEN-RUN attestation block (or ``None``); when
     set it is injected into the batch prompt.
+
+    *max_citations_per_ac* bounds the file:line evidence citations the model
+    may emit per criterion (prompt-level only, LP-0MSQ32WM5000NCB7).
     """
     ac_list: list[dict] = []
     for i, r in enumerate(ac_results):
@@ -4585,11 +4973,9 @@ def _run_batch_phase2(
             f"({child.get('id', '')}):\n{manifest}\n\n"
         )
     batch_prompt += (
-        "SCANNING — When you need to look something up, use the bounded helpers:\n"
-        "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
-        "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-        "- NEVER run unbounded recursive grep over the repo root or .worklog/.\n\n"
+        f"{_SCANNING_BLOCK}"
         f"{green_run_block or ''}"
+        f"{_max_citations_prompt_snippet(max_citations_per_ac)}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirement. Provide a "
         "specific file:line reference as evidence.\n\n"
@@ -4607,6 +4993,7 @@ def _run_batch_phase2(
             enable_tools=True, timeout=timeout,
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
+            ac_count=len(ac_list),
         )
     except RuntimeError:
         return None
@@ -4675,6 +5062,7 @@ def _run_phase2_deep_analysis(
     green_run_block: str | None = None,
     skip_parent_deep: bool = False,
     owning_root: Path | None = None,
+    max_citations_per_ac: int | None = None,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -4699,6 +5087,15 @@ def _run_phase2_deep_analysis(
     ``ac_results`` back in with the gap-mapped children so the parent call is
     not duplicated.
 
+    Small/low-risk children (SA-0MSQ026T3009QY2L): children with ``effort``
+    ∈ {Extra Small, Small} AND ``risk`` = Low are dropped from the Phase 2
+    pending list — their Phase 1 ``ac_results`` stand unchanged with the
+    skip reason annotated into the AC evidence. Non-qualifying children
+    (and children with missing/unknown effort or risk — fail-closed) still
+    get deep analysis. The parent's own skip is decided by the caller's
+    Phase 2 gate, which passes ``skip_parent_deep=True`` here when the
+    parent qualifies.
+
     *owning_root* is the project root that owns the audited item (resolved
     by the launch-context guard); when omitted it is re-resolved from the
     issue id. The FILE SCOPE manifest is validated against it and an
@@ -4706,12 +5103,21 @@ def _run_phase2_deep_analysis(
     (LP-0MSQ32HNR007AI6B) — the caller aborts instead of emitting 'unmet'
     verdicts from a wrong scope.
 
+    *max_citations_per_ac* bounds the file:line evidence citations the model
+    may emit per criterion in the parent/child/batch deep prompts (default:
+    resolved via ``_resolve_max_citations_per_ac``). Prompt-level only —
+    verdict semantics and the canonical report format are unchanged
+    (LP-0MSQ32WM5000NCB7).
+
     Returns (updated_ac_results, updated_child_results, phase2_completed).
     The ``phase2_completed`` flag is ``False`` when the Pi call times out,
     allowing the caller to set appropriate diagnostic evidence.
     """
     if runner is None:
         runner = _default_runner
+
+    if max_citations_per_ac is None:
+        max_citations_per_ac = _resolve_max_citations_per_ac()
 
     # Active children needing Phase 2 deep analysis (shared by the batch
     # path and the per-child path below).
@@ -4744,6 +5150,23 @@ def _run_phase2_deep_analysis(
             continue
         if not child.get("ac_results"):
             continue
+        if _is_low_risk_small(child.get("effort"), child.get("risk")):
+            # Small effort + Low risk — skip this child's Phase 2 deep
+            # analysis (SA-0MSQ026T3009QY2L). Phase 1 verdicts stand
+            # unchanged; annotate the AC evidence with the skip reason.
+            print(
+                f"Skipping Phase 2 deep analysis for child "
+                f"{child.get('id', '')}: effort={child.get('effort')}, "
+                f"risk={child.get('risk')}. Phase 1 verdicts stand unchanged.",
+                file=sys.stderr,
+            )
+            child["ac_results"] = _annotate_skip_evidence(
+                child.get("ac_results", []),
+                f"Phase 2 deep analysis skipped (effort={child.get('effort')}, "
+                f"risk={child.get('risk')}): small, low-risk item per "
+                f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
+            )
+            continue
         pending.append((ci, child))
 
     # Batch mode (P6): fold parent + pending child ACs into one indexed
@@ -4757,6 +5180,7 @@ def _run_phase2_deep_analysis(
             resolved_model, pi_bin, debug_log, timeout, runner,
             ac_fallback_used=ac_fallback_used,
             green_run_block=green_run_block,
+            max_citations_per_ac=max_citations_per_ac,
         )
         if batch_outcome is not None:
             return batch_outcome
@@ -4790,12 +5214,9 @@ def _run_phase2_deep_analysis(
             "or `ls -R` across the repo). If a criterion requires a file not listed "
             "here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
-            "SCANNING — When you need to look something up, use the bounded helpers:\n"
-            "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
-            "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-            "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
-            "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
+            f"{_SCANNING_BLOCK}"
             f"{green_run_block or ''}"
+            f"{_max_citations_prompt_snippet(max_citations_per_ac)}"
             "For each acceptance criterion:\n"
             "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
             "2. **Verify the code actually does what the criterion claims.**\n"
@@ -4819,6 +5240,7 @@ def _run_phase2_deep_analysis(
                 enable_tools=True, timeout=timeout,
                 max_retries=_PHASE2_MAX_RETRIES,
                 ac_fallback_used=ac_fallback_used,
+                ac_count=len(ac_results),
             )
         except RuntimeError as exc:
             # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
@@ -4921,7 +5343,7 @@ def _run_phase2_deep_analysis(
             for i in range(len(updated_ac)):
                 item = reviewed.get(i, {})
                 deep_verdict = _normalize_verdict(item.get("verdict", ""))
-                deep_evidence = item.get("evidence", "")
+                deep_evidence = _evidence_text(item.get("evidence"))
                 if deep_verdict:
                     # Final verdict = Phase 1 passes AND Phase 2 confirms
                     initial = updated_ac[i]["verdict"]
@@ -4975,6 +5397,7 @@ def _run_phase2_deep_analysis(
                     debug_log, timeout, runner,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
                 for ci, child in pending
             ]
@@ -4994,6 +5417,7 @@ def _run_phase2_deep_analysis(
                 ci, child, resolved_model, pi_bin, debug_log, timeout, runner,
                 ac_fallback_used=ac_fallback_used,
                 green_run_block=green_run_block,
+                max_citations_per_ac=max_citations_per_ac,
             ))
 
     return updated_ac, updated_children, not child_timeout_occurred
@@ -5026,7 +5450,7 @@ def _reask_verdict_array_once(
             "index": i,
             "text": r.get("text", ""),
             "verdict": r.get("verdict", "unmet"),
-            "evidence": (r.get("evidence", "") or "")[:200],
+            "evidence": _evidence_text(r.get("evidence"))[:200],
         }
         for i, r in enumerate(ac_results)
     ])
@@ -5084,108 +5508,122 @@ def _reask_verdict_array_once(
             "verdict": _normalize_verdict(
                 item.get("verdict", r.get("verdict", "unmet"))
             ),
-            "evidence": item.get("evidence", r.get("evidence", "")),
+            "evidence": _evidence_text(item.get("evidence", r.get("evidence", ""))),
         })
     return repaired
 
 
-def cmd_issue(issue_id: str, persist: bool = True,
-              timeout: int | None = None,
-              parent_timeout: int | None = None,
-              pi_bin: str = "pi", model: str | None = None,
-              model_source: str = DEFAULT_MODEL_SOURCE,
-              runner: Runner | None = None, json_mode: bool = False,
-              debug_log: str | None = None,
-              force: bool = False,
-              worklog_dir: str | None = None,
-              batch_phase2: bool = False,
-              green_run: str | None = None,
-              audit_children: bool = False,
-              max_child_audits: int | None = None,
-              run_tests: bool = False) -> int:
-    """Audit a single work item.
+def _format_script_failure(script_name: str, exc: Exception) -> dict:
+    """Map a script execution exception to a structured failure record.
 
-    The resolved model name and source are included as a metadata line
-    in the audit report output (issue-level and child reports).
-
-    Model resolution order (highest first):
-      1. --model CLI flag (explicit override)
-      2. Config-driven: model.audit from .ralph.json resolved via model_source
-      3. Hardcoded fallback: DEFAULT_MODEL
-
-    When *force* is ``True``, the freshness gate is bypassed and a full
-    audit pipeline is always run, even if a recent audit already exists.
-
-    *audit_children* enables the recursive child-audit cascade: when a child
-    has no fresh audit, the runner auto-triggers a full child audit instead
-    of leaving the child not-ready (SA-0MSKB6V5Q007YDHE). The cascade is
-    OPT-IN — the default is no cascade. Children with unchanged content are
-    skipped via the Feature 1 content-based freshness gate rather than
-    re-audited.
-
-    *max_child_audits* bounds the number of child audits a single run may
-    auto-trigger (default: ``AUDIT_MAX_CHILD_AUDITS`` env or
-    ``_DEFAULT_MAX_CHILD_AUDITS``).
-
-    *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
-    auto-resolution for every wl call made by this run (see
-    ``_resolve_worklog_flags``).
-
-    *green_run* is the operator-attested green test run value (an exact
-    commit sha or the alias ``HEAD``; resolution precedence flag > env
-    ``AUDIT_GREEN_RUN`` > unset). When the value matches the audited HEAD,
-    the GREEN-RUN attestation block is injected into the Phase 1 parent
-    prompt and all Phase 2 prompts, and the attested sha is recorded in the
-    persisted report. A mismatched or unverifiable value prints a clear
-    error and the run proceeds WITHOUT the attestation (execution-dependent
-    ACs stay partial) — never silently accepted.
-
-    When no operator attestation is present, the runner attempts the
-    automatic full-suite verification path (SA-0MSIU5HFI0024D7W): a green
-    full-suite run is looked up READ-ONLY in the per-repo test cache
-    (``query_cached`` — never executes) and, if found at the audited git
-    state within the cache TTL, an AUTO-VERIFIED block is injected and the
-    sha recorded as ``Automatic green run evidence``. Any miss, non-zero
-    run, or cache error yields no evidence (fail-closed); the operator path
-    takes precedence when both are available.
-
-    *run_tests* (``--run-tests``, OFF by default) extends the automatic path
-    (SA-0MSJELSWS002UF60): when no operator attestation exists AND the
-    read-only cache holds no green full-suite run at the audited state, the
-    runner invokes the test skill (``run_tests.py`` machinery) to EXECUTE
-    the full project test suite in quiet mode, triage failures per the test
-    skill, and refresh the per-repo cache. When the executed run is green, a
-    TEST-SKILL RUN block is injected (the model MAY mark execution-dependent
-    criteria met) and the sha recorded as ``Test skill run evidence``. This
-    is an explicit, operator-authorized deviation from the audit's read-only
-    mandate — environments that forbid test execution during audits simply
-    omit the flag and behavior is unchanged (execution-dependent ACs stay
-    partial with the operator instruction). A non-green executed run yields
-    no evidence (fail-closed).
-
-    For each active child (not completed/done), the child's persisted audit
-    verdict is checked via ``wl audit-show``. If no audit exists or the audit
-    is stale, an audit is auto-triggered for that child (via the same audit
-    runner mechanism) and the resulting verdict is evaluated. A child whose
-    audit says "Ready to close: No" prevents the parent from being ready to
-    close. This check is performed before Phase 1 screening so that Phase 1
-    can block on children not individually ready.
-
-    Default orchestration is parent-first (SA-0MSKB6VJA005N43F): the parent
-    is fully audited first (Phase 1 parent ACs + Phase 2 deep analysis) with
-    no child screening; then the parent verdict drives the child pass-through
-    (all children inherit passed when the parent has no gaps; only gap-mapped
-    children are audited when it does). ``--audit-children`` forces the full
-    per-child flow described above (explicit override).
+    Shared by ``cmd_issue`` and ``cmd_project`` (SA-0MSL1Z67Z001ZO87): each
+    command keeps a tiny first-failure-only wrapper, but the reason mapping
+    lives in exactly one place. Maps ``TimeoutExpired`` to a readable
+    timeout reason and ``FileNotFoundError`` to the missing filename; other
+    exceptions keep their str() as the reason.
     """
-    # ------------------------------------------------------------------
-    # Launch-context guard (LP-0MSQ32HNR007AI6B): fail fast BEFORE any
-    # phase runs or pi/model calls when the launch project does not own
-    # the audited work item. A mis-scoped launch previously produced a
-    # full wasted run whose Phase 2 targeted the wrong repository
-    # (see _verify_launch_context). Non-zero exit, clear error, zero pi
-    # calls, no status lifecycle.
-    # ------------------------------------------------------------------
+    reason = str(exc)
+    if isinstance(exc, subprocess.TimeoutExpired):
+        reason = f"Timeout after {exc.timeout}s"
+    elif isinstance(exc, FileNotFoundError):
+        reason = f"File not found: {exc.filename}"
+    return {
+        "script_name": script_name,
+        "reason": reason,
+        "stderr": str(exc),
+    }
+
+
+@dataclass
+class _AuditContext:
+    """Mutable state shared across the decomposed cmd_issue phases.
+
+    Immutable inputs are set at construction; the phase functions
+    (SA-0MSL1ZB5J005ENLI) read them via local aliases and write results
+    back into the fields below so the next phase (and the terminal
+    lifecycle) sees them. ``record_script_failure`` replaces the former
+    nonlocal ``_record_script_failure`` closure (first failure wins).
+    """
+
+    issue_id: str
+    persist: bool
+    timeout: int | None
+    parent_timeout: int | None
+    pi_bin: str
+    model: str | None
+    model_source: str
+    runner: Runner
+    json_mode: bool
+    debug_log: str | None
+    force: bool
+    worklog_dir: str | None
+    batch_phase2: bool
+    green_run: str | None
+    audit_children: bool
+    max_child_audits: int | None
+    run_tests: bool
+    no_execute: bool = False
+    max_citations_per_ac: int | None = None
+
+    # Resolved / gate-phase state (set by _phase_gate)
+    owning_root: str | None = None
+    resolved_model: str = DEFAULT_MODEL
+    green_run_block: str | None = None
+    green_run_sha: str | None = None
+    auto_green_run_sha: str | None = None
+    test_skill_run_sha: str | None = None
+    original_status: str = "open"
+    original_stage: str = ""
+    wi: dict | None = None
+    script_failure: dict | None = None
+
+    # Pipeline state
+    work_item: dict = field(default_factory=dict)
+    children: list = field(default_factory=list)
+    description: str = ""
+    acs: list = field(default_factory=list)
+    content_fingerprint: str | None = None
+    cq_findings: list = field(default_factory=list)
+    cq_fixes_applied: int = 0
+    cq_skipped_reason: str | None = None
+    fp_screen_results: list = field(default_factory=list)
+    remediation_results: dict = field(default_factory=dict)
+    ac_results: list = field(default_factory=list)
+    child_results: list = field(default_factory=list)
+    ac_fallback_used: threading.Event = field(default_factory=threading.Event)
+    phase2_completed: bool = False
+    phase2_skip_note: str | None = None
+    child_persist_results: list = field(default_factory=list)
+    audit_verdict: str | None = None
+    audit_completed: bool = False
+
+    def record_script_failure(self, script_name: str, exc: Exception) -> None:
+        """Record a script execution failure (first failure wins)."""
+        if self.script_failure is not None:
+            return
+        self.script_failure = _format_script_failure(script_name, exc)
+
+
+def _phase_gate(ctx: _AuditContext) -> int | None:
+    """Phase 1 — launch-context guard, model/green-run resolution, original
+    status capture, freshness gates, and the in_progress claim.
+
+    Returns an exit code for early-abort paths (fresh-skip, pre-flight
+    refusal) — cmd_issue returns it directly without touching the
+    status lifecycle. Returns None when the pipeline should continue.
+    Note (F4, SA-0MSTN8CWM003AAU9): a full-suite cache miss is NOT an
+    early-abort — it auto-executes (F3) or fails open partial.
+    """
+    issue_id = ctx.issue_id
+    json_mode = ctx.json_mode
+    runner = ctx.runner
+    worklog_dir = ctx.worklog_dir
+    force = ctx.force
+    green_run = ctx.green_run
+    run_tests = ctx.run_tests
+    model = ctx.model
+    model_source = ctx.model_source
+
     launch_error = _verify_launch_context(issue_id, worklog_dir=worklog_dir)
     if launch_error:
         if json_mode:
@@ -5195,8 +5633,28 @@ def cmd_issue(issue_id: str, persist: bool = True,
         return 1
 
     # Owning project root used by the Phase 1/2 FILE SCOPE manifest
-    # validation (resolved once; None → fail open).
+    # validation and as the git root for all runner-based git commands
+    # (resolved once; None → abort per AC2 — see below).
     owning_root = _resolve_owning_project_root(issue_id, worklog_dir=worklog_dir)
+    if owning_root is None:
+        # AC2 (SA-0MSLLGDW00098UCC): undeterminable ownership aborts. The
+        # git-derived content (file-scope manifest, HEAD sha, working-tree
+        # hash, green-run evidence) must resolve against the OWNING
+        # project's repository; with no --worklog-dir, an unknown prefix,
+        # and no sibling match, falling back to the launch cwd's repo would
+        # silently scope the audit to the wrong repository. Refuse.
+        error = (
+            f"Undeterminable project scope for work item {issue_id}: no "
+            f"--worklog-dir, unknown item prefix, and no sibling match. "
+            f"Refusing to fall back to the launch cwd's repository for "
+            f"git-derived content. Re-launch from the owning project or "
+            f"pass --worklog-dir."
+        )
+        if json_mode:
+            print(json.dumps({"error": error}, indent=2))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
 
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -5207,12 +5665,36 @@ def cmd_issue(issue_id: str, persist: bool = True,
     if runner is None:
         runner = _default_runner
 
+    # Resolve the git root for every runner-based git command
+    # (SA-0MSLLGDW00098UCC): git-derived content must come from the OWNING
+    # project's repository — never the launch cwd's. The owning root is the
+    # default git root; when the launch cwd is the same git repository (a
+    # worktree of the owning project, or the owning project itself), keep
+    # the launch cwd so a worktree launch still resolves git to the
+    # worktree checkout (worktree branch HEAD and worktree-only changes
+    # stay correct — AC3). Then wrap the runner so every git call carries
+    # `git -C <git_root>` when git_root differs from the launch root (AC1)
+    # and stays byte-identical otherwise (zero regression for owning
+    # launches).
+    git_root = owning_root
+    if _same_git_repository(TARGET_PROJECT_ROOT, owning_root):
+        git_root = TARGET_PROJECT_ROOT
+    runner = _cwd_aware_runner(git_root, runner)
+    ctx.runner = runner
+
     # Resolve the operator-attested green test run (if any). The attestation
     # is external evidence: the runner NEVER executes the test suite itself
     # (the read-only mandate otherwise remains in force).
     green_run_block, green_run_sha = _resolve_green_run_attestation(
         green_run, runner,
     )
+
+    # F3 (SA-0MSTN5KRF0097TVP): automatic suite-execution hatch. By default
+    # the audit auto-executes the repo's actual suite on a cache miss; the
+    # operator can opt out with --no-execute / AUDIT_NO_EXECUTE=1 (proceed
+    # fail-open partial instead). Resolved here so the auto-verification
+    # path below can consult it.
+    no_execute = ctx.no_execute or os.environ.get(AUDIT_NO_EXECUTE_ENV) == "1"
 
     # Automatic full-suite verification (SA-0MSIU5HFI0024D7W): when there is
     # no operator attestation, consume a green full-suite run from the per-repo
@@ -5223,20 +5705,28 @@ def cmd_issue(issue_id: str, persist: bool = True,
     auto_green_run_sha = None
     test_skill_run_sha = None
     if green_run_sha is None:
-        auto_block, auto_sha = _resolve_auto_green_run(
+        auto_block, auto_sha, auto_status = _auto_green_run_outcome(
             runner, cwd=str(TARGET_PROJECT_ROOT),
         )
         if auto_sha is not None:
             green_run_block = auto_block
             auto_green_run_sha = auto_sha
-        elif run_tests:
-            # --run-tests path (SA-0MSJELSWS002UF60): no operator attestation
-            # and no cached green evidence. Invoke the test skill (run_tests.py)
-            # to execute the full project test suite in quiet mode, triage any
-            # failures per the test skill, and refresh the per-repo cache so
-            # subsequent audits auto-verify. This is an explicit,
-            # operator-authorized deviation from the audit's read-only mandate;
-            # the default (no --run-tests) stays strictly read-only.
+        elif run_tests or (not no_execute
+                           and auto_status == _FULL_SUITE_CACHE_MISS):
+            # F3 (SA-0MSTN5KRF0097TVP): default auto-execution on cache miss.
+            # The audit's read-only mandate is lifted for suite execution:
+            # when no operator attestation and no cached green evidence exist
+            # AND the cache is MISSING (not red, error, or empty — those stay
+            # fail-open partial, no execution), the runner invokes the test
+            # skill (run_tests.py) to execute the repo's ACTUAL suite
+            # (full_suite_commands — F2 AC4), triage any failures per the
+            # test skill, and refresh the per-repo cache so subsequent audits
+            # auto-verify read-only. A green executed run injects the
+            # TEST-SKILL GREEN RUN block; a red run is fail-open (no block,
+            # execution-dependent ACs stay partial with failure evidence).
+            # --no-execute / AUDIT_NO_EXECUTE=1 opts out and proceeds
+            # fail-open partial (no execution, no block). --run-tests is the
+            # explicit override that executes on ANY non-green state.
             head_sha = _resolve_audited_head(runner)
             test_run = _run_tests_via_test_skill(
                 cwd=TARGET_PROJECT_ROOT,
@@ -5248,74 +5738,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 test_skill_run_sha = head_sha
 
     # ------------------------------------------------------------------
-    # Freshness gate: skip if a recent audit already exists
-    # (before status lifecycle to avoid unnecessary in_progress transitions)
-    # ------------------------------------------------------------------
-    if not force:
-        fresh_report = _check_audit_freshness(runner, issue_id,
-                                              worklog_dir=worklog_dir)
-        if fresh_report is not None:
-            print("Skipping: audit still fresh")
-            print(fresh_report)
-            return 0
-
-    # ------------------------------------------------------------------
-    # Pre-flight full-suite cache gate (SA-0MSQ72BVV0011SRU): a MISSING
-    # full-suite cache at HEAD (no green cached run via query_cached) with
-    # no explicit opt-out (--run-tests executes the suite; --green-run
-    # attests it) blocks the audit BEFORE any Phase 1 pi call, report, or
-    # persistence — and before the status lifecycle, so pre-audit
-    # status/stage are preserved. Without the gate a cache miss degraded to
-    # a diagnostic and the run continued, letting the Phase 2 model mark
-    # execution-dependent ACs 'met' from implementer-reported evidence with
-    # no forcing function to populate the cache (the degraded-verdict bug
-    # this gate fixes). A red cached run and cache errors keep the
-    # historical partial + diagnostic behavior (fail-open); only a miss
-    # exits non-zero, and only for repos whose effective suite set actually
-    # requires the suite (no-pytest repos are never falsely blocked, AC3).
-    # ------------------------------------------------------------------
-    if (green_run_sha is None and auto_green_run_sha is None
-            and test_skill_run_sha is None and not run_tests):
-        gate_message = _preflight_cache_gate(
-            runner, cwd=str(TARGET_PROJECT_ROOT),
-        )
-        if gate_message is not None:
-            if json_mode:
-                print(json.dumps({"error": gate_message}, indent=2))
-            else:
-                print(f"Error: {gate_message}", file=sys.stderr)
-            return 1
-
-    # Track script execution failures for prominent surfacing
-    script_failure: dict | None = None
-
-    def _record_script_failure(script_name: str, exc: Exception) -> None:
-        """Record a script execution failure into the enclosing scope.
-
-        Only records the first failure; subsequent failures are suppressed
-        to avoid overwriting the root cause.
-        """
-        nonlocal script_failure
-        if script_failure is not None:
-            return
-        reason = str(exc)
-        if isinstance(exc, subprocess.TimeoutExpired):
-            reason = f"Timeout after {exc.timeout}s"
-        elif isinstance(exc, FileNotFoundError):
-            reason = f"File not found: {exc.filename}"
-        script_failure = {
-            "script_name": script_name,
-            "reason": reason,
-            "stderr": str(exc),
-        }
-
-    # ------------------------------------------------------------------
-    # Capture original status + stage before setting in_progress, so the
-    # finally block can restore a safe consistent state on failure and
-    # apply a verdict-driven terminal transition on success.
+    # Capture original status + stage before the freshness gate / status
+    # lifecycle, so the finally block can restore a safe consistent state
+    # on failure and apply a verdict-driven terminal transition on success.
+    # The fetched work item is also reused by the freshness gate below
+    # (SA-0MSL1Z7E9005TLBA) — a single ``wl show`` serves both the status
+    # capture and the freshness fingerprint/time-gate computation.
     # ------------------------------------------------------------------
     original_status = "open"  # safe default
     original_stage = ""       # safe default (unknown)
+    wi: dict | None = None
     try:
         item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                             worklog_dir=worklog_dir)
@@ -5329,6 +5761,44 @@ def cmd_issue(issue_id: str, persist: bool = True,
             original_stage = wi.get("stage", "")
     except RuntimeError:
         pass  # Fall back to safe defaults
+
+    # ------------------------------------------------------------------
+    # Freshness gate: skip if a recent audit already exists
+    # (before status lifecycle to avoid unnecessary in_progress transitions)
+    # ------------------------------------------------------------------
+    if not force:
+        fresh_report = _check_audit_freshness(runner, issue_id,
+                                              worklog_dir=worklog_dir,
+                                              work_item=wi)
+        if fresh_report is not None:
+            print("Skipping: audit still fresh")
+            print(fresh_report)
+            return 0
+
+    # ------------------------------------------------------------------
+    # Never-block guarantee (F4, SA-0MSTN8CWM003AAU9): the audit NEVER
+    # hard-exits solely because it cannot run tests. The old pre-flight
+    # hard gate (SA-0MSQ72BVV0011SRU) was removed; a cache miss is handled
+    # by F3's auto-execution above (or fail-open partial under
+    # --no-execute / AUDIT_NO_EXECUTE=1). Execution-dependent ACs are
+    # verified from the executed green run or stay partial with a documented
+    # reason — never a degraded 'met' verdict, never a hard block. Red
+    # executed runs, cache errors, unresolvable HEADs, and empty command
+    # sets (F2 AC4 / F4 AC2) all fail open partial.
+    # ------------------------------------------------------------------
+    if no_execute and green_run_sha is None and auto_green_run_sha is None \
+            and test_skill_run_sha is None and not run_tests:
+        print(
+            "AUDIT_NO_EXECUTE=1 / --no-execute: automatic suite execution "
+            "skipped — execution-dependent acceptance criteria stay partial "
+            "(fail-open, no block).",
+            file=sys.stderr,
+        )
+
+    # Track script execution failures for prominent surfacing: the
+    # first-failure-only recorder lives on the context (record_script_failure)
+    # so later phases and the terminal lifecycle can read ctx.script_failure.
+    ctx.script_failure = None
 
     # Audit verdict parsed from the assembled report ("yes"/"no"); stays
     # None when the audit failed or the verdict could not be parsed.
@@ -5353,227 +5823,954 @@ def cmd_issue(issue_id: str, persist: bool = True,
     ac_fallback_used = threading.Event()
 
     # ------------------------------------------------------------------
+    # Pre-flight affirmation guard (SA-0MSL1Z1WU005O5IY): the SKILL.md
+    # documented a "pre-flight affirmation" that no code implemented. A
+    # work item already ``in_progress`` at entry means another audit (or an
+    # implementation claim) owns the item — starting a competing audit races
+    # status transitions and lets the last writer win on persist + status.
+    # Abort with a clear, actionable message unless ``--force`` explicitly
+    # overrides the guard. No report is produced, nothing is persisted, and
+    # the pre-audit status/stage are untouched (guard runs before the
+    # status lifecycle below).
+    # ------------------------------------------------------------------
+    if not force and original_status in ("in_progress", "in-progress"):
+        pre_flight_msg = (
+            f"Refusing to audit {issue_id}: the work item is already "
+            f"in_progress (a concurrent audit or implementation owns it). "
+            f"Pass --force to bypass this pre-flight guard."
+        )
+        if json_mode:
+            print(json.dumps({
+                "error": pre_flight_msg,
+                "pre_flight": {
+                    "issue_id": issue_id,
+                    "status": original_status,
+                    "bypass": "--force",
+                },
+            }, indent=2))
+        else:
+            print(f"Error: {pre_flight_msg}", file=sys.stderr)
+        return 1
+
+    # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry (verdict-driven on exit)
     # ------------------------------------------------------------------
     _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"],
             worklog_dir=worklog_dir)
 
-    try:
+    # Sync the resolved gate state back into the context for later phases.
+    ctx.owning_root = owning_root
+    ctx.resolved_model = resolved_model
+    ctx.green_run_block = green_run_block
+    ctx.green_run_sha = green_run_sha
+    ctx.auto_green_run_sha = auto_green_run_sha
+    ctx.test_skill_run_sha = test_skill_run_sha
+    ctx.original_status = original_status
+    ctx.original_stage = original_stage
+    ctx.wi = wi
+    ctx.ac_fallback_used = ac_fallback_used
+    ctx.ac_results = ac_results
+    ctx.child_results = child_results
+    ctx.audit_verdict = audit_verdict
+    ctx.audit_completed = audit_completed
+    return None
+
+
+def _parse_fp_screen_response(raw_text: str,
+                              findings: list[dict]) -> tuple[list[dict], bool]:
+    """Parse a batched false-positive screen response into classifications.
+
+    Returns ``(entries, failed)`` where *entries* is one dict per ruff
+    finding (in input order) and *failed* is True when the whole response
+    degraded (unparseable output or an infra-failure marker) — in which
+    case EVERY finding is ``uncertain`` (T1 AC2).
+
+    Entry schema:
+      ``{"index": int, "finding": dict, "classification": str,
+        "justification": str, "remediable": bool, "screen_failed": bool}``
+
+    Caution-first rules:
+      - A finding missing from the batch defaults to ``uncertain`` and is
+        never ``confident-false-positive`` (T1 AC1).
+      - A classification outside ``FP_SCREEN_VALID_CLASSIFICATIONS``
+        normalizes to ``uncertain`` with a written justification.
+      - Only blocking-severity (critical/high) ``confident-false-positive``
+        findings are marked remediable; remediation is F2 scope (T1 AC5).
+    """
+    entries: list[dict] = []
+    raw_text = raw_text or ""
+    batch: list | None = _extract_json_array(raw_text)
+    if batch is None:
         try:
-            data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"],
-                           worklog_dir=worklog_dir)
-        except RuntimeError as exc:
-            _record_script_failure("wl show", exc)
-            print(f"Warning: wl show failed: {exc}", file=sys.stderr)
-            # Build a minimal failure report
-            fail_notice = FailureNotice(
-                script_name="wl show",
-                reason=str(exc),
-                stderr_context=str(exc),
-            )
-            fail_report = fail_notice.wrap(
-                f"Could not fetch work item {issue_id}. "
-                "No audit report could be generated."
-            )
-            if json_mode:
-                payload = {"error": str(exc), "script_failure": {"script_name": "wl show", "reason": str(exc)}}
-                print(json.dumps(payload, indent=2))
-            else:
-                print(fail_report)
-            return 1
+            batch = json.loads(raw_text)
+        except (json.JSONDecodeError, TypeError):
+            batch = None
 
-        work_item = data.get("workItem", {})
-        children = data.get("children", [])
-        description = work_item.get("description", "")
+    if not isinstance(batch, list):
+        # Unparseable output — degrade EVERY finding to uncertain.
+        for i, f in enumerate(findings):
+            entries.append({
+                "index": i,
+                "finding": f,
+                "classification": "uncertain",
+                "justification": FP_SCREEN_FAILED_JUSTIFICATION,
+                "remediable": False,
+                "screen_failed": True,
+            })
+        return entries, True
 
-        # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT):
-        # git HEAD sha + work-item description hash + Key Files list. The
-        # fingerprint is embedded in the persisted report so a re-audit of an
-        # unchanged item skips the pipeline (content-based freshness gate).
-        # Fail-open: if the fingerprint cannot be computed (git unavailable,
-        # wl failure), the audit proceeds and simply stores no fingerprint.
-        content_fingerprint = _compute_content_fingerprint(
+    reviewed = {
+        item.get("index"): item
+        for item in batch
+        if isinstance(item, dict) and isinstance(item.get("index"), int)
+    }
+    if not reviewed and batch and all(isinstance(item, dict) for item in batch):
+        # Model omitted explicit indexes — fall back to positional matching
+        # (same-count arrays), keeping the caution-first rules intact.
+        reviewed = {i: item for i, item in enumerate(batch)}
+    for i, f in enumerate(findings):
+        item = reviewed.get(i, {})
+        classification = item.get("classification", "uncertain")
+        if classification not in FP_SCREEN_VALID_CLASSIFICATIONS:
+            classification = "uncertain"
+        if not isinstance(item, dict) or "classification" not in item:
+            justification = FP_SCREEN_MISSING_JUSTIFICATION
+        elif item.get("classification") not in FP_SCREEN_VALID_CLASSIFICATIONS:
+            justification = (
+                f"Classification {item.get('classification')!r} not recognized — "
+                "normalized to uncertain (caution-first)."
+            )
+        else:
+            justification = item.get("justification", "") or ""
+        remediable = (
+            classification == "confident-false-positive"
+            and f.get("severity") in ("critical", "high")
+        )
+        entries.append({
+            "index": i,
+            "finding": f,
+            "classification": classification,
+            "justification": justification,
+            "remediable": remediable,
+            "screen_failed": False,
+        })
+    return entries, False
+
+
+def _fp_classification_for(finding: dict, fp_screen_results: list[dict]) -> str | None:
+    """Return the screen classification for *finding*, or None when the
+    finding was not screened (non-ruff finding, or screen skipped)."""
+    for entry in fp_screen_results or []:
+        if entry.get("finding") is finding or entry.get("finding") == finding:
+            return entry.get("classification")
+    return None
+
+
+def _screen_ruff_findings(issue_id: str, findings: list[dict],
+                          pi_bin: str, resolved_model: str,
+                          debug_log: str | None, timeout: int | None,
+                          ac_fallback_used: threading.Event) -> list[dict]:
+    """Model-judged false-positive screen over ruff findings (F1 scope).
+
+    Classifies each ruff finding via a SINGLE batched Pi call
+    (``FP_SCREEN_CONTEXT``); non-ruff findings are never sent to the screen.
+    Returns one entry per ruff finding (see ``_parse_fp_screen_response``
+    for the schema) or ``[]`` when there are no ruff findings — the screen
+    is skipped entirely, so zero Pi calls happen (T1 AC3).
+
+    Caution-first degradation (T1 AC2): a provider error, timeout,
+    concurrency-limit marker, unparseable output, or RuntimeError from the
+    Pi call marks EVERY finding ``uncertain`` (never
+    ``confident-false-positive``) and sets ``ac_fallback_used`` so a
+    verdict derived from the failed screen restores the pre-audit state
+    instead of demoting.
+    """
+    ruff_findings = [f for f in (findings or []) if f.get("linter") == "ruff"]
+    if not ruff_findings:
+        return []
+
+    finding_list_json = json.dumps([
+        {
+            "index": i,
+            "file": f.get("file", "?"),
+            "line": f.get("line", 0),
+            "severity": f.get("severity", "?"),
+            "code": f.get("code", "?"),
+            "message": f.get("message", ""),
+        }
+        for i, f in enumerate(ruff_findings)
+    ])
+    prompt = (
+        "[READ-ONLY AUDIT] You are performing a read-only audit. "
+        "Do NOT close, modify, or delete any work items; you MAY create "
+        "a chore work item to track a false-positive finding (config-fix "
+        "remediation). "
+        "Do NOT execute any wl, git, or other state-modifying commands. "
+        "Return ONLY a structured JSON array.\n\n"
+        "Classify each ruff lint finding below as either 'genuine' (a real "
+        "defect that should stay), 'confident-false-positive' (the rule "
+        "misfires for this file and the finding is not a real defect), or "
+        "'uncertain'. Err on the side of caution: when in doubt, choose "
+        "'uncertain'.\n\n"
+        "Return ONLY a JSON array of objects, each with keys 'index' "
+        "(integer, matching the input), 'classification' (one of: "
+        "genuine, confident-false-positive, uncertain) and 'justification' "
+        "(a one-line written reason).\n\n"
+        f"Findings: {finding_list_json}"
+    )
+    try:
+        result = _call_pi_and_maybe_log(
+            issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
+            pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
+            ac_fallback_used=ac_fallback_used, child_screen=True,
+        )
+    except RuntimeError as exc:
+        ac_fallback_used.set()
+        print(
+            f"Warning: Pi call failed for false-positive screen: {exc} — "
+            "all findings defaulted to uncertain (caution-first).",
+            file=sys.stderr,
+        )
+        entries, _ = _parse_fp_screen_response("", ruff_findings)
+        return entries
+
+    degraded = bool(
+        result.get("_provider_error")
+        or result.get("_timeout")
+        or result.get("_concurrency_timeout")
+    )
+    if degraded:
+        # Infra failure: _call_pi already set ac_fallback_used for
+        # timeout/concurrency/provider-error paths; belt-and-suspenders here.
+        ac_fallback_used.set()
+        print(
+            "Warning: false-positive screen degraded (provider error / timeout / "
+            "concurrency limit) — all findings defaulted to uncertain "
+            "(caution-first).",
+            file=sys.stderr,
+        )
+        entries, _ = _parse_fp_screen_response("", ruff_findings)
+        return entries
+
+    raw_text = result.get("extracted_text", "") or result.get("evidence", "") or ""
+    entries, failed = _parse_fp_screen_response(raw_text, ruff_findings)
+    if failed:
+        ac_fallback_used.set()
+        print(
+            "Warning: unparseable Pi output for false-positive screen — "
+            "all findings defaulted to uncertain (caution-first).",
+            file=sys.stderr,
+        )
+    return entries
+
+
+def _effective_blocking_findings(cq_findings: list[dict],
+                                 fp_screen_results: list[dict]) -> list[dict]:
+    """Findings that still block closure after the false-positive screen.
+
+    Only ``confident-false-positive`` critical/high findings are screened
+    out; ``uncertain`` (caution-first) and ``genuine`` findings remain
+    blocking (SA-0MST01O4G002VPBR AC4). Non-ruff findings are never
+    screened and always block at critical/high.
+    """
+    blocking = []
+    for f in cq_findings or []:
+        if f.get("severity") not in ("critical", "high"):
+            continue
+        if _fp_classification_for(f, fp_screen_results or []) == "confident-false-positive":
+            continue
+        blocking.append(f)
+    return blocking
+
+
+def _default_max_remediation_iterations() -> int:
+    """Resolve the config-fix iteration cap (env-configurable, T2 AC5).
+
+    ``AUDIT_REMEDIATION_MAX_ITERATIONS`` overrides the default 3; invalid
+    values (non-int, zero, negative) fail closed to the default.
+    """
+    try:
+        value = int(os.environ.get(AUDIT_REMEDIATION_MAX_ITERATIONS_ENV, ""))
+    except (TypeError, ValueError):
+        return REMEDIATION_MAX_ITERATIONS_DEFAULT
+    return value if value > 0 else REMEDIATION_MAX_ITERATIONS_DEFAULT
+
+
+def _commit_config_remediation(runner: Runner, config_path: Path,
+                               project_root: Path,
+                               issue_id: str | None = None) -> str | None:
+    """Commit the applied ruff config fix locally (no push). T2 AC3 / F2 AC3.
+
+    Stages only the config file and commits with
+    ``REMEDIATION_COMMIT_MESSAGE`` (plus the work-item id when known so
+    the message references the work item — F2 AC3). Returns the short
+    commit sha, or None when the commit failed (nothing to commit, git
+    error).
+    """
+    try:
+        rel = config_path.relative_to(project_root)
+    except ValueError:
+        rel = config_path
+    message = REMEDIATION_COMMIT_MESSAGE
+    if issue_id:
+        message = f"{message} — {issue_id}"
+    try:
+        runner(["git", "add", "--", str(rel)])
+        proc = runner(["git", "commit", "-m", message])
+        if getattr(proc, "returncode", 0) != 0:
+            return None
+        head = runner(["git", "rev-parse", "--short", "HEAD"])
+        sha = getattr(head, "stdout", "").strip()
+        return sha or None
+    except Exception:  # noqa: BLE001 -- remediation must never crash the audit
+        return None
+
+
+def _fp_remediation_change_summary(targets: list[dict]) -> str:
+    """Human-readable summary of the per-file-ignores change applied.
+
+    Renders ``file -> code1, code2`` for each flagged file in the
+    remediated target set (F2: per-iteration config-change note).
+    """
+    by_file: dict[str, list[str]] = {}
+    for t in targets or []:
+        finding = t.get("finding", {}) if isinstance(t, dict) else {}
+        file = finding.get("file", "")
+        code = finding.get("code", "")
+        if file and code:
+            by_file.setdefault(file, [])
+            if code not in by_file[file]:
+                by_file[file].append(code)
+    return "; ".join(
+        f"{f} -> {', '.join(sorted(codes))}" for f, codes in by_file.items()
+    ) or "per-file-ignores"
+
+
+def _create_chore_item(runner: Runner, *, title: str, description: str,
+                       worklog_dir: str | None) -> str | None:
+    """Create a ``chore`` work item via ``wl create`` (F3 scope).
+
+    Dispatches through ``_run_wl`` so ``--worklog-dir`` resolves via
+    ``_resolve_worklog_flags`` (explicit dir / prefix-to-sibling — sibling
+    project audits create the chore in the owning project's worklog,
+    SA-0MST01PBJ008100Y AC5). Returns the new work-item id, or ``None``
+    when creation failed — the caller handles the failure fail-safely
+    (F3 AC5: the remediation commit still stands, the finding stays
+    blocking 'genuine', the failure is recorded in the report).
+    """
+    cmd = ["wl", "create", "--issue-type", "chore",
+           "--title", title, "--description", description, "--json"]
+    try:
+        data = _run_wl(runner, cmd, worklog_dir=worklog_dir)
+    except RuntimeError as exc:
+        print(f"Warning: chore-item creation failed: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None
+    wi = data.get("workItem", {})
+    if not isinstance(wi, dict):
+        return None
+    return wi.get("id") or None
+
+
+def _chore_description_for_fix(entries: list[dict], sha: str) -> str:
+    """Description for a config-fix chore: links each remediated false-
+    positive finding (file, rule, justification) and the local commit sha
+    (F3 AC1)."""
+    lines = []
+    for e in entries or []:
+        finding = e.get("finding", {}) if isinstance(e, dict) else {}
+        lines.append(
+            f"- {finding.get('code', '?')} in {finding.get('file', '?')}:"
+            f"{finding.get('line', 0)} — {e.get('justification', '')}"
+        )
+    body = "\n".join(lines) or "(no finding details)"
+    return (
+        "Ruff false positives remediated by a minimal per-file-ignores "
+        f"config fix.\n{body}\n\nSilenced by config commit {sha}."
+    )
+
+
+def _run_remediation_loop(
+    issue_id: str,
+    cq_findings: list[dict],
+    fp_screen_results: list[dict],
+    runner: Runner,
+    pi_bin: str,
+    resolved_model: str,
+    debug_log: str | None,
+    timeout: int | None,
+    ac_fallback_used: threading.Event,
+    project_root: Path,
+    worklog_dir: str | None,
+    work_item: dict,
+    content_fingerprint: str | None,
+) -> dict:
+    """Confident-false-positive config remediation loop (F2 scope).
+
+    For each remediable (confident-false-positive critical/high) ruff
+    finding the loop: applies a MINIMAL per-file-ignores config edit
+    (``apply_ruff_remediation``), commits it locally (no push), recomputes
+    the content fingerprint AFTER the commit (working tree clean), re-runs
+    the scoped code-quality scan ONLY (``fix=False``, same changed-file
+    scoping — the pipeline is never restarted), and re-classifies remaining
+    ruff findings via the screen. Capped at
+    ``_default_max_remediation_iterations()`` iterations per audit run.
+
+    Uncertain findings never enter the loop (no config edit, no commit —
+    T2 AC6). A finding still persisting after the cap is demoted to
+    blocking ``genuine`` annotated ``REMEDIATION_EXHAUSTED_ANNOTATION``
+    (T2 AC5).
+
+    Returns a results dict (also the source of truth for the report):
+      ``{"iterations", "max_iterations", "exhausted", "commits":
+        [{"sha", "file", "fingerprint_after"}], "fingerprint_before",
+        "fingerprint_after", "cq_findings", "fp_screen_results",
+        "chore_items": [{"id", "commit_sha"}],
+        "chore_failures": [{"commit_sha"|"finding", "error"}]}``
+    """
+    max_iterations = _default_max_remediation_iterations()
+    results: dict = {
+        "iterations": 0,
+        "max_iterations": max_iterations,
+        "exhausted": False,
+        "commits": [],
+        "chore_items": [],
+        "chore_failures": [],
+        "fingerprint_before": content_fingerprint,
+        "fingerprint_after": content_fingerprint,
+        "cq_findings": cq_findings,
+        "fp_screen_results": fp_screen_results,
+    }
+    try:
+        from skill.code_review.scripts.code_quality import run_code_quality
+        from skill.code_review.scripts.linter_runner import (
+            apply_ruff_remediation,
+            locate_ruff_config,
+        )
+    except ImportError:
+        # Remediation tooling unavailable — nothing to remediate.
+        return results
+
+    iteration = 0
+    while iteration < max_iterations:
+        targets = [
+            e for e in results["fp_screen_results"] if e.get("remediable")
+        ]
+        if not targets:
+            break
+        config_path = locate_ruff_config(project_root)
+        if not apply_ruff_remediation(config_path, targets):
+            # Nothing to add — the config cannot silence these findings.
+            results["exhausted"] = True
+            break
+        sha = _commit_config_remediation(runner, config_path, project_root,
+                                          issue_id)
+        change = _fp_remediation_change_summary(targets)
+        # Track the applied config fix with a chore work item linking the
+        # findings + commit sha (F3 AC1). Failure is fail-safe (F3 AC5):
+        # the commit stands; the failure is recorded and the affected
+        # finding stays blocking 'genuine' (post-loop pass below).
+        chore_id = _create_chore_item(
+            runner,
+            title=f"ruff false positives silenced by config fix {sha}",
+            description=_chore_description_for_fix(targets, sha),
+            worklog_dir=worklog_dir,
+        )
+        if chore_id:
+            results["chore_items"].append({
+                "id": chore_id, "commit_sha": sha,
+            })
+        else:
+            results["chore_failures"].append({
+                "commit_sha": sha, "change": change,
+                "error": "wl create failed",
+            })
+        new_fp = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
         )
-
-        # ------------------------------------------------------------------
-        # Code quality check (before AC verification)
-        # ------------------------------------------------------------------
-        cq_findings: list[dict] = []
-        cq_fixes_applied: int = 0
-        cq_skipped_reason: str | None = None
+        results["commits"].append({
+            "sha": sha,
+            "file": str(config_path),
+            "change": change,
+            "fingerprint_after": new_fp,
+        })
+        # Re-run the code-quality scan ONLY (no phase re-entry): same
+        # scoped changed-file list, fix=False (T2 AC4).
+        cq_scope_files = _git_changed_files(runner)
         try:
-            from skill.code_review.scripts.code_quality import run_code_quality
-            # Scoped, read-only code-quality scan (SA-0MSKB6VWU000RT58): the
-            # audit lints only the git changed-file list (already computed for
-            # the Phase 1/2 file-scope manifest) instead of the whole repo, and
-            # never mutates files (fix=False — audits are read-only). The
-            # changed-file list doubles as the scoping manifest, so no extra
-            # git scan is issued here.
-            cq_scope_files = _git_changed_files(runner)
             cq_result = run_code_quality(
-                project_root=TARGET_PROJECT_ROOT, runner=runner, fix=False,
+                project_root=project_root, runner=runner, fix=False,
                 files=cq_scope_files or None,
             )
             if cq_result.get("success", False):
-                cq_findings = cq_result.get("findings", [])
-                cq_fixes_applied = cq_result.get("fixes_applied", 0)
-            else:
-                cq_skipped_reason = cq_result.get("error", "Code quality check failed")
-        except ImportError:
-            # code_quality module not available — skip gracefully
-            cq_skipped_reason = "code_quality module not available"
-        except Exception as exc:  # noqa: BLE001 -- code_quality module not available, skip gracefully
-            cq_skipped_reason = str(exc)
-
-        acs = _extract_acs(description)
-
-        # Track elapsed time so we can skip remaining child audits if we
-        # approach the parent bash-tool timeout. This ensures a graceful
-        # degradation instead of a silent external kill. The default guard
-        # scales with the number of active children (see
-        # _default_parent_timeout) so multi-child parents get a realistic
-        # default budget; an explicit --parent-timeout / AUDIT_PARENT_TIMEOUT
-        # override replaces the computed value entirely. The guard itself is
-        # resolved below once active_children is known.
-        _audit_start = time.monotonic()
-
-        def _elapsed():
-            return time.monotonic() - _audit_start
-
-        # Review parent ACs via Pi (batched into a single call for performance)
-        ac_results = []
-        if acs and acs[0] != "No acceptance criteria defined.":
-            ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
-            file_scope = _build_file_scope_manifest(work_item, [], runner=runner)
-            # Validate the FILE SCOPE manifest covers the item repository
-            # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
-            # (e.g. the audit skill's own tree) would emit misleading
-            # 'unmet' verdicts — abort with a scope error instead.
-            scope_error = _validate_file_scope_manifest(file_scope, owning_root)
-            if scope_error:
-                if json_mode:
-                    print(json.dumps({"error": scope_error}, indent=2))
-                else:
-                    print(f"Error: {scope_error}", file=sys.stderr)
-                return 1
-            prompt = (
-                f"[READ-ONLY AUDIT] You are performing a read-only audit. "
-                f"Do NOT close, modify, create, or delete any work items. "
-                f"Do NOT execute any wl, git, or other state-modifying commands. "
-                f"Return ONLY a structured JSON array.\n\n"
-                f"Review the following acceptance criteria against the codebase. "
-                f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
-                f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
-                f"(a one-line note with file:line reference).\n\n"
-                f"Evaluate criteria against user story intent and actual implementation quality, "
-                f"not just literal matching of the original specification. "
-                f"If a criterion has acceptable variance (implementation differs from original "
-                f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
-                f"Include justification in the evidence field.\n\n"
-                f"FILE SCOPE — Read ONLY the files listed in the manifest below. "
-                f"Do not explore the whole repository (no unbounded `find`, `grep -r`, "
-                f"or `ls -R` across the repo). If a criterion requires a file not listed "
-                f"here, state that in the evidence instead of searching for it.\n\n"
-                f"{file_scope}\n\n"
-                f"{_PHASE1_SCANNING_BLOCK}"
-                f"{green_run_block or ''}"
-                f"Criteria: {ac_list_json}"
+                results["cq_findings"] = cq_result.get("findings", [])
+        except Exception as exc:  # noqa: BLE001 -- scan failure keeps prior findings
+            print(
+                f"Warning: remediation re-scan failed: {exc} — "
+                "keeping prior findings.",
+                file=sys.stderr,
             )
-            try:
-                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, enable_tools=True, timeout=timeout, ac_fallback_used=ac_fallback_used)
-            except RuntimeError as exc:
-                _record_script_failure("pi (parent AC review)", exc)
-                print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
-                result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
-            # Parse the batched result - try to extract JSON array from text
-            # Use extracted_text (full response) instead of evidence (may be truncated)
-            raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
-            batch = _extract_json_array(raw_text)
-            if batch is None:
-                # Fallback: try direct JSON parse
-                try:
-                    batch = json.loads(raw_text)
-                except json.JSONDecodeError:
-                    batch = []
-            if isinstance(batch, list) and batch and any(
-                isinstance(item, dict) and "index" in item for item in batch
-            ):
-                reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
-                for i, ac in enumerate(acs):
-                    item = reviewed.get(i, {})
-                    ac_results.append({
-                        "text": ac,
-                        "verdict": _normalize_verdict(item.get("verdict", "unmet")),
-                        "evidence": item.get("evidence", ""),
-                    })
-            else:
-                # Fallback: this path is reached when the Pi response was not a
-                # parseable JSON array. Print a warning, log raw output, and use
-                # 'partial' verdict with diagnostic evidence instead of silently
-                # falling back to 'unmet' with empty evidence.
-                # Infra-failure provenance (SA-0MSG9SLGI002OF7V): the batch
-                # JSON could not be parsed (unparseable output, provider error,
-                # or concurrency-limit timeout), so any 'No' derived from these
-                # verdicts must restore the pre-audit state rather than demote.
-                ac_fallback_used.set()
-                if result.get("_provider_error"):
-                    print(
-                        "Warning: Pi provider error during AC evaluation — "
-                        "falling back to 'partial' verdict",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        "Warning: Unparseable Pi output for AC evaluation — "
-                        "falling back to 'partial' verdict",
-                        file=sys.stderr,
-                    )
-                if debug_log:
-                    try:
-                        target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, "parent_ac_fallback")
-                        _write_debug_log(target, {
-                            "issue_id": issue_id,
-                            "context": "parent_ac_fallback",
-                            "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
-                            "raw_text": raw_text,
-                            "result_verdict": result.get("verdict"),
-                            "result_evidence": result.get("evidence", "")[:500],
-                            "provider_error": result.get("_provider_error_message"),
-                        })
-                    except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
-                        pass
-                # When batched parsing fails, the root-level verdict from Pi
-                # cannot be trusted to represent each AC individually. Override
-                # verdict to 'partial' but preserve any diagnostic evidence
-                # from the root-level result (e.g., a timeout message).
-                if result.get("_provider_error"):
-                    # Provider errors are NOT model parse failures: surface the
-                    # actual provider diagnostic so operators can distinguish a
-                    # transient model outage from a genuine unparseable response.
-                    provider_error = result.get("_provider_error_message", "unknown")
-                    evidence = (
-                        f"Pi provider error: {provider_error} — "
-                        "criterion could not be evaluated."
-                    )
-                else:
-                    outer_evidence = result.get("evidence", "")
-                    if outer_evidence:
-                        evidence = (
-                            f"Pi model output could not be parsed — raw output logged. "
-                            f"Root-level diagnostic: {outer_evidence[:500]}"
-                        )
-                    else:
-                        evidence = "Pi model output could not be parsed — raw output logged"
-                for ac in acs:
-                    ac_results.append({
-                        "text": ac,
-                        "verdict": "partial",
-                        "evidence": evidence,
-                    })
-        else:
-            ac_results = [{"text": "No acceptance criteria defined.", "verdict": "met", "evidence": ""}]
+        # Re-classify remaining ruff findings via the screen.
+        results["fp_screen_results"] = _screen_ruff_findings(
+            issue_id, results["cq_findings"], pi_bin, resolved_model,
+            debug_log, timeout, ac_fallback_used,
+        )
+        results["fingerprint_after"] = new_fp
+        iteration += 1
 
+    results["iterations"] = iteration
+    if (
+        iteration >= max_iterations
+        and any(e.get("remediable") for e in results["fp_screen_results"])
+    ):
+        # Cap exhaustion: the finding persists after max iterations.
+        results["exhausted"] = True
+    if results.get("exhausted"):
+        # Persisting remediable findings become blocking 'genuine' with the
+        # exhaustion annotation (T2 AC5) — never silently suppressed.
+        for e in results["fp_screen_results"]:
+            if e.get("remediable"):
+                e["classification"] = "genuine"
+                e["remediable"] = False
+                e["remediation_exhausted"] = True
+                e["justification"] = (
+                    f"{e.get('justification', '')} — "
+                    f"{REMEDIATION_EXHAUSTED_ANNOTATION}"
+                ).strip(" —")
+
+    # ── Tracked work items (F3 AC1/AC2/AC3) ────────────────────────────────
+    # AC2: every medium/low confident-false-positive finding gets a
+    # tracking chore (no config change, no commit link) annotated for a
+    # producer decision. AC3: uncertain and genuine findings never get a
+    # work item (they are not confident-false-positive).
+    for e in results["fp_screen_results"]:
+        finding = e.get("finding", {}) if isinstance(e, dict) else {}
+        if (
+            e.get("classification") == "confident-false-positive"
+            and finding.get("severity") in ("medium", "low")
+            and not e.get("remediation_exhausted")
+        ):
+            code = finding.get("code", "?")
+            file = finding.get("file", "?")
+            chore_id = _create_chore_item(
+                runner,
+                title=f"ruff {code} in {file} — {FP_CHORE_ANNOTATION}",
+                description=(
+                    f"False-positive candidate (medium/low severity). "
+                    f"{code} in {file}:{finding.get('line', 0)} — "
+                    f"{e.get('justification', '')}. {FP_CHORE_ANNOTATION}."
+                ),
+                worklog_dir=worklog_dir,
+            )
+            if chore_id:
+                results["chore_items"].append({"id": chore_id})
+            else:
+                results["chore_failures"].append({
+                    "finding": finding,
+                    "error": "wl create failed",
+                })
+
+    # ── Fail-safe (F3 AC5) ────────────────────────────────────────────────
+    # A failed config-fix chore leaves the affected finding blocking
+    # 'genuine' (the commit stands, but the finding cannot be considered
+    # tracked/resolved) — never silently suppressed. Only entries still
+    # present after the re-scan are demoted; the failure itself is always
+    # recorded in the report.
+    failed_pairs = set()
+    for f in results["chore_failures"]:
+        if f.get("change"):
+            for part in f["change"].split("; "):
+                if " -> " in part:
+                    failed_pairs.add(part)
+    if failed_pairs:
+        for e in results["fp_screen_results"]:
+            finding = e.get("finding", {})
+            key = f"{finding.get('file', '')} -> {finding.get('code', '')}"
+            if key in failed_pairs and e.get("classification") != "genuine":
+                e["classification"] = "genuine"
+                e["remediable"] = False
+                e["chore_failed"] = True
+                e["justification"] = (
+                    f"{e.get('justification', '')} — chore tracking failed; "
+                    "finding remains blocking genuine"
+                ).strip(" —")
+    return results
+
+
+def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
+    """Phase 2 — fetch the item + children, capture the content fingerprint,
+    run the scoped code-quality scan, and extract the acceptance criteria.
+
+    Returns 1 when the ``wl show --children`` fetch fails (a minimal failure
+    report is emitted); None otherwise.
+    """
+    issue_id = ctx.issue_id
+    json_mode = ctx.json_mode
+    runner = ctx.runner
+    worklog_dir = ctx.worklog_dir
+
+    try:
+        data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError as exc:
+        ctx.record_script_failure("wl show", exc)
+        print(f"Warning: wl show failed: {exc}", file=sys.stderr)
+        # Build a minimal failure report
+        fail_notice = FailureNotice(
+            script_name="wl show",
+            reason=str(exc),
+            stderr_context=str(exc),
+        )
+        fail_report = fail_notice.wrap(
+            f"Could not fetch work item {issue_id}. "
+            "No audit report could be generated."
+        )
+        if json_mode:
+            payload = {"error": str(exc), "script_failure": {"script_name": "wl show", "reason": str(exc)}}
+            print(json.dumps(payload, indent=2))
+        else:
+            print(fail_report)
+        return 1
+
+    work_item = data.get("workItem", {})
+    children = data.get("children", [])
+    description = work_item.get("description", "")
+
+    # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT):
+    # git HEAD sha + work-item description hash + Key Files list. The
+    # fingerprint is embedded in the persisted report so a re-audit of an
+    # unchanged item skips the pipeline (content-based freshness gate).
+    # Fail-open: if the fingerprint cannot be computed (git unavailable,
+    # wl failure), the audit proceeds and simply stores no fingerprint.
+    content_fingerprint = _compute_content_fingerprint(
+        runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+    )
+
+    # ------------------------------------------------------------------
+    # Code quality check (before AC verification)
+    # ------------------------------------------------------------------
+    cq_findings: list[dict] = []
+    cq_fixes_applied: int = 0
+    cq_skipped_reason: str | None = None
+    try:
+        from skill.code_review.scripts.code_quality import run_code_quality
+        # Scoped, read-only code-quality scan (SA-0MSKB6VWU000RT58): the
+        # audit lints only the git changed-file list (already computed for
+        # the Phase 1/2 file-scope manifest) instead of the whole repo, and
+        # never mutates files (fix=False — audits are read-only). The
+        # changed-file list doubles as the scoping manifest, so no extra
+        # git scan is issued here.
+        cq_scope_files = _git_changed_files(runner)
+        cq_result = run_code_quality(
+            project_root=TARGET_PROJECT_ROOT, runner=runner, fix=False,
+            files=cq_scope_files or None,
+        )
+        if cq_result.get("success", False):
+            cq_findings = cq_result.get("findings", [])
+            cq_fixes_applied = cq_result.get("fixes_applied", 0)
+        else:
+            cq_skipped_reason = cq_result.get("error", "Code quality check failed")
+    except ImportError:
+        # code_quality module not available — skip gracefully
+        cq_skipped_reason = "code_quality module not available"
+    except Exception as exc:  # noqa: BLE001 -- code_quality module not available, skip gracefully
+        cq_skipped_reason = str(exc)
+
+    acs = _extract_acs(description)
+
+    # ------------------------------------------------------------------
+    # False-positive screen (SA-0MST01NPD007MYG4 / SA-0MST01O4G002VPBR):
+    # model-judged classification of ruff findings via a single batched Pi
+    # call, BEFORE the Phase-1 blocking check consumes cq_findings. The
+    # screen is skipped (zero Pi calls) when the scan yields no ruff
+    # findings; non-ruff findings are never sent to it. Classifications +
+    # justifications feed the Phase-1 blocking decision and the report.
+    # ------------------------------------------------------------------
+    try:
+        fp_screen_results = _screen_ruff_findings(
+            issue_id=issue_id,
+            findings=cq_findings,
+            pi_bin=ctx.pi_bin,
+            resolved_model=ctx.resolved_model,
+            debug_log=ctx.debug_log,
+            timeout=ctx.timeout,
+            ac_fallback_used=ctx.ac_fallback_used,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the screen must never crash the audit
+        ctx.record_script_failure("false-positive screen", exc)
+        print(
+            f"Warning: false-positive screen failed unexpectedly: {exc} — "
+            "all findings defaulted to uncertain (caution-first).",
+            file=sys.stderr,
+        )
+        ctx.ac_fallback_used.set()
+        entries, _ = _parse_fp_screen_response("", cq_findings)
+        # Consistent with _screen_ruff_findings: only ruff findings are
+        # ever screened; non-ruff findings are never classified.
+        fp_screen_results = [
+            e for e in entries if e.get("finding", {}).get("linter") == "ruff"
+        ]
+
+    # ------------------------------------------------------------------
+    # Config remediation loop (SA-0MST01OIN008MXYT / F2): confident-
+    # false-positive critical/high ruff findings get a MINIMAL per-file-
+    # ignores config edit, committed locally (no push), with the content
+    # fingerprint re-hashed and the scoped code-quality scan re-run ONLY
+    # (the pipeline is not restarted). Capped at N iterations; findings
+    # persisting past the cap stay blocking genuine with the exhaustion
+    # annotation. Uncertain findings never enter the loop.
+    # ------------------------------------------------------------------
+    remediation_results = _run_remediation_loop(
+        issue_id=issue_id,
+        cq_findings=cq_findings,
+        fp_screen_results=fp_screen_results,
+        runner=runner,
+        pi_bin=ctx.pi_bin,
+        resolved_model=ctx.resolved_model,
+        debug_log=ctx.debug_log,
+        timeout=ctx.timeout,
+        ac_fallback_used=ctx.ac_fallback_used,
+        project_root=TARGET_PROJECT_ROOT,
+        worklog_dir=worklog_dir,
+        work_item=work_item,
+        content_fingerprint=content_fingerprint,
+    )
+    cq_findings = remediation_results.get("cq_findings", cq_findings)
+    fp_screen_results = remediation_results.get(
+        "fp_screen_results", fp_screen_results
+    )
+    content_fingerprint = remediation_results.get(
+        "fingerprint_after", content_fingerprint
+    )
+
+    ctx.work_item = work_item
+    ctx.children = children
+    ctx.description = description
+    ctx.content_fingerprint = content_fingerprint
+    ctx.cq_findings = cq_findings
+    ctx.cq_fixes_applied = cq_fixes_applied
+    ctx.cq_skipped_reason = cq_skipped_reason
+    ctx.fp_screen_results = fp_screen_results
+    ctx.remediation_results = remediation_results
+    ctx.acs = acs
+    return None
+
+
+def _phase1_parent_screening(ctx: _AuditContext) -> None:
+    """Phase 3 — batched parent AC review via Pi (single call).
+
+    Fills ctx.ac_results with one verdict entry per AC; falls back to
+    'partial' diagnostics on unparseable/provider-error output (with
+    infra-failure provenance set on ctx.ac_fallback_used).
+    """
+    issue_id = ctx.issue_id
+    json_mode = ctx.json_mode
+    runner = ctx.runner
+    pi_bin = ctx.pi_bin
+    resolved_model = ctx.resolved_model
+    debug_log = ctx.debug_log
+    timeout = ctx.timeout
+    green_run_block = ctx.green_run_block
+    owning_root = ctx.owning_root
+    ac_fallback_used = ctx.ac_fallback_used
+    acs = ctx.acs
+    work_item = ctx.work_item
+    ac_results = ctx.ac_results
+
+    # Review parent ACs via Pi (batched into a single call for performance)
+    ac_results = []
+    if acs and acs[0] != "No acceptance criteria defined.":
+        ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
+        file_scope = _build_file_scope_manifest(work_item, [], runner=runner)
+        # Validate the FILE SCOPE manifest covers the item repository
+        # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
+        # (e.g. the audit skill's own tree) would emit misleading
+        # 'unmet' verdicts — abort with a scope error instead.
+        scope_error = _validate_file_scope_manifest(file_scope, owning_root)
+        if scope_error:
+            if json_mode:
+                print(json.dumps({"error": scope_error}, indent=2))
+            else:
+                print(f"Error: {scope_error}", file=sys.stderr)
+            return 1
+        prompt = (
+            f"[READ-ONLY AUDIT] You are performing a read-only audit. "
+            f"Do NOT close, modify, create, or delete any work items. "
+            f"Do NOT execute any wl, git, or other state-modifying commands. "
+            f"Return ONLY a structured JSON array.\n\n"
+            f"Review the following acceptance criteria against the codebase. "
+            f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
+            f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
+            f"(a one-line note with file:line reference).\n\n"
+            f"Evaluate criteria against user story intent and actual implementation quality, "
+            f"not just literal matching of the original specification. "
+            f"If a criterion has acceptable variance (implementation differs from original "
+            f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
+            f"Include justification in the evidence field.\n\n"
+            f"FILE SCOPE — Read ONLY the files listed in the manifest below. "
+            f"Do not explore the whole repository (no unbounded `find`, `grep -r`, "
+            f"or `ls -R` across the repo). If a criterion requires a file not listed "
+            f"here, state that in the evidence instead of searching for it.\n\n"
+            f"{file_scope}\n\n"
+            f"{_SCANNING_BLOCK}"
+            f"{green_run_block or ''}"
+            f"Criteria: {ac_list_json}"
+        )
+        try:
+            result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, enable_tools=True, timeout=timeout, ac_fallback_used=ac_fallback_used)
+        except RuntimeError as exc:
+            ctx.record_script_failure("pi (parent AC review)", exc)
+            print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
+            result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
+        # Parse the batched result - try to extract JSON array from text
+        # Use extracted_text (full response) instead of evidence (may be truncated)
+        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
+        batch = _extract_json_array(raw_text)
+        if batch is None:
+            # Fallback: try direct JSON parse
+            try:
+                batch = json.loads(raw_text)
+            except json.JSONDecodeError:
+                batch = []
+        if isinstance(batch, list) and batch and any(
+            isinstance(item, dict) and "index" in item for item in batch
+        ):
+            reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
+            for i, ac in enumerate(acs):
+                item = reviewed.get(i, {})
+                ac_results.append({
+                    "text": ac,
+                    "verdict": _normalize_verdict(item.get("verdict", "unmet")),
+                    "evidence": _evidence_text(item.get("evidence")),
+                })
+        else:
+            # Fallback: this path is reached when the Pi response was not a
+            # parseable JSON array. Print a warning, log raw output, and use
+            # 'partial' verdict with diagnostic evidence instead of silently
+            # falling back to 'unmet' with empty evidence.
+            # Infra-failure provenance (SA-0MSG9SLGI002OF7V): the batch
+            # JSON could not be parsed (unparseable output, provider error,
+            # or concurrency-limit timeout), so any 'No' derived from these
+            # verdicts must restore the pre-audit state rather than demote.
+            ac_fallback_used.set()
+            if result.get("_provider_error"):
+                print(
+                    "Warning: Pi provider error during AC evaluation — "
+                    "falling back to 'partial' verdict",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Warning: Unparseable Pi output for AC evaluation — "
+                    "falling back to 'partial' verdict",
+                    file=sys.stderr,
+                )
+            if debug_log:
+                try:
+                    target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, "parent_ac_fallback")
+                    _write_debug_log(target, {
+                        "issue_id": issue_id,
+                        "context": "parent_ac_fallback",
+                        "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
+                        "raw_text": raw_text,
+                        "result_verdict": result.get("verdict"),
+                        "result_evidence": result.get("evidence", "")[:500],
+                        "provider_error": result.get("_provider_error_message"),
+                    })
+                except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
+                    pass
+            # When batched parsing fails, the root-level verdict from Pi
+            # cannot be trusted to represent each AC individually. Override
+            # verdict to 'partial' but preserve any diagnostic evidence
+            # from the root-level result (e.g., a timeout message).
+            if result.get("_provider_error"):
+                # Provider errors are NOT model parse failures: surface the
+                # actual provider diagnostic so operators can distinguish a
+                # transient model outage from a genuine unparseable response.
+                provider_error = result.get("_provider_error_message", "unknown")
+                evidence = (
+                    f"Pi provider error: {provider_error} — "
+                    "criterion could not be evaluated."
+                )
+            else:
+                outer_evidence = _evidence_text(result.get("evidence"))
+                if outer_evidence:
+                    evidence = (
+                        f"Pi model output could not be parsed — raw output logged. "
+                        f"Root-level diagnostic: {outer_evidence[:500]}"
+                    )
+                else:
+                    evidence = "Pi model output could not be parsed — raw output logged"
+            for ac in acs:
+                ac_results.append({
+                    "text": ac,
+                    "verdict": "partial",
+                    "evidence": evidence,
+                })
+    else:
+        ac_results = [{"text": "No acceptance criteria defined.", "verdict": "met", "evidence": ""}]
+
+
+    ctx.ac_results = ac_results
+    ctx.ac_fallback_used = ac_fallback_used
+
+
+def _phase_children(ctx: _AuditContext) -> int | None:
+    """Phase 4 — child orchestration + Phase 2 gate.
+
+    Runs the ``--audit-children`` cascade or the parent-first pass-through
+    flow (including the auto-trigger loop and child persistence), then the
+    Phase 2 gate (blocked / no-AC / small-low-risk / full deep analysis).
+    Returns 1 when child persistence is fatal; None otherwise.
+    """
+    runner = ctx.runner
+    worklog_dir = ctx.worklog_dir
+    pi_bin = ctx.pi_bin
+    resolved_model = ctx.resolved_model
+    model_source = ctx.model_source
+    debug_log = ctx.debug_log
+    timeout = ctx.timeout
+    parent_timeout = ctx.parent_timeout
+    persist = ctx.persist
+    force = ctx.force
+    audit_children = ctx.audit_children
+    max_child_audits = ctx.max_child_audits
+    max_citations_per_ac = _resolve_max_citations_per_ac(
+        ctx.max_citations_per_ac
+    )
+    batch_phase2 = ctx.batch_phase2
+    green_run_block = ctx.green_run_block
+    owning_root = ctx.owning_root
+    ac_fallback_used = ctx.ac_fallback_used
+    run_tests = ctx.run_tests
+    acs = ctx.acs
+    work_item = ctx.work_item
+    children = ctx.children
+    cq_findings = ctx.cq_findings
+    ac_results = ctx.ac_results
+    child_results = ctx.child_results
+    # Pre-initialized so the try/finally sync never hits an unbound name on
+    # early-exit paths (e.g. the fatal child-persist return before the Phase 2
+    # gate assigns these). Both branches reassign them later.
+    phase2_completed = False
+    phase2_skip_note = None
+    child_persist_results = []
+
+    # Track elapsed time so we can skip remaining child audits if we
+    # approach the parent bash-tool timeout. This ensures a graceful
+    # degradation instead of a silent external kill. The default guard
+    # scales with the number of active children (see
+    # _default_parent_timeout) so multi-child parents get a realistic
+    # default budget; an explicit --parent-timeout / AUDIT_PARENT_TIMEOUT
+    # override replaces the computed value entirely. The guard itself is
+    # resolved below once active_children is known.
+    _audit_start = time.monotonic()
+
+    def _elapsed():
+        return time.monotonic() - _audit_start
+
+    try:
         # Review children (depth 1 only, ignore deleted)
         # Children with status=deleted (wl delete) or deletedBy (imported)
         # are excluded from active children so they don't block parent closure.
@@ -5588,7 +6785,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         #     (child_audit_ready=True) skip the screening call and reuse the AC
         #     verdicts persisted in their own audit report.
         #  2. Pending children are reviewed with bounded parallelism
-        #     (ThreadPoolExecutor capped by _resolve_phase2_parallelism()).
+        #     (ThreadPoolExecutor capped by _resolve_parallelism()).
         #  3. The auto-trigger loop below reuses these pre-computed verdicts
         #     instead of re-querying wl audit-show per child.
         #
@@ -5616,6 +6813,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     "id": child.get("id", ""),
                     "status": child.get("status", ""),
                     "stage": child.get("stage", ""),
+                    "effort": child.get("effort"),
+                    "risk": child.get("risk"),
                 }
                 # Skip remaining children if we're too close to the parent
                 # timeout (elapsed_guard). This prevents a silent external kill
@@ -5656,7 +6855,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
                 verdict, reason, audited_at = _get_child_audit_verdict(
                     runner, child["id"], worklog_dir=worklog_dir,
-                    force=force,
+                    force=force, child=child,
                 )
                 pre_verdicts[child["id"]] = (verdict, reason)
                 if verdict is not None:
@@ -5698,7 +6897,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                 _phase1_review_child_acs,
                                 ci, child,
                                 resolved_model, pi_bin, debug_log, timeout,
-                                runner, _record_script_failure,
+                                runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                             )
                             for ci, child in pending_children
@@ -5711,7 +6910,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         _ci, acs = _phase1_review_child_acs(
                             ci, child,
                             resolved_model, pi_bin, debug_log, timeout,
-                            runner, _record_script_failure,
+                            runner, ctx.record_script_failure,
                             ac_fallback_used=ac_fallback_used,
                         )
                         child_results[ci]["ac_results"] = acs
@@ -5751,6 +6950,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         # child is re-audited (LP-0MSQ32MF200675AR AC4).
                         fresh_report = None if force else _check_audit_freshness(
                             runner, child["id"], worklog_dir=worklog_dir,
+                            work_item=child,
                         )
                         if fresh_report is not None:
                             fresh_ready = _parse_ready_to_close(fresh_report)
@@ -5832,6 +7032,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                 # Re-check verdict after triggered audit
                                 verdict, reason, _audited_at = _get_child_audit_verdict(
                                     runner, child["id"], worklog_dir=worklog_dir,
+                                    child=child,
                                 )
                             except subprocess.TimeoutExpired:
                                 print(
@@ -5918,9 +7119,10 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # Phase 2 gate: check if Phase 1 automated screening has blocking issues
             # ------------------------------------------------------------------
             phase1_blocked, phase1_reason = _has_phase1_blocking_issues(
-                cq_findings, child_results
+                cq_findings, child_results, fp_screen_results=ctx.fp_screen_results
             )
             phase2_completed = False
+            phase2_skip_note = None
 
             if phase1_blocked:
                 # Phase 1 blocked → demote all "met" verdicts to "partial"
@@ -5940,6 +7142,50 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     "No acceptance criteria defined: skipping Phase 2 deep analysis.",
                     file=sys.stderr,
                 )
+            elif _is_low_risk_small(
+                work_item.get("effort"), work_item.get("risk")
+            ):
+                # Small effort + Low risk — skip Phase 2 per SA-0MSQ026T3009QY2L.
+                # Phase 1 verdicts stand unchanged; evidence notes the skip reason.
+                # Children are evaluated independently (AC3): qualifying
+                # children are dropped (and annotated) inside
+                # _run_phase2_deep_analysis; non-qualifying children still get
+                # deep analysis via skip_parent_deep=True.
+                print(
+                    f"Skipping Phase 2 deep analysis: "
+                    f"effort={work_item.get('effort')}, risk={work_item.get('risk')}. "
+                    f"Phase 1 verdicts stand unchanged.",
+                    file=sys.stderr,
+                )
+                ac_results = _annotate_skip_evidence(
+                    ac_results,
+                    f"Phase 2 deep analysis skipped (effort={work_item.get('effort')}, "
+                    f"risk={work_item.get('risk')}): small, low-risk item per "
+                    f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
+                )
+                phase2_skip_note = (
+                    f"small, low-risk item (effort={work_item.get('effort')}, "
+                    f"risk={work_item.get('risk')}) per SA-0MSQ026T3009QY2L"
+                )
+                ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
+                    work_item, ac_results, child_results,
+                    resolved_model=resolved_model,
+                    pi_bin=pi_bin,
+                    debug_log=debug_log,
+                    script_failure_callback=ctx.record_script_failure,
+                    timeout=timeout,
+                    runner=runner,
+                    batch_phase2=batch_phase2,
+                    worklog_dir=worklog_dir,
+                    ac_fallback_used=ac_fallback_used,
+                    green_run_block=green_run_block,
+                    skip_parent_deep=True,
+                    owning_root=owning_root,
+                    max_citations_per_ac=max_citations_per_ac,
+                )
+                # The parent's deep analysis definitively did not run — never
+                # report it as completed regardless of child outcomes.
+                phase2_completed = False
             else:
                 # Phase 1 passed → run Phase 2 deep code analysis
                 print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)
@@ -5948,7 +7194,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     resolved_model=resolved_model,
                     pi_bin=pi_bin,
                     debug_log=debug_log,
-                    script_failure_callback=_record_script_failure,
+                    script_failure_callback=ctx.record_script_failure,
                     timeout=timeout,
                     runner=runner,
                     batch_phase2=batch_phase2,
@@ -5956,6 +7202,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
                     owning_root=owning_root,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
         else:
             # ── PARENT-FIRST flow (default, SA-0MSKB6VJA005N43F) ──
@@ -5968,9 +7215,10 @@ def cmd_issue(issue_id: str, persist: bool = True,
             #     unrelated children are not audited
             # --audit-children (Feature 2) forces the full per-child flow.
             phase2_completed = False
-            has_blocking_cq = any(
-                f.get("severity") in ("critical", "high") for f in cq_findings
-            )
+            phase2_skip_note = None
+            has_blocking_cq = bool(_effective_blocking_findings(
+                cq_findings, ctx.fp_screen_results
+            ))
             # 1. Parent Phase 2 deep analysis FIRST (parent-only).
             if has_blocking_cq:
                 # Blocking CQ findings → demote met verdicts to partial and
@@ -5978,6 +7226,27 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 # already "Ready to close: No" via the CQ findings, so the
                 # parent deep call would only burn model latency).
                 ac_results = _demote_met_to_partial(ac_results)
+            elif _is_low_risk_small(
+                work_item.get("effort"), work_item.get("risk")
+            ):
+                # Small effort + Low risk — skip Phase 2 per SA-0MSQ026T3009QY2L.
+                # Phase 1 verdicts stand unchanged; evidence notes the skip reason.
+                print(
+                    f"Skipping Phase 2 deep analysis (parent-first): "
+                    f"effort={work_item.get('effort')}, risk={work_item.get('risk')}. "
+                    f"Phase 1 verdicts stand unchanged.",
+                    file=sys.stderr,
+                )
+                ac_results = _annotate_skip_evidence(
+                    ac_results,
+                    f"Phase 2 deep analysis skipped (effort={work_item.get('effort')}, "
+                    f"risk={work_item.get('risk')}): small, low-risk item per "
+                    f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
+                )
+                phase2_skip_note = (
+                    f"small, low-risk item (effort={work_item.get('effort')}, "
+                    f"risk={work_item.get('risk')}) per SA-0MSQ026T3009QY2L"
+                )
             elif acs and acs[0] != "No acceptance criteria defined.":
                 print(
                     "Phase 1 passed: running Phase 2 deep code analysis "
@@ -5989,7 +7258,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     resolved_model=resolved_model,
                     pi_bin=pi_bin,
                     debug_log=debug_log,
-                    script_failure_callback=_record_script_failure,
+                    script_failure_callback=ctx.record_script_failure,
                     timeout=timeout,
                     runner=runner,
                     batch_phase2=batch_phase2,
@@ -5997,6 +7266,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
                     owning_root=owning_root,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
 
             # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
@@ -6013,6 +7283,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     "id": child.get("id", ""),
                     "status": child.get("status", ""),
                     "stage": child.get("stage", ""),
+                    "effort": child.get("effort"),
+                    "risk": child.get("risk"),
                 }
                 if _elapsed() >= elapsed_guard:
                     cr["ac_results"] = [{
@@ -6044,6 +7316,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     # changed children are never silently inherited-passed).
                     if _child_content_changed(
                         runner, child["id"], worklog_dir=worklog_dir,
+                        work_item=child,
                     ):
                         cr["child_audit_ready"] = False
                         pending_children.append((len(child_results), child))
@@ -6089,7 +7362,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                 _phase1_review_child_acs,
                                 ci, child,
                                 resolved_model, pi_bin, debug_log, timeout,
-                                runner, _record_script_failure,
+                                runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                             )
                             for ci, child in pending_children
@@ -6102,7 +7375,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         _ci, acs = _phase1_review_child_acs(
                             ci, child,
                             resolved_model, pi_bin, debug_log, timeout,
-                            runner, _record_script_failure,
+                            runner, ctx.record_script_failure,
                             ac_fallback_used=ac_fallback_used,
                         )
                         child_results[ci]["ac_results"] = acs
@@ -6115,7 +7388,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     resolved_model=resolved_model,
                     pi_bin=pi_bin,
                     debug_log=debug_log,
-                    script_failure_callback=_record_script_failure,
+                    script_failure_callback=ctx.record_script_failure,
                     timeout=timeout,
                     runner=runner,
                     batch_phase2=batch_phase2,
@@ -6124,6 +7397,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     green_run_block=green_run_block,
                     skip_parent_deep=True,
                     owning_root=owning_root,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
 
             # 6. Persist child audits (inherited children are explicit in the
@@ -6182,6 +7456,50 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
 
         # ------------------------------------------------------------------
+    finally:
+        ctx.ac_results = ac_results
+        ctx.child_results = child_results
+        ctx.phase2_completed = phase2_completed
+        ctx.phase2_skip_note = phase2_skip_note
+        ctx.child_persist_results = child_persist_results
+    return None
+
+
+def _phase_report(ctx: _AuditContext) -> int:
+    """Phase 5 — quality epics, report assembly/output, persistence + readback.
+
+    Sets ctx.audit_verdict and ctx.audit_completed for the terminal
+    lifecycle. Returns the process exit code (0 on success, non-zero on
+    persistence/readback failure).
+    """
+    issue_id = ctx.issue_id
+    json_mode = ctx.json_mode
+    runner = ctx.runner
+    worklog_dir = ctx.worklog_dir
+    pi_bin = ctx.pi_bin
+    resolved_model = ctx.resolved_model
+    model_source = ctx.model_source
+    debug_log = ctx.debug_log
+    timeout = ctx.timeout
+    persist = ctx.persist
+    ac_fallback_used = ctx.ac_fallback_used
+    work_item = ctx.work_item
+    cq_findings = ctx.cq_findings
+    cq_fixes_applied = ctx.cq_fixes_applied
+    cq_skipped_reason = ctx.cq_skipped_reason
+    ac_results = ctx.ac_results
+    child_results = ctx.child_results
+    phase2_completed = ctx.phase2_completed
+    phase2_skip_note = ctx.phase2_skip_note
+    green_run_sha = ctx.green_run_sha
+    auto_green_run_sha = ctx.auto_green_run_sha
+    test_skill_run_sha = ctx.test_skill_run_sha
+    content_fingerprint = ctx.content_fingerprint
+    child_persist_results = ctx.child_persist_results
+    audit_verdict = ctx.audit_verdict
+    audit_completed = ctx.audit_completed
+
+    try:
         # Create quality epics for findings (before report assembly)
         # ------------------------------------------------------------------
         if cq_findings:
@@ -6204,20 +7522,23 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 code_quality_findings=cq_findings,
                 code_quality_fixes_applied=cq_fixes_applied,
                 code_quality_skipped_reason=cq_skipped_reason,
+                fp_screen_results=ctx.fp_screen_results,
+                remediation_results=ctx.remediation_results,
                 model=resolved_model,
                 model_source=model_source,
                 phase2_completed=phase2_completed,
+                phase2_skip_note=phase2_skip_note,
                 green_run_sha=green_run_sha,
                 auto_green_run_sha=auto_green_run_sha,
                 test_skill_run_sha=test_skill_run_sha,
                 content_fingerprint=content_fingerprint,
             )
             # Wrap report with failure notice if any subprocess calls failed
-            if script_failure:
+            if ctx.script_failure:
                 notice = FailureNotice(
-                    script_name=script_failure["script_name"],
-                    reason=script_failure["reason"],
-                    stderr_context=script_failure["stderr"],
+                    script_name=ctx.script_failure["script_name"],
+                    reason=ctx.script_failure["reason"],
+                    stderr_context=ctx.script_failure["stderr"],
                 )
                 assembled = notice.wrap(assembled)
             return assembled
@@ -6234,15 +7555,18 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 work_item, ac_results, child_results,
                 code_quality_findings=cq_findings,
                 code_quality_fixes_applied=cq_fixes_applied,
+                fp_screen_results=ctx.fp_screen_results,
+                remediation_results=ctx.remediation_results,
                 phase2_completed=phase2_completed,
+                phase2_skip_note=phase2_skip_note,
             )
             payload["child_persist_results"] = child_persist_results
             # Include script failure info in JSON output
-            if script_failure:
+            if ctx.script_failure:
                 payload["script_failure"] = {
-                    "script_name": script_failure["script_name"],
-                    "reason": script_failure["reason"],
-                    "stderr": script_failure.get("stderr", ""),
+                    "script_name": ctx.script_failure["script_name"],
+                    "reason": ctx.script_failure["reason"],
+                    "stderr": ctx.script_failure.get("stderr", ""),
                 }
             print(json.dumps(payload, indent=2))
         else:
@@ -6348,153 +7672,315 @@ def cmd_issue(issue_id: str, persist: bool = True,
         audit_completed = True
         return 0
 
+    finally:
+        ctx.ac_results = ac_results
+        ctx.audit_verdict = audit_verdict
+        ctx.audit_completed = audit_completed
+
+
+def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
+    """Phase 6 — verdict-driven terminal status transition + debug-log cleanup.
+
+    Always runs (cmd_issue's finally): the item is never left in_progress.
+    Restores the pre-audit state on failure/fallback-tainted runs; advances
+    to completed/in_review only on a genuine 'Ready to close: Yes' verdict.
+    """
+    # ------------------------------------------------------------------
+    # Status lifecycle: verdict-driven terminal transition on exit.
+    # Always runs because of try/finally — the item is never left
+    # in_progress after the audit completes.
+    #
+    #   Ready to close: Yes → completed / in_review (stage kept 'done')
+    #       — even when AC evidence was fallback-tainted (WL-0MSN7XAUS008WOPQ):
+    #       a fallback (e.g. a read-only test skip) does not invalidate an
+    #       explicit model 'Yes' verdict; the report is complete/persisted.
+    #   Ready to close: No  → open / plan_complete (only when the "No" is
+    #       a genuine explicit model verdict with parseable AC evidence)
+    #   Failure / timeout / unparseable verdict (infrastructure failure) →
+    #       restore the captured pre-audit status+stage (fall back to
+    #       open/plan_complete only when the original is unknowable) +
+    #       assignee cleared so the item stays observable for a re-audit.
+    #       An in_review item that hit a model timeout stays in_review —
+    #       only an explicit No verdict demotes an item to open.
+    #   Infra-failure fallback "No" (SA-0MSG9SLGI002OF7V): a "No"
+    #       verdict produced solely from AC verdicts degraded to partial
+    #       by infrastructure failure (concurrency limit, provider error,
+    #       unparseable output, Phase-2 timeout) is NOT an explicit model
+    #       assessment — it takes the restore branch. The flag is set at
+    #       every fallback site; an evidence-marker backstop defends
+    #       against future fallback sites that forget to set it. The flag
+    #       only forces restore for a "No" verdict — a completed "Yes"
+    #       run advances regardless (WL-0MSN7XAUS008WOPQ). If a completed
+    #       "Yes" run ever takes the restore path (script failure while
+    #       the report still parsed a Yes verdict), a visible warning is
+    #       printed — never a silent divergence.
+    #
+    # The transition is retried on transient wl failures so a single
+    # hiccup never leaves the item stuck in_progress; if it still fails a
+    # visible warning is printed (SA-0MSAL2NQV0008HY5) instead of being
+    # silently swallowed — a stuck in_progress child breaks the release
+    # close step.
+    # ------------------------------------------------------------------
+    # Compute the intended terminal state first (no wl calls), so the
+    # failure warning can tell the operator exactly what to apply.
+    restore_cmd: list[str] | None = None
+    # Conservative default: on any computation failure below, treat the
+    # run as fallback-tainted so the debug log is retained for forensics.
+    fallback_tainted = True
+    try:
+        # Infra-fallback provenance: a "No" derived from infrastructure-
+        # failure fallbacks must restore, never demote. The flag does NOT
+        # block a completed "Yes" advance (WL-0MSN7XAUS008WOPQ) — a
+        # fallback on some AC evidence (e.g. a read-only test skip with a
+        # variance note) leaves the overall 'Ready to close: Yes' verdict
+        # trustworthy, so the item still moves to the review queue.
+        fallback_tainted = ctx.ac_fallback_used.is_set()
+        if ctx.audit_verdict == "no" and not fallback_tainted:
+            # Evidence-marker backstop: if any AC evidence carries a known
+            # infra-failure diagnostic, treat the "No" as fallback-tainted
+            # even if a future fallback site forgot to set the flag.
+            fallback_tainted = _evidence_has_infra_failure_markers(
+                ctx.ac_results, ctx.child_results,
+            )
+        if (ctx.script_failure is not None or not ctx.audit_completed
+                or ctx.audit_verdict is None
+                or (ctx.audit_verdict == "no" and fallback_tainted)):
+            # Infrastructure failure / unparseable verdict: restore the
+            # pre-audit state captured on entry (status + stage). A
+            # transient failure (model timeout, provider error, wl hiccup)
+            # must never demote the item — an in_review item re-audited
+            # during a timeout stays in_review for a re-run. Only an
+            # explicit 'Ready to close: No' verdict moves an item to open
+            # (SA-0MSF5PG1Y005P3AR). Falls back to open/plan_complete only
+            # when the original state could not be determined (capture
+            # failed / unknown). The assignee is cleared so the item stays
+            # observable in the actionable queue for a re-audit.
+            safe_status = ctx.original_status
+            safe_stage = ctx.original_stage
+            if not safe_stage:
+                # Stage unknown (capture failed): pick a stage valid for
+                # the restored status so wl never rejects the combo.
+                safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+            if ctx.audit_completed and ctx.audit_verdict == "yes":
+                # Never silently diverge (WL-0MSN7XAUS008WOPQ AC4): a
+                # completed run whose report parsed 'Ready to close: Yes'
+                # is being restored (script failure during the run). The
+                # persisted report claims closure-ready while the item
+                # stays in its pre-audit state — surface that loudly so
+                # the operator can review and advance manually if right.
+                print(
+                    f"Warning: audit for {ctx.issue_id} returned 'Ready to "
+                    f"close: Yes' but the item was restored to its pre-audit "
+                    f"state ({safe_status}/{safe_stage}) because of an "
+                    "infrastructure failure during the run; review the "
+                    "persisted report and advance the item manually if "
+                    "appropriate.",
+                    file=sys.stderr,
+                )
+            restore_cmd = [
+                "wl", "update", ctx.issue_id,
+                "--status", safe_status,
+                "--stage", safe_stage,
+                "--assignee", "",
+                "--json",
+            ]
+        elif ctx.audit_verdict == "yes":
+            # Advance to the review queue. Keep a terminal 'done' stage.
+            if ctx.original_stage == "done":
+                restore_cmd = ["wl", "update", ctx.issue_id, "--status", "completed", "--json"]
+            else:
+                restore_cmd = ["wl", "update", ctx.issue_id, "--status", "completed", "--stage", "in_review", "--json"]
+        else:  # ctx.audit_verdict == "no"
+            # Return to the actionable queue at a fixed pre-review stage.
+            restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
+    except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
+        print(
+            f"Warning: could not compute terminal status for {ctx.issue_id}: {exc}",
+            file=sys.stderr,
+        )
+
+    # ------------------------------------------------------------------
+    # Debug-log lifecycle: a successful audit run removes its debug file
+    # (including explicit --debug-log runs); failed or fallback-tainted
+    # runs retain full-content files for forensics (SA-0MSBSOAEM0078LAO
+    # AC3). A parse-failure/provider-error fallback keeps the file even
+    # though the run completed, because the raw output is the only
+    # forensic record of the failed evaluation.
+    # ------------------------------------------------------------------
+    if ctx.audit_completed and ctx.script_failure is None and not fallback_tainted:
+        _remove_debug_log(ctx.debug_log, ctx.issue_id)
+
+    if restore_cmd is not None:
+        # Apply the terminal transition, retrying transient failures. The
+        # update is idempotent, so retrying after a partially-applied
+        # update is harmless.
+        last_error: Exception | None = None
+        for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
+            try:
+                _run_wl(ctx.runner, restore_cmd, worklog_dir=ctx.worklog_dir)
+                last_error = None
+                break
+            except RuntimeError as exc:
+                last_error = exc
+                if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
+                    time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
+
+        if last_error is not None:
+            # Best-effort readback so the operator knows the item's actual
+            # state (the update may have applied but the response was lost).
+            actual_status = "unknown"
+            try:
+                rb = _run_wl(ctx.runner, ["wl", "show", ctx.issue_id, "--json"],
+                             worklog_dir=ctx.worklog_dir)
+                wi = rb.get("workItem") if isinstance(rb, dict) else None
+                if isinstance(wi, dict):
+                    actual_status = wi.get("status", "unknown")
+            except RuntimeError:
+                pass
+            print(
+                f"Warning: Failed to restore work item {ctx.issue_id} status after "
+                f"audit ({last_error}); item status is '{actual_status}'. "
+                f"If it was left in_progress, recover it manually, e.g. "
+                f"`wl update {ctx.issue_id} --status <terminal-status> --stage <stage>`.",
+                file=sys.stderr,
+            )
+
+
+def cmd_issue(issue_id: str, persist: bool = True,
+              timeout: int | None = None,
+              parent_timeout: int | None = None,
+              pi_bin: str = "pi", model: str | None = None,
+              model_source: str = DEFAULT_MODEL_SOURCE,
+              runner: Runner | None = None, json_mode: bool = False,
+              debug_log: str | None = None,
+              force: bool = False,
+              worklog_dir: str | None = None,
+              batch_phase2: bool = False,
+              green_run: str | None = None,
+              audit_children: bool = False,
+              max_child_audits: int | None = None,
+              run_tests: bool = False,
+              no_execute: bool = False,
+              max_citations_per_ac: int | None = None) -> int:
+    """Audit a single work item.
+
+    The resolved model name and source are included as a metadata line
+    in the audit report output (issue-level and child reports).
+
+    Model resolution order (highest first):
+      1. --model CLI flag (explicit override)
+      2. Config-driven: model.audit from .ralph.json resolved via model_source
+      3. Hardcoded fallback: DEFAULT_MODEL
+
+    When *force* is ``True``, the freshness gate is bypassed and a full
+    audit pipeline is always run, even if a recent audit already exists.
+
+    *audit_children* enables the recursive child-audit cascade: when a child
+    has no fresh audit, the runner auto-triggers a full child audit instead
+    of leaving the child not-ready (SA-0MSKB6V5Q007YDHE). The cascade is
+    OPT-IN — the default is no cascade. Children with unchanged content are
+    skipped via the Feature 1 content-based freshness gate rather than
+    re-audited.
+
+    *max_child_audits* bounds the number of child audits a single run may
+    auto-trigger (default: ``AUDIT_MAX_CHILD_AUDITS`` env or
+    ``_DEFAULT_MAX_CHILD_AUDITS``).
+
+    *max_citations_per_ac* bounds the file:line evidence citations per AC in
+    the Phase 2 deep prompts (default: resolved via
+    ``_resolve_max_citations_per_ac`` — ``--max-citations-per-ac`` CLI flag
+    > ``audit.max_citations_per_ac`` CWD config key > 5). Prompt-level only
+    (LP-0MSQ32WM5000NCB7).
+
+    *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
+    auto-resolution for every wl call made by this run (see
+    ``_resolve_worklog_flags``).
+
+    *green_run* is the operator-attested green test run value (an exact
+    commit sha or the alias ``HEAD``; resolution precedence flag > env
+    ``AUDIT_GREEN_RUN`` > unset). When the value matches the audited HEAD,
+    the GREEN-RUN attestation block is injected into the Phase 1 parent
+    prompt and all Phase 2 prompts, and the attested sha is recorded in the
+    persisted report. A mismatched or unverifiable value prints a clear
+    error and the run proceeds WITHOUT the attestation (execution-dependent
+    ACs stay partial) — never silently accepted.
+
+    When no operator attestation is present, the runner attempts the
+    automatic full-suite verification path (SA-0MSIU5HFI0024D7W): a green
+    full-suite run is looked up READ-ONLY in the per-repo test cache
+    (``query_cached`` — never executes) and, if found at the audited git
+    state within the cache TTL, an AUTO-VERIFIED block is injected and the
+    sha recorded as ``Automatic green run evidence``. Any miss, non-zero
+    run, or cache error yields no evidence (fail-closed); the operator path
+    takes precedence when both are available.
+
+    *run_tests* (``--run-tests``, OFF by default) extends the automatic path
+    (SA-0MSJELSWS002UF60): when no operator attestation exists AND the
+    read-only cache holds no green full-suite run at the audited state, the
+    runner invokes the test skill (``run_tests.py`` machinery) to EXECUTE
+    the full project test suite in quiet mode, triage failures per the test
+    skill, and refresh the per-repo cache. When the executed run is green, a
+    TEST-SKILL RUN block is injected (the model MAY mark execution-dependent
+    criteria met) and the sha recorded as ``Test skill run evidence``. This
+    is an explicit, operator-authorized deviation from the audit's read-only
+    mandate — environments that forbid test execution during audits simply
+    omit the flag and behavior is unchanged (execution-dependent ACs stay
+    partial with the operator instruction). A non-green executed run yields
+    no evidence (fail-closed).
+
+    For each active child (not completed/done), the child's persisted audit
+    verdict is checked via ``wl audit-show``. If no audit exists or the audit
+    is stale, an audit is auto-triggered for that child (via the same audit
+    runner mechanism) and the resulting verdict is evaluated. A child whose
+    audit says "Ready to close: No" prevents the parent from being ready to
+    close. This check is performed before Phase 1 screening so that Phase 1
+    can block on children not individually ready.
+
+    Default orchestration is parent-first (SA-0MSKB6VJA005N43F): the parent
+    is fully audited first (Phase 1 parent ACs + Phase 2 deep analysis) with
+    no child screening; then the parent verdict drives the child pass-through
+    (all children inherit passed when the parent has no gaps; only gap-mapped
+    children are audited when it does). ``--audit-children`` forces the full
+    per-child flow described above (explicit override).
+    """
+
+    ctx = _AuditContext(
+        issue_id=issue_id, persist=persist, timeout=timeout,
+        parent_timeout=parent_timeout, pi_bin=pi_bin, model=model,
+        model_source=model_source, runner=runner or _default_runner,
+        json_mode=json_mode, debug_log=debug_log, force=force,
+        worklog_dir=worklog_dir, batch_phase2=batch_phase2,
+        green_run=green_run, audit_children=audit_children,
+        max_child_audits=max_child_audits, run_tests=run_tests,
+        no_execute=no_execute,
+        max_citations_per_ac=max_citations_per_ac,
+    )
+    rc = _phase_gate(ctx)
+    if rc is not None:
+        return rc
+
+    try:
+        rc = _phase_fetch_and_cq(ctx)
+        if rc is not None:
+            return rc
+        _phase1_parent_screening(ctx)
+        rc = _phase_children(ctx)
+        if rc is not None:
+            return rc
+        return _phase_report(ctx)
     except AuditScopeError as exc:
         # Scope error (LP-0MSQ32HNR007AI6B): the Phase 2 FILE SCOPE
         # manifest does not cover the item repository. Fail loudly with a
         # non-zero exit; the finally block restores the pre-audit status.
-        if json_mode:
+        if ctx.json_mode:
             print(json.dumps({"error": str(exc)}, indent=2))
         else:
             print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     finally:
-        # ------------------------------------------------------------------
-        # Status lifecycle: verdict-driven terminal transition on exit.
-        # Always runs because of try/finally — the item is never left
-        # in_progress after the audit completes.
-        #
-        #   Ready to close: Yes → completed / in_review (stage kept 'done')
-        #   Ready to close: No  → open / plan_complete (only when the "No" is
-        #       a genuine explicit model verdict with parseable AC evidence)
-        #   Failure / timeout / unparseable verdict (infrastructure failure) →
-        #       restore the captured pre-audit status+stage (fall back to
-        #       open/plan_complete only when the original is unknowable) +
-        #       assignee cleared so the item stays observable for a re-audit.
-        #       An in_review item that hit a model timeout stays in_review —
-        #       only an explicit No verdict demotes an item to open.
-        #   Infra-failure fallback "No" (SA-0MSG9SLGI002OF7V): a "No"
-        #       verdict produced solely from AC verdicts degraded to partial
-        #       by infrastructure failure (concurrency limit, provider error,
-        #       unparseable output, Phase-2 timeout) is NOT an explicit model
-        #       assessment — it takes the restore branch. The flag is set at
-        #       every fallback site; an evidence-marker backstop defends
-        #       against future fallback sites that forget to set it.
-        #
-        # The transition is retried on transient wl failures so a single
-        # hiccup never leaves the item stuck in_progress; if it still fails a
-        # visible warning is printed (SA-0MSAL2NQV0008HY5) instead of being
-        # silently swallowed — a stuck in_progress child breaks the release
-        # close step.
-        # ------------------------------------------------------------------
-        # Compute the intended terminal state first (no wl calls), so the
-        # failure warning can tell the operator exactly what to apply.
-        restore_cmd: list[str] | None = None
-        # Conservative default: on any computation failure below, treat the
-        # run as fallback-tainted so the debug log is retained for forensics.
-        fallback_tainted = True
-        try:
-            # Infra-fallback provenance: a "No" derived from infrastructure-
-            # failure fallbacks must restore, never demote. A "Yes" verdict
-            # with the flag set also restores (conservative — a fallback
-            # implies the assessment is incomplete).
-            fallback_tainted = ac_fallback_used.is_set()
-            if audit_verdict == "no" and not fallback_tainted:
-                # Evidence-marker backstop: if any AC evidence carries a known
-                # infra-failure diagnostic, treat the "No" as fallback-tainted
-                # even if a future fallback site forgot to set the flag.
-                fallback_tainted = _evidence_has_infra_failure_markers(
-                    ac_results, child_results,
-                )
-            if script_failure is not None or not audit_completed or audit_verdict is None or fallback_tainted:
-                # Infrastructure failure / unparseable verdict: restore the
-                # pre-audit state captured on entry (status + stage). A
-                # transient failure (model timeout, provider error, wl hiccup)
-                # must never demote the item — an in_review item re-audited
-                # during a timeout stays in_review for a re-run. Only an
-                # explicit 'Ready to close: No' verdict moves an item to open
-                # (SA-0MSF5PG1Y005P3AR). Falls back to open/plan_complete only
-                # when the original state could not be determined (capture
-                # failed / unknown). The assignee is cleared so the item stays
-                # observable in the actionable queue for a re-audit.
-                safe_status = original_status
-                safe_stage = original_stage
-                if not safe_stage:
-                    # Stage unknown (capture failed): pick a stage valid for
-                    # the restored status so wl never rejects the combo.
-                    safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
-                restore_cmd = [
-                    "wl", "update", issue_id,
-                    "--status", safe_status,
-                    "--stage", safe_stage,
-                    "--assignee", "",
-                    "--json",
-                ]
-            elif audit_verdict == "yes":
-                # Advance to the review queue. Keep a terminal 'done' stage.
-                if original_stage == "done":
-                    restore_cmd = ["wl", "update", issue_id, "--status", "completed", "--json"]
-                else:
-                    restore_cmd = ["wl", "update", issue_id, "--status", "completed", "--stage", "in_review", "--json"]
-            else:  # audit_verdict == "no"
-                # Return to the actionable queue at a fixed pre-review stage.
-                restore_cmd = ["wl", "update", issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
-        except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
-            print(
-                f"Warning: could not compute terminal status for {issue_id}: {exc}",
-                file=sys.stderr,
-            )
+        _apply_terminal_lifecycle(ctx)
 
-        # ------------------------------------------------------------------
-        # Debug-log lifecycle: a successful audit run removes its debug file
-        # (including explicit --debug-log runs); failed or fallback-tainted
-        # runs retain full-content files for forensics (SA-0MSBSOAEM0078LAO
-        # AC3). A parse-failure/provider-error fallback keeps the file even
-        # though the run completed, because the raw output is the only
-        # forensic record of the failed evaluation.
-        # ------------------------------------------------------------------
-        if audit_completed and script_failure is None and not fallback_tainted:
-            _remove_debug_log(debug_log, issue_id)
-
-        if restore_cmd is not None:
-            # Apply the terminal transition, retrying transient failures. The
-            # update is idempotent, so retrying after a partially-applied
-            # update is harmless.
-            last_error: Exception | None = None
-            for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
-                try:
-                    _run_wl(runner, restore_cmd, worklog_dir=worklog_dir)
-                    last_error = None
-                    break
-                except RuntimeError as exc:
-                    last_error = exc
-                    if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
-                        time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
-
-            if last_error is not None:
-                # Best-effort readback so the operator knows the item's actual
-                # state (the update may have applied but the response was lost).
-                actual_status = "unknown"
-                try:
-                    rb = _run_wl(runner, ["wl", "show", issue_id, "--json"],
-                                 worklog_dir=worklog_dir)
-                    wi = rb.get("workItem") if isinstance(rb, dict) else None
-                    if isinstance(wi, dict):
-                        actual_status = wi.get("status", "unknown")
-                except RuntimeError:
-                    pass
-                print(
-                    f"Warning: Failed to restore work item {issue_id} status after "
-                    f"audit ({last_error}); item status is '{actual_status}'. "
-                    f"If it was left in_progress, recover it manually, e.g. "
-                    f"`wl update {issue_id} --status <terminal-status> --stage <stage>`.",
-                    file=sys.stderr,
-                )
-
-
-# ---------------------------------------------------------------------------
-# Subcommand: project
-# ---------------------------------------------------------------------------
 
 def _build_project_json(summary: str, recommendation: str) -> dict:
     """Build structured JSON payload for project-mode audit."""
@@ -6510,7 +7996,8 @@ def cmd_project(timeout: int | None = None,
                 model_source: str = DEFAULT_MODEL_SOURCE,
                 runner: Runner | None = None, json_mode: bool = False,
                 debug_log: str | None = None,
-                worklog_dir: str | None = None) -> int:
+                worklog_dir: str | None = None,
+                max_citations_per_ac: int | None = None) -> int:
     """Audit the overall project.
 
     Model resolution order (highest first):
@@ -6521,6 +8008,11 @@ def cmd_project(timeout: int | None = None,
     *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
     auto-resolution for every wl call made by this run (see
     ``_resolve_worklog_flags``).
+
+    *max_citations_per_ac* is accepted for CLI parity with the issue
+    subcommand; project-level audits do not run Phase 2 deep analysis, so
+    the cap is validated upstream in ``main()`` and unused here
+    (LP-0MSQ32WM5000NCB7).
     """
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -6535,19 +8027,16 @@ def cmd_project(timeout: int | None = None,
     script_failure: dict | None = None
 
     def _record_script_failure(script_name: str, exc: Exception) -> None:
+        """Record a script execution failure into the enclosing scope.
+
+        Only records the first failure; subsequent failures are suppressed
+        to avoid overwriting the root cause. The failure record itself is
+        built by the shared :func:`_format_script_failure`.
+        """
         nonlocal script_failure
         if script_failure is not None:
             return
-        reason = str(exc)
-        if isinstance(exc, subprocess.TimeoutExpired):
-            reason = f"Timeout after {exc.timeout}s"
-        elif isinstance(exc, FileNotFoundError):
-            reason = f"File not found: {exc.filename}"
-        script_failure = {
-            "script_name": script_name,
-            "reason": reason,
-            "stderr": str(exc),
-        }
+        script_failure = _format_script_failure(script_name, exc)
 
     try:
         # Scoped status queries only (SA-0MSLVQMKF000ESPZ): the project audit
@@ -6748,6 +8237,13 @@ def build_parser() -> argparse.ArgumentParser:
                              f"(default: {AUDIT_MAX_CHILD_AUDITS_ENV} env or "
                              f"{_DEFAULT_MAX_CHILD_AUDITS})"
                          ))
+    p_issue.add_argument("--max-citations-per-ac", type=int, default=None,
+                         help=(
+                             "Max file:line evidence citations per criterion in the "
+                             "Phase 2 deep-analysis prompts "
+                             f"(default: audit.max_citations_per_ac config key or "
+                             f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
+                         ))
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_issue.add_argument("--max-concurrency", type=int, default=None,
@@ -6768,11 +8264,24 @@ def build_parser() -> argparse.ArgumentParser:
                              "(/skill:test / run_tests.py) when execution-dependent "
                              "acceptance criteria are present and no cached green "
                              "full-suite run exists, then auto-verify those criteria "
-                             "from the executed green run. OFF by default: the audit "
-                             "is otherwise strictly read-only and never executes the "
-                             "suite (environments that forbid test execution during "
-                             "audits are unaffected). Failures are triaged per the "
-                             "test skill (critical test-failure work items)."
+                             "from the executed green run. Note: since F3 "
+                             "(SA-0MSTN5KRF0097TVP) the runner AUTO-EXECUTES on a "
+                             "cache miss by default, so this flag is now a no-op on "
+                             "the miss path; it remains the explicit override that "
+                             "executes even on red/error/empty cache states and is "
+                             "overridden by --no-execute / AUDIT_NO_EXECUTE=1. "
+                             "Failures are triaged per the test skill (critical "
+                             "test-failure work items)."
+                         ))
+    p_issue.add_argument("--no-execute", action="store_true",
+                         help=(
+                             "Opt out of automatic suite execution on a cache miss "
+                             "(F3, SA-0MSTN5KRF0097TVP): the audit proceeds fail-open "
+                             "partial — execution-dependent acceptance criteria stay "
+                             "partial with a documented reason, and the suite is never "
+                             "executed. Env: AUDIT_NO_EXECUTE=1. Without this flag the "
+                             "runner auto-executes the repo's actual suite on a miss "
+                             "via the test skill."
                          ))
 
     p_project = sub.add_parser("project", help="Audit the overall project")
@@ -6792,6 +8301,13 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_project.add_argument("--max-concurrency", type=int, default=None,
                            help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
+    p_project.add_argument("--max-citations-per-ac", type=int, default=None,
+                           help=(
+                               "Accepted for CLI parity with the issue subcommand; "
+                               "project-level audits do not run Phase 2 deep analysis "
+                               f"(default: audit.max_citations_per_ac config key or "
+                               f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
+                           ))
 
     return p
 
@@ -6817,6 +8333,12 @@ def main(argv: list[str] | None = None) -> int:
     if child_screen_timeout is not None:
         os.environ[AUDIT_CHILD_SCREEN_TIMEOUT_ENV] = str(child_screen_timeout)
 
+    # Detect proxy 'cheap' mode before any pi call and serialize this run's
+    # parallelism (AUDIT_PARALLELISM=1 + AUDIT_MAX_CONCURRENCY=1) so the
+    # audit does not race the proxy's single-slot pool (SA-0MSN04X2S006ONH0).
+    # Fail-open: a failed query or any other mode leaves settings unchanged.
+    _apply_proxy_mode_serialization()
+
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
                          timeout=_resolve_effective_timeout(args.timeout),
@@ -6832,13 +8354,20 @@ def main(argv: list[str] | None = None) -> int:
                          max_child_audits=_resolve_max_child_audits(
                              args.max_child_audits
                          ),
-                         run_tests=args.run_tests)
+                         max_citations_per_ac=_resolve_max_citations_per_ac(
+                             args.max_citations_per_ac
+                         ),
+                         run_tests=args.run_tests,
+                         no_execute=getattr(args, "no_execute", False))
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,
                            model_source=args.model_source, json_mode=args.json,
                            debug_log=args.debug_log,
-                           worklog_dir=args.worklog_dir)
+                           worklog_dir=args.worklog_dir,
+                           max_citations_per_ac=_resolve_max_citations_per_ac(
+                               args.max_citations_per_ac
+                           ))
 
     return 2
 

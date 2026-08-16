@@ -68,3 +68,32 @@ The following skills use `FailureNotice` to surface script execution failures:
 - `skill/triage/scripts/check_or_create.py`
 - `skill/refactor/scripts/refactor.py`
 
+
+## `pi_utils.py`
+
+Shared Pi JSON-stream parsing utilities for skills that invoke `pi -p --mode json`
+non-interactively. Canonical home for the parser (previously duplicated in
+`skill/audit/scripts/audit_runner.py`).
+
+### Usage
+
+```python
+from skill.scripts.pi_utils import extract_pi_text
+
+raw = subprocess.run(..., capture_output=True).stdout
+text = extract_pi_text(raw)
+```
+
+### Behavior
+
+- `parse_pi_json_line(line)` parses one JSON-stream line into
+  `(stream_text, should_print, complete_text)`.
+- `extract_pi_text(raw)` assembles the final user-facing text, preferring
+  complete blocks (`text_end`, `agent_end`) over accumulated deltas.
+- User-role `message_start` events (the prompt echo) are skipped so a
+  mid-stream model error never yields the prompt as extracted output.
+
+### Consumers
+
+- `skill/audit/scripts/audit_runner.py`
+- `skill/audit/audit_pr.py`

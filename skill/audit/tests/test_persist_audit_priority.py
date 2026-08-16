@@ -39,6 +39,20 @@ def _proc(returncode: int = 0, stdout: str = "", stderr: str = "") -> SimpleName
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _strip_worklog_flags(cmd: list[str]) -> list[str]:
+    """Drop an injected ``--worklog-dir <value>`` pair (position 1).
+
+    Since SA-0MSKQERKH002IBLG every wl command built by persist_audit
+    carries the resolved ``--worklog-dir`` flag (from the shared
+    prefix-to-sibling scan / cwd-chain); assertions on the wl subcommand
+    tokens must ignore it.
+    """
+    cmd = list(cmd)
+    if len(cmd) >= 3 and cmd[1] == "--worklog-dir":
+        del cmd[1:3]
+    return cmd
+
+
 def _make_priority_runner(recorded: list[list[str]], priority: str = "critical",
                           show_rc: int = 0, prio_update_rc: int = 0):
     """Build a recording runner simulating wl calls made by persist_audit.
@@ -96,8 +110,8 @@ class TestLowerCriticalPriorityWhenReadyToClose:
         assert rc == 0
         prio_calls = [c for c in calls if "--priority" in c]
         assert len(prio_calls) == 1
-        assert prio_calls[0][:4] == ["wl", "update", "SA-TEST", "--priority"]
-        assert prio_calls[0][4] == "high"
+        assert _strip_worklog_flags(prio_calls[0])[:4] == ["wl", "update", "SA-TEST", "--priority"]
+        assert _strip_worklog_flags(prio_calls[0])[4] == "high"
         assert "--json" in prio_calls[0]
 
     def test_priority_update_happens_before_audit_set(self):
@@ -193,8 +207,9 @@ class TestChildAuditPath:
         assert rc == 0
         prio_calls = [c for c in calls if "--priority" in c]
         assert len(prio_calls) == 1
-        assert prio_calls[0][:4] == ["wl", "update", "SA-CHILD", "--priority"]
-        assert prio_calls[0][4] == "high"
+        stripped = _strip_worklog_flags(prio_calls[0])
+        assert stripped[:4] == ["wl", "update", "SA-CHILD", "--priority"]
+        assert stripped[4] == "high"
 
 
 # ---------------------------------------------------------------------------

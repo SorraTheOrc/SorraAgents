@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.16 (2026-08-16)
+### Features
+- Small, low-risk audits now skip deep analysis for faster, cheaper results. (SA-0MSQ026T3009QY2L)
+- Audits now auto-fix false-positive lint findings by updating the project config, with uncertain cases flagged for your review. (SA-0MSSSNOZN000LQKR)
+- Audits now start with 96% less context, making them faster and cheaper. (SA-0MSISKM8F004NW1U)
+- Audits now automatically run one at a time during cheap mode to avoid slowdowns. (SA-0MSN04X2S006ONH0)
+- Intake now auto-suggests priority (critical/high/medium/low) when you don't specify one. (SA-0MSMAZP6T007NM0O)
+### Bug Fixes
+- Audits now preserve your work item's original status instead of resetting it to open. (SA-0MRNKVPTA005FKBG)
+- Fixed audits launched from other folders now checking the wrong project's files. (SA-0MSLLGDW00098UCC)
+- Audits can now run the actual test suite, so "tests pass" criteria won't be stuck as partial for non-standard repos. (SA-0MSTEW41N005ZCBC)
+- Items only return to open when they truly fail audit, not on temporary errors. (SA-0MSF5PG1Y005P3AR)
+- Auto-verification now works for projects with different test setups, no more false failures. (SA-0MSJELL44009XYIL)
+- Fixed acceptance criteria not being detected under headings like "Acceptance criteria (testable)". (SA-0MSJLC8XA00178YD)
+- Fixed a crash when audit evidence arrives as structured data instead of plain text. (SA-0MSKM2LSP006L0K8)
+- Fixed audit saves failing with "Work item not found" when run from a different folder. (SA-0MSKQERKH002IBLG)
+- Fixed an issue where deleted tasks could block epic progress. (SA-0MSRVN28E009OL5S)
+### Other
+- Improved the implement skill guide: clearer error handling, correct step order, and better agent assignment. (SA-0MSLY2OQK004FYQA)
+- Audit skill is now faster, more accurate, and easier to maintain. (SA-0MSL1YS4K008HJVU)
+- Skill links now work from any folder. (SA-0MSAFWEHT002RI72)
+- Fixed import formatting in 6 files to keep code style consistent. (SA-0MSGIQVGG003FXQV)
+- Cleaned up code quality for smoother performance and stability. (SA-0MSCDW0WR008WBLM)
+
 ## v0.1.15 (2026-08-13)
 ### Features
 - End-to-end verification and regression gate (F6) (SA-0MSLK7XNZ00366YY)

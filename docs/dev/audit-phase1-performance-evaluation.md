@@ -36,8 +36,17 @@ This work item applies the Phase 2 treatment to Phase 1: prompts now carry the
 file-scope manifest + SCANNING block, sessions enable the same read-only tool
 set (`--tools read,bash,grep,find,ls --exclude-tools ask_question`), pending
 child screenings run with bounded concurrency (default 2, configurable via
-`AUDIT_PHASE2_PARALLELISM`), and ready children skip Phase 1 screening
+`AUDIT_PARALLELISM`), and ready children skip Phase 1 screening
 entirely, reusing their persisted AC verdicts.
+
+**Cheap-mode serialization (SA-0MSN04X2S006ONH0):** the runner now also
+queries the llm-manager proxy mode at start (`GET <base>/admin/mode`, base
+from `AUDIT_PROXY_BASE_URL` default `http://192.168.0.199:8000`, ~3 s
+fail-open). When the proxy reports `"cheap"` (1-slot local pool), the runner
+forces `AUDIT_PARALLELISM=1` and `AUDIT_MAX_CONCURRENCY=1` for the run, so
+both Phase 1 child screening and Phase 2 deep analysis serialize instead of
+racing the single slot; any other mode or query failure leaves settings
+unchanged (fail-open).
 
 **Verdict semantics are unchanged** — Phase 1 verdicts remain
 `met/unmet/partial/adjusted` with the same normalization and adjusted-verdict
@@ -87,7 +96,7 @@ elapsed_seconds=...` instrumentation used for Phase 2).
 
 | Scenario | Parallelism | Phase 1 child calls | Wall-clock | Reduction vs sequential |
 |----------|-------------|--------------------:|-----------:|-------------------------|
-| A sequential | 1 (`AUDIT_PHASE2_PARALLELISM=1`) | 4 | 3.62s | baseline |
+| A sequential | 1 (`AUDIT_PARALLELISM=1`) | 4 | 3.62s | baseline |
 | B parallel | 2 (default) | 4 | 2.01s | 44% |
 | C parallel | 4 | 4 | 1.21s | 67% |
 | D ready-reuse | 2 | **0** | 0.40s | 89% |

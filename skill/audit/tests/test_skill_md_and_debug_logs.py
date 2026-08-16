@@ -22,6 +22,7 @@ All tests run offline.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,92 @@ class TestSkillMdScanningGuidance:
         )
         assert "--batch-phase2" in runner_line
         assert "--max-concurrency" in runner_line
+
+
+# ===========================================================================
+# SKILL.md path resolvability (SA-0MSL1ZBY0007PIVD)
+# ===========================================================================
+
+
+class TestSkillMdPathResolvability:
+    """Every repo path referenced in SKILL.md resolves to a real file.
+
+    Catches doc-drift like the stale ``./scripts/failure_notice.py``
+    reference (the module lives one level up in ``skill/scripts/``). Only
+    concrete repo-relative paths are checked: flags, env vars, commands
+    (``/skill:test``), placeholders (``<id>``), home paths (``~``), and
+    absolute paths (``/llama/...``) are out of scope.
+    """
+
+    SKILL_DIR = REPO_ROOT / "skill" / "audit"
+
+    def _path_tokens(self):
+        """Backtick-quoted tokens + markdown-link targets from SKILL.md."""
+        text = SKILL_MD.read_text()
+        tokens = set(re.findall(r"`([^`]+)`", text))
+        tokens |= set(re.findall(r"\]\(([^)]+)\)", text))
+        return sorted(t.strip() for t in tokens)
+
+    def _resolve(self, token):
+        """Resolve a token to a repo path, or None when out of scope."""
+        if token.startswith(("~", "/", "<")):
+            return None  # home / absolute / placeholder
+        if token.startswith(("./", "../", "evidence/")):
+            return self.SKILL_DIR / token
+        if token.startswith(("skill/", "docs/", "tests/")):
+            return REPO_ROOT / token
+        return None  # bare flag / command / env var / filename mention
+
+    def test_every_referenced_path_resolves(self):
+        """AC1: every repo path referenced in SKILL.md exists on disk."""
+        missing = []
+        for token in self._path_tokens():
+            path = self._resolve(token)
+            if path is not None and not path.exists():
+                missing.append(f"{token} -> {path}")
+        assert missing == [], \
+            "SKILL.md references paths that do not exist:\n" + "\n".join(missing)
+
+    def test_failure_notice_points_at_shared_module(self):
+        """The failure-notice banner references ../scripts/ (one level up),
+        never the stale ./scripts/failure_notice.py (the module lives in
+        the shared scripts dir, above the audit scripts)."""
+        text = SKILL_MD.read_text()
+        assert "../scripts/failure_notice.py" in text
+        assert not re.search(r"`\./scripts/failure_notice\.py`", text)
+
+
+# ===========================================================================
+# Context reduction documentation (SA-0MSRVNMFW005LWZL)
+# ===========================================================================
+
+
+class TestSkillMdContextReductionDoc:
+    """SKILL.md documents the context-reduction flags AND the rationale.
+
+    Work item: SA-0MSRVNMFW005LWZL (gap remediation after the 2026-08-13
+    re-audit rated AC5 partial — SKILL.md documented the "what" (flags) but
+    not the "why" (prompts are self-contained); the rationale had been
+    trimmed by later SKILL.md edits). The restored text must state both the
+    mechanism and the self-contained invariant in its own words.
+    """
+
+    def test_skill_md_documents_flags_in_context_reduction(self) -> None:
+        """SKILL.md scripts section names both flags for _call_pi calls."""
+        text = SKILL_MD.read_text()
+        assert "--no-context-files" in text
+        assert "--no-skills" in text
+
+    def test_skill_md_documents_why_self_contained(self) -> None:
+        """SKILL.md states the rationale: prompts are fully self-contained."""
+        text = SKILL_MD.read_text()
+        assert "self-contained" in text
+        assert "never depend" in text or "invariant" in text
+
+    def test_skill_md_evidence_dir_referenced(self) -> None:
+        """SKILL.md points to the recorded in-scope AC2/AC3 evidence."""
+        text = SKILL_MD.read_text()
+        assert "evidence/" in text
 
 
 # ===========================================================================
@@ -265,6 +352,56 @@ class TestSkillMdDocumentsBatchAndConcurrencyFlags:
         )
         assert "--batch-phase2" in usage_line
         assert "--max-concurrency" in usage_line
+
+
+class TestSkillMdReadOnlyException:
+    """SKILL.md + reference doc document the justified READ-ONLY exception
+    (SA-0MST01Q4W005G495 AC1-AC3)."""
+
+    def test_exception_scope_documented(self) -> None:
+        """The exception scope (config write, local commit, chore creation,
+        code-quality re-run) is documented; never close/delete/push."""
+        text = _skill_docs()
+        assert "READ-ONLY exception" in text
+        assert "per-file-ignores" in text
+        assert "committed locally (no push)" in text
+        assert "chore" in text.lower()
+        assert "Do NOT close or delete work items" in text
+
+    def test_no_create_rule_relaxation_documented(self) -> None:
+        """The no-create rule states the config-fix chore exception and its
+        preconditions (model confidence + no-breakage verification)."""
+        text = _skill_docs()
+        assert "ONLY relaxation of the no-create rule" in text
+        assert "confident-false-positive" in text
+        assert "no-breakage verification" in text
+
+    def test_reference_doc_documents_false_positive_screen(self) -> None:
+        """The reference doc documents the screen classifications and
+        caution-first degradation."""
+        text = _skill_docs()
+        assert "False-positive screen" in text
+        assert "confident-false-positive" in text
+        assert "caution-first" in text
+        assert "uncertain" in text
+
+    def test_reference_doc_documents_remediation_loop_and_env_var(self) -> None:
+        """The reference doc documents the remediation loop and the env var
+        with its default (3)."""
+        text = _skill_docs()
+        assert "Remediation loop" in text
+        assert "AUDIT_REMEDIATION_MAX_ITERATIONS" in text
+        assert "default `3`" in text
+        assert "remediation loop exhausted" in text
+
+    def test_reference_doc_documents_chore_creation(self) -> None:
+        """The reference doc documents chore creation for config fixes and
+        medium/low tracking (worklog resolution, fail-safe)."""
+        text = _skill_docs()
+        assert "Chore work-item creation" in text
+        assert "candidate false positive — producer decision required" in text
+        assert "--worklog-dir" in text
+        assert "chore_failures" in text
 
 
 class TestDebugLogLocation:

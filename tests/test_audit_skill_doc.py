@@ -209,9 +209,9 @@ class TestAuditSkillWorkItemIdDetection:
         assert "Pre-flight affirmation" in text
 
     def test_verification_guard_present(self):
-        """SKILL.md must include a verification guard before project-level path."""
+        """SKILL.md must include the pre-flight affirmation guard text."""
         text = _skill_md_text()
-        assert "Verify absence before proceeding" in text
+        assert "Pass --force to bypass this pre-flight guard" in text
 
     def test_scan_match_branch_structure(self):
         """SKILL.md must use active 'scan → match → branch' structure."""

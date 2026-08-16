@@ -125,6 +125,23 @@ run:
 or contradict a runner verdict that already completed its lifecycle: if the
 runner finished, its verdict and status transitions stand untouched.
 
+## Pre-flight affirmation guard
+
+Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the same work item from racing. The SKILL.md long documented a "pre-flight affirmation" with no code behind it; this guard makes docs and code agree.
+
+### Behavior
+
+1. After the read-only gates (freshness, full-suite cache) but **before** the status lifecycle, the runner fetches the item and checks its current status.
+2. If the item is already `in_progress` at entry and `--force` is NOT given → abort: `Error: Refusing to audit <id>: the work item is already in_progress (a concurrent audit or implementation owns it). Pass --force to bypass this pre-flight guard.` Exit code 1, **no** report, **no** persistence, **no** status transition (the runner never sets `in_progress` itself, so the pre-audit state is preserved exactly). JSON mode emits `{"error": ..., "pre_flight": {"issue_id", "status", "bypass": "--force"}}`.
+3. `--force` bypasses the guard and proceeds (also bypasses the freshness gate).
+4. Any other status (`open`, `completed`, …) audits normally without `--force`.
+
+### Why
+
+The concurrency semaphore (`skill/shared/process_semaphore.py`) caps pi subprocesses host-wide but cannot see per-item claims: two audits of the same item would both set `in_progress`, both run the pipeline, and the last writer would win on persist + status transition. `in_progress` at entry is the reliable signal that another audit (or an implementation claim) owns the item.
+
+> Implementation self-review audits (implement skill Step 6) audit in-progress items and therefore pass `--force`.
+
 ## Freshness Gate
 
 Short-circuits item-level audits when a recent, valid audit exists to avoid unnecessary model calls.
@@ -154,9 +171,11 @@ No status lifecycle transitions occur, and no persistence is performed. An expli
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
-(including the status lifecycle and `persist_audit`) targets the correct
-worklog store regardless of the caller's working directory. Resolution order
-for each `wl` command:
+(including the status lifecycle) **and by `persist_audit`** targets the correct
+worklog store regardless of the caller's working directory — including the
+standalone `persist_audit.py` CLI, which resolves the store itself when no
+`--worklog-dir` is passed (SA-0MSKQERKH002IBLG). Resolution order for each
+`wl` command:
 
 1. Explicit `--worklog-dir DIR` (highest precedence — overrides everything).
 2. Prefix-to-project sibling scan: the work-item id prefix (e.g. `OSL-…`)
@@ -168,24 +187,42 @@ for each `wl` command:
    git root, or nearest ancestor.
 4. No flag — `wl` resolves from cwd.
 
-**Fail-fast launch context (LP-0MSQ32HNR007AI6B):** while `wl` resolution is
-cwd-independent, the *project scope* is not — `TARGET_PROJECT_ROOT` (the
-git root of the launch cwd) is the repository Phase 1/2 target. An audit
-MUST be launched from the project root that owns the work item. Before any
-phase runs (and before any pi/model call) the runner verifies:
+**Fail-fast launch context (LP-0MSQ32HNR007AI6B):** the *project scope* has
+two independent axes. The **launch-context guard** still checks the launch
+cwd: ``TARGET_PROJECT_ROOT`` (the git root of the launch cwd) must own the
+item or be a worktree of the owning project. But the runner's **git-derived
+content now follows the worklog** (SA-0MSLLGDW00098UCC): the file-scope
+manifest (changed-file list + repo index), HEAD attestations, working-tree
+hashes, and ``--green-run`` evidence resolve against the worklog-derived
+owning project root (``--worklog-dir`` parent, else prefix-to-sibling
+scan) — NOT the launch cwd. Before any phase runs (and before any pi/model
+call) the runner verifies:
 
 1. **Owning project** — the item's id prefix resolves to its owning project
-   via the prefix-to-sibling scan (explicit `--worklog-dir` takes
+   via the prefix-to-sibling scan (explicit ``--worklog-dir`` takes
    precedence: its parent is the expected project). A launch from a
    non-owning checkout aborts with `Error: Audit launch-context error:` and
    a non-zero exit — zero pi calls, no status lifecycle. A worktree of the
-   owning project counts as owning.
-2. **FILE SCOPE manifest** — before Phase 1 and again before Phase 2, the
+   owning project counts as owning (same git repository). When the owning
+   project root cannot be determined (no ``--worklog-dir``, unknown item
+   prefix, no sibling match), the run aborts with `Error: Undeterminable
+   project scope: ...` before any phase runs — never a silent fallback to
+   the launch cwd's repository for git-derived content.
+2. **Git scope follows the worklog** — every git command issued by the
+   runner targets the worklog-derived owning root (`git -C <owning_root>`
+   when it differs from the launch root), so launching from any cwd audits
+   the owning project's repository. A launch from the owning project — or a
+   worktree of it (same git repository) — keeps git resolving to that
+   checkout (byte-identical commands), so worktree-only changes and the
+   worktree branch HEAD stay correct. The remaining ``TARGET_PROJECT_ROOT``
+   consumers (code-quality scan and debug-log path) are still
+   launch-cwd-bound.
+3. **FILE SCOPE manifest** — before Phase 1 and again before Phase 2, the
    manifest must reference the item repository's files; a manifest built
    from the audit skill's own tree (or lacking the item repo) aborts with
    `Error: Audit scope error:` and a non-zero exit instead of emitting
    misleading "unmet" verdicts.
-3. **Child persistence** — a child audit that cannot be persisted
+4. **Child persistence** — a child audit that cannot be persisted
    (`wl audit-set` rc!=0, e.g. "Work item not found") aborts the run with a
    non-zero exit; `PERSIST_CONTENT_INVALID` (fallback notice persisted)
    remains a warning (the child audit is usable).
@@ -197,9 +234,13 @@ cd /path/to/owning-project
 python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN --do-not-persist
 ```
 
-`--worklog-dir` does NOT change the project scope; only the launch
-directory does. If auto-resolution cannot determine the target store while
-launching from the owning project root, pass an explicit dir:
+The runner is cwd-independent for both `wl` resolution and git-derived
+content: launching from any directory (e.g. the skill install dir) with
+`--worklog-dir` pointing at the audited project audits that project's
+repository. Only the remaining `TARGET_PROJECT_ROOT` consumers (code-quality
+scan, debug-log path) stay launch-cwd-bound. If auto-resolution cannot
+determine the target store while launching from the owning project root,
+pass an explicit dir:
 
 ```bash
 python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \
@@ -261,20 +302,20 @@ Semantics:
 
 - **No flag needed** — the automatic path is always attempted when no `--green-run`/`AUDIT_GREEN_RUN` attestation is present, and a valid operator attestation takes precedence (the automatic path augments rather than replaces SA-0MSGLAVCZ002LVZ4).
 - **Fail-closed with a diagnostic:** a cache miss, a non-zero (or timed-out) cached run, a partially cached suite set (e.g. pytest but not node), an unresolvable HEAD, or any cache/infra error yields NO evidence — execution-dependent ACs stay `partial` (never crashes, never fabricates a green verdict). When verification fails, the runner prints a clear diagnostic to stderr that distinguishes a **cache miss** (`no cached full-suite run for '<cmd>' at HEAD <sha>`) from a **failed run** (`cached full-suite run for '<cmd>' exited non-zero (<code>)`), counts the unverifiable commands, and states the remedy: run the full suite once at the commit (`/skill:test` or `run_tests.py --force`) to populate the cache, then re-audit — or attest manually with `--green-run HEAD`.
-- **Pre-flight cache gate (SA-0MSQ72BVV0011SRU): a cache MISS is an early exit, not a diagnostic.** If there is no green cached full-suite run at HEAD (via `query_cached()`) and neither `--run-tests` nor `--green-run <sha|HEAD>` was passed, the runner exits non-zero **before any Phase 1 pi call, report, or persistence**, with an actionable message (`Audit blocked: ... run the full suite once at this commit (/skill:test or run_tests.py --force) ... or explicitly opt out with --run-tests ... or --green-run HEAD`). No report is produced, nothing is persisted, and the pre-audit work-item status/stage are preserved. This closes the degraded-verdict loop where a cache miss degraded to a diagnostic and the Phase 2 model could still mark execution-dependent ACs "met" from implementer-reported evidence. The gate is **repo-aware**: a repo without a pytest suite (no pytest config marker or pytest-style test files) is never falsely blocked on the phantom pytest command — the pytest command is only required when the repo actually has a pytest suite (mirroring the node-dir skipping of SA-0MSJELL44009XYIL). It **fails open** on red cached runs (evidence exists that the suite ran and failed — historical partial + diagnostic behavior preserved) and on cache/infra errors (never blocks an audit that today proceeds partial). Both opt-outs proceed: `--run-tests` executes the suite and populates the cache; `--green-run <sha|HEAD>` attests.
-- **Read-only by construction:** `query_cached()` executes nothing, so the audit's read-only mandate is preserved unconditionally — the suite is never executed inside the audit. The cached run must match the audited git state exactly (HEAD sha + working-tree fingerprint) and be within the 2h TTL, so the evidence is a genuine full-suite result at the audited commit.
+- **Never-block guarantee + auto-execution (F3/F4, SA-0MSTN5KRF0097TVP / SA-0MSTN8CWM003AAU9):** the old pre-flight hard gate (SA-0MSQ72BVV0011SRU) was removed — the audit NEVER exits with a hard block solely because it cannot run tests (no cache, no test runner, no configured suite commands, execution impossible). On a cache **miss** (no green cached full-suite run at HEAD and no `--green-run` attestation) the runner AUTO-EXECUTES the repo's actual suite via the test skill (`run_tests.py` / `full_suite_commands`, per-command timeout `AUDIT_TEST_SKILL_RUN_TIMEOUT` default 600s, `run_cached(force=True)` so the per-repo cache is refreshed for subsequent read-only audits). A green executed run injects a **TEST-SKILL GREEN RUN** block; a red run is fail-open — no block, execution-dependent ACs stay `partial` with failure evidence, and the audit continues. Every other failure mode (red/error/empty cache states, unresolvable HEAD, empty command set) degrades to a fail-open `partial` verdict with a clear diagnostic. Operators can suppress auto-execution with `--no-execute` / `AUDIT_NO_EXECUTE=1` (fail-open partial, no execution); `--run-tests` remains the explicit override that executes on ANY non-green state. Verification order for execution-dependent ACs: read-only cache → auto-execute → partial with documented reason. **Long suites:** the default per-command timeout is 600s (module constant `AUDIT_TEST_SKILL_RUN_TIMEOUT`); suites that need longer (e.g. TCE's ~16-min `npm test` — see the F5 acceptance proof, SA-0MSTNCI6500879CD) MUST raise it via the `.pi/test-config.json` `timeoutPerCommand` field (F2 AC1) — otherwise the auto-execution times out and the run fails open partial (never blocks, but the evidence is lost). Note: `AUDIT_TEST_SKILL_RUN_TIMEOUT` is a code constant, not an env var — the extension file is the only runtime override.
+- **Read-only by construction (except F3 auto-execution):** `query_cached()` executes nothing, so the read-only cache-verification path never runs the suite — the audit's read-only mandate is preserved for every non-executing path. The cached run must match the audited git state exactly (HEAD sha + working-tree fingerprint) and be within the 2h TTL, so the evidence is a genuine full-suite result at the audited commit. The suite is executed ONLY by the F3 auto-execution path (cache miss) or the explicit `--run-tests` override; `--no-execute` / `AUDIT_NO_EXECUTE=1` restores strict read-only behavior for the whole audit.
 - **Failed runs expire fast (SA-0MSJELL44009XYIL):** cache entries with a non-zero exit use a short 5-minute TTL, so a transient infra failure is never re-served as a current result for the full 2h TTL — a stale red entry degrades to a miss and re-execution instead of blocking auto-verification indefinitely.
 - **Workflow:** run the full suite once via the [test skill](../../skill/test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green; this populates the cache), then audits at the same git state within the TTL automatically verify execution-dependent ACs. This removes the manual attestation step for automated/read-only pipelines (e.g. the herdr downtime worker's auto-audit dispatches).
 
-**Auto-invoked test skill (`--run-tests`, SA-0MSJELSWS002UF60):** For environments that authorize test execution during audits (e.g. the herdr downtime worker's auto-audit dispatches, where the manual `/skill:test` round-trip stalls the pipeline), the `--run-tests` flag removes the operator round-trip entirely:
+**Auto-invoked test skill (`--run-tests`, SA-0MSJELSWS002UF60 / F3 SA-0MSTN5KRF0097TVP):** environments that authorize test execution during audits can rely on the runner executing the suite for them:
 
 ```bash
 python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 ```
 
-- When no `--green-run`/`AUDIT_GREEN_RUN` attestation is present AND the read-only cache holds no green full-suite run at the audited git state, the runner **invokes the test skill** (the `run_tests.py` machinery) to execute the full project test suite in quiet mode, triage any failures per the test skill, and refresh the per-repo cache. When the executed run is green, a **TEST-SKILL GREEN RUN** block is injected into the Phase 1 parent prompt and ALL Phase 2 prompts, the sha is recorded in the persisted report as `Test skill run evidence: <sha> (executed full-suite run, --run-tests)`, and execution-dependent ACs MAY be marked met — no operator round-trip needed.
-- **OFF by default (AC2):** without the flag the audit stays strictly read-only and never executes the suite — environments that forbid test execution during audits are unaffected (execution-dependent ACs stay `partial` with the operator instruction). The flag is an explicit, operator-authorized deviation from the read-only mandate, consistent with the implement skill's "run the full suite via the test skill before `in_review`" discipline.
-- **Clear log lines (AC3):** the runner prints when the test skill is invoked (`Invoking test skill (run_tests.py) — --run-tests enabled: executing the full project test suite at <cwd> in quiet mode...`) and what it returned (`Test skill run completed: success=... commands=... failures=... triaged=... notice=...`).
+- When no `--green-run`/`AUDIT_GREEN_RUN` attestation is present AND the read-only cache holds no green full-suite run at the audited git state, the runner **invokes the test skill** (the `run_tests.py` machinery) to execute the full project test suite in quiet mode, triage any failures per the test skill, and refresh the per-repo cache. When the executed run is green, a **TEST-SKILL GREEN RUN** block is injected into the Phase 1 parent prompt and ALL Phase 2 prompts, the sha is recorded in the persisted report as `Test skill run evidence: <sha> (executed full-suite run)`, and execution-dependent ACs MAY be marked met — no operator round-trip needed.
+- **ON by default on a cache miss since F3 (SA-0MSTN5KRF0097TVP):** the `--run-tests` flag is now redundant on the miss path — the runner auto-executes by default. The flag remains the explicit override that executes on ANY non-green state (red/error/empty) and is itself overridden by `--no-execute` / `AUDIT_NO_EXECUTE=1` (strict read-only). Environments that forbid test execution during audits should pass `--no-execute` / set `AUDIT_NO_EXECUTE=1`; execution-dependent ACs stay `partial` with a documented reason.
+- **Clear log lines (AC3):** the runner prints when the test skill is invoked (`Invoking test skill (run_tests.py) — suite execution: executing the full project test suite at <cwd> in quiet mode...`) and what it returned (`Test skill run completed: success=... commands=... failures=... triaged=... notice=...`).
 - **Failures are triaged, never silently ignored (AC4):** each structured failure record from the executed run is passed to the triage helper (`check_or_create.py`), which links/creates a critical `test-failure` work item for the failing test — exactly the test skill's run → triage discipline. The audit then completes fail-closed with no green evidence.
 - **Fail-closed:** a non-green executed run (failures, non-zero exit, timeout, missing binary) yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict).
 - A green cache hit at the audited state short-circuits the invocation entirely (the suite is only executed when the cache cannot satisfy the evidence).
@@ -293,11 +334,38 @@ Per-call timing: issue_id=<id> context=<context> elapsed_seconds=<seconds>
 
 where `<context>` is the call type (e.g. `parent`, `phase2_deep`, `phase2_child:<i>`, `child:<id>`, `project`). This establishes a performance baseline for Phase 2 deep analysis (N+1 sequential agent-mode calls: one parent + one per active child) and makes regressions visible. The same `elapsed_seconds` value is written into `--debug-log` JSONL entries alongside `issue_id`, `context`, and `provider_error`.
 
+**Per-AC latency (Phase 2, LP-0MSQ32WM5000NCB7):** Phase-2 call sites pass the AC count to `_call_pi_and_maybe_log`, so the timing line additionally surfaces per-AC latency for the deep-analysis contexts (`phase2_deep`, `phase2_child:<i>`, `phase2_batch`):
+
+```text
+Per-call timing: issue_id=<id> context=phase2_deep elapsed_seconds=<seconds> input_tokens=<tokens> ac_count=<N> avg_ac_elapsed_seconds=<seconds/N>
+```
+
+- `ac_count=<N>` — number of acceptance criteria covered by the call (`len(ac_results)` for the parent, `len(child_acs)` per child, total indexed AC count for the batch).
+- `avg_ac_elapsed_seconds=<elapsed/N>` — elapsed seconds divided by the AC count, so per-AC latency regressions are visible even when AC counts vary between runs.
+- A count of 0 is emitted as `ac_count=0` with no avg field (no division by zero); a missing count (non-Phase-2 contexts) keeps the legacy format byte-for-byte.
+- Debug-log JSONL entries are unaffected — the extension is timing-line only.
+
+**Evidence-scope cap (Phase 2, LP-0MSQ32WM5000NCB7):** the parent/child/batch deep prompts instruct the model to cite **at most N file:line references per criterion, minimum 1** (prompt-level only; parsed evidence/verdicts are never mutated, so verdict semantics and the canonical report format are unchanged). This bounds evidence-JSON generation — the dominant Phase 2 cost (Phase 2 is 66% of audit model time on inputs of only ~0.5–2.5K tokens) — without changing the model. Resolution precedence (config contract):
+
+1. `--max-citations-per-ac N` CLI flag (issue and project subcommands; highest)
+2. `audit.max_citations_per_ac` key in the CWD `.ralph.json` / `ralph.config.json` (dotted form, or nested `audit: {max_citations_per_ac: N}`)
+3. hardcoded default `_DEFAULT_MAX_CITATIONS_PER_AC` = 5
+
+Invalid values (0, negative, non-int) fail closed to the default with a warning (mirrors `_resolve_max_child_audits`). **Trade-off:** a smaller cap shortens deep analysis but narrows evidence breadth; the ≥1 file:line floor keeps every verdict substantiated. The benchmark `skill/audit/tests/test_audit_runner_phase2_benchmark.py` (`@pytest.mark.benchmark`, opt-in via `AUDIT_RUN_BENCHMARKS=1`) measures the median `phase2_deep` latency reduction against the 2026-08-12 baseline (median 1324 s of 1537/1324/903; threshold 927 s = 0.70×).
+
 **File-scope manifest (Phase 2):** Each Phase 2 prompt (parent `phase2_deep` and every child `phase2_child:<i>`) now includes a **FILE SCOPE** section built from the work item's **Key Files** section, the **git changed-file list** (`git diff --name-only HEAD` + `git status --porcelain`), **Phase 1 evidence file:line references** (so the model verifies named files rather than re-discovering them), and a lightweight **repository index** (top-level layout with file counts). The prompt instructs the model to read ONLY in-scope files and to avoid unbounded `find`/`grep -r`/`ls -R` exploration. This bounds the dominant Phase 2 cost (unbounded repo exploration) without changing verdict semantics. If git is unavailable, the manifest degrades gracefully to the Key Files/evidence/index entries that can still be determined. See `docs/dev/audit-phase2-performance-evaluation.md` (SA-0MSAHR63100415PM) for the underlying evaluation.
+
+**Low-risk/small-item skip (Phase 2, SA-0MSQ026T3009QY2L):** When a work item has `effort` ∈ {Extra Small, Small} **and** `risk` = Low (the first-class fields populated by the effort-and-risk skill), Phase 2 deep code analysis is skipped — Phase 1 verdicts stand unchanged (`met` remains `met`) and the AC evidence notes the skip reason (e.g. `Phase 2 deep analysis skipped (effort=Small, risk=Low): small, low-risk item per SA-0MSQ026T3009QY2L. Phase 1 verdict stands.`). The runner prints a diagnostic when the skip applies (e.g. `Skipping Phase 2 deep analysis: effort=Small, risk=Low. Phase 1 verdicts stand unchanged.`) and the report summary records the skip via `phase2_skip_note` instead of claiming deep analysis completed. Key semantics:
+
+- **Tree-wide, per-node:** the parent and every child in the cascade are evaluated independently against the criterion (`_is_low_risk_small(effort, risk)`). A qualifying child is dropped from the Phase 2 `pending` list in `_run_phase2_deep_analysis` (both the batch and per-child paths) with its Phase 1 `ac_results` left intact; a non-qualifying child still gets deep analysis. In the child-first (`--audit-children`) flow a qualifying parent skips its own deep call and passes children through with `skip_parent_deep=True`.
+- **Fail-closed:** missing/empty/unknown `effort` or `risk` ⇒ Phase 2 runs as usual — the skip never applies on absent data.
+- **Unconditional:** no override flag or env var forces deep analysis for a qualifying node (AC 4); the narrow exception is the *only* case where a passed Phase 1 gate does not proceed to Phase 2.
 
 **Child verdict reuse (Phase 2):** When a child's own fresh audit already produced a ready verdict (`child_audit_ready=True`), the parent Phase 2 **skips** the duplicated child deep-analysis call (`phase2_child:<i>`) and reuses the child's existing `ac_results`. The same skip applies to children whose own fresh audit returned an explicit **'not ready to close'** verdict (`child_audit_not_ready=True`, P12): their own pipeline already ran deep analysis on the same ACs, so the parent Phase 2 reuses the child's own persisted audit findings (parsed from the child's audit report AC table, falling back to the Phase 1 screening results when the table cannot be parsed). Children with no fresh audit verdict (stale / no audit) still get parent deep analysis. Freshness is decided by `_get_child_audit_verdict`: the content-fingerprint gate is the PRIMARY test (stored fingerprint vs the child's current state; unchanged + verdict present = fresh), with the legacy time gate as the floor for fingerprint-less reports (LP-0MSQ32MF200675AR); `--force` bypasses both. Because the reuse decision is made in the Phase 1 pre-pass (see below), a reused child costs ZERO pi calls across the whole run — no Phase 1 screening and no Phase 2 deep/batch entry — while a 'not ready' child still blocks the parent's Ready-to-close evaluation.
 
-**Parallel child deep analysis (Phase 2):** Independent child deep-analysis calls (`phase2_child:<i>`) run concurrently with a slot-aware dynamic ceiling (LP-0MSQ32S2M001EA74): the runner queries the local proxy status endpoint (`/llama/local/status` → `available_slots`/`total_slots`; `AUDIT_SLOT_STATUS_URL`, default `http://localhost:8000/llama/local/status`, short 1s timeout, fail-open) once per child-call batch dispatch and caps the ceiling at `min(free-slots, configured_max)` with a floor of 1. When the slot query fails, the runner degrades gracefully to the configured static ceiling — `AUDIT_MAX_CHILD_CONCURRENCY` env var (integer ≥1) or the `AUDIT_PHASE2_PARALLELISM` env var (default 2, set to `1` for strictly-sequential historical behavior); the static knob remains the floor/fallback. The parent deep-analysis call always runs first and is never parallelized. Child workers are exception-isolated: a failure or timeout in one child degrades that child to `partial` (or falls back to its existing ACs) without affecting the others; on persistent executor failure the runner falls back to sequential execution. This collapses Phase 2 wall-clock from N sequential calls to ~N/cap while preserving per-child verdict isolation and avoiding slot contention with sibling sessions.
+**Parallel child deep analysis (Phase 2):** Independent child deep-analysis calls (`phase2_child:<i>`) run concurrently with a slot-aware dynamic ceiling (LP-0MSQ32S2M001EA74): the runner queries the local proxy status endpoint (`/llama/local/status` → `available_slots`/`total_slots`; `AUDIT_SLOT_STATUS_URL`, default `http://localhost:8000/llama/local/status`, short 1s timeout, fail-open) once per child-call batch dispatch and caps the ceiling at `min(free-slots, configured_max)` with a floor of 1. When the slot query fails, the runner degrades gracefully to the configured static ceiling — `AUDIT_MAX_CHILD_CONCURRENCY` env var (integer ≥1) or the `AUDIT_PARALLELISM` env var (default 2, set to `1` for strictly-sequential historical behavior); the static knob remains the floor/fallback. The parent deep-analysis call always runs first and is never parallelized. Child workers are exception-isolated: a failure or timeout in one child degrades that child to `partial` (or falls back to its existing ACs) without affecting the others; on persistent executor failure the runner falls back to sequential execution. This collapses Phase 2 wall-clock from N sequential calls to ~N/cap while preserving per-child verdict isolation and avoiding slot contention with sibling sessions.
+
+**Proxy cheap-mode serialization (startup):** At runner start (`main()`, before any pi call) the runner queries the llm-manager proxy mode endpoint — `GET <base>/admin/mode` (`AUDIT_PROXY_BASE_URL`, default `http://192.168.0.199:8000`; ~3 s timeout, fail-open) — and parses the JSON `mode` field. When the mode is exactly `cheap` (the proxy's reduced 1-slot local pool, e.g. during the default 01:00–10:00 local cheap window), the runner serializes this run's pi calls by setting **both** `AUDIT_PARALLELISM=1` **and** `AUDIT_MAX_CONCURRENCY=1` in its own process environment, and prints a detection line to stderr. The change is per-process (`os.environ`) — it affects only this run's spawned pi subprocesses, never other processes or audits; `AUDIT_MAX_CONCURRENCY=1` is defensive against sibling dispatchers sharing the same host-wide flock ceiling. Any other mode (including `fast`) or a failed query (unreachable / timeout / non-200 / unparseable) leaves all parallelism settings unchanged (fail-open) and logs a warning to stderr only on query failure; verdict semantics and the two-phase pipeline are unaffected. Mode *switching* (`POST /admin/set-mode`) is out of scope — the runner is read-only (SA-0MSN04X2S006ONH0).
 
 **Retry tuning (Phase 2):** Long agent-mode Phase 2 calls (`phase2_deep` / `phase2_child`) retry provider errors at most once (`_PHASE2_MAX_RETRIES = 1`), instead of the `_PI_MAX_RETRIES`=2 budget used by short Phase 1 bare calls. A provider error late in a long agent-mode call no longer restarts it multiple times (worst case was ~3 x 1800s before this change); the call degrades to `partial` with the existing provider-error diagnostic after the bounded retry.
 
@@ -356,8 +424,10 @@ wall-clock cost (unbounded repository exploration during AC screening):
   ceiling used by Phase 2 (`_resolve_child_concurrency()` — see
   "Parallel child deep analysis (Phase 2)" below; queries
   `/llama/local/status` for free slots, fail-open to
-  `AUDIT_MAX_CHILD_CONCURRENCY` > `AUDIT_PHASE2_PARALLELISM` > 2; set to
-  `1` for strictly-sequential behavior). A single pending child or
+  `AUDIT_MAX_CHILD_CONCURRENCY` > `AUDIT_PARALLELISM` > 2; set to
+  `1` for strictly-sequential behavior; proxy cheap-mode startup
+  detection forces both to 1 — see "Proxy cheap-mode serialization
+  (startup)" below). A single pending child or
   parallelism=1 falls back to the sequential path. Workers are
   exception-isolated exactly like Phase 2: a Pi failure degrades that
   child to diagnostic `partial` verdicts without affecting the others,
@@ -381,6 +451,14 @@ Runner performs code quality checks before AC verification (invokes `../code_rev
 - Persist from stdin: `cat report.md | python3 ./scripts/persist_audit.py --issue-id SA-123`
 - Persist from a file: `python3 ./scripts/persist_audit.py --issue-id SA-123 --file report.md`
 - Persist from a CLI string: `python3 ./scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
+- The persister is cwd-independent: without `--worklog-dir`, the store is
+  auto-resolved from the work-item id prefix (prefix-to-sibling scan) with a
+  cwd-chain fallback, so `persist_audit.py` can be launched from any directory
+  (e.g. the skill install dir) and still persist to the item's own store
+  (SA-0MSKQERKH002IBLG). An explicit `--worklog-dir` keeps highest precedence.
+  Note: the repo-scope facet of the skill-dir launch pattern
+  (`TARGET_PROJECT_ROOT` code-quality scan / debug-log consumers) remains
+  launch-cwd-bound — tracked in SA-0MSRLECW2001AA15.
 
 **Unique report file naming convention:**
 
@@ -409,7 +487,7 @@ Notes:
 - **Persistence + readback verification is an invariant of the runner.** Unless `--do-not-persist` is given, the runner ALWAYS persists the audit and then performs a readback verification via `wl audit-show --json` to confirm the stored audit is retrievable. If either step fails, the runner exits non-zero. Use `--do-not-persist` for dry runs. The `--require-persist` flag has been removed — persist+verify is now unconditional.
 - **Resilient audit persistence (P8):** the final `wl update <id> --audit-text <report>` step is the last write of the run. If it rejects the assembled verdict content (malformed JSON / validation error), `persist_audit()` never leaves the audit text field as the 43-char stub (`Audit result persisted via persist_audit.py`). It (1) runs a repair pass that salvages broken JSON fragments (valid JSON prefixes extracted; per-AC rows preserved; zero model calls) and retries once; (2) if the retry fails, persists a compact markdown fallback notice (with a clear failure notice naming the work item, so the identity/readback guards pass) and returns `PERSIST_CONTENT_INVALID` (4); (3) the runner then performs a *bounded* re-ask — at most **one** additional model call to re-emit the verdict array in valid JSON — reassembles the report and retries persistence. The repair never re-runs the full audit pipeline. If every attempt fails, `persist_audit()` returns non-zero and the run reports failure.
 - **Priority normalization on 'Ready to close: Yes':** when the persisted report says `Ready to close: Yes` and the work item currently carries `critical` priority, `persist_audit.py` lowers it to `high` (via `wl update <id> --priority high`) before calling `wl audit-set`, so resolved items leave the critical queue. This is best-effort: a failed priority fetch/update logs a warning and never blocks persistence. It applies to both parent and child audit persistence (single `persist_audit()` entry point).
-- The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null, has empty `rawOutput`/`summary`, **or the stored content does not reference the target work-item ID** (content identity check — catches a stale report persisted to the wrong item).
+- The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. Every `wl` command built by `persist_audit` resolves the worklog store exactly like the runner's READ path (explicit `--worklog-dir` > prefix-to-sibling scan > cwd-chain > no flag) via the shared `skill.shared.status_lifecycle` helpers — the PERSIST path is cwd-independent by construction (SA-0MSKQERKH002IBLG), covering the runner parent/child path, the re-ask path, and the standalone CLI. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null, has empty `rawOutput`/`summary`, **or the stored content does not reference the target work-item ID** (content identity check — catches a stale report persisted to the wrong item). The readback runs through the same resolved store, so it verifies against the store the audit was persisted to.
 - **Child item audit persistence:** When auditing a parent work item with children, the runner also persists an individual audit report to each child work item. Each child receives a focused report covering only its own acceptance criteria. Child persistence is controlled by the same `--do-not-persist` flag — if persistence is disabled for the parent, child persistence is also skipped. Child persist failures are logged as warnings to stderr but do not prevent the parent audit from succeeding. Child readback verification is out of scope for the current release.
 
 ### Agent-mode response parsing
@@ -417,15 +495,105 @@ Notes:
 - Phase 2 deep analysis now runs Pi in agent mode (with `--tools`). The agent-mode
   JSON-stream output may contain additional event types (`agent_start`, `turn_start`,
   `message_start`, `tool_execution_start`, `tool_execution_end`, `agent_end`) not
-  present in bare LLM pipe mode. The `_extract_pi_text()` and `_parse_pi_json_line()`
-  functions handle these transparently by extracting text content from
-  `message_update` events (same as bare LLM mode).
+  present in bare LLM pipe mode. The shared `extract_pi_text()` /
+  `parse_pi_json_line()` in `skill/scripts/pi_utils.py` handle these
+  transparently by extracting text content from `message_update` events (same as
+  bare LLM mode), and skip user-role `message_start` events so the prompt echo is
+  never mistaken for model output.
 - If response parsing fails, check debug logs (use `--debug-log`) to see the raw
   agent output. The runner automatically falls back to Phase 1 results on Phase 2
   failure.
 - The `_extract_json_array()` function strips prose text before/after JSON arrays,
   so it works correctly regardless of whether the model wraps its output in
   explanatory text (common in agent mode).
+- **Non-string evidence tolerance (SA-0MSKM2LSP006L0K8):** Phase 2 models
+  occasionally emit `evidence` as a structured JSON object (e.g.
+  `{"file": ..., "line": ..., "note": ...}`) inside the verdict array instead
+  of the requested `path/file:line` string. Every evidence consumer — gap
+  mapping to children (`_map_gaps_to_children`), Phase 1 file-scope refs
+  (`_phase1_evidence_refs`), infra-failure marker detection
+  (`_evidence_has_infra_failure_markers`), report assembly, and the verdict
+  re-emit prompt — normalizes through the shared `_evidence_text()` helper:
+  `None` → `""`, `str` → unchanged, `dict`/`list` → `json.dumps` (so embedded
+  file references stay regex-salvageable), anything else → `str()`. Phase 2
+  merge sites (parent deep, child deep, batch) also normalize before writing
+  evidence into `ac_results`, so downstream consumers never receive a
+  non-string. Verdict semantics and the conservative fail-closed gap-mapping
+  behavior are unchanged.
+
+
+## False-positive screen (SA-0MST01NPD007MYG4 / SA-0MST01O4G002VPBR)
+
+Ruff code-quality findings are screened by a single batched Pi call before they can
+block closure:
+
+- **Scope**: only findings with `linter == "ruff"` are screened; non-ruff findings
+  (eslint, markdownlint, shellcheck) are never sent. When no ruff findings exist
+  the screen is skipped entirely — zero Pi calls.
+- **Classifications** (per finding, with a written one-line justification):
+  `genuine` (real defect — stays blocking), `confident-false-positive` (rule
+  misfires — eligible for config remediation), `uncertain` (caution-first —
+  remains blocking).
+- **Caution-first degradation**: a missing finding in the batch, an unparseable
+  response, a provider error, a timeout, a concurrency-limit marker, or a
+  `RuntimeError` from the Pi call defaults EVERY finding to `uncertain` — never
+  `confident-false-positive` — and sets the infra-fallback flag so a verdict
+  derived from the failed screen restores the pre-audit state instead of demoting.
+- **Blocking decision**: only `confident-false-positive` critical/high findings
+  are non-blocking (remediable); `uncertain` findings remain blocking annotated
+  "candidate false positive — producer decision required".
+- Surfaces in the report as a `#### False-positive screen` table under
+  `### Code Quality`, and in `_build_issue_json` under
+  `code_quality.false_positive_screen`.
+
+## Ruff config remediation loop (SA-0MST01OIN008MXYT / SA-0MST01OX4007Z17C)
+
+The justified READ-ONLY exception (SA-0MSSSNOZN000LQKR): a
+`confident-false-positive` critical/high ruff finding is silenced by a MINIMAL,
+surgical ruff config change, then re-scanned:
+
+1. **Locate/create the config** (`locate_ruff_config` in
+   `skill/code_review/scripts/linter_runner.py`): existing `ruff.toml`, else the
+   `pyproject.toml` `[tool.ruff]` section, else a new `ruff.toml` created in
+   `TARGET_PROJECT_ROOT`.
+2. **Minimal edit** (`apply_ruff_remediation`): `per-file-ignores` entries for the
+   flagged file+rule pairs only — no sweeping rule changes, no inline source
+   suppressions, no `_RUFF_SEVERITY_MAP` / `_classify_ruff` edits.
+3. **Local commit** (`_commit_config_remediation`): `git add <config>` +
+   `git commit` (never `git push`), message referencing the work item.
+4. **Fingerprint re-hash** AFTER the commit (working tree clean → freshness gate
+   stable).
+5. **Code-quality-only re-run**: `run_code_quality(fix=False, files=<same
+   changed-file scope>)` — the pipeline is never restarted; remaining findings
+   flow back through the screen.
+6. **Cap**: at most 3 config-fix iterations per audit run by default,
+   env-configurable via `AUDIT_REMEDIATION_MAX_ITERATIONS` (default `3`;
+   invalid values fail closed). A finding persisting past the cap stays blocking
+   `genuine` annotated "remediation loop exhausted". `uncertain` and non-blocking
+   (medium/low) findings never enter the loop.
+
+Outcomes surface in the report as `#### Remediation loop` and in
+`_build_issue_json` under `code_quality.remediation`.
+
+## Chore work-item creation (SA-0MST01PQQ009T0CI)
+
+The ONLY relaxation of the audit's no-create rule, for tracking false positives:
+
+- **Per applied config fix**: a `chore` work item is created via `_run_wl`
+  (`wl create --issue-type chore --title <finding> --description <finding refs +
+  commit sha>`) with full `--worklog-dir` resolution
+  (`_resolve_worklog_flags`: explicit dir > prefix-to-sibling > cwd-chain), so
+  sibling-project audits create the chore in the owning project's worklog.
+- **Medium/low confident-false-positive findings**: a tracking `chore` with no
+  commit link, annotated "candidate false positive — producer decision required".
+- **Never tracked**: `uncertain` and `genuine` findings get no work item.
+- **Fail-safe** (`chore_failures`): a `wl create` failure never reverts the
+  remediation commit; the affected finding stays blocking `genuine` (demoted with
+  `chore_failed`) and the failure is recorded in the report.
+
+Chore ids surface in the report (`#### Remediation loop`) and in
+`_build_issue_json` under `code_quality.remediation.chore_items` /
+`.chore_failures`.
 
 ## Context reduction (SA-0MSISKM8F004NW1U)
 
@@ -467,3 +635,27 @@ runner and a flag-off runner copy, comparing verdicts (controlled before/after
 comparison). Exit status is 0 iff all checks pass; reports are written to
 `--report-dir` as JSON+Markdown for the work item's evidence record. Unit
 tests: `skill/audit/tests/test_verify_context_reduction.py`.
+
+### Recorded evidence (in-scope)
+
+Executed reports are committed under `skill/audit/evidence/` so the
+execution-dependent AC2/AC3 criteria are verifiable from repository files
+(SA-0MSRVNMFW005LWZL):
+
+- `sessions/` — AC2 `check-sessions` report (20 distinct audited items since
+  2026-08-07T11:15, first-call input tokens all < 10K, regenerated
+  2026-08-13).
+- `static/` — AC2 `check-static` report (without flags 14,914 B ≈ 3,728
+  tokens → with flags 1,721 B ≈ 430 tokens, 88.5% reduction).
+- `reaudit-sample/` — AC3 controlled flags-on vs flags-off verdict comparison
+  (run 1: 2026-08-10, run 2: 2026-08-11 triage re-run) with the analysis in
+  `SUMMARY.md` (divergences attributed to model non-determinism, not the
+  change; all per-call input tokens < 10K).
+
+Regenerate with:
+
+```bash
+python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit/evidence/sessions check-sessions
+python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit/evidence/static check-static
+python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit/evidence/reaudit-sample reaudit-sample
+```

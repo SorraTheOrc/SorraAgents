@@ -19,13 +19,13 @@ from skill.audit.scripts.audit_runner import (
     _assemble_project_report,
     _build_issue_json,
     _call_pi,
-    _extract_pi_text,
     _extract_provider_error,
     _has_phase1_blocking_issues,
     build_parser,
     cmd_issue,
     cmd_project,
 )
+from skill.scripts.pi_utils import extract_pi_text
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -383,7 +383,7 @@ class TestCallPi:
                 ],
             }),
         ]) + "\n"
-        assert _extract_pi_text(raw) == ""
+        assert extract_pi_text(raw) == ""
 
 
 # ---------------------------------------------------------------------------
