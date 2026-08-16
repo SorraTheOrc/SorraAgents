@@ -17,6 +17,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
   - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
+  - [skill/report/SKILL.md](skill/report/SKILL.md): the **report helper** — canonical end-of-session report format (Acceptance Criteria table, Meta-Data with ContextHub icons, Producer Actions, Notes, Conclusion) that every work-item skill renders as its final step.
 - plugins/: local agent framework plugins used by this repository.
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
 - Workflow.md: high-level workflow for using this repository.

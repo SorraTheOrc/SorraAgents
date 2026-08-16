@@ -109,10 +109,10 @@ are decorative — the textual value always accompanies them.
 
 ## Icon mappings (ContextHub canonical set)
 
-Source of truth: **`../ContextHub/docs/icons-design.md`** (spec) and
-**`../ContextHub/src/icons.ts`** (implementation, consumed by the `wl` CLI).
-The report helper mirrors these mappings — do not invent new icons in
-individual skills. Bracketed-text fallbacks are used when icons are
+Source of truth: the **ContextHub** project (sibling of this repo —
+``docs/icons-design.md`` spec and ``src/icons.ts`` implementation, consumed by
+the `wl` CLI). The report helper mirrors these mappings — do not invent new
+icons in individual skills. Bracketed-text fallbacks are used when icons are
 unavailable (`--no-icons` / `WL_NO_ICONS=1` / non-emoji terminals); the
 fallback always accompanies the icon so reports stay readable everywhere.
 
@@ -250,7 +250,7 @@ This completes the plan process for SA-0MSJ082OY003IQ8S (Standardize skill sessi
 - `../audit/SKILL.md` — audit's **persisted, machine-verified** report
   format is preserved; only its end-of-session summary reconciles with this
   template.
-- `../ContextHub/docs/icons-design.md` / `../ContextHub/src/icons.ts` —
+- **ContextHub** (sibling project, `docs/icons-design.md` / `src/icons.ts`) —
   canonical icon set consumed by the `wl` CLI.
 - `../effort-and-risk/SKILL.md` — risk (low/medium/high) and effort
   t-shirt (XS–XL) values rendered in Meta-Data.
