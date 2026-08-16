@@ -1,0 +1,150 @@
+{
+  "check": "sessions",
+  "passed": true,
+  "distinct_items": 20,
+  "min_items": 10,
+  "since": "2026-08-07T11:15",
+  "samples": [
+    {
+      "item_id": "SA-0MSCDC4750019G9Y",
+      "input_tokens": 2049,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-07T12-39-16-236Z_019fdc3c-220b-769f-ac92-7e3b27d20a79.jsonl",
+      "ts": "2026-08-07T12:39:17.910Z"
+    },
+    {
+      "item_id": "SA-0MSISKM8F004NW1U",
+      "input_tokens": 2720,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-07T12-41-26-836Z_019fdc3e-2034-7692-8131-82aaa20f6b99.jsonl",
+      "ts": "2026-08-07T12:41:28.313Z"
+    },
+    {
+      "item_id": "SA-0MSIU5HFI0024D7W",
+      "input_tokens": 2034,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-07T12-55-12-980Z_019fdc4a-bb54-7406-b5d7-141a8d895760.jsonl",
+      "ts": "2026-08-07T12:55:16.468Z"
+    },
+    {
+      "item_id": "SA-0MSAIXI1E005SZPV",
+      "input_tokens": 610,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-07T13-56-57-093Z_019fdc83-4085-7642-a24f-6c62552a9f56.jsonl",
+      "ts": "2026-08-07T13:57:01.037Z"
+    },
+    {
+      "item_id": "SA-0MSHID94D009P0TL",
+      "input_tokens": 649,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-07T21-19-29-910Z_019fde18-6a76-7dc0-b5bf-de55e58b75ce.jsonl",
+      "ts": "2026-08-07T21:19:35.187Z"
+    },
+    {
+      "item_id": "SA-0MLDF0YTH01PNA59",
+      "input_tokens": 2975,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-07T23-51-45-643Z_019fdea3-d0eb-7ede-85d4-af07fdcff519.jsonl",
+      "ts": "2026-08-07T23:51:47.191Z"
+    },
+    {
+      "item_id": "SA-0MSKB6V5Q007YDHE",
+      "input_tokens": 2947,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T11-21-27-838Z_019fe641-9e1e-776b-8999-4b72534cec8f.jsonl",
+      "ts": "2026-08-09T11:21:30.003Z"
+    },
+    {
+      "item_id": "SA-0MSKB6VJA005N43F",
+      "input_tokens": 3056,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T11-48-41-813Z_019fe65a-8cd5-70fe-9dea-ef694c173edf.jsonl",
+      "ts": "2026-08-09T11:48:43.472Z"
+    },
+    {
+      "item_id": "SA-0MSAEKOQE009TEB4",
+      "input_tokens": 2910,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T12-25-47-202Z_019fe67c-81c2-7780-b7c5-36663fd1914d.jsonl",
+      "ts": "2026-08-09T12:25:48.809Z"
+    },
+    {
+      "item_id": "SA-0MSBR0E8Y0022Z4V",
+      "input_tokens": 2739,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T14-47-59-843Z_019fe6fe-b462-7688-8ce8-f51499b564b7.jsonl",
+      "ts": "2026-08-09T14:48:02.186Z"
+    },
+    {
+      "item_id": "SA-0MLPU8H3B1LWK3B3",
+      "input_tokens": 2729,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T18-04-04-123Z_019fe7b2-369b-7db6-92ec-bfcef1442511.jsonl",
+      "ts": "2026-08-09T18:04:05.787Z"
+    },
+    {
+      "item_id": "OSL-0MSABC7SB001NVUN",
+      "input_tokens": 2265,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T19-32-08-827Z_019fe802-d9fb-77b4-ac96-1828d6256bf6.jsonl",
+      "ts": "2026-08-09T19:32:11.740Z"
+    },
+    {
+      "item_id": "SA-0MSJELSWS002UF60",
+      "input_tokens": 729,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T21-21-03-865Z_019fe866-9179-7a17-b237-40e0e61a37e1.jsonl",
+      "ts": "2026-08-09T21:21:06.005Z"
+    },
+    {
+      "item_id": "SA-0MSBR0LLT006JCXN",
+      "input_tokens": 749,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T21-21-03-941Z_019fe866-91c5-7263-a089-2f833cf83c36.jsonl",
+      "ts": "2026-08-09T21:21:06.105Z"
+    },
+    {
+      "item_id": "SA-0MSLK7LGA003J0KP",
+      "input_tokens": 1279,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T21-54-00-689Z_019fe884-bb71-7c8d-aa81-9e49c5133a99.jsonl",
+      "ts": "2026-08-09T21:54:02.414Z"
+    },
+    {
+      "item_id": "SA-0MSM6VU2K001IMVP",
+      "input_tokens": 2382,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T22-04-03-451Z_019fe88d-edfb-7d70-8f60-5095eb9eae60.jsonl",
+      "ts": "2026-08-09T22:04:05.360Z"
+    },
+    {
+      "item_id": "SA-0MSMBPIRE00201CV",
+      "input_tokens": 1011,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-09T22-36-49-882Z_019fe8ab-ef5a-7a74-ab0c-294e71dc08cc.jsonl",
+      "ts": "2026-08-09T22:36:53.133Z"
+    },
+    {
+      "item_id": "SA-0MS8UI3H3007GPWX",
+      "input_tokens": 1879,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-10T03-10-02-965Z_019fe9a6-12d5-7f87-a3b0-950f10e661f9.jsonl",
+      "ts": "2026-08-10T03:10:05.265Z"
+    },
+    {
+      "item_id": "SA-0MNXA6AAM0005GJT",
+      "input_tokens": 1281,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-10T06-30-52-394Z_019fea5d-eeea-77dc-a6d0-aaa2ea6ed3f8.jsonl",
+      "ts": "2026-08-10T06:30:53.996Z"
+    },
+    {
+      "item_id": "SA-0MSITKOXI007XD4N",
+      "input_tokens": 1503,
+      "under_10k": true,
+      "session_file": "/home/rgardler/.pi/agent/sessions/--home-rgardler-projects-SorraAgents--/2026-08-10T06-36-07-783Z_019fea62-bee7-7e89-8f39-aa7d0d7c475a.jsonl",
+      "ts": "2026-08-10T06:36:09.339Z"
+    }
+  ],
+  "violations": []
+}

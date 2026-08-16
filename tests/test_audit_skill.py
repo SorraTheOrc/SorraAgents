@@ -14,6 +14,14 @@ class FakeProc(SimpleNamespace):
 def test_persist_audit_calls_wl_update_with_report():
     calls = []
 
+    def _strip_flags(cmd):
+        # persist_audit injects a resolved --worklog-dir <value> pair at
+        # position 1 (SA-0MSKQERKH002IBLG); drop it before keying on the
+        # wl subcommand tokens.
+        if len(cmd) >= 3 and cmd[1] == "--worklog-dir":
+            return cmd[:1] + cmd[3:]
+        return cmd
+
     def fake_runner(cmd, check=False, text=True, capture_output=True):
         # record the command
         calls.append(list(cmd))
@@ -27,11 +35,11 @@ def test_persist_audit_calls_wl_update_with_report():
     assert len(calls) == 4
     # first call: wl show for the priority check
     cmd0 = calls[0]
-    assert cmd0[:3] == ["wl", "show", "SA-TEST"]
+    assert _strip_flags(cmd0)[:3] == ["wl", "show", "SA-TEST"]
     assert "--json" in cmd0
     # second call: wl audit-set
     cmd = calls[1]
-    assert cmd[:3] == ["wl", "audit-set", "SA-TEST"]
+    assert _strip_flags(cmd)[:3] == ["wl", "audit-set", "SA-TEST"]
     assert "--ready-to-close" in cmd
     assert "yes" in cmd
     assert "--raw-output" in cmd
@@ -40,11 +48,11 @@ def test_persist_audit_calls_wl_update_with_report():
     assert cmd[-1] == "--json"
     # ensure wl show was invoked for stage preservation
     cmd2 = calls[2]
-    assert cmd2[:3] == ["wl", "show", "SA-TEST"]
+    assert _strip_flags(cmd2)[:3] == ["wl", "show", "SA-TEST"]
     assert "--json" in cmd2
     # ensure wl update --audit-text was invoked
     cmd3 = calls[3]
-    assert cmd3[:3] == ["wl", "update", "SA-TEST"]
+    assert _strip_flags(cmd3)[:3] == ["wl", "update", "SA-TEST"]
     assert "--audit-text" in cmd3
     assert cmd3[-1] == "--json"
 

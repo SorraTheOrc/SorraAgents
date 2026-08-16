@@ -61,6 +61,27 @@ class TestParsePiJsonLine:
         assert result[0] == ""
         assert result[2] == "Final output"
 
+    def test_message_start_user_role_skipped(self):
+        """A user-role message_start (prompt echo) must not be model output.
+
+        Regression: the unguarded shared parser treated the user prompt echo
+        as a complete text block, causing false parse failures when the model
+        errored out mid-stream (SA-0MSL1Z15600760KC AC2).
+        """
+        line = (
+            '{"type":"message_start",'
+            '"message":{"role":"user","content":[{"type":"text","text":"THE PROMPT ECHO"}]}}'
+        )
+        assert parse_pi_json_line(line) == ("", False, None)
+
+    def test_message_start_assistant_role_extracted(self):
+        """An assistant-role message_start is still extracted as complete text."""
+        line = (
+            '{"type":"message_start",'
+            '"message":{"role":"assistant","content":[{"type":"text","text":"assistant intro"}]}}'
+        )
+        assert parse_pi_json_line(line) == ("", False, "assistant intro")
+
     def test_fallback_content_key(self):
         """Fallback to 'content' key for unrecognized event types."""
         line = '{"type":"unknown","content":"fallback text"}'
@@ -139,3 +160,16 @@ class TestExtractPiText:
         # Should prefer the agent_end (last complete block)
         assert "Ready to close: Yes" in result
         assert "AUDIT REPORT START" in result
+
+    def test_prompt_echo_not_extracted_when_model_errors(self):
+        """A user prompt echo must not become the extracted output.
+
+        Regression: when the model errors out mid-stream, the prompt echo
+        (message_start, role=user) was the last complete block and got
+        returned as model output (SA-0MSL1Z15600760KC AC2).
+        """
+        lines = [
+            '{"type":"session","id":"s"}',
+            '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"THE PROMPT ECHO"}]}}',
+        ]
+        assert extract_pi_text("\n".join(lines)) == ""

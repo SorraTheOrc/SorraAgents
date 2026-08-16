@@ -47,6 +47,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import tomllib
+
 from .detection import detect_languages, get_linters_for_language, probe_linter
 
 # ---------------------------------------------------------------------------
@@ -102,6 +104,148 @@ def _classify_ruff(code: str) -> str:
         return _RUFF_SEVERITY_MAP[prefix[0]]
 
     return _RUFF_DEFAULT_SEVERITY
+
+
+# ---------------------------------------------------------------------------
+# Ruff config remediation (SA-0MSSSNOZN000LQKR Phase B — T2/F2)
+# ---------------------------------------------------------------------------
+#
+# The false-positive screen (audit Phase 1) classifies ruff findings;
+# confident-false-positive critical/high findings are remediated by a
+# MINIMAL surgical ruff config edit (per-file-ignores targeted at the
+# flagged files only) — never sweeping rule changes, never inline
+# suppression comments in source files, and never touching
+# ``_RUFF_SEVERITY_MAP`` / ``_classify_ruff`` (T2 AC2).
+
+
+def locate_ruff_config(project_root: str | Path) -> Path:
+    """Locate the ruff config file for *project_root*, creating one if missing.
+
+    Resolution order (Q6 "create if needed", T2 AC1):
+
+    1. ``ruff.toml`` that already exists → returned unchanged.
+    2. ``pyproject.toml`` that exists → gains a ``[tool.ruff]`` section when
+       absent (a created pyproject-format config), then returned.
+    3. Neither exists → ``ruff.toml`` is created (standalone format).
+
+    The created config is an empty ruff section: the remediation edit
+    (``apply_ruff_remediation``) fills in the ``per-file-ignores`` entries.
+    """
+    root = Path(project_root)
+    ruff_toml = root / "ruff.toml"
+    if ruff_toml.exists():
+        return ruff_toml
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        text = pyproject.read_text(encoding="utf-8")
+        if "[tool.ruff]" not in text:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            pyproject.write_text(text + "\n[tool.ruff]\n", encoding="utf-8")
+        return pyproject
+    ruff_toml.write_text(
+        "# Ruff configuration (created by audit remediation)\n",
+        encoding="utf-8",
+    )
+    return ruff_toml
+
+
+def apply_ruff_remediation(config_path: str | Path,
+                          targets: list[dict]) -> bool:
+    """Add minimal ``per-file-ignores`` entries for the flagged files.
+
+    *targets* is a list of screen entries (``{"finding": {...}}``) whose
+    ``finding`` carries ``file`` + ``code``. Only the flagged file+rule
+    pairs are ignored — no sweeping rule changes, no inline suppression
+    comments in source files, and
+    the severity classifier is never touched (T2 AC2).
+
+    The section header depends on the config format: ``[per-file-ignores]``
+    for ``ruff.toml`` and ``[tool.ruff.per-file-ignores]`` for
+    ``pyproject.toml``. Existing entries are merged (idempotent).
+
+    Returns True when the file was modified, False when there was nothing
+    to add (all entries already present, or no file+code pairs).
+    """
+    entries: dict[str, list[str]] = {}
+    for t in targets or []:
+        finding = t.get("finding", {}) if isinstance(t, dict) else {}
+        file = finding.get("file", "")
+        code = finding.get("code", "")
+        if file and code:
+            entries.setdefault(file, [])
+            if code not in entries[file]:
+                entries[file].append(code)
+    if not entries:
+        return False
+
+    config_path = Path(config_path)
+    section = (
+        "per-file-ignores"
+        if config_path.name == "ruff.toml"
+        else "tool.ruff.per-file-ignores"
+    )
+    text = config_path.read_text(encoding="utf-8")
+    new_text = _merge_per_file_ignores(text, section, entries)
+    if new_text == text:
+        return False
+    config_path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def _merge_per_file_ignores(text: str, section: str,
+                            entries: dict[str, list[str]]) -> str:
+    """Merge ``{file: [codes]}`` into the TOML *section*, preserving the rest.
+
+    Handles both an existing section (merging/updating its keys) and a
+    missing section (appended at the end). The file body outside the
+    section is preserved verbatim.
+    """
+    header = f"[{section}]"
+    lines = text.splitlines(keepends=True)
+    section_idx = next(
+        (i for i, ln in enumerate(lines) if ln.strip() == header), None
+    )
+
+    merged: dict[str, list[str]] = {}
+    body_end = len(lines)
+    if section_idx is not None:
+        i = section_idx + 1
+        while i < len(lines):
+            ln = lines[i].strip()
+            if ln.startswith("["):
+                body_end = i
+                break
+            if "=" in ln and not ln.startswith("#"):
+                key, _, val = ln.partition("=")
+                try:
+                    k = key.strip().strip('"').strip("'")
+                    parsed = tomllib.loads(f"x = {val.strip()}")
+                    v = parsed.get("x")
+                    if isinstance(v, list):
+                        merged[k] = [str(x) for x in v]
+                except tomllib.TOMLDecodeError:
+                    pass
+            i += 1
+        body_end = i
+    else:
+        body_end = len(lines)
+
+    for file, codes in entries.items():
+        existing = merged.setdefault(file, [])
+        for c in codes:
+            if c not in existing:
+                existing.append(c)
+
+    body = "".join(
+        f"{json.dumps(file)} = {json.dumps(codes)}\n"
+        for file, codes in merged.items()
+    )
+    if section_idx is None:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        return text + f"\n[{section}]\n" + body
+    return "".join(lines[:section_idx]) + f"[{section}]\n" + body + "".join(lines[body_end:])
 
 
 def _classify_eslint(severity: Any) -> str:

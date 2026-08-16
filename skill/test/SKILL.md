@@ -13,10 +13,10 @@ useless), or escalated with a clear justification.
 **Part of the contract:** every run is cached per-repo (git state + 2h TTL) and
 consumed read-only by the audit skill to auto-verify execution-dependent ACs —
 the pre-`in_review` suite pass MUST therefore go through this skill. An ad-hoc
-`npx vitest run`/`pytest` at the same commit does not populate the cache, and the
-audit's pre-flight cache gate then blocks the audit outright (non-zero exit, no
-report) until the suite is re-run through this skill at the commit or the
-operator attests with `--green-run HEAD`.
+`npx vitest run`/`pytest` at the same commit does not populate the cache, so the
+audit cannot auto-verify those ACs (it auto-executes the suite itself on a cache
+miss — F3, SA-0MSTN5KRF0097TVP — or the operator attests with `--green-run HEAD`;
+it never hard-blocks — F4, SA-0MSTN8CWM003AAU9).
 
 Inputs
 ------
@@ -47,10 +47,14 @@ python3 ./scripts/run_tests.py --json
 
 **Project-root resolution:** the runner targets the invoking project (see [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md)).
 
-The runner executes, in quiet mode:
+**Suite-command resolution order (F2, SA-0MSTMYE79006NA61):** the full suite is `full_suite_commands(project_root)`, resolved in this order:
 
-- **pytest**: `pytest -q -r a --disable-warnings` (canonicalized via `canonicalize_quiet_test_command` from `../test_runner.py`)
-- **Node**: `node --test "tests/node/**/*.mjs" "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per suite dir). Glob patterns required — node v22.22.1 rejects a bare dir (SA-0MSF8KNE3003JDVD). Only suite dirs that **exist** under the target repo are included — missing dirs are skipped (SA-0MSJELL44009XYIL), so a repo without `tests/node` never gets a guaranteed-failing phantom command.
+1. **`.pi/test-config.json` extension file** (repo root) — overrides convention detection entirely: `{"suiteCommands": ["pytest ...", "node --test ..."], "timeoutPerCommand": 600}`. Use it for bespoke suites (e.g. a monorepo package command) that conventions would miss.
+2. **npm-test convention** — `npm --silent test` for repos whose `package.json` declares a `test` script (TCE-like layouts).
+3. **pytest** — `pytest -q -r a --disable-warnings` (canonicalized via `canonicalize_quiet_test_command` from `../test_runner.py`) ONLY when the repo declares a pytest suite (`pytest.ini` / `[tool.pytest.ini_options]` / pytest-style `tests/**/test_*.py` files).
+4. **Node suite dirs** — `node --test "tests/node/**/*.mjs" "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per suite dir). Glob patterns required — node v22.22.1 rejects a bare dir (SA-0MSF8KNE3003JDVD). Only suite dirs that **exist** under the target repo are included — missing dirs are skipped (SA-0MSJELL44009XYIL), so a repo without `tests/node` never gets a guaranteed-failing phantom command.
+
+An empty resolved set (no extension file, no npm test script, no pytest suite, no node dirs) is NOT an error — the runner reports zero commands and the audit skill treats the repo as execution-impossible (fail-open partial, never blocks — F4 AC2).
 
 Output: JSON with per-suite results and a flat `failures` array (`test_name`, `stdout_excerpt`, `stack_trace`).
 

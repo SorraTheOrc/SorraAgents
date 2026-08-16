@@ -71,6 +71,27 @@ def test_run_audit_dry_run(tmp_path):
     assert 'DRY-RUN' in content
 
 
+def test_run_audit_prompt_echo_not_extracted_as_output(tmp_path, monkeypatch):
+    """AC3: A user prompt-echo (message_start, role=user) must not be written
+    to the audit log as if it were the model's output when the model errors
+    out mid-stream (false-parse regression).
+    """
+
+    class FakeProc:
+        returncode = 0
+        stdout = (
+            '{"type":"session","id":"s"}\n'
+            '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"THE PROMPT ECHO"}]}}\n'
+        )
+        stderr = ''
+
+    monkeypatch.setattr(audit_pr.subprocess, 'run', lambda *a, **k: FakeProc())
+    rc, log = audit_pr.run_audit_in_worktree(str(tmp_path), 'SA-TEST', dry_run=False)
+    assert rc == 0
+    content = open(log).read()  # noqa: SIM115
+    assert 'THE PROMPT ECHO' not in content
+
+
 def test_record_audit_result_dry_run(tmp_path):
     ok = audit_pr.record_audit_result('SA-TEST', True, 'summary', 'raw', dry_run=True)
     assert ok

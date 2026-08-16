@@ -21,7 +21,11 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 ## Pre-flight affirmation
 
-Verify absence before proceeding. Confirm the work item is ready for audit and no active conflicting processes exist.
+Implemented as a lightweight entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY). Before the status lifecycle runs, the runner checks the item's current status:
+
+- **Item already `in_progress` at entry + no `--force`** → abort with exit 1: `Error: Refusing to audit <id>: the work item is already in_progress (a concurrent audit or implementation owns it). Pass --force to bypass this pre-flight guard.` No report is produced, nothing is persisted, and the pre-audit status/stage are untouched (the guard runs before the runner sets `in_progress`). This prevents two audits of the same item racing — both would set `in_progress`, run the pipeline, and the last writer would win on persist + status transition. The concurrency semaphore (`../shared/process_semaphore.py`) caps pi subprocesses host-wide but cannot see per-item claims.
+- **`--force`** → bypass the guard and proceed (also bypasses the freshness gate).
+- **Implementation self-review audits** (implement skill Step 6) audit in-progress items, so they pass `--force`.
 
 ## Status Lifecycle
 
@@ -29,7 +33,8 @@ The runner manages the item's `status`/`stage` during execution to prevent concu
 
 - Capture original status+stage at `cmd_issue()` start; set `in_progress`.
 - `Ready to close: Yes` → `completed`/`in_review` (keep `done` if terminal); `No` → `open`/`plan_complete`.
-- Failure/timeout/unparseable → restore captured pre-audit status/stage (fallback only if undeterminable) and **clear the assignee**. Only an explicit `No` moves to `open` — a transient timeout never demotes an `in_review` item.
+- A completed `Yes` verdict advances **even when AC evidence was fallback-tainted** (e.g. a read-only test skip with a variance note) — a fallback on some ACs does not invalidate an explicit model `Yes` (WL-0MSN7XAUS008WOPQ). The fallback flag only forces the restore path for a `No` verdict (an infra-fallback `No` is not an explicit model assessment).
+- Failure/timeout/unparseable → restore captured pre-audit status/stage (fallback only if undeterminable) and **clear the assignee**. Only an explicit `No` moves to `open` — a transient timeout never demotes an `in_review` item. If a completed `Yes` run is ever restored (script failure during the run), a visible warning is printed — never a silent divergence.
 - `--do-not-persist` doesn't affect the lifecycle; status-update failures are silently caught (still reported).
 
 ### Manual Fallback
@@ -69,15 +74,28 @@ the runner verifies the launch context:
 A mis-scoped audit is indistinguishable from a failed audit, so it MUST fail
 fast (seconds, no pi calls) rather than waste model time. To re-launch
 correctly, cd into the owning project root (a worktree of the owning project
-counts as owning). `--worklog-dir` does not change the project scope; only
-the launch directory does.
+counts as owning).
+
+**Git scope follows the worklog (SA-0MSLLGDW00098UCC).** The runner's
+git-derived content — the file-scope manifest (changed-file list + repo
+index), HEAD attestations, working-tree hashes, and `--green-run` evidence
+— resolves against the **worklog-derived owning project root**
+(`--worklog-dir` parent, else prefix-to-sibling scan), not the launch cwd.
+Launching from any cwd, the git-derived content reflects the audited
+project's repository, and an undeterminable owning root aborts with
+`Error: Undeterminable project scope: ...` before any phase runs (never a
+silent fallback to the launch cwd's repo). Launching from inside the
+owning project — or a worktree of it (same git repository) — keeps git
+resolving to that checkout, so worktree-only changes and the worktree
+branch HEAD stay correct. The remaining `TARGET_PROJECT_ROOT` consumers
+(code-quality scan and debug-log path) are still launch-cwd-bound.
 
 ## Monitored Run Execution
 
 Audits can run for **hours**; the **launch → monitor → abort** contract is in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Summary:
 
 - **Launch:** detached, unique log under `~/.audit_debug/<project>/`; **180-min budget**.
-- **Monitor:** every 3 min — `kill -0 <pid>`, `tail -50 <log>` (markers: `Phase 1 passed: running Phase 2 deep code analysis...`, `Per-call timing:`); confirm log growth.
+- **Monitor:** every 3 min — `kill -0 <pid>`, `tail -50 <log>` (markers: `Phase 1 passed: running Phase 2 deep code analysis...`, `Skipping Phase 2 deep analysis: effort=... risk=...`, `Per-call timing:`); confirm log growth.
 - **Abort:** stale log ≥10 min, ≥3 provider-error retries w/o progress, unexpected exits/loops, or 180-min budget → kill tree (`pkill -TERM -P` → `kill` → `-KILL`); restore pre-audit status/stage only if the runner didn't complete its lifecycle (never demote `in_review`→`open`); append failure notice (progress summary: elapsed time, last phase marker, trigger) and **report the outcome to the operator** (run id, log path, trigger, restored status/stage). Never fabricate a report or override a completed verdict.
 
 ### In-process per-call safeguards (complementary to the external monitor)
@@ -86,7 +104,7 @@ The runner also protects individual Pi calls in-process, so the external monitor
 
 - **Short child Phase-1 screen budget:** lightweight child Phase-1 AC-review screens use a short per-call budget (default 600 s; `AUDIT_CHILD_SCREEN_TIMEOUT` env or `--child-screen-timeout` flag). A screen that exceeds its budget returns a clean timeout verdict (`_timeout` marker + timeout evidence) — never a full 1800 s burn. Phase 2 calls (parent + child deep analysis) and parent Phase-1 screens keep the 1800 s budget.
 - **In-process stall abort:** any single Pi call (Phase 1 or Phase 2) that produces no output for ≥ `AUDIT_STALL_TIMEOUT` seconds (default 600 = 10 min) is aborted in-process inside `_call_pi` (kill + drain) with a `_timeout` verdict and stall evidence, instead of waiting out the remaining per-call budget. The external stale-log abort (≥10 min) remains as a backstop.
-- **Slot-aware child-call concurrency:** the parallel child-call ceiling (Phase-1 child AC review and Phase-2 child deep analysis) is derived dynamically from the local proxy slot status (`/llama/local/status` → `available_slots`/`total_slots`; `AUDIT_SLOT_STATUS_URL`, short 1 s timeout, fail-open). The ceiling is `min(free-slots, configured_max)` with a floor of 1; when the slot query fails the runner degrades to the configured static ceiling (`AUDIT_MAX_CHILD_CONCURRENCY` > `AUDIT_PHASE2_PARALLELISM` > 2).
+- **Slot-aware child-call concurrency:** the parallel child-call ceiling (Phase-1 child AC review and Phase-2 child deep analysis) is derived dynamically from the local proxy slot status (`/llama/local/status` → `available_slots`/`total_slots`; `AUDIT_SLOT_STATUS_URL`, short 1 s timeout, fail-open). The ceiling is `min(free-slots, configured_max)` with a floor of 1; when the slot query fails the runner degrades to the configured static ceiling (`AUDIT_MAX_CHILD_CONCURRENCY` > `AUDIT_PARALLELISM` > 2).
 
 ## Freshness Gate
 
@@ -99,8 +117,9 @@ Short-circuits item-level audits when a recent, valid audit exists. Full behavio
 
 ## Safety and prompt design
 
-- Audit executions are read-only except explicit persistence and the automatic status lifecycle. Mark read-only phases `[READ-ONLY AUDIT]`; persistence `[PERSIST-AUDIT]`.
-- Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) the runner's verdict-driven status lifecycle.
+- Audit executions are read-only except explicit persistence, the automatic status lifecycle, and the ruff config remediation loop. Mark read-only phases `[READ-ONLY AUDIT]`; persistence `[PERSIST-AUDIT]`.
+- **READ-ONLY exception — ruff config remediation (SA-0MSSSNOZN000LQKR, Phase B):** when the false-positive screen classifies a critical/high ruff finding `confident-false-positive`, the pipeline MAY apply a MINIMAL, surgical config fix to silence it: `per-file-ignores` entries for the flagged file+rule pairs only, in `ruff.toml` or the `pyproject.toml` `[tool.ruff]` section (created if absent), committed locally (no push) with the work item referenced; the content fingerprint is re-hashed after each commit and the code-quality scan re-run (`fix=False`, same changed-file scope — the pipeline is never restarted). Capped at 3 config-fix iterations per audit run (`AUDIT_REMEDIATION_MAX_ITERATIONS`); a finding persisting past the cap stays blocking `genuine` annotated "remediation loop exhausted". `uncertain` and non-blocking (medium/low) findings never enter the loop. Each applied config fix is tracked by a `chore` work item linking the finding + commit sha, and each medium/low confident-false-positive finding gets a tracking chore (no commit link, annotated "candidate false positive — producer decision required") — see SA-0MST01PQQ009T0CI. The exception applies ONLY when the model classifies the finding `confident-false-positive` AND the no-breakage verification (T3) is green; it never closes or deletes work items and never pushes. Full documentation in the audit skill reference (D1).
+- Do NOT close or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) the runner's verdict-driven status lifecycle, (3) **creating a `chore` work item to track a false-positive config fix or a medium/low confident-false-positive finding** (the ONLY relaxation of the no-create rule — SA-0MST01PQQ009T0CI). Chore creation is fail-safe: a `wl create` failure never reverts the remediation commit; the finding stays blocking `genuine` and the failure is recorded in the report. `uncertain` and `genuine` findings never get a work item.
 - Refuse any request to run state-modifying `wl` commands outside the authorized flow.
 - If ambiguity prevents a reliable verdict, return immediately and do NOT persist. `--debug-log` appends raw Pi output to JSONL.
 
@@ -113,9 +132,13 @@ Phase 1 (linters + children stage + surface AC pass)
 Phase 2 (model verifies code against each AC)
 ```
 
-- **Phase 1 — Automated Screening:** order (1) code quality check, (2) children stage check (must be `in_review`/`done`), (3) surface AC assessment. Blocking: critical/high findings, or any non-deleted child not in `in_review`/`done`.
-- **Decision Gate:** blocking → all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, "Ready to close: No" — **FINAL**, MUST NOT be overridden. No blockers → proceed to Phase 2 (**MANDATORY**).
-- **Phase 2 — Deep Code Analysis:** **MANDATORY when reached** — model reads actual implementation files, verifies each AC, provides file:line evidence. Never skipped once the gate passes.
+- **Phase 1 — Automated Screening:** order (1) code quality check, (2) children stage check (must be `in_review`/`done`), (3) surface AC assessment. Blocking: critical/high findings (unless screened as a confident false positive), or any non-deleted child not in `in_review`/`done`.
+- **False-positive screen (SA-0MSSSNOZN000LQKR):** after the code-quality scan, ruff findings are classified by a single batched Pi call (`_screen_ruff_findings` in `audit_runner.py`, context `false-positive-screen`, child-screen timeout budget) into `genuine` / `confident-false-positive` / `uncertain` with per-finding written justifications, surfaced in the report (`#### False-positive screen` table) and `_build_issue_json` (`code_quality.false_positive_screen`). Caution-first: a finding missing from the batch, unparseable output, provider error, timeout, concurrency-limit marker, or pi failure defaults EVERY finding to `uncertain` (never `confident-false-positive`) and marks infra-failure provenance (`ac_fallback_used`) so a failed screen restores the pre-audit state instead of demoting. Only `confident-false-positive` critical/high findings stop blocking closure; `uncertain` findings stay blocking annotated `candidate false positive — producer decision required`. Medium/low confident-false-positives are classified and reported but never flagged remediable (remediation is blocking-severity only — F2/T2 scope). The screen is skipped entirely (zero Pi calls) when the scan yields no ruff findings; non-ruff findings are never sent to it.
+- **Decision Gate:** blocking → all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, "Ready to close: No" — **FINAL**, MUST NOT be overridden. No blockers → proceed to Phase 2 (**MANDATORY**), **except** the narrow low-risk/small-item skip below.
+- **Phase 2 — Deep Code Analysis:** **MANDATORY when reached** — model reads actual implementation files, verifies each AC, provides file:line evidence. Never skipped once the gate passes, except for the single, unconditional exception in the next bullet.
+- **Defensive evidence handling (SA-0MSKM2LSP006L0K8):** models occasionally emit `evidence` as a structured JSON object (`{file, line, note}`) instead of the requested `path/file:line` string. All evidence consumers normalize through the shared `_evidence_text()` helper (dict/list → `json.dumps`, other scalars → `str()`), and Phase 2 merge sites normalize before writing into `ac_results` — so gap mapping, file-scope refs, infra-marker detection, and report assembly never crash or silently miss on non-string evidence. Verdict semantics and conservative fail-closed gap mapping are unchanged.
+- **Evidence-scope cap (LP-0MSQ32WM5000NCB7):** the Phase 2 deep prompts (parent `phase2_deep`, child `phase2_child`, batch `phase2_batch`) instruct the model to cite **at most N file:line references per criterion, minimum 1** — a prompt-level bound that shortens evidence-JSON generation (the dominant Phase 2 cost) without changing the model or verdict semantics. Default N is 5; resolve via `--max-citations-per-ac N` (highest), the `audit.max_citations_per_ac` key in the CWD `.ralph.json`/`ralph.config.json`, or the hardcoded default. Invalid values (0/negative/non-int) fail closed to the default with a warning. Parsed evidence/verdicts are never mutated — the canonical report format is preserved. Trade-off: fewer citations per AC shortens deep analysis but narrows evidence breadth; the ≥1 file:line floor keeps every verdict substantiated.
+- **Low-risk/small-item exception (SA-0MSQ026T3009QY2L):** when a work item has `effort` ∈ {Extra Small, Small} **and** `risk` = Low, Phase 2 deep analysis is skipped — Phase 1 verdicts stand unchanged (`met` remains `met`) and the report/evidence records the skip reason. The rule applies tree-wide: the parent and every child in the cascade are evaluated independently against the criterion. **Fail-closed:** missing/unknown `effort` or `risk` ⇒ Phase 2 runs as usual (never skip on absent data). No override flag or env var forces deep analysis for a qualifying node — the skip is unconditional.
 - **Final Verdict:** "met" only when BOTH phases confirm; disagreement → "partial".
 - **Ready-to-close criteria:** (1) all ACs `met`/`adjusted`, (2) all active children `in_review`/`done` (empty stage excluded), (3) no critical/high findings.
 
@@ -179,16 +202,20 @@ Synonym for "Acceptance Criteria"; **Acceptance Criteria** is canonical.
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--audit-children`, `--max-child-audits N`, `--pi-bin`, `--model`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`.
-- **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
+- **Runner:** `./scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`.
+- **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string; cwd-independent — the worklog store is auto-resolved from the work-item id prefix (prefix-to-sibling scan, cwd-chain fallback) when `--worklog-dir` is omitted, so it persists to the item's own store from any cwd (SA-0MSKQERKH002IBLG).
 
 Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, test-cache auto-verification, `--run-tests`, batch/parallel Phase 2, tools-enabled invocation, bounded scanning, debug logs, file-scope manifest, child verdict reuse, phase-1/2 performance) are fully documented in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Execution-dependent ACs can also be verified via the [test skill](../test/SKILL.md) (`/skill:test`).
 
 **Automatic full-suite verification (SA-0MSIU5HFI0024D7W / SA-0MSJELL44009XYIL):** the runner auto-verifies execution-dependent ACs from a green cached full-suite run (read-only `query_cached()`, never executes the suite). Suite commands are repo-aware — only node suite dirs that exist under the target repo are required (`tests/node`, `tests/cli`, `tests/unit`; missing dirs skipped), so any layout can auto-verify. When verification fails, the runner prints a clear diagnostic distinguishing a cache miss (run `/skill:test` / `run_tests.py --force` once at HEAD to populate the cache, then re-audit) from a non-zero cached run (suite is red — fix or attest with `--green-run HEAD`); execution-dependent ACs stay `partial`. Failed runs get a short 5-min cache TTL so transient infra failures are not re-served as current results.
 
-**Pre-flight cache gate (SA-0MSQ72BVV0011SRU):** a cache **miss** is now a hard gate, not a diagnostic: if there is no green cached full-suite run at HEAD (via `query_cached()`) and neither `--run-tests` nor `--green-run <sha|HEAD>` was passed, the runner exits non-zero **before any Phase 1 pi call, report, or persistence** with an actionable message (run `/skill:test` / `run_tests.py --force` at HEAD, then re-audit — or opt out explicitly). No report is produced, nothing is persisted, and the pre-audit work-item status/stage are preserved. This closes the degraded-verdict loop: previously the runner printed the diagnostic and continued, letting the Phase 2 model mark execution-dependent ACs "met" from implementer-reported evidence with no forcing function to populate the cache. The gate is repo-aware (a repo without a pytest suite is never falsely blocked on the phantom pytest command) and fails open on red cached runs and cache errors (partial + diagnostic behavior preserved). The two opt-outs both proceed: `--run-tests` executes the suite and populates the cache; `--green-run <sha|HEAD>` attests.
+**Default auto-execution on cache miss (F3, SA-0MSTN5KRF0097TVP):** when the read-only cache cannot satisfy the evidence (a cache **miss** — no cached green full-suite run at HEAD and no `--green-run` attestation), the audit now AUTO-EXECUTES the repo's actual suite via the test skill (`run_tests.py` / `full_suite_commands`), triages any failures per the test skill, and refreshes the per-repo cache so subsequent audits auto-verify read-only. A green executed run injects the **TEST-SKILL GREEN RUN** evidence block (execution-dependent ACs MAY be marked met); a red run is fail-open — no block, execution-dependent ACs stay `partial` with failure evidence, and the audit continues (never blocks). Operators can opt out with `--no-execute` / `AUDIT_NO_EXECUTE=1` to proceed fail-open partial without executing the suite; `--run-tests` remains the explicit override that executes on ANY non-green state.
 
-**Context reduction (SA-0MSISKM8F004NW1U):** every `_call_pi` runs with `--no-context-files --no-skills`; per-call timing + verification script: [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md).
+**Never-block guarantee (F4, SA-0MSTN8CWM003AAU9):** the audit NEVER exits with a hard block solely because it cannot run tests — no cache, no test runner, no configured suite commands, execution impossible. The old pre-flight hard gate (SA-0MSQ72BVV0011SRU) was removed; every such case degrades to a fail-open `partial` verdict with a clear diagnostic. Verification order for execution-dependent ACs: **(1) read-only cache** (`query_cached()`, green within TTL → AUTO-VERIFIED GREEN RUN) → **(2) auto-execute** on a cache miss via the test skill (green → TEST-SKILL GREEN RUN; red → partial + triaged `test-failure` items) → **(3) partial with documented reason** (red/error/empty cache states, `--no-execute`, or an unresolvable suite command set).
+
+**Per-project suite extension (F2, SA-0MSTMYE79006NA61):** a `.pi/test-config.json` file at the repo root overrides convention detection — `{"suiteCommands": ["..."], "timeoutPerCommand": 600}` — so a bespoke suite (e.g. a monorepo package command) is executed exactly as configured. Resolution order: extension file > npm-test convention (`npm --silent test`) > pytest (only when the repo declares a pytest suite) + node suite dirs (`tests/{unit,node,cli}` that exist).
+
+**Context reduction (SA-0MSISKM8F004NW1U):** every `_call_pi` runs with `--no-context-files --no-skills` in both tool-enabled and tool-less modes. Audit prompts are fully self-contained — they carry the read-only mandate, JSON output format, FILE SCOPE manifest, SCANNING block, and criteria — so the duplicated global+project AGENTS.md load and the skills section are dropped from each session's static context (an 88% reduction, ~23x margin under the 10K-token bound; prompts must never depend on AGENTS.md or skill descriptions — that is an invariant of this skill). Per-call timing + verification script + recorded AC2/AC3 evidence: [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md), [evidence/](evidence/).
 
 ## Guidance for models
 
@@ -201,7 +228,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 ### Two-Phase Pipeline (MANDATORY)
 
 - Return a structured markdown report with `Ready to close:` header and canonical sections (pipeline sections above are normative).
-- **Phase 2 is MANDATORY when Phase 1 passes — never skip it**; verify each AC against actual code with file:line evidence.
+- **Phase 2 is MANDATORY when Phase 1 passes — never skip it**; verify each AC against actual code with file:line evidence. **Sole exception (SA-0MSQ026T3009QY2L):** items with `effort` ∈ {Extra Small, Small} **and** `risk` = Low skip Phase 2 — Phase 1 verdicts stand unchanged, evidence notes the skip, and the rule is fail-closed (missing/unknown values ⇒ deep analysis runs). Applies independently to the parent and every child in the cascade; unconditional (no override flag/env).
 - **Blocking issues are narrow:** only (1) **critical/high** findings and (2) an active child not in `in_review`/`done` block Phase 2. AC ambiguity, medium warnings, or preference are NOT valid reasons to skip.
 - **Ready-to-close criteria:** all ACs `met`/`adjusted`, all active children `in_review`/`done`, no critical/high findings. **Children in `in_review` do NOT block closure** — only pre-review stages do.
 - **Do NOT add release-process or merge-status constraints** — not audit concerns.
@@ -211,7 +238,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 ### Persistence Procedure (MUST FOLLOW)
 
 1. **Print** the complete audit report to stdout.
-2. **Persist** via `python3 ./scripts/persist_audit.py --issue-id <id> --report "<report>"` (or echo-pipe; runner `audit_runner.py issue <id>` persists **and verifies** unless `--do-not-persist`).
+2. **Persist** via `python3 ./scripts/persist_audit.py --issue-id <id> --report "<report>"` (or echo-pipe; runner `audit_runner.py issue <id>` persists **and verifies** unless `--do-not-persist`). The persister targets the work-item's own worklog store from any cwd (auto-resolved via the shared prefix-to-sibling scan when `--worklog-dir` is omitted; an explicit `--worklog-dir` keeps highest precedence).
    > **Readback verification is an invariant:** runner reads back via `wl audit-show <id> --json` (audit exists, `rawOutput` non-empty, content references the ID) or exits non-zero.
 3. **Verify persistence** — exit 0 does NOT guarantee storage: `wl audit-show <id> --json` must show `success=true`, audit not null, `rawOutput` non-empty with `Ready to close:` marker.
 4. **On failure:** re-print, report the error, do NOT mark as recorded.
@@ -225,11 +252,12 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 ```bash
 python3 ./scripts/audit_runner.py issue SA-123                  # audit + persist
 python3 ./scripts/audit_runner.py issue SA-123 --do-not-persist  # dry run
+python3 ./scripts/audit_runner.py issue SA-123 --force           # in-progress item (bypasses pre-flight guard + freshness)
 ```
 
 ## Script Execution Failure Notice
 
-On runner failure (non-zero exit, timeout, exception), the report is wrapped with an `⚠ Script Execution Failure: <script_name> — <reason>` banner above and below (informational, no state changes; `./scripts/failure_notice.py`; JSON key `script_failure`).
+On runner failure (non-zero exit, timeout, exception), the report is wrapped with an `⚠ Script Execution Failure: <script_name> — <reason>` banner above and below (informational, no state changes; `../scripts/failure_notice.py` — note this module lives one level above the audit scripts in the shared scripts dir, unlike the `./scripts/...` runner/persister; JSON key `script_failure`).
 
 ## Common failure modes
 

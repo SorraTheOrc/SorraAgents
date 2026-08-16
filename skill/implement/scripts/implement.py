@@ -425,7 +425,7 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
 # Parent-recursion helpers
 # ---------------------------------------------------------------------------
 
-TERMINAL_STATUSES = {"in_review", "completed", "done"}
+TERMINAL_STATUSES = {"in_review", "completed", "done", "deleted"}
 
 
 def _is_terminal_status(status: str) -> bool:
@@ -434,6 +434,11 @@ def _is_terminal_status(status: str) -> bool:
     A terminal child is never re-implemented and counts toward parent
     advancement (AC-4). ``in_review``/``completed``/``done`` are terminal;
     ``open``/``blocked``/``in_progress`` are not.
+
+    Soft-deleted items (status ``deleted``) are also treated as terminal:
+    they are spurious/removed and can never be implemented, so they must
+    never be claimed by ``phase_parent`` nor block parent advancement
+    (SA-0MSRVN28E009OL5S).
 
     Args:
         status: The work-item status string.

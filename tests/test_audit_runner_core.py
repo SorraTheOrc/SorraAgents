@@ -1223,7 +1223,7 @@ class TestStatusLifecycle:
             },
         )
 
-        cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False)
+        cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False, force=True)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-ORIGSTAT2"]]
         # The only in_progress update is the entry claim — the item must NOT be
@@ -2017,13 +2017,14 @@ class TestCmdIssueChildAuditAutoTrigger:
             fake_call_pi,
         )
 
-        # Fail the launch-context / file-scope guards open (LP-0MSQ32HNR007AI6B):
-        # these tests exercise child auto-trigger logic with fake work items,
-        # not scope validation — an unknown owning project is the documented
-        # fail-open path for both guards.
+        # Resolve ownership to the launch cwd's project root
+        # (SA-0MSLLGDW00098UCC AC2): these tests exercise child auto-trigger
+        # logic with fake work items, not scope validation — undeterminable
+        # ownership now aborts, so resolve to the launch cwd's root (the
+        # legacy fail-open equivalent) to keep the flow deterministic.
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._resolve_owning_project_root",
-            lambda *args, **kwargs: None,
+            lambda *args, **kwargs: Path.cwd(),
         )
 
         triggered_children = []
@@ -2095,7 +2096,8 @@ class TestCmdIssueChildAuditAutoTrigger:
             return _fake_proc(stdout=json.dumps({"success": True}))
 
         cmd_issue("SA-PARENT", runner=fake_runner, persist=True,
-                  audit_children=True)  # cascade is opt-in (SA-0MSKB6V5Q007YDHE)
+                  audit_children=True,  # cascade is opt-in (SA-0MSKB6V5Q007YDHE)
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
         # Should have triggered an audit for the active child
         assert "SA-ACTIVE" in triggered_children
 
@@ -2120,13 +2122,14 @@ class TestCmdIssueChildAuditAutoTrigger:
             fake_call_pi,
         )
 
-        # Fail the launch-context / file-scope guards open (LP-0MSQ32HNR007AI6B):
-        # these tests exercise child auto-trigger logic with fake work items,
-        # not scope validation — an unknown owning project is the documented
-        # fail-open path for both guards.
+        # Resolve ownership to the launch cwd's project root
+        # (SA-0MSLLGDW00098UCC AC2): these tests exercise child auto-trigger
+        # logic with fake work items, not scope validation — undeterminable
+        # ownership now aborts, so resolve to the launch cwd's root (the
+        # legacy fail-open equivalent) to keep the flow deterministic.
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._resolve_owning_project_root",
-            lambda *args, **kwargs: None,
+            lambda *args, **kwargs: Path.cwd(),
         )
 
         def fake_subprocess_run(cmd, **kwargs):
@@ -2187,7 +2190,8 @@ class TestCmdIssueChildAuditAutoTrigger:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=True,
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
 
         # The just-persisted audit must be trusted as fresh: no re-trigger,
         # and the child is treated ready (child_audit_ready=True).
@@ -2529,7 +2533,8 @@ class TestRC2RCFallbackVerdict:
             capturing_assemble,
         )
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False,
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
 
         # Find the child result
         child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
@@ -2593,7 +2598,8 @@ class TestRC2RCFallbackVerdict:
             capturing_assemble,
         )
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False,
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
 
         assert len(captured_ac_results) > 0, "Should have AC results"
         for ac in captured_ac_results:
@@ -2691,7 +2697,8 @@ class TestRC2RCFallbackVerdict:
             capturing_assemble,
         )
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False,
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
 
         child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
         assert child is not None, "Child should be in results"

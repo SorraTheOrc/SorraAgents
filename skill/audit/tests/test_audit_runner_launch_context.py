@@ -18,6 +18,7 @@ skill's own tree — ~124 min model time wasted):
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,18 +85,35 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, P
 
 
 def _make_minimal_runner(recorded: list[list[str]] | None = None,
-                         description: str = ""):
+                         description: str = "",
+                         git_cwd: Path | None = None):
     """Fake runner for the no-child, persist=False cmd_issue happy path.
 
     Handles the wl show/update/children calls plus git (best-effort) and
     defaults every other command to success. *recorded*, when given, receives
     every command list for assertions.
+
+    *git_cwd*, when given, executes git commands for REAL against that
+    directory (simulating a process launched from a worktree checkout)
+    instead of faking them — used by the worktree-launch regression tests
+    (SA-0MSRM7KIF003E0B2) to verify git resolves against the worktree.
     """
     recorded = [] if recorded is None else recorded
 
     def fake_runner(cmd):
         recorded.append(list(cmd))
         cmd_str = " ".join(cmd)
+
+        if git_cwd is not None and cmd and cmd[0] == "git":
+            proc = subprocess.run(
+                list(cmd), cwd=str(git_cwd), check=False,
+                capture_output=True, text=True,
+            )
+            return SimpleNamespace(
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+            )
 
         if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
             return SimpleNamespace(
@@ -266,12 +284,18 @@ class TestLaunchContextGuard:
 
         assert rc == 0
 
-    def test_fail_open_when_ownership_cannot_be_determined(self, tmp_path):
-        """AC1: when no sibling project matches the item's prefix, ownership
-        cannot be determined and the guard fails open (never blocks).
+    def test_undeterminable_ownership_aborts(self, tmp_path, capsys):
+        """AC2 (SA-0MSLLGDW00098UCC): when no sibling project matches the
+        item's prefix and no --worklog-dir is given, ownership is
+        undeterminable — the run aborts with a clear error instead of
+        falling back to the launch cwd's repository for git-derived content.
         """
-        # No patcher → the real sibling scan has no project with prefix ZZZ.
+        # Override the conftest autouse resolvable-ownership fixture: this
+        # test exercises the abort path, so resolution must return None.
         with (
+            mock.patch.object(
+                audit_runner, "_resolve_owning_project_root", return_value=None
+            ),
             mock.patch.object(
                 audit_runner, "TARGET_PROJECT_ROOT", tmp_path / "elsewhere"
             ),
@@ -282,11 +306,13 @@ class TestLaunchContextGuard:
             ),
         ):
             rc = audit_runner.cmd_issue(
-                "ZZZ-1", persist=False, force=True,
+                "ZZ-0001", persist=False, force=True,
                 runner=_make_minimal_runner(description=""),
             )
 
-        assert rc == 0
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "undeterminable project scope" in err.lower()
 
 
 # ===========================================================================
@@ -592,3 +618,288 @@ class TestChildPersistFailureFatal:
             persist_rc=PERSIST_CONTENT_INVALID, tmp_path=tmp_path
         )
         assert rc == 0
+
+
+# ===========================================================================
+# SA-0MSLLGDW00098UCC: git file-scope/HEAD resolution must be
+# cwd-independent — git commands target the owning project's repository.
+# ===========================================================================
+
+
+class TestGitResolutionFromNonOwningCwd:
+    """Git-derived content resolves against the OWNING project, not the
+    launch cwd (SA-0MSLLGDW00098UCC).
+
+    The audit runner's git pieces (HEAD sha, working-tree hash, file-scope
+    manifest, green-run evidence) execute git via the runner, which runs in
+    the process cwd — the launch directory. A launch from an unrelated cwd
+    with ``--worklog-dir`` pointing at the audited project would therefore
+    scope git-derived content to the WRONG repository. The fix pins every
+    runner git command to the owning project's root via ``git -C
+    <owning_root>`` unless the launch cwd IS the owning root (or a worktree
+    of it), where commands pass through byte-identical.
+    """
+
+    def test_git_commands_target_owning_project_root(self, tmp_path):
+        """AC1: a simulated launch from an unrelated cwd with --worklog-dir
+        produces git commands pinned to the owning project via `git -C`.
+        """
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
+        # The launch cwd's project root — unrelated to the owning project.
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+        recorded: list[list[str]] = []
+
+        with (
+            patcher,
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", launch_root
+            ),
+            mock.patch.object(
+                audit_runner, "_verify_launch_context", return_value=None
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(recorded),
+                worklog_dir=str(target),
+            )
+
+        assert rc == 0
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds, "expected at least one git command to be recorded"
+        for cmd in git_cmds:
+            assert cmd[1] == "-C", f"git command lacks -C: {cmd}"
+            assert cmd[2] == str(target_root), (
+                f"git command must target the owning project root: {cmd}"
+            )
+
+    def test_undeterminable_ownership_aborts_before_git(self, tmp_path, capsys):
+        """AC2: unknown prefix + no --worklog-dir + no sibling match aborts
+        with a clear error before any git command runs (no fallback to the
+        launch cwd's repository).
+        """
+        launch_root = tmp_path / "elsewhere"
+        launch_root.mkdir()
+        recorded: list[list[str]] = []
+
+        with (
+            mock.patch.object(
+                audit_runner, "_resolve_owning_project_root", return_value=None
+            ),
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", launch_root
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "ZZ-0001", persist=False, force=True,
+                runner=_make_minimal_runner(recorded),
+            )
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "undeterminable project scope" in err.lower()
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds == [], (
+            "undeterminable ownership must abort before any git command"
+        )
+
+    def test_owning_project_launch_git_commands_unchanged(self, tmp_path):
+        """AC3: launching from the owning project root leaves git commands
+        byte-identical — no `-C` injection, zero regression for the
+        standard owning-project path.
+        """
+        _target, target_root, patcher = _make_sibling_projects(tmp_path)
+        recorded: list[list[str]] = []
+
+        with (
+            patcher,
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", target_root
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(recorded),
+            )
+
+        assert rc == 0
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds, "expected at least one git command to be recorded"
+        for cmd in git_cmds:
+            assert cmd[1] != "-C", (
+                f"owning-project launch must not inject -C: {cmd}"
+            )
+
+
+# ===========================================================================
+# SA-0MSRM7KIF003E0B2: worktree-launch git regression — a launch from a
+# worktree of the owning project keeps git resolving to the WORKTREE
+# checkout (worktree branch HEAD + worktree-only files), never the
+# --worklog-dir parent's main checkout.
+# ===========================================================================
+
+
+def _make_real_git_project_with_worktree(tmp_path: Path,
+                                         prefix: str = "OSL"):
+    """Create a real git repo (owning project) plus a real worktree checkout.
+
+    Layout::
+
+        <tmp>/projects/open_source_llm/.worklog/config.yaml   (prefix: OSL)
+        <tmp>/projects/open_source_llm/.gitignore             (ignores .worklog/)
+        <tmp>/projects/open_source_llm/src/main.py            (tracked marker)
+        <tmp>/projects/open_source_llm/.worklog/worktrees/wl-OSL-1-test/
+            wt_only/main.py            (worktree-only tracked file)
+            wt_uncommitted.txt         (worktree-only untracked file)
+
+    The worktree checks out a branch with a distinct commit (``wt_only/``)
+    and an untracked file, so its HEAD and working tree differ from the
+    main checkout's — a launch from the worktree must resolve git to the
+    worktree checkout (SA-0MSRM7KIF003E0B2).
+
+    Returns ``(worklog_dir, owning_root, worktree_path, main_head,
+    worktree_head)``.
+    """
+    import subprocess as sp
+
+    projects = tmp_path / "projects"
+    owning_root = projects / "open_source_llm"
+    (owning_root / "src").mkdir(parents=True)
+    (owning_root / "src" / "main.py").write_text("print('hi')\n")
+    (owning_root / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    worklog_dir = owning_root / ".worklog"
+    worklog_dir.mkdir(parents=True)
+    (worklog_dir / "config.yaml").write_text(
+        f"projectName: Open Source LLM\nprefix: {prefix}\n", encoding="utf-8"
+    )
+
+    def _git(*args: str, cwd: Path) -> str:
+        proc = sp.run(["git", *args], cwd=str(cwd), check=True,
+                      capture_output=True, text=True)
+        return proc.stdout.strip()
+
+    _git("init", cwd=owning_root)
+    _git("config", "user.email", "test@test.com", cwd=owning_root)
+    _git("config", "user.name", "Test", cwd=owning_root)
+    _git("add", "-A", cwd=owning_root)
+    _git("commit", "-m", "main", cwd=owning_root)
+    main_head = _git("rev-parse", "HEAD", cwd=owning_root)
+
+    worktree_path = (worklog_dir / "worktrees" / "wl-OSL-1-test").resolve()
+    _git("worktree", "add", "-b", "wl-OSL-1-test",
+         str(worktree_path), cwd=owning_root)
+    # worktree-only tracked file (committed on the worktree branch).
+    (worktree_path / "wt_only").mkdir()
+    (worktree_path / "wt_only" / "main.py").write_text("print('wt')\n")
+    _git("add", "-A", cwd=worktree_path)
+    _git("commit", "-m", "worktree-only", cwd=worktree_path)
+    # worktree-only untracked file (uncommitted working-tree state).
+    (worktree_path / "wt_uncommitted.txt").write_text("wt state\n")
+    worktree_head = _git("rev-parse", "HEAD", cwd=worktree_path)
+    return worklog_dir, owning_root, worktree_path, main_head, worktree_head
+
+
+class TestWorktreeLaunchGitResolution:
+    """A launch from a worktree of the owning project keeps git resolving to
+    the worktree checkout (SA-0MSLLGDW00098UCC AC3) — never the
+    --worklog-dir parent's main checkout.
+    """
+
+    def test_worktree_launch_git_commands_byte_identical(self, tmp_path):
+        """AC3: launching from a worktree of the owning project leaves git
+        commands byte-identical (no -C injection), so git resolves against
+        the worktree checkout — not the --worklog-dir parent's main
+        checkout.
+        """
+        worklog_dir, _owning_root, worktree_path, _mh, _wh = (
+            _make_real_git_project_with_worktree(tmp_path)
+        )
+        recorded: list[list[str]] = []
+
+        with (
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", worktree_path
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(recorded, git_cwd=worktree_path),
+                worklog_dir=str(worklog_dir),
+            )
+
+        assert rc == 0
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds, "expected at least one git command to be recorded"
+        for cmd in git_cmds:
+            assert cmd[1] != "-C", (
+                f"worktree launch must not inject -C: {cmd}"
+            )
+
+    def test_worktree_launch_head_and_manifest_reflect_worktree(self, tmp_path):
+        """AC3: HEAD sha and file-scope manifest reflect the WORKTREE state,
+        not the --worklog-dir parent's main checkout.
+        """
+        worklog_dir, _owning_root, worktree_path, main_head, worktree_head = (
+            _make_real_git_project_with_worktree(tmp_path)
+        )
+        assert main_head != worktree_head, "fixture: worktree HEAD must differ"
+        recorded: list[list[str]] = []
+        runner = _make_minimal_runner(recorded, git_cwd=worktree_path)
+
+        with (
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", worktree_path
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=runner,
+                worklog_dir=str(worklog_dir),
+            )
+
+        assert rc == 0
+        # HEAD resolves to the worktree checkout — the worktree branch HEAD.
+        head = audit_runner._resolve_audited_head(runner)
+        assert head == worktree_head, (
+            f"audited HEAD must reflect the worktree checkout "
+            f"({worktree_head}), not the main checkout ({main_head}): got {head}"
+        )
+        # File-scope manifest reflects the worktree state: worktree-only
+        # tracked file in the repo index + worktree-only untracked file in
+        # the changed-files list.
+        manifest = audit_runner._build_file_scope_manifest(
+            {}, [], runner=runner
+        )
+        assert "wt_only" in manifest, (
+            f"manifest must reflect worktree-only files: {manifest!r}"
+        )
+        changed = audit_runner._git_changed_files(runner)
+        assert "wt_uncommitted.txt" in changed, (
+            f"changed files must reflect the worktree working tree: {changed}"
+        )
