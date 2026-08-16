@@ -151,3 +151,21 @@ Fully offline (local `wl` + filesystem). Conservative keyword matching. Scans `.
 - **Bug fix:** `run_wl_search` now correctly parses the `workItems` key from `wl search --json` output.
 
 End.
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 ../report/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met|unmet" \
+  --ac "<...>|<...>|met|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+Then close with: `<work-item-id>: <one-line summary>`. Do NOT re-summarize the report in a different format — the report is the summary.

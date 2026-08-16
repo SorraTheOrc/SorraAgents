@@ -192,3 +192,21 @@ Example:
 - Q: "Can we reuse service X?" — Answer (engineer@acme): "Partially; need a small wrapper. Research: inspected services/x, no adapter — created follow-up wl-789".
 
 Behavior: append before final approval; **idempotent** (update existing records, never duplicate); mark open questions "OPEN QUESTION" with context; respect `.gitignore`. Privacy: record only user/authorized-stakeholder info; redact secrets with a note ("[REDACTED sensitive snippet]"). Traceability: each entry linkable; include `related-to:<work-item-id>` or file-path references when practical.
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 ../report/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met|unmet" \
+  --ac "<...>|<...>|met|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+Then close with: `<work-item-id>: <one-line summary>`. Do NOT re-summarize the report in a different format — the report is the summary.

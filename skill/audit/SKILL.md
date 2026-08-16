@@ -264,3 +264,25 @@ On runner failure (non-zero exit, timeout, exception), the report is wrapped wit
 - **Silent persistence failure:** `persist_audit.py` / `wl audit-set` returns success without storing — **always verify with `wl audit-show --json`**.
 - `wl` unavailable/invalid JSON → report the error, do not claim success.
 - Agent-mode response parsing (Phase 2 JSON streams, `_extract_json_array`) is documented in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md).
+
+
+## Final step: standardized end-of-session report
+
+The audit's **persisted** machine-verified report (``Ready to close:`` header,
+``## Summary``, ``## Acceptance Criteria Status``) is unchanged and remains
+the authoritative audit record. Only the agent's end-of-session summary
+reconciles with the canonical template — render it as the **last step**, then
+close with: `<work-item-id>: <one-line summary>`.
+
+```bash
+python3 ../report/scripts/render_report.py <work-item-id> \
+  --skill-name audit \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met|unmet" \
+  --ac "<...>|<...>|met|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+Do NOT re-summarize the report in a different format — the report is the summary.
