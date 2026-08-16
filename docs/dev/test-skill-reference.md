@@ -81,7 +81,8 @@ runner's auto-execution path, and its read-only cache classification):
    convention detection entirely: `{"suiteCommands": ["..."], "timeoutPerCommand": 600}`.
    Use it for bespoke suites (e.g. a monorepo package command) that
    conventions would miss. `timeoutPerCommand` overrides the audit runner's
-   `AUDIT_TEST_SKILL_RUN_TIMEOUT` default (600s per command).
+   default per-command timeout (600s, `AUDIT_TEST_SKILL_RUN_TIMEOUT` code
+   constant — not an env var).
 2. **npm-test convention** — `npm --silent test` for repos whose
    `package.json` declares a `test` script (TCE-like layouts).
 3. **pytest** — `pytest -q -r a --disable-warnings` ONLY when the repo
