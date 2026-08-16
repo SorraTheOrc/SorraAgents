@@ -240,6 +240,88 @@ def test_audit_failed():
     assert "- Audit: [NO] failed" in _render(data, no_icons=True)
 
 
+# ── Icon mapping drift guard (ContextHub canonical set) ─────────────────────
+#
+# Pins the renderer's icon tables to the values documented in
+# ../ContextHub/docs/icons-design.md (the canonical set consumed by the wl
+# CLI). If ContextHub's documented mapping changes, this test fails and the
+# renderer tables + SKILL.md mapping table must be updated together — the
+# report helper's icon sets cannot drift independently.
+
+def test_priority_icons_match_contexthub_docs():
+    expected = {
+        "critical": ("🚨", "[CRIT]"),
+        "high": ("⭐", "[HIGH]"),
+        "medium": ("📋", "[MED]"),
+        "low": ("🐢", "[LOW]"),
+    }
+    assert mod.PRIORITY_ICONS == expected
+
+
+def test_status_icons_match_contexthub_docs():
+    expected = {
+        "open": ("🔓", "[OPEN]"),
+        "in-progress": ("🔄", "[INPR]"),
+        "completed": ("✔️", "[DONE]"),
+        "blocked": ("⛔", "[BLKD]"),
+        "deleted": ("🗑️", "[DEL]"),
+        "input_needed": ("💬", "[HELP]"),
+    }
+    assert mod.STATUS_ICONS == expected
+
+
+def test_stage_icons_match_contexthub_docs():
+    expected = {
+        "idea": ("💡", "[IDEA]"),
+        "intake_complete": ("📥", "[INTAKE]"),
+        "plan_complete": ("📋", "[PLAN]"),
+        "in_progress": ("🛠️", "[PROG]"),
+        "in_review": ("🔍", "[REVIEW]"),
+        "done": ("🏁", "[DONE]"),
+    }
+    assert mod.STAGE_ICONS == expected
+
+
+def test_risk_icons_match_contexthub_docs():
+    expected = {
+        "low": ("🌱", "[LOW]"),
+        "medium": ("⚠️", "[MED]"),
+        "high": ("🔥", "[HIGH]"),
+        "severe": ("🚨", "[SEV]"),
+    }
+    assert mod.RISK_ICONS == expected
+
+
+def test_effort_icons_match_contexthub_docs():
+    expected = {
+        "xs": ("🐜", "[XS]"),
+        "s": ("🐇", "[S]"),
+        "m": ("🐕", "[M]"),
+        "l": ("🐘", "[L]"),
+        "xl": ("🐋", "[XL]"),
+        "extra small": ("🐜", "[XS]"),
+        "small": ("🐇", "[S]"),
+        "medium": ("🐕", "[M]"),
+        "large": ("🐘", "[L]"),
+        "extra large": ("🐋", "[XL]"),
+        "xlarge": ("🐋", "[XL]"),
+    }
+    assert mod.EFFORT_ICONS == expected
+
+
+def test_audit_icons_match_contexthub_docs():
+    expected = {
+        "yes": ("✅", "[YES]"),
+        "no": ("❌", "[NO]"),
+        "unknown": ("❔", "[UNKN]"),
+    }
+    assert mod.AUDIT_ICONS == expected
+
+
+def test_epic_type_icon_matches_contexthub_docs():
+    assert mod.EPIC_ICONS == {"epic": ("🏰", "[EPIC]")}
+
+
 # ── Conclusion ───────────────────────────────────────────────────────────────
 
 def test_conclusion_format():
