@@ -183,7 +183,7 @@ Then output a summary of what each stage checked/found.
    - Run `wl show <work-item-id> --children --json` to fetch existing children.
    - Order children by dependency edges using `wl dep list <id> --json` (topological order, ties broken by listed order).
    - For each child (in dependency order), recurse: if that child has its own children, process them first.
-   - Use the shared tree-coverage helper from `skill/shared/tree_coverage.py`:
+   - Use the shared tree-coverage helper from `../shared/tree_coverage.py`:
      ```bash
      python3 ./tree_coverage.py run-coverage-review <work-item-id>
      ```
