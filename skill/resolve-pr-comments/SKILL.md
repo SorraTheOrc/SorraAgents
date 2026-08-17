@@ -155,8 +155,8 @@ Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../re
 python3 ../report/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met|unmet" \
-  --ac "<...>|<...>|met|unmet" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
   [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]

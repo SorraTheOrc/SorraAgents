@@ -312,10 +312,14 @@ def _load_payload(work_item_id: str) -> dict:
 
 
 def _parse_ac(spec: str) -> dict:
-    """Parse an ``--ac`` argument: ``description|metric|met|unmet``."""
+    """Parse an ``--ac`` argument: ``description|metric|verdict``.
+
+    Exactly three pipe-separated fields; ``verdict`` is ``met`` or ``unmet``
+    (case-insensitive; ``yes``/``true``/``1`` accepted as met).
+    """
     parts = spec.split("|")
     if len(parts) != 3:
-        raise SystemExit(f"--ac expects 'description|metric|met|unmet', got: {spec!r}")
+        raise SystemExit(f"--ac expects 'description|metric|verdict' (VERDICT: met|unmet), got: {spec!r}")
     description, metric, verdict = (p.strip() for p in parts)
     met = verdict.lower() in {"met", "yes", "true", "1"}
     return {"description": description, "metric": metric, "met": met}
@@ -332,8 +336,8 @@ def main(argv: list[str] | None = None) -> int:
         "--ac",
         action="append",
         default=[],
-        metavar="DESCRIPTION|METRIC|met|unmet",
-        help="Acceptance criterion row; repeat for each AC",
+        metavar="DESCRIPTION|METRIC|VERDICT",
+        help="Acceptance criterion row; repeat for each AC (VERDICT: met or unmet)",
     )
     parser.add_argument("--producer-actions", default=None, help="Producer actions (default: None needed)")
     parser.add_argument("--notes", default="", help="Freeform notes section")

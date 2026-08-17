@@ -322,6 +322,54 @@ def test_epic_type_icon_matches_contexthub_docs():
     assert mod.EPIC_ICONS == {"epic": ("🏰", "[EPIC]")}
 
 
+# ── CLI --ac argument parsing ─────────────────────────────────────────────────
+#
+# The parser accepts exactly 3 pipe-separated fields: description|metric|verdict
+# where verdict is one of met/unmet (case-insensitive; yes/true/1 aliases).
+
+
+def test_parse_ac_met_verdict():
+    parsed = mod._parse_ac("Helper skill exists|grep SKILL.md|met")
+    assert parsed == {
+        "description": "Helper skill exists",
+        "metric": "grep SKILL.md",
+        "met": True,
+    }
+
+
+def test_parse_ac_unmet_verdict():
+    parsed = mod._parse_ac("All skills wired|grep across 16 SKILL.md files|unmet")
+    assert parsed == {"description": "All skills wired", "metric": "grep across 16 SKILL.md files", "met": False}
+
+
+def test_parse_ac_strips_whitespace():
+    parsed = mod._parse_ac("  Desc  |  Metric  |  met  ")
+    assert parsed == {"description": "Desc", "metric": "Metric", "met": True}
+
+
+def test_parse_ac_verdict_aliases():
+    for alias in ("yes", "true", "1", "MET", "Met"):
+        assert mod._parse_ac(f"Desc|Metric|{alias}")["met"] is True, f"alias {alias!r} should parse as met"
+
+
+def test_parse_ac_rejects_four_fields():
+    # The old (incorrectly documented) 4-field form must fail loudly.
+    try:
+        mod._parse_ac("Desc|Metric|met|unmet")
+    except SystemExit as exc:
+        assert "met" in str(exc.code)
+    else:
+        raise AssertionError("4-field spec should raise SystemExit")
+
+
+def test_parse_ac_rejects_too_few_fields():
+    try:
+        mod._parse_ac("Desc|Metric")
+    except SystemExit:
+        return
+    raise AssertionError("2-field spec should raise SystemExit")
+
+
 # ── Conclusion ───────────────────────────────────────────────────────────────
 
 def test_conclusion_format():

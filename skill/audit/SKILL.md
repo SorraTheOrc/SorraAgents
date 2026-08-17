@@ -279,8 +279,8 @@ close with: `<work-item-id>: <one-line summary>`.
 python3 ../report/scripts/render_report.py <work-item-id> \
   --skill-name audit \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met|unmet" \
-  --ac "<...>|<...>|met|unmet" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
   [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
