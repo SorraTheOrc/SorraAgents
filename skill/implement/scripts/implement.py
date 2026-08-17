@@ -849,6 +849,66 @@ def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> b
     return True
 
 
+def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool:
+    """Initialize git submodules inside a newly-created worktree.
+
+    ``git worktree add`` does not automatically initialize submodules.  This
+    helper runs ``git submodule update --init --recursive`` inside the
+    worktree so that downstream builds and tests see the expected submodule
+    content.
+
+    Best-effort only — submodule initialisation failure is **never fatal**.
+    On failure a warning is logged and the worktree is left usable.
+
+    When the main checkout has no ``.gitmodules`` the command is a no-op and
+    returns ``False``.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout (unused but kept for
+            API symmetry with ``_ensure_node_modules_symlink``).
+
+    Returns:
+        ``True`` if submodules were initialised (or there were none),
+        ``False`` if the command failed or there was nothing to do.
+    """
+    # Quick check: does the repo even have submodules?
+    gitmodules = Path(repo_root) / ".gitmodules" if repo_root else None
+    if gitmodules and not gitmodules.is_file():
+        LOG.info("No .gitmodules found at %s; skipping submodule init.", gitmodules)
+        return False
+
+    try:
+        result = subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 min — generous for large submodule trees.
+        )
+        if result.returncode != 0:
+            LOG.warning(
+                "Submodule initialisation failed in worktree %s (rc=%d): %s",
+                worktree_path,
+                result.returncode,
+                result.stderr.strip() or result.stdout.strip(),
+            )
+            return False
+        LOG.info(
+            "Submodules initialised in worktree %s.", worktree_path
+        )
+        return True
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError) as exc:
+        LOG.warning(
+            "Submodule initialisation errored in worktree %s: %s",
+            worktree_path,
+            exc,
+        )
+        return False
+
+
 def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
     """Remove a worktree directory gracefully.
 
@@ -1794,6 +1854,10 @@ def phase_start(
     # dist-spawning tests resolve dependencies without manual setup. Never
     # fatal: skip when either side lacks node_modules (SA-0MSGS763C006SM1B).
     _ensure_node_modules_symlink(abs_wt_path, _get_repo_root())
+
+    # Initialise git submodules in the worktree (git worktree add does not
+    # do this automatically). Best-effort: a warning on failure, never fatal.
+    _ensure_submodules(abs_wt_path, _get_repo_root())
 
     # Update status with stage via shared helper
     try:

@@ -192,6 +192,11 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > `<worktree>/node_modules -> <repo-root>/node_modules` when the main checkout
 > has one (SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** — writes pass through the symlink, corrupting the shared tree.
 
+> **Git submodules are auto-initialised:** `implement.py start` runs
+> ``git submodule update --init --recursive`` inside the new worktree (SA-0MSN52GGN002B0AZ).
+> Failures produce a ``WARNING`` log message but **do not abort** — the worktree
+> remains usable (best-effort). Repos without ``.gitmodules`` are unaffected.
+
 See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 
 5. Implement
