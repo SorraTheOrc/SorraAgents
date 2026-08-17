@@ -2489,7 +2489,7 @@ class TestChildScreenShortBudget:
             return_value={"extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}, {"index": 1, "verdict": "met", "evidence": "ok"}]'},
         ) as mock_call, mock.patch.object(audit_runner, "_build_file_scope_manifest", return_value="manifest"):
             audit_runner._phase1_review_child_acs(
-                0, child, "test-model", "pi", None, None,
+                0, child, "test-model", "test-model", "pi", None, None,
                 mock.MagicMock(), lambda *a, **k: None,
             )
         _args, kwargs = mock_call.call_args

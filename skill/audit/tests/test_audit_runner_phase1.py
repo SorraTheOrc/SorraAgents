@@ -611,7 +611,8 @@ class TestPhase1ChildWorkerExceptionSafety:
         ):
             ci, acs = audit_runner._phase1_review_child_acs(
                 0, child,
-                resolved_model="test-model",
+                phase1_model="test-model",
+                full_model="test-model",
                 pi_bin="pi",
                 debug_log=None,
                 timeout=None,

@@ -146,6 +146,16 @@ Phase 2 (model verifies code against each AC)
 
 > **IMPORTANT:** Release process constraints are NOT audit concerns. Do NOT include merge-status, deployment, or release criteria.
 
+### Tiered Phase 1 model (SA-0MSKB697P000T3HG)
+
+Phase 1 parent + child AC screening can run on a fast/cheap model while Phase 2 deep analysis keeps the full model:
+
+- **Config key:** `model.audit_phase1` in the CWD `.ralph.json` / `ralph.config.json` (same resolution shape as `model.audit` — dotted, nested, or `model.remote.audit_phase1` / `model.local.audit_phase1` source-mapped).
+- **Default (safe):** when `model.audit_phase1` is absent, Phase 1 resolves to the full `model.audit` model — behavior is byte-for-byte identical to a single-model audit. The flag defaults OFF.
+- **Resolution order (Phase 1 model):** 1. `--phase1-model` CLI flag (explicit phase-1 override), 2. `--model` CLI flag, 3. `model.audit_phase1` config, 4. `model.audit` (full model), 5. `DEFAULT_MODEL` (`Local Proxy/plan`). Phase 2 always resolves via `model.audit` (1. `--model`, 2. config, 3. default).
+- **Wall-clock target:** Phase 1 per-call < **60s** on a healthy proxy when a fast model is configured (baseline: 1,348s avg / max 2,400s — see `docs/dev/audit-phase2-measured-report.md`). Per-call `Per-call timing:` stderr lines remain the observability surface.
+- **Safe runtime fallback (AC4):** when the fast Phase 1 model cannot produce reliable batched verdict JSON (unparseable output, provider error, or concurrency-limit timeout) AND a distinct full model is configured, the SAME Phase 1 screen is retried once with the full model before falling back to `partial` diagnostics. With the default config (`audit_phase1` absent) the retry is a no-op. An infra failure on the fast attempt that succeeds on the full-model retry keeps the conservative `ac_fallback_used` provenance (restore-not-demote).
+
 ### Model metadata line
 
 With ``--model``/``--model-source``, a metadata line goes after ``Ready to close:`` in issue/child reports (project reports NOT modified):
@@ -204,7 +214,7 @@ Synonym for "Acceptance Criteria"; **Acceptance Criteria** is canonical.
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`.
+- **Runner:** `./scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model`, `--phase1-model`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`.
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string; cwd-independent — the worklog store is auto-resolved from the work-item id prefix (prefix-to-sibling scan, cwd-chain fallback) when `--worklog-dir` is omitted, so it persists to the item's own store from any cwd (SA-0MSKQERKH002IBLG).
 
 Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, test-cache auto-verification, `--run-tests`, batch/parallel Phase 2, tools-enabled invocation, bounded scanning, debug logs, file-scope manifest, child verdict reuse, phase-1/2 performance) are fully documented in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Execution-dependent ACs can also be verified via the [test skill](../test/SKILL.md) (`/skill:test`).

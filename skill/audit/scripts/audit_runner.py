@@ -6,7 +6,7 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--run-tests] [--no-execute]
+  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--phase1-model <name>] [--run-tests] [--no-execute]
   audit_runner.py project [--pi-bin pi] [--model <name>]
 
 Verdicts:
@@ -615,6 +615,7 @@ RALPH_CONFIG_FILES = [
     Path("ralph.config.json"),
 ]
 AUDIT_PHASE = "audit"
+AUDIT_PHASE1 = "audit_phase1"
 
 # ---------------------------------------------------------------------------
 # Types
@@ -2308,7 +2309,7 @@ def _extract_phase_model_config(config: dict) -> dict[str, object]:
     phase_config: dict[str, object] = {}
     model_root = config.get("model")
 
-    for phase in (AUDIT_PHASE,):
+    for phase in (AUDIT_PHASE, AUDIT_PHASE1):
         # Check dotted keys first (model.audit, model.remote.audit, etc.)
         dotted_key = config.get(f"model.{phase}")
         if dotted_key is not None:
@@ -2369,6 +2370,59 @@ def _resolve_model_for_phase(phase: str, config: dict,
         return resolved
 
     # 3. Hardcoded fallback
+    return DEFAULT_MODEL
+
+
+def _resolve_phase1_model(config: dict, model_source: str,
+                         cli_model: str | None = None,
+                         cli_phase1_model: str | None = None,
+                         full_model: str | None = None) -> str:
+    """Resolve the Phase 1 (fast/cheap screening) model.
+
+    Resolution chain:
+      1. ``--phase1-model`` CLI flag (explicit phase-1 override, highest)
+      2. ``--model`` CLI flag (explicit full-audit override)
+      3. Config-driven: ``model.audit_phase1`` from .ralph.json resolved via
+         model_source (falls back to ``model.audit`` — the full model — when
+         the phase-1 key is absent; SA-0MSKB697P000T3HG AC1)
+      4. Hardcoded fallback: DEFAULT_MODEL
+
+    Phase 1 (parent + child AC screening) runs on the fast/cheap model while
+    Phase 2 deep analysis keeps the full ``model.audit`` model.
+
+    The *full_model* argument is the already-resolved full audit model
+    (``_resolve_model_for_phase(AUDIT_PHASE, ...)``); when ``model.audit_phase1``
+    is absent the screening falls back to exactly that value, so a config with
+    only ``model.audit`` behaves byte-for-byte like today.
+    """
+    # 1. Explicit phase-1 CLI override
+    explicit = _coerce_model_str(cli_phase1_model)
+    if explicit:
+        return explicit
+
+    # 2. CLI override (applies to the whole audit)
+    explicit = _coerce_model_str(cli_model)
+    if explicit:
+        return explicit
+
+    # 3. Config-driven resolution: model.audit_phase1, falling back to
+    # the full model (model.audit) when the phase-1 key is absent.
+    phase_config = _extract_phase_model_config(config)
+    config_value = phase_config.get(AUDIT_PHASE1)
+    resolved = _resolve_phase_model_value(config_value, model_source)
+    if resolved:
+        return resolved
+
+    # AC1: no model.audit_phase1 → fall back to model.audit (full model).
+    # The caller usually passes the already-resolved full model; when absent
+    # (standalone resolution), resolve model.audit from the config directly.
+    if full_model is None:
+        full_value = phase_config.get(AUDIT_PHASE)
+        full_model = _resolve_phase_model_value(full_value, model_source)
+    if full_model:
+        return full_model
+
+    # 4. Hardcoded fallback
     return DEFAULT_MODEL
 
 
@@ -3910,8 +3964,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             supplied, the per-call timing line appends ``ac_count=N`` and
             ``avg_ac_elapsed_seconds`` (elapsed / N) so Phase-2 per-AC
             latency is visible and regressions surface (LP-0MSQ32WM5000NCB7
-            F4 AC1). A count of 0 is emitted without the avg field; a
-            missing count keeps the legacy timing format byte-for-byte.
+            F4 AC1). A count of 0 is emitted without the avg field. Every
+            timing line also appends ``model=<model>`` so the serving model
+            is observable per call (tiered Phase 1 fast vs Phase 2 full,
+            SA-0MSKB697P000T3HG).
 
         # Context reduction: every forwarded pi call runs with
         ``--no-context-files --no-skills`` (see _call_pi) so audit sessions
@@ -3948,6 +4004,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                 timing += (
                     f" avg_ac_elapsed_seconds={float(elapsed) / ac_count:.2f}"
                 )
+        # Surface the serving model so tiered Phase 1 (fast/cheap) vs Phase 2
+        # (full) usage is verifiable from the timing line alone
+        # (SA-0MSKB697P000T3HG AC2/AC3).
+        timing += f" model={model}"
         print(timing, file=sys.stderr)
 
     # Decide whether to write a debug line
@@ -4239,18 +4299,25 @@ def _child_acs_from_own_audit(child: dict, runner: Runner,
     return fallback if fallback is not None else fallback_met
 
 
-def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
-                             pi_bin: str, debug_log: str | None,
+def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
+                             full_model: str, pi_bin: str,
+                             debug_log: str | None,
                              timeout: int | None, runner: Runner,
                              script_failure_callback: Callable[[str, Exception], None],
                              ac_fallback_used: threading.Event | None = None
                              ) -> tuple[int, list[dict]]:
     """Phase 1 child AC review worker (P7, parallel-safe).
 
-    Runs the batched Phase 1 acceptance-criteria screening for one child and
+    Runs the batched Phase 1 acceptance-criteria screening for one child on
+    the fast Phase 1 model (*phase1_model*, ``model.audit_phase1``) and
     returns ``(ci, child_ac_results)``. The prompt includes the file-scope
     manifest and SCANNING block, and the call runs with read-only tools
     (``enable_tools=True``) — mirroring the Phase 2 performance pattern.
+
+    AC4 safe fallback (SA-0MSKB697P000T3HG): when the fast model cannot
+    produce reliable batched verdict JSON and a distinct full model is
+    configured, the SAME screen is retried once with *full_model* before
+    falling back to diagnostic 'partial' verdicts.
 
     Never raises: a Pi ``RuntimeError`` records a script failure and falls
     back to diagnostic ``partial`` verdicts (identical to the historical
@@ -4286,12 +4353,11 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
             f"Criteria: {child_ac_list}"
         )
         try:
-            result = _call_pi_and_maybe_log(
+            result, batch, raw_text = _call_phase1_screen(
                 child.get("id", ""), f"child:{child.get('id', '')}", prompt,
-                model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
-                enable_tools=True, timeout=timeout,
-                ac_fallback_used=ac_fallback_used,
-                child_screen=True,
+                phase1_model, pi_bin, debug_log, timeout, ac_fallback_used,
+                script_failure_callback, failure_label="child AC review",
+                child_screen=True, enable_tools=True,
             )
         except RuntimeError as exc:
             script_failure_callback("pi (child AC review)", exc)
@@ -4300,14 +4366,21 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                 file=sys.stderr,
             )
             result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
-        # Use extracted_text (full response) instead of evidence (may be truncated)
-        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
-        batch = _extract_json_array(raw_text)
-        if batch is None:
-            try:
-                batch = json.loads(raw_text)
-            except json.JSONDecodeError:
-                batch = []
+        # AC4 safe fallback (SA-0MSKB697P000T3HG): a fast Phase 1 model that
+        # cannot produce reliable batched verdict JSON is retried once with
+        # the full audit model before falling back to 'partial'.
+        if not batch and phase1_model != full_model:
+            print(
+                "Warning: fast Phase 1 model produced unparseable output — "
+                "retrying child AC review with the full audit model",
+                file=sys.stderr,
+            )
+            result, batch, raw_text = _call_phase1_screen(
+                child.get("id", ""), f"child:{child.get('id', '')}", prompt,
+                full_model, pi_bin, debug_log, timeout, ac_fallback_used,
+                script_failure_callback, failure_label="child AC review",
+                child_screen=True, enable_tools=True,
+            )
         if isinstance(batch, list) and batch and any(
             isinstance(item, dict) and "index" in item for item in batch
         ):
@@ -5564,10 +5637,12 @@ class _AuditContext:
     run_tests: bool
     no_execute: bool = False
     max_citations_per_ac: int | None = None
+    phase1_model: str | None = None
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
     resolved_model: str = DEFAULT_MODEL
+    resolved_phase1_model: str = DEFAULT_MODEL
     green_run_block: str | None = None
     green_run_sha: str | None = None
     auto_green_run_sha: str | None = None
@@ -5660,6 +5735,14 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     config = _load_config()
     resolved_model = _resolve_model_for_phase(
         AUDIT_PHASE, config, model_source, cli_model=model,
+    )
+    # Tiered Phase 1 model (SA-0MSKB697P000T3HG): Phase 1 parent + child AC
+    # screening resolves model.audit_phase1 (fast/cheap), falling back to the
+    # full audit model when absent; Phase 2 deep analysis keeps model.audit.
+    phase1_model = _resolve_phase1_model(
+        config, model_source, cli_model=model,
+        cli_phase1_model=ctx.phase1_model,
+        full_model=resolved_model,
     )
 
     if runner is None:
@@ -5861,6 +5944,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
     ctx.resolved_model = resolved_model
+    ctx.resolved_phase1_model = phase1_model
     ctx.green_run_block = green_run_block
     ctx.green_run_sha = green_run_sha
     ctx.auto_green_run_sha = auto_green_run_sha
@@ -6557,6 +6641,49 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     return None
 
 
+def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
+                        pi_bin: str, debug_log: str | None,
+                        timeout: int | None,
+                        ac_fallback_used: threading.Event | None,
+                        on_runtime_error: Callable[[str, Exception], None],
+                        failure_label: str,
+                        child_screen: bool = False,
+                        enable_tools: bool = True) -> tuple[dict, list, str]:
+    """Call Pi for one Phase 1 batched AC screen and parse the verdict JSON.
+
+    Returns ``(result, batch, raw_text)`` where *batch* is the parsed list
+    of index-bearing verdict dicts, or ``[]`` when the response was not a
+    parseable verdict array (the caller falls back to 'partial'); *raw_text*
+    is the raw response text (used for debug logging on the fallback path).
+    Never raises: a ``RuntimeError`` is recorded via *on_runtime_error*
+    (script name ``pi (<failure_label>)``) and converts to a diagnostic
+    fallback result.
+    """
+    try:
+        result = _call_pi_and_maybe_log(
+            issue_id, context, prompt, model=model, pi_bin=pi_bin,
+            debug_log=debug_log, enable_tools=enable_tools, timeout=timeout,
+            ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+        )
+    except RuntimeError as exc:
+        on_runtime_error(f"pi ({failure_label})", exc)
+        print(f"Warning: Pi call failed for {failure_label}: {exc}", file=sys.stderr)
+        return {"verdict": "unmet", "evidence": "", "extracted_text": ""}, [], ""
+    raw_text = (result.get("extracted_text", "") or result.get("evidence", "")
+                or result.get("text", ""))
+    batch = _extract_json_array(raw_text)
+    if batch is None:
+        try:
+            batch = json.loads(raw_text)
+        except json.JSONDecodeError:
+            batch = []
+    if isinstance(batch, list) and batch and any(
+        isinstance(item, dict) and "index" in item for item in batch
+    ):
+        return result, batch, raw_text
+    return result, [], raw_text
+
+
 def _phase1_parent_screening(ctx: _AuditContext) -> None:
     """Phase 3 — batched parent AC review via Pi (single call).
 
@@ -6568,7 +6695,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     json_mode = ctx.json_mode
     runner = ctx.runner
     pi_bin = ctx.pi_bin
-    resolved_model = ctx.resolved_model
+    phase1_model = ctx.resolved_phase1_model
     debug_log = ctx.debug_log
     timeout = ctx.timeout
     green_run_block = ctx.green_run_block
@@ -6617,22 +6744,30 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"{green_run_block or ''}"
             f"Criteria: {ac_list_json}"
         )
-        try:
-            result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, enable_tools=True, timeout=timeout, ac_fallback_used=ac_fallback_used)
-        except RuntimeError as exc:
-            ctx.record_script_failure("pi (parent AC review)", exc)
-            print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
-            result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
-        # Parse the batched result - try to extract JSON array from text
-        # Use extracted_text (full response) instead of evidence (may be truncated)
-        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
-        batch = _extract_json_array(raw_text)
-        if batch is None:
-            # Fallback: try direct JSON parse
-            try:
-                batch = json.loads(raw_text)
-            except json.JSONDecodeError:
-                batch = []
+        result, batch, raw_text = _call_phase1_screen(
+            issue_id, "parent", prompt, phase1_model, pi_bin, debug_log,
+            timeout, ac_fallback_used, ctx.record_script_failure,
+            failure_label="parent AC review", enable_tools=True,
+        )
+        # AC4 safe fallback (SA-0MSKB697P000T3HG): when a fast Phase 1 model
+        # is configured and it cannot produce reliable batched verdict JSON
+        # (unparseable output, provider error, or concurrency-limit timeout),
+        # retry the SAME Phase 1 screen with the full audit model before
+        # falling back to 'partial' diagnostics. The default (no
+        # model.audit_phase1 key) resolves phase1_model == resolved_model, so
+        # this retry is a no-op for legacy configs — zero behavior change.
+        if not batch and phase1_model != ctx.resolved_model:
+            print(
+                "Warning: fast Phase 1 model produced unparseable output — "
+                "retrying parent AC review with the full audit model",
+                file=sys.stderr,
+            )
+            result, batch, raw_text = _call_phase1_screen(
+                issue_id, "parent", prompt, ctx.resolved_model, pi_bin,
+                debug_log, timeout, ac_fallback_used,
+                ctx.record_script_failure, failure_label="parent AC review",
+                enable_tools=True,
+            )
         if isinstance(batch, list) and batch and any(
             isinstance(item, dict) and "index" in item for item in batch
         ):
@@ -6896,7 +7031,8 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                             executor.submit(
                                 _phase1_review_child_acs,
                                 ci, child,
-                                resolved_model, pi_bin, debug_log, timeout,
+                                ctx.resolved_phase1_model, ctx.resolved_model,
+                                pi_bin, debug_log, timeout,
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                             )
@@ -6909,7 +7045,8 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     for ci, child in pending_children:
                         _ci, acs = _phase1_review_child_acs(
                             ci, child,
-                            resolved_model, pi_bin, debug_log, timeout,
+                            ctx.resolved_phase1_model, ctx.resolved_model,
+                            pi_bin, debug_log, timeout,
                             runner, ctx.record_script_failure,
                             ac_fallback_used=ac_fallback_used,
                         )
@@ -7002,6 +7139,14 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     "--model-source", model_source,
                                     "--force",  # Bypass freshness gate
                                 ]
+                                # Thread the tiered Phase 1 model into the
+                                # child audit so its Phase 1 screening uses the
+                                # fast/cheap model too (SA-0MSKB697P000T3HG AC2)
+                                # — only when tiering is actually configured.
+                                if ctx.resolved_phase1_model != resolved_model:
+                                    audit_cmd.extend([
+                                        "--phase1-model", ctx.resolved_phase1_model,
+                                    ])
                                 if timeout is not None:
                                     audit_cmd.extend(["--timeout", str(timeout)])
                                 if parent_timeout is not None:
@@ -7361,7 +7506,8 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                             executor.submit(
                                 _phase1_review_child_acs,
                                 ci, child,
-                                resolved_model, pi_bin, debug_log, timeout,
+                                ctx.resolved_phase1_model, ctx.resolved_model,
+                                pi_bin, debug_log, timeout,
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                             )
@@ -7374,7 +7520,8 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     for ci, child in pending_children:
                         _ci, acs = _phase1_review_child_acs(
                             ci, child,
-                            resolved_model, pi_bin, debug_log, timeout,
+                            ctx.resolved_phase1_model, ctx.resolved_model,
+                            pi_bin, debug_log, timeout,
                             runner, ctx.record_script_failure,
                             ac_fallback_used=ac_fallback_used,
                         )
@@ -8000,6 +8147,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
               timeout: int | None = None,
               parent_timeout: int | None = None,
               pi_bin: str = "pi", model: str | None = None,
+              phase1_model: str | None = None,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
               debug_log: str | None = None,
@@ -8021,6 +8169,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
       1. --model CLI flag (explicit override)
       2. Config-driven: model.audit from .ralph.json resolved via model_source
       3. Hardcoded fallback: DEFAULT_MODEL
+
+    Phase 1 model resolution (tiered, SA-0MSKB697P000T3HG):
+      1. --phase1-model CLI flag (explicit phase-1 override)
+      2. --model CLI flag
+      3. Config-driven: model.audit_phase1 from .ralph.json resolved via
+         model_source, falling back to model.audit (full model)
+      4. Hardcoded fallback: DEFAULT_MODEL
+
+    Phase 1 (parent + child AC screening) runs on the resolved phase-1
+    model; Phase 2 deep analysis keeps the full model.
 
     When *force* is ``True``, the freshness gate is bypassed and a full
     audit pipeline is always run, even if a recent audit already exists.
@@ -8097,6 +8255,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
     ctx = _AuditContext(
         issue_id=issue_id, persist=persist, timeout=timeout,
         parent_timeout=parent_timeout, pi_bin=pi_bin, model=model,
+        phase1_model=phase1_model,
         model_source=model_source, runner=runner or _default_runner,
         json_mode=json_mode, debug_log=debug_log, force=force,
         worklog_dir=worklog_dir, batch_phase2=batch_phase2,
@@ -8374,6 +8533,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_issue.add_argument("--model", default=None,
                          help="Pi model to use for review (default: resolved from .ralph.json)")
+    p_issue.add_argument("--phase1-model", default=None,
+                         help=(
+                             "Pi model for Phase 1 parent + child AC screening "
+                             "(fast/cheap tier; default: resolved from "
+                             "model.audit_phase1, falling back to model.audit)"
+                         ))
     p_issue.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
                          choices=sorted(MODEL_SOURCES),
                          help="Model source: remote or local (default: local)")
@@ -8503,6 +8668,7 @@ def main(argv: list[str] | None = None) -> int:
                          timeout=_resolve_effective_timeout(args.timeout),
                          parent_timeout=_resolve_parent_timeout(args.parent_timeout),
                          pi_bin=args.pi_bin, model=args.model,
+                         phase1_model=getattr(args, "phase1_model", None),
                          model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log,
                          force=args.force,

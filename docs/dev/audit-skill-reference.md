@@ -167,7 +167,7 @@ No status lifecycle transitions occur, and no persistence is performed. An expli
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--phase1-model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
