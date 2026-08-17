@@ -369,8 +369,6 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
     stack_trace = payload.get("stack_trace") or sig.get("stack_trace", "")
     commit_hash = payload.get("commit_hash") or sig.get("commit_hash")
     ci_url = payload.get("ci_url") or sig.get("ci_url")
-    repo_path = payload.get("repo_path", ".")
-    file_path = payload.get("file_path") or sig.get("file_path")
     parent_work_item_id = payload.get("parent_work_item_id")
 
     if not test_name:

@@ -21,7 +21,7 @@ JSON payload (flat or under `failure_signature`):
 
 - `test_name` (required) — failing test name
 - `stdout_excerpt`, `stack_trace`, `commit_hash`, `ci_url` — optional context
-- `repo_path` (default `.`), `file_path` — for owner inference
+- `parent_work_item_id` — optional; creates the test-failure item as a child that blocks this work item
 
 Outputs
 -------
@@ -69,8 +69,7 @@ cat <<'JSON' > payload.json
   "test_name": "tests/test_example.py::test_failure",
   "stdout_excerpt": "AssertionError: expected 1 but got 0",
   "stack_trace": "...",
-  "commit_hash": "abc123",
-  "file_path": "tests/test_example.py"
+  "commit_hash": "abc123"
 }
 JSON
 python3 ./scripts/check_or_create.py payload.json
