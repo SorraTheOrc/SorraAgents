@@ -27,12 +27,10 @@ import measure_context as mc
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HIDDEN_SKILLS = [
-    "owner-inference",
     "triage",
     "find-related",
     "effort-and-risk",
     "speak",
-    "git-management",
 ]
 AGENTS_GLOBAL = REPO_ROOT / "AGENTS_GLOBAL.md"
 

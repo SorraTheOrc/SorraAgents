@@ -207,11 +207,6 @@ def test_create_new_issue_success(monkeypatch, capsys):
         return None
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
-    monkeypatch.setattr(
-        cc,
-        "infer_owner",
-        lambda *a, **kw: {"assignee": "Build", "confidence": 0.0, "reason": "fallback"},
-    )
 
     result = cc.check_or_create({"test_name": "test_bar", "stdout_excerpt": "err"})
     assert result["created"] is True
@@ -235,15 +230,6 @@ def test_create_issue_uses_template_sections(monkeypatch):
         return None
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
-    monkeypatch.setattr(
-        cc,
-        "infer_owner",
-        lambda *a, **kw: {
-            "assignee": "test-owner",
-            "confidence": 0.8,
-            "reason": "codeowners",
-        },
-    )
 
     cc.check_or_create(
         {
@@ -264,7 +250,7 @@ def test_create_issue_uses_template_sections(monkeypatch):
     assert "## Links" in body
     assert "test_tpl" in body
     assert "deadbeef" in body
-    assert "test-owner" in body
+    assert "Build" in body
     assert "pytest -q -r a --disable-warnings -k test_tpl" in body
 
 
@@ -280,11 +266,6 @@ def test_create_failure_no_wl(monkeypatch):
         return None
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
-    monkeypatch.setattr(
-        cc,
-        "infer_owner",
-        lambda *a, **kw: {"assignee": "Build", "confidence": 0.0, "reason": "fallback"},
-    )
 
     result = cc.check_or_create({"test_name": "test_baz", "stdout_excerpt": "err"})
     assert "error" in result
@@ -307,11 +288,6 @@ def test_idempotence(monkeypatch):
         return None
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl_first)
-    monkeypatch.setattr(
-        cc,
-        "infer_owner",
-        lambda *a, **kw: {"assignee": "Build", "confidence": 0.0, "reason": "fallback"},
-    )
 
     out1 = cc.check_or_create({"test_name": "test_qux", "stdout_excerpt": "err"})
     assert out1["created"] is True
@@ -368,11 +344,6 @@ def test_skip_completed_issues(monkeypatch):
         return None
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
-    monkeypatch.setattr(
-        cc,
-        "infer_owner",
-        lambda *a, **kw: {"assignee": "Build", "confidence": 0.0, "reason": "fallback"},
-    )
 
     result = cc.check_or_create({"test_name": "test_skip", "stdout_excerpt": "fail"})
     assert result["created"] is True
@@ -449,11 +420,6 @@ def test_child_mode_creates_child_work_item(monkeypatch):
         return None
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
-    monkeypatch.setattr(
-        cc,
-        "infer_owner",
-        lambda *a, **kw: {"assignee": "Build", "confidence": 0.0, "reason": "fallback"},
-    )
 
     result = cc.check_or_create({
         "test_name": "test_child_mode",
@@ -517,11 +483,6 @@ def test_child_mode_parent_failure_detection(monkeypatch):
         return None
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
-    monkeypatch.setattr(
-        cc,
-        "infer_owner",
-        lambda *a, **kw: {"assignee": "Build", "confidence": 0.0, "reason": "fallback"},
-    )
 
     # Missing parent_work_item_id - should create without parent
     result = cc.check_or_create({"test_name": "test_no_parent", "stdout_excerpt": "fail"})
@@ -586,11 +547,6 @@ def test_main_cli(monkeypatch, capsys):
         return None
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
-    monkeypatch.setattr(
-        cc,
-        "infer_owner",
-        lambda *a, **kw: {"assignee": "Build", "confidence": 0.0, "reason": "fallback"},
-    )
     monkeypatch.setattr(
         sys,
         "argv",

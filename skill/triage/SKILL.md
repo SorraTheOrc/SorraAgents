@@ -33,7 +33,6 @@ References
 
 - Template: `./resources/test-failure-template.md`
 - Runbook: `./resources/runbook-test-failure.md`
-- Owner inference: `../owner-inference/SKILL.md`
 - Test-writing anti-patterns to avoid when creating test-failure work items:
   [Test Writing Guidelines](../shared/test-writing-guidelines.md)
 
@@ -55,7 +54,7 @@ Behavior
 --------
 
 - Conservative matching: return existing issue id if any heuristic matches
-- No match: create new `critical` issue from template, infer owner via owner-inference skill
+- No match: create new `critical` issue from template with assignee `Build`
 - Prefer quiet test commands (`pytest -q` / `npm --silent test`) for local reproduction
 - Enhance existing issues by adding comment with new evidence (don't overwrite fields)
 

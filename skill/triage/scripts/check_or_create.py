@@ -147,31 +147,6 @@ def emit_event(event_name: str, data: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Owner inference integration
-# ---------------------------------------------------------------------------
-
-
-def infer_owner(repo_path: str, file_path: str | None) -> dict[str, Any]:
-    """Try to infer the owner using the owner-inference skill."""
-    if not file_path:
-        return {
-            "assignee": "Build",
-            "confidence": 0.0,
-            "reason": "no file path provided",
-        }
-    try:
-        from skill.owner_inference.scripts.infer_owner import infer_owner as _infer
-
-        return _infer(repo_path, file_path)
-    except Exception:  # noqa: BLE001
-        return {
-            "assignee": "Build",
-            "confidence": 0.0,
-            "reason": "owner inference unavailable",
-        }
-
-
-# ---------------------------------------------------------------------------
 # Template rendering
 # ---------------------------------------------------------------------------
 
@@ -232,7 +207,7 @@ Failing test detected by agent during automated run. May block PR creation for t
 ## Suggested Triage Steps
 
 1. Verify flakiness: rerun CI/test locally once.
-2. If reproducible, add owner from owner-inference heuristics and assign for triage.
+2. If reproducible, assign to `Build` and route for triage.
 3. If flaky, tag `flaky` and route to flaky-test queue.
 
 ## Suspected Owner
@@ -460,7 +435,7 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     # No match — create a new issue using the template
-    owner_info = infer_owner(repo_path, file_path)
+    owner_info = {"assignee": "Build", "confidence": 0.0, "reason": "no owner-inference skill"}
 
     title = f"[test-failure] {test_name} — failing test"
     body = render_template(

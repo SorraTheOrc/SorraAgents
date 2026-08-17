@@ -99,9 +99,7 @@ Skills with `disable-model-invocation: true` (internal helpers / always invoked 
 
 | Skill | How it is invoked | Purpose |
 |---|---|---|
-| `owner-inference` | triage's `check_or_create.py` | Infer owner for a failing test file |
 | `triage` | test skill's scripts (`check_or_create.py`) | Search/create critical `test-failure` work items |
 | `find-related` | `/skill:find-related <id>` | Discover related work for a work item |
 | `effort-and-risk` | `/skill:effort-and-risk <id>` (plan/implement) | Produce effort/risk estimates |
 | `speak` | `/skill:speak <text>` or `./scripts/speak.sh` | Generate audible speech from text |
-| `git-management` | `/skill:git-management` | Unified git feature-branch lifecycle management |

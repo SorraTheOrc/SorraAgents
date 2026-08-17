@@ -262,15 +262,6 @@ to use skill-relative paths is completed under the parent epic
 
 ### Cross-Skill References (Use with Caution)
 
-The `git-management` skill references scripts from the `ship` and `cleanup`
-skills. These are cross-skill dependencies that should be clearly documented.
-
-| Consuming Skill | Reference | External Provider |
-|----------------|-----------|-------------------|
-| `git-management` | `skill/ship/scripts/git-helpers.js` | `ship` skill |
-| `git-management` | `skill/ship/scripts/ship.js` | `ship` skill |
-| `git-management` | `skill/cleanup/scripts/` | `cleanup` skill |
-
 The `audit` skill also references a script from the `code-review` skill:
 
 | Consuming Skill | Reference | External Provider |
@@ -308,4 +299,4 @@ and document the external dependency in the consuming skill's SKILL.md.
   [GitHub](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/skills.md)).
 - **Agent Skills specification:** [https://agentskills.io/specification](https://agentskills.io/specification)
 - **Skills in this repository:** `skill/ship/`, `skill/cleanup/`,
-  `skill/triage/`, `skill/audit/`, `skill/git-management/`
+  `skill/triage/`, `skill/audit/`

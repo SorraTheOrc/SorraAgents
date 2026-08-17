@@ -37,11 +37,12 @@ def _prose() -> dict[str, str]:
 class TestDescriptionTemplate:
     """Every skill description follows the compact template."""
 
-    def test_all_18_skills_have_descriptions(self):
+    def test_all_skills_have_descriptions(self):
         prose = _prose()
-        # 17 skills when F2 compacted descriptions (SA-0MSLK78W7009HIXC); the
-        # report helper skill (SA-0MSRFTP2Y008BH6L) is the 18th.
-        assert len(prose) == 18, f"expected 18 skills, got {len(prose)}"
+        # 18 skills at F2 (SA-0MSLK78W7009HIXC + report helper
+        # SA-0MSRFTP2Y008BH6L); 16 after retiring owner-inference and
+        # git-management (SA-0MSN81W9G006K0K8).
+        assert len(prose) == 16, f"expected 16 skills, got {len(prose)}"
 
     def test_each_description_within_140_chars(self):
         for name, desc in _prose().items():
