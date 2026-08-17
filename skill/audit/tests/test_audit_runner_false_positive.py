@@ -38,6 +38,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -370,7 +371,7 @@ class TestScreenSkipped:
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
 
@@ -560,7 +561,7 @@ class TestScreenBatchedCall:
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
 

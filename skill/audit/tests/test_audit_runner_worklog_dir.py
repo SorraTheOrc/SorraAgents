@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import make_stateful_runner
 
 # ===========================================================================
 # Helpers
@@ -237,7 +238,7 @@ class TestChildAuditWorklogDirThreading:
                 "OSL-1",
                 persist=True,
                 force=True,
-                runner=fake_runner,
+                runner=make_stateful_runner(fake_runner),
                 timeout=30,
                 audit_children=True,  # Cascade is opt-in (SA-0MSKB6V5Q007YDHE)
             )
@@ -371,7 +372,7 @@ class TestStatusLifecycleFromOwningProjectRoot:
                 )
             return _make_wl_success_proc()
 
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def test_lifecycle_completes_and_commands_carry_worklog_dir(self, tmp_path):
         """AC2: capture -> in_progress -> terminal transition completes without

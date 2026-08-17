@@ -33,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import stateful_wl_side_effect
 
 _GREEN_RUN_HEAD = "a1b2c3d4e5f67890abcdef1234567890abcdef12"
 
@@ -114,7 +115,7 @@ def _make_cmd_issue_runner(description: str = _GREEN_RUN_DESC,
             stderr="",
         )
 
-    mock_runner.side_effect = _side_effect
+    mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
     return mock_runner
 
 

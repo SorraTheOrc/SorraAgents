@@ -29,6 +29,7 @@ from skill.audit.scripts.audit_runner import (
     cmd_project,
     main,
 )
+from skill.audit.tests.wl_helpers import make_stateful_runner
 
 # Path to the audit_runner.py source file
 AUDIT_RUNNER_PY = Path(__file__).resolve().parent.parent / "skill" / "audit" / "scripts" / "audit_runner.py"
@@ -482,7 +483,7 @@ class TestPersistenceDelegation:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        rc = cmd_issue("SA-TEST-001", runner=fake_runner)
+        rc = cmd_issue("SA-TEST-001", runner=make_stateful_runner(fake_runner))
         assert rc == 0
         assert persisted["issue_id"] == "SA-TEST-001"
         assert "Ready to close:" in persisted["report_text"]
@@ -509,7 +510,7 @@ class TestPersistenceDelegation:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        rc = cmd_issue("SA-TEST-002", persist=False, runner=fake_runner)
+        rc = cmd_issue("SA-TEST-002", persist=False, runner=make_stateful_runner(fake_runner))
         assert rc == 0
         assert called["persist"] is False
 
@@ -998,7 +999,7 @@ class TestStatusLifecycle:
                 }))
             # All other calls succeed with valid JSON
             return _fake_proc(stdout=json.dumps({"success": True}))
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def _fake_runner_with_status(self, calls: list, status: str = "completed",
                                  has_acs: bool = True):
@@ -1034,7 +1035,7 @@ class TestStatusLifecycle:
                     "children": [],
                 }))
             return _fake_proc(stdout=json.dumps({"success": True}))
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def test_sets_in_progress_before_audit(self, monkeypatch):
         """in_progress status must be set before wl show (first operation)."""
@@ -1279,7 +1280,7 @@ class TestStatusLifecycle:
                     "children": [],
                 }))
             return _fake_proc(stdout=json.dumps({"success": True}))
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def test_restore_failure_retries_then_succeeds(self, monkeypatch, capsys):
         """A transient failure on the terminal status restore is retried, so
@@ -1342,14 +1343,17 @@ class TestStatusLifecycle:
             runner=self._fake_runner_with_restore_failure(calls, fail_restore_count=999),
             persist=False,
         )
-        assert rc == 0, "Audit result must not be masked by status-restore failure"
+        # WL-0MSVVFBJ2003RRYK: a terminal transition that cannot be applied
+        # after retries must NEVER be a silent success — the run exits non-zero
+        # with a clear diagnostic (the old contract preserved rc=0).
+        assert rc != 0, "A failed terminal transition must fail the run"
 
         err = capsys.readouterr().err
-        assert "Failed to restore" in err, (
-            f"Expected a visible restore-failure warning on stderr, got: {err}"
+        assert "Failed to apply terminal status transition" in err, (
+            f"Expected a visible transition-failure diagnostic on stderr, got: {err}"
         )
         assert "SA-RESTOREFAIL" in err, (
-            f"Warning should name the affected work item, got: {err}"
+            f"Diagnostic should name the affected work item, got: {err}"
         )
 
     def test_restore_failure_preserves_audit_exit_code(self, monkeypatch, capsys):
@@ -1373,8 +1377,10 @@ class TestStatusLifecycle:
             runner=self._fake_runner_with_restore_failure(calls, fail_restore_count=999),
             persist=False,
         )
-        assert rc == 0, (
-            f"Status-restore failure must not mask the audit result (expected 0), got {rc}"
+        # WL-0MSVVFBJ2003RRYK: the lifecycle failure is folded into the exit
+        # code — the run no longer exits 0 when the transition is unverifiable.
+        assert rc != 0, (
+            f"An unverifiable terminal transition must exit non-zero, got {rc}"
         )
 
 
@@ -1528,7 +1534,7 @@ def _audit_fresh_runner(audit_audited_at: str | None = None,
             return _fake_proc(stdout=json.dumps(wi))
         return _fake_proc(stdout=json.dumps({"success": True}))
 
-    return _runner
+    return make_stateful_runner(_runner)
 
 
 class TestFreshnessGate:

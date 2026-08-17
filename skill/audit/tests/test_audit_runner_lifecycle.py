@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -110,12 +111,12 @@ class TestVerdictDrivenStatusLifecycle:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
-    def _run_issue(self, updates, verdict_report, **runner_kwargs):
+    def _run_issue(self, updates, verdict_report, runner=None, **runner_kwargs):
         """Run cmd_issue with a controlled report verdict and no real subprocesses."""
-        mock_runner = self._make_runner(updates, **runner_kwargs)
+        mock_runner = runner or self._make_runner(updates, **runner_kwargs)
         with (
             mock.patch.object(
                 audit_runner, "_assemble_issue_report",
@@ -607,3 +608,281 @@ class TestVerdictDrivenStatusLifecycle:
         )
         self._assert_restored_completed_in_review(updates)
 
+
+
+class TestLifecycleVerification:
+    """Post-update lifecycle readback verification (WL-0MSVVFBJ2003RRYK).
+
+    The terminal ``wl update`` may exit 0 while the item's status/stage
+    silently stays unchanged (a swallowed update) — the audit runner must
+    verify the transition through an independent ``wl show`` readback,
+    retry transient failures AND verification mismatches, then fail loudly
+    with a non-zero exit instead of reporting a silent success:
+
+      - Ready to close: Yes → item MUST end verified completed/in_review
+      - Ready to close: No  → item MUST end verified open/plan_complete
+      - Infra failure       → item MUST end verified at pre-audit state
+      - A swallowed update  → non-zero exit + clear diagnostic + best-effort
+        restore of the pre-audit state (WL-0MSWFRM800073Y81)
+    """
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_swallow_runner(self, updates, status="open", stage="idea",
+                             parent_id=None, description="",
+                             fail_children_show=False):
+        """Build a runner whose ``wl update`` ALWAYS reports success but never
+        applies — the silently-swallowed update this work item targets.
+
+        ``wl show`` keeps returning the fixed pre-audit state, so the
+        post-update readback verification can never confirm the transition.
+        """
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "update" in cmd_str:
+                updates.append(list(cmd))
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                wi = {"id": "TEST-1", "status": status, "stage": stage}
+                if parent_id is not None:
+                    wi["parentId"] = parent_id
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True, "workItem": wi}),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                if fail_children_show:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1", "description": description,
+                            "status": status, "stage": stage,
+                        },
+                        "children": [],
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _run_issue(self, updates, verdict_report, runner=None, **runner_kwargs):
+        """Run cmd_issue with a controlled report verdict and a swallow runner."""
+        mock_runner = runner or self._make_swallow_runner(updates, **runner_kwargs)
+        with (
+            mock.patch.object(
+                audit_runner, "_assemble_issue_report",
+                return_value=verdict_report,
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+    @staticmethod
+    def _update_statuses(updates):
+        """Return the (status, stage) tuples of every recorded wl update."""
+        out = []
+        for cmd in updates:
+            status = stage = None
+            for i, tok in enumerate(cmd):
+                if tok == "--status" and i + 1 < len(cmd):
+                    status = cmd[i + 1]
+                elif tok == "--stage" and i + 1 < len(cmd):
+                    stage = cmd[i + 1]
+            out.append((status, stage))
+        return out
+
+    # ------------------------------------------------------------------
+    # Swallowed update detection (AC1/AC3: never a silent success)
+    # ------------------------------------------------------------------
+
+    def test_swallowed_yes_update_fails_nonzero_with_diagnostic(self, capsys):
+        """AC1: a 'Yes' verdict whose wl update is swallowed (exit 0, state
+        unchanged) exits non-zero with a clear diagnostic — never rc 0."""
+        updates = []
+        rc = self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="open", stage="idea",
+        )
+        assert rc != 0, "a swallowed lifecycle update must fail the run"
+        err = capsys.readouterr().err
+        assert "Failed to apply terminal status transition" in err
+        assert "TEST-1" in err
+        # The terminal update was retried up to _STATUS_RESTORE_MAX_ATTEMPTS
+        # times (the restore to pre-audit open/idea is a separate update).
+        terminal_updates = [
+            (s, t) for s, t in self._update_statuses(updates)
+            if s == "completed"
+        ]
+        assert len(terminal_updates) == 3, (
+            "expected the terminal update to be retried 3 times, got "
+            f"{len(terminal_updates)}"
+        )
+        assert all(s == "completed" and t == "in_review"
+                   for s, t in terminal_updates)
+
+    def test_swallowed_yes_update_restores_pre_audit_state(self, capsys):
+        """AC2 (WL-0MSWFRM800073Y81): after retries are exhausted the runner
+        restores the captured pre-audit state and logs the restore."""
+        updates = []
+        rc = self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="open", stage="idea",
+        )
+        assert rc != 0
+        # The final wl update must restore open/idea and clear the assignee.
+        last = updates[-1]
+        assert "--status" in last and last[last.index("--status") + 1] == "open"
+        assert "--stage" in last and last[last.index("--stage") + 1] == "idea"
+        assert "--assignee" in last and last[last.index("--assignee") + 1] == ""
+        err = capsys.readouterr().err
+        assert "Restored TEST-1 to pre-audit state" in err
+
+    def test_swallowed_no_update_fails_nonzero(self, capsys):
+        """AC2: a 'No' verdict whose demote update is swallowed fails loudly."""
+        updates = []
+        rc = self._run_issue(
+            updates,
+            verdict_report="Ready to close: No\n\n## Summary\n2 unmet.",
+            status="completed", stage="in_review",
+        )
+        assert rc != 0, "a swallowed demote must fail the run"
+        err = capsys.readouterr().err
+        assert "Failed to apply terminal status transition" in err
+        terminal_updates = [
+            (s, t) for s, t in self._update_statuses(updates)
+            if s == "open"
+        ]
+        assert len(terminal_updates) == 3
+        assert all(s == "open" and t == "plan_complete"
+                   for s, t in terminal_updates)
+
+    def test_swallowed_restore_update_fails_nonzero(self, capsys):
+        """AC2: an infra-failure restore whose update is swallowed fails loudly.
+
+        The claim (``--status in_progress``) applies but the terminal restore
+        is swallowed, so the item is left in_progress — the readback cannot
+        confirm the pre-audit state and the run must surface the failure.
+        """
+        updates = []
+        state = {"status": "open", "stage": "plan_complete"}
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "update" in cmd_str and "--status" in cmd_str:
+                updates.append(list(cmd))
+                # The in_progress claim applies; every later update is
+                # silently swallowed.
+                if "in_progress" in cmd_str:
+                    state["status"] = "in_progress"
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": state["status"],
+                                     "stage": state["stage"]},
+                    }),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner = mock.MagicMock()
+        mock_runner.side_effect = _side_effect
+        rc = self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            runner=mock_runner,
+        )
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert "Failed to apply terminal status transition" in err
+
+    # ------------------------------------------------------------------
+    # Verification passes when the update applies (stateful wl)
+    # ------------------------------------------------------------------
+
+    def test_yes_verification_passes_when_update_applies(self):
+        """AC1: a real (stateful) worklog reflects the terminal update, so the
+        readback verification passes and the run exits 0."""
+        updates = []
+        mock_runner = mock.MagicMock()
+        state = {"status": "open", "stage": "idea"}
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "update" in cmd_str:
+                updates.append(list(cmd))
+                for i, tok in enumerate(cmd):
+                    if tok == "--status" and i + 1 < len(cmd):
+                        state["status"] = cmd[i + 1]
+                    elif tok == "--stage" and i + 1 < len(cmd):
+                        state["stage"] = cmd[i + 1]
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": state["status"],
+                                     "stage": state["stage"]},
+                    }),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "description": "",
+                                     "status": "open", "stage": "idea"},
+                        "children": [],
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        rc = self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            runner=mock_runner,
+        )
+        assert rc == 0, "an applied+verified transition must exit 0"
+        # Exactly one terminal update (no retries) after the claim.
+        terminal_updates = [
+            (s, t) for s, t in self._update_statuses(updates)
+            if s == "completed"
+        ]
+        assert terminal_updates == [("completed", "in_review")]

@@ -41,6 +41,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import stateful_wl_side_effect
 from skill.code_review.scripts import linter_runner
 
 
@@ -88,7 +89,7 @@ def _git_runner():
             return SimpleNamespace(returncode=0, stdout="abc1234\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    runner.side_effect = _side
+    runner.side_effect = stateful_wl_side_effect(_side)
     return runner
 
 
@@ -519,7 +520,7 @@ class TestRemediationLoop:
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        runner.side_effect = _side
+        runner.side_effect = stateful_wl_side_effect(_side)
 
         def _fake_pi(issue_id, context, prompt, **kwargs):
             if context == audit_runner.FP_SCREEN_CONTEXT:

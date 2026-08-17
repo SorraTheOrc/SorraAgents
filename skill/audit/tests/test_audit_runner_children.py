@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -169,7 +170,7 @@ class TestOptInChildAuditCascade:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run(self, triggered, **cmd_kwargs):
@@ -464,7 +465,7 @@ class TestChildVerdictReuseInParentAudits:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run(self, child_pi_contexts, triggered, *, n_children=1,
@@ -736,7 +737,7 @@ class TestChildVerdictReuseInParentAudits:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         with mock.patch.object(
             ar, "_resolve_audited_head", return_value=self.PARENT_HEAD
         ):
@@ -780,7 +781,7 @@ class TestChildVerdictReuseInParentAudits:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def test_verdict_content_fresh_ready(self):
@@ -926,7 +927,7 @@ class TestParentFirstChildPassThrough:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run(self, children, parent_verdict="met", gap_file=None,
@@ -1118,7 +1119,7 @@ class TestParentFirstChildPassThrough:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        runner.side_effect = _side_effect
+        runner.side_effect = stateful_wl_side_effect(_side_effect)
         captured = {}
         pi_calls = []
 

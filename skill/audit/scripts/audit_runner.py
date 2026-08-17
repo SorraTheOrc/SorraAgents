@@ -7678,12 +7678,114 @@ def _phase_report(ctx: _AuditContext) -> int:
         ctx.audit_completed = audit_completed
 
 
-def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
+def _read_item_lifecycle_state(
+    runner: Runner,
+    issue_id: str,
+    worklog_dir: str | None,
+) -> tuple[str, str] | None:
+    """Read back an item's current status/stage via ``wl show <id> --json``.
+
+    Used by the post-update lifecycle verification (WL-0MSVVFBJ2003RRYK):
+    the terminal ``wl update`` may exit 0 while the item's state silently
+    stays unchanged, so the runner must verify the transition independently
+    through a fresh readback rather than trust the update's exit code.
+
+    Returns ``(status, stage)`` (stage normalized to a string, empty when
+    absent), or ``None`` when the readback fails (wl error, invalid JSON,
+    missing workItem/status) so the caller treats it as unverified.
+    """
+    try:
+        data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    wi = data.get("workItem")
+    if not isinstance(wi, dict):
+        wi = data
+    status = wi.get("status")
+    if not status:
+        return None
+    return status, str(wi.get("stage") or "")
+
+
+def _lifecycle_state_matches(
+    expected_status: str | None,
+    expected_stage: str | None,
+    actual: tuple[str, str] | None,
+) -> bool:
+    """Whether the readback state matches the expected terminal state.
+
+    A ``None`` readback (unverifiable) never matches — the transition is
+    treated as not applied so the caller retries then fails loudly.
+    """
+    if actual is None:
+        return False
+    actual_status, actual_stage = actual
+    return actual_status == expected_status and actual_stage == expected_stage
+
+
+def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
+    """Best-effort restore of the captured pre-audit state after a failed
+    terminal transition (WL-0MSWFRM800073Y81).
+
+    After a verification failure the item's state is uncertain (partial
+    application, silently-swallowed update, or a wl error). Restoring the
+    captured pre-audit status/stage — itself verified by a readback — keeps
+    the item observable and consistent; any residual failure is logged
+    loudly rather than silently ignored. Falls back to ``open``/``plan_complete``
+    only when the pre-audit state could not be captured.
+    """
+    safe_status = ctx.original_status or "open"
+    safe_stage = ctx.original_stage
+    if not safe_stage:
+        safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+    cmd = [
+        "wl", "update", ctx.issue_id,
+        "--status", safe_status,
+        "--stage", safe_stage,
+        "--assignee", "",
+        "--json",
+    ]
+    try:
+        _run_wl(ctx.runner, cmd, worklog_dir=ctx.worklog_dir)
+    except RuntimeError as exc:
+        print(
+            f"Error: failed to restore pre-audit state for {ctx.issue_id}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    actual = _read_item_lifecycle_state(ctx.runner, ctx.issue_id, ctx.worklog_dir)
+    if _lifecycle_state_matches(safe_status, safe_stage, actual):
+        print(
+            f"Restored {ctx.issue_id} to pre-audit state "
+            f"({safe_status}/{safe_stage}).",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Error: restore of {ctx.issue_id} to pre-audit state "
+            f"({safe_status}/{safe_stage}) could not be verified "
+            f"(readback: {actual!r}). Recover manually with "
+            f"`wl update {ctx.issue_id} --status {safe_status} "
+            f"--stage {safe_stage}`.",
+            file=sys.stderr,
+        )
+
+
+def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     """Phase 6 — verdict-driven terminal status transition + debug-log cleanup.
 
     Always runs (cmd_issue's finally): the item is never left in_progress.
     Restores the pre-audit state on failure/fallback-tainted runs; advances
     to completed/in_review only on a genuine 'Ready to close: Yes' verdict.
+
+    Returns 0 when the terminal transition was applied AND verified via a
+    ``wl show`` readback, or non-zero when the transition could not be
+    verified after retries (a silently-swallowed ``wl update`` must never
+    pass silently — WL-0MSVVFBJ2003RRYK). The caller (cmd_issue) folds a
+    non-zero result into its exit code so the failure is operator-visible.
     """
     # ------------------------------------------------------------------
     # Status lifecycle: verdict-driven terminal transition on exit.
@@ -7716,14 +7818,21 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
     #       printed — never a silent divergence.
     #
     # The transition is retried on transient wl failures so a single
-    # hiccup never leaves the item stuck in_progress; if it still fails a
-    # visible warning is printed (SA-0MSAL2NQV0008HY5) instead of being
-    # silently swallowed — a stuck in_progress child breaks the release
-    # close step.
+    # hiccup never leaves the item stuck in_progress; after every attempt
+    # the item state is VERIFIED via a ``wl show`` readback
+    # (WL-0MSVVFBJ2003RRYK) — a wl update that exits 0 without applying
+    # (silently swallowed) is never accepted. If retries are exhausted a
+    # loud diagnostic is printed, the pre-audit state is best-effort
+    # restored, and the run exits non-zero (never a silent success).
     # ------------------------------------------------------------------
     # Compute the intended terminal state first (no wl calls), so the
     # failure warning can tell the operator exactly what to apply.
     restore_cmd: list[str] | None = None
+    # Expected terminal state after the transition, used by the post-update
+    # readback verification (WL-0MSVVFBJ2003RRYK). Computed alongside
+    # restore_cmd so a verification failure can report the exact expectation.
+    expected_status: str | None = None
+    expected_stage: str | None = None
     # Conservative default: on any computation failure below, treat the
     # run as fallback-tainted so the debug log is retained for forensics.
     fallback_tainted = True
@@ -7784,6 +7893,7 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
                 "--assignee", "",
                 "--json",
             ]
+            expected_status, expected_stage = safe_status, safe_stage
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
             # Top-level items (no parent) get --needs-producer-review yes so
@@ -7803,14 +7913,22 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
                 cmd += ["--needs-producer-review", "yes"]
             cmd.append("--json")
             restore_cmd = cmd
+            # Stage is kept as the pre-existing 'done' when the item already
+            # sits in a terminal done stage; otherwise the review queue.
+            expected_status, expected_stage = "completed", (
+                "done" if ctx.original_stage == "done" else "in_review"
+            )
         else:  # ctx.audit_verdict == "no"
             # Return to the actionable queue at a fixed pre-review stage.
             restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
+            expected_status, expected_stage = "open", "plan_complete"
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(
-            f"Warning: could not compute terminal status for {ctx.issue_id}: {exc}",
+            f"Error: could not compute terminal status for {ctx.issue_id}: {exc}; "
+            "the item's lifecycle is unresolved and was NOT applied.",
             file=sys.stderr,
         )
+        return 1
 
     # ------------------------------------------------------------------
     # Debug-log lifecycle: a successful audit run removes its debug file
@@ -7823,40 +7941,59 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
     if ctx.audit_completed and ctx.script_failure is None and not fallback_tainted:
         _remove_debug_log(ctx.debug_log, ctx.issue_id)
 
-    if restore_cmd is not None:
-        # Apply the terminal transition, retrying transient failures. The
-        # update is idempotent, so retrying after a partially-applied
-        # update is harmless.
-        last_error: Exception | None = None
-        for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
-            try:
-                _run_wl(ctx.runner, restore_cmd, worklog_dir=ctx.worklog_dir)
+    if restore_cmd is None:
+        # Defensive: every branch above assigns restore_cmd; a future edit
+        # that adds a branch without one must never silently skip the
+        # lifecycle.
+        print(
+            f"Error: no terminal transition was computed for {ctx.issue_id}; "
+            "the item's lifecycle is unresolved and was NOT applied.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Apply the terminal transition and VERIFY it actually applied via a
+    # ``wl show`` readback (WL-0MSVVFBJ2003RRYK). A ``wl update`` that exits
+    # 0 without changing the item (silently swallowed) must never pass
+    # silently: transient wl failures AND verification mismatches are
+    # retried, then surfaced loudly with a non-zero exit. The update is
+    # idempotent, so retrying after a partially-applied update is harmless.
+    last_error: Exception | None = None
+    for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
+        try:
+            _run_wl(ctx.runner, restore_cmd, worklog_dir=ctx.worklog_dir)
+            actual = _read_item_lifecycle_state(
+                ctx.runner, ctx.issue_id, ctx.worklog_dir
+            )
+            if _lifecycle_state_matches(expected_status, expected_stage, actual):
                 last_error = None
                 break
-            except RuntimeError as exc:
-                last_error = exc
-                if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
-                    time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
-
-        if last_error is not None:
-            # Best-effort readback so the operator knows the item's actual
-            # state (the update may have applied but the response was lost).
-            actual_status = "unknown"
-            try:
-                rb = _run_wl(ctx.runner, ["wl", "show", ctx.issue_id, "--json"],
-                             worklog_dir=ctx.worklog_dir)
-                wi = rb.get("workItem") if isinstance(rb, dict) else None
-                if isinstance(wi, dict):
-                    actual_status = wi.get("status", "unknown")
-            except RuntimeError:
-                pass
-            print(
-                f"Warning: Failed to restore work item {ctx.issue_id} status after "
-                f"audit ({last_error}); item status is '{actual_status}'. "
-                f"If it was left in_progress, recover it manually, e.g. "
-                f"`wl update {ctx.issue_id} --status <terminal-status> --stage <stage>`.",
-                file=sys.stderr,
+            last_error = RuntimeError(
+                f"terminal transition not applied: expected "
+                f"status={expected_status!r} stage={expected_stage!r}, "
+                f"readback status={actual[0] if actual else None!r} "
+                f"stage={actual[1] if actual else None!r}"
             )
+        except RuntimeError as exc:
+            last_error = exc
+        if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
+            time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
+
+    if last_error is not None:
+        # Never a silent success: surface the failure loudly, restore the
+        # captured pre-audit state (best-effort, itself verified), and exit
+        # non-zero so the caller knows the item's lifecycle is unresolved.
+        print(
+            f"Error: Failed to apply terminal status transition for "
+            f"{ctx.issue_id} after {_STATUS_RESTORE_MAX_ATTEMPTS} attempt(s): "
+            f"{last_error}. The item's lifecycle is unresolved — check its "
+            f"state with `wl show {ctx.issue_id}` and recover manually if "
+            f"needed.",
+            file=sys.stderr,
+        )
+        _restore_pre_audit_state_on_failure(ctx)
+        return 1
+    return 0
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
@@ -7975,12 +8112,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
     try:
         rc = _phase_fetch_and_cq(ctx)
         if rc is not None:
-            return rc
-        _phase1_parent_screening(ctx)
-        rc = _phase_children(ctx)
-        if rc is not None:
-            return rc
-        return _phase_report(ctx)
+            pass
+        else:
+            _phase1_parent_screening(ctx)
+            rc = _phase_children(ctx)
+            if rc is not None:
+                pass
+            else:
+                rc = _phase_report(ctx)
     except AuditScopeError as exc:
         # Scope error (LP-0MSQ32HNR007AI6B): the Phase 2 FILE SCOPE
         # manifest does not cover the item repository. Fail loudly with a
@@ -7989,10 +8128,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print(json.dumps({"error": str(exc)}, indent=2))
         else:
             print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        rc = 1
 
     finally:
-        _apply_terminal_lifecycle(ctx)
+        # The terminal lifecycle transition always runs; a verification
+        # failure (e.g. a silently-swallowed ``wl update``) overrides the
+        # run's exit code with a non-zero value so it is never a silent
+        # success (WL-0MSVVFBJ2003RRYK).
+        lifecycle_rc = _apply_terminal_lifecycle(ctx)
+        if lifecycle_rc != 0:
+            rc = lifecycle_rc
+    return rc
 
 
 def _build_project_json(summary: str, recommendation: str) -> dict:

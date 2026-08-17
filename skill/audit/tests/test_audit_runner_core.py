@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -187,7 +188,7 @@ class TestCodeQualityUsesTargetProjectRoot:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def test_code_quality_passed_target_project_root(self):
@@ -1201,7 +1202,7 @@ class TestParentTimeoutGuardBehavior:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run(self, parent_timeout=None, elapsed=120.0):
@@ -1793,17 +1794,46 @@ class TestCmdIssuePhases:
     # ------------------------------------------------------------------
 
     def _run_terminal_lifecycle(self, *, fallback_tainted=False, **ctx_overrides):
-        """Run _apply_terminal_lifecycle on a ctx with an update-recording runner.
+        """Run _apply_terminal_lifecycle on a ctx with a stateful runner.
 
-        *fallback_tainted* sets the ctx's ``ac_fallback_used`` event so the
-        infra-fallback provenance flag is visible to the lifecycle.
+        The runner models a real worklog: ``wl update --status/--stage``
+        mutates the item state that subsequent ``wl show`` calls return, so
+        the post-update readback verification (WL-0MSVVFBJ2003RRYK)
+        observes the applied transition. *fallback_tainted* sets the ctx's
+        ``ac_fallback_used`` event so the infra-fallback provenance flag is
+        visible to the lifecycle.
         """
         updates = []
+        state = {
+            "status": ctx_overrides.get("original_status", "open"),
+            "stage": ctx_overrides.get("original_stage", "plan_complete"),
+        }
 
         def _runner(cmd):
             cs = " ".join(cmd)
             if "update" in cs:
                 updates.append(list(cmd))
+                for i, tok in enumerate(cmd):
+                    if tok == "--status" and i + 1 < len(cmd):
+                        state["status"] = cmd[i + 1]
+                    elif tok == "--stage" and i + 1 < len(cmd):
+                        state["stage"] = cmd[i + 1]
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            if "show" in cs and "--children" not in cs:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "status": state["status"],
+                            "stage": state["stage"],
+                        },
+                    }),
+                    stderr="",
+                )
             return SimpleNamespace(
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
@@ -2014,7 +2044,7 @@ class TestWlShowDedup:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        return _side_effect
+        return stateful_wl_side_effect(_side_effect)
 
     def _run_single_child_audit(self, calls, child_audit=None):
         """Run a full cmd_issue for a single-child item; return its rc."""
@@ -2055,8 +2085,12 @@ class TestWlShowDedup:
             c for c in calls if "show" in c and "TEST-1" in c
             and "--children" not in c
         ]
-        assert len(parent_shows) == 1, \
-            f"expected exactly 1 parent wl show, got {len(parent_shows)}: {parent_shows}"
+        # Exactly one fetch: the pre-audit status capture. The single extra
+        # readback is the post-update lifecycle verification
+        # (WL-0MSVVFBJ2003RRYK) — a deliberate new fetch that confirms the
+        # terminal transition actually applied.
+        assert len(parent_shows) == 2, \
+            f"expected 2 parent wl shows (capture + lifecycle readback), got {len(parent_shows)}: {parent_shows}"
 
     def test_child_verdict_reuses_in_hand_child_data(self):
         """AC1: a legacy (fingerprint-less) child audit forces the time

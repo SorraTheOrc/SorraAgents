@@ -38,6 +38,7 @@ from skill.audit.scripts.persist_audit import (
     PERSIST_CONTENT_INVALID,
     persist_audit,
 )
+from skill.audit.tests.wl_helpers import make_stateful_runner
 
 # The 43-char stub observed in the Phase 2 failure: the summary string passed
 # to ``wl audit-set`` when the ``wl update --audit-text`` replacement failed.
@@ -286,7 +287,7 @@ class TestBoundedReask:
                     },
                 }))
             return _proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def test_reask_uses_at_most_one_additional_model_call(self, monkeypatch, capsys):
         """When the first persist attempt returns PERSIST_CONTENT_INVALID, the

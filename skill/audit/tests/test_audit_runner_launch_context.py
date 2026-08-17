@@ -33,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from skill.audit.scripts import audit_runner
 from skill.audit.scripts.persist_audit import PERSIST_CONTENT_INVALID
+from skill.audit.tests.wl_helpers import make_stateful_runner
 
 # ===========================================================================
 # Helpers
@@ -146,7 +147,7 @@ def _make_minimal_runner(recorded: list[list[str]] | None = None,
             )
         return _make_wl_success_proc()
 
-    return fake_runner
+    return make_stateful_runner(fake_runner)
 
 
 # ===========================================================================
@@ -552,7 +553,7 @@ class TestChildPersistFailureFatal:
                 )
             return _make_wl_success_proc()
 
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def _run_with_child(self, persist_rc: int, tmp_path):
         """Run cmd_issue with one child and a canned persist_audit return."""

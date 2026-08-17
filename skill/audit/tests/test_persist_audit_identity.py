@@ -25,6 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from skill.audit.scripts.persist_audit import persist_audit
+from skill.audit.tests.wl_helpers import make_stateful_runner
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -301,7 +302,7 @@ class TestReadbackIdentityRunner:
                 cmd, 0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def _run_cmd_issue(self, audit_show_raw: str | None, report: str):
         """Run cmd_issue with persist=True and a controlled assembled report."""

@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +83,7 @@ class TestPhase1IntakeNormalizesVerdict:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def test_parent_ac_review_normalizes_pass(self, capsys):
@@ -222,7 +223,7 @@ def _make_phase1_runner(children: list[dict],
         )
 
     mock_runner = mock.MagicMock()
-    mock_runner.side_effect = _side_effect
+    mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
     return mock_runner, audit_shows
 
 class TestPhase1PromptFileScope:

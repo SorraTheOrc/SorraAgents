@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 from skill.audit.scripts import audit_runner
+from skill.audit.tests.wl_helpers import stateful_wl_side_effect
 from skill.test.scripts.run_tests import repo_has_pytest_suite
 
 
@@ -61,7 +62,7 @@ def _green_run_git_runner(head_sha: str | None = _GREEN_RUN_HEAD):
             return SimpleNamespace(returncode=0, stdout=head_sha + "\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
-    mock_runner.side_effect = _side_effect
+    mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
     return mock_runner
 
 class TestGreenRunResolution:
@@ -211,7 +212,7 @@ class TestGreenRunPromptInjection:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _mock_cq(self):
@@ -430,7 +431,7 @@ class TestGreenRunCmdIssue:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _mock_cq(self):
@@ -842,7 +843,7 @@ class TestAutoGreenRunPromptInjection:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _mock_cq(self):

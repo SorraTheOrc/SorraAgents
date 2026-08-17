@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from skill.audit.scripts.audit_runner import cmd_issue
 from skill.audit.scripts.persist_audit import persist_audit
+from skill.audit.tests.wl_helpers import make_stateful_runner
 
 # ---------------------------------------------------------------------------
 # Helper fixtures
@@ -230,7 +231,7 @@ class TestAuditRunnerReportOnPersistFailure:
                 }))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
-        rc = cmd_issue("SA-SUCCESS", runner=fake_runner, persist=True)
+        rc = cmd_issue("SA-SUCCESS", runner=make_stateful_runner(fake_runner), persist=True)
         assert rc == 0
 
         captured = capsys.readouterr()
@@ -266,7 +267,7 @@ class TestAuditRunnerReportOnPersistFailure:
                 }))
             return _fake_proc(stdout=json.dumps(WI_WITH_CHILDREN))
 
-        rc = cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+        rc = cmd_issue("SA-PARENT", runner=make_stateful_runner(fake_runner), persist=True)
         assert rc == 0
         # Parent and child both should be persisted
         assert "SA-PARENT" in persist_calls
@@ -293,7 +294,7 @@ class TestAuditRunnerReportOnPersistFailure:
         def fake_runner(cmd, **kwargs):
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
-        rc = cmd_issue("SA-SKIP", runner=fake_runner, persist=False)
+        rc = cmd_issue("SA-SKIP", runner=make_stateful_runner(fake_runner), persist=False)
         assert rc == 0
         assert len(persist_called) == 0
 
@@ -332,7 +333,7 @@ class TestAuditRunnerReportOnPersistFailure:
         def fake_runner(cmd, **kwargs):
             return _fake_proc(stdout=json.dumps(WI_WITH_CHILDREN))
 
-        rc = cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+        rc = cmd_issue("SA-PARENT", runner=make_stateful_runner(fake_runner), persist=False)
         assert rc == 0
         # Both parent and child persist should be skipped
         assert len(persist_calls) == 0, f"persist_audit called unexpectedly for: {persist_calls}"
@@ -385,7 +386,7 @@ class TestReadbackVerification:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
-        rc = cmd_issue("SA-READBACK-OK", runner=fake_runner)
+        rc = cmd_issue("SA-READBACK-OK", runner=make_stateful_runner(fake_runner))
         assert rc == 0
         assert "SA-READBACK-OK" in persist_called
 
@@ -407,7 +408,7 @@ class TestReadbackVerification:
         def fake_runner(cmd, **kwargs):
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
-        rc = cmd_issue("SA-FAIL-PERSIST", runner=fake_runner)
+        rc = cmd_issue("SA-FAIL-PERSIST", runner=make_stateful_runner(fake_runner))
         assert rc == 7
         captured = capsys.readouterr()
         assert "Failed to persist" in captured.err
@@ -509,7 +510,7 @@ class TestReadbackVerification:
                 return _fake_proc(stdout=json.dumps({"success": True, "audit": None}))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
-        rc = cmd_issue("SA-SKIP-ALL", runner=fake_runner, persist=False)
+        rc = cmd_issue("SA-SKIP-ALL", runner=make_stateful_runner(fake_runner), persist=False)
         assert rc == 0
         assert len(persist_called) == 0, "persist_audit should not be called when persist=False"
 
@@ -544,7 +545,7 @@ class TestReadbackVerification:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
-        rc = cmd_issue("SA-SUMMARY-ONLY", runner=fake_runner)
+        rc = cmd_issue("SA-SUMMARY-ONLY", runner=make_stateful_runner(fake_runner))
         assert rc == 0
 
     def test_readback_success_with_both_rawoutput_and_summary(self, monkeypatch, capsys):
@@ -578,7 +579,7 @@ class TestReadbackVerification:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
-        rc = cmd_issue("SA-BOTH", runner=fake_runner)
+        rc = cmd_issue("SA-BOTH", runner=make_stateful_runner(fake_runner))
         assert rc == 0
 
     def test_readback_fails_when_both_rawoutput_and_summary_empty(self, monkeypatch, capsys):
@@ -645,7 +646,7 @@ class TestExitCodes:
                 }))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
-        rc = cmd_issue("SA-OK", runner=fake_runner)
+        rc = cmd_issue("SA-OK", runner=make_stateful_runner(fake_runner))
         assert rc == 0
 
     def test_persist_failure_returns_1(self, monkeypatch, capsys):

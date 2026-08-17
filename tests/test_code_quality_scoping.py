@@ -19,6 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from skill.audit.tests.wl_helpers import make_stateful_runner
+
 
 def _mock_result(returncode=0, stdout="", stderr=""):
     result = MagicMock(spec=subprocess.CompletedProcess)
@@ -216,8 +218,10 @@ class TestAuditReadOnlyCodeQuality:
             patch.object(audit_runner, "_run_phase2_deep_analysis",
                          side_effect=lambda issue, ac, ch, **kw: (ac, ch, True)),
         ):
-            rc = audit_runner.cmd_issue("TEST-1", persist=False, force=True,
-                                        runner=fake_runner)
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True,
+                runner=make_stateful_runner(fake_runner),
+            )
 
         assert rc == 0
         assert captured["fix"] is False, "audits must be read-only (fix=False)"
