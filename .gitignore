@@ -60,3 +60,6 @@ tmp/
 
 # Speak skill runtime directory
 .pi/speak/
+
+# Test skill run cache (auto-created by the test skill runner)
+.test-cache/

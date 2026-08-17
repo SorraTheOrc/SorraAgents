@@ -5,13 +5,12 @@ Purpose
 
 Guidance for triaging critical `test-failure` work items created by agents.
 
-Owner inference
----------------
+Owner assignment
+----------------
 
-1. Check `.worklog/triage/owner-map.yaml` for overrides.
-2. If not present, prefer CODEOWNERS if available.
-3. Otherwise run `git blame <file>` and use recent commit authorship.
-4. If confidence is low, assign to `Build` and request human triage.
+New test-failure issues are deterministically assigned to `Build` (the previous owner
+heuristics were retired). Route to humans via the normal PM/triage check when the
+issue needs an owner decision.
 
 Triage steps
 ------------
