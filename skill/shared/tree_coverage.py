@@ -44,7 +44,7 @@ def _execute_subprocess(
         if input_data is not None:
             return runner(list(cmd) + [input_data])
         return runner(list(cmd))
-    return subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+    return subprocess.run(cmd, input=input_data, capture_output=True, text=True, check=False)
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +363,7 @@ def compute_coverage(
         for c_idx, child_ac in enumerate(child_acs_list):
             for c_ac in child_ac:
                 score = jaccard_similarity(parent_ac, c_ac)
-                if score > best_score:
-                    best_score = score
+                best_score = max(best_score, score)
                 if score >= similarity_threshold:
                     covered_by.append(c_idx)
 

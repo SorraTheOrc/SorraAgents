@@ -885,6 +885,7 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
             capture_output=True,
             text=True,
             timeout=600,  # 10 min — generous for large submodule trees.
+            check=False,
         )
         if result.returncode != 0:
             LOG.warning(

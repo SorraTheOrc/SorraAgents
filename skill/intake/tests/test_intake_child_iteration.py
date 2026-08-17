@@ -13,12 +13,8 @@ Related work item: SA-0MSLRVQIF0040GAM
 
 import json
 
-import pytest
-
 from skill.shared.tree_coverage import (
     compute_coverage,
-    extract_acceptance_criteria,
-    extract_acs_from_item,
     run_coverage_review,
 )
 

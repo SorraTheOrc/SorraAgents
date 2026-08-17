@@ -14,8 +14,6 @@ Related work item: SA-0MSLRVQIF0040GAM
 
 import json
 
-import pytest
-
 from skill.shared.tree_coverage import (
     compute_coverage,
     extract_acceptance_criteria,
@@ -482,8 +480,6 @@ class TestRunCoverageReview:
     def test_missing_coverage_returns_stop(self):
         """When parent ACs are not covered and cannot be auto-closed,
         recommendation is stop."""
-        runner = _FakeWlRunner()
-
         def _custom_runner(cmd):
             if "--children" in cmd:
                 return _FakeResult(
@@ -526,8 +522,6 @@ class TestRunCoverageReview:
 
     def test_child_summary_includes_ac_count(self):
         """Child summary lists each child's AC count."""
-        runner = _FakeWlRunner()
-
         def _custom_runner(cmd):
             if "--children" in cmd:
                 return _FakeResult(
