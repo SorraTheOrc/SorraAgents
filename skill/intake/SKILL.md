@@ -52,6 +52,25 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
   ```
   This must happen before any evaluation, context gathering, or preflight checks.
 
+### 0b. Per-child intake pass (when children exist)
+
+If the work item already has children, run intake on each child before proceeding:
+
+- Run `wl show <work-item-id> --children --json` to fetch existing children.
+- Order children by dependency edges using `wl dep list <id> --json` (topological order, ties broken by listed order).
+- For each child, run the intake process on it (steps 1–11, recursing if the child has its own children).
+- Use the shared tree-coverage helper to verify AC coverage across existing children:
+  ```python
+  from skill.shared.tree_coverage import run_coverage_review
+  review = run_coverage_review(<work-item-id>)
+  ```
+- If the coverage review returns `recommendation: "stop"` with unresolvable conflicts,
+  record the conflicts as a comment and stop — leave the item `open`.
+- If the coverage review returns `recommendation: "auto_close"`, apply the auto-closed gaps
+  and note them in a comment.
+- If the coverage review returns `recommendation: "proceed"`, continue to Step 1.
+- Idempotence: re-running must not create duplicate children or duplicate comments.
+
 ### 1. Evaluate whether intake is required (agent responsibility)
 
 Run a lightweight evaluation to decide whether the item is well-defined enough to skip the interview/draft. Conservative, idempotent heuristics: `stage` already `intake_complete` or later → skip; description has a clear one-line headline + an "## Acceptance Criteria" section (1–3 measurable bullets) + concise implementation notes (≤~200 words) → well-defined; small item (`task`/`bug`, not `epic`) with explicit ACs + minimal implementation sketch → prefer to complete; parent/child relationships already express the context → consider skipping.
@@ -135,13 +154,25 @@ Collect related work via `/skill:find-related <work-item-id>`; add a report to t
 - Adding dependencies: `wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json` / `wl comment add <work-item-id> --comment "Blocked-by:<blocking-id>" --json`
 - Adjusting priority: `wl update <work-item-id> --priority <level> --json`
 
-### 9. Update the work item
+### 9. Update the work item and verify coverage
 
-Write the final draft to the work item description and advance the stage:
+Write the final draft to the work item description:
 
 ```bash
 python3 ./scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
 ```
+
+**AC coverage verification:** After updating the description, run the AC coverage review:
+
+```python
+from skill.shared.tree_coverage import run_coverage_review
+review = run_coverage_review(<work-item-id>)
+```
+
+- If ``recommendation == "proceed"`` or ``"auto_close"`` → mark `intake_complete`.
+- If ``recommendation == "stop"`` → **do NOT advance the stage**. Leave the item `open` with a comment describing the conflicts.
+
+Then advance the stage:
 
 This transitions `status=open`, `stage=intake_complete`.
 

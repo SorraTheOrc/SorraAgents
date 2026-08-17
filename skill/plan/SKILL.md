@@ -161,10 +161,42 @@ Review stages:
    vague criteria where intent is clear.
 6. **Polish & handoff review** — description clear, well formatted, actionable.
 
-After all six stages, output a summary of what each stage checked/found, then
-mark `plan_complete` (see skip path instructions above).
+After all six stages, run the AC coverage review:
+
+```python
+from skill.shared.tree_coverage import run_coverage_review
+review = run_coverage_review(<work-item-id>)
+```
+
+- If ``recommendation == "proceed"`` → mark `plan_complete`.
+- If ``recommendation == "auto_close"`` → close gaps, record comment, mark `plan_complete`.
+- If ``recommendation == "stop"`` → **do NOT mark `plan_complete`**; leave the item `open` with a comment describing conflicts.
+
+Then output a summary of what each stage checked/found.
 
 ## Process (must follow)
+
+0. Tree iteration (when children exist)
+
+   If the work item already has children, iterate the entire subtree **before** any other processing:
+
+   - Run `wl show <work-item-id> --children --json` to fetch existing children.
+   - Order children by dependency edges using `wl dep list <id> --json` (topological order, ties broken by listed order).
+   - For each child (in dependency order), recurse: if that child has its own children, process them first.
+   - Use the shared tree-coverage helper from `skill/shared/tree_coverage.py`:
+     ```bash
+     python3 ./tree_coverage.py run-coverage-review <work-item-id>
+     ```
+     Or import and call `run_coverage_review(<work-item-id>)` directly.
+   - If the coverage review returns `recommendation: "stop"` with unresolvable conflicts,
+     record the conflicts as a comment and **do not advance the stage** — leave the item `open`.
+   - If the coverage review returns `recommendation: "auto_close"`, apply the auto-closed gaps
+     and note them in a comment.
+   - If the coverage review returns `recommendation: "proceed"`, continue to Step 1.
+   - Idempotence: re-running must not create duplicate children or duplicate comments.
+
+   This step ensures every node in the tree has been planned/processed and that parent ACs
+   are collectively covered by their children.
 
 1. Evaluate whether planning is required (agent responsibility)
 
@@ -214,6 +246,19 @@ mark `plan_complete` (see skip path instructions above).
    4. **Scope sizing review** — features sized as deliverable increments.
    5. **Acceptance & testability review** — ACs pass/fail and testable.
    6. **Polish & handoff review** — plan copy-pasteable and easy to execute.
+
+   **AC coverage review (final step):**
+
+   After the six review stages, run the AC coverage review using the shared helper:
+
+   ```python
+   from skill.shared.tree_coverage import run_coverage_review
+   review = run_coverage_review(<work-item-id>)
+   ```
+
+   - If ``recommendation == "proceed"`` → all parent ACs are covered; continue to Step 7.
+   - If ``recommendation == "auto_close"`` → unambiguous gaps are identified; close them by adding the missing child ACs (where intent is clear), record a comment noting what was auto-closed.
+   - If ``recommendation == "stop"`` → unresolvable conflicts exist; **do NOT advance the stage**. Leave the item `open` with a comment describing the conflicts and which parent ACs are uncovered.
 
 7. Update work items (agent)
 
