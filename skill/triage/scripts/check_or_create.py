@@ -433,7 +433,7 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     # No match — create a new issue using the template
-    owner_info = {"assignee": "Build", "confidence": 0.0, "reason": "no owner-inference skill"}
+    owner_info = {"assignee": "Build", "confidence": 0.0, "reason": "no owner inference available"}
 
     title = f"[test-failure] {test_name} — failing test"
     body = render_template(
