@@ -215,14 +215,26 @@ def render_ac_table(ac_rows: list[dict]) -> str:
     """Render the ``## Acceptance Criteria`` table body.
 
     Each row: ``{ac#} | {description} | {metric} | met|unmet``.
+
+    Accepts rows with either a boolean ``met`` field (backward compat)
+    or a string ``verdict`` field (audit-runner format: met/unmet/adjusted/partial).
     """
     lines = ["| AC# | Description | Metric | Verdict |", "|---|---|---|---|"]
     if not ac_rows:
         lines.append("| — | No acceptance criteria supplied | — | — |")
     else:
         for i, row in enumerate(ac_rows, start=1):
-            verdict = "met" if row.get("met") else "unmet"
-            lines.append(f"| {i} | {row['description']} | {row['metric']} | {verdict} |")
+            # Prefer an explicit string verdict (audit-runner format or
+            # adjusted/partial passed via --ac); fall back to the met
+            # boolean for backward compat.
+            v = row.get("verdict")
+            if v is None:
+                met = row.get("met")
+                if isinstance(met, str):
+                    v = met
+                else:
+                    v = "met" if met else "unmet"
+            lines.append(f"| {i} | {row['description']} | {row['metric']} | {v} |")
     return "\n".join(lines)
 
 
@@ -314,14 +326,26 @@ def _load_payload(work_item_id: str) -> dict:
 def _parse_ac(spec: str) -> dict:
     """Parse an ``--ac`` argument: ``description|metric|verdict``.
 
-    Exactly three pipe-separated fields; ``verdict`` is ``met`` or ``unmet``
-    (case-insensitive; ``yes``/``true``/``1`` accepted as met).
+    Exactly three pipe-separated fields; ``verdict`` is one of ``met``,
+    ``unmet``, ``adjusted`` or ``partial`` (case-insensitive;
+    ``yes``/``true``/``1`` accepted as met, ``no``/``false``/``0`` as unmet).
     """
     parts = spec.split("|")
     if len(parts) != 3:
-        raise SystemExit(f"--ac expects 'description|metric|verdict' (VERDICT: met|unmet), got: {spec!r}")
+        raise SystemExit(
+            f"--ac expects 'description|metric|verdict' "
+            "(VERDICT: met|unmet|adjusted|partial), got: {spec!r}"
+        )
     description, metric, verdict = (p.strip() for p in parts)
-    met = verdict.lower() in {"met", "yes", "true", "1"}
+    v = verdict.lower()
+    if v in {"met", "yes", "true", "1"}:
+        met: bool | str = True
+    elif v in {"unmet", "no", "false", "0"}:
+        met = False
+    else:
+        # Pass through adjusted/partial as strings; render_ac_table treats
+        # a non-boolean met as an explicit verdict string.
+        met = v
     return {"description": description, "metric": metric, "met": met}
 
 

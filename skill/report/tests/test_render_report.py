@@ -146,6 +146,56 @@ def test_ac_table_empty_rows():
     assert "| AC# | Description | Metric | Verdict |" in report
 
 
+def test_ac_table_renders_audit_runner_verdict_field():
+    # Audit-runner rows carry a string `verdict` (met/unmet/adjusted/partial).
+    report = _render(ac_rows=[
+        {"description": "A", "metric": "m", "verdict": "adjusted"},
+        {"description": "B", "metric": "m", "verdict": "partial"},
+        {"description": "C", "metric": "m", "verdict": "met"},
+        {"description": "D", "metric": "m", "verdict": "unmet"},
+    ])
+    assert "| 1 | A | m | adjusted |" in report
+    assert "| 2 | B | m | partial |" in report
+    assert "| 3 | C | m | met |" in report
+    assert "| 4 | D | m | unmet |" in report
+
+
+def test_ac_table_verdict_field_takes_precedence_over_met():
+    # When both present, the explicit verdict must win over the met boolean.
+    report = _render(ac_rows=[
+        {"description": "A", "metric": "m", "verdict": "adjusted", "met": False},
+    ])
+    assert "| 1 | A | m | adjusted |" in report
+
+
+def test_ac_table_string_met_is_passed_through_as_verdict():
+    # _parse_ac keeps the boolean-only return shape, so adjusted/partial
+    # travel as a string in the `met` field; render_ac_table must not
+    # collapse that back to met/unmet.
+    report = _render(ac_rows=[
+        {"description": "A", "metric": "m", "met": "adjusted"},
+        {"description": "B", "metric": "m", "met": "partial"},
+    ])
+    assert "| 1 | A | m | adjusted |" in report
+    assert "| 2 | B | m | partial |" in report
+
+
+def test_parse_ac_adjusted_partial_roundtrip():
+    # CLI --ac acceptance of adjusted/partial, round-tripped through the
+    # renderer so the final table shows the exact verdict string.
+    rows = [
+        mod._parse_ac("A|m|adjusted"),
+        mod._parse_ac("B|m|partial"),
+        mod._parse_ac("C|m|met"),
+        mod._parse_ac("D|m|unmet"),
+    ]
+    report = _render(ac_rows=rows)
+    assert "| 1 | A | m | adjusted |" in report
+    assert "| 2 | B | m | partial |" in report
+    assert "| 3 | C | m | met |" in report
+    assert "| 4 | D | m | unmet |" in report
+
+
 # ── Meta-Data: icons + values (ContextHub canonical set) ────────────────────
 
 def test_metadata_icons_and_values():
