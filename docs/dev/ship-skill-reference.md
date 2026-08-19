@@ -17,7 +17,7 @@ All scripts below are internal implementation details — they are not exposed a
 | `./skill/ship/scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement workflow |
 | `./skill/ship/scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
 | `./skill/ship/scripts/check-unmerged-branches.js` | Unmerged branch detection |
-| `./skill/ship/scripts/check-audit-gate.js` | Audit readiness and producer-review gating |
+| `./skill/ship/scripts/check-audit-gate.js` | Audit readiness and producer-review gating (`getCandidateItems`, `getTopLevelCandidateItems`, `checkAuditReadyToClose`, `checkProducerReviewStatus`, `resolveAuditRunner`) |
 | `./skill/ship/scripts/check-critical-items.js` | Critical-items gating |
 | `./skill/ship/scripts/check-worklog-refs.js` | Worklog refs gating |
 | `./skill/ship/scripts/remediate-spurious-closes.js` | Idempotent remediation sweep for test-suite-spuriously-closed work items (SA-0MSJ2XMQL006CVQS) |
@@ -49,12 +49,62 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 3 | Unmerged branches found |
 | 4 | PR merge failed |
 | 5 | Dev sync failed |
-| 6 | Audit gate failure (items not ready to close) |
+| 6 | Audit gate failure — top-level `in_review` item(s) lack a passing audit after conservative auto-remediation (missing/transient audits are re-run automatically via `audit_runner.py`; genuine "not ready to close" verdicts block immediately) |
 | 7 | Critical-items gate failure (critical items not in terminal state) |
 | 8 | Worklog-ref gate failure (worklog refs present) |
-| 9 | Producer-review gate failure (items need producer review) |
+| 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
 | 10 | Release script timed out (killed after `SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
 | 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
+
+## Audit & Producer-Review Gates
+
+`check-audit-gate.js` provides the two readiness gates evaluated during a
+release (before the dev→main merge):
+
+### Candidate scoping (top-level only)
+
+Both gates operate on **top-level** `in_review` items (`parentId == null`),
+never children — a child's audit and producer review are covered by its
+parent's, so a child-level gap must never spuriously block a release.
+
+- `getCandidateItems()` — queries `wl list --stage in_review --json`, piped
+  through `jq` so only `{id, title, needsProducerReview, parentId}` crosses
+  into the execSync buffer (ENOBUFS-safe single query, SA-0MSLW5P7J0068UFZ).
+- `getTopLevelCandidateItems()` — sibling of `getCandidateItems()` that
+  filters to `parentId == null`; used by both gates. Orphaned `in_review`
+  items (no parent) are top-level and remain gated.
+
+### Audit readiness gate (exit 6)
+
+`checkAuditReadyToClose()` checks each top-level item via
+`wl audit-show <id> --json` and classifies it:
+
+- **Genuine "not ready to close"** verdict — blocks immediately, **no**
+  re-audit attempt.
+- **Missing audit** or **transient** audit (timeout, provider error,
+  FailureNotice per `isTimeoutOrTransientAudit`) — **conservative
+  auto-remediation**: the gate re-runs the audit via
+  `resolveAuditRunner()` (in-repo `skill/audit/scripts/audit_runner.py`
+  preferred, global `~/.pi/agent/skills/audit/scripts/audit_runner.py`
+  fallback) with `audit_runner.py issue <id>`, then re-checks
+  `wl audit-show`. The item blocks **only if it still fails after the
+  re-run**; successful remediations are reported in `remediatedItems`.
+- **Remediation-runner failure/timeout** — treated as blocking for that item
+  with the manual remediation command surfaced; never silently passed.
+
+The gate never mutates state destructively: it only invokes
+`audit_runner.py` (which persists per its own contract) and `wl audit-show`
+(read-only) — never `wl update`/`wl close` directly. Command boundaries
+(`getCandidateItemsFn`, `runAuditShow`, `runAuditCommand`,
+`resolveAuditRunnerFn`) are injectable so unit tests are hermetic (no live
+`wl`/`audit_runner` runs).
+
+### Producer-review gate (exit 9)
+
+`checkProducerReviewStatus(items)` blocks on any top-level item with
+`needsProducerReview != false` (`true`, `null`, or `undefined`). The
+`run-release.js` Step 3.6 call site passes `getTopLevelCandidateItems()`, so
+child items never block this gate either.
 
 ## Release Process
 ## Release Process

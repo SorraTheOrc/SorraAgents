@@ -55,10 +55,10 @@ isBranchBlocked('main');                       // → true
 The `release` action runs five gating checks before merging `dev` to `main`:
 
 1. **Unmerged branches check** — abort if feature branches pending; exit 3.
-2. **Audit readiness gate** — verifies `in_review`/`completed` items pass audits; exit 6. Timed-out/transient audits are warnings and do **not** block — only genuine "not ready to close" verdicts do.
+2. **Audit readiness gate** — verifies **top-level** `in_review` items (`parentId == null`) pass audits; exit 6. Child items are covered by their parent's audit and never block. Missing/transient audits (timeout, provider error, FailureNotice) are **auto-remediated conservatively**: the gate re-runs `audit_runner.py issue <id>` and re-checks `wl audit-show`, blocking only if the item still fails after the re-run; successfully-remediated items are reported separately. Genuine "not ready to close" verdicts block immediately with **no** re-audit attempt. A remediation-runner failure is treated as blocking with the manual remediation command surfaced — never silently passed.
 3. **Critical-items gate** — abort if non-terminal critical items exist; exit 7.
 4. **Worklog refs gate** — abort if worklog refs remain in merged code; exit 8.
-5. **Producer-review gate** — abort if items need producer review; exit 9.
+5. **Producer-review gate** — abort if **top-level** items need producer review; exit 9. Child items (covered by their parent's review) never block.
 
 All gates bypass with `--skip-checks`. CI is **optional**: PR status checks must pass if present; none → merge proceeds without waiting.
 
@@ -75,10 +75,10 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 | 3 | Unmerged branches found |
 | 4 | PR merge failed |
 | 5 | Dev sync failed |
-| 6 | Audit gate failure |
+| 6 | Audit gate failure — top-level `in_review` item(s) lack a passing audit after conservative auto-remediation (missing/transient audits are re-run automatically; genuine "not ready to close" verdicts block immediately) |
 | 7 | Critical-items gate failure |
 | 8 | Worklog-ref gate failure |
-| 9 | Producer-review gate failure |
+| 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
 | 10 | Release script timed out (`SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
 | 11 | Release merge verification failed (no verified dev→main merge) |
 
