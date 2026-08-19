@@ -20,6 +20,7 @@ All scripts below are internal implementation details — they are not exposed a
 | `./skill/ship/scripts/check-audit-gate.js` | Audit readiness and producer-review gating (`getCandidateItems`, `getTopLevelCandidateItems`, `checkAuditReadyToClose`, `checkProducerReviewStatus`, `resolveAuditRunner`) |
 | `./skill/ship/scripts/check-critical-items.js` | Critical-items gating |
 | `./skill/ship/scripts/check-worklog-refs.js` | Worklog refs gating |
+| `./skill/ship/scripts/discord-notify.js` | Post-release Discord notification (`sendReleaseNotification`, config resolution, changelog extraction/truncation, embed payload, non-blocking webhook POST) |
 | `./skill/ship/scripts/remediate-spurious-closes.js` | Idempotent remediation sweep for test-suite-spuriously-closed work items (SA-0MSJ2XMQL006CVQS) |
 
 ## Usage
@@ -128,7 +129,30 @@ Steps:
    - the released version tag `v<version>` exists on origin (`git ls-remote`), and
    - the tag commit is an ancestor of `origin/main` (`git merge-base --is-ancestor`).
    If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
-10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
+10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
+11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
+
+### Discord release notification
+
+After a successful, verified release (`verifyReleaseMerge` passed, Step 9), `run-release.js` invokes `sendReleaseNotification()` from `discord-notify.js` alongside the close-work-items step. It is a post-release, non-blocking concern.
+
+**Hook point:** in `run-release.js`, inside the `if (version)` block after `verifyReleaseMerge(version)` succeeds, wrapped in its own `try/catch` — a defect in the notification module can never fail the release.
+
+**Config schema** (key: `discord.webhook_url`):
+
+| Priority | File | Notes |
+|----------|------|-------|
+| 1 (project) | `<project>/.worklog/config.yaml` | Takes precedence; committed to the repo in most projects — do **not** store the webhook secret here |
+| 2 (global) | `~/.pi/agent/config.yaml` | Global fallback, outside any repo — preferred location for the secret |
+
+Neither set → the step logs an info message, skips, and the release completes normally (not an error).
+
+**Behaviour:**
+- Message content: released version, git tag `vX.Y.Z`, release date, PR URL, and the new version's changelog section from `CHANGELOG.md` (sections are `## vX.Y.Z (YYYY-MM-DD)` blocks; the date is read from the section header, falling back to today).
+- Discord limits: the embed description (changelog) is truncated to ≤ 4096 chars with an ellipsis marker (`truncateForDiscord`).
+- Non-blocking: webhook POST uses built-in `fetch` with `AbortSignal.timeout` (default 10 s). Fetch rejection, HTTP error status (incl. 429), timeout, missing/corrupt config, and missing changelog section all log a warning and return a non-failure result — the release exit code is unchanged.
+- No new runtime dependencies (Node 18+ built-in `fetch`); no `DISCORD_*` environment variables.
+- The webhook URL is a **secret** (contains an auth token) — prefer the global fallback file and never commit it to a repository.
 
 #### Test isolation (mandatory)
 

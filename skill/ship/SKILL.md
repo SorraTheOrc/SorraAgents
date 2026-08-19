@@ -27,7 +27,7 @@ Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "shi
 
 ## Internal Scripts and Modules
 
-All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `remediate-spurious-closes.js`.
+All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `discord-notify.js` (post-release Discord notification), `remediate-spurious-closes.js`.
 
 > **Path resolution:** all `./scripts/...` and `../` paths in this document are **relative to the skill directory** (the `ship` skill folder under the repo's `skill/` tree, or under the installed skills folder) — not the repo root. When invoking from the repo root, prefix with the full skill path instead of `./`.
 
@@ -97,7 +97,31 @@ node ./scripts/run-release.js
 7. **Audit logging** — record merge hash, PR URL in worklog.
 8. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push. Release ops run from **main checkout**, not worktrees.
 9. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): close only after the release landed on main — tag `v<version>` exists on origin AND is an ancestor of `origin/main`; else exit 11, no items closed.
-10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items only when `needsProducerReview === false`; others skipped + logged.
+10. **Discord notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` posts version, tag (`vX.Y.Z`), release date, PR URL, and the new version's changelog section from `CHANGELOG.md` to a configured Discord channel via webhook. Runs only after merge verification (never on `--dry-run` or failed releases). Failure (network, HTTP error, timeout) logs a warning and never changes the release exit code. See [Discord release notification](#discord-release-notification).
+11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items only when `needsProducerReview === false`; others skipped + logged.
+
+### Discord release notification
+
+After a successful, verified release the ship skill posts release details + changelog to a Discord channel (SA-0MSQ6K7Z1002H14Z).
+
+**Config schema** — the webhook URL is read from `discord.webhook_url`:
+
+```yaml
+# <project>/.worklog/config.yaml (per-project, takes precedence)
+discord:
+  webhook_url: https://discord.com/api/webhooks/<id>/<token>
+```
+
+```yaml
+# ~/.pi/agent/config.yaml (global fallback — preferred for shared setups)
+discord:
+  webhook_url: https://discord.com/api/webhooks/<id>/<token>
+```
+
+- **Precedence (AC2):** per-project `.worklog/config.yaml` first; global `~/.pi/agent/config.yaml` fallback. Neither set → the step is skipped with an info log and the release completes normally (no error).
+- **Non-blocking (AC3):** a failed or slow webhook POST logs a warning and does not change the release exit code; an already-landed release is never failed by a notification failure.
+- **Discord limits (AC4):** the embed description (changelog) is truncated to ≤ 4096 chars with an ellipsis marker.
+- **Secret:** the webhook URL contains an auth token — do **not** commit it to a repository. Prefer the global `~/.pi/agent/config.yaml` (outside any repo); a repo may override via its own `.worklog/config.yaml` but must then keep that file out of version control or accept the exposure.
 
 #### Test isolation (mandatory)
 

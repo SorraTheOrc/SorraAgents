@@ -35,6 +35,7 @@ const CHECK_UNMERGED_BRANCHES_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 
 const CHECK_AUDIT_GATE_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-audit-gate.js');
 const CHECK_CRITICAL_ITEMS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-critical-items.js');
 const CHECK_WORKLOG_REFS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-worklog-refs.js');
+const DISCORD_NOTIFY_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'discord-notify.js');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -47,6 +48,7 @@ function makeTempSkillDir() {
   writeFileSync(join(skillScriptDir, 'check-audit-gate.js'), readFileSync(CHECK_AUDIT_GATE_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'check-critical-items.js'), readFileSync(CHECK_CRITICAL_ITEMS_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'check-worklog-refs.js'), readFileSync(CHECK_WORKLOG_REFS_SRC, 'utf8'));
+  writeFileSync(join(skillScriptDir, 'discord-notify.js'), readFileSync(DISCORD_NOTIFY_SRC, 'utf8'));
   return { tmpDir, skillScriptDir };
 }
 

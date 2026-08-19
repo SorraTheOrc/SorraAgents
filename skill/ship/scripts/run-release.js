@@ -14,6 +14,7 @@ import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
+import { sendReleaseNotification } from './discord-notify.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -558,6 +559,7 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * 6. Wait for PR merge (if not already merged with --force)
  * 7. Sync dev with main
  * 8. Verify the release merge landed on main (gating, exit code 11)
+ * 8.5. Post-release Discord notification (non-blocking)
  * 9. Close work items shipped in this release (non-blocking)
  *
  * @param {string[]} [cliArgs=[]] - Command-line arguments.
@@ -780,6 +782,17 @@ async function runReleaseImpl(cliArgs = []) {
       console.error(`\n⚠️  ${mergeVerification.message}`);
       console.error('Refusing to close work items (exit code 11).');
       return 11;
+    }
+
+    // ── Step 8.5: Post-release Discord notification (non-blocking) ────────
+    // Send release details + changelog to the configured Discord channel
+    // (SA-0MSQ6K7Z1002H14Z). Runs only after the release merge is verified
+    // (never on --dry-run or failed releases). Notification failures are
+    // logged as warnings and never change the release exit code.
+    try {
+      await sendReleaseNotification({ version, prUrl, projectRoot });
+    } catch (err) {
+      console.warn(`\n⚠ Discord notification step failed: ${err.message} (non-blocking).`);
     }
 
     // ── Step 9: Close work items shipped in this release (non-blocking) ──
