@@ -28,6 +28,16 @@
  */
 
 import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Module constants for audit-runner path resolution: the in-repo copy of the
+// audit skill is preferred; the globally installed skill is the fallback.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(__dirname, '..', '..', '..');
+const HOME_DIR = homedir();
 
 // ── getCandidateItems ────────────────────────────────────────────────────────
 
@@ -225,6 +235,36 @@ export function buildRemediationCommand(workItemId) {
   ].join('\n');
 }
 
+// ── resolveAuditRunner ───────────────────────────────────────────────────────
+
+/**
+ * Resolve the path to the audit runner script.
+ *
+ * Prefers the in-repo copy (`<repo>/skill/audit/scripts/audit_runner.py`)
+ * so the release process uses the version pinned with the repository;
+ * falls back to the globally installed skill
+ * (`~/.pi/agent/skills/audit/scripts/audit_runner.py`) when the in-repo
+ * copy is absent (e.g. the ship skill itself is run from its global
+ * install). If neither exists the in-repo path is returned and the
+ * invocation fails loudly — never silently.
+ *
+ * @param {object} [fsMod] - Injectable fs-like module exposing
+ *   `existsSync` (defaults to `node:fs`). Used by unit tests to simulate
+ *   in-repo/global availability.
+ * @returns {string} The resolved audit runner script path.
+ */
+export function resolveAuditRunner(fsMod = { existsSync }) {
+  const inRepo = join(REPO_ROOT, 'skill', 'audit', 'scripts', 'audit_runner.py');
+  const globalPath = join(HOME_DIR, '.pi', 'agent', 'skills', 'audit', 'scripts', 'audit_runner.py');
+  if (fsMod.existsSync(inRepo)) {
+    return inRepo;
+  }
+  if (fsMod.existsSync(globalPath)) {
+    return globalPath;
+  }
+  return inRepo;
+}
+
 // ── buildProducerReviewRemediationCommand ────────────────────────────────────
 
 /**
@@ -341,18 +381,96 @@ export function checkProducerReviewStatus(items) {
   };
 }
 
+// ── attemptAuditRemediation ──────────────────────────────────────────────────
+
+/**
+ * Attempt to self-heal a missing or transient audit by re-running the audit
+ * for a single work item.
+ *
+ * Conservative remediation (SA-0MSUT8GQP004WSYN AC2): re-runs the audit via
+ * `audit_runner.py issue <id>` (persist semantics — never `wl update`
+ * directly), then re-checks `wl audit-show`. The item is unblocked only if
+ * the re-run produces a passing audit; a still-failing item blocks. A runner
+ * failure (non-zero exit / thrown exception) is treated as blocking for that
+ * item and never silently passes.
+ *
+ * @param {{ id: string, title: string }} workItem - The work item to remediate.
+ * @param {object} boundaries - Injectable command boundaries.
+ * @param {(workItemId: string) => string} boundaries.runAuditShow - Runs
+ *   `wl audit-show <id> --json` and returns the raw JSON string.
+ * @param {(runnerPath: string, workItemId: string) => string} boundaries.runAuditCommand -
+ *   Runs the audit runner for the item.
+ * @param {() => string} boundaries.resolveAuditRunnerFn - Resolves the audit
+ *   runner script path.
+ * @returns {Promise<{ status: 'passing'|'blocking'|'runner-failed', reason: string, summary: string|null }>}
+ */
+async function attemptAuditRemediation(workItem, { runAuditShow, runAuditCommand, resolveAuditRunnerFn }) {
+  try {
+    const runnerPath = resolveAuditRunnerFn();
+    runAuditCommand(runnerPath, workItem.id);
+  } catch (err) {
+    return {
+      status: 'runner-failed',
+      reason: `Audit remediation failed: ${err.stderr?.toString()?.trim() || err.message}`,
+      summary: null,
+    };
+  }
+
+  // Re-check the audit after the remediation run.
+  try {
+    const output = runAuditShow(workItem.id);
+    const auditData = JSON.parse(output);
+    const status = getAuditStatus(workItem, auditData);
+    if (status.isBlocking || status.transient) {
+      return {
+        status: 'blocking',
+        reason: status.reason,
+        summary: status.summary,
+      };
+    }
+    return {
+      status: 'passing',
+      reason: 'Remediated audit passes',
+      summary: status.summary,
+    };
+  } catch (err) {
+    return {
+      status: 'blocking',
+      reason: `Failed to re-check audit after remediation: ${err.stderr?.toString()?.trim() || err.message}`,
+      summary: null,
+    };
+  }
+}
+
 // ── checkAuditReadyToClose ───────────────────────────────────────────────────
 
 /**
- * Check all `in_review` and `completed` work items for audit readiness.
+ * Check all top-level `in_review` work items for audit readiness.
  *
- * For each candidate item, queries `wl audit-show <id> --json` and checks
- * `audit.readyToClose`. Items whose audit timed out or hit a transient
- * failure are collected separately in `transientItems` (warnings, NOT
- * blocking) so a slow/transient audit does not spuriously block the release.
- * Collects any items that are genuinely blocking (no audit, or a real
- * not-ready verdict) and returns a structured report.
+ * For each top-level candidate item, queries `wl audit-show <id> --json`
+ * and checks `audit.readyToClose`. Items whose audit is **missing** or
+ * **transient** (timeout/provider-error/FailureNotice) are auto-remediated:
+ * the gate re-runs the audit (`audit_runner.py issue <id>`, which persists
+ * per its own contract — the gate never calls `wl update` directly), then
+ * re-checks `wl audit-show`; the item blocks only if it still fails after
+ * the re-run. Genuine "not ready to close" verdicts block immediately with
+ * no re-audit attempt (conservative remediation, SA-0MSUT8GQP004WSYN AC2).
  *
+ * Command boundaries are injectable (mirroring the
+ * `closeWorkItemsAfterRelease` `runCloseCommand` pattern) so unit tests are
+ * hermetic — no live `wl`/`audit_runner` invocations.
+ *
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {() => Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null }>} [options.getCandidateItemsFn] -
+ *   Candidate-item query; defaults to `getTopLevelCandidateItems()` (top-level
+ *   `in_review` items only).
+ * @param {(workItemId: string) => string} [options.runAuditShow] - Runs
+ *   `wl audit-show <id> --json` and returns the raw JSON string.
+ * @param {(runnerPath: string, workItemId: string) => string} [options.runAuditCommand] -
+ *   Runs the audit remediation (`python3 <runner> issue <id>`) and returns
+ *   its stdout.
+ * @param {() => string} [options.resolveAuditRunnerFn] - Resolves the audit
+ *   runner script path; defaults to `resolveAuditRunner`.
  * @returns {Promise<{
  *   hasBlockingItems: boolean,
  *   blockingItems: Array<{
@@ -369,20 +487,40 @@ export function checkProducerReviewStatus(items) {
  *     summary: string|null,
  *     remediation: string
  *   }>,
+ *   remediatedItems: Array<{
+ *     workItemId: string,
+ *     title: string,
+ *     reason: string,
+ *     summary: string|null
+ *   }>,
  *   message: string
  * }>}
  */
-export async function checkAuditReadyToClose() {
+export async function checkAuditReadyToClose(options = {}) {
+  const {
+    getCandidateItemsFn = getTopLevelCandidateItems,
+    runAuditShow = (workItemId) => execSync(
+      `wl audit-show ${workItemId} --json`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ),
+    runAuditCommand = (runnerPath, workItemId) => execSync(
+      `python3 "${runnerPath}" issue ${workItemId}`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ),
+    resolveAuditRunnerFn = resolveAuditRunner,
+  } = options;
+
   // Step 1: Collect candidate items — top-level only. Children are covered
   // by their parent's audit, so they must never block the release
   // (SA-0MSUT8GQP004WSYN).
-  const items = getTopLevelCandidateItems();
+  const items = getCandidateItemsFn();
 
   if (items.length === 0) {
     return {
       hasBlockingItems: false,
       blockingItems: [],
       transientItems: [],
+      remediatedItems: [],
       message: 'No in_review work items found. Audit gate passed.',
     };
   }
@@ -390,14 +528,12 @@ export async function checkAuditReadyToClose() {
   // Step 3: Check audit status for each item
   const blockingItems = [];
   const transientItems = [];
+  const remediatedItems = [];
 
   for (const item of items) {
     let auditData = null;
     try {
-      const output = execSync(`wl audit-show ${item.id} --json`, {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      const output = runAuditShow(item.id);
       auditData = JSON.parse(output);
     } catch (err) {
       // If audit-show fails entirely, treat as blocking
@@ -413,17 +549,47 @@ export async function checkAuditReadyToClose() {
 
     const status = getAuditStatus(item, auditData);
 
-    if (status.isBlocking) {
-      blockingItems.push({
-        workItemId: item.id,
-        title: item.title,
-        reason: status.reason,
-        summary: status.summary,
-        remediation: buildRemediationCommand(item.id),
+    // Missing audit (no audit record at all) or transient (timed out /
+    // provider error / FailureNotice): attempt conservative auto-remediation.
+    const isMissingAudit = status.isBlocking && status.reason === 'No audit found';
+    if (isMissingAudit || status.transient) {
+      const remediation = await attemptAuditRemediation(item, {
+        runAuditShow,
+        runAuditCommand,
+        resolveAuditRunnerFn,
       });
-    } else if (status.transient) {
-      // Timeout / transient failure: report as a warning, NOT a blocker
-      transientItems.push({
+
+      if (remediation.status === 'passing') {
+        // Re-run succeeded: item unblocked.
+        remediatedItems.push({
+          workItemId: item.id,
+          title: item.title,
+          reason: remediation.reason,
+          summary: remediation.summary,
+        });
+      } else if (remediation.status === 'runner-failed') {
+        // The remediation runner itself failed — never silently pass; block
+        // and surface the manual remediation command.
+        blockingItems.push({
+          workItemId: item.id,
+          title: item.title,
+          reason: remediation.reason,
+          summary: null,
+          remediation: buildRemediationCommand(item.id),
+        });
+      } else {
+        // Still failing after the re-run → block.
+        blockingItems.push({
+          workItemId: item.id,
+          title: item.title,
+          reason: remediation.reason,
+          summary: remediation.summary,
+          remediation: buildRemediationCommand(item.id),
+        });
+      }
+    } else if (status.isBlocking) {
+      // Genuine 'not ready to close' verdict — block immediately, no re-run.
+      blockingItems.push({
         workItemId: item.id,
         title: item.title,
         reason: status.reason,
@@ -453,16 +619,36 @@ export async function checkAuditReadyToClose() {
     });
   }
 
+  // Helper: format an auto-remediated-items note for the report message
+  function buildRemediatedNote(lines) {
+    if (remediatedItems.length === 0) {
+      return;
+    }
+    lines.push(
+      '',
+      `Note: ${remediatedItems.length} work item(s) had missing or transient audits ` +
+        'and were auto-remediated (re-audit succeeded, item unblocked):',
+      '',
+    );
+    remediatedItems.forEach((entry, i) => {
+      lines.push(`${i + 1}. ${entry.title} (${entry.workItemId})`);
+      lines.push(`   Reason: ${entry.reason}`);
+      lines.push('');
+    });
+  }
+
   // Step 4: Build report
   if (blockingItems.length === 0) {
     const lines = [
       `All ${items.length} work item(s) have passing audits. Audit gate passed.`,
     ];
+    buildRemediatedNote(lines);
     buildTransientWarning(lines);
     return {
       hasBlockingItems: false,
       blockingItems: [],
       transientItems,
+      remediatedItems,
       message: lines.join('\n'),
     };
   }
@@ -487,6 +673,7 @@ export async function checkAuditReadyToClose() {
     lines.push('');
   });
 
+  buildRemediatedNote(lines);
   buildTransientWarning(lines);
 
   lines.push(
@@ -498,6 +685,7 @@ export async function checkAuditReadyToClose() {
     hasBlockingItems: true,
     blockingItems,
     transientItems,
+    remediatedItems,
     message: lines.join('\n'),
   };
 }

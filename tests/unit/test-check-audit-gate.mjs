@@ -860,3 +860,241 @@ describe('checkProducerReviewStatus - top-level scoping', () => {
     assert.equal(result.blockingItems.length, 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 22. Conservative audit auto-remediation (SA-0MSUT8GQP004WSYN AC2/AC4, FT2)
+// ---------------------------------------------------------------------------
+// Hermetic: all command boundaries (candidate query, audit-show, remediation
+// runner, runner resolver) are injected — no live `wl`/`audit_runner` runs,
+// no worklog mutation, `wl update` is never invoked by the gate.
+
+const TOP_LEVEL_ITEM = {
+  id: 'SA-TOP-1',
+  title: 'Top Level Item',
+  needsProducerReview: false,
+  parentId: null,
+};
+
+const AUDIT_SHOW = {
+  success: true,
+  workItemId: 'SA-TOP-1',
+  audit: { readyToClose: true, summary: 'All good' },
+};
+const AUDIT_MISSING = { success: true, workItemId: 'SA-TOP-1', audit: null };
+const AUDIT_TRANSIENT = {
+  success: true,
+  workItemId: 'SA-TOP-1',
+  audit: {
+    readyToClose: false,
+    summary: 'Deep analysis timed out — manual review required.',
+    rawOutput: 'Ready to close: No\n\nPhase 2 deep analysis timed out.',
+  },
+};
+const AUDIT_GENUINE = {
+  success: true,
+  workItemId: 'SA-TOP-1',
+  audit: {
+    readyToClose: false,
+    summary: '2 of 3 acceptance criteria not met.',
+    rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria for SA-TOP-1 are not met.',
+  },
+};
+
+/**
+ * Build a stateful audit-show runner that returns each canned result in
+ * sequence, repeating the last one for any further calls.
+ */
+function makeAuditShowSequence(results) {
+  let i = 0;
+  return () => JSON.stringify(results[Math.min(i++, results.length - 1)]);
+}
+
+/**
+ * Run the gate with fully injected boundaries.
+ *
+ * @param {object} opts
+ * @param {Array<object>} opts.auditShowResults - Canned `wl audit-show`
+ *   payloads, returned in sequence.
+ * @param {function} [opts.runAuditCommand] - Remediation runner; when absent
+ *   a recording no-op that records invocations in `invocations`.
+ * @param {string} [opts.runnerPath] - Path returned by the resolver.
+ * @returns {Promise<{ report: object, invocations: Array<Array<string>> }>}
+ */
+async function runGateWithBoundaries({ auditShowResults, runAuditCommand, runnerPath = '/tmp/fake-audit_runner.py' }) {
+  const mod = await import(MODULE_PATH);
+  const invocations = [];
+  const recordRunAuditCommand = runAuditCommand
+    || ((path, id) => { invocations.push([path, id]); return 'ok'; });
+  const report = await mod.checkAuditReadyToClose({
+    getCandidateItemsFn: () => [TOP_LEVEL_ITEM],
+    runAuditShow: makeAuditShowSequence(auditShowResults),
+    runAuditCommand: recordRunAuditCommand,
+    resolveAuditRunnerFn: () => runnerPath,
+  });
+  return { report, invocations };
+}
+
+describe('checkAuditReadyToClose - auto-remediation missing audit', () => {
+  test('missing audit triggers re-run; passing re-run unblocks the item', async () => {
+    const { report, invocations } = await runGateWithBoundaries({
+      // First audit-show: missing. After remediation: passing.
+      auditShowResults: [AUDIT_MISSING, AUDIT_SHOW],
+    });
+
+    assert.equal(invocations.length, 1, 'exactly one remediation re-run should be invoked');
+    assert.deepEqual(invocations[0], ['/tmp/fake-audit_runner.py', 'SA-TOP-1']);
+    assert.equal(report.hasBlockingItems, false, 'passing re-run should unblock');
+    assert.equal(report.blockingItems.length, 0);
+    assert.equal(report.remediatedItems.length, 1, 'remediated item should be reported');
+    assert.equal(report.remediatedItems[0].workItemId, 'SA-TOP-1');
+  });
+
+  test('missing audit re-run that still fails blocks the item', async () => {
+    const { report, invocations } = await runGateWithBoundaries({
+      auditShowResults: [AUDIT_MISSING, AUDIT_MISSING],
+    });
+
+    assert.equal(invocations.length, 1, 'remediation should be attempted once');
+    assert.equal(report.hasBlockingItems, true, 'still-missing after re-run should block');
+    assert.equal(report.blockingItems.length, 1);
+    assert.equal(report.blockingItems[0].workItemId, 'SA-TOP-1');
+    assert.ok(report.blockingItems[0].remediation.includes('audit_runner.py'), 'manual remediation command surfaced');
+  });
+});
+
+describe('checkAuditReadyToClose - auto-remediation transient audit', () => {
+  test('transient audit triggers re-run; passing re-run unblocks the item', async () => {
+    const { report, invocations } = await runGateWithBoundaries({
+      auditShowResults: [AUDIT_TRANSIENT, AUDIT_SHOW],
+    });
+
+    assert.equal(invocations.length, 1, 'exactly one remediation re-run should be invoked');
+    assert.equal(report.hasBlockingItems, false, 'passing re-run should unblock');
+    assert.equal(report.blockingItems.length, 0);
+    assert.equal(report.remediatedItems.length, 1);
+  });
+
+  test('transient audit re-run that still fails blocks the item', async () => {
+    const { report, invocations } = await runGateWithBoundaries({
+      auditShowResults: [AUDIT_TRANSIENT, AUDIT_TRANSIENT],
+    });
+
+    assert.equal(invocations.length, 1);
+    assert.equal(report.hasBlockingItems, true, 'still-failing after re-run should block');
+    assert.equal(report.blockingItems.length, 1);
+  });
+});
+
+describe('checkAuditReadyToClose - genuine verdict immediate block', () => {
+  test('genuine not-ready verdict blocks immediately with no re-run', async () => {
+    const { report, invocations } = await runGateWithBoundaries({
+      auditShowResults: [AUDIT_GENUINE],
+    });
+
+    assert.equal(invocations.length, 0, 'no remediation re-run should be invoked for a genuine verdict');
+    assert.equal(report.hasBlockingItems, true, 'genuine not-ready verdict must block');
+    assert.equal(report.blockingItems.length, 1);
+    assert.equal(report.blockingItems[0].reason, 'Audit verdict: not ready to close');
+    assert.equal(report.remediatedItems.length, 0);
+  });
+});
+
+describe('checkAuditReadyToClose - remediation runner failure', () => {
+  test('runner failure blocks the item and surfaces the manual remediation command', async () => {
+    const failingRunner = () => {
+      const err = new Error('audit_runner.py exited with code 2');
+      err.stderr = Buffer.from('boom');
+      throw err;
+    };
+    const { report, invocations } = await runGateWithBoundaries({
+      auditShowResults: [AUDIT_MISSING],
+      runAuditCommand: failingRunner,
+    });
+
+    assert.equal(invocations.length, 0);
+    assert.equal(report.hasBlockingItems, true, 'runner failure must block');
+    assert.equal(report.blockingItems.length, 1);
+    assert.match(report.blockingItems[0].reason, /Audit remediation failed/);
+    assert.ok(
+      report.blockingItems[0].remediation.includes('audit_runner.py issue SA-TOP-1'),
+      'manual remediation command must be surfaced',
+    );
+  });
+
+  test('re-check failure after a successful re-run blocks the item', async () => {
+    const mod = await import(MODULE_PATH);
+    // First audit-show: missing. Second call (re-check): throws.
+    const invocations = [];
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [TOP_LEVEL_ITEM],
+      runAuditShow: (() => {
+        let i = 0;
+        return () => {
+          i += 1;
+          if (i === 1) { return JSON.stringify(AUDIT_MISSING); }
+          const err = new Error('wl audit-show failed on re-check');
+          err.stderr = Buffer.from('re-check boom');
+          throw err;
+        };
+      })(),
+      runAuditCommand: (path, id) => { invocations.push([path, id]); return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+
+    assert.equal(invocations.length, 1);
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems.length, 1);
+    assert.match(report.blockingItems[0].reason, /Failed to re-check audit after remediation/);
+  });
+});
+
+describe('resolveAuditRunner - path resolution', () => {
+  test('prefers the in-repo audit runner when it exists', async () => {
+    const mod = await import(MODULE_PATH);
+    const fakeFs = {
+      existsSync: (p) => p.includes('skill/audit/scripts/audit_runner.py'),
+    };
+    const resolved = mod.resolveAuditRunner(fakeFs);
+    assert.ok(
+      resolved.endsWith('skill/audit/scripts/audit_runner.py'),
+      `should prefer in-repo runner, got: ${resolved}`,
+    );
+  });
+
+  test('falls back to the global skill runner when in-repo is absent', async () => {
+    const mod = await import(MODULE_PATH);
+    const fakeFs = {
+      existsSync: (p) => p.includes('.pi/agent/skills/audit/scripts/audit_runner.py'),
+    };
+    const resolved = mod.resolveAuditRunner(fakeFs);
+    assert.ok(
+      resolved.includes('.pi/agent/skills/audit/scripts/audit_runner.py'),
+      `should fall back to global runner, got: ${resolved}`,
+    );
+  });
+
+  test('returns the in-repo path when neither exists (fails loudly, never silently)', async () => {
+    const mod = await import(MODULE_PATH);
+    const fakeFs = { existsSync: () => false };
+    const resolved = mod.resolveAuditRunner(fakeFs);
+    assert.ok(resolved.endsWith('skill/audit/scripts/audit_runner.py'));
+  });
+});
+
+describe('checkAuditReadyToClose - gate never invokes wl update', () => {
+  test('remediation goes through the audit runner only, never wl update', async () => {
+    const mod = await import(MODULE_PATH);
+    const invocations = [];
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [TOP_LEVEL_ITEM],
+      runAuditShow: makeAuditShowSequence([AUDIT_MISSING, AUDIT_SHOW]),
+      runAuditCommand: (path, id) => { invocations.push([path, id]); return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+
+    assert.equal(invocations.length, 1);
+    assert.deepEqual(invocations[0], ['/tmp/fake-audit_runner.py', 'SA-TOP-1']);
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.remediatedItems.length, 1);
+  });
+});
