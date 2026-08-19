@@ -66,8 +66,16 @@ DEFAULT_PARENT_BRANCH = "dev"
 
 
 def _build_ruff_fix_cmd(files: list[str]) -> list[str]:
-    """Build the ruff check --fix command for the given files."""
-    return ["ruff", "check", "--fix", "--output-format", "json", "--quiet"] + files
+    """Build the ruff check --fix command for the given files.
+
+    Explicitly excludes non-Python extensions to prevent ruff from
+    mis-parsing TypeScript/JavaScript as Python (see CG-0MSXL2L0T009CA3I).
+    """
+    return [
+        "ruff", "check", "--fix", "--extend-exclude",
+        "**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.mjs,**/*.cjs",
+        "--output-format", "json", "--quiet",
+    ] + files
 
 
 def _build_eslint_fix_cmd(files: list[str]) -> list[str]:

@@ -358,6 +358,11 @@ def _run_ruff_check(
 ) -> list[dict[str, Any]]:
     """Run ruff check (without fix) and return structured findings.
 
+    Explicitly excludes non-Python extensions (TypeScript/JavaScript) to
+    prevent ruff from mis-parsing them as Python and producing
+    false-positive lint findings (see CG-0MSXL2L0T009CA3I: 627 false
+    positives on a .ts file).
+
     Args:
         root: The project root path.
         runner: Subprocess runner callable.
@@ -367,11 +372,26 @@ def _run_ruff_check(
     """
     findings: list[dict[str, Any]] = []
 
+    # Exclude known non-Python extensions as a belt-and-braces guard.
+    # Prevents false-positives when ruff mis-parses TypeScript/JavaScript
+    # as Python (see CG-0MSXL2L0T009CA3I: 627 false positives on .ts).
+    _TS_EXCLUDE = "**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.mjs,**/*.cjs"
+
+    # Only pass Python files explicitly: ruff lints explicitly-passed paths
+    # regardless of `exclude` unless `--force-exclude` is given, so filter
+    # the file list down to Python extensions AND force-exclude.
     if files:
-        cmd = ["ruff", "check", *[str(f) for f in files],
+        py_files = [f for f in files if str(f).endswith((".py", ".pyi", ".pyx"))]
+        if not py_files:
+            return []
+        cmd = ["ruff", "check", *[str(f) for f in py_files],
+               "--extend-exclude", _TS_EXCLUDE,
+               "--force-exclude",
                "--output-format", "json", "--quiet"]
     else:
-        cmd = ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
+        cmd = ["ruff", "check", str(root), "--extend-exclude", _TS_EXCLUDE,
+               "--force-exclude",
+               "--output-format", "json", "--quiet"]
     result = runner(cmd)
 
     if result.returncode not in (0, 1):
@@ -602,18 +622,36 @@ def _run_ruff_fix_mode(
     runner: Callable,
     files: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Run ruff check --fix and return remaining findings."""
+    """Run ruff check --fix and return remaining findings.
+
+    Explicitly excludes non-Python extensions (TypeScript/JavaScript) to
+    prevent ruff from mis-parsing them as Python.
+    """
+    _TS_EXCLUDE = "**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.mjs,**/*.cjs"
+
+    # Only pass Python files explicitly (see _run_ruff_check note).
+    _py_files = [f for f in (files or []) if str(f).endswith((".py", ".pyi", ".pyx"))]
+
     def fix_cmd(root: Path) -> list[str]:
-        if files:
-            return ["ruff", "check", *[str(f) for f in files], "--fix",
+        if _py_files:
+            return ["ruff", "check", *[str(f) for f in _py_files], "--fix",
+                    "--extend-exclude", _TS_EXCLUDE,
+                    "--force-exclude",
                     "--output-format", "json", "--quiet"]
-        return ["ruff", "check", str(root), "--fix", "--output-format", "json", "--quiet"]
+        return ["ruff", "check", str(root), "--fix",
+                "--extend-exclude", _TS_EXCLUDE,
+                "--force-exclude",
+                "--output-format", "json", "--quiet"]
 
     def rescan_cmd(root: Path) -> list[str]:
-        if files:
-            return ["ruff", "check", *[str(f) for f in files],
+        if _py_files:
+            return ["ruff", "check", *[str(f) for f in _py_files],
+                    "--extend-exclude", _TS_EXCLUDE,
+                    "--force-exclude",
                     "--output-format", "json", "--quiet"]
-        return ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
+        return ["ruff", "check", str(root), "--extend-exclude", _TS_EXCLUDE,
+                "--force-exclude",
+                "--output-format", "json", "--quiet"]
 
     def fixes_detected(result: Any, output: str) -> bool:
         if result.returncode == 1:
@@ -719,6 +757,9 @@ def run_ruff(
     """Run ruff check on the given project root and return structured findings.
 
     Only runs if the linter is available on PATH and Python files are detected.
+    Explicitly excludes non-Python extensions (TypeScript/JavaScript) to
+    prevent false-positive lint findings — ruff mis-parses them as Python
+    (see CG-0MSXL2L0T009CA3I: 627 false positives on .ts file).
 
     Args:
         project_root: Path to the project root (default: cwd).
@@ -727,6 +768,7 @@ def run_ruff(
                 ``subprocess.CompletedProcess``-like object).
         fix: If True, run ruff with ``--fix`` to auto-fix issues, then re-scan
              for remaining (non-fixable) issues.
+        files: Optional list of file paths to scope the scan to.
 
     Returns:
         A dict with keys:

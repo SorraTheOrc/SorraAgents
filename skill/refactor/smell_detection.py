@@ -247,6 +247,10 @@ def _run_single_linter(
     existing files match the linter's language, then runs the linter
     and returns normalized findings filtered to the session file set.
 
+    For ruff, explicitly excludes non-Python extensions to prevent
+    false-positive lint findings — ruff mis-parses TypeScript/JavaScript
+    as Python (see CG-0MSXL2L0T009CA3I: 627 false positives on .ts).
+
     Args:
         linter_name: The linter name (e.g. ``"ruff"``, ``"eslint"``).
         existing_files: List of existing file paths to consider.
