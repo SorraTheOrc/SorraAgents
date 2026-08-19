@@ -1,0 +1,4 @@
+# Ruff configuration (created by audit remediation)
+
+[per-file-ignores]
+"/home/rgardler/projects/SorraAgents/skill/report/scripts/render_report.py" = ["F541"]
