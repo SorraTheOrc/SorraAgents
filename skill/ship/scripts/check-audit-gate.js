@@ -391,8 +391,8 @@ export function checkProducerReviewStatus(items) {
  * `audit_runner.py issue <id>` (persist semantics — never `wl update`
  * directly), then re-checks `wl audit-show`. The item is unblocked only if
  * the re-run produces a passing audit; a still-failing item blocks. A runner
- * failure (non-zero exit / thrown exception) is treated as blocking for that
- * item and never silently passes.
+ * failure (non-zero exit / thrown exception / timeout) is treated as blocking
+ * for that item and never silently passes.
  *
  * @param {{ id: string, title: string }} workItem - The work item to remediate.
  * @param {object} boundaries - Injectable command boundaries.
@@ -505,7 +505,10 @@ export async function checkAuditReadyToClose(options = {}) {
     ),
     runAuditCommand = (runnerPath, workItemId) => execSync(
       `python3 "${runnerPath}" issue ${workItemId}`,
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      // Per-item timeout guard (SA-0MSUT8GQP004WSYN AC6 / R1): a hung audit
+      // runner must not stall the whole release gate. The default audit
+      // runner hard-times-out internally, so this is a belt-and-braces cap.
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 600000 },
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
   } = options;
@@ -553,11 +556,23 @@ export async function checkAuditReadyToClose(options = {}) {
     // provider error / FailureNotice): attempt conservative auto-remediation.
     const isMissingAudit = status.isBlocking && status.reason === 'No audit found';
     if (isMissingAudit || status.transient) {
+      // Log the remediation attempt per item (SA-0MSUT8GQP004WSYN AC6) so a
+      // slow release gate is attributable.
+      console.log(
+        `Audit gate: auto-remediating ${item.id} (${isMissingAudit ? 'missing audit' : 'transient audit'})...`,
+      );
       const remediation = await attemptAuditRemediation(item, {
         runAuditShow,
         runAuditCommand,
         resolveAuditRunnerFn,
       });
+      if (remediation.status === 'passing') {
+        console.log(`Audit gate: ${item.id} auto-remediated successfully.`);
+      } else if (remediation.status === 'runner-failed') {
+        console.log(`Audit gate: ${item.id} remediation runner failed — blocking.`);
+      } else {
+        console.log(`Audit gate: ${item.id} still failing after remediation — blocking.`);
+      }
 
       if (remediation.status === 'passing') {
         // Re-run succeeded: item unblocked.
