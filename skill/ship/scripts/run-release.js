@@ -11,7 +11,7 @@ import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
-import { checkAuditReadyToClose, getCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
+import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 
@@ -635,7 +635,10 @@ async function runReleaseImpl(cliArgs = []) {
 
   // ── Step 3.6: Check producer-review status (gating step) ───────────────
   if (!skipChecks) {
-    const items = getCandidateItems();
+    // Top-level candidates only: a child's producer review is covered by its
+    // parent's review, so children must not block the release
+    // (SA-0MSUT8GQP004WSYN AC3).
+    const items = getTopLevelCandidateItems();
     const producerReviewReport = checkProducerReviewStatus(items);
     if (producerReviewReport.hasBlockingItems) {
       console.error(

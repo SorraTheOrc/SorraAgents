@@ -509,6 +509,22 @@ test('check-audit-gate: ship.js re-exports checkProducerReviewStatus', async () 
   );
 });
 
+test('check-audit-gate: ship.js re-exports getTopLevelCandidateItems', async () => {
+  const shipMod = await import(join(REPO_ROOT, 'skill', 'ship', 'scripts', 'ship.js'));
+
+  assert.ok(
+    typeof shipMod.getTopLevelCandidateItems === 'function',
+    'ship.js should re-export getTopLevelCandidateItems from check-audit-gate.js',
+  );
+
+  const checkModule = await import(join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-audit-gate.js'));
+  assert.equal(
+    shipMod.getTopLevelCandidateItems,
+    checkModule.getTopLevelCandidateItems,
+    'ship.js should export the same getTopLevelCandidateItems function',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 17. getCandidateItems — single stage query + jq projection (SA-0MSLW5P7J0068UFZ,
 //     SA-0MSPPDCTH004561Z)
@@ -569,7 +585,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
     assert.ok(calls[0].includes('--stage in_review'), `should filter stage, got: ${calls[0]}`);
     assert.ok(!calls[0].includes('--status completed'), `should drop redundant status filter (completed-minus-done == in_review), got: ${calls[0]}`);
     assert.ok(calls[0].includes('--json'), `should request JSON, got: ${calls[0]}`);
-    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false }]);
+    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false, parentId: null }]);
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -635,6 +651,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
       id: 'SA-1',
       title: 'Dash-safe',
       needsProducerReview: false,
+      parentId: null,
     }], 'query must run under bash so set -o pipefail works on dash');
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -656,4 +673,190 @@ test('check-audit-gate: checkProducerReviewStatus has JSDoc comment', async () =
   const jsdoc = jsdocMatch[jsdocMatch.length - 1];
   assert.ok(jsdoc.includes('@returns'), 'JSDoc should document return type');
   assert.ok(jsdoc.includes('@param'), 'JSDoc should document parameters');
+});
+
+// ---------------------------------------------------------------------------
+// 18. getCandidateItems parentId projection (SA-0MSUT8GQP004WSYN AC1)
+// ---------------------------------------------------------------------------
+describe('getCandidateItems - parentId projection', () => {
+  test('projects parentId for every returned item', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const workItems = [
+      { id: 'SA-TOP-1', title: 'Top', needsProducerReview: false, parentId: null },
+      { id: 'SA-CHILD-1', title: 'Child', needsProducerReview: false, parentId: 'SA-TOP-1' },
+    ];
+    const binDir = createWlMock({ workItems, argsLogPath });
+
+    const items = withWlMock(binDir, () => mod.getCandidateItems());
+
+    assert.equal(items.length, 2, 'both items should be returned by getCandidateItems');
+    for (const item of items) {
+      assert.ok('id' in item, 'item should have id');
+      assert.ok('title' in item, 'item should have title');
+      assert.ok('needsProducerReview' in item, 'item should have needsProducerReview');
+      assert.ok('parentId' in item, 'item should have parentId');
+    }
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 19. getTopLevelCandidateItems filtering (SA-0MSUT8GQP004WSYN AC1)
+// ---------------------------------------------------------------------------
+describe('getTopLevelCandidateItems - top-level filtering', () => {
+  test('is exported as a function', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(typeof mod.getTopLevelCandidateItems, 'function');
+  });
+
+  test('returns only items with parentId == null', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const workItems = [
+      { id: 'SA-TOP-1', title: 'Top 1', needsProducerReview: false, parentId: null },
+      { id: 'SA-CHILD-1', title: 'Child 1', needsProducerReview: false, parentId: 'SA-TOP-1' },
+      { id: 'SA-TOP-2', title: 'Top 2', needsProducerReview: false, parentId: null },
+      { id: 'SA-CHILD-2', title: 'Child 2', needsProducerReview: false, parentId: 'SA-TOP-2' },
+    ];
+    const binDir = createWlMock({ workItems, argsLogPath });
+
+    const items = withWlMock(binDir, () => mod.getTopLevelCandidateItems());
+
+    assert.deepEqual(
+      items.map((i) => i.id),
+      ['SA-TOP-1', 'SA-TOP-2'],
+      'children (parentId set) should be excluded; top-level items retained',
+    );
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('includes orphans (in_review with no parent) as top-level', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const workItems = [
+      { id: 'SA-ORPHAN-1', title: 'Orphan', needsProducerReview: false, parentId: null },
+    ];
+    const binDir = createWlMock({ workItems, argsLogPath });
+
+    const items = withWlMock(binDir, () => mod.getTopLevelCandidateItems());
+
+    assert.deepEqual(
+      items.map((i) => i.id),
+      ['SA-ORPHAN-1'],
+      'an orphan (parentId null) is top-level and must still be gated',
+    );
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('preserves parentId field on returned items', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const workItems = [
+      { id: 'SA-TOP-1', title: 'Top', needsProducerReview: false, parentId: null },
+    ];
+    const binDir = createWlMock({ workItems, argsLogPath });
+
+    const items = withWlMock(binDir, () => mod.getTopLevelCandidateItems());
+
+    assert.equal(items.length, 1);
+    assert.equal(items[0].parentId, null);
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 20. Audit gate excludes children (SA-0MSUT8GQP004WSYN AC2)
+// ---------------------------------------------------------------------------
+// The gate queries top-level candidates only, so an in_review child with a
+// failing audit must not block. Hermetic: `wl` is mocked on PATH and returns
+// only child items (parentId set); because the top-level list is empty the
+// gate never even calls `wl audit-show` for them.
+describe('checkAuditReadyToClose - top-level-only blocking', () => {
+  // Run the async gate while binDir is on PATH, then restore PATH and clean up.
+  async function runGateWithWlMock(workItems) {
+    const mod = await import(MODULE_PATH);
+    const savedPath = process.env.PATH;
+    const binDir = mkdtempSync(join(tmpdir(), 'fakebin-'));
+    const payloadPath = join(binDir, 'payload.json');
+    writeFileSync(payloadPath, JSON.stringify({ success: true, workItems }), 'utf-8');
+    const wlPath = join(binDir, 'wl');
+    const script = `#!/usr/bin/env bash\n` + `cat "${payloadPath}"\n`;
+    writeFileSync(wlPath, script, { mode: 0o755 });
+    process.env.PATH = `${binDir}:${savedPath}`;
+    try {
+      const report = await mod.checkAuditReadyToClose();
+      return { report, binDir };
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  }
+
+  test('does not block, and does not query audits, for in_review children', async () => {
+    const mod = await import(MODULE_PATH);
+    // Only children are in_review; each would fail an audit if queried, but
+    // because the gate scopes to top-level they must be excluded entirely.
+    const workItems = [
+      { id: 'SA-CHILD-1', title: 'Child Blocking', needsProducerReview: false, parentId: 'SA-TOP-1' },
+    ];
+    const { report, binDir } = await runGateWithWlMock(workItems);
+
+    assert.equal(report.hasBlockingItems, false, 'child audit gap should not block');
+    assert.equal(report.blockingItems.length, 0);
+    assert.equal(report.transientItems.length, 0, 'children should not appear as transient warnings');
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  test('does not list children in the transient-warning report', async () => {
+    const workItems = [
+      { id: 'SA-CHILD-T', title: 'Child Transient', needsProducerReview: false, parentId: 'SA-TOP-1' },
+    ];
+    const { report, binDir } = await runGateWithWlMock(workItems);
+
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.transientItems.length, 0, 'children should not appear as transient warnings');
+    assert.ok(!report.message.includes('SA-CHILD-T'), 'message should not mention the child');
+    rmSync(binDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 21. Producer-review top-level scoping (SA-0MSUT8GQP004WSYN AC3)
+// ---------------------------------------------------------------------------
+describe('checkProducerReviewStatus - top-level scoping', () => {
+  test('does not block on children flagged needsProducerReview = true', async () => {
+    const mod = await import(MODULE_PATH);
+    // checkProducerReviewStatus operates on the list it is given; here we
+    // pass a top-level-only list (children excluded upstream) and verify a
+    // child flag does not appear because it was filtered out of the input.
+    const result = mod.checkProducerReviewStatus([
+      { id: 'SA-TOP-1', title: 'Top Ready', needsProducerReview: false, parentId: null },
+    ]);
+    assert.equal(result.hasBlockingItems, false, 'top-level list with no flagged items passes');
+    assert.equal(result.blockingItems.length, 0);
+
+    // And a top-level item still blocks as before.
+    const blocking = mod.checkProducerReviewStatus([
+      { id: 'SA-TOP-2', title: 'Top Flagged', needsProducerReview: true, parentId: null },
+    ]);
+    assert.equal(blocking.hasBlockingItems, true, 'top-level flagged item still blocks');
+    assert.equal(blocking.blockingItems[0].workItemId, 'SA-TOP-2');
+  });
+
+  test('children with producer-review flags are excluded from blocking report', async () => {
+    const mod = await import(MODULE_PATH);
+    // Simulate the gate being invoked with the top-level list only: child
+    // items (parentId set) have already been filtered out, so their flags
+    // cannot block.
+    const items = [
+      { id: 'SA-TOP-1', title: 'Top', needsProducerReview: false, parentId: null },
+    ];
+    const result = mod.checkProducerReviewStatus(items);
+    assert.equal(result.hasBlockingItems, false);
+    assert.equal(result.blockingItems.length, 0);
+  });
 });

@@ -52,40 +52,63 @@ import { execSync } from 'node:child_process';
  * Extracts `needsProducerReview` from each item's `wl list` output,
  * defaulting to `null` when the field is missing. This field is used
  * by `checkProducerReviewStatus()` for the producer-review gating step.
+ * Also projects `parentId` (SA-0MSUT8GQP004WSYN) so callers can
+ * distinguish top-level items from children; `getTopLevelCandidateItems()`
+ * uses it to scope the release gates.
  *
  * Invoked via `bash -c` (not plain /bin/sh) because `set -o pipefail`
  * is a bash-ism not supported by dash (Ubuntu/Debian's default sh) —
  * see LP-0MSQ0NTMO00577UJ.
  *
- * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null }>}
+ * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null }>}
  */
 export function getCandidateItems() {
   try {
     // Single query: stage=in_review implies status=completed (the
     // completed-minus-done == in_review invariant), piped through jq so only
-    // {id, title, needsProducerReview} enters the execSync buffer.
+    // {id, title, needsProducerReview, parentId} enters the execSync buffer.
     const output = execSync(
       `bash -c 'set -o pipefail; wl list --stage in_review --json ` +
-      `| jq -c \"[.workItems[] | {id, title, needsProducerReview}]\"'`,
+      `| jq -c \"[.workItems[] | {id, title, needsProducerReview, parentId}]\"'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     const projected = JSON.parse(output);
     if (!Array.isArray(projected)) {
       return [];
     }
-    // jq emits null for a missing needsProducerReview; normalize it to null
-    // (the same default the previous extraction applied for undefined).
+    // jq emits null for a missing needsProducerReview/parentId; normalize
+    // them to null (the same default the previous extraction applied for
+    // undefined).
     return projected.map((item) => ({
       id: item.id,
       title: item.title || item.id,
       needsProducerReview: item.needsProducerReview !== undefined
         ? item.needsProducerReview
         : null,
+      parentId: item.parentId !== undefined ? item.parentId : null,
     }));
   } catch (err) {
     console.error(`Warning: Failed to query release candidates: ${err.message}`);
     return [];
   }
+}
+
+// ── getTopLevelCandidateItems ────────────────────────────────────────────────
+
+/**
+ * Query Worklog for top-level candidate work items only.
+ *
+ * Same query and projection as {@link getCandidateItems}, but filters to
+ * items with `parentId == null`. Children are audited (and covered) as part
+ * of their parent's audit/review, so the release gates must consider only
+ * top-level items — a child-level audit gap must not spuriously block a
+ * release (SA-0MSUT8GQP004WSYN). An orphaned `in_review` item with no
+ * parent (`parentId == null`) IS top-level and remains gated.
+ *
+ * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null }>}
+ */
+export function getTopLevelCandidateItems() {
+  return getCandidateItems().filter((item) => item.parentId === null);
 }
 
 // ── getAuditStatus ───────────────────────────────────────────────────────────
@@ -350,8 +373,10 @@ export function checkProducerReviewStatus(items) {
  * }>}
  */
 export async function checkAuditReadyToClose() {
-  // Step 1: Collect candidate items
-  const items = getCandidateItems();
+  // Step 1: Collect candidate items — top-level only. Children are covered
+  // by their parent's audit, so they must never block the release
+  // (SA-0MSUT8GQP004WSYN).
+  const items = getTopLevelCandidateItems();
 
   if (items.length === 0) {
     return {
