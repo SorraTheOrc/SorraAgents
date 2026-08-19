@@ -134,4 +134,38 @@ describe('getCompletedOrInReviewItems - single stage query + jq projection', () 
     assert.deepEqual(items, [], 'failed query should yield no items');
     rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  // Regression for dash: getCompletedOrInReviewItems must invoke the query
+  // via 'bash -c' so that 'set -o pipefail' does not fail on dash systems
+  // (where /bin/sh → dash).  The mock 'wl' only emits its payload when its
+  // parent process is bash — if the outer shell is dash the mock exits 1,
+  // and getCompletedOrInReviewItems() should return [].
+  // (LP-0MSQ0NTMO00577UJ)
+  test('wraps execSync command in bash -c for dash compatibility', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const payloadPath = join(tmpDir, 'payload.json');
+    writeFileSync(payloadPath, JSON.stringify({
+      success: true,
+      workItems: [{
+        id: 'SA-1', title: 'Dash-safe', issueType: 'task',
+        description: 'desc', parentId: null,
+      }],
+    }));
+    const wlPath = join(tmpDir, 'wl');
+    // This script checks its parent process name; it only emits payload
+    // when the parent is bash (i.e. the query runs under bash -c).
+    const script = `#!/usr/bin/env bash\n` +
+      `parent=$(ps -o comm= -p $PPID 2>/dev/null)\n` +
+      `case "$parent" in *bash*) cat "${payloadPath}" ;; *) exit 1 ;; esac\n`;
+    writeFileSync(wlPath, script, { mode: 0o755 });
+
+    const items = withWlMock(tmpDir, () => mod.getCompletedOrInReviewItems());
+
+    assert.deepEqual(items, [{
+      id: 'SA-1', title: 'Dash-safe', issueType: 'task',
+      description: 'desc', parentId: null,
+    }], 'query must run under bash so set -o pipefail works on dash');
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
 });

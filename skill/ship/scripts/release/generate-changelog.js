@@ -45,9 +45,11 @@ const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
  * re-listed). The output is piped through `jq` so only the needed field
  * projection enters execSync's buffer — the full `wl list --json` output
  * for a large worklog can exceed the default 1 MB buffer (ENOBUFS), while
- * the OS pipe between `wl` and `jq` is unbounded. `set -o pipefail`
- * ensures a `wl` failure still surfaces as an execSync error so the
- * warning path below fires.
+ * the OS pipe between `wl` and `jq` is unbounded. The command is
+ * invoked via `bash -c` (not plain /bin/sh) because `set -o pipefail`
+ * is a bash-ism not supported by dash — see LP-0MSQ0NTMO00577UJ.
+ * `set -o pipefail` ensures a `wl` failure still surfaces as an execSync
+ * error so the warning path below fires.
  *
  * @returns {Array<{id:string, title:string, issueType:string, description:string, parentId?:string|null}>}
  */
@@ -57,8 +59,8 @@ export function getCompletedOrInReviewItems() {
     // jq so only {id, title, issueType, description, parentId} enters the buffer.
     // parentId is needed to filter parent-only work items for the changelog.
     const output = execSync(
-      `set -o pipefail; wl list --stage in_review --json ` +
-      `| jq -c '[.workItems[] | {id, title, issueType, description, parentId}]'`,
+      `bash -c 'set -o pipefail; wl list --stage in_review --json ` +
+      `| jq -c \"[.workItems[] | {id, title, issueType, description, parentId}]\"'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     return JSON.parse(output) || [];

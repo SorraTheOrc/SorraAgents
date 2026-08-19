@@ -53,6 +53,10 @@ import { execSync } from 'node:child_process';
  * defaulting to `null` when the field is missing. This field is used
  * by `checkProducerReviewStatus()` for the producer-review gating step.
  *
+ * Invoked via `bash -c` (not plain /bin/sh) because `set -o pipefail`
+ * is a bash-ism not supported by dash (Ubuntu/Debian's default sh) —
+ * see LP-0MSQ0NTMO00577UJ.
+ *
  * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null }>}
  */
 export function getCandidateItems() {
@@ -61,8 +65,8 @@ export function getCandidateItems() {
     // completed-minus-done == in_review invariant), piped through jq so only
     // {id, title, needsProducerReview} enters the execSync buffer.
     const output = execSync(
-      `set -o pipefail; wl list --stage in_review --json ` +
-      `| jq -c '[.workItems[] | {id, title, needsProducerReview}]'`,
+      `bash -c 'set -o pipefail; wl list --stage in_review --json ` +
+      `| jq -c \"[.workItems[] | {id, title, needsProducerReview}]\"'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     const projected = JSON.parse(output);
