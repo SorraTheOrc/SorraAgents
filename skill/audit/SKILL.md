@@ -287,7 +287,7 @@ reconciles with the canonical template — render it as the **last step**, then
 close with: `<work-item-id>: <one-line summary>`.
 
 ```bash
-python3 ../report/scripts/render_report.py <work-item-id> \
+python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
   --skill-name audit \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \
