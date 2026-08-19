@@ -71,6 +71,45 @@ def test_run_audit_dry_run(tmp_path):
     assert 'DRY-RUN' in content
 
 
+def test_run_audit_includes_session_id_non_dry_run(tmp_path, monkeypatch):
+    """AC2: run_audit_in_worktree adds --session-id when dry_run=False.
+
+    The session-id must be ``audit-{wl_id}-entrypoint-{uuid8}`` with an
+    8-hex-char UUID suffix, and the WL id must be embedded.
+    """
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = '{"type":"session","id":"s"}\n'
+        stderr = ''
+
+    def fake_run(cmd, *a, **k):
+        captured['cmd'] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(audit_pr.subprocess, 'run', fake_run)
+    rc, _log = audit_pr.run_audit_in_worktree(str(tmp_path), 'SA-TEST', dry_run=False)
+    assert rc == 0
+    cmd = captured['cmd']
+    assert '--session-id' in cmd
+    idx = cmd.index('--session-id')
+    session_id = cmd[idx + 1]
+    assert session_id.startswith('audit-SA-TEST-entrypoint-')
+    suffix = session_id.rsplit('-', 1)[1]
+    assert len(suffix) == 8
+    int(suffix, 16)
+
+
+def test_run_audit_no_session_id_dry_run(tmp_path):
+    """AC2: dry_run mode must NOT add --session-id."""
+    rc, log = audit_pr.run_audit_in_worktree(str(tmp_path), 'SA-TEST', dry_run=True)
+    assert rc == 0
+    content = open(log).read()  # noqa: SIM115
+    assert 'DRY-RUN' in content
+    assert '--session-id' not in content
+
+
 def test_run_audit_prompt_echo_not_extracted_as_output(tmp_path, monkeypatch):
     """AC3: A user prompt-echo (message_start, role=user) must not be written
     to the audit log as if it were the model's output when the model errors

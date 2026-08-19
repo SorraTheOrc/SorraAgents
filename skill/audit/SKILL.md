@@ -229,6 +229,8 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 
 **Context reduction (SA-0MSISKM8F004NW1U):** every `_call_pi` runs with `--no-context-files --no-skills` in both tool-enabled and tool-less modes. Audit prompts are fully self-contained — they carry the read-only mandate, JSON output format, FILE SCOPE manifest, SCANNING block, and criteria — so the duplicated global+project AGENTS.md load and the skills section are dropped from each session's static context (an 88% reduction, ~23x margin under the 10K-token bound; prompts must never depend on AGENTS.md or skill descriptions — that is an invariant of this skill). Per-call timing + verification script + recorded AC2/AC3 evidence: [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md), [evidence/](evidence/).
 
+**Session-id traceability (SA-0MSNYMKV7005P0H9):** every pi subprocess invocation carries a descriptive `--session-id` so sessions can be traced back to the work item being audited. `_call_pi()` builds `audit-{issue_id}-{context}-{uuid8}` (8-hex-char UUID, fresh per invocation; colons in context values like `child:SA-XXX` are replaced with underscores so the id passes `assertValidSessionId`); `audit_pr.py`'s `run_audit_in_worktree()` builds `audit-{wl_id}-entrypoint-{uuid8}` but only when `dry_run=False`. Sessions appear under `~/.pi/agent/sessions/` keyed by the descriptive id instead of a random UUID.
+
 ## Guidance for models
 
 ### Authority and Runner Verdicts (CRITICAL)

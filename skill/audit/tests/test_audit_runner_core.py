@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -370,6 +371,131 @@ class TestCallPiEnableTools:
         assert result.get("_timeout") is True
         assert result.get("verdict") == "unmet"
         assert "timed out" in result.get("evidence", "")
+
+
+class TestCallPiSessionId:
+    """Tests for _call_pi() --session-id construction (SA-0MSNYMKV7005P0H9)."""
+
+    def _make_mock_popen(self, stdout_text: str = "{\"text\": \"test\"}"):
+        """Create a mock Popen that returns a process-like object."""
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        return mock_process
+
+    def test_session_id_added_when_issue_id_given(self):
+        """AC1: _call_pi() adds --session-id when issue_id is supplied.
+
+        The session-id must start with ``audit-`` and contain the issue id
+        and the phase context.
+        """
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi(
+                "test prompt", model="test-model",
+                issue_id="SA-0MSNYMKV7005P0H9", context="phase2_deep",
+            )
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--session-id" in args
+        idx = args.index("--session-id")
+        session_id = args[idx + 1]
+        assert session_id.startswith("audit-SA-0MSNYMKV7005P0H9-phase2_deep-")
+        # 8 hex chars UUID suffix
+        suffix = session_id.rsplit("-", 1)[1]
+        assert len(suffix) == 8
+        int(suffix, 16)
+
+    def test_session_id_absent_when_issue_id_empty(self):
+        """Existing callers (no issue_id) do not get --session-id."""
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi("test prompt", model="test-model")
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--session-id" not in args
+
+    def test_session_id_sanitizes_colons_in_context(self):
+        """AC3: colons in context are replaced with underscores.
+
+        ``assertValidSessionId`` rejects ``:``, so ``child:SA-XXX`` must
+        become ``child_SA-XXX``.
+        """
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi(
+                "test prompt", model="test-model",
+                issue_id="SA-0MSNYMKV7005P0H9", context="child:SA-XXX",
+            )
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--session-id" in args
+        idx = args.index("--session-id")
+        session_id = args[idx + 1]
+        assert "child_SA-XXX" in session_id
+        assert ":" not in session_id
+        # assertValidSessionId regex: alphanumeric, -, _, . only
+        assert re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", session_id)
+
+    def test_session_id_fresh_uuid_per_invocation(self):
+        """AC1: each invocation gets its own unique UUID suffix."""
+        mock_process = self._make_mock_popen()
+
+        session_ids = []
+        for _ in range(3):
+            with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+                audit_runner._call_pi(
+                    "test prompt", model="test-model",
+                    issue_id="SA-0MSNYMKV7005P0H9", context="phase2_deep",
+                )
+            args = mock_popen.call_args[0][0]
+            assert "--session-id" in args
+            idx = args.index("--session-id")
+            session_ids.append(args[idx + 1])
+
+        assert len(set(session_ids)) == 3
+
+    def test_session_id_does_not_break_context_reduction_flags(self):
+        """AC4: --no-context-files --no-skills remain in the command."""
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi(
+                "test prompt", model="test-model",
+                issue_id="SA-0MSNYMKV7005P0H9", context="phase2_deep",
+                enable_tools=True,
+            )
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--no-context-files" in args
+        assert "--no-skills" in args
+        assert "--tools" in args
+
+
+class TestCallPiAndMaybeLogSessionId:
+    """Tests for _call_pi_and_maybe_log() forwarding issue_id/context."""
+
+    def test_forwards_issue_id_and_context_to_call_pi(self):
+        """issue_id and context are forwarded to _call_pi()."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call_pi:
+            mock_call_pi.return_value = {"verdict": "met", "evidence": "ok"}
+            audit_runner._call_pi_and_maybe_log(
+                "SA-0MSNYMKV7005P0H9", "phase2_deep", "test prompt",
+                model="test-model",
+            )
+
+        mock_call_pi.assert_called_once()
+        _args, kwargs = mock_call_pi.call_args
+        assert kwargs.get("issue_id") == "SA-0MSNYMKV7005P0H9"
+        assert kwargs.get("context") == "phase2_deep"
+
 
 class TestCallPiAndMaybeLogEnableTools:
     """Tests for _call_pi_and_maybe_log() forwarding enable_tools (AC1-AC3)."""

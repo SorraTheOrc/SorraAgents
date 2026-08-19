@@ -63,6 +63,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -122,6 +123,32 @@ shorter than any long bounded wait, so a long default wait previously
 killed audits mid-wait. Operators can opt into a bounded wait via the
 ``AUDIT_LOCK_TIMEOUT`` environment variable.
 """
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _sanitize_session_id_segment(value: str) -> str:
+    """Replace characters that are invalid in a session-id with underscores.
+
+    ``--session-id`` must match ``^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$``
+    (``assertValidSessionId`` in the pi core), so colons are replaced with
+    underscores to keep values like ``child:SA-XXX`` valid.
+    """
+    return value.replace(":", "_")
+
+
+def _build_session_id(issue_id: str, context: str) -> str:
+    """Build a descriptive session-id for audit pi invocations.
+
+    Format: ``audit-{issue_id}-{context}-{uuid8}`` where the UUID is the
+    first 8 hex chars of ``uuid4()``.  Colons in *context* are replaced
+    with underscores so the result passes ``assertValidSessionId``.
+    """
+    safe_context = _sanitize_session_id_segment(context)
+    short_uuid = uuid.uuid4().hex[:8]
+    return f"audit-{issue_id}-{safe_context}-{short_uuid}"
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2532,7 +2559,9 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              timeout: int | None = None,
              max_retries: int | None = None,
              ac_fallback_used: threading.Event | None = None,
-             child_screen: bool = False) -> dict:
+             child_screen: bool = False,
+             issue_id: str = "",
+             context: str = "") -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
 
     Args:
@@ -2560,6 +2589,11 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 600 s, configurable via
             ``AUDIT_CHILD_SCREEN_TIMEOUT`` / ``--child-screen-timeout``)
             instead of the 1800 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
+
+        issue_id: Work-item ID used in the ``--session-id`` flag.
+        context: Phase/context string used in the ``--session-id`` flag
+                 (e.g. ``phase2_deep``, ``parent``, ``child:SA-XXX``).
+                 Colons are replaced with underscores in the output.
 
     Returns a dict with keys ``verdict`` and ``evidence``.
     On success, implementations may also include additional diagnostic keys
@@ -2590,6 +2624,10 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     # modes. Both flags are loader toggles compatible with --mode json and
     # --tools; prompts must never rely on AGENTS.md or skill descriptions.
     cmd.extend(["--no-context-files", "--no-skills"])
+    # Session-id: attach a descriptive session identifier so audit sessions
+    # can be traced back to the work item being audited (SA-0MSNYMKV7005P0H9).
+    if issue_id:
+        cmd.extend(["--session-id", _build_session_id(issue_id, context)])
 
     effective_timeout = _resolve_call_timeout(timeout, child_screen=child_screen)
     stall_timeout = _resolve_stall_timeout()
@@ -3979,7 +4017,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries, ac_fallback_used=ac_fallback_used, child_screen=child_screen)
+    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries, ac_fallback_used=ac_fallback_used, child_screen=child_screen, issue_id=issue_id, context=context)
 
     # Emit a per-call timing line to stderr (performance baseline). Includes
     # issue id, call context, and elapsed seconds so Phase 2 durations are
