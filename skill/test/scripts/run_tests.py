@@ -645,7 +645,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-run failing tests once to verify flakiness before triage.",
     )
-    parser.add_argument("--timeout", type=int, default=600, help="Per-suite timeout in seconds.")
+    parser.add_argument("--timeout", type=int, default=None, help="Per-suite timeout in seconds.")
     parser.add_argument(
         "--no-cache",
         action="store_true",
