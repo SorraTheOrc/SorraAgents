@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 from skill.test.scripts.run_tests import (
+    build_parser,
     full_suite_commands,
     node_suite_commands,
     suite_timeout_per_command,
@@ -177,3 +179,177 @@ class TestBackwardCompatibility:
         (tmp_path / "tests" / "unit").mkdir(parents=True)
         cmds = node_suite_commands(tmp_path)
         assert cmds == ["npm --silent test -- tests/unit"]
+
+
+class TestTimeoutResolution:
+    """Test the timeout resolution chain in main().
+
+    Root cause: ``--timeout`` argparse default=600 made ``args.timeout`` always
+    truthy, short-circuiting the or-chain
+    ``args.timeout or suite_timeout_per_command(project_root) or 600``.
+
+    Fix: default=None so the or-chain falls through to config, then 600.
+
+    Acceptance Criteria:
+    - AC: --timeout argparse default is None (not 600)
+    - AC: Without --timeout, suite_timeout_per_command() config value is consulted
+    - AC: --timeout CLI flag overrides config when explicitly provided
+    - AC: Fallback to 600 still applies when neither --timeout nor config is set
+    """
+
+    def test_args_timeout_default_is_none(self) -> None:
+        """args.timeout should be None when --timeout is not provided,
+        allowing the or-chain to fall through to suite_timeout_per_command."""
+        args = build_parser().parse_args([])
+        assert args.timeout is None
+
+    def test_args_timeout_set_when_provided(self) -> None:
+        """When --timeout is explicitly provided, it should have the given value."""
+        args = build_parser().parse_args(["--timeout", "120"])
+        assert args.timeout == 120
+
+    def test_timeout_from_config_when_no_flag(self) -> None:
+        """Without --timeout, suite_timeout_per_command config is consulted.
+
+        Simulates: args.timeout=None, config returns 900.
+        Resolution: None or 900 or 600 → 900.
+        """
+        args = build_parser().parse_args([])
+        config_timeout = 900
+        resolved = args.timeout or config_timeout or 600
+        assert resolved == 900
+
+    def test_timeout_fallback_to_600_when_no_config(self) -> None:
+        """Without --timeout and without config, fallback to 600.
+
+        Simulates: args.timeout=None, config returns None.
+        Resolution: None or None or 600 → 600.
+        """
+        args = build_parser().parse_args([])
+        config_timeout = None
+        resolved = args.timeout or config_timeout or 600
+        assert resolved == 600
+
+    def test_timeout_cli_overrides_config(self) -> None:
+        """When --timeout is explicitly provided, it overrides config.
+
+        Simulates: args.timeout=120, config returns 900.
+        Resolution: 120 or 900 or 600 → 120 (CLI wins).
+        """
+        args = build_parser().parse_args(["--timeout", "120"])
+        config_timeout = 900
+        resolved = args.timeout or config_timeout or 600
+        assert resolved == 120
+
+    def test_timeout_chain_integration_config_applied(self) -> None:
+        """Integration: main() passes correct timeout to run_all when
+        suite_timeout_per_command returns a config value.
+
+        Verifies the full chain: main() parses args → resolves timeout via
+        or-chain → passes to run_all().
+        """
+        from skill.test.scripts import run_tests as run_tests_module
+
+        captured_timeout: list[int | None] = [None]
+
+        def capture_run_all(*args, **kwargs):
+            captured_timeout[0] = kwargs.get("timeout")
+            return {
+                "success": True,
+                "suites": {},
+                "failures": [],
+                "notices": [],
+            }
+
+        with patch.object(
+            run_tests_module,
+            "suite_timeout_per_command",
+            return_value=900,
+        ):
+            with patch.object(
+                run_tests_module,
+                "run_all",
+                side_effect=capture_run_all,
+            ):
+                try:
+                    run_tests_module.main([])
+                except SystemExit:
+                    pass  # main() calls sys.exit(0) on success
+
+        assert captured_timeout[0] == 900, (
+            f"Expected timeout 900 from config, got {captured_timeout[0]}"
+        )
+
+    def test_timeout_chain_integration_cli_overrides(self) -> None:
+        """Integration: main() passes CLI --timeout to run_all, ignoring config.
+
+        Verifies that explicit --timeout 120 overrides a config value of 900.
+        """
+        from skill.test.scripts import run_tests as run_tests_module
+
+        captured_timeout: list[int | None] = [None]
+
+        def capture_run_all(*args, **kwargs):
+            captured_timeout[0] = kwargs.get("timeout")
+            return {
+                "success": True,
+                "suites": {},
+                "failures": [],
+                "notices": [],
+            }
+
+        with patch.object(
+            run_tests_module,
+            "suite_timeout_per_command",
+            return_value=900,
+        ):
+            with patch.object(
+                run_tests_module,
+                "run_all",
+                side_effect=capture_run_all,
+            ):
+                try:
+                    run_tests_module.main(["--timeout", "120"])
+                except SystemExit:
+                    pass
+
+        assert captured_timeout[0] == 120, (
+            f"Expected CLI timeout 120 to override config, got {captured_timeout[0]}"
+        )
+
+    def test_timeout_chain_integration_fallback_to_600(self) -> None:
+        """Integration: main() falls back to 600 when config is absent.
+
+        Verifies: no --timeout, config returns None → timeout = 600.
+        """
+        from skill.test.scripts import run_tests as run_tests_module
+
+        captured_timeout: list[int | None] = [None]
+
+        def capture_run_all(*args, **kwargs):
+            captured_timeout[0] = kwargs.get("timeout")
+            return {
+                "success": True,
+                "suites": {},
+                "failures": [],
+                "notices": [],
+            }
+
+        with patch.object(
+            run_tests_module,
+            "suite_timeout_per_command",
+            return_value=None,
+        ):
+            with patch.object(
+                run_tests_module,
+                "run_all",
+                side_effect=capture_run_all,
+            ):
+                try:
+                    run_tests_module.main([])
+                except SystemExit:
+                    pass
+
+        assert captured_timeout[0] == 600, (
+            f"Expected fallback timeout 600, got {captured_timeout[0]}"
+        )
