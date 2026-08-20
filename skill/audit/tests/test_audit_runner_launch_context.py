@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest import mock
 
 # ---------------------------------------------------------------------------
@@ -454,6 +455,138 @@ class TestFileScopeManifestValidation:
             )
 
         assert rc == 0
+
+
+# ===========================================================================
+# SA-0MSUBX8PP0087OEA: FILE SCOPE manifest false positive for repos whose
+# distinctive markers are all root-level files.
+#
+# _repo_index aggregates root-level files under "(root)/ (N files)", so a
+# work item whose changes touch only framework-shared subdirectories never
+# surfaces the owning repo's distinctive root-file markers in the manifest
+# and the Phase 2 validation falsely aborts with an audit scope error.
+# The fix exposes a bounded list of root file names in the (root) entry so
+# root-file markers stay verifiable (AC1) while a manifest built from the
+# wrong repo is still rejected (AC2). Fixture repos are used per the work
+# item (never live dev-scripts state).
+# ===========================================================================
+
+
+class TestRootFileOnlyRepoManifest:
+    """AC1/AC2: root-file-only-marker repos must not false-positive the
+    FILE SCOPE validation, and mis-scoped manifests are still rejected.
+    """
+
+    ROOT_FILES: ClassVar[list[str]] = [
+        "install.sh", "remote", "sshl", "update", "ai.home.conf"
+    ]
+    SHARED_SUBDIR = "tests"  # present in the framework repo too -> not distinctive
+
+    @staticmethod
+    def _init_repo(tmp_path: Path) -> Path:
+        """Init a real git repo whose distinctive markers are all root files."""
+        repo = tmp_path / "root-file-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "t@t.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "T"], check=True
+        )
+        for name in TestRootFileOnlyRepoManifest.ROOT_FILES:
+            (repo / name).write_text("x\n", encoding="utf-8")
+        shared = repo / TestRootFileOnlyRepoManifest.SHARED_SUBDIR
+        shared.mkdir()
+        (shared / "test_a.py").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+        return repo
+
+    @staticmethod
+    def _git_runner(repo: Path):
+        """Runner resolving git commands against the fixture repo."""
+        def runner(cmd):
+            if cmd and cmd[0] == "git":
+                cmd = ["git", "-C", str(repo)] + list(cmd[1:])
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  check=False)
+        return runner
+
+    def test_repo_index_exposes_root_file_names(self, tmp_path):
+        """AC1: _repo_index lists root-level file names in the (root) entry so
+        distinctive root-file markers appear in the manifest.
+        """
+        repo = self._init_repo(tmp_path)
+        index = audit_runner._repo_index(self._git_runner(repo))
+        joined = "\n".join(index)
+        for name in self.ROOT_FILES:
+            assert name in joined, f"root file {name!r} missing from index: {index}"
+        assert any(line.startswith("(root)/ (5 files)") for line in index), (
+            f"aggregate (root) count must be preserved: {index}"
+        )
+
+    def test_root_file_markers_are_distinctive(self, tmp_path):
+        """AC1: the fixture repo's root files (not the shared subdir) are the
+        distinctive markers the validation verifies against.
+        """
+        repo = self._init_repo(tmp_path)
+        distinctive = audit_runner._distinctive_project_top_levels(repo)
+        assert set(distinctive) == set(self.ROOT_FILES), (
+            f"expected only root-file markers to be distinctive: {distinctive}"
+        )
+
+    def test_manifest_with_root_file_markers_passes_validation(self, tmp_path):
+        """AC1: a manifest for a root-file-only-marker repo whose changes touch
+        only a framework-shared subdir does NOT abort with a scope error.
+        """
+        repo = self._init_repo(tmp_path)
+        index = audit_runner._repo_index(self._git_runner(repo))
+        manifest = (
+            "Changed files (git diff / status):\n"
+            "- `tests/test_a.py`\n\n"
+            "Repository index (top-level layout):\n"
+            + "\n".join(f"- {line}" for line in index)
+        )
+        error = audit_runner._validate_file_scope_manifest(manifest, repo)
+        assert error is None, f"false positive scope error: {error}"
+
+    def test_mis_scoped_manifest_still_rejected_for_root_file_repo(self, tmp_path):
+        """AC2: a manifest built from the wrong repo (no owning root-file
+        markers) is still rejected — the guard is not disabled.
+        """
+        repo = self._init_repo(tmp_path)
+        wrong_manifest = (
+            "Repository index (top-level layout):\n"
+            "- skill/ (42 files)\n- tests/ (11 files)\n- (root)/ (3 files)"
+        )
+        error = audit_runner._validate_file_scope_manifest(wrong_manifest, repo)
+        assert error is not None
+        assert "Audit scope error" in error
+
+    def test_repo_index_root_file_list_is_bounded(self, tmp_path):
+        """Risk mitigation: the root-file name list is bounded so a repo with
+        many root files cannot bloat the manifest.
+        """
+        repo = self._init_repo(tmp_path)
+        # (root) bucket has 5 files; cap the inline list at 2 and expect "..."
+        index = audit_runner._repo_index(
+            self._git_runner(repo), max_root_files=2
+        )
+        root_line = next(
+            line for line in index if line.startswith("(root)/")
+        )
+        shown = root_line.split(":", 1)[1] if ":" in root_line else ""
+        truncated = shown.rstrip().endswith(", ...")
+        names = [
+            p.strip()
+            for p in shown.rstrip()[:-5].split(",") if p.strip()
+        ] if truncated else [p.strip() for p in shown.split(",") if p.strip()]
+        assert len(names) <= 2, (
+            f"root-file list must be capped at max_root_files: {root_line}"
+        )
+        assert truncated, f"truncated list must be marked: {root_line}"
 
 
 # ===========================================================================

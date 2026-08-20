@@ -1078,7 +1078,10 @@ def _validate_file_scope_manifest(file_scope: str,
     The check is inclusion-based (per the risk mitigation): at least one
     distinctive top-level entry of the item repo must appear in the manifest
     — the manifest need not equal the item repo, so mono-repo items whose
-    files legitimately live in the framework tree stay valid.
+    files legitimately live in the framework tree stay valid. Repos whose
+    distinctive markers are all root-level files are handled by
+    ``_repo_index``, which lists root file names in the ``(root)`` index
+    entry so the markers surface in the manifest (SA-0MSUBX8PP0087OEA).
     """
     if owning_root is None:
         return None
@@ -3161,15 +3164,21 @@ def _git_changed_files(runner: Runner) -> list[str]:
     return changed[:_FILE_SCOPE_MAX_FILES]
 
 
-def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX) -> list[str]:
+def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
+                max_root_files: int = _FILE_SCOPE_MAX_FILES) -> list[str]:
     """Return a lightweight repo index (top-level entries with file counts).
 
     Uses ``git ls-files`` to count files per top-level path and returns the
-    ``max_entries`` largest buckets as ``path/ (N files)`` strings. On git
-    failure, falls back to a best-effort directory listing of
-    ``TARGET_PROJECT_ROOT``.
+    ``max_entries`` largest buckets as ``path/ (N files)`` strings. Root-level
+    files are aggregated under ``(root)/`` but the first ``max_root_files``
+    root file names are listed inline (e.g. ``(root)/ (16 files): install.sh,
+    remote, ...``) so repos whose distinctive top-level markers are all
+    root-level files stay verifiable by the file-scope manifest check
+    (SA-0MSUBX8PP0087OEA). On git failure, falls back to a best-effort
+    listing of ``TARGET_PROJECT_ROOT``'s top-level entries.
     """
     buckets: dict[str, int] = {}
+    root_files: list[str] = []
     try:
         proc = runner(["git", "ls-files"])
         if proc.returncode == 0 and proc.stdout:
@@ -3179,21 +3188,37 @@ def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX) -> lis
                     continue
                 top = rel.split("/", 1)[0] if "/" in rel else "(root)"
                 buckets[top] = buckets.get(top, 0) + 1
+                if top == "(root)":
+                    root_files.append(rel)
     except Exception:  # noqa: S110, BLE001 -- git is best-effort for the manifest
         pass
 
     if not buckets:
-        # Best-effort fallback: list top-level dirs of TARGET_PROJECT_ROOT
+        # Best-effort fallback: list top-level entries of TARGET_PROJECT_ROOT
         try:
             root = TARGET_PROJECT_ROOT
             for entry in sorted(root.iterdir()):
-                if entry.is_dir() and not entry.name.startswith("."):
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
                     buckets[entry.name] = len(list(entry.iterdir()))
+                else:
+                    buckets["(root)"] = buckets.get("(root)", 0) + 1
+                    root_files.append(entry.name)
         except OSError:
             return []
 
     ordered = sorted(buckets.items(), key=lambda kv: -kv[1])[:max_entries]
-    return [f"{name}/ ({count} files)" for name, count in ordered]
+    lines: list[str] = []
+    for name, count in ordered:
+        line = f"{name}/ ({count} files)"
+        if name == "(root)" and root_files:
+            shown = sorted(root_files)[:max_root_files]
+            line += ": " + ", ".join(shown)
+            if len(root_files) > max_root_files:
+                line += ", ..."
+        lines.append(line)
+    return lines
 
 
 def _phase1_evidence_refs(ac_results: list[dict],
