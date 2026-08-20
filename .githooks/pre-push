@@ -32,11 +32,21 @@ fi
 # committed thresholds (docs/dev/context-budget.thresholds.json). The gate is
 # fail-open when the tooling or thresholds file is absent (e.g. worktrees of
 # old commits, or repositories that do not ship the context-audit skill).
+# measure_context.py is resolved first from the local skill/context-audit/
+# path (SorraAgents), then from the installed global symlink
+# (~/.pi/agent/skills/context-audit/scripts/measure_context.py) for the other
+# framework projects that only get the skill via install_pi.sh.
 if [ "$CONTEXT_BUDGET_SKIP" != "1" ]; then
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-  measure="$repo_root/skill/context-audit/scripts/measure_context.py"
+  if [ -f "$repo_root/skill/context-audit/scripts/measure_context.py" ]; then
+    measure="$repo_root/skill/context-audit/scripts/measure_context.py"
+  elif [ -f "$HOME/.pi/agent/skills/context-audit/scripts/measure_context.py" ]; then
+    measure="$HOME/.pi/agent/skills/context-audit/scripts/measure_context.py"
+  else
+    measure=""
+  fi
   thresholds="$repo_root/docs/dev/context-budget.thresholds.json"
-  if [ -n "$repo_root" ] && [ -f "$measure" ] && [ -f "$thresholds" ]; then
+  if [ -n "$repo_root" ] && [ -n "$measure" ] && [ -f "$measure" ] && [ -f "$thresholds" ]; then
     if python3 "$measure" --include-hidden --thresholds "$thresholds" >/dev/null 2>&1; then
       :
     else
