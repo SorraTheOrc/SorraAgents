@@ -2,3 +2,4 @@
 
 [per-file-ignores]
 "/home/rgardler/projects/SorraAgents/skill/report/scripts/render_report.py" = ["F541"]
+"/home/rgardler/projects/SorraAgents/.worklog/worktrees/wl-SA-0MSQ6K7Z1002H14Z-ship-skill-send-discord-message-with-rel/skill/report/scripts/render_report.py" = ["F541"]
