@@ -595,6 +595,7 @@ VERDICT_MET = "met"
 VERDICT_UNMET = "unmet"
 VERDICT_PARTIAL = "partial"
 VERDICT_ADJUSTED = "adjusted"
+VERDICT_WARNING = "warning"  # zero-AC sentinel / extraction failure (SA-0MSRLLQ0V008EW3J)
 _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
 
 
@@ -3338,6 +3339,9 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
+        ``warning`` criteria (e.g. zero-AC sentinel where ACs could not be extracted)
+        are **not** acceptable and will produce ``Ready to close: No``.
+        (SA-0MSRLLQ0V008EW3J)
       - All non-deleted children must be in ``in_review`` or ``done`` stage.
         Children with ``status: in_progress`` but ``stage: in_review`` are
         acceptable and do NOT block closure.
@@ -6882,7 +6886,18 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                     "evidence": evidence,
                 })
     else:
-        ac_results = [{"text": "No acceptance criteria defined.", "verdict": "met", "evidence": ""}]
+        # Zero-AC sentinel path: ACs could not be extracted (heading mismatch).
+        # Emit a warning verdict so the item is NOT auto-approved.
+        # The sentinel string itself is unchanged for backward compat with other
+        # callers; only the verdict changes (SA-0MSRLLQ0V008EW3J).
+        ac_results = [{
+            "text": "No acceptance criteria defined.",
+            "verdict": VERDICT_WARNING,
+            "evidence": (
+                "ACs could not be extracted — verify item description uses a "
+                "recognized heading format (e.g. 'Acceptance Criteria' or 'AC')."
+            ),
+        }]
 
 
     ctx.ac_results = ac_results

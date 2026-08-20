@@ -1825,6 +1825,107 @@ class TestExtractAcs:
         acs = audit_runner._extract_acs(desc)
         assert acs == ["First criterion", "Second criterion"]
 
+
+class TestZeroAcSentinelWarning:
+    """SA-0MSRLLQ0V008EW3J: zero-AC sentinel yields warning, not met.
+
+    The sentinel string (returned by _extract_acs on heading mismatch) must
+    produce a ``warning`` verdict so the item is NOT auto-approved.
+    """
+
+    def test_verdict_warning_constant_exists(self):
+        """VERDICT_WARNING is defined and equals 'warning'."""
+        assert hasattr(audit_runner, "VERDICT_WARNING")
+        assert audit_runner.VERDICT_WARNING == "warning"
+
+    def test_warning_not_in_acceptable_verdicts(self):
+        """VERDICT_WARNING is NOT in _ACCEPTABLE_VERDICTS."""
+        assert "warning" not in audit_runner._ACCEPTABLE_VERDICTS
+
+    def test_normalize_verdict_passes_through_warning(self):
+        """_normalize_verdict passes 'warning' through unchanged."""
+        assert audit_runner._normalize_verdict("warning") == "warning"
+        assert audit_runner._normalize_verdict("WARNING") == "warning"
+
+    def test_assemble_report_ready_no_with_warning(self):
+        """_assemble_issue_report produces 'Ready to close: No' when any AC
+        has a 'warning' verdict."""
+        ac_results = [{
+            "text": "No acceptance criteria defined.",
+            "verdict": audit_runner.VERDICT_WARNING,
+            "evidence": "ACs could not be extracted",
+        }]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, [], model="test-model",
+            model_source="remote",
+        )
+        assert "Ready to close: No" in report
+
+    def test_assemble_report_ready_yes_with_all_met(self):
+        """_assemble_issue_report still produces 'Ready to close: Yes' when
+        all ACs are 'met' (no regression on happy path)."""
+        ac_results = [
+            {"text": "AC one", "verdict": audit_runner.VERDICT_MET, "evidence": "ok"},
+            {"text": "AC two", "verdict": audit_runner.VERDICT_MET, "evidence": "ok"},
+        ]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, [], model="test-model",
+            model_source="remote",
+        )
+        assert "Ready to close: Yes" in report
+
+    def test_sentinel_path_includes_evidence_message(self):
+        """The sentinel ac_result includes an evidence message directing
+        the operator to check the heading format."""
+        ac_results = [{
+            "text": "No acceptance criteria defined.",
+            "verdict": audit_runner.VERDICT_WARNING,
+            "evidence": "ACs could not be extracted — verify item",
+        }]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, [], model="test-model",
+            model_source="remote",
+        )
+        # The verdict is 'warning' so the report says 'Ready to close: No'
+        assert "Ready to close: No" in report
+        # The sentinel text still appears in the report (display unchanged)
+        assert "No acceptance criteria defined." in report
+
+    def test_adjusted_still_acceptable_with_warning_present(self):
+        """'adjusted' remains acceptable; only 'warning' blocks closure."""
+        ac_results = [
+            {"text": "AC one", "verdict": audit_runner.VERDICT_ADJUSTED, "evidence": "variance"},
+            {"text": "AC two", "verdict": audit_runner.VERDICT_WARNING, "evidence": "unextracted"},
+        ]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, [], model="test-model",
+            model_source="remote",
+        )
+        assert "Ready to close: No" in report
+
+    def test_warning_with_children_all_met_blocks_closure(self):
+        """Even when all children are met, a parent warning blocks closure."""
+        ac_results = [{
+            "text": "No acceptance criteria defined.",
+            "verdict": audit_runner.VERDICT_WARNING,
+            "evidence": "unextracted",
+        }]
+        child_results = [{
+            "id": "CHILD-1",
+            "title": "Child task",
+            "status": "in_progress",
+            "stage": "in_review",
+            "ac_results": [
+                {"text": "child AC", "verdict": audit_runner.VERDICT_MET, "evidence": "ok"},
+            ],
+        }]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, child_results,
+            model="test-model", model_source="remote",
+        )
+        assert "Ready to close: No" in report
+
+
 class TestCmdIssuePhases:
     """SA-0MSL1ZB5J005ENLI: the decomposed cmd_issue phases are
     independently callable module-level functions operating on a shared
