@@ -175,6 +175,36 @@ If the gate fails: (1) `StatusLifecycle.update_status(<work-item-id>, "open")`;
 (2) not well-defined → intake interview (`../intake/SKILL.md`); too large →
 plan interview (`/skill:plan`); (3) inform the user and ask whether to restart.
 
+3.2. Detect "already implemented" and close gaps (if applicable)
+
+Before creating a worktree, check whether the work item has **already been
+implemented** but is stuck in a wrong state/stage. Detection signals include:
+
+- The implement skill has previously reported the work as completed with a
+  commit hash (the skill's own output — not inferred from status alone).
+- The item's status/stage is inconsistent (e.g. `in_progress` with a commit
+  already on `dev`, or `completed` without `in_review`).
+- A recent audit report indicates prior completion but unmet ACs or gaps.
+
+If **any** detection signal applies:
+
+1. Run the audit to get a current picture:
+   `/skill:audit <work-item-id>` (reuse a recent audit if one exists from
+   the same session; the most recent audit report may predate later fixes).
+2. Review the audit report (`audit_report_<id>.md`) for gaps: unmet ACs,
+   failing tests, missed requirements.
+3. **If gaps exist:** fix them inline as part of the current item's
+   implementation — write tests, code, or docs as needed. Do **NOT** create
+   new work items for gaps (they are closed inline per the intake decision).
+   Large gaps that exceed the scope of minimal remediation → record as a
+   `discovered-from:<work-item-id>` work item instead.
+4. **If the audit is clean** (no gaps): report the summary and skip further
+   implementation — the item is done, just needs a status/stage update.
+   Proceed directly to Step 8 (Commit, Push to dev and mark in_review).
+
+If **no** detection signal applies (the item genuinely needs implementation):
+proceed to Step 4.
+
 4. Create a worktree from dev and branch inside it
 
 > **MANDATORY — worktree requirement:** All implementation work MUST be done
