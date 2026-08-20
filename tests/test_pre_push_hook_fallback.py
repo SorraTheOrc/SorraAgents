@@ -18,8 +18,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
-
 
 def _str(p: Path) -> str:
     """Helper to stringify a Path."""

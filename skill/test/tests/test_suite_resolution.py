@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from skill.test.scripts.run_tests import (
     build_parser,
@@ -265,16 +265,15 @@ class TestTimeoutResolution:
             run_tests_module,
             "suite_timeout_per_command",
             return_value=900,
+        ), patch.object(
+            run_tests_module,
+            "run_all",
+            side_effect=capture_run_all,
         ):
-            with patch.object(
-                run_tests_module,
-                "run_all",
-                side_effect=capture_run_all,
-            ):
-                try:
-                    run_tests_module.main([])
-                except SystemExit:
-                    pass  # main() calls sys.exit(0) on success
+            try:
+                run_tests_module.main([])
+            except SystemExit:
+                pass  # main() calls sys.exit(0) on success
 
         assert captured_timeout[0] == 900, (
             f"Expected timeout 900 from config, got {captured_timeout[0]}"
@@ -302,16 +301,15 @@ class TestTimeoutResolution:
             run_tests_module,
             "suite_timeout_per_command",
             return_value=900,
+        ), patch.object(
+            run_tests_module,
+            "run_all",
+            side_effect=capture_run_all,
         ):
-            with patch.object(
-                run_tests_module,
-                "run_all",
-                side_effect=capture_run_all,
-            ):
-                try:
-                    run_tests_module.main(["--timeout", "120"])
-                except SystemExit:
-                    pass
+            try:
+                run_tests_module.main(["--timeout", "120"])
+            except SystemExit:
+                pass
 
         assert captured_timeout[0] == 120, (
             f"Expected CLI timeout 120 to override config, got {captured_timeout[0]}"
@@ -339,16 +337,15 @@ class TestTimeoutResolution:
             run_tests_module,
             "suite_timeout_per_command",
             return_value=None,
+        ), patch.object(
+            run_tests_module,
+            "run_all",
+            side_effect=capture_run_all,
         ):
-            with patch.object(
-                run_tests_module,
-                "run_all",
-                side_effect=capture_run_all,
-            ):
-                try:
-                    run_tests_module.main([])
-                except SystemExit:
-                    pass
+            try:
+                run_tests_module.main([])
+            except SystemExit:
+                pass
 
         assert captured_timeout[0] == 600, (
             f"Expected fallback timeout 600, got {captured_timeout[0]}"
