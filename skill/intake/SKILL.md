@@ -20,6 +20,14 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
 
 ## Hard requirements
 
+- **Never copy skill scripts between repositories.** The intake scripts
+  (and all skills) resolve their shared libraries from the canonical global
+  skills location (`~/.pi/agent/skills`, per-skill via `$(skill_path <name>)`)
+  or this repo's `skill/` tree. If a script reports a missing shared module,
+  reinstall via `scripts/install_pi.sh` or invoke the skill from its
+  canonical location — do **not** copy/paste script files into another
+  project, as real-copy installs without `shared/` break import resolution.
+
 - Do not create a work item for this intake process itself.
 - Interview style: concise, high-signal questions, max three per round.
 - Do not invent requirements — ask the user; don't ask leading or unnecessary questions when an obvious answer exists.

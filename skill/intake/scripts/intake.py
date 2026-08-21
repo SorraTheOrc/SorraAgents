@@ -32,7 +32,12 @@ _SKILLS_ROOT = Path(__file__).resolve().parents[2]  # <repo>/skill (or ~/.pi/age
 if str(_SKILLS_ROOT) not in sys.path:
     sys.path.insert(0, str(_SKILLS_ROOT))
 
-from shared.status_lifecycle import StatusLifecycle, run_wl
+from import_guard import guard_shared_import
+
+try:
+    from shared.status_lifecycle import StatusLifecycle, run_wl
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
 
 LOG = logging.getLogger("intake.scripts.intake")
 

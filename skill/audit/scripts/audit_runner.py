@@ -82,28 +82,33 @@ from audit.scripts.persist_audit import (
     PERSIST_CONTENT_INVALID,
     persist_audit,
 )
+from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
 from scripts.pi_utils import extract_pi_text
-from shared.process_semaphore import (
-    DEFAULT_MAX_WORKERS,
-    ENV_MAX_WORKERS,
-    Semaphore,
-)
-from shared.status_lifecycle import (
-    SIBLING_SCAN_ROOT as SHARED_SIBLING_SCAN_ROOT,
-)
-from shared.status_lifecycle import (
-    _extract_work_item_prefix as _extract_work_item_prefix_shared,
-)
-from shared.status_lifecycle import (
-    _find_worklog_dir_by_prefix as _find_worklog_dir_by_prefix_shared,
-)
-from shared.status_lifecycle import (
-    _wl_error_detail,
-)
-from shared.status_lifecycle import (
-    resolve_worklog_flags as shared_resolve_worklog_flags,
-)
+
+try:
+    from shared.process_semaphore import (
+        DEFAULT_MAX_WORKERS,
+        ENV_MAX_WORKERS,
+        Semaphore,
+    )
+    from shared.status_lifecycle import (
+        SIBLING_SCAN_ROOT as SHARED_SIBLING_SCAN_ROOT,
+    )
+    from shared.status_lifecycle import (
+        _extract_work_item_prefix as _extract_work_item_prefix_shared,
+    )
+    from shared.status_lifecycle import (
+        _find_worklog_dir_by_prefix as _find_worklog_dir_by_prefix_shared,
+    )
+    from shared.status_lifecycle import (
+        _wl_error_detail,
+    )
+    from shared.status_lifecycle import (
+        resolve_worklog_flags as shared_resolve_worklog_flags,
+    )
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
 from test.scripts.run_tests import (
     full_suite_commands,
     parse_node_failures,

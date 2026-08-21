@@ -64,7 +64,12 @@ if _SKILLS_ROOT_STR in sys.path:
     sys.path.remove(_SKILLS_ROOT_STR)
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from shared.status_lifecycle import resolve_worklog_flags
+from import_guard import guard_shared_import
+
+try:
+    from shared.status_lifecycle import resolve_worklog_flags
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
 
 # ── Icon mappings: ContextHub canonical set ────────────────────────────────
 # Source: ../ContextHub/docs/icons-design.md (spec) and ../ContextHub/src/icons.ts

@@ -53,8 +53,13 @@ if _SKILLS_ROOT_STR in sys.path:
     sys.path.remove(_SKILLS_ROOT_STR)
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from shared.code_freeze import is_code_freeze_active
-from shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
+from import_guard import guard_shared_import
+
+try:
+    from shared.code_freeze import is_code_freeze_active
+    from shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
 from test_cache import run_cached
 from test_runner import canonicalize_quiet_test_command
 

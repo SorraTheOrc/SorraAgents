@@ -27,12 +27,17 @@ if _SKILLS_ROOT_STR in sys.path:
     sys.path.remove(_SKILLS_ROOT_STR)
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
+from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
-from shared.status_lifecycle import (
-    StatusLifecycle,
-    resolve_worklog_dir,
-    resolve_worklog_flags,
-)
+
+try:
+    from shared.status_lifecycle import (
+        StatusLifecycle,
+        resolve_worklog_dir,
+        resolve_worklog_flags,
+    )
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
 
 # ---------------------------------------------------------------------------
 # Stop words

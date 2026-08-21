@@ -38,8 +38,13 @@ from _shared import (
     level_from_score,
     pick_tshirt,
 )
+from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
-from shared.status_lifecycle import resolve_worklog_flags
+
+try:
+    from shared.status_lifecycle import resolve_worklog_flags
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
 
 # ---------------------------------------------------------------------------
 # Extracted helper functions

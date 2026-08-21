@@ -96,6 +96,10 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
     (skill_pkg / "test_cache.py").write_text(real_tc)
     real_tr = (_REPO_ROOT / "skill" / "test_runner.py").read_text()
     (skill_pkg / "test_runner.py").write_text(real_tr)
+    # Provide the graceful-failure guard (F3, SA-0MSWJ9ZEU001HDVT) —
+    # implement.py imports guard_shared_import at module load.
+    real_ig = (_REPO_ROOT / "skill" / "import_guard.py").read_text()
+    (skill_pkg / "import_guard.py").write_text(real_ig)
     (skill_pkg / "__init__.py").touch()
     (skill_pkg / "shared" / "__init__.py").touch()
 
