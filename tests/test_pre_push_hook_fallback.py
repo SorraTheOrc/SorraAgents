@@ -26,10 +26,13 @@ def _str(p: Path) -> str:
 
 # Resolve to the SorraAgents main checkout — worktrees share git but have
 # different working trees, so .githooks/ lives at the canonical repo root.
+# For a file at <repo>/tests/test_pre_push_hook_fallback.py the repo root is
+# parents[1] (direct parent of tests/); the deeper candidates cover layouts
+# where the test lives a level or two below the root.
 _REPO_ROOTS = [
-    Path(__file__).resolve().parents[4],       # worktree: tests -> repo
-    Path(__file__).resolve().parents[3],       # worktree: tests -> .. -> repo
-    Path(__file__).resolve().parents[2].parent, # direct parent of tests/
+    Path(__file__).resolve().parents[1],       # main checkout / worktree: tests -> repo
+    Path(__file__).resolve().parents[2],       # tests nested one level: <repo>/x/tests -> <repo>
+    Path(__file__).resolve().parents[3],       # tests nested two levels
 ]
 REPO_ROOT: Path | None = None
 for candidate in _REPO_ROOTS:
