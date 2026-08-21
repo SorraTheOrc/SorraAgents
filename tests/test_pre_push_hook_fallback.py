@@ -183,6 +183,22 @@ class TestGlobalFallback:
             "Hook must reference local skill path"
         )
 
+    def test_hook_passes_repo_root_to_measure(self):
+        """The hook must pass --repo-root so measure_context.py measures the
+        pushed project even when resolved via the global symlink.
+
+        Regression from ContextHub E2E: without --repo-root the global script
+        resolves its default repo root from the symlink target (SorraAgents),
+        measuring the wrong repo and false-failing the gate.
+        """
+        hook_content = HOOK_PATH.read_text(encoding="utf-8")
+        assert "--repo-root" in hook_content, (
+            "Hook must pass --repo-root to measure_context.py"
+        )
+        assert '"$repo_root"' in hook_content, (
+            "Hook must pass the resolved repo root to measure_context.py"
+        )
+
 
 # ── AC4: Tests run successfully with pytest ────────────────────────────────
 
