@@ -9,6 +9,14 @@ repo_root = Path(__file__).resolve().parent.parent
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
+# Also add the skills root so top-level packages (shared, scripts, audit, etc.)
+# are importable for skill/*/scripts/*.py imports. The repo root MUST stay
+# ahead of the skills root so the root `plan/` package (a regular package with
+# __init__.py) wins over `skill/plan` (see tests/test_plan_package_resolution.py).
+skills_root = repo_root / "skill"
+if str(skills_root) not in sys.path:
+    sys.path.append(str(skills_root))
+
 
 @pytest.fixture(autouse=True)
 def _default_green_full_suite_cache():
@@ -23,7 +31,7 @@ def _default_green_full_suite_cache():
     entry so they proceed deterministically; tests that exercise cache
     behavior override it with their own ``mock.patch.object(...)``.
     """
-    from skill.audit.scripts import audit_runner
+    from audit.scripts import audit_runner
 
     green = {
         "stdout": "5 passed in 0.03s",
@@ -55,7 +63,7 @@ def _default_resolvable_ownership():
     ``mock.patch.object(audit_runner, "_resolve_owning_project_root", ...)``
     — the inner patch wins while active.
     """
-    from skill.audit.scripts import audit_runner
+    from audit.scripts import audit_runner
 
     real_resolve = audit_runner._resolve_owning_project_root
 

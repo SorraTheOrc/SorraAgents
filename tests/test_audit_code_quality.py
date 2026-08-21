@@ -25,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from skill.audit.scripts.audit_runner import (
+    from audit.scripts.audit_runner import (
         _assemble_issue_report,
         _extract_acs,
         cmd_issue,
@@ -382,7 +382,7 @@ class TestCmdIssueCodeQualityIntegration:
     def _patch_pi(self, monkeypatch):
         """Mock _call_pi to return 'met' for all acceptance criteria."""
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, **kw: {
                 "verdict": "met",
                 "evidence": "Test mock",
@@ -398,7 +398,7 @@ class TestCmdIssueCodeQualityIntegration:
         """cmd_issue with critical code quality finding should report blocking."""
         self._patch_pi(monkeypatch)
         monkeypatch.setattr(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             lambda **kw: {
                 "success": True,
                 "languages": ["python"],
@@ -412,7 +412,7 @@ class TestCmdIssueCodeQualityIntegration:
             }
         )
         monkeypatch.setattr(
-            "skill.code_review.scripts.create_quality_epics.create_epics_for_findings",
+            "code_review.scripts.create_quality_epics.create_epics_for_findings",
             lambda findings, runner=None: {"epic_id": "SA-EPIC", "children_created": 1},
         )
 
@@ -431,7 +431,7 @@ class TestCmdIssueCodeQualityIntegration:
         """cmd_issue with only medium findings should allow closure."""
         self._patch_pi(monkeypatch)
         monkeypatch.setattr(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             lambda **kw: {
                 "success": True,
                 "languages": ["python"],
@@ -445,7 +445,7 @@ class TestCmdIssueCodeQualityIntegration:
             }
         )
         monkeypatch.setattr(
-            "skill.code_review.scripts.create_quality_epics.create_epics_for_findings",
+            "code_review.scripts.create_quality_epics.create_epics_for_findings",
             lambda findings, runner=None: {"epic_id": "SA-EPIC", "children_created": 1},
         )
 
@@ -464,7 +464,7 @@ class TestCmdIssueCodeQualityIntegration:
         """cmd_issue with no findings should show clean quality section."""
         self._patch_pi(monkeypatch)
         monkeypatch.setattr(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             lambda **kw: {
                 "success": True,
                 "languages": ["python"],
@@ -475,7 +475,7 @@ class TestCmdIssueCodeQualityIntegration:
             }
         )
         monkeypatch.setattr(
-            "skill.code_review.scripts.create_quality_epics.create_epics_for_findings",
+            "code_review.scripts.create_quality_epics.create_epics_for_findings",
             lambda findings, runner=None: {"epic_id": None, "children_created": 0},
         )
 
@@ -494,7 +494,7 @@ class TestCmdIssueCodeQualityIntegration:
         """cmd_issue with fixes_applied should show all-fixed message."""
         self._patch_pi(monkeypatch)
         monkeypatch.setattr(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             lambda **kw: {
                 "success": True,
                 "languages": ["python"],
@@ -506,7 +506,7 @@ class TestCmdIssueCodeQualityIntegration:
             }
         )
         monkeypatch.setattr(
-            "skill.code_review.scripts.create_quality_epics.create_epics_for_findings",
+            "code_review.scripts.create_quality_epics.create_epics_for_findings",
             lambda findings, runner=None: {"epic_id": None, "children_created": 0},
         )
 

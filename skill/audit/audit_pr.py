@@ -22,9 +22,15 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from skill.scripts.pi_utils import extract_pi_text
+# Bootstrap: add skills root to sys.path for top-level package imports
+_SKILLS_ROOT = Path(__file__).resolve().parents[1]
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
+
+from scripts.pi_utils import extract_pi_text
 
 WL_ID_RE = re.compile(r"\b([A-Z]+-[0-9A-Z]+)\b")
 PR_URL_RE = re.compile(r"https?://github.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)")

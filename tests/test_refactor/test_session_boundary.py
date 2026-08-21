@@ -70,7 +70,7 @@ class TestModifiedFilesDetection:
         # The session boundary module (to be implemented) will call
         # subprocess.run(["git", "diff", "--name-status", "dev"])
         # and parse the output.
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert files == [
@@ -85,7 +85,7 @@ class TestModifiedFilesDetection:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert files == [{"status": "A", "file": "src/new.py"}]
@@ -97,7 +97,7 @@ class TestModifiedFilesDetection:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert files == [{"status": "D", "file": "src/old.py"}]
@@ -109,7 +109,7 @@ class TestModifiedFilesDetection:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert files == [
@@ -123,7 +123,7 @@ class TestModifiedFilesDetection:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert files == []
@@ -141,7 +141,7 @@ class TestUntrackedFilesHandling:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_untracked_files
+        from refactor.session_boundary import get_untracked_files
 
         files = get_untracked_files()
         assert files == ["src/untracked.py", "docs/TODO.md"]
@@ -153,7 +153,7 @@ class TestUntrackedFilesHandling:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_untracked_files
+        from refactor.session_boundary import get_untracked_files
 
         files = get_untracked_files()
         assert files == []
@@ -170,7 +170,7 @@ class TestUntrackedFilesHandling:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_session_files
+        from refactor.session_boundary import get_session_files
 
         files = get_session_files(parent_branch="dev")
         assert files == [
@@ -194,7 +194,7 @@ class TestMergeCommitHandling:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert {"status": "M", "file": "src/merged.py"} in files
@@ -208,7 +208,7 @@ class TestMergeCommitHandling:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert files == [{"status": "M", "file": "src/fallback.py"}]
@@ -226,7 +226,7 @@ class TestEdgeCases:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert len(files) == 3
@@ -240,7 +240,7 @@ class TestEdgeCases:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert {"status": "M", "file": "assets/logo.png"} in files
@@ -255,7 +255,7 @@ class TestEdgeCases:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
 
@@ -271,7 +271,7 @@ class TestEdgeCases:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         # Call without specifying parent_branch
         files = get_changed_files()
@@ -286,7 +286,7 @@ class TestEdgeCases:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import get_changed_files
+        from refactor.session_boundary import get_changed_files
 
         files = get_changed_files(parent_branch="dev")
         assert files == []
@@ -298,7 +298,7 @@ class TestEdgeCases:
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
-        from skill.refactor.session_boundary import has_changes
+        from refactor.session_boundary import has_changes
 
         assert has_changes(parent_branch="dev") is False
 

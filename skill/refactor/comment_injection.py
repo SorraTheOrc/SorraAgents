@@ -11,7 +11,7 @@ Provides:
 
 Usage:
 
-    from skill.refactor.comment_injection import (
+    from refactor.comment_injection import (
         inject_refactor_comment,
         has_existing_comment,
         get_comment_style,

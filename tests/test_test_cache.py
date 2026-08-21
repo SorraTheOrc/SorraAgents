@@ -14,8 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-from skill.test_cache import (
+from test_cache import (
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
     cache_dir,
@@ -415,7 +414,7 @@ def test_store_replaces_existing_entry(git_repo: Path) -> None:
 def _key_for(command: str, git_state: str) -> str:
     """Compute the cache key directory name (mirrors the module internals)."""
 
-    from skill.test_cache import cache_key
+    from test_cache import cache_key
 
     return cache_key(normalize_test_command(command), git_state)
 

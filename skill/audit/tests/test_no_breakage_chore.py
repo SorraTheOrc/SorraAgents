@@ -23,9 +23,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
-from skill.audit.tests.wl_helpers import stateful_wl_side_effect
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -207,7 +206,7 @@ def _run_loop(tmp_path, cq_findings, fp_screen_results):
         mock.patch.object(audit_runner, "_git_changed_files",
                           return_value=["src/bad.py"]),
         mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             return_value={"success": True, "findings": [],
                           "fixes_applied": 0},
         ),

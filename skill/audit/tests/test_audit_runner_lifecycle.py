@@ -12,9 +12,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
-from skill.audit.tests.wl_helpers import stateful_wl_side_effect
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -123,7 +122,7 @@ class TestVerdictDrivenStatusLifecycle:
                 return_value=verdict_report,
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
         ):
@@ -409,7 +408,7 @@ class TestVerdictDrivenStatusLifecycle:
             audit_runner, "_assemble_issue_report",
             return_value="Ready to close: Yes\n\n## Summary\nAll met.",
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             return_value={"success": True, "findings": [], "fixes_applied": 0},
         ):
             rc = audit_runner.cmd_issue(
@@ -459,7 +458,7 @@ class TestVerdictDrivenStatusLifecycle:
                 side_effect=pi_side_effect,
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
         ):
@@ -688,7 +687,7 @@ class TestLifecycleVerification:
                 return_value=verdict_report,
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
         ):

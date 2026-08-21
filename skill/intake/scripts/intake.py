@@ -27,12 +27,12 @@ import logging
 import sys
 from pathlib import Path
 
-# Ensure the repository root is on sys.path so skill package imports work
-_REPO_ROOT = Path(__file__).resolve().parents[3]  # e.g. <repo>/skill/intake/scripts/
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+# Ensure the skills root is on sys.path so top-level skill packages import work
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]  # <repo>/skill (or ~/.pi/agent/skills)
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
 
-from skill.shared.status_lifecycle import StatusLifecycle, run_wl
+from shared.status_lifecycle import StatusLifecycle, run_wl
 
 LOG = logging.getLogger("intake.scripts.intake")
 

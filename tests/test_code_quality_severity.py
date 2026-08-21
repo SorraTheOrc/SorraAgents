@@ -35,8 +35,8 @@ def _import_classifier():
       2. skill.code_review.scripts.severity.classify_finding
     """
     candidates = [
-        "skill.code_review.scripts.linter_runner",
-        "skill.code_review.scripts.severity",
+        "code_review.scripts.linter_runner",
+        "code_review.scripts.severity",
     ]
     for mod_path in candidates:
         try:
@@ -249,7 +249,7 @@ class TestRunLinterFixMode:
 
     @pytest.fixture(autouse=True)
     def _setup(self):
-        import skill.code_review.scripts.linter_runner as m
+        import code_review.scripts.linter_runner as m
         self.mod = m
 
     def test_run_linter_fix_mode_no_fixes(self):

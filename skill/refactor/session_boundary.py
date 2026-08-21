@@ -5,7 +5,7 @@ comparing the current branch against a parent branch (default: ``dev``).
 
 Usage:
 
-    from skill.refactor.session_boundary import (
+    from refactor.session_boundary import (
         get_changed_files,
         get_untracked_files,
         get_session_files,

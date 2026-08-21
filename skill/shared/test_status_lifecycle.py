@@ -16,9 +16,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.append(str(_SKILLS_ROOT))
 
-from skill.shared import status_lifecycle as status_lifecycle_module
-from skill.shared.status_lifecycle import StatusLifecycle
+from shared import status_lifecycle as status_lifecycle_module
+from shared.status_lifecycle import StatusLifecycle
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -38,13 +41,13 @@ def mock_run():
     ``skill/shared/tests/test_shared_worklog_resolution.py``.
     """
     with (
-        mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+        mock.patch("shared.status_lifecycle.subprocess.run") as m,
         mock.patch(
-            "skill.shared.status_lifecycle.worklog_dir_flag",
+            "shared.status_lifecycle.worklog_dir_flag",
             return_value=[],
         ),
         mock.patch(
-            "skill.shared.status_lifecycle._find_worklog_dir_by_prefix",
+            "shared.status_lifecycle._find_worklog_dir_by_prefix",
             return_value=None,
         ),
     ):
@@ -388,7 +391,7 @@ class TestStatusLifecycleUnit:
     def test_worklog_dir_flag_injected_when_detected(self, mock_run):
         """When a worklog dir is resolved, --worklog-dir is injected after wl."""
         with mock.patch(
-            "skill.shared.status_lifecycle.worklog_dir_flag",
+            "shared.status_lifecycle.worklog_dir_flag",
             return_value=["--worklog-dir", "/fake/proj/.worklog"],
         ):
             mock_run.side_effect = [_make_wl_update_proc()]
@@ -404,7 +407,7 @@ class TestStatusLifecycleUnit:
     def test_no_flag_when_cwd_is_worklog_root(self, mock_run):
         """When cwd is already a worklog root, no flag is injected."""
         with mock.patch(
-            "skill.shared.status_lifecycle.worklog_dir_flag",
+            "shared.status_lifecycle.worklog_dir_flag",
             return_value=[],
         ):
             mock_run.side_effect = [_make_wl_update_proc()]
@@ -436,7 +439,7 @@ class TestWorklogDirDetection:
         monkeypatch.chdir(tmp_path)  # cwd has no .worklog
         wl_dir = tmp_path / "proj" / ".worklog"
         with mock.patch(
-            "skill.shared.status_lifecycle._detect_worklog_dir",
+            "shared.status_lifecycle._detect_worklog_dir",
             return_value=wl_dir,
         ):
             assert status_lifecycle_module.worklog_dir_flag() == [
@@ -447,7 +450,7 @@ class TestWorklogDirDetection:
         """Non-root cwd with no resolvable worklog dir -> no flag (graceful)."""
         monkeypatch.chdir(tmp_path)
         with mock.patch(
-            "skill.shared.status_lifecycle._detect_worklog_dir",
+            "shared.status_lifecycle._detect_worklog_dir",
             return_value=None,
         ):
             assert status_lifecycle_module.worklog_dir_flag() == []
@@ -471,7 +474,7 @@ class TestWorklogDirDetection:
             stdout=str(root),
             stderr="",
         )
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+        with mock.patch("shared.status_lifecycle.subprocess.run", return_value=fake):
             assert status_lifecycle_module._detect_worklog_dir() == root / ".worklog"
 
     def test_detect_walk_up(self, monkeypatch, tmp_path):
@@ -487,7 +490,7 @@ class TestWorklogDirDetection:
             stdout="",
             stderr="",
         )
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+        with mock.patch("shared.status_lifecycle.subprocess.run", return_value=fake):
             assert status_lifecycle_module._detect_worklog_dir() == proj / ".worklog"
 
     def test_detect_none(self, monkeypatch):
@@ -512,7 +515,7 @@ class TestWorklogDirDetection:
             stdout="",
             stderr="",
         )
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+        with mock.patch("shared.status_lifecycle.subprocess.run", return_value=fake):
             assert status_lifecycle_module._detect_worklog_dir() is None
 
 

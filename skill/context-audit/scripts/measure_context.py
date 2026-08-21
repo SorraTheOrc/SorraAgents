@@ -278,7 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repo-root",
         type=Path,
-        default=Path(__file__).resolve().parents[3],
+        default=Path(__file__).resolve().parents[2],
         help="Repository root to measure (default: repo containing this script).",
     )
     output = parser.add_mutually_exclusive_group()

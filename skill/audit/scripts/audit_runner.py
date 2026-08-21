@@ -70,43 +70,47 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.audit.scripts.persist_audit import (
+REPO_ROOT = _SKILLS_ROOT.parent
+
+from audit.scripts.persist_audit import (
     PERSIST_CONTENT_INVALID,
     persist_audit,
 )
-from skill.scripts.failure_notice import FailureNotice
-from skill.scripts.pi_utils import extract_pi_text
-from skill.shared.process_semaphore import (
+from scripts.failure_notice import FailureNotice
+from scripts.pi_utils import extract_pi_text
+from shared.process_semaphore import (
     DEFAULT_MAX_WORKERS,
     ENV_MAX_WORKERS,
     Semaphore,
 )
-from skill.shared.status_lifecycle import (
+from shared.status_lifecycle import (
     SIBLING_SCAN_ROOT as SHARED_SIBLING_SCAN_ROOT,
 )
-from skill.shared.status_lifecycle import (
+from shared.status_lifecycle import (
     _extract_work_item_prefix as _extract_work_item_prefix_shared,
 )
-from skill.shared.status_lifecycle import (
+from shared.status_lifecycle import (
     _find_worklog_dir_by_prefix as _find_worklog_dir_by_prefix_shared,
 )
-from skill.shared.status_lifecycle import (
+from shared.status_lifecycle import (
     _wl_error_detail,
 )
-from skill.shared.status_lifecycle import (
+from shared.status_lifecycle import (
     resolve_worklog_flags as shared_resolve_worklog_flags,
 )
-from skill.test.scripts.run_tests import (
+from test.scripts.run_tests import (
     full_suite_commands,
     parse_node_failures,
     parse_pytest_failures,
     suite_timeout_per_command,
 )
-from skill.test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
+from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
 # ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
@@ -1987,7 +1991,7 @@ def _run_tests_via_test_skill(
     # Triage failures per the test skill (AC4) — never silently ignored.
     if failures:
         try:
-            from skill.triage.scripts.check_or_create import check_or_create
+            from triage.scripts.check_or_create import check_or_create
         except ImportError:
             check_or_create = None
         for failure in failures:
@@ -6394,8 +6398,8 @@ def _run_remediation_loop(
         "fp_screen_results": fp_screen_results,
     }
     try:
-        from skill.code_review.scripts.code_quality import run_code_quality
-        from skill.code_review.scripts.linter_runner import (
+        from code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.linter_runner import (
             apply_ruff_remediation,
             locate_ruff_config,
         )
@@ -6605,7 +6609,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     cq_fixes_applied: int = 0
     cq_skipped_reason: str | None = None
     try:
-        from skill.code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.code_quality import run_code_quality
         # Scoped, read-only code-quality scan (SA-0MSKB6VWU000RT58): the
         # audit lints only the git changed-file list (already computed for
         # the Phase 1/2 file-scope manifest) instead of the whole repo, and
@@ -7729,7 +7733,7 @@ def _phase_report(ctx: _AuditContext) -> int:
         # ------------------------------------------------------------------
         if cq_findings:
             try:
-                from skill.code_review.scripts.create_quality_epics import (
+                from code_review.scripts.create_quality_epics import (
                     create_epics_for_findings,
                 )
                 _epic_result = create_epics_for_findings(cq_findings, runner=runner)

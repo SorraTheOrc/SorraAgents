@@ -124,8 +124,8 @@ def _import_find_related():
 def test_script_uses_status_lifecycle():
     """The script must import and use StatusLifecycle as a context manager."""
     content = SCRIPT_PATH.read_text()
-    assert "from skill.shared.status_lifecycle import" in content, \
-        "Script must import StatusLifecycle from the shared module"
+    assert "from shared.status_lifecycle import" in content, \
+        "Script must import StatusLifecycle from the shared (top-level) module"
     assert "with StatusLifecycle" in content, \
         "Script must use StatusLifecycle as a context manager"
 

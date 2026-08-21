@@ -13,7 +13,7 @@ Related work item: SA-0MSLRVQIF0040GAM
 
 import json
 
-from skill.shared.tree_coverage import (
+from shared.tree_coverage import (
     compute_coverage,
     run_coverage_review,
 )

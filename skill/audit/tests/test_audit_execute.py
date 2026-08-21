@@ -32,8 +32,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner
-from skill.audit.tests.wl_helpers import stateful_wl_side_effect
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 _GREEN_RUN_HEAD = "a1b2c3d4e5f67890abcdef1234567890abcdef12"
 
@@ -150,7 +150,7 @@ def _run_issue(*, cache_return=None, test_run=_GREEN_TEST_RUN,
             audit_runner, "_run_tests_via_test_skill", return_value=test_run
         ),
         mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             _mock_cq(),
         ),
     ]

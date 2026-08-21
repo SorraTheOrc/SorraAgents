@@ -6,7 +6,7 @@ validation.
 
 Usage:
 
-    from skill.refactor.scripts.config import RefactorConfig
+    from refactor.scripts.config import RefactorConfig
 
     config = RefactorConfig.load(".refactor.json")
     if config.enabled:

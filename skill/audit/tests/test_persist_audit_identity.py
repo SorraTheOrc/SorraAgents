@@ -24,8 +24,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.audit.scripts.persist_audit import persist_audit
-from skill.audit.tests.wl_helpers import make_stateful_runner
+from audit.scripts.persist_audit import persist_audit
+from audit.tests.wl_helpers import make_stateful_runner
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -306,8 +306,8 @@ class TestReadbackIdentityRunner:
 
     def _run_cmd_issue(self, audit_show_raw: str | None, report: str):
         """Run cmd_issue with persist=True and a controlled assembled report."""
-        from skill.audit.scripts import audit_runner as ar_module
-        from skill.audit.scripts.audit_runner import cmd_issue
+        from audit.scripts import audit_runner as ar_module
+        from audit.scripts.audit_runner import cmd_issue
 
         def fake_subprocess_run(cmd, *args, **kwargs):
             """Handle persist_audit's wl audit-set / show / update calls."""
@@ -335,7 +335,7 @@ class TestReadbackIdentityRunner:
 
         with (
             patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             patch.object(ar_module.subprocess, "run", fake_subprocess_run),
@@ -407,7 +407,7 @@ class TestAssembledReportIdentifiesWorkItem:
     """
 
     def test_issue_report_contains_issue_id(self):
-        from skill.audit.scripts.audit_runner import _assemble_issue_report
+        from audit.scripts.audit_runner import _assemble_issue_report
 
         issue = {"id": "TEST-1", "title": "Test", "description": "desc"}
         report = _assemble_issue_report(
@@ -418,7 +418,7 @@ class TestAssembledReportIdentifiesWorkItem:
         assert "TEST-1" in report
 
     def test_child_report_contains_child_id(self):
-        from skill.audit.scripts.audit_runner import _assemble_child_audit_report
+        from audit.scripts.audit_runner import _assemble_child_audit_report
 
         child = {"id": "CHILD-1", "title": "Child", "status": "open", "stage": "plan_complete"}
         report = _assemble_child_audit_report(

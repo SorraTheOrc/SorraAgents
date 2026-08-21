@@ -12,9 +12,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-
-from skill.shared import status_lifecycle as status_lifecycle_module
-from skill.shared.status_lifecycle import StatusLifecycle
+from shared import status_lifecycle as status_lifecycle_module
+from shared.status_lifecycle import StatusLifecycle
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -250,7 +249,7 @@ class TestWorklogDirResolutionFromWorktree:
         # otherwise match the real framework project's prefix): this test
         # exercises the cwd-chain worktree resolution, not prefix resolution.
         with mock.patch(
-            "skill.shared.status_lifecycle._find_worklog_dir_by_prefix",
+            "shared.status_lifecycle._find_worklog_dir_by_prefix",
             return_value=None,
         ):
             status_lifecycle_module.run_wl(

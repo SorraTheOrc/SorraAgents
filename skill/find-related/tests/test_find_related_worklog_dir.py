@@ -19,6 +19,9 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
 
 import importlib.util
 
@@ -54,7 +57,7 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, m
         f"projectName: Open Source LLM\nprefix: {prefix}\n", encoding="utf-8"
     )
     patcher = mock.patch(
-        "skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+        "shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
     )
     return target, patcher
 
@@ -223,9 +226,9 @@ class TestNoBehaviorChangeFromProjectRoot:
         recorded: list[list[str]] = []
 
         with (
-            mock.patch("skill.shared.status_lifecycle.SIBLING_SCAN_ROOT",
+            mock.patch("shared.status_lifecycle.SIBLING_SCAN_ROOT",
                        empty_root),
-            mock.patch("skill.shared.status_lifecycle.worklog_dir_flag",
+            mock.patch("shared.status_lifecycle.worklog_dir_flag",
                        return_value=[]),
             mock.patch.object(
                 mod.subprocess, "check_output",

@@ -1,5 +1,5 @@
-# skill/shared - Shared utilities for SorraAgents skills
+# shared - shared utilities for SorraAgents skills (installed at the skills root)
 
-from skill.shared.status_lifecycle import StatusLifecycle
+from .status_lifecycle import StatusLifecycle
 
 __all__ = ["StatusLifecycle"]

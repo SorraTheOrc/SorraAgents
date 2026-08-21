@@ -81,12 +81,12 @@ class TestAutoFixPythonFiles:
     def test_auto_fix_runs_ruff_on_python_files(self, mock_ruff_available):
         """Auto-fix should invoke ruff check --fix on Python files."""
         # Patch probe_linter where auto_fix_files imports it
-        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        patch_target = "refactor.scripts.refactor.probe_linter"
         with (
             patch(patch_target) as mock_probe,
             patch("subprocess.run") as mock_run,
         ):
-            from skill.refactor.scripts.refactor import auto_fix_files
+            from refactor.scripts.refactor import auto_fix_files
 
             mock_probe.return_value = mock_ruff_available
             mock_run.return_value = MagicMock(
@@ -125,9 +125,9 @@ class TestAutoFixPythonFiles:
 
     def test_auto_fix_skips_when_ruff_unavailable(self, mock_ruff_unavailable):
         """Auto-fix should gracefully skip when ruff is not available."""
-        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        patch_target = "refactor.scripts.refactor.probe_linter"
         with patch(patch_target) as mock_probe:
-            from skill.refactor.scripts.refactor import auto_fix_files
+            from refactor.scripts.refactor import auto_fix_files
 
             mock_probe.return_value = mock_ruff_unavailable
 
@@ -140,7 +140,7 @@ class TestAutoFixPythonFiles:
 
     def test_auto_fix_handles_empty_file_list(self):
         """Auto-fix should return empty results for empty file list."""
-        from skill.refactor.scripts.refactor import auto_fix_files
+        from refactor.scripts.refactor import auto_fix_files
 
         result = auto_fix_files(files=[])
 
@@ -149,9 +149,9 @@ class TestAutoFixPythonFiles:
 
     def test_auto_fix_handles_non_python_files_gracefully(self, mock_ruff_available):
         """Auto-fix should skip non-Python/non-JS files without errors."""
-        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        patch_target = "refactor.scripts.refactor.probe_linter"
         with patch(patch_target) as mock_probe:
-            from skill.refactor.scripts.refactor import auto_fix_files
+            from refactor.scripts.refactor import auto_fix_files
 
             mock_probe.return_value = mock_ruff_available
 
@@ -165,12 +165,12 @@ class TestAutoFixPythonFiles:
 
     def test_auto_fix_no_fixable_issues(self, mock_ruff_available):
         """Auto-fix should report no fixes when no issues found."""
-        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        patch_target = "refactor.scripts.refactor.probe_linter"
         with (
             patch(patch_target) as mock_probe,
             patch("subprocess.run") as mock_run,
         ):
-            from skill.refactor.scripts.refactor import auto_fix_files
+            from refactor.scripts.refactor import auto_fix_files
 
             mock_probe.return_value = mock_ruff_available
             mock_run.return_value = MagicMock(
@@ -189,12 +189,12 @@ class TestAutoFixPythonFiles:
 
     def test_auto_fix_reports_fixed_findings(self, mock_ruff_available):
         """Auto-fix should report what was fixed."""
-        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        patch_target = "refactor.scripts.refactor.probe_linter"
         with (
             patch(patch_target) as mock_probe,
             patch("subprocess.run") as mock_run,
         ):
-            from skill.refactor.scripts.refactor import auto_fix_files
+            from refactor.scripts.refactor import auto_fix_files
 
             mock_probe.return_value = mock_ruff_available
             mock_run.return_value = MagicMock(
@@ -234,12 +234,12 @@ class TestAutoFixJSFiles:
 
     def test_auto_fix_runs_eslint_on_js_files(self, mock_eslint_available):
         """Auto-fix should invoke eslint --fix on JS files."""
-        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        patch_target = "refactor.scripts.refactor.probe_linter"
         with (
             patch(patch_target) as mock_probe,
             patch("subprocess.run") as mock_run,
         ):
-            from skill.refactor.scripts.refactor import auto_fix_files
+            from refactor.scripts.refactor import auto_fix_files
 
             def probe_side_effect(name):
                 if name == "ruff":
@@ -291,7 +291,7 @@ class TestAutoFixIntegration:
         """refactor_pipeline should include auto-fix step before detection."""
         import inspect
 
-        from skill.refactor.scripts.refactor import refactor_pipeline
+        from refactor.scripts.refactor import refactor_pipeline
         sig = inspect.signature(refactor_pipeline)
         params = list(sig.parameters.keys())
 
@@ -304,12 +304,12 @@ class TestAutoFixIntegration:
     def test_refactor_pipeline_runs_auto_fix(self):
         """refactor_pipeline should attempt auto-fix on session files."""
         with (
-            patch("skill.refactor.scripts.refactor.detect_session_files") as mock_detect,
-            patch("skill.refactor.scripts.refactor.auto_fix_files") as mock_autofix,
-            patch("skill.refactor.scripts.refactor.run_smell_detection") as mock_detect_smells,
-            patch("skill.refactor.scripts.refactor.remediate_pre_existing") as mock_remediate,
+            patch("refactor.scripts.refactor.detect_session_files") as mock_detect,
+            patch("refactor.scripts.refactor.auto_fix_files") as mock_autofix,
+            patch("refactor.scripts.refactor.run_smell_detection") as mock_detect_smells,
+            patch("refactor.scripts.refactor.remediate_pre_existing") as mock_remediate,
         ):
-            from skill.refactor.scripts.refactor import refactor_pipeline
+            from refactor.scripts.refactor import refactor_pipeline
 
             # Mock session detection returning some files
             mock_detect.return_value = {
@@ -345,12 +345,12 @@ class TestAutoFixIntegration:
     def test_refactor_pipeline_reports_auto_fix_results(self):
         """refactor_pipeline should include auto-fix results in report."""
         with (
-            patch("skill.refactor.scripts.refactor.detect_session_files") as mock_detect,
-            patch("skill.refactor.scripts.refactor.auto_fix_files") as mock_autofix,
-            patch("skill.refactor.scripts.refactor.run_smell_detection") as mock_detect_smells,
-            patch("skill.refactor.scripts.refactor.remediate_pre_existing") as mock_remediate,
+            patch("refactor.scripts.refactor.detect_session_files") as mock_detect,
+            patch("refactor.scripts.refactor.auto_fix_files") as mock_autofix,
+            patch("refactor.scripts.refactor.run_smell_detection") as mock_detect_smells,
+            patch("refactor.scripts.refactor.remediate_pre_existing") as mock_remediate,
         ):
-            from skill.refactor.scripts.refactor import refactor_pipeline
+            from refactor.scripts.refactor import refactor_pipeline
 
             mock_detect.return_value = {
                 "changed": [{"status": "M", "file": "src/main.py"}],
@@ -391,12 +391,12 @@ class TestAutoFixIntegration:
     def test_refactor_pipeline_auto_fix_counts_in_summary(self):
         """Pipeline summary should include auto-fix counts."""
         with (
-            patch("skill.refactor.scripts.refactor.detect_session_files") as mock_detect,
-            patch("skill.refactor.scripts.refactor.auto_fix_files") as mock_autofix,
-            patch("skill.refactor.scripts.refactor.run_smell_detection") as mock_detect_smells,
-            patch("skill.refactor.scripts.refactor.remediate_pre_existing") as mock_remediate,
+            patch("refactor.scripts.refactor.detect_session_files") as mock_detect,
+            patch("refactor.scripts.refactor.auto_fix_files") as mock_autofix,
+            patch("refactor.scripts.refactor.run_smell_detection") as mock_detect_smells,
+            patch("refactor.scripts.refactor.remediate_pre_existing") as mock_remediate,
         ):
-            from skill.refactor.scripts.refactor import refactor_pipeline
+            from refactor.scripts.refactor import refactor_pipeline
 
             mock_detect.return_value = {
                 "changed": [{"status": "M", "file": "src/main.py"}],
@@ -437,7 +437,7 @@ class TestRunLinterFixHelpers:
 
     def test_parse_ruff_fix_output_parses_correctly(self):
         """_parse_ruff_fix_output extracts findings from ruff JSON."""
-        from skill.refactor.scripts.refactor import _parse_ruff_fix_output
+        from refactor.scripts.refactor import _parse_ruff_fix_output
 
         raw = [
             {
@@ -467,13 +467,13 @@ class TestRunLinterFixHelpers:
 
     def test_parse_ruff_fix_output_empty_input(self):
         """_parse_ruff_fix_output returns empty list for empty input."""
-        from skill.refactor.scripts.refactor import _parse_ruff_fix_output
+        from refactor.scripts.refactor import _parse_ruff_fix_output
 
         assert _parse_ruff_fix_output([]) == []
 
     def test_parse_eslint_fix_output_parses_correctly(self):
         """_parse_eslint_fix_output extracts findings from eslint JSON."""
-        from skill.refactor.scripts.refactor import _parse_eslint_fix_output
+        from refactor.scripts.refactor import _parse_eslint_fix_output
 
         raw = [
             {
@@ -499,22 +499,22 @@ class TestRunLinterFixHelpers:
 
     def test_parse_eslint_fix_output_empty_input(self):
         """_parse_eslint_fix_output returns empty list for empty input."""
-        from skill.refactor.scripts.refactor import _parse_eslint_fix_output
+        from refactor.scripts.refactor import _parse_eslint_fix_output
 
         assert _parse_eslint_fix_output([]) == []
 
     def test_run_linter_fix_returns_empty_when_no_files(self):
         """_run_linter_fix returns empty list when given no files."""
-        from skill.refactor.scripts.refactor import _run_linter_fix
+        from refactor.scripts.refactor import _run_linter_fix
 
         result = _run_linter_fix([], "ruff", lambda f: ["ruff"] + f, lambda r: [{"mock": True}])
         assert result == []
 
     def test_run_linter_fix_skips_when_linter_unavailable(self):
         """_run_linter_fix returns empty when linter is not available."""
-        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        patch_target = "refactor.scripts.refactor.probe_linter"
         with patch(patch_target) as mock_probe:
-            from skill.refactor.scripts.refactor import _run_linter_fix
+            from refactor.scripts.refactor import _run_linter_fix
 
             mock_probe.return_value = {"available": False}
 
@@ -527,12 +527,12 @@ class TestAutoFixEdgeCases:
 
     def test_auto_fix_handles_subprocess_failure(self, mock_ruff_available):
         """Auto-fix should handle subprocess errors gracefully."""
-        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        patch_target = "refactor.scripts.refactor.probe_linter"
         with (
             patch(patch_target) as mock_probe,
             patch("subprocess.run") as mock_run,
         ):
-            from skill.refactor.scripts.refactor import auto_fix_files
+            from refactor.scripts.refactor import auto_fix_files
 
             mock_probe.return_value = mock_ruff_available
             mock_run.side_effect = FileNotFoundError("ruff not found")
@@ -597,10 +597,10 @@ class TestAutoFixEdgeCases:
             )
 
         with (
-            patch("skill.refactor.scripts.refactor.probe_linter", side_effect=mock_probe_linter),
+            patch("refactor.scripts.refactor.probe_linter", side_effect=mock_probe_linter),
             patch("subprocess.run", side_effect=mock_subprocess_run),
         ):
-            from skill.refactor.scripts.refactor import auto_fix_files
+            from refactor.scripts.refactor import auto_fix_files
 
             result = auto_fix_files(
                 files=["/tmp/test/src/main.py", "/tmp/test/src/app.js"],

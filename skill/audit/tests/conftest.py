@@ -14,14 +14,20 @@ cache behavior (the gate matrix, auto-verification diagnostics) override
 it with their own ``mock.patch.object(audit_runner, "query_cached", ...)``
 — the inner patch wins while active.
 """
-
 from __future__ import annotations
+
+# Bootstrap: add skills root to sys.path for top-level package imports
+import sys
+from pathlib import Path
+
+_AUDIT_TEST_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_AUDIT_TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(_AUDIT_TEST_ROOT))
 
 from unittest import mock
 
 import pytest
-
-from skill.audit.scripts import audit_runner
+from audit.scripts import audit_runner
 
 _GREEN_CACHE_ENTRY = {
     "stdout": "5 passed in 0.03s",

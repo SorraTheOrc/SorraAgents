@@ -39,11 +39,13 @@ from typing import Any
 # Add repo root to sys.path for shared utility access (parity with
 # orchestrate_estimate.py). This lets the module run from any cwd — including
 # the installed skills dir (~/.pi/agent/skills is a symlink into the repo).
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[1]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.shared.status_lifecycle import resolve_worklog_flags
+from shared.status_lifecycle import resolve_worklog_flags
 
 logger = logging.getLogger("plan_helpers")
 

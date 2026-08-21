@@ -23,8 +23,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
 
-from skill.intake.scripts import intake
+from intake.scripts import intake
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +41,7 @@ def _neutralize_prefix_scan():
     keeps the tests hermetic regardless of which projects exist on the host.
     """
     with mock.patch(
-        "skill.shared.status_lifecycle._find_worklog_dir_by_prefix",
+        "shared.status_lifecycle._find_worklog_dir_by_prefix",
         return_value=None,
     ):
         yield
@@ -55,9 +58,9 @@ class TestIntakeCwdIndependence:
     def test_description_update_injects_worklog_dir(self):
         """When a worklog dir is resolved, --worklog-dir is added to wl update."""
         with (
-            mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+            mock.patch("shared.status_lifecycle.subprocess.run") as m,
             mock.patch(
-                "skill.shared.status_lifecycle.worklog_dir_flag",
+                "shared.status_lifecycle.worklog_dir_flag",
                 return_value=["--worklog-dir", "/fake/proj/.worklog"],
             ),
         ):
@@ -70,7 +73,7 @@ class TestIntakeCwdIndependence:
 
     def test_description_update_failure_surfaces_detail(self):
         """wl failure detail (stdout JSON error) propagates in the RuntimeError."""
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run") as m:
+        with mock.patch("shared.status_lifecycle.subprocess.run") as m:
             m.return_value = subprocess.CompletedProcess(
                 ["wl"],
                 1,
@@ -86,9 +89,9 @@ class TestIntakeCwdIndependence:
     def test_cmd_start_injects_worklog_dir(self):
         """cmd_start (via StatusLifecycle.update_status) gets the flag too."""
         with (
-            mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+            mock.patch("shared.status_lifecycle.subprocess.run") as m,
             mock.patch(
-                "skill.shared.status_lifecycle.worklog_dir_flag",
+                "shared.status_lifecycle.worklog_dir_flag",
                 return_value=["--worklog-dir", "/fake/proj/.worklog"],
             ),
         ):
@@ -102,9 +105,9 @@ class TestIntakeCwdIndependence:
     def test_cmd_abort_injects_worklog_dir(self):
         """cmd_abort (via StatusLifecycle.update_status) gets the flag too."""
         with (
-            mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+            mock.patch("shared.status_lifecycle.subprocess.run") as m,
             mock.patch(
-                "skill.shared.status_lifecycle.worklog_dir_flag",
+                "shared.status_lifecycle.worklog_dir_flag",
                 return_value=["--worklog-dir", "/fake/proj/.worklog"],
             ),
         ):
@@ -118,9 +121,9 @@ class TestIntakeCwdIndependence:
     def test_cmd_finish_preserves_statuses(self):
         """finish still sets open + intake_complete (no behaviour change)."""
         with (
-            mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+            mock.patch("shared.status_lifecycle.subprocess.run") as m,
             mock.patch(
-                "skill.shared.status_lifecycle.worklog_dir_flag",
+                "shared.status_lifecycle.worklog_dir_flag",
                 return_value=[],
             ),
         ):

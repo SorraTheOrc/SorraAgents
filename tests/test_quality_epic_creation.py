@@ -121,7 +121,7 @@ class TestQualityEpicCreation:
     def _import_module(self):
         """Import create_quality_epics; skip if not implemented."""
         try:
-            from skill.code_review.scripts import create_quality_epics
+            from code_review.scripts import create_quality_epics
             return create_quality_epics
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"create_quality_epics not yet available: {exc}")

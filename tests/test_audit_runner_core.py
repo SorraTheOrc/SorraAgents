@@ -13,8 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-from skill.audit.scripts.audit_runner import (
+from audit.scripts.audit_runner import (
     AUDIT_FRESHNESS_BUFFER_SECONDS,
     CALL_PI_TIMEOUT,
     DEFAULT_MODEL,
@@ -29,7 +28,7 @@ from skill.audit.scripts.audit_runner import (
     cmd_project,
     main,
 )
-from skill.audit.tests.wl_helpers import make_stateful_runner
+from audit.tests.wl_helpers import make_stateful_runner
 
 # Path to the audit_runner.py source file
 AUDIT_RUNNER_PY = Path(__file__).resolve().parent.parent / "skill" / "audit" / "scripts" / "audit_runner.py"
@@ -461,11 +460,11 @@ class TestPersistenceDelegation:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
@@ -497,11 +496,11 @@ class TestPersistenceDelegation:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
@@ -519,11 +518,11 @@ class TestPersistenceDelegation:
             return 1
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
@@ -545,7 +544,7 @@ class TestReportStructure:
 
     def test_report_starts_with_ready_to_close(self, capsys, monkeypatch):
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
@@ -560,7 +559,7 @@ class TestReportStructure:
 
     def test_report_contains_section_headings(self, capsys, monkeypatch):
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
@@ -577,7 +576,7 @@ class TestReportStructure:
 
     def test_report_contains_ac_table(self, capsys, monkeypatch):
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
@@ -596,7 +595,7 @@ class TestReportStructure:
 
     def test_report_no_ac_fallback(self, capsys, monkeypatch):
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
@@ -630,11 +629,11 @@ class TestDebugLogging:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._default_debug_log_path",
+            "audit.scripts.audit_runner._default_debug_log_path",
             lambda issue_id, context: log_path,
         )
 
@@ -668,7 +667,7 @@ class TestDebugLogging:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -750,7 +749,7 @@ class TestProjectMode:
 
     def test_project_report_starts_with_ready_to_close(self, capsys, monkeypatch):
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
@@ -763,7 +762,7 @@ class TestProjectMode:
 
     def test_project_report_has_summary_and_recommendation(self, capsys, monkeypatch):
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
@@ -831,7 +830,7 @@ class TestCmdIssueModelResolution:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -854,7 +853,7 @@ class TestCmdIssueModelResolution:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -875,7 +874,7 @@ class TestCmdIssueModelResolution:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -896,7 +895,7 @@ class TestCmdIssueModelResolution:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1042,7 +1041,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
         )
 
@@ -1060,7 +1059,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
         )
 
@@ -1081,7 +1080,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1105,7 +1104,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1141,7 +1140,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1172,7 +1171,7 @@ class TestStatusLifecycle:
             raise RuntimeError("Pi crashed")
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1189,7 +1188,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1216,7 +1215,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1288,10 +1287,10 @@ class TestStatusLifecycle:
         retry succeeds."""
         calls = []
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+            "audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1327,10 +1326,10 @@ class TestStatusLifecycle:
         item, so the operator can recover an item left in_progress."""
         calls = []
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+            "audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1361,10 +1360,10 @@ class TestStatusLifecycle:
         exit code still reflects the audit outcome (0 = success)."""
         calls = []
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+            "audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1395,7 +1394,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
                 "verdict": "met",
@@ -1429,7 +1428,7 @@ class TestStatusLifecycle:
         calls = []
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {
                 "extracted_text": '[{"index": 0, "verdict": "unmet", "evidence": "missing"}]',
                 "verdict": "unmet",
@@ -1454,7 +1453,7 @@ class TestStatusLifecycle:
             raise RuntimeError("Pi crashed")
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1589,7 +1588,7 @@ class TestFreshnessGate:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1608,7 +1607,7 @@ class TestFreshnessGate:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1630,7 +1629,7 @@ class TestFreshnessGate:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1652,7 +1651,7 @@ class TestFreshnessGate:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1670,7 +1669,7 @@ class TestFreshnessGate:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1706,7 +1705,7 @@ class TestFreshnessGate:
             return {"verdict": "met", "evidence": "ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1730,7 +1729,7 @@ class TestFreshnessGate:
             return {"verdict": "met", "evidence": ""}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2027,7 +2026,7 @@ class TestCmdIssueChildAuditAutoTrigger:
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2037,7 +2036,7 @@ class TestCmdIssueChildAuditAutoTrigger:
         # ownership now aborts, so resolve to the launch cwd's root (the
         # legacy fail-open equivalent) to keep the flow deterministic.
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._resolve_owning_project_root",
+            "audit.scripts.audit_runner._resolve_owning_project_root",
             lambda *args, **kwargs: Path.cwd(),
         )
 
@@ -2053,7 +2052,7 @@ class TestCmdIssueChildAuditAutoTrigger:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.subprocess.run",
+            "audit.scripts.audit_runner.subprocess.run",
             fake_subprocess_run,
         )
 
@@ -2132,7 +2131,7 @@ class TestCmdIssueChildAuditAutoTrigger:
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2142,7 +2141,7 @@ class TestCmdIssueChildAuditAutoTrigger:
         # ownership now aborts, so resolve to the launch cwd's root (the
         # legacy fail-open equivalent) to keep the flow deterministic.
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._resolve_owning_project_root",
+            "audit.scripts.audit_runner._resolve_owning_project_root",
             lambda *args, **kwargs: Path.cwd(),
         )
 
@@ -2156,7 +2155,7 @@ class TestCmdIssueChildAuditAutoTrigger:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.subprocess.run",
+            "audit.scripts.audit_runner.subprocess.run",
             fake_subprocess_run,
         )
 
@@ -2223,7 +2222,7 @@ class TestCmdIssueChildAuditAutoTrigger:
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2236,7 +2235,7 @@ class TestCmdIssueChildAuditAutoTrigger:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.subprocess.run",
+            "audit.scripts.audit_runner.subprocess.run",
             fake_subprocess_run,
         )
 
@@ -2308,7 +2307,7 @@ class TestRC1CompletedInReviewChildFilter:
             return {"verdict": "met", "evidence": "x:1 — ok", "extracted_text": ""}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2351,7 +2350,7 @@ class TestRC1CompletedInReviewChildFilter:
             return _fake_proc(stdout=json.dumps({"success": True}))
 
         # Monkey-patch _assemble_issue_report to capture child_results
-        original_assemble = __import__("skill.audit.scripts.audit_runner", fromlist=["_assemble_issue_report"])._assemble_issue_report
+        original_assemble = __import__("audit.scripts.audit_runner", fromlist=["_assemble_issue_report"])._assemble_issue_report
 
         def capturing_assemble(issue, ac_results, child_results, **kwargs):
             nonlocal captured_child_results
@@ -2359,7 +2358,7 @@ class TestRC1CompletedInReviewChildFilter:
             return original_assemble(issue, ac_results, child_results, **kwargs)
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            "audit.scripts.audit_runner._assemble_issue_report",
             capturing_assemble,
         )
 
@@ -2411,7 +2410,7 @@ class TestRC2RCFallbackVerdict:
 
     def test_parent_ac_fallback_uses_partial_verdict_and_warning(self, monkeypatch, capsys):
         """Parent AC fallback uses "partial" verdict, diagnostic evidence, and prints warning."""
-        from skill.audit.scripts.audit_runner import _assemble_issue_report
+        from audit.scripts.audit_runner import _assemble_issue_report
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             # Return text that _extract_json_array cannot parse
@@ -2423,7 +2422,7 @@ class TestRC2RCFallbackVerdict:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2446,7 +2445,7 @@ class TestRC2RCFallbackVerdict:
             return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            "audit.scripts.audit_runner._assemble_issue_report",
             capturing_assemble,
         )
 
@@ -2470,7 +2469,7 @@ class TestRC2RCFallbackVerdict:
 
     def test_child_ac_fallback_uses_partial_verdict_and_warning(self, monkeypatch, capsys):
         """Child AC fallback uses "partial" verdict, diagnostic evidence, and prints warning."""
-        from skill.audit.scripts.audit_runner import _assemble_issue_report
+        from audit.scripts.audit_runner import _assemble_issue_report
 
         pi_call_count = [0]
 
@@ -2493,7 +2492,7 @@ class TestRC2RCFallbackVerdict:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2543,7 +2542,7 @@ class TestRC2RCFallbackVerdict:
             return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            "audit.scripts.audit_runner._assemble_issue_report",
             capturing_assemble,
         )
 
@@ -2570,7 +2569,7 @@ class TestRC2RCFallbackVerdict:
 
     def test_parent_ac_fallback_uses_provider_error_diagnostic(self, monkeypatch, capsys):
         """Provider-error results surface a provider diagnostic, not a generic parse failure."""
-        from skill.audit.scripts.audit_runner import _assemble_issue_report
+        from audit.scripts.audit_runner import _assemble_issue_report
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             # Simulate a persistent provider error (as returned by _call_pi
@@ -2585,7 +2584,7 @@ class TestRC2RCFallbackVerdict:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2608,7 +2607,7 @@ class TestRC2RCFallbackVerdict:
             return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            "audit.scripts.audit_runner._assemble_issue_report",
             capturing_assemble,
         )
 
@@ -2635,7 +2634,7 @@ class TestRC2RCFallbackVerdict:
 
     def test_child_ac_fallback_uses_provider_error_diagnostic(self, monkeypatch, capsys):
         """Child AC provider-error results surface a provider diagnostic."""
-        from skill.audit.scripts.audit_runner import _assemble_issue_report
+        from audit.scripts.audit_runner import _assemble_issue_report
 
         pi_call_count = [0]
 
@@ -2660,7 +2659,7 @@ class TestRC2RCFallbackVerdict:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -2707,7 +2706,7 @@ class TestRC2RCFallbackVerdict:
             return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            "audit.scripts.audit_runner._assemble_issue_report",
             capturing_assemble,
         )
 
@@ -2746,11 +2745,11 @@ class TestRC2RCFallbackVerdict:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._default_debug_log_path",
+            "audit.scripts.audit_runner._default_debug_log_path",
             lambda issue_id, context: log_path,
         )
 

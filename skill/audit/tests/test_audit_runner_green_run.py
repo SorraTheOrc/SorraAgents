@@ -13,10 +13,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
-from skill.audit.tests.wl_helpers import stateful_wl_side_effect
-from skill.test.scripts.run_tests import repo_has_pytest_suite
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
+from test.scripts.run_tests import repo_has_pytest_suite
 
 
 @pytest.fixture(autouse=True)
@@ -232,7 +231,7 @@ class TestGreenRunPromptInjection:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(
@@ -444,7 +443,7 @@ class TestGreenRunCmdIssue:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             return audit_runner.cmd_issue(
@@ -508,7 +507,7 @@ class TestGreenRunCmdIssue:
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -557,7 +556,7 @@ class TestGreenRunCmdIssue:
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -865,7 +864,7 @@ class TestAutoGreenRunPromptInjection:
         ), mock.patch.object(
             audit_runner, "query_cached", return_value=cache_result
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(
@@ -936,7 +935,7 @@ class TestAutoGreenRunPromptInjection:
         ), mock.patch.object(
             audit_runner, "query_cached", side_effect=_side_effect
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -963,7 +962,7 @@ class TestAutoGreenRunPromptInjection:
         ), mock.patch.object(
             audit_runner, "query_cached"
         ) as mock_q, mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(
@@ -1024,7 +1023,7 @@ class TestAutoGreenRunCmdIssue:
         ), mock.patch.object(
             audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -1055,7 +1054,7 @@ class TestAutoGreenRunCmdIssue:
             audit_runner, "query_cached",
             side_effect=RuntimeError("cache corrupt"),
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -1217,7 +1216,7 @@ class TestNeverBlocksOnExecutionImpossible:
                 "triaged": [], "notice": "",
             },
         ) as mock_run_tests, mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             mock.MagicMock(
                 return_value={"success": True, "findings": [], "fixes_applied": 0}
             ),
@@ -1254,7 +1253,7 @@ class TestPreflightGateCmdIssue:
                 audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 mock.MagicMock(
                     return_value={"success": True, "findings": [], "fixes_applied": 0}
                 ),
@@ -1393,7 +1392,7 @@ class TestRunTestsViaTestSkill:
         with mock.patch.object(
             audit_runner, "run_cached", side_effect=_side_effect
         ), mock.patch(
-            "skill.triage.scripts.check_or_create.check_or_create",
+            "triage.scripts.check_or_create.check_or_create",
             return_value={"issueId": "SA-TRIAGE-1", "created": True},
         ) as mock_triage:
             result = audit_runner._run_tests_via_test_skill(
@@ -1432,7 +1431,7 @@ class TestRunTestsViaTestSkill:
         with mock.patch.object(
             audit_runner, "run_cached", side_effect=_side_effect
         ), mock.patch(
-            "skill.triage.scripts.check_or_create.check_or_create",
+            "triage.scripts.check_or_create.check_or_create",
             return_value={"issueId": "SA-TRIAGE-1", "created": True},
         ) as mock_triage:
             result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
@@ -1494,7 +1493,7 @@ class TestRunTestsViaTestSkill:
         with mock.patch.object(
             audit_runner, "run_cached", side_effect=_side_effect
         ), mock.patch(
-            "skill.triage.scripts.check_or_create.check_or_create",
+            "triage.scripts.check_or_create.check_or_create",
             side_effect=RuntimeError("triage boom"),
         ):
             result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
@@ -1541,7 +1540,7 @@ class TestRunTestsPromptInjection:
             audit_runner, "_run_tests_via_test_skill",
             return_value=effective_test_run,
         ) as mock_run_tests, mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(
@@ -1589,7 +1588,7 @@ class TestRunTestsPromptInjection:
                 "triaged": [], "notice": "",
             },
         ) as mock_run_tests, mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -1652,7 +1651,7 @@ class TestRunTestsPromptInjection:
         ), mock.patch.object(
             audit_runner, "run_cached", side_effect=_green_run
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(

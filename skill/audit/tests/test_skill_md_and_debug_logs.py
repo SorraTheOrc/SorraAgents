@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner
+from audit.scripts import audit_runner
 
 SKILL_MD = REPO_ROOT / "skill" / "audit" / "SKILL.md"
 SKILL_REF = REPO_ROOT / "docs" / "dev" / "audit-skill-reference.md"
@@ -510,7 +510,7 @@ class TestRunCompletionCleanup:
                 "raw_stderr": "", "elapsed_seconds": 1.0,
             }), mock.patch.object(audit_runner, "_run_wl",
                                   side_effect=self._fake_run_wl), \
-                 mock.patch("skill.code_review.scripts.code_quality.run_code_quality",
+                 mock.patch("code_review.scripts.code_quality.run_code_quality",
                             return_value={"success": True, "findings": [], "fixes_applied": 0}), \
                  mock.patch.object(audit_runner, "_remove_debug_log") as mock_remove, \
                  mock.patch.object(audit_runner, "_default_debug_log_path",
@@ -567,7 +567,7 @@ class TestRunCompletionCleanup:
                                    side_effect=RuntimeError("provider timeout")), \
                  mock.patch.object(audit_runner, "_run_wl",
                                    side_effect=_run_wl_with_ac), \
-                 mock.patch("skill.code_review.scripts.code_quality.run_code_quality",
+                 mock.patch("code_review.scripts.code_quality.run_code_quality",
                             return_value={"success": True, "findings": [], "fixes_applied": 0}), \
                  mock.patch.object(audit_runner, "_default_debug_log_path",
                                    return_value=debug_path):

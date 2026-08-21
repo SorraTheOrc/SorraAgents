@@ -12,9 +12,18 @@ Tests cover:
 Related work item: SA-0MSLRVQIF0040GAM
 """
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT_FOR_TESTS = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
+    sys.path.append(str(_SKILLS_ROOT_FOR_TESTS))
 import json
 
-from skill.shared.tree_coverage import (
+from shared.tree_coverage import (
     compute_coverage,
     extract_acceptance_criteria,
     extract_acs_from_item,

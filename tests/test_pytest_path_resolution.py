@@ -13,9 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-import skill.test.scripts.run_tests as rt
-from skill.test_runner import (
+import test.scripts.run_tests as rt
+from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
     resolve_pytest_command,
@@ -28,7 +27,7 @@ def git(repo: Path, *args: str) -> None:
 
 def _reset_pytest_cache() -> None:
     """Clear the module-level pytest command cache so tests are isolated."""
-    import skill.test_runner as tr
+    import test_runner as tr
 
     tr._PYTEST_COMMAND = None
 
@@ -93,7 +92,7 @@ def test_resolve_pytest_command_fallback_to_python_m_pytest(tmp_path: Path, monk
 def test_resolve_pytest_command_caches_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The resolved command should be stable across calls (cached at module level)."""
     _reset_pytest_cache()
-    import skill.test_runner as tr
+    import test_runner as tr
 
     monkeypatch.delenv("HOME", raising=False)
     calls = 0

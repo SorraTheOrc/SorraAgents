@@ -21,12 +21,14 @@ from pathlib import Path
 from typing import Any
 
 # Add repo root to sys.path for shared utility access
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.scripts.failure_notice import FailureNotice
-from skill.shared.status_lifecycle import (
+from scripts.failure_notice import FailureNotice
+from shared.status_lifecycle import (
     StatusLifecycle,
     resolve_worklog_dir,
     resolve_worklog_flags,
@@ -54,7 +56,7 @@ STOP_WORDS: set = {
 # Constants
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = _SKILLS_ROOT.parent
 REPORT_HEADING = "Related work (automated report)"
 
 

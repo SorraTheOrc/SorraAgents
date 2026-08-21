@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.tests.wl_helpers import make_stateful_runner
+from audit.tests.wl_helpers import make_stateful_runner
 
 
 def _mock_result(returncode=0, stdout="", stderr=""):
@@ -35,7 +35,7 @@ class TestCodeQualityFileScoping:
 
     def test_run_code_quality_forwards_files_to_linters(self):
         """run_code_quality passes the files list through to the linter runner."""
-        from skill.code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.code_quality import run_code_quality
 
         captured = {}
 
@@ -49,7 +49,7 @@ class TestCodeQualityFileScoping:
             }
 
         with patch(
-            "skill.code_review.scripts.code_quality.run_linters_for_project",
+            "code_review.scripts.code_quality.run_linters_for_project",
             side_effect=fake_linters,
         ):
             result = run_code_quality(
@@ -62,7 +62,7 @@ class TestCodeQualityFileScoping:
 
     def test_run_code_quality_defaults_files_none(self):
         """Without files, the whole-project behavior is preserved (files=None)."""
-        from skill.code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.code_quality import run_code_quality
 
         captured = {}
 
@@ -75,7 +75,7 @@ class TestCodeQualityFileScoping:
             }
 
         with patch(
-            "skill.code_review.scripts.code_quality.run_linters_for_project",
+            "code_review.scripts.code_quality.run_linters_for_project",
             side_effect=fake_linters,
         ):
             run_code_quality(str(REPO_ROOT), runner=MagicMock())
@@ -85,7 +85,7 @@ class TestCodeQualityFileScoping:
     def test_run_linters_for_project_scopes_ruff_command(self):
         """run_linters_for_project passes files to run_ruff, which targets only
         the scoped files in the ruff command."""
-        from skill.code_review.scripts.linter_runner import run_linters_for_project
+        from code_review.scripts.linter_runner import run_linters_for_project
 
         commands: list[list[str]] = []
 
@@ -94,9 +94,9 @@ class TestCodeQualityFileScoping:
             return _mock_result(returncode=0, stdout="")
 
         with (
-            patch("skill.code_review.scripts.linter_runner.detect_languages",
+            patch("code_review.scripts.linter_runner.detect_languages",
                   return_value=["python"]),
-            patch("skill.code_review.scripts.linter_runner.probe_linter",
+            patch("code_review.scripts.linter_runner.probe_linter",
                   return_value={"name": "ruff", "available": True}),
         ):
             run_linters_for_project(
@@ -111,7 +111,7 @@ class TestCodeQualityFileScoping:
 
     def test_run_linters_for_project_full_scan_unchanged(self):
         """Without files, the full-project ruff command is unchanged."""
-        from skill.code_review.scripts.linter_runner import run_linters_for_project
+        from code_review.scripts.linter_runner import run_linters_for_project
 
         commands: list[list[str]] = []
 
@@ -120,9 +120,9 @@ class TestCodeQualityFileScoping:
             return _mock_result(returncode=0, stdout="")
 
         with (
-            patch("skill.code_review.scripts.linter_runner.detect_languages",
+            patch("code_review.scripts.linter_runner.detect_languages",
                   return_value=["python"]),
-            patch("skill.code_review.scripts.linter_runner.probe_linter",
+            patch("code_review.scripts.linter_runner.probe_linter",
                   return_value={"name": "ruff", "available": True}),
         ):
             run_linters_for_project(str(REPO_ROOT), runner=runner)
@@ -133,7 +133,7 @@ class TestCodeQualityFileScoping:
 
     def test_run_shellcheck_filters_by_scope(self):
         """run_shellcheck only checks shell files in the provided scope."""
-        from skill.code_review.scripts.linter_runner import run_shellcheck
+        from code_review.scripts.linter_runner import run_shellcheck
 
         checked: list[str] = []
 
@@ -148,9 +148,9 @@ class TestCodeQualityFileScoping:
             (root / "a.sh").write_text("#!/bin/bash\necho hi\n")
             (root / "b.sh").write_text("#!/bin/bash\necho hi\n")
             with (
-                patch("skill.code_review.scripts.linter_runner.detect_languages",
+                patch("code_review.scripts.linter_runner.detect_languages",
                       return_value=["shell"]),
-                patch("skill.code_review.scripts.linter_runner.probe_linter",
+                patch("code_review.scripts.linter_runner.probe_linter",
                       return_value={"name": "shellcheck", "available": True}),
             ):
                 run_shellcheck(str(root), runner=runner,
@@ -166,7 +166,7 @@ class TestAuditReadOnlyCodeQuality:
         """cmd_issue scopes the code-quality scan to git changed files and
         never passes fix=True (read-only mandate)."""
         sys.path.insert(0, str(REPO_ROOT))
-        from skill.audit.scripts import audit_runner
+        from audit.scripts import audit_runner
 
         captured = {}
 
@@ -211,7 +211,7 @@ class TestAuditReadOnlyCodeQuality:
                          return_value={"extracted_text": json.dumps([
                              {"index": 0, "verdict": "met", "evidence": "f.py:1"},
                          ])}),
-            patch("skill.code_review.scripts.code_quality.run_code_quality",
+            patch("code_review.scripts.code_quality.run_code_quality",
                   side_effect=fake_run_code_quality),
             patch.object(audit_runner, "_git_changed_files",
                          return_value=["src/a.py", "src/b.py"]),

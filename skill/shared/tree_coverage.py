@@ -23,7 +23,7 @@ import re
 from collections import defaultdict, deque
 from typing import Any
 
-from skill.shared.status_lifecycle import resolve_worklog_flags
+from shared.status_lifecycle import resolve_worklog_flags
 
 logger = logging.getLogger("tree_coverage")
 

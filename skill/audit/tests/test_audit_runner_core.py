@@ -17,9 +17,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
-from skill.audit.tests.wl_helpers import stateful_wl_side_effect
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -207,7 +206,7 @@ class TestCodeQualityUsesTargetProjectRoot:
         mock_runner = self._make_mock_runner()
 
         with mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality", mock_cq
+            "code_review.scripts.code_quality.run_code_quality", mock_cq
         ):
             audit_runner.cmd_issue(
                 "TEST-1",
@@ -237,7 +236,7 @@ class TestCodeQualityUsesTargetProjectRoot:
         mock_runner = self._make_mock_runner()
 
         with mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality", mock_cq
+            "code_review.scripts.code_quality.run_code_quality", mock_cq
         ):
             audit_runner.cmd_issue(
                 "TEST-1",
@@ -1362,7 +1361,7 @@ class TestParentTimeoutGuardBehavior:
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(
@@ -1442,7 +1441,7 @@ class TestParentTimeoutGuardBehavior:
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(
@@ -1506,7 +1505,7 @@ class TestParentTimeoutGuardBehavior:
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(
@@ -1975,7 +1974,7 @@ class TestCmdIssuePhases:
 
         ctx = self._make_ctx(_runner)
         with mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             return_value={"success": True, "findings": [], "fixes_applied": 0},
         ):
             rc = audit_runner._phase_fetch_and_cq(ctx)
@@ -2292,7 +2291,7 @@ class TestWlShowDedup:
                 return_value="Ready to close: Yes\n\n## Summary\nall met",
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
         ):

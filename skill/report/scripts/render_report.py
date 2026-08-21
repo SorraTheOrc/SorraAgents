@@ -58,11 +58,13 @@ import sys
 from pathlib import Path
 
 # Add repo root to sys.path for shared utility access.
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.shared.status_lifecycle import resolve_worklog_flags
+from shared.status_lifecycle import resolve_worklog_flags
 
 # ── Icon mappings: ContextHub canonical set ────────────────────────────────
 # Source: ../ContextHub/docs/icons-design.md (spec) and ../ContextHub/src/icons.ts
@@ -333,7 +335,7 @@ def _parse_ac(spec: str) -> dict:
     parts = spec.split("|")
     if len(parts) != 3:
         raise SystemExit(
-            f"--ac expects 'description|metric|verdict' "
+            "--ac expects 'description|metric|verdict' "
             "(VERDICT: met|unmet|adjusted|partial), got: {spec!r}"
         )
     description, metric, verdict = (p.strip() for p in parts)

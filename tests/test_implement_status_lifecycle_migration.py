@@ -33,12 +33,12 @@ class TestImplementScriptStatusLifecycle:
         """implement.py imports StatusLifecycle from skill.shared."""
         assert self.SOURCE, f"implement.py not found at {self.IMPLEMENT_PY}"
         has_import = any([
-            "from skill.shared.status_lifecycle import StatusLifecycle" in self.SOURCE,
-            "from skill.shared import StatusLifecycle" in self.SOURCE,
-            "from skill.shared import status_lifecycle" in self.SOURCE,
+            "from shared.status_lifecycle import StatusLifecycle" in self.SOURCE,
+            "from shared import StatusLifecycle" in self.SOURCE,
+            "from shared import status_lifecycle" in self.SOURCE,
         ])
         assert has_import, (
-            "implement.py should import StatusLifecycle from skill.shared.status_lifecycle"
+            "implement.py should import StatusLifecycle from shared.status_lifecycle"
         )
 
     def test_imports_and_uses_context_manager_in_phase_finish(self):

@@ -20,7 +20,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from skill.test.scripts.run_tests import (
+from test.scripts.run_tests import (
     build_parser,
     full_suite_commands,
     node_suite_commands,
@@ -248,7 +248,7 @@ class TestTimeoutResolution:
         Verifies the full chain: main() parses args → resolves timeout via
         or-chain → passes to run_all().
         """
-        from skill.test.scripts import run_tests as run_tests_module
+        from test.scripts import run_tests as run_tests_module
 
         captured_timeout: list[int | None] = [None]
 
@@ -284,7 +284,7 @@ class TestTimeoutResolution:
 
         Verifies that explicit --timeout 120 overrides a config value of 900.
         """
-        from skill.test.scripts import run_tests as run_tests_module
+        from test.scripts import run_tests as run_tests_module
 
         captured_timeout: list[int | None] = [None]
 
@@ -320,7 +320,7 @@ class TestTimeoutResolution:
 
         Verifies: no --timeout, config returns None → timeout = 600.
         """
-        from skill.test.scripts import run_tests as run_tests_module
+        from test.scripts import run_tests as run_tests_module
 
         captured_timeout: list[int | None] = [None]
 

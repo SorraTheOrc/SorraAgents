@@ -13,8 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-import skill.test.scripts.run_tests as rt
+import test.scripts.run_tests as rt
 
 # Output that looks like a vitest/pytest summary (grep targets in production).
 SUMMARY_OUTPUT = (
@@ -171,7 +170,7 @@ def test_pipeline_normalized_variants_share_one_entry(
     assert len(fake_run) == 1
 
     # The same run keyed via its output-filtering pipeline form hits the cache.
-    from skill.test_cache import normalize_test_command, query_cached
+    from test_cache import normalize_test_command, query_cached
 
     command = rt.pytest_command()
     normalized = normalize_test_command(f"{command} 2>&1 | grep -E 'Test Files|failed'")
@@ -216,7 +215,7 @@ def test_expired_ttl_causes_reexecution(
     assert len(fake_run) == 1
 
     # Backdate the entry beyond the default TTL.
-    from skill.test_cache import (
+    from test_cache import (
         cache_dir,
         cache_key,
         compute_git_state,

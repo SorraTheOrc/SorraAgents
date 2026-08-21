@@ -165,7 +165,7 @@ class TestLinterRunnerImportable:
     def test_import_linter_runner(self):
         """Import the module (does not run) to check no syntax errors."""
         import importlib
-        spec = importlib.util.find_spec("skill.code_review.scripts.linter_runner")
+        spec = importlib.util.find_spec("code_review.scripts.linter_runner")
         if spec is None:
             pytest.skip("linter_runner module not found on sys.path")
         # Just verify the module path resolves

@@ -3,8 +3,8 @@ import json
 import sys
 from types import SimpleNamespace
 
-from skill.audit.scripts.persist_audit import main as persist_main
-from skill.audit.scripts.persist_audit import persist_audit
+from audit.scripts.persist_audit import main as persist_main
+from audit.scripts.persist_audit import persist_audit
 
 
 class FakeProc(SimpleNamespace):
@@ -70,7 +70,7 @@ def test_cli_reads_stdin_and_exits_zero(monkeypatch, capsys):
     def fake_runner(cmd, check=False, text=True, capture_output=True):
         return FakeProc(returncode=0, stdout=json.dumps({"success": True}), stderr="")
 
-    monkeypatch.setattr("skill.audit.scripts.persist_audit.subprocess.run", fake_runner)
+    monkeypatch.setattr("audit.scripts.persist_audit.subprocess.run", fake_runner)
 
     # Simulate piped stdin
     monkeypatch.setattr(sys, "stdin", io.StringIO("Ready to close: Yes\nAll good"))

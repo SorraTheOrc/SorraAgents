@@ -9,7 +9,7 @@ Provides:
 
 Usage:
 
-    from skill.refactor.smell_detection import detect_smells, load_rules
+    from refactor.smell_detection import detect_smells, load_rules
 
     rules = load_rules(".refactor.json")
     findings = detect_smells(
@@ -28,10 +28,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-from skill.code_review.scripts.linter_runner import (
+from code_review.scripts.linter_runner import (
     classify_finding as _classify_linter_finding,
 )
-from skill.code_review.scripts.linter_runner import (
+from code_review.scripts.linter_runner import (
     probe_linter,
     run_eslint,
     run_ruff,

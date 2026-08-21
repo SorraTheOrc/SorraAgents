@@ -23,12 +23,14 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.scripts.failure_notice import FailureNotice
-from skill.test_runner import canonicalize_quiet_pytest_command
+from scripts.failure_notice import FailureNotice
+from test_runner import canonicalize_quiet_pytest_command
 
 # ---------------------------------------------------------------------------
 # WL CLI helpers

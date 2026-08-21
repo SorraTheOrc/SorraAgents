@@ -47,22 +47,24 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.test_cache import (
+from test_cache import (
     DEFAULT_TTL_SECONDS,
     query_cached,
     run_cached,
     summary_lines,
 )
-from skill.test_runner import (
+from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
 )
 
-REPO_ROOT = _REPO_ROOT
+REPO_ROOT = _SKILLS_ROOT.parent
 
 # Cache TTL exposed as a module constant so CLI tests can backdate entries.
 CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS

@@ -3,7 +3,7 @@
 import json
 import sys
 
-import skill.triage.scripts.check_or_create as cc
+import triage.scripts.check_or_create as cc
 
 # ---------------------------------------------------------------------------
 # list_critical_issues() output-shape parsing

@@ -60,12 +60,12 @@ class TestRunSkillSourceStructure:
     def test_imports_from_skill_shared(self):
         """run_skill.py imports from skill.shared.status_lifecycle module."""
         has_import = any([
-            "from skill.shared.status_lifecycle import" in self.SOURCE,
-            "from skill.shared import status_lifecycle" in self.SOURCE,
-            "import skill.shared.status_lifecycle" in self.SOURCE,
+            "from shared.status_lifecycle import" in self.SOURCE,
+            "from shared import status_lifecycle" in self.SOURCE,
+            "import shared.status_lifecycle" in self.SOURCE,
         ])
         assert has_import, (
-            "run_skill.py should import from skill.shared.status_lifecycle"
+            "run_skill.py should import from shared.status_lifecycle"
         )
 
     def test_does_not_use_context_manager(self):

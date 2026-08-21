@@ -30,26 +30,25 @@ from pathlib import Path
 from typing import Any
 
 # Add repo root to sys.path for shared utility access
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.scripts.failure_notice import FailureNotice
-from skill.shared.status_lifecycle import StatusLifecycle
+from scripts.failure_notice import FailureNotice
+from shared.status_lifecycle import StatusLifecycle
 
 # Ensure repo root is on sys.path
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from skill.code_review.scripts.linter_runner import probe_linter
-from skill.refactor.comment_injection import inject_refactor_comment
-from skill.refactor.session_boundary import (
+REPO_ROOT = _SKILLS_ROOT.parent
+from code_review.scripts.linter_runner import probe_linter
+from refactor.comment_injection import inject_refactor_comment
+from refactor.session_boundary import (
     get_changed_files,
     get_untracked_files,
 )
-from skill.refactor.smell_detection import detect_smells, load_rules
-from skill.refactor.workitem_creation import create_smell_work_items
+from refactor.smell_detection import detect_smells, load_rules
+from refactor.workitem_creation import create_smell_work_items
 
 LOG = logging.getLogger("refactor.scripts.refactor")
 

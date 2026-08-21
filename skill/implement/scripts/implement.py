@@ -47,14 +47,16 @@ from pathlib import Path
 from typing import Any
 
 # Ensure the repository root is on sys.path so skill package imports work
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.shared.code_freeze import is_code_freeze_active
-from skill.shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
-from skill.test_cache import run_cached
-from skill.test_runner import canonicalize_quiet_test_command
+from shared.code_freeze import is_code_freeze_active
+from shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
+from test_cache import run_cached
+from test_runner import canonicalize_quiet_test_command
 
 # Canonical quiet full-suite commands — identical cache keys to the test
 # skill's run_tests.py (SA-0MSN6FBFS006Z5QP) so cached runs are shared

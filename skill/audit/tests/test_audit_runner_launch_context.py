@@ -32,9 +32,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner
-from skill.audit.scripts.persist_audit import PERSIST_CONTENT_INVALID
-from skill.audit.tests.wl_helpers import make_stateful_runner
+from audit.scripts import audit_runner
+from audit.scripts.persist_audit import PERSIST_CONTENT_INVALID
+from audit.tests.wl_helpers import make_stateful_runner
 
 # ===========================================================================
 # Helpers
@@ -81,7 +81,7 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, P
     # by the file-scope manifest validation; the framework repo has no src/).
     (target_root / "src").mkdir()
     patcher = mock.patch(
-        "skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+        "shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
     )
     return target, target_root, patcher
 
@@ -274,7 +274,7 @@ class TestLaunchContextGuard:
             patcher,
             mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", target_root),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -302,7 +302,7 @@ class TestLaunchContextGuard:
                 audit_runner, "TARGET_PROJECT_ROOT", tmp_path / "elsewhere"
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -404,7 +404,7 @@ class TestFileScopeManifestValidation:
                 audit_runner, "_call_pi_and_maybe_log"
             ) as pi_mock,
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -444,7 +444,7 @@ class TestFileScopeManifestValidation:
                 audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -722,7 +722,7 @@ class TestChildPersistFailureFatal:
                 audit_runner, "persist_audit", return_value=persist_rc
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -793,7 +793,7 @@ class TestGitResolutionFromNonOwningCwd:
                 audit_runner, "_verify_launch_context", return_value=None
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -830,7 +830,7 @@ class TestGitResolutionFromNonOwningCwd:
                 audit_runner, "TARGET_PROJECT_ROOT", launch_root
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -862,7 +862,7 @@ class TestGitResolutionFromNonOwningCwd:
                 audit_runner, "TARGET_PROJECT_ROOT", target_root
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -971,7 +971,7 @@ class TestWorktreeLaunchGitResolution:
                 audit_runner, "TARGET_PROJECT_ROOT", worktree_path
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -1006,7 +1006,7 @@ class TestWorktreeLaunchGitResolution:
                 audit_runner, "TARGET_PROJECT_ROOT", worktree_path
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),

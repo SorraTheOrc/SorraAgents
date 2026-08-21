@@ -5,7 +5,7 @@ Provides a standardized notice format that appears as both the first AND last
 line of any skill output when its automated script fails.
 
 Usage:
-    from skill.scripts.failure_notice import FailureNotice
+    from scripts.failure_notice import FailureNotice
 
     notice = FailureNotice(
         script_name="audit_runner.py",

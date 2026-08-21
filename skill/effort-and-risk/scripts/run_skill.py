@@ -27,11 +27,11 @@ import sys
 from pathlib import Path
 
 # Ensure the repository root is on sys.path so skill package imports work
-_REPO_ROOT = Path(__file__).resolve().parents[3]  # <repo>/skill/effort-and-risk/scripts/
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]  # <repo>/skill/effort-and-risk/scripts/
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
 
-from skill.shared.status_lifecycle import StatusLifecycle, run_wl
+from shared.status_lifecycle import StatusLifecycle, run_wl
 
 
 def wl_show(issue_id):

@@ -48,7 +48,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from skill.test_runner import normalize_test_command
+from test_runner import normalize_test_command
 
 DEFAULT_TTL_SECONDS = 2 * 60 * 60  # 2 hours (operator decision)
 # Non-zero-exit runs get a much shorter TTL (SA-0MSJELL44009XYIL): a failed

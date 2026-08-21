@@ -6,7 +6,7 @@ transitions consistently across all skills (audit, implement, plan, etc.).
 
 Usage::
 
-    from skill.shared.status_lifecycle import StatusLifecycle
+    from shared.status_lifecycle import StatusLifecycle
 
     with StatusLifecycle(
         work_item_id,

@@ -36,9 +36,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
-from skill.audit.tests.wl_helpers import stateful_wl_side_effect
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -314,14 +313,14 @@ class TestScreenSkipped:
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True,
                               "findings": [_finding("high", code="no-undef",
                                                     linter="eslint")],
                               "fixes_applied": 0},
             ),
             mock.patch(
-                "skill.code_review.scripts.create_quality_epics."
+                "code_review.scripts.create_quality_epics."
                 "create_epics_for_findings",
                 return_value={"epic_id": None},
             ),
@@ -501,13 +500,13 @@ class TestScreenBatchedCall:
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True,
                               "findings": [_finding("critical", code="F401")],
                               "fixes_applied": 0},
             ),
             mock.patch(
-                "skill.code_review.scripts.create_quality_epics."
+                "code_review.scripts.create_quality_epics."
                 "create_epics_for_findings",
                 return_value={"epic_id": None},
             ),

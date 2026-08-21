@@ -19,9 +19,9 @@ REPO_ROOT = Path(__file__).resolve().parent / ".."
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts.audit_runner import cmd_issue
-from skill.audit.scripts.persist_audit import persist_audit
-from skill.audit.tests.wl_helpers import make_stateful_runner
+from audit.scripts.audit_runner import cmd_issue
+from audit.scripts.persist_audit import persist_audit
+from audit.tests.wl_helpers import make_stateful_runner
 
 # ---------------------------------------------------------------------------
 # Helper fixtures
@@ -183,11 +183,11 @@ class TestAuditRunnerReportOnPersistFailure:
             return 1  # Simulate failure
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -209,11 +209,11 @@ class TestAuditRunnerReportOnPersistFailure:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -246,11 +246,11 @@ class TestAuditRunnerReportOnPersistFailure:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(ac_count=1),
         )
 
@@ -283,11 +283,11 @@ class TestAuditRunnerReportOnPersistFailure:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -322,11 +322,11 @@ class TestAuditRunnerReportOnPersistFailure:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(ac_count=1),
         )
 
@@ -356,7 +356,7 @@ class TestReadbackVerification:
     def test_successful_persist_and_readback_returns_0(self, monkeypatch, capsys):
         """When persist succeeds and readback returns valid audit data, return 0."""
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
         persist_called = []
@@ -366,7 +366,7 @@ class TestReadbackVerification:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
 
@@ -393,7 +393,7 @@ class TestReadbackVerification:
     def test_failed_persist_returns_rc(self, monkeypatch, capsys):
         """When persist_audit returns non-zero, the runner prints an error and returns that rc."""
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -401,7 +401,7 @@ class TestReadbackVerification:
             return 7  # Simulate non-zero exit code
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
 
@@ -417,7 +417,7 @@ class TestReadbackVerification:
     def test_null_audit_readback_errors(self, monkeypatch, capsys):
         """When readback returns null audit, print error and return 1."""
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -425,7 +425,7 @@ class TestReadbackVerification:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
 
@@ -448,7 +448,7 @@ class TestReadbackVerification:
     def test_empty_raw_output_readback_errors(self, monkeypatch, capsys):
         """When readback returns audit with empty rawOutput, print error and return 1."""
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -456,7 +456,7 @@ class TestReadbackVerification:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
 
@@ -489,7 +489,7 @@ class TestReadbackVerification:
         happen if the readback verification ran).
         """
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
         persist_called = []
@@ -499,7 +499,7 @@ class TestReadbackVerification:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
 
@@ -517,7 +517,7 @@ class TestReadbackVerification:
     def test_readback_success_with_rawoutput_null_summary_fallback(self, monkeypatch, capsys):
         """When rawOutput is null but summary has content, readback succeeds."""
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -525,7 +525,7 @@ class TestReadbackVerification:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
 
@@ -551,7 +551,7 @@ class TestReadbackVerification:
     def test_readback_success_with_both_rawoutput_and_summary(self, monkeypatch, capsys):
         """When both rawOutput and summary have content, readback succeeds (preferring rawOutput)."""
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -559,7 +559,7 @@ class TestReadbackVerification:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
 
@@ -585,7 +585,7 @@ class TestReadbackVerification:
     def test_readback_fails_when_both_rawoutput_and_summary_empty(self, monkeypatch, capsys):
         """When both rawOutput and summary are empty/null, readback fails."""
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -593,7 +593,7 @@ class TestReadbackVerification:
             return 0
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
 
@@ -626,11 +626,11 @@ class TestExitCodes:
         def fake_persist(*a, **kw):
             return 0
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 
@@ -653,11 +653,11 @@ class TestExitCodes:
         def fake_persist(*a, **kw):
             return 1
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner.persist_audit",
+            "audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
         )
 

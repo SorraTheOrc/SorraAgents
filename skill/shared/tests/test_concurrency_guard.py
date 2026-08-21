@@ -20,6 +20,15 @@ semaphore module lands in SA-0MSAK2P3J0065POO, so this file can be committed
 green in advance of the implementation.
 """
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT_FOR_TESTS = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
+    sys.path.append(str(_SKILLS_ROOT_FOR_TESTS))
 import json
 import os
 import subprocess
@@ -30,11 +39,11 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-SEMAPHORE_MODULE = "skill.shared.process_semaphore"
+SEMAPHORE_MODULE = "shared.process_semaphore"
 
 pytest.importorskip(SEMAPHORE_MODULE)
 
-from skill.shared.process_semaphore import Semaphore
+from shared.process_semaphore import Semaphore
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,8 +56,9 @@ import sys
 import time
 
 sys.path.insert(0, os.environ["REPO_ROOT"])
+sys.path.insert(0, os.environ["SKILLS_ROOT"])
 
-from skill.shared.process_semaphore import Semaphore  # noqa: E402
+from shared.process_semaphore import Semaphore  # noqa: E402
 
 name = os.environ["SEM_NAME"]
 max_workers = int(os.environ.get("SEM_MAX", "2"))
@@ -87,6 +97,7 @@ def _run_workers(n, sem_name, max_workers=2, hold=0.4, timeout=30, env_ceiling=N
         env.update(
             {
                 "REPO_ROOT": str(REPO_ROOT),
+                "SKILLS_ROOT": str(REPO_ROOT / "skill"),
                 "SEM_NAME": sem_name,
                 "SEM_MAX": str(max_workers),
                 "SEM_HOLD": str(hold),
@@ -213,6 +224,7 @@ def _launch_holder(sem_name, hold=3.0, max_workers=1):
     env.update(
         {
             "REPO_ROOT": str(REPO_ROOT),
+            "SKILLS_ROOT": str(REPO_ROOT / "skill"),
             "SEM_NAME": sem_name,
             "SEM_MAX": str(max_workers),
             "SEM_HOLD": str(hold),

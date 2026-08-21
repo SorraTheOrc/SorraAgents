@@ -11,8 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-from skill.test.scripts.run_tests import (
+from test.scripts.run_tests import (
     full_suite_commands,
     node_suite_commands,
     parse_node_failures,
@@ -273,7 +272,7 @@ def test_run_suite_surfaces_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> Non
     def fake_run(cmd, **kwargs):
         return SimpleNamespace(returncode=1, stdout=PYTEST_FAILURE_OUTPUT, stderr="")
 
-    monkeypatch.setattr("skill.test.scripts.run_tests._run_cmd", fake_run)
+    monkeypatch.setattr("test.scripts.run_tests._run_cmd", fake_run)
     # use_cache=False: this test exercises execution/parsing, not caching
     # (cache behaviour is covered in tests/test_run_tests_cache.py).
     result = run_suite("pytest", use_cache=False)
@@ -288,7 +287,7 @@ def test_run_suite_reports_passing_suite(monkeypatch: pytest.MonkeyPatch) -> Non
     def fake_run(cmd, **kwargs):
         return SimpleNamespace(returncode=0, stdout="5 passed in 0.03s", stderr="")
 
-    monkeypatch.setattr("skill.test.scripts.run_tests._run_cmd", fake_run)
+    monkeypatch.setattr("test.scripts.run_tests._run_cmd", fake_run)
     result = run_suite("pytest", use_cache=False)
     assert result["returncode"] == 0
     assert result["success"] is True
@@ -303,7 +302,7 @@ def test_run_suite_node_runs_each_directory_separately(monkeypatch: pytest.Monke
         commands_run.append(" ".join(cmd))
         return SimpleNamespace(returncode=0, stdout="# tests 2\n# pass 2\n# fail 0", stderr="")
 
-    monkeypatch.setattr("skill.test.scripts.run_tests._run_cmd", fake_run)
+    monkeypatch.setattr("test.scripts.run_tests._run_cmd", fake_run)
     result = run_suite("node", use_cache=False)
     assert result["success"] is True
     assert len(commands_run) == 3

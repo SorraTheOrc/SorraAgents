@@ -7,7 +7,7 @@ in ``skill/audit/scripts/audit_runner.py`` and other skills that invoke Pi
 non-interactively.
 
 Usage:
-    from skill.scripts.pi_utils import extract_pi_text
+    from scripts.pi_utils import extract_pi_text
 
     raw = subprocess.run(..., capture_output=True).stdout
     text = extract_pi_text(raw)

@@ -4,6 +4,17 @@ Written before the implementation exists (TDD).
 """
 
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+# The repo root must stay ahead of the skills root so top-level `plan`
+# resolves to the ROOT plan/ package (see tests/test_plan_package_resolution.py).
+# plan_helpers.py applies its own skills-root bootstrap internally, so only the
+# repo root is needed here.
+if str(REPO_ROOT) in sys.path:
+    sys.path.remove(str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
 from skill.plan.plan_helpers import (
     validate_key_files_format,
     validate_key_files_in_description,

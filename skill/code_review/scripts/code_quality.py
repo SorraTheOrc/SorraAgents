@@ -28,12 +28,12 @@ _PACKAGE_ROOT = _SCRIPT_DIR.parent.parent.parent  # repo root
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
-from skill.code_review.scripts.detection import (
+from code_review.scripts.detection import (
     detect_languages,
     get_linters_for_language,
     probe_linter,
 )
-from skill.code_review.scripts.linter_runner import (
+from code_review.scripts.linter_runner import (
     run_linters_for_project,
 )
 

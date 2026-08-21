@@ -3,8 +3,7 @@ import os
 import subprocess
 
 import pytest
-
-from skill.audit import audit_pr
+from audit import audit_pr
 
 
 def test_parse_input_ref_url():

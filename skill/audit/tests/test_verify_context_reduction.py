@@ -180,9 +180,9 @@ class TestSessionTokenExtraction:
 
 class TestFlagOffRunnerCopy:
     SAMPLE = (
-        "REPO_ROOT = Path(__file__).resolve().parents[3]\n"
-        "if str(REPO_ROOT) not in sys.path:\n"
-        "    sys.path.insert(0, str(REPO_ROOT))\n"
+        "_SKILLS_ROOT = Path(__file__).resolve().parents[2]\n"
+        "if str(_SKILLS_ROOT) not in sys.path:\n"
+        "    sys.path.insert(0, str(_SKILLS_ROOT))\n"
         "    cmd.extend([\"--no-context-files\", \"--no-skills\"])\n"
         "print('done')\n"
     )
@@ -201,8 +201,8 @@ class TestFlagOffRunnerCopy:
         src.write_text(self.SAMPLE, encoding="utf-8")
         copy = vcr._flag_off_runner_copy(src, Path("/repo/root"), tmp_path)
         text = copy.read_text(encoding="utf-8")
-        assert "REPO_ROOT = Path('/repo/root')" in text
-        assert "parents[3]" not in text
+        assert "_SKILLS_ROOT = Path('/repo/root')" in text
+        assert "parents[2]" not in text
 
 
 # ---------------------------------------------------------------------------

@@ -26,6 +26,11 @@ _SCRIPT_DIR = REPO_ROOT / "skill" / "effort-and-risk" / "scripts"
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+# Also add the skills root for top-level packages (scripts, shared, etc.)
+_SKILLS_ROOT = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
+
 import orchestrate_estimate as oe
 
 
@@ -54,7 +59,7 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, m
         f"projectName: Open Source LLM\nprefix: {prefix}\n", encoding="utf-8"
     )
     patcher = mock.patch(
-        "skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+        "shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
     )
     return target, patcher
 
@@ -170,9 +175,9 @@ class TestNoBehaviorChangeFromProjectRoot:
         recorded: list[list[str]] = []
 
         with (
-            mock.patch("skill.shared.status_lifecycle.SIBLING_SCAN_ROOT",
+            mock.patch("shared.status_lifecycle.SIBLING_SCAN_ROOT",
                        empty_root),
-            mock.patch("skill.shared.status_lifecycle.worklog_dir_flag",
+            mock.patch("shared.status_lifecycle.worklog_dir_flag",
                        return_value=[]),
             mock.patch("subprocess.run",
                        _recording_run(recorded, returncode=0)),

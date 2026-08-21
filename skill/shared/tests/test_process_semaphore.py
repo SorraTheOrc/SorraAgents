@@ -8,9 +8,17 @@ by the guard suite.
 """
 
 
-import pytest
+import sys
+from pathlib import Path
 
-from skill.shared.process_semaphore import (
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT_FOR_TESTS = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
+    sys.path.append(str(_SKILLS_ROOT_FOR_TESTS))
+import pytest
+from shared.process_semaphore import (
     DEFAULT_MAX_WORKERS,
     ENV_LOCK_DIR,
     ENV_MAX_WORKERS,

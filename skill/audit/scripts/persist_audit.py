@@ -30,11 +30,13 @@ from pathlib import Path
 
 # Ensure the repo root is on sys.path so the shared status_lifecycle module
 # is importable when this script is executed directly from any cwd.
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.shared.status_lifecycle import resolve_worklog_flags
+from shared.status_lifecycle import resolve_worklog_flags
 
 
 def _build_fallback_text(issue_id: str, ready: str) -> str:

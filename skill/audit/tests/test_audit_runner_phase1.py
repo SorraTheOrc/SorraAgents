@@ -12,9 +12,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
-from skill.audit.tests.wl_helpers import stateful_wl_side_effect
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -107,7 +106,7 @@ class TestPhase1IntakeNormalizesVerdict:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", return_value=pass_batch
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality", mock_cq
+            "code_review.scripts.code_quality.run_code_quality", mock_cq
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
@@ -252,7 +251,7 @@ class TestPhase1PromptFileScope:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -284,7 +283,7 @@ class TestPhase1PromptFileScope:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -336,7 +335,7 @@ class TestPhase1PromptFileScope:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -378,7 +377,7 @@ class TestPhase1EnableTools:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -416,7 +415,7 @@ class TestPhase1ChildAuditReuse:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -478,7 +477,7 @@ class TestPhase1ChildAuditReuse:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -520,7 +519,7 @@ class TestPhase1ChildParallelism:
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_slow
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             _t0 = _time.monotonic()
@@ -553,7 +552,7 @@ class TestPhase1ChildParallelism:
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_ordered
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -831,7 +830,7 @@ class TestPhase2NotReadyChildReuse:
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             mock.MagicMock(
                 return_value={"success": True, "findings": [], "fixes_applied": 0}
             ),
@@ -927,7 +926,7 @@ class TestExtractAcsHeadingVariantsIntegration:
             audit_runner, "_call_pi_and_maybe_log",
             return_value={"extracted_text": self._MET_JSON},
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             return audit_runner.cmd_issue(

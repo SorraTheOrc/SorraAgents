@@ -16,6 +16,16 @@ Contract (fail-open, per work item AC):
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT_FOR_TESTS = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
+    sys.path.append(str(_SKILLS_ROOT_FOR_TESTS))
+
 import json
 import os
 import subprocess
@@ -26,11 +36,11 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-CODE_FREEZE_MODULE = "skill.shared.code_freeze"
+CODE_FREEZE_MODULE = "shared.code_freeze"
 
 pytest.importorskip(CODE_FREEZE_MODULE)
 
-from skill.shared.code_freeze import (
+from shared.code_freeze import (
     code_freeze_marker_path,
     is_code_freeze_active,
 )

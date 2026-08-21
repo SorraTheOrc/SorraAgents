@@ -403,8 +403,8 @@ def _flag_off_runner_copy(runner_path: Path, repo_root: Path, tmp_dir: Path) -> 
         src,
     )
     src = re.sub(
-        r"REPO_ROOT = Path\(__file__\)\.resolve\(\)\.parents\[3\]",
-        f"REPO_ROOT = Path({str(repo_root)!r})",
+        r"_SKILLS_ROOT = Path\(__file__\)\.resolve\(\)\.parents\[2\]",
+        f"_SKILLS_ROOT = Path({str(repo_root)!r})",
         src,
     )
     copy = tmp_dir / "audit_runner_noflags.py"
@@ -420,10 +420,10 @@ def _wl_flags() -> list[str]:
     have no worklog DB of their own).
     """
     try:
-        _REPO_ROOT = Path(__file__).resolve().parents[3]
-        if str(_REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(_REPO_ROOT))
-        from skill.shared.status_lifecycle import (  # type: ignore[import-not-found]
+        _SKILLS_ROOT = Path(__file__).resolve().parents[2]
+        if str(_SKILLS_ROOT) not in sys.path:
+            sys.path.insert(0, str(_SKILLS_ROOT))
+        from shared.status_lifecycle import (  # type: ignore[import-not-found]
             resolve_worklog_flags as _resolve,
         )
         return _resolve(["wl", "show", "--json"])

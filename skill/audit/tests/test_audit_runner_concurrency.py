@@ -29,8 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner
-from skill.shared.process_semaphore import ENV_LOCK_DIR, ENV_MAX_WORKERS
+from audit.scripts import audit_runner
+from shared.process_semaphore import ENV_LOCK_DIR, ENV_MAX_WORKERS
 
 
 @pytest.fixture(autouse=True)
@@ -81,7 +81,7 @@ def _mock_popen(stdout_text=None):
 
 def test_call_pi_uses_semaphore_context(monkeypatch):
     """_call_pi must acquire and release the audit semaphore around Popen."""
-    from skill.shared.process_semaphore import Semaphore
+    from shared.process_semaphore import Semaphore
 
     events = []
     real_acquire = Semaphore.acquire
@@ -110,7 +110,7 @@ def test_call_pi_uses_semaphore_context(monkeypatch):
 
 def test_call_pi_slot_released_after_call():
     """After _call_pi returns, no slot remains held (no leak)."""
-    from skill.shared.process_semaphore import Semaphore
+    from shared.process_semaphore import Semaphore
 
     with _mock_popen():
         audit_runner._call_pi("prompt", model="m", pi_bin="pi")
@@ -208,7 +208,7 @@ def test_concurrency_ceiling_respected_with_serialization(monkeypatch):
 
 def test_default_ceiling_documented(monkeypatch):
     """Without env override, the audit semaphore uses the documented default."""
-    from skill.shared.process_semaphore import DEFAULT_MAX_WORKERS
+    from shared.process_semaphore import DEFAULT_MAX_WORKERS
 
     monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
     with _mock_popen():
@@ -225,7 +225,7 @@ def test_env_ceiling_applied(monkeypatch):
 
 def test_invalid_env_ceiling_falls_back(monkeypatch, capsys):
     """A non-integer AUDIT_MAX_CONCURRENCY warns and uses the default."""
-    from skill.shared.process_semaphore import DEFAULT_MAX_WORKERS
+    from shared.process_semaphore import DEFAULT_MAX_WORKERS
 
     monkeypatch.setenv(ENV_MAX_WORKERS, "not-a-number")
     assert audit_runner._audit_semaphore_max_workers() == DEFAULT_MAX_WORKERS
@@ -259,7 +259,7 @@ def test_lock_timeout_env_override_still_wins(monkeypatch):
 def test_call_pi_saturated_ceiling_fails_fast_without_env_override(monkeypatch):
     """With no env override, a saturated ceiling returns 'unmet' promptly
     instead of blocking for the old 300s default wait."""
-    from skill.shared.process_semaphore import Semaphore
+    from shared.process_semaphore import Semaphore
 
     # Saturate all slots: hold 1 slot in this process, then attempt another.
     monkeypatch.setenv(ENV_MAX_WORKERS, "1")
@@ -292,7 +292,7 @@ def test_call_pi_saturated_ceiling_fails_fast_without_env_override(monkeypatch):
 def test_call_pi_timeout_returns_unmet_verdict(monkeypatch):
     """When the ceiling stays saturated past the bounded wait, _call_pi must
     return an 'unmet' verdict with a clear message (not raise)."""
-    from skill.shared.process_semaphore import Semaphore
+    from shared.process_semaphore import Semaphore
 
     # Saturate all slots: hold 1 slot in this process, then attempt another.
     monkeypatch.setenv(ENV_MAX_WORKERS, "1")
