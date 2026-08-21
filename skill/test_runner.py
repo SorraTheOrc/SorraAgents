@@ -1,10 +1,98 @@
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 from pathlib import Path
 
 QUIET_PYTEST_FLAGS = ("-q", "-r", "a", "--disable-warnings")
 QUIET_NPM_FLAGS = ("--silent",)
+
+# Resolved pytest command — set by resolve_pytest_command() and then reused.
+# Kept as a module global so the PATH probe runs once per process.
+_PYTEST_COMMAND: str | None = None
+
+
+def resolve_pytest_command() -> str:
+    """Return the pytest command actually usable in this environment.
+
+    ``pytest`` may be installed in a user site-packages bin dir
+    (``~/.local/bin``) that is not on PATH in non-login shells (e.g. agent
+    tool shells, cron/nohup contexts), so a bare ``pytest`` invocation
+    fails with "command not found" (SA-0MSQ012QG005N22S). Resolution order:
+
+    1. ``pytest`` on PATH (via ``shutil.which``) → ``pytest``
+    2. ``~/.local/bin/pytest`` executable when the plain command is not on
+       PATH but the user-installed copy exists
+    3. ``python3 -m pytest`` — the most robust fallback since the Python
+       interpreter is almost always on PATH even when user bin dirs are not
+
+    The result is cached in ``_PYTEST_COMMAND`` so the PATH probes run once.
+
+    Returns:
+        A runnable command string (``pytest``, an absolute path, or
+        ``python3 -m pytest``).
+    """
+    global _PYTEST_COMMAND
+    if _PYTEST_COMMAND is not None:
+        return _PYTEST_COMMAND
+
+    # 1. pytest on PATH
+    if shutil.which("pytest") is not None:
+        _PYTEST_COMMAND = "pytest"
+        return _PYTEST_COMMAND
+
+    # 2. ~/.local/bin/pytest (pip install --user)
+    home = os.environ.get("HOME", "")
+    if home:
+        local_pytest = Path(home).expanduser() / ".local" / "bin" / "pytest"
+        if local_pytest.is_file() and os.access(str(local_pytest), os.X_OK):
+            _PYTEST_COMMAND = str(local_pytest)
+            return _PYTEST_COMMAND
+
+    # 3. python3 -m pytest
+    if shutil.which("python3") is not None:
+        _PYTEST_COMMAND = "python3 -m pytest"
+        return _PYTEST_COMMAND
+
+    # All fallbacks exhausted — the caller will surface a FileNotFoundError.
+    _PYTEST_COMMAND = "pytest"
+    return _PYTEST_COMMAND
+
+
+def executable_test_command(command: str) -> str:
+    """Return *command* with the bare ``pytest`` executable resolved.
+
+    Canonical pytest command forms (e.g. ``pytest -q -r a``) stay canonical
+    for cache keying and cross-consumer reuse, but when the plain ``pytest``
+    token is not on PATH the spawned subprocess would fail. This helper
+    rewrites only the executable prefix at run time, e.g.:
+
+        pytest -q -r a  →  /home/user/.local/bin/pytest -q -r a
+        pytest -q -r a  →  python3 -m pytest -q -r a
+
+    Explicit ``python -m pytest`` forms are left untouched (the interpreter
+    is resolvable). Non-pytest commands are returned unchanged.
+
+    Args:
+        command: Shell command string (may be a canonical quiet form).
+
+    Returns:
+        The command string with the pytest prefix resolved for execution.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    if not parts or _is_pytest_command(parts) != 1:
+        return command
+
+    resolved = resolve_pytest_command()
+    if resolved in (parts[0], "pytest"):
+        return command
+
+    prefix = shlex.split(resolved)
+    return shlex.join(prefix + parts[1:])
 
 # Known output-filtering commands that may appear in a shell pipeline after a
 # test command (e.g. `npm test 2>&1 | tail -30`). These never change which

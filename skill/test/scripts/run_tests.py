@@ -57,13 +57,20 @@ from skill.test_cache import (
     run_cached,
     summary_lines,
 )
-from skill.test_runner import canonicalize_quiet_test_command
+from skill.test_runner import (
+    canonicalize_quiet_test_command,
+    executable_test_command,
+)
 
 REPO_ROOT = _REPO_ROOT
 
 # Cache TTL exposed as a module constant so CLI tests can backdate entries.
 CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
 
+# Canonical pytest command (stable form for cache keying and cross-consumer
+# reuse). The executable is resolved at run time via executable_test_command
+# so a shell without ~/.local/bin on PATH still runs the suite
+# (SA-0MSQ012QG005N22S).
 PYTEST_CMD = canonicalize_quiet_test_command("pytest")
 NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
 
@@ -440,8 +447,13 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
     ``node --test "tests/node/**/*.mjs"`` pass the glob without literal
     quotes — otherwise node matches zero files and the suite trivially
     "passes" with 0 tests (pre-existing bug fixed with SA-0MSGN5OJ4002OZKY).
+
+    The pytest executable is resolved before spawning so a shell without
+    ``~/.local/bin`` on PATH still runs the suite (SA-0MSQ012QG005N22S);
+    the canonical command (cache key) is unchanged.
     """
-    return _run_cmd(shlex.split(command), cwd=Path(cwd), timeout=timeout)
+    executable = executable_test_command(command)
+    return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
 
 
 def run_suite(
@@ -503,7 +515,11 @@ def run_suite(
                 )
                 cached_flags.append(run["cached"])
             else:
-                proc = _run_cmd(shlex.split(cmd), cwd=cwd, timeout=timeout)
+                proc = _run_cmd(
+                    shlex.split(executable_test_command(cmd)),
+                    cwd=cwd,
+                    timeout=timeout,
+                )
                 cached_flags.append(False)
         except FileNotFoundError as exc:
             return {
@@ -603,7 +619,11 @@ def rerun_failures(
             stable.append(failure)
             continue
         try:
-            proc = _run_cmd(cmd.split(), cwd=cwd or REPO_ROOT, timeout=timeout)
+            proc = _run_cmd(
+                shlex.split(executable_test_command(cmd)),
+                cwd=cwd or REPO_ROOT,
+                timeout=timeout,
+            )
         except FileNotFoundError:
             stable.append(failure)
             continue
