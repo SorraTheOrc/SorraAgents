@@ -21,6 +21,9 @@ Usage:
     python3 skill/context-audit/scripts/measure_context.py \\
         --thresholds docs/dev/context-budget.thresholds.json
     python3 skill/context-audit/scripts/measure_context.py --threshold total=26000
+    python3 skill/context-audit/scripts/measure_context.py --generate-thresholds
+    python3 skill/context-audit/scripts/measure_context.py \
+        --write-thresholds docs/dev/context-budget.thresholds.json
 
 Exit codes:
     0  measured within thresholds (or no thresholds given)
@@ -236,6 +239,19 @@ def format_keyvalue(components: dict) -> str:
     return "\n".join(lines)
 
 
+def thresholds_from_components(components: dict) -> dict[str, int]:
+    """Build a thresholds dict from a measurement's per-component byte counts.
+
+    Mirrors the committed thresholds-file format used by the regression gate:
+    ``{component: max_bytes, ...}`` for the four components global_agents,
+    project_agents, skills_prose, total.
+    """
+    return {
+        name: comp["bytes"]
+        for name, comp in components.items()
+    }
+
+
 def format_json(repo_root: Path, components: dict, thresholds: dict,
                 exceeded: list[str]) -> str:
     """Machine-readable JSON summary."""
@@ -275,6 +291,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--keyvalue",
         action="store_true",
         help="Emit machine-readable key=value lines.",
+    )
+    output.add_argument(
+        "--generate-thresholds",
+        action="store_true",
+        help="Measure the repo and emit a thresholds JSON object to stdout "
+        "(per-component measured byte values for the regression gate).",
+    )
+    parser.add_argument(
+        "--write-thresholds",
+        dest="thresholds_out",
+        metavar="FILE",
+        help="Measure the repo and write a thresholds JSON file at FILE "
+        "(per-component measured byte values for the regression gate).",
     )
     parser.add_argument(
         "--include-hidden",
@@ -320,7 +349,19 @@ def main(argv: list[str] | None = None) -> int:
         if components.get(name, {}).get("bytes", 0) > limit
     )
 
-    if args.json:
+    if args.generate_thresholds or args.thresholds_out:
+        threshold_data = thresholds_from_components(components)
+        payload = json.dumps(threshold_data, indent=2, sort_keys=True)
+        if args.thresholds_out:
+            try:
+                Path(args.thresholds_out).write_text(payload + "\n", encoding="utf-8")
+            except OSError as exc:
+                print(f"Error: cannot write thresholds file {args.thresholds_out}: {exc}",
+                      file=sys.stderr)
+                return EXIT_ERROR
+        else:
+            print(payload)
+    elif args.json:
         print(format_json(repo_root, components, thresholds, exceeded))
     elif args.keyvalue:
         print(format_keyvalue(components))
