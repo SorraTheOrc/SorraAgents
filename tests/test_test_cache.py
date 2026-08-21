@@ -518,7 +518,7 @@ def test_default_runner_prepends_local_bin_to_path(git_repo: Path) -> None:
 
         sp.run = fake_run  # type: ignore[assignment]
         try:
-            result = _default_runner("pytest -q", str(git_repo), 60)
+            _default_runner("pytest -q", str(git_repo), 60)
             path_value = captured_env.get("PATH", "")
             assert path_value is not None, "PATH not captured from subprocess.run call"
             # ~/.local/bin must be first on PATH.
@@ -556,7 +556,7 @@ def test_default_runner_skips_dup_when_local_bin_already_on_path(git_repo: Path)
 
         sp.run = fake_run  # type: ignore[assignment]
         try:
-            result = _default_runner("pytest -q", str(git_repo), 60)
+            _default_runner("pytest -q", str(git_repo), 60)
             # Count occurrences — should be exactly one.
             parts = captured_env["PATH"].split(os.pathsep)
             count = parts.count(local_bin)
