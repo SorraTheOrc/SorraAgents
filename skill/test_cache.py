@@ -258,7 +258,18 @@ def store(
 
 
 def _default_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
-    """Execute a normalized command string, capturing stdout/stderr."""
+    """Execute a normalized command string, capturing stdout/stderr.
+
+    Prepend ``~/.local/bin`` to PATH if not already present so that
+    user-installed executables (e.g. pytest at ``~/.local/bin/pytest``)
+    are found when the audit runner spawns suite commands in a restricted
+    environment (SA-0MSUZAJPC003BS66).
+    """
+    env = os.environ.copy()
+    local_bin = os.path.expanduser("~/.local/bin")
+    path_value = env.get("PATH", "")
+    if local_bin not in path_value.split(os.pathsep):
+        env["PATH"] = local_bin + os.pathsep + path_value
     return subprocess.run(
         shlex.split(command),
         cwd=cwd,
@@ -266,6 +277,7 @@ def _default_runner(command: str, cwd: str, timeout: int) -> subprocess.Complete
         text=True,
         timeout=timeout,
         check=False,
+        env=env,
     )
 
 
