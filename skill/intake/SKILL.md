@@ -6,6 +6,23 @@ agent: build
 
 # Intake Skill
 
+## Invocation (canonical)
+
+Run the intake scripts from the **skill directory** — never from the project
+repo:
+
+```bash
+python3 ./scripts/intake.py <work-item-id>          # from the skill dir
+python3 $(skill_path intake)/scripts/intake.py ...  # from anywhere
+```
+
+`./scripts/...` paths in this document are relative to the **skill directory**
+(the `intake/` folder inside the global skills install at `~/.pi/agent/skills`,
+or the `intake/` folder under this repo's `skill/` tree) — they are **never** relative to the project
+repo, which does not (and must not) contain copies of skill scripts.
+
+---
+
 You are authoring a new Worklog work item for a feature or bug fix, following an interview-driven approach to gather requirements, constraints, Acceptance Criteria (synonym: Success Criteria), and related work — ensuring sufficient detail for a developer to complete the work.
 
 ## Inputs
@@ -23,10 +40,13 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
 - **Never copy skill scripts between repositories.** The intake scripts
   (and all skills) resolve their shared libraries from the canonical global
   skills location (`~/.pi/agent/skills`, per-skill via `$(skill_path <name>)`)
-  or this repo's `skill/` tree. If a script reports a missing shared module,
-  reinstall via `scripts/install_pi.sh` or invoke the skill from its
-  canonical location — do **not** copy/paste script files into another
-  project, as real-copy installs without `shared/` break import resolution.
+  or this repo's `skill/` tree. If a script reports a missing shared module
+  (see the graceful-failure guard in
+  [docs/dev/skills-script-paths.md](../../docs/dev/skills-script-paths.md#graceful-failure-for-missing-shared-modules)
+  and `import_guard.py` at the skills root), reinstall via `scripts/install_pi.sh` or
+  invoke the skill from its canonical location — do **not** copy/paste script
+  files into another project, as real-copy installs without `shared/` break
+  import resolution.
 
 - Do not create a work item for this intake process itself.
 - Interview style: concise, high-signal questions, max three per round.

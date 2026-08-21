@@ -19,7 +19,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
   - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
   - [skill/report/SKILL.md](skill/report/SKILL.md): the **report helper** — canonical end-of-session report format (Acceptance Criteria table, Meta-Data with ContextHub icons, Producer Actions, Notes, Conclusion) that every work-item skill renders as its final step.
 - plugins/: local agent framework plugins used by this repository.
-- docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
+- docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)). For setting up a new project: [skills-script-paths.md](docs/dev/skills-script-paths.md#initializing-a-new-project-global-install) (global skills install via `scripts/install_pi.sh` — project repos need no `skill/` and must not receive copies of skill scripts).
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
 
