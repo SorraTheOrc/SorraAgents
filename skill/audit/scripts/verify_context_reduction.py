@@ -393,8 +393,8 @@ def _flag_off_runner_copy(runner_path: Path, repo_root: Path, tmp_dir: Path) -> 
     """Create a runner copy with the context-reduction flags removed.
 
     Removes the ``cmd.extend(["--no-context-files", "--no-skills"])`` line
-    and pins ``REPO_ROOT`` to *repo_root* (the copy lives outside the repo
-    so ``parents[3]`` would otherwise resolve wrong).
+    and pins the skills root to *repo_root* (the copy lives outside the repo
+    so the default resolve-from-file-depth would otherwise resolve wrong).
     """
     src = runner_path.read_text(encoding="utf-8")
     src = re.sub(
