@@ -86,6 +86,7 @@ def _run_install_pi_in_sandbox(sandbox: Path) -> subprocess.CompletedProcess:
         text=True,
         env=env,
         cwd=str(fake_proj),
+        check=False,  # caller inspects result (stdout behavior asserted below)
     )
 
 
