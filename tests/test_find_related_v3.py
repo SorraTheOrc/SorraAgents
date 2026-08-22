@@ -18,12 +18,9 @@ Covers the speed/value fixes shipped by the v3 review:
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from unittest import mock
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
