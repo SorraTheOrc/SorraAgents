@@ -5,6 +5,20 @@ Fetches a work item, derives keywords from its title/description, searches
 Worklog and the repository for related items, generates a concise Markdown
 report, and updates the work-item description.
 
+v3 (SA-0MNCDAQ8W008KOG9) performance/value changes:
+  - Keywords are extracted with the skill's own automated report section
+    stripped and ordered by descending frequency (closes the feedback loop
+    that grew 14 -> 82 -> 523 keywords; numeric-only tokens dropped).
+  - Worklog search queries only the top MAX_SEARCH_KEYWORDS keywords (8),
+    capping the v2 per-keyword subprocess fan-out (measured ~0.5s/spawn;
+    96% of v2 runtime was subprocess waits). Multi-term batched queries
+    were measured to collapse conjunctively (1 result), so capping beats
+    batching for recall.
+  - Repo scan excludes `.worklog` (sidecar full report + stale worktree
+    clones) and other non-authoritative dirs.
+  - `update_description` cuts sections at `\n##` NOT followed by `#`, fixing
+    the boundary bug that orphaned `###` sub-blocks on re-runs.
+
 Usage:
     python3 skill/find-related/scripts/find_related.py --work-item-id <id>
     python3 skill/find-related/scripts/find_related.py --work-item-id <id> --json
@@ -88,6 +102,17 @@ MAX_REPO_FILE_RESULTS: int = 3
 MAX_KEYWORDS_PER_FILE: int = 5
 
 
+# Maximum number of search keywords fed to Worklog search. Bounds the
+# subprocess fan-out (v2 spawned one `wl search` per extracted keyword —
+# measured ~0.5s/spawn, 96% of runtime — and grew unbounded on polluted
+# descriptions: 14 -> 82 -> 523 keywords). Only the top
+# MAX_SEARCH_KEYWORDS frequency-ranked keywords (see extract_keywords) are
+# queried per-keyword: this preserved recall (26 distinct items from 6
+# spawns on the review item) where multi-term batched queries collapsed to
+# ~1 conjunctive result, so capping beats batching as the speed lever.
+MAX_SEARCH_KEYWORDS: int = 8
+
+
 # ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
@@ -152,22 +177,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def extract_keywords(title: str, description: str) -> list[str]:
     """Derive conservative keywords from a work-item title and description.
 
-    Returns a sorted list of unique, lowercased keywords.
+    Returns unique, lowercased keywords ordered by **descending frequency**
+    (deterministic — ties alphabetical). Frequency ordering puts the
+    descriptive core of the text first, so capped search queries (see
+    ``search_and_dedup`` / ``MAX_SEARCH_KEYWORDS``) pick the most
+    representative terms rather than alphabetical junk (v3). Pure numeric
+    tokens (years, counts) carry no search signal and are dropped.
     Common English stop words and very short terms are excluded.
+
+    The skill's own 'Related work (automated report)' section is stripped
+    from the description before tokenizing (v3): report words (work-item
+    IDs, "matched", "repository", "worktrees") must never become search
+    keywords, or every run re-extracts them and the search fan-out grows
+    unbounded (feedback loop).
     """
-    combined = f"{title} {description}"
+    combined = f"{title} {strip_report_sections(description)}"
     # Lowercase
     combined = combined.lower()
     # Replace special characters (including hyphens) with spaces
     combined = re.sub(r"[^a-z0-9]", " ", combined)
     # Split into tokens
     tokens = combined.split()
-    # Filter: remove stop words, keep only words with 3+ characters, deduplicate
-    keywords = sorted({
-        t for t in tokens
-        if t not in STOP_WORDS and len(t) >= 3
-    })
-    return keywords
+    # Count frequencies: exclude stop words, short terms, and numeric-only
+    # tokens ("2026", "452") that carry no search signal.
+    counts: dict[str, int] = {}
+    for token in tokens:
+        if token in STOP_WORDS or len(token) < 3 or token.isdigit():
+            continue
+        counts[token] = counts.get(token, 0) + 1
+    # Deterministic ordering: descending frequency, ties alphabetical. The
+    # top of the list is the descriptive core of the item.
+    return sorted(counts, key=lambda word: (-counts[word], word))
 
 
 # ---------------------------------------------------------------------------
@@ -312,24 +352,36 @@ def search_and_dedup(
     keywords: list[str],
     use_semantic: bool = False,
     worklog_flags: list[str] | None = None,
+    max_keywords: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Search Worklog for each keyword, aggregate results, deduplicate, rank, and limit.
+    """Search Worklog for related items, aggregate, dedup, rank, and limit.
 
-    Results are ranked by descending score (the `score` field from
-    `wl search --json`, which is BM25 or hybrid BM25+semantic). Items
-    without a score sort last. The final list is capped at
-    MAX_WORK_ITEM_RESULTS.
+    v3 (SA-0MNCDAQ8W008KOG9): only the top *max_keywords* frequency-ranked
+    keywords are queried — one ``wl search`` spawn each (hybrid
+    ``--semantic`` ranking when available). This caps the v2 per-keyword
+    fan-out (523 spawns on the polluted review item -> 8) while preserving
+    per-keyword recall. Multi-term batched queries were measured to be
+    conjunctive/collapse (a single 25-term ``--semantic`` query returned 1
+    result vs 26 distinct items from 6 per-keyword spawns), so keyword
+    capping — not query batching — is the speed lever that holds recall.
 
     ``worklog_flags`` pins the target worklog store (resolved from the
     work-item id being analyzed) so every search targets the same store.
 
-    Ranking heuristic: scored items are sorted by descending score
-    (higher = more relevant). Unscored items sort after all scored items.
+    Ranking heuristic: items are sorted by descending score (the `score`
+    field from `wl search --json`, BM25 or hybrid BM25+semantic). Items
+    without a score sort last. The final list is capped at
+    MAX_WORK_ITEM_RESULTS.
     """
+    if not keywords:
+        return []
+    if max_keywords is None:
+        max_keywords = MAX_SEARCH_KEYWORDS
+
     seen: set = set()
     results: list[dict[str, Any]] = []
 
-    for keyword in keywords:
+    for keyword in keywords[:max_keywords]:
         items = run_wl_search(keyword, use_semantic=use_semantic,
                               worklog_flags=worklog_flags)
         for item in items:
@@ -355,7 +407,15 @@ ALLOWED_EXTENSIONS: set = {".md", ".py", ".js", ".mjs", ".txt"}
 # Directories to always exclude from repository scanning
 EXCLUDED_DIRS: set = {".git", "node_modules", "__pycache__", ".pytest_cache",
                       ".venv", "venv", "env", ".idea", ".vscode",
-                      "dist", "build", ".next"}
+                      "dist", "build", ".next",
+                      # v3: the worklog store and agent scaffolding are
+                      # non-authoritative / self-referential — the main
+                      # checkout is canonical. The skill's own sidecar full
+                      # report (`.worklog/tmp/find-related-full-<id>.md`) and
+                      # stale worktree clones (`.worklog/worktrees/wl-*`) were
+                      # measured to be 83% of scanned files AND ranked as top
+                      # repo matches (SA-0MNCDAQ8W008KOG9).
+                      ".worklog", ".pi", ".ruff_cache", ".mypy_cache"}
 
 
 def search_repo(repo_path: str, keywords: list[str]) -> list[dict[str, Any]]:
@@ -521,6 +581,53 @@ def write_full_report(
         return None
 
 
+# A top-level (level-2) Markdown heading is "\n## " — but the report's own
+# sub-headings ("### Related work items", "### Repository file matches")
+# also start with "\n##". The v2 boundary scan matched the plain "\n##"
+# prefix, so re-runs cut the report short at its first ### sub-block,
+# orphaning stale content and eventually stacking duplicate sub-blocks. The
+# regex requires the heading NOT to be followed by another "#" so "###"
+# sub-headings stay inside the report section.
+_SECTION_BOUNDARY_RE = re.compile(r"\n##(?!#)")
+
+
+def _section_spans(text: str) -> list[tuple[int, int]]:
+    """Return (start, end) spans of every automated-report section in *text*.
+
+    Each span runs from its ``## Related work (automated report)`` heading to
+    the next top-level heading (``\n##`` not followed by ``#``) or the end
+    of the text. ``###`` sub-headings inside the report are NOT boundaries
+    (v3 boundary fix).
+    """
+    heading = f"## {REPORT_HEADING}"
+    spans: list[tuple[int, int]] = []
+    search_from = 0
+    while True:
+        start = text.find(heading, search_from)
+        if start == -1:
+            break
+        end = len(text)
+        boundary = _SECTION_BOUNDARY_RE.search(text, start + len(heading))
+        if boundary is not None:
+            end = boundary.start()
+        spans.append((start, end))
+        search_from = end
+    return spans
+
+
+def strip_report_sections(text: str) -> str:
+    """Return *text* with every automated related-work report section removed.
+
+    Used by keyword extraction so the skill's own report (other work-item
+    IDs, "matched", "repository", "worktrees", ...) never feeds back into
+    the next run's search keywords (v3 feedback-loop fix).
+    """
+    spans = _section_spans(text)
+    if not spans:
+        return text
+    return text[: spans[0][0]] + text[spans[-1][1]:]
+
+
 # ---------------------------------------------------------------------------
 # Description update (idempotent)
 # ---------------------------------------------------------------------------
@@ -537,33 +644,22 @@ def update_description(original_desc: str, report_section: str) -> str:
     appended when no section existed. Manual "Related work" sections
     (without the automated marker) are preserved.
 
+    Section boundaries are detected via :data:`_SECTION_BOUNDARY_RE` (v3):
+    ``###`` sub-headings belong to the report section and are replaced with
+    it, so re-runs never orphan stale sub-blocks or stack duplicates.
+
     Returns the updated description string.
     """
-    heading_pattern = f"## {REPORT_HEADING}"
-    remaining = original_desc
-    insertion_idx: int | None = None
-
-    # Remove every automated report section: each spans from its heading to
-    # the next section heading (\n##) or the end of the description.
-    while True:
-        heading_idx = remaining.find(heading_pattern)
-        if heading_idx == -1:
-            break
-        if insertion_idx is None:
-            insertion_idx = heading_idx
-        next_section_idx = len(remaining)
-        for i in range(heading_idx + len(heading_pattern), len(remaining)):
-            if remaining[i : i + 3] == "\n##":
-                next_section_idx = i
-                break
-        remaining = remaining[:heading_idx] + remaining[next_section_idx:]
-
-    if insertion_idx is None:
+    spans = _section_spans(original_desc)
+    if not spans:
         # No existing report section — append
         return original_desc.rstrip() + report_section
 
-    # Replace the (first) report section position with the new report;
-    # everything after the last removed section follows unchanged.
+    # Everything before the first report section, then the last removed
+    # section's tail, with the new report inserted at the first section's
+    # position (in-place replacement, preserving surrounding sections).
+    remaining = original_desc[: spans[0][0]] + original_desc[spans[-1][1]:]
+    insertion_idx = spans[0][0]
     before = remaining[:insertion_idx].rstrip()
     after = remaining[insertion_idx:]
     return before + report_section + after

@@ -17,15 +17,15 @@ Discover related work for a work item via Worklog search, file inspection, and o
 ## Decision logic
 
 1. Fetch item: `wl show <id> --json`
-2. Derive keywords from title/description; stop words excluded, 3+ chars
+2. Derive keywords from title/description; stop words excluded, 3+ chars, numeric-only tokens dropped; **the skill's own automated-report section is stripped first** so report tokens never feed back; ordered by descending frequency so the top-k terms are the descriptive core (v3)
 3. Probe `wl search --semantic` — use hybrid ranking if available
-4. Search Worklog for each keyword, aggregate results, deduplicate
+4. **Cap** worklog search to the top `MAX_SEARCH_KEYWORDS` frequency-ranked keywords, one `wl search` subprocess each (v3; was one subprocess per extracted keyword — 523 spawns on the polluted review item); multi-term batched queries were measured to collapse conjunctively, so capping (not batching) preserves recall
 5. **Rank** work items by descending `score` field (BM25 or hybrid), cap at `MAX_WORK_ITEM_RESULTS`
-6. Search repo files (`.md`, `.py`, `.js`, `.mjs`, `.txt`, excluding `.git`, `node_modules`, etc.)
+6. Search repo files (`.md`, `.py`, `.js`, `.mjs`, `.txt`, excluding `.git`, `.worklog`, `node_modules`, etc. — the main checkout is authoritative; stale worktrees/sidecar output are never scanned)
 7. **Rank** repo files by distinct keyword match count, cap at `MAX_REPO_FILE_RESULTS`
 8. Filter out the current work item from results
 9. Generate report under "## Related work (automated report)"
-10. Update item description (replace existing automated report section, preserving manual content)
+10. Update item description (replace existing automated report section **including its `###` sub-headings**, preserving manual content)
 11. Return JSON summary
 
 **Policy**: Conservative — prefer false negatives over false positives. Only include truly related items.
@@ -44,6 +44,7 @@ Discover related work for a work item via Worklog search, file inspection, and o
 | `MAX_WORK_ITEM_RESULTS` | 3 | Maximum related work items shown. Soft limit — may be replaced by minimum-relevance thresholds when semantic/embedding-based scoring is available. |
 | `MAX_REPO_FILE_RESULTS` | 3 | Maximum repo file matches shown. Same soft-limit semantics. |
 | `MAX_KEYWORDS_PER_FILE` | 5 | Maximum matched keywords listed per repo file match. Raw keyword word-lists are the dominant source of report bloat (measured ~58% of the related-work section), so lists are capped with a `(+N more)` marker to keep descriptions/prompts compact. |
+| `MAX_SEARCH_KEYWORDS` | 8 | Maximum keywords fed to Worklog search. Bounds the subprocess fan-out (v2 spawned one `wl search` per keyword, growing 14 → 82 → 523 across runs) while preserving per-keyword recall — measured 26 distinct items from 6 spawns vs 1 result from a 25-term batched semantic query. |
 
 ### Prompt-size management (P11)
 
@@ -132,15 +133,53 @@ Work item: <id> | Related: 3 | Repo matches: 2 | Added IDs: REL-001, REL-002
 | 0 | Success |
 | 1 | Error |
 
+### Runtime expectations
+
+Clean runs finish in **~2–4s** (v3): worklog search is bounded to
+`MAX_SEARCH_KEYWORDS` (8) per-keyword subprocesses (~0.5s each) instead of one
+per extracted keyword (96% of v2 runtime was subprocess waits; the polluted
+review item hit 523 spawns / unbounded wall-clock). Keyword extraction never
+reads the skill's own report and is frequency-ranked, so re-runs do not grow
+slower over time (pre-fix feedback loop: 14 → 82 → 523 keywords). Repo
+scanning excludes `.worklog` (~83% of scanned files) so stale worktrees and
+the sidecar full report are neither read nor matched. See
+`docs/dev/find-related-v3-analysis.md` for the measured before/after.
+
 ### Idempotency
 
 Safe to re-run: ALL prior automated report sections are removed before the
-new one is inserted (duplicates from earlier runs never accumulate). Manual
+new one is inserted (duplicates from earlier runs never accumulate). Section
+boundaries are detected at `\n##` **not followed by `#`**, so the report's own
+`### Related work items` / `### Repository file matches` sub-headings are
+replaced with the section instead of being orphaned or stacked. Manual
 "Related work" sections (without the automated marker) are preserved.
 
 ### Design
 
 Fully offline (local `wl` + filesystem). Conservative keyword matching. Scans `.md`, `.py`, `.js`, `.mjs`, `.txt` files only.
+
+### Changes in v3 (speed & value — SA-0MNCDAQ8W008KOG9)
+
+- **Bounded worklog search:** only the top `MAX_SEARCH_KEYWORDS` (8)
+  frequency-ranked keywords are queried, one `wl search` subprocess each
+  (hybrid `--semantic` ranking when available). This caps the v2 per-keyword
+  fan-out (523 spawns on the polluted review item → 8). Multi-term batched
+  queries were measured to collapse conjunctively (1 result), so keyword
+  capping — not query batching — is the speed lever that holds recall.
+- **Feedback loop closed:** keyword extraction strips the automated-report
+  section from the description and drops numeric-only tokens; frequency
+  ordering surfaces the descriptive core for the top-k query. Report tokens
+  (other work-item IDs, "matched", "repository", "worktrees") never become
+  search keywords and the description never grows without bound.
+- **Repo scan noise removed:** `.worklog` (sidecar full report + stale worktree
+  clones), `.pi`, and cache dirs are excluded; the main checkout is
+  authoritative.
+- **Idempotency boundary fix:** report sections end at `\n##` not followed by
+  `#`, so `###` sub-headings stay inside the section and re-runs never stack
+  duplicate sub-blocks.
+- Measured: polluted run ≥240s (523-keyword search fan-out, timed out) → ~3s;
+  repo scan 2,188 → 362 files. Full analysis:
+  `docs/dev/find-related-v3-analysis.md`.
 
 ### Changes in v2 (scoring, ranking, and limits)
 
