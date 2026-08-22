@@ -95,6 +95,7 @@ def _run_hook_in_temp_repo(
         capture_output=True,
         text=True,
         env=env,
+        check=False,  # exit codes are asserted below
     )
     return result
 
