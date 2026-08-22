@@ -164,6 +164,51 @@ class TestCodeQualityFileScoping:
 # ===========================================================================
 
 
+class TestGitChangedFilesDropsPhantomPath:
+    """AC1: a duplicated/concatenated phantom path (never existed on
+    disk, e.g. ``skill/audit/skill/skill``) is excluded from the lint
+    scope before any linter runs (SA-0MSXVXW9C0032S7G).
+
+    Pre-fix (no existence filter in ``_git_changed_files``): the phantom
+    path flows into ``ruff check`` → E902 IO error. Post-fix: dropped.
+    """
+
+    def test_concatenated_phantom_path_excluded(self):
+        import tempfile
+
+        from audit.scripts import audit_runner
+
+        # Real temp dir = project root; the phantom path does NOT exist.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # A real changed file that DOES exist, to prove the scope is
+            # not dropped wholesale.
+            real = root / "real.py"
+            real.write_text("x = 1\n")
+
+            phantom = "skill/audit/skill/skill"
+            assert not (root / phantom).exists()
+
+            def fake_runner(cmd):
+                """git reports the phantom + a real changed file."""
+                cmd_str = " ".join(cmd)
+                if "diff --name-only" in cmd_str:
+                    out = f"{phantom}\n{real.name}\n"
+                else:  # status --porcelain
+                    out = f"?? {phantom}\n M {real.name}\n"
+                return _mock_result(returncode=0, stdout=out)
+
+            with patch.object(audit_runner, "TARGET_PROJECT_ROOT",
+                              str(root)):
+                changed = audit_runner._git_changed_files(fake_runner)
+
+            # Phantom dropped; real file kept.
+            assert phantom not in changed, (
+                f"phantom path must be excluded: {changed}"
+            )
+            assert "real.py" in changed
+
+
 class TestGitChangedFilesDropsDeleted:
     """AC1: _git_changed_files drops non-existent (deleted) paths.
 
