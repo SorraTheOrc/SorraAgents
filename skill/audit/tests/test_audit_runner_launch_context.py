@@ -1026,14 +1026,22 @@ class TestWorktreeLaunchGitResolution:
         )
         # File-scope manifest reflects the worktree state: worktree-only
         # tracked file in the repo index + worktree-only untracked file in
-        # the changed-files list.
+        # the changed-files list.  (Manifest is built inside the patch
+        # context so TARGET_PROJECT_ROOT is correct for the existence
+        # filter in _git_changed_files — SA-0MSXVXVUL0011JKX.)
         manifest = audit_runner._build_file_scope_manifest(
             {}, [], runner=runner
         )
         assert "wt_only" in manifest, (
             f"manifest must reflect worktree-only files: {manifest!r}"
         )
-        changed = audit_runner._git_changed_files(runner)
+        # Direct _git_changed_files call must also be inside the patch
+        # context for the TARGET_PROJECT_ROOT-based existence filter to
+        # resolve paths correctly.
+        with mock.patch.object(
+            audit_runner, "TARGET_PROJECT_ROOT", worktree_path
+        ):
+            changed = audit_runner._git_changed_files(runner)
         assert "wt_uncommitted.txt" in changed, (
             f"changed files must reflect the worktree working tree: {changed}"
         )

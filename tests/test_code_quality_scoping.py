@@ -159,6 +159,86 @@ class TestCodeQualityFileScoping:
         assert checked == [str(root / "a.sh")], f"got {checked}"
 
 
+# ===========================================================================
+# AC1: _git_changed_files drops non-existent (deleted) paths
+# ===========================================================================
+
+
+class TestGitChangedFilesDropsDeleted:
+    """AC1: _git_changed_files drops non-existent (deleted) paths.
+
+    A tracked file that has been deleted appears in ``git diff
+    --name-only HEAD`` as a ghost path.  Linting such a path makes ruff
+    fail with ``E902`` (IO error) and the remediation loop then writes
+    junk per-file-ignores for machine-absolute paths (SA-0MSXVXVUL0011JKX).
+
+    Post-fix: deleted paths are filtered so they never reach the linter.
+    Pre-fix (without the filter) this test fails.
+    """
+    def test_deleted_tracked_file_not_in_changed_list(self):
+        import tempfile
+
+        # Create a real git repo with a tracked Python file.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            marker = repo / "_marker.py"
+            marker.write_text("x = 1  # unused var\n")  # F841 trigger
+
+            def _git(*args, cwd):
+                return subprocess.run(
+                    ["git", *args], cwd=str(cwd), check=True,
+                    capture_output=True, text=True,
+                )
+
+            _git("init", cwd=repo)
+            _git("config", "user.email", "test@test.com", cwd=repo)
+            _git("config", "user.name", "Test", cwd=repo)
+            _git("add", "-A", cwd=repo)
+            _git("commit", "-m", "init", cwd=repo)
+
+            # Delete the tracked file — now a ghost path.
+            marker.unlink()
+
+            # Verify git diff lists it (the ghost path exists).
+            diff = _git("diff", "--name-only", "HEAD", cwd=repo)
+            assert "_marker.py" in diff.stdout, (
+                "git should list _marker.py as deleted"
+            )
+
+            # Call _git_changed_files with a runner that executes git
+            # from inside the test repo so paths are repo-relative.
+            from audit.scripts import audit_runner
+
+            def git_runner(cmd):
+                return subprocess.run(
+                    list(cmd), cwd=str(repo),
+                    capture_output=True, text=True, check=False,
+                )
+
+            with patch.object(audit_runner, "TARGET_PROJECT_ROOT",
+                              str(repo)):
+                changed = audit_runner._git_changed_files(git_runner)
+
+            # The deleted file must NOT appear — lint scope excludes it.
+            assert "_marker.py" not in changed, (
+                f"deleted file must be dropped from lint scope: {changed}"
+            )
+
+            # Also verify _git_changed_files includes only existing files.
+            for path in changed:
+                candidate = Path(path)
+                if not candidate.is_absolute():
+                    assert (Path(repo) / candidate).exists(), (
+                        f"{path!r} should exist on disk"
+                    )
+
+
+# ===========================================================================
+# The audit path invokes code quality scoped + read-only (fix=False).
+# ===========================================================================
+
+
 class TestAuditReadOnlyCodeQuality:
     """The audit path invokes code quality scoped + read-only (fix=False)."""
 

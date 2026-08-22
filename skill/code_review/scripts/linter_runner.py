@@ -164,6 +164,10 @@ def apply_ruff_remediation(config_path: str | Path,
     for ``ruff.toml`` and ``[tool.ruff.per-file-ignores]`` for
     ``pyproject.toml``. Existing entries are merged (idempotent).
 
+    E902 (IO error) findings and machine-absolute file paths are skipped
+    because they cannot be remediated via per-file-ignores and would
+    pollute config with junk entries (SA-0MSXVXVUL0011JKX).
+
     Returns True when the file was modified, False when there was nothing
     to add (all entries already present, or no file+code pairs).
     """
@@ -172,6 +176,10 @@ def apply_ruff_remediation(config_path: str | Path,
         finding = t.get("finding", {}) if isinstance(t, dict) else {}
         file = finding.get("file", "")
         code = finding.get("code", "")
+        # Skip E902 (IO error — not fixable via per-file-ignores) and
+        # machine-absolute paths (would pollute config with junk keys).
+        if code == "E902" or os.path.isabs(file):
+            continue
         if file and code:
             entries.setdefault(file, [])
             if code not in entries[file]:

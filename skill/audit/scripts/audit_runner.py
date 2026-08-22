@@ -3147,8 +3147,15 @@ def _git_changed_files(runner: Runner) -> list[str]:
     """Return the list of changed/untracked files from git (bounded).
 
     Combines ``git diff --name-only HEAD`` and ``git status --porcelain=v1``
-    so both tracked modifications and untracked files are captured. Any git
-    failure returns an empty list so the audit never breaks on VCS errors.
+    so both tracked modifications and untracked files are captured.
+
+    Deleted and transient files are filtered out so that lint-scoped runs
+    never target ghost paths — without this filter, ``ruff check`` fails
+    with ``E902`` (IO error) and the remediation loop then writes junk
+    per-file-ignores for machine-absolute paths (SA-0MSXVXVUL0011JKX).
+
+    Any git failure returns an empty list so the audit never breaks on
+    VCS errors.
     """
     changed: list[str] = []
     try:
@@ -3170,7 +3177,23 @@ def _git_changed_files(runner: Runner) -> list[str]:
                         changed.append(path)
     except Exception:  # noqa: S110, BLE001 -- git is best-effort for the manifest
         pass
-    return changed[:_FILE_SCOPE_MAX_FILES]
+
+    # ------------------------------------------------------------------
+    # Drop ghost paths (deleted / transient files) that git reports but
+    # that no longer exist on disk.  Without this filter, ``ruff check``
+    # fails with E902 (IO error) and the remediation loop writes junk
+    # per-file-ignores for machine-absolute ghost paths (SA-0MSXVXVUL0011JKX).
+    # ------------------------------------------------------------------
+    root = Path(TARGET_PROJECT_ROOT).resolve()
+    existing: list[str] = []
+    for path in changed:
+        p = Path(path)
+        if p.is_absolute():
+            if p.exists():
+                existing.append(path)
+        elif (root / p).exists() or Path(path).exists():
+            existing.append(path)
+    return existing[:_FILE_SCOPE_MAX_FILES]
 
 
 def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
@@ -6416,6 +6439,18 @@ def _run_remediation_loop(
     while iteration < max_iterations:
         targets = [
             e for e in results["fp_screen_results"] if e.get("remediable")
+        ]
+        if not targets:
+            break
+        # Skip E902 (IO error) and machine-absolute-path findings — they
+        # cannot be remediated via per-file-ignores and would produce
+        # junk config keys (SA-0MSXVXVUL0011JKX).  Filtering here prevents
+        # ``locate_ruff_config`` from creating a root ruff.toml when all
+        # remaining targets are un-remediable.
+        targets = [
+            t for t in targets
+            if not (t.get("finding", {}).get("code") == "E902"
+                    or os.path.isabs(t.get("finding", {}).get("file", "")))
         ]
         if not targets:
             break
