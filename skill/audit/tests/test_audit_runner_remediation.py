@@ -343,6 +343,44 @@ class TestRemediationFilter:
         assert not (tmp_path / "ruff.toml").exists()
 
 
+    def test_no_tracked_ruff_config_has_machine_absolute_keys(self):
+        """AC4 repo-hygiene regression (SA-0MSXVXW9C0032S7G): no tracked
+        ruff config (ruff.toml or pyproject.toml [tool.ruff]) may contain
+        per-file-ignores keys that are machine-specific absolute paths.
+
+        Pre-fix: ruff.toml shipped legacy keys like
+        "/home/rgardler/projects/SorraAgents/skill/....py" (written by the
+        remediation loop before the absolute-path skip existed).
+        Post-fix: the junk config was deleted; a config re-introduced with
+        absolute-path keys fails this guard — the config is portable.
+        """
+        candidates = [
+            (REPO_ROOT / "ruff.toml", "per-file-ignores"),
+            (REPO_ROOT / "pyproject.toml", "tool.ruff.per-file-ignores"),
+        ]
+        cfg_texts = [
+            (cfg.read_text(encoding="utf-8"), section)
+            for cfg, section in candidates
+            if cfg.exists()
+        ]
+        if not cfg_texts:
+            pytest.skip("repo has no tracked ruff config to guard")
+        for text, section in cfg_texts:
+            in_section = False
+            for raw in text.splitlines():
+                line = raw.strip()
+                if line == f"[{section}]":
+                    in_section = True
+                    continue
+                if in_section and line.startswith("["):
+                    break
+                if in_section and line and not line.startswith("#"):
+                    key = line.partition("=")[0].strip().strip('"').strip("'")
+                    assert not Path(key).is_absolute(), (
+                        f"junk machine-absolute per-file-ignores key: {key}"
+                    )
+
+
 # ===========================================================================
 # AC3/AC4/AC5/AC6 — the remediation loop
 # ===========================================================================
