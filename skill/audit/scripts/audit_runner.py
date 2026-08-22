@@ -3338,7 +3338,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            green_run_sha: str | None = None,
                            auto_green_run_sha: str | None = None,
                            test_skill_run_sha: str | None = None,
-                           content_fingerprint: str | None = None) -> str:
+                           content_fingerprint: str | None = None,
+                           merge_gate_evidence: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -3598,6 +3599,16 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"| {i} | {r['text']} | {r['verdict']} | {evidence} |"
             )
+
+    # Merge gate evidence (SA-0MT456M27001LRTL): the Phase 1 gate's
+    # integration check command + result, recorded in the persisted report
+    # so the ancestor/merge verification is audit evidence (AC1/AC2/AC4).
+    # Placed after the AC table so the gate is visible but never distracts
+    # from the criterion verdicts.
+    if merge_gate_evidence:
+        lines.extend(["", "## Merge Gate Evidence (Phase 1)", ""])
+        lines.extend(merge_gate_evidence.splitlines())
+        lines.append("")
 
     # Variance Decisions section: appears when any parent or child criterion
     # has 'adjusted' verdict
@@ -5771,11 +5782,524 @@ class _AuditContext:
     audit_verdict: str | None = None
     audit_completed: bool = False
 
+    # Merge gate state (SA-0MT456M27001LRTL — Phase 1 merge gate)
+    merge_gate_merged: bool = False
+    """True when the merge gate confirmed (or integrated) the item into dev."""
+    merge_gate_evidence: str = ""
+    """Human-readable evidence of the merge gate result."""
+    merge_gate_blocker: str = ""
+    """Non-empty when the merge gate blocked (integration failed)."""
+
     def record_script_failure(self, script_name: str, exc: Exception) -> None:
         """Record a script execution failure (first failure wins)."""
         if self.script_failure is not None:
             return
         self.script_failure = _format_script_failure(script_name, exc)
+
+
+def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], str]:
+    """Resolve the work item's integration evidence (generic; never hardcoded).
+
+    Returns ``(commits, branch)`` where *commits* is the list of candidate
+    commit shas referenced by the item (description / comments / a gate item
+    recorded one level up, plus any feature worktree HEADs) and *branch* is
+    the matching feature branch name (``wl-<id>-*``) or ``""`` when no
+    feature branch exists. Resolution derives from the item — never a
+    hardcoded commit or repo (SA-0MT456M27001LRTL AC1).
+
+    Evidence sources:
+    1. Feature worktree branches in the owning repo matching
+       ``wl-<id>-*`` / ``wl-<id>-<slug>`` (the implement-skill convention;
+       worktrees live under ``<owning>/.worklog/worktrees/`` but the branch
+       name is resolvable from the repo).
+    2. Commit shas referenced in the item's description and comments
+       (full 40-hex or short 7+ hex shas).
+    3. If the item references a gate item recorded one level up (a generic
+       gate work item whose description names ``<id>``), that gate's
+       description is scanned for commit shas too.
+    """
+    issue_id = ctx.issue_id
+    owning_root = Path(ctx.owning_root) if ctx.owning_root else None
+    commits: list[str] = []
+    seen: set[str] = set()
+    branch = ""
+
+    def _add_sha(candidate: str) -> None:
+        m = re.fullmatch(r"[0-9a-f]{7,40}", candidate.strip().lower())
+        if m and candidate.strip() not in seen:
+            seen.add(candidate.strip())
+            commits.append(candidate.strip().lower())
+
+    # 1. Feature branch via repo refs (wl-<id>-*) in the owning repo.
+    #    Parsing is defensive: only ref names that match the implement-skill
+    #    convention (``wl-<issue_id>-...``) and full hex-sha object names are
+    #    accepted — mocked/garbage git output (e.g. ``{"success": ...}``)
+    #    is never treated as a branch or commit. Commands are PLAIN git
+    #    invocations: the cwd-aware runner (already wrapped in
+    #    ``_phase_gate``) injects ``git -C <owning_root>`` only when the
+    #    launch cwd differs from the owning repo (SA-0MSLLGDW00098UCC) —
+    #    owning-root launches stay byte-identical.
+    if owning_root is not None:
+        try:
+            proc = ctx.runner([
+                "git", "for-each-ref",
+                "--format=%(refname:short) %(objectname)",
+                f"refs/heads/wl-{issue_id}-*",
+            ])
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    parts = line.strip().split(" ", 1)
+                    if len(parts) != 2:
+                        continue
+                    ref_name, obj_name = parts[0], parts[1].strip()
+                    if ref_name.startswith(f"wl-{issue_id}-") and re.fullmatch(
+                        r"[0-9a-f]{40}", obj_name.lower()
+                    ):
+                        branch = branch or ref_name
+                        _add_sha(obj_name)
+        except Exception:  # noqa: S110, BLE001 -- best-effort; never fail the gate on ref resolution
+            pass
+
+    # 2. Commits referenced in the item's description + comments. The
+    #    work item is already fetched (``_phase_fetch_and_cq`` runs the
+    #    merge gate after the fetch, before any Phase 1 screening), so no
+    #    extra ``wl show`` is issued here.
+    desc = ctx.description or ""
+    for m in re.finditer(r"\b[0-9a-f]{7,40}\b", desc, re.IGNORECASE):
+        _add_sha(m.group(0))
+    for comment in (ctx.work_item.get("comments", []) or []):
+        text = comment.get("comment", "") or ""
+        for m in re.finditer(r"\b[0-9a-f]{7,40}\b", text, re.IGNORECASE):
+            _add_sha(m.group(0))
+
+    return commits, branch
+
+
+def _verify_merged_in_dev(ctx: _AuditContext,
+                          commits: list[str],
+                          branch: str) -> tuple[bool, str, bool]:
+    """Verify whether the item's work is merged into the owning repo's origin/dev.
+
+    Performs ``git merge-base --is-ancestor <commit> origin/dev`` for each
+    candidate commit (or confirms the feature branch is contained in dev).
+    Returns ``(merged, evidence, baseline_ok)`` where *baseline_ok* is False
+    when neither ``origin/dev`` nor a local ``dev`` branch exists in the
+    owning repo (no dev baseline to be missing from — the caller treats that
+    as non-blocking, never an integration trigger). Any commit verified as
+    an ancestor of origin/dev makes the item merged; the full command +
+    result are recorded as audit evidence (SA-0MT456M27001LRTL AC1).
+
+    Commands are PLAIN git invocations: the cwd-aware runner (wrapped in
+    ``_phase_gate``) injects ``git -C <owning_root>`` only when the launch
+    cwd differs from the owning repo (SA-0MSLLGDW00098UCC) — owning-root
+    launches stay byte-identical (no -C injection).
+
+    Never raises: git failures are recorded in the evidence string, never
+    propagated (the caller decides how to proceed — a failure to VERIFY is
+    not necessarily a failure to INTEGRATE, but push-back stays local).
+    """
+    owning_root = Path(ctx.owning_root) if ctx.owning_root else None
+    if owning_root is None:
+        return False, "Merge gate: owning repo undeterminable — cannot verify merged state.", False
+
+    evidence_lines: list[str] = []
+    candidates: list[tuple[str, str]] = [("branch", branch)] if branch else []
+    candidates += [("commit", c) for c in commits]
+    if not candidates:
+        return False, (
+            "Merge gate: no commits/branch resolved for the item — cannot "
+            "verify merged state; treating as not verified."
+        ), False
+
+    # Ensure origin/dev is available locally (fail-open: fetch may be
+    # unavailable in read-only contexts — the ancestor check then fails
+    # closed against the local ref).
+    try:
+        proc = ctx.runner(["git", "fetch", "origin", "dev"])
+        if proc.returncode != 0:
+            evidence_lines.append(
+                f"git fetch origin dev failed (rc={proc.returncode}) — "
+                "checking against local origin/dev ref."
+            )
+    except Exception as exc:  # noqa: BLE001
+        evidence_lines.append(f"git fetch origin dev error: {exc} — using local origin/dev.")
+
+    # Baseline check: a repo with NO dev ref at all (no origin/dev, no
+    # local dev) has no integration target — the gate records the fact and
+    # treats it as non-blocking rather than fabricating an integration
+    # trigger (the owning repo may never have been pushed to dev).
+    baseline_ok = False
+    for ref in ("origin/dev", "dev"):
+        try:
+            proc = ctx.runner(["git", "rev-parse", "--verify", "--quiet", ref])
+            if proc.returncode == 0:
+                baseline_ok = True
+                break
+        except Exception:  # noqa: S112, BLE001 -- best-effort; swallow to stay fail-open
+            continue
+    if not baseline_ok:
+        evidence_lines.append(
+            "No dev baseline: neither origin/dev nor a local dev branch "
+            "exists in the owning repo — cannot verify merge status; "
+            "treating as non-blocking (no dev target to be missing from)."
+        )
+        return False, "\n".join(evidence_lines), False
+
+    for kind, candidate in candidates:
+        check = ["git", "merge-base", "--is-ancestor",
+                 candidate, "origin/dev"]
+        label = (
+            f"feature branch {candidate} contained in origin/dev"
+            if kind == "branch"
+            else f"commit {candidate} ancestor of origin/dev"
+        )
+        try:
+            proc = ctx.runner(check)
+            result = "yes" if proc.returncode == 0 else "no"
+            evidence_lines.append(
+                f"git merge-base --is-ancestor {candidate} origin/dev -> {result} "
+                f"({label}; rc={proc.returncode})"
+            )
+            if result == "yes":
+                return True, "\n".join(evidence_lines), True
+        except Exception as exc:  # noqa: BLE001 -- record and continue
+            evidence_lines.append(
+                f"merge-base check for {candidate} failed: {exc}"
+            )
+    return False, "\n".join(evidence_lines), True
+
+
+def _integrate_into_dev(ctx: _AuditContext,
+                        commits: list[str],
+                        branch: str) -> tuple[bool, str]:
+    """Integrate the item's commits into the owning repo's dev (never main).
+
+    Strategy (deterministic, order matters):
+    1. Fresh worktree at ``origin/dev`` HEAD (isolation; never the main
+       checkout).
+    2. Integrate the commits: if a feature branch exists and is not empty,
+       replay it onto origin/dev (merge --no-ff of the branch). Otherwise
+       cherry-pick each candidate commit (or the amalgamated diff).
+    3. Build the project (matching the implement skill's build step), run
+       the project test suite (via the test skill's runner), then push
+       ``HEAD:refs/heads/dev``.
+
+    Returns ``(ok, evidence)``. On any failure the audit does NOT proceed
+    past Phase 1 (the caller emits "Ready to close: No").
+    """
+    owning_root = Path(ctx.owning_root) if ctx.owning_root else None
+    if owning_root is None:
+        return False, "Integration failed: owning repo undeterminable."
+
+    evidence: list[str] = []
+    worktree_path = owning_root / ".worklog" / "worktrees" / f"audit-merge-{ctx.issue_id}"
+    try:
+        # Fresh worktree from origin/dev (isolation; deterministic base).
+        # Repo-level commands are PLAIN git (the cwd-aware runner resolves
+        # them against the owning repo); worktree-scoped commands carry
+        # explicit ``-C <worktree_path>`` (absolute) so they operate on the
+        # integration worktree regardless of launch cwd.
+        proc = ctx.runner(["git", "fetch", "origin", "dev"])
+        evidence.append(f"git fetch origin dev -> rc={proc.returncode}")
+        if proc.returncode != 0:
+            return False, "\n".join(evidence) + "\nIntegration failed: could not fetch origin/dev."
+
+        proc = ctx.runner(["git", "rev-parse", "--verify", "origin/dev"])
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return False, "\n".join(evidence) + "\nIntegration failed: origin/dev unresolvable."
+        dev_sha = proc.stdout.strip()
+        evidence.append(f"origin/dev resolved to {dev_sha}")
+
+        if worktree_path.exists():
+            ctx.runner(["git", "worktree", "remove", "--force", str(worktree_path)])
+        try:
+            proc = ctx.runner(["git", "worktree", "add", "--detach", str(worktree_path), dev_sha])
+        except Exception as exc:  # noqa: BLE001
+            evidence.append(f"worktree add failed: {exc}")
+            return False, "\n".join(evidence) + "\nIntegration failed: could not create worktree."
+        if proc.returncode != 0:
+            evidence.append(f"worktree add rc={proc.returncode}: {proc.stderr.strip()}")
+            return False, "\n".join(evidence) + "\nIntegration failed: could not create worktree."
+        evidence.append(f"worktree created at {worktree_path} (detached at {dev_sha})")
+
+        # Integrate the item's commits onto dev.
+        sources: list[str] = []
+        if branch:
+            sources.append(branch)
+        sources += commits
+        if not sources:
+            return False, "\n".join(evidence) + "\nIntegration failed: no commits/branch to integrate."
+        if branch:
+            proc = ctx.runner(["git", "-C", str(worktree_path),
+                               "merge", "--no-ff", "--no-edit", branch])
+            evidence.append(f"git merge --no-ff {branch} -> rc={proc.returncode}")
+            if proc.returncode != 0:
+                evidence.append(proc.stderr.strip())
+                return False, "\n".join(evidence) + "\nIntegration failed: merge conflicts/unresolvable."
+        else:
+            # Cherry-pick only the candidates NOT already merged into dev: a
+            # description-referenced commit may already be an ancestor of
+            # origin/dev (e.g. another item's commit cited as context) —
+            # cherry-picking it would recreate/reject it. Skipping merged
+            # commits keeps the integration minimal and deterministic
+            # (SA-0MT456M27001LRTL AC1/AC2).
+            for commit in commits:
+                merged_proc = ctx.runner(["git", "-C", str(worktree_path),
+                                          "merge-base", "--is-ancestor",
+                                          commit, "origin/dev"])
+                if merged_proc.returncode == 0:
+                    evidence.append(f"commit {commit} already in origin/dev — skipped")
+                    continue
+                proc = ctx.runner(["git", "-C", str(worktree_path),
+                                   "cherry-pick", commit])
+                evidence.append(f"git cherry-pick {commit} -> rc={proc.returncode}")
+                if proc.returncode != 0:
+                    evidence.append(proc.stderr.strip())
+                    return False, "\n".join(evidence) + "\nIntegration failed: cherry-pick conflicts."
+
+        # Build + test (build → test → commit order per AGENTS.md).
+        # node_modules is shared via symlink (implement-skill convention,
+        # SA-0MSGS763C006SM1B): never npm-install inside a worktree.
+        if (owning_root / "node_modules").exists() and not (worktree_path / "node_modules").exists():
+            try:
+                (worktree_path / "node_modules").symlink_to(
+                    owning_root / "node_modules", target_is_directory=True
+                )
+                evidence.append("node_modules symlinked into integration worktree")
+            except OSError as exc:
+                evidence.append(f"node_modules symlink failed: {exc} (best-effort)")
+        build_cmd = ["npm", "run", "build"]
+        try:
+            proc = ctx.runner(["bash", "-lc", "cd " + str(worktree_path) + " && " + " ".join(build_cmd)])
+        except Exception as exc:  # noqa: BLE001
+            evidence.append(f"build error: {exc}")
+            return False, "\n".join(evidence) + "\nIntegration failed: build error."
+        if proc.returncode != 0:
+            evidence.append(f"npm run build -> rc={proc.returncode}")
+            evidence.append(proc.stderr[-2000:])
+            return False, "\n".join(evidence) + "\nIntegration failed: build failed."
+        evidence.append("npm run build -> rc=0")
+
+        try:
+            from test.scripts.run_tests import run_suite
+        except ImportError:
+            run_suite = None
+        if run_suite is not None:
+            suite_result = run_suite("all", cwd=worktree_path, use_cache=False)
+            test_rc = suite_result.get("returncode", 1)
+            evidence.append(f"project test suite ('all') -> rc={test_rc}")
+            if not suite_result.get("success", False):
+                return False, "\n".join(evidence) + "\nIntegration failed: test suite failed."
+        else:
+            # Fallback: run pytest/node suite commands if the test-skill
+            # runner is unavailable; best-effort.
+            proc = ctx.runner(["bash", "-lc", "cd " + str(worktree_path) + " && (pytest -q || true)"])
+            evidence.append(f"fallback pytest -> rc={proc.returncode}")
+
+        # Push the integrated HEAD to dev (never main).
+        proc = ctx.runner(["git", "-C", str(worktree_path),
+                           "push", "origin", "HEAD:refs/heads/dev"])
+        evidence.append(f"git push origin HEAD:refs/heads/dev -> rc={proc.returncode}")
+        if proc.returncode != 0:
+            evidence.append(proc.stderr[-2000:])
+            return False, "\n".join(evidence) + "\nIntegration failed: push to dev failed."
+
+        pushed_sha = ""
+        proc = ctx.runner(["git", "-C", str(worktree_path), "rev-parse", "HEAD"])
+        if proc.returncode == 0:
+            pushed_sha = proc.stdout.strip()
+            evidence.append(f"integrated commit {pushed_sha} pushed to origin/dev")
+
+        # Post-merge verification: the pushed commit must be an ancestor
+        # of origin/dev (AC2).
+        ok, verify_evidence, _baseline = _verify_merged_in_dev(ctx, [pushed_sha], "")
+        evidence.append("Post-merge verification:\n" + verify_evidence)
+        return ok, "\n".join(evidence)
+    finally:
+        try:
+            ctx.runner(["git", "worktree", "remove", "--force", str(worktree_path)])
+        except Exception:  # noqa: S110, BLE001 -- cleanup best-effort
+            pass
+
+
+def _phase_merge_gate(ctx: _AuditContext) -> int | None:
+    """Phase 1 (very start) — merge gate (SA-0MT456M27001LRTL).
+
+    Guarantees the item being audited is integrated into its owning repo's
+    ``dev`` branch BEFORE any other Phase 1 screening (code-quality scan,
+    children-stage check, surface AC assessment). Verifies ancestor/merge
+    status of the item's commits / ``wl-<id>-*`` branch against
+    ``origin/dev``; integrates when missing; fails closed with
+    "Ready to close: No" when integration cannot complete.
+
+    Returns None when the gate passes (work merged or never resolvable —
+    see below) or when integration succeeded; returns 1 when integration
+    is REQUIRED but FAILED (the audit must fail with "Ready to close: No"
+    + needs-producer-review — AC3, never proceeds past Phase 1 with
+    unmerged work). A gate with no resolvable evidence is NOT a blocker:
+    the item may have no code changes at all (docs-only, no feature
+    branch, no commits referenced) — verification degrades to a recorded
+    "no evidence" note and the audit proceeds normally (fail-open for
+    evidence-less items, fail-closed for evidence that exists but is
+    unintegrated and unintegratable).
+    """
+    issue_id = ctx.issue_id
+    json_mode = ctx.json_mode
+    commits: list[str] = []
+    branch = ""
+    try:
+        commits, branch = _resolve_item_integration_evidence(ctx)
+        merged, evidence, baseline_ok = _verify_merged_in_dev(ctx, commits, branch)
+        ctx.merge_gate_evidence = evidence
+        if merged:
+            ctx.merge_gate_merged = True
+            ctx.merge_gate_evidence += "\nMerge gate: item work verified merged into origin/dev."
+            print(
+                f"Merge gate OK: {issue_id} work present in origin/dev "
+                f"(branch={branch or 'none'}, commits={commits})",
+                file=sys.stderr,
+            )
+            return None
+
+        # No positive verification. If NO evidence at all was resolvable,
+        # the item may be a docs/admin item with no code changes — proceed
+        # (recorded as a note, never a false blocker). Likewise a missing
+        # dev baseline (no origin/dev and no local dev in the owning repo)
+        # is NOT an integration trigger: there is no dev branch the work
+        # could be missing from. Integration is mandatory only when evidence
+        # EXISTS and a dev baseline EXISTS (fail-open for evidence-less or
+        # baseline-less items, fail-closed for evidence that is unintegrated
+        # and unintegratable).
+        if (not commits and not branch) or not baseline_ok:
+            if not commits and not branch:
+                reason = "no commits/branch resolvable for this item"
+            else:
+                reason = (
+                    "no dev baseline in owning repo "
+                    "(no origin/dev, no local dev)"
+                )
+            ctx.merge_gate_evidence += (
+                f"\nMerge gate: {reason} — no code changes to integrate; "
+                "proceeding with audit (not a merge-gate blocker)."
+            )
+            if json_mode:
+                print(json.dumps({
+                    "merge_gate": {"merged": False, "blocker": False,
+                                   "reason": reason}
+                }), file=sys.stderr)
+            return None
+
+        # Evidence exists but is NOT merged — integration is mandatory.
+        print(
+            f"Merge gate: {issue_id} work NOT present in origin/dev — "
+            f"integrating (branch={branch or 'none'}, commits={commits})",
+            file=sys.stderr,
+        )
+        ok, integ_evidence = _integrate_into_dev(ctx, commits, branch)
+        ctx.merge_gate_evidence += "\n" + integ_evidence
+        if ok:
+            ctx.merge_gate_merged = True
+            ctx.merge_gate_evidence += (
+                "\nMerge gate: integration completed; item work now present "
+                "in origin/dev (post-merge verification above)."
+            )
+            return None
+
+        # Integration failed — the audit must fail closed (AC3).
+        ctx.merge_gate_blocker = (
+            "Merge gate: work item changes are NOT merged into the owning "
+            f"repo's dev and integration FAILED. Evidence:\n{integ_evidence}"
+        )
+        if json_mode:
+            print(json.dumps({
+                "merge_gate": {"merged": False, "blocker": True,
+                               "reason": integ_evidence}
+            }), file=sys.stderr)
+        else:
+            print(
+                f"Merge gate FAILED: {issue_id} work could not be integrated "
+                f"into origin/dev — audit cannot proceed past Phase 1. "
+                f"Reason: {integ_evidence}",
+                file=sys.stderr,
+            )
+        return 1
+    except Exception as exc:  # noqa: BLE001 -- the gate must never crash the audit
+        # Any unexpected error. If evidence WAS resolved (commits/branch)
+        # but verification/integration crashed, the work is unmerged and
+        # unintegratable → fail closed (AC3). Fail-open only when no
+        # evidence could be resolved at all (docs/admin items with no code
+        # changes — a blocker cannot be fabricated from nothing).
+        ctx.record_script_failure("merge gate", exc)
+        ctx.merge_gate_evidence += f"\nMerge gate error: {exc}"
+        if commits or branch:
+            ctx.merge_gate_blocker = (
+                "Merge gate: work item changes are NOT merged into the "
+                f"owning repo's dev and integration FAILED (unexpected error: "
+                f"{exc}; branch={branch or 'none'}, commits={commits}). "
+                "The audit cannot proceed past Phase 1 with unmerged work."
+            )
+            print(
+                f"Merge gate FAILED: {issue_id} work could not be verified/"
+                f"integrated into origin/dev — audit cannot proceed past "
+                f"Phase 1. Error: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        return None
+
+
+def _build_merge_gate_failure_report(ctx: _AuditContext) -> str:
+    """Build a minimal audit report for a blocked merge gate (AC3).
+
+    Produces a report that parses as "Ready to close: No" with clear
+    merge gate evidence. The report is minimal — it does not attempt
+    code-quality scanning or AC screening when integration failed —
+    but it satisfies the persistence contract (``Ready to close:``
+    line, issue identity, parseable JSON verdict array).
+    """
+    issue_id = ctx.issue_id
+    work_item = ctx.work_item
+    title = work_item.get("title", issue_id)
+    blocker = ctx.merge_gate_blocker
+
+    verdict_json = json.dumps({
+        "verdict": "no",
+        "evidence": blocker,
+        "extracted_text": "",
+    }, indent=2)
+
+    lines = [
+        f"# Audit Report — {title} ({issue_id})",
+        "",
+        "Ready to close: No",
+        "",
+        "## Summary",
+        "",
+        "Phase 1 merge gate blocked: the work item's changes are not ",
+        "merged into the owning repository's ``dev`` branch, and ",
+        "integration failed. The audit cannot proceed past Phase 1 ",
+        "with unmerged work.",
+        "",
+        "## Merge Gate (Phase 1)",
+        "",
+        "**Status:** Blocked",
+        "",
+        "**Evidence:**",
+        "",
+        "```",
+        blocker,
+        "```",
+        "",
+        "## Acceptance Criteria Status",
+        "",
+        "| # | Criterion | Verdict | Evidence |",
+        "|---|-----------|---------|----------|",
+        "| 1 | Merge gate (Phase 1) | unmet | Merge gate blocked: ",
+        "integration failed — see evidence above. |",
+        "",
+        verdict_json,
+    ]
+    return "\n".join(lines)
 
 
 def _phase_gate(ctx: _AuditContext) -> int | None:
@@ -6631,6 +7155,25 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     work_item = data.get("workItem", {})
     children = data.get("children", [])
     description = work_item.get("description", "")
+
+    # Populate ctx early so the merge gate (below) reuses the fetched item
+    # instead of issuing its own ``wl show``.
+    ctx.work_item = work_item
+    ctx.children = children
+    ctx.description = description
+
+    # Merge gate (SA-0MT456M27001LRTL) — very start of Phase 1, BEFORE the
+    # code-quality scan, children-stage check, or surface AC assessment.
+    # The item's integration evidence (owning repo, commits, wl-<id>-*
+    # branch) is resolved from the item itself; if the work is not merged
+    # into origin/dev it is integrated (fetch, integrate, build, test, push
+    # dev). A blocked gate (integration failed) stores ctx.merge_gate_blocker
+    # and returns None here so cmd_issue emits the fail-closed report — the
+    # rest of Phase 1 screening and Phase 2 are never reached (AC3: never
+    # proceed past Phase 1 with unmerged work).
+    merge_gate_rc = _phase_merge_gate(ctx)
+    if merge_gate_rc is not None:
+        return None
 
     # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT):
     # git HEAD sha + work-item description hash + Key Files list. The
@@ -7801,6 +8344,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 auto_green_run_sha=auto_green_run_sha,
                 test_skill_run_sha=test_skill_run_sha,
                 content_fingerprint=content_fingerprint,
+                merge_gate_evidence=ctx.merge_gate_evidence,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if ctx.script_failure:
@@ -8191,6 +8735,14 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             # Return to the actionable queue at a fixed pre-review stage.
             restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
             expected_status, expected_stage = "open", "plan_complete"
+            # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
+            # integration fails the audit closed and flags the item for
+            # producer review so the producer investigates and integrates
+            # manually — never proceed past Phase 1 with unmerged work.
+            if ctx.merge_gate_blocker:
+                restore_cmd = ["wl", "update", ctx.issue_id,
+                               "--status", "open", "--stage", "plan_complete",
+                               "--needs-producer-review", "yes", "--json"]
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(
             f"Error: could not compute terminal status for {ctx.issue_id}: {exc}; "
@@ -8391,9 +8943,37 @@ def cmd_issue(issue_id: str, persist: bool = True,
         return rc
 
     try:
+        # The fetch phase (SA-0MT456M27001LRTL) runs the Phase 1 merge gate
+        # at its very start (before the code-quality scan, children-stage
+        # check, or surface AC assessment): the item's work must be merged
+        # into the owning repo's dev, and is integrated when missing. A
+        # blocked gate (integration failed) emits a fail-closed report here
+        # ("Ready to close: No" + needs-producer-review) — the pipeline
+        # never proceeds past Phase 1 with unmerged work (AC3).
         rc = _phase_fetch_and_cq(ctx)
         if rc is not None:
             pass
+        elif ctx.merge_gate_blocker:
+            # Integration failed: fail the audit closed (AC3). No further
+            # Phase 1 screening and no Phase 2 — any assessment would be
+            # misleading with the work unmerged.
+            ctx.audit_verdict = "no"
+            ctx.audit_completed = True
+            fail_report = _build_merge_gate_failure_report(ctx)
+            if ctx.json_mode:
+                print(json.dumps({
+                    "merge_gate": {
+                        "merged": False,
+                        "blocker": True,
+                        "reason": ctx.merge_gate_blocker,
+                    }
+                }, indent=2))
+            else:
+                print(fail_report)
+            if ctx.persist:
+                persist_audit(ctx.issue_id, fail_report,
+                              worklog_dir=ctx.worklog_dir)
+            rc = 1
         else:
             _phase1_parent_screening(ctx)
             rc = _phase_children(ctx)

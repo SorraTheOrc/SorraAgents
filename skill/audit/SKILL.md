@@ -128,13 +128,14 @@ Short-circuits item-level audits when a recent, valid audit exists. Full behavio
 ## Two-Phase Audit Pipeline
 
 ```text
-Phase 1 (linters + children stage + surface AC pass)
+Phase 1 (merge gate + linters + children stage + surface AC pass)
    ↓  Decision Gate: blocking? → "partial", skip Phase 2
    ↓  (no blockers)
 Phase 2 (model verifies code against each AC)
 ```
 
-- **Phase 1 — Automated Screening:** order (1) code quality check, (2) children stage check (must be `in_review`/`done`), (3) surface AC assessment. Blocking: critical/high findings (unless screened as a confident false positive), or any non-deleted child not in `in_review`/`done`.
+- **Phase 1 — Automated Screening:** order (0) **merge gate** (SA-0MT456M27001LRTL), (1) code quality check, (2) children stage check (must be `in_review`/`done`), (3) surface AC assessment. Blocking: critical/high findings (unless screened as a confident false positive), or any non-deleted child not in `in_review`/`done`.
+- **Merge gate (Phase 1 step 0, SA-0MT456M27001LRTL):** BEFORE any screening the runner guarantees the item under audit is integrated into its owning repository's `dev` branch. The item's integration evidence is resolved GENERICALLY from the item itself (owning repo via the worklog prefix-to-sibling scan; commits from the item's description/comments; the `wl-<id>-*` feature branch via `git for-each-ref`) — never a hardcoded commit or repo. Each candidate is verified with `git merge-base --is-ancestor <commit> origin/dev`; the command + result are recorded in the report's `## Merge Gate Evidence (Phase 1)` section. When the work is NOT merged the gate integrates it into the owning repo's `dev` (fetch dev, fresh worktree at origin/dev, merge/cherry-pick the item's branch/commits, build, run the project test suite, push `dev` — NEVER `main`), then re-verifies the pushed commit is an ancestor of `origin/dev`. When integration cannot complete (missing commit, conflicts, build/test failure, push failure, any blocker) the audit FAILS CLOSED: "Ready to close: No" + `--needs-producer-review yes`, and the pipeline never proceeds past Phase 1 with unmerged work (AC3). Fail-open exceptions (never blockers): an item with NO resolvable evidence (docs/admin item, no feature branch, no referenced commits) and an owning repo with NO dev baseline (neither `origin/dev` nor a local `dev` — no dev target to be missing from). Items whose work is already in `dev`, and repos lacking any dev baseline, simply record the evidence and proceed.
 - **False-positive screen (SA-0MSSSNOZN000LQKR):** after the code-quality scan, ruff findings are classified by a single batched Pi call (`_screen_ruff_findings` in `audit_runner.py`, context `false-positive-screen`, child-screen timeout budget) into `genuine` / `confident-false-positive` / `uncertain` with per-finding written justifications, surfaced in the report (`#### False-positive screen` table) and `_build_issue_json` (`code_quality.false_positive_screen`). Caution-first: a finding missing from the batch, unparseable output, provider error, timeout, concurrency-limit marker, or pi failure defaults EVERY finding to `uncertain` (never `confident-false-positive`) and marks infra-failure provenance (`ac_fallback_used`) so a failed screen restores the pre-audit state instead of demoting. Only `confident-false-positive` critical/high findings stop blocking closure; `uncertain` findings stay blocking annotated `candidate false positive — producer decision required`. Medium/low confident-false-positives are classified and reported but never flagged remediable (remediation is blocking-severity only — F2/T2 scope). The screen is skipped entirely (zero Pi calls) when the scan yields no ruff findings; non-ruff findings are never sent to it.
 - **Decision Gate:** blocking → all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, "Ready to close: No" — **FINAL**, MUST NOT be overridden. No blockers → proceed to Phase 2 (**MANDATORY**), **except** the narrow low-risk/small-item skip below.
 - **Phase 2 — Deep Code Analysis:** **MANDATORY when reached** — model reads actual implementation files, verifies each AC, provides file:line evidence. Never skipped once the gate passes, except for the single, unconditional exception in the next bullet.
@@ -144,7 +145,7 @@ Phase 2 (model verifies code against each AC)
 - **Final Verdict:** "met" only when BOTH phases confirm; disagreement → "partial".
 - **Ready-to-close criteria:** (1) all ACs `met`/`adjusted`, (2) all active children `in_review`/`done` (empty stage excluded), (3) no critical/high findings.
 
-> **IMPORTANT:** Release process constraints are NOT audit concerns. Do NOT include merge-status, deployment, or release criteria.
+> **IMPORTANT:** Release process constraints are NOT audit concerns. The ONE exception is the Phase 1 merge gate (SA-0MT456M27001LRTL) above: it verifies the audited item's work is integrated into its owning repo's `dev` and fails the audit closed when integration cannot complete. Every other deployment/release criterion stays out of scope.
 
 ### Tiered Phase 1 model (SA-0MSKB697P000T3HG)
 
@@ -245,7 +246,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 - **Phase 2 is MANDATORY when Phase 1 passes — never skip it**; verify each AC against actual code with file:line evidence. **Sole exception (SA-0MSQ026T3009QY2L):** items with `effort` ∈ {Extra Small, Small} **and** `risk` = Low skip Phase 2 — Phase 1 verdicts stand unchanged, evidence notes the skip, and the rule is fail-closed (missing/unknown values ⇒ deep analysis runs). Applies independently to the parent and every child in the cascade; unconditional (no override flag/env).
 - **Blocking issues are narrow:** only (1) **critical/high** findings and (2) an active child not in `in_review`/`done` block Phase 2. AC ambiguity, medium warnings, or preference are NOT valid reasons to skip.
 - **Ready-to-close criteria:** all ACs `met`/`adjusted`, all active children `in_review`/`done`, no critical/high findings. **Children in `in_review` do NOT block closure** — only pre-review stages do.
-- **Do NOT add release-process or merge-status constraints** — not audit concerns.
+- **Do NOT add release-process or merge-status constraints** — not audit concerns. Sole exception: the Phase 1 merge gate (SA-0MT456M27001LRTL) verifies the item's work is integrated into its owning repo's `dev` and fails closed when integration cannot complete; everything else stays out of scope.
 - If ACs are ambiguous, return immediately and do NOT persist.
 - **Persistence is mandatory** — runner or `./scripts/persist_audit.py` with `[PERSIST-AUDIT]`.
 

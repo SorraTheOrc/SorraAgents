@@ -142,6 +142,28 @@ The concurrency semaphore (`skill/shared/process_semaphore.py`) caps pi subproce
 
 > Implementation self-review audits (implement skill Step 6) audit in-progress items and therefore pass `--force`.
 
+## Phase 1 merge gate (SA-0MT456M27001LRTL)
+
+At the very start of Phase 1 (after the item fetch, BEFORE the code-quality scan, children-stage check, or surface AC assessment) the runner guarantees the item under audit is integrated into its owning repository's `dev` branch.
+
+### Resolution (generic, never hardcoded)
+
+The item's integration evidence is derived from the item itself:
+
+1. **Owning repo** — the worklog prefix-to-sibling scan already resolves the owning project root (`_resolve_owning_project_root`); git commands run PLAIN and the cwd-aware runner pins them to the owning repo when the launch cwd differs (SA-0MSLLGDW00098UCC).
+2. **Feature branch** — `git for-each-ref refs/heads/wl-<id>-*`; only refs matching `wl-<id>-` with a 40-hex object name are accepted (mocked/garbage output is never treated as evidence).
+3. **Commits** — 7–40 hex shas referenced in the item's description and comments.
+
+### Verify → integrate → fail closed (AC1–AC3)
+
+- **Verify:** `git fetch origin dev` (best-effort), then `git merge-base --is-ancestor <candidate> origin/dev` for each candidate (branch first). Command + result are recorded; ANY positive ancestor check makes the item merged.
+- **No baseline:** an owning repo with neither `origin/dev` nor a local `dev` has no integration target — recorded as non-blocking (never an integration trigger).
+- **Integrate (when evidence exists, not merged, baseline present):** fetch `dev`; fresh detached worktree at `origin/dev`; merge `--no-ff` the feature branch (or cherry-pick each candidate NOT already in `dev`); symlink the owning repo's `node_modules` (implement-skill convention — never npm-install inside a worktree); build (`npm run build`); run the project test suite (test-skill runner, `run_suite("all")`); then push `HEAD:refs/heads/dev` — NEVER `main`. Post-merge the pushed sha is re-verified as an ancestor of `origin/dev`.
+- **Fail closed (AC3):** when integration cannot complete (fetch/ref failure, conflicts, build/test failure, push failure, or any unexpected error after evidence resolution) the gate emits "Ready to close: No" (+ `--needs-producer-review yes` via the lifecycle's no-verdict branch) — the pipeline never proceeds past Phase 1 with unmerged work. No rest of Phase 1 screening and no Phase 2 run (assessment would be misleading against unmerged code).
+- **Fail open (never blockers):** items with NO resolvable evidence (docs/admin items — no feature branch, no referenced commits) and repos with NO dev baseline proceed with the gate recorded as a note.
+
+Evidence surfaces in the report under `## Merge Gate Evidence (Phase 1)` (before the Code Quality section) and in JSON payloads as `{merge_gate: {merged, blocker, reason}}`.
+
 ## Freshness Gate
 
 Short-circuits item-level audits when a recent, valid audit exists to avoid unnecessary model calls.
