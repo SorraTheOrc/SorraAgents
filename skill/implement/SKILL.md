@@ -22,11 +22,15 @@ through code, tests, and docs.
 
 - Intake/interview helpers: `intake`, `plan`.
 
-Security note: Do not push or create PRs automatically unless the invoking
-agent has explicit permission to push and open pull requests; require explicit
-confirmation before remote actions (push/PR) without an operator-approved
-credential. When in doubt, produce the exact `git`/`gh`/`wl` commands for a
-human to run.
+Security note — scope: this restriction applies to **protected branches**
+(`main`/`master`/`HEAD`) and to **creating PRs**: do not push to them or open
+PRs automatically without explicit operator permission (no operator-approved
+credential exists for those actions). Pushing the feature branch into `dev`
+(Step 8) is **pre-authorized by this workflow** — the repo's pre-push hook
+enforces the same policy, blocking `main`/`master`/`HEAD` only — and requires
+no additional approval, provided the full test suite and build pass at the
+committed revision being pushed. When in doubt, produce the exact
+`git`/`gh`/`wl` commands for a human to run.
 
 Privacy note: Avoid secrets/tokens/PII in comments or PR bodies — reference by
 work-item id or document path; mask/redact sensitive values before writing to
@@ -307,6 +311,14 @@ See ``../refactor/SKILL.md``.
 - Follow the mandatory build → test → commit order before committing.
 - **Do NOT create a Pull Request to `main`** — work is integrated into `dev`; the `dev`→`main` promotion is handled by the release process.
 - Push the feature branch into `dev` via the ship skill (`pushToDev()` from `../ship/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
+
+  > **Pushing from a worktree:** the repo's pre-push hook runs `wl sync`, which
+  > refuses to run from a worktree (worktrees have no local `.worklog`; the
+  > data lives in the main checkout). First run `wl sync` from the main
+  > checkout, then push from the worktree with the hook's documented bypass:
+  > `WORKLOG_SKIP_PRE_PUSH=1 git push origin HEAD:refs/heads/dev`. Nothing is
+  > lost by skipping the sync at push time — the main checkout syncs the data
+  > on its own pushes.
 - After pushing, clean up the worktree:
 
   ```bash
