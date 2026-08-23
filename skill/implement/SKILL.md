@@ -343,15 +343,17 @@ See ``../refactor/SKILL.md``.
   pre-commit, with `HEAD` still at the base `dev` commit):
 
   ```bash
-  python3 ../audit/scripts/audit_runner.py issue <work-item-id> --green-run <commit-hash> --no-execute
+  python3 ../audit/scripts/audit_runner.py issue <work-item-id> --green-run <full-commit-sha> --no-execute
   ```
 
-  - `<commit-hash>` is the sha just pushed (recorded in the work-item comment
-    above) — it attests the pre-push `/skill:test` green run against the **exact
-    committed state**. Use `--green-run HEAD` only when the checkout is at the
-    pushed commit (immediately after `git pull origin dev`, with no intervening
-    pushes; a mismatched attestation is reported and the run proceeds without it
-    — never silently accepted).
+  - `<full-commit-sha>` is the FULL 40-hex sha just pushed (from `git rev-parse
+    HEAD`; short shas are rejected — the runner compares the value exactly
+    against the audited HEAD). It attests the pre-push `/skill:test` green
+    run against the **exact committed state**. The alias `--green-run HEAD`
+    is accepted only when the checkout is at the pushed commit (immediately
+    after `git pull origin dev`, with no intervening pushes; a mismatched
+    attestation is reported and the run proceeds without it — never silently
+    accepted).
   - `--no-execute` guarantees the audit never re-runs the test suite: it already
     passed pre-push, and execution-dependent ACs verify from the green-run
     attestation (see [../audit/SKILL.md](../audit/SKILL.md)).
@@ -364,8 +366,9 @@ See ``../refactor/SKILL.md``.
     user, re-claim
     (`StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`),
     and return to Step 5 — do NOT leave the item in_review with unmet ACs.
-  - **Parent/epic runs:** each child is validated at its own Step 8; the parent
-    is covered by its own audit when it advances at Step 5.1.
+  - **Parent/epic runs:** parent/epic items are validated per child at each
+    child's Step 8; the parent itself is covered by its own audit when it
+    advances at Step 5.1.
 
 Pre-push blocking check
 -----------------------
