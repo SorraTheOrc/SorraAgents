@@ -7,7 +7,6 @@ content to be requested and preserved in responses (SA-0MT5RXZZ1006EW4R).
 """
 
 import json
-
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
