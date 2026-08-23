@@ -337,6 +337,36 @@ See ``../refactor/SKILL.md``.
 
   > The item stays `in_review` until release promotes `dev` to `main` (see `../ship/SKILL.md`).
 
+- **Final validation — belt-and-suspenders (post-push, post-`in_review`):** run one last
+  audit at the committed state and reconcile its verdict BEFORE closing your
+  response. This catches gaps the Step 6 self-review could not see (it ran
+  pre-commit, with `HEAD` still at the base `dev` commit):
+
+  ```bash
+  python3 ../audit/scripts/audit_runner.py issue <work-item-id> --green-run <commit-hash> --no-execute
+  ```
+
+  - `<commit-hash>` is the sha just pushed (recorded in the work-item comment
+    above) — it attests the pre-push `/skill:test` green run against the **exact
+    committed state**. Use `--green-run HEAD` only when the checkout is at the
+    pushed commit (immediately after `git pull origin dev`, with no intervening
+    pushes; a mismatched attestation is reported and the run proceeds without it
+    — never silently accepted).
+  - `--no-execute` guarantees the audit never re-runs the test suite: it already
+    passed pre-push, and execution-dependent ACs verify from the green-run
+    attestation (see [../audit/SKILL.md](../audit/SKILL.md)).
+  - Do **NOT** pass `--force`: the pre-flight guard passes at
+    `completed`/`in_review`, and `--force` would bypass the freshness gate and
+    child-verdict reuse.
+  - `Ready to close: Yes` (or a freshness skip) → the item is genuinely ready;
+    close your response below.
+  - `Ready to close: No` → the final validation caught a real gap: inform the
+    user, re-claim
+    (`StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`),
+    and return to Step 5 — do NOT leave the item in_review with unmet ACs.
+  - **Parent/epic runs:** each child is validated at its own Step 8; the parent
+    is covered by its own audit when it advances at Step 5.1.
+
 Pre-push blocking check
 -----------------------
 
