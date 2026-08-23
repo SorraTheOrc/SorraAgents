@@ -127,6 +127,388 @@ _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
+# Scope-aware test selection
+# ---------------------------------------------------------------------------
+
+TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts")
+
+
+def compute_changed_files(
+    project_root: Path | None = None,
+    base_ref: str = "origin/dev",
+) -> set[str]:
+    """Return the set of files changed between *base_ref* and HEAD.
+
+    Base resolution order (first match wins):
+
+    1. ``<base_ref>`` (default ``origin/dev``) — the remote-tracking dev ref
+    2. ``dev`` local branch — when the remote ref is absent
+    3. ``HEAD~1`` — when neither dev ref exists (fallback for repos without
+       a dev branch, so the diff is against the last commit)
+
+    Untracked files are not included (they have no diff and would be
+    reported only by ``git status``, not a diff). The merge-base is used so
+    only files changed on the current branch since it forked from the base
+    are returned — files changed on the base after the fork point are not
+    attributed to this branch.
+
+    Args:
+        project_root: Repo root (default: detected from calling repo).
+        base_ref: Preferred base ref for the diff (default ``origin/dev``).
+
+    Returns:
+        Set of repo-relative changed file paths (POSIX separators).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+
+    base = _resolve_merge_base(root, base_ref)
+    if base is None:
+        # No base ref at all — nothing to diff against.
+        return set()
+
+    proc = subprocess.run(
+        ["git", "diff", "--name-only", base],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return set()
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def _resolve_merge_base(root: Path, base_ref: str) -> str | None:
+    """Find the merge-base commit for diffing, following the fallback chain.
+
+    Returns None only when no usable base exists (no commits yet, or git
+    unavailable). Logs a warning for each fallback so operators understand
+    which base produced the diff.
+    """
+    candidates = [base_ref]
+    if base_ref != "dev":
+        candidates.append("dev")
+    candidates.append("HEAD~1")
+
+    for candidate in candidates:
+        proc = subprocess.run(
+            ["git", "merge-base", candidate, "HEAD"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            if candidate != base_ref:
+                print(
+                    f"run_tests: base ref '{base_ref}' not found — using '{candidate}' "
+                    "for changed-file detection",
+                    file=sys.stderr,
+                )
+            return candidate
+    return None
+
+
+def map_changed_to_tests(
+    project_root: Path | None = None,
+    changed_files: set[str] | None = None,
+) -> set[str]:
+    """Map changed source files to affected test files.
+
+    Two mechanisms, unioned:
+
+    1. **Convention mapping**: ``src/foo.py`` → ``tests/test_foo.py``;
+       ``tests/test_foo.py`` itself; any ``test_*.py`` / ``*_test.py`` in the
+       same directory tree as a non-test change whose basename matches the
+       changed file's stem.
+    2. **Import-graph expansion**: AST-scan every test file once; for each
+       changed module (dotted name derived from its path relative to the
+       project root), find test files whose import statements reference the
+       changed module OR any module that (transitively) imports it. This
+       catches indirect breakage — e.g. ``utils.py`` changed →
+       ``test_report.py`` imported via a chain.
+
+    ``changed_files`` defaults to :func:`compute_changed_files` against the
+    calling repo. Non-Python changes (README, yaml, …) never map to tests
+    (they return an empty selection) unless they are themselves test files.
+
+    Args:
+        project_root: Repo root.
+        changed_files: Changed files (default: computed).
+
+    Returns:
+        Set of test-file paths (repo-relative, POSIX).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    changed = changed_files if changed_files is not None else compute_changed_files(root)
+
+    if not changed:
+        return set()
+
+    # All test files under tests/test dirs (matching run_tests conventions).
+    test_dirs = [d for d in ("tests", "test") if (root / d).is_dir()]
+    all_tests: set[str] = set()
+    for d in test_dirs:
+        all_tests.update(
+            str(p.relative_to(root))
+            for p in (root / d).rglob("*.py")
+        )
+    # Node suite dirs also carry test files (tests/node|cli|unit/**/*.mjs)
+    # — included so a changed source can select its node tests by convention.
+    for d in NODE_SUITE_DIRS:
+        node_dir = root / d
+        if not node_dir.is_dir():
+            continue
+        for p in node_dir.rglob("*.mjs"):
+            if _is_test_file(Path(str(p.relative_to(root)))):
+                all_tests.add(str(p.relative_to(root)))
+
+    # 1. Convention mapping
+    selected: set[str] = set()
+    for changed_file in changed:
+        rel = Path(changed_file)
+        if _is_test_file(rel):
+            selected.add(changed_file)
+            continue
+        if rel.suffix not in TRACKED_SOURCE_EXTENSIONS:
+            continue  # non-source change → no test selection
+
+        # Direct convention: changed_stem → test_<stem>.py in same tree
+        for test in all_tests:
+            test_rel = Path(test)
+            if test_rel.name in {
+                f"test_{rel.stem}.py",
+                f"{rel.stem}_test.py",
+                f"test_{rel.stem}.mjs",
+                f"{rel.stem}_test.mjs",
+                f"{rel.stem}.test.mjs",
+            }:
+                selected.add(test)
+            elif (
+                rel.name == "__init__.py"
+                and test_rel.name.startswith("test_")
+                and str(rel.parent) == str(test_rel.parent)
+            ):
+                # Package init changed → every test under that package tree.
+                selected.add(test)
+
+    # 2. Import-graph expansion
+    if selected or _has_python_changes(changed):
+        selected |= _expand_by_imports(root, all_tests, changed)
+
+    return selected
+
+
+def _is_test_file(rel: Path) -> bool:
+    """True for names matching test-file conventions (test_*.py / *_test.py)."""
+    name = rel.name
+    return (
+        name.startswith("test_")
+        or name.endswith(("_test.py", ".test.mjs", "_test.mjs"))
+    )
+
+
+def _has_python_changes(changed: set[str]) -> bool:
+    return any(p.endswith(".py") for p in changed)
+
+
+def _expand_by_imports(
+    root: Path,
+    all_tests: set[str],
+    changed: set[str],
+) -> set[str]:
+    """AST scan: find test files importing changed modules (transitively).
+
+    Builds a project-wide module import graph from every ``.py`` file (source
+    and test): module name → directly-imported dotted names (relative imports
+    resolved against the file's package). Node names are aliased by basename
+    (``src/foo.py`` → ``src.foo`` AND ``foo``) so repos that expose a source
+    root on the import path (e.g. ``src/`` on ``sys.path``, so tests import
+    ``foo`` while the file lives at ``src/foo.py``) still match. For each
+    changed module (also matched by basename), a test file is affected when
+    it directly imports the changed module, or imports any module that
+    (transitively) imports it — so a change to ``utils.py`` triggers
+    ``test_report.py`` that only imports ``report.py`` which imports
+    ``utils.py``.
+
+    The mapping is deliberately approximate: dynamic imports, ``__import__``,
+    importlib, and namespace-package aliasing are not resolved; same-named
+    modules in different packages are conflated (over-matching only — extra
+    tests run, never fewer). This is a fast-feedback heuristic, NOT a
+    correctness gate — the full suite is the push-time gate.
+    """
+    changed_targets: set[str] = set()
+    for p in changed:
+        if not p.endswith(".py"):
+            continue
+        full = _path_to_module(p)
+        if full:
+            changed_targets.add(full)
+        changed_targets.add(Path(p).stem)
+    if not changed_targets:
+        return set()
+
+    # module name → directly-imported dotted names, parsed once for every
+    # project .py file (no double-parsing: tests are also in the rglob).
+    # Each node is registered under BOTH its path-derived name and its
+    # basename so imports in either namespace resolve.
+    module_imports: dict[str, set[str]] = {}
+    for py_file in root.rglob("*.py"):
+        rel = str(py_file.relative_to(root))
+        mod = _path_to_module(rel)
+        if mod is None:
+            continue
+        imports = _ast_imports(root, rel)
+        module_imports[mod] = imports
+        module_imports[py_file.stem] = imports
+
+    # BFS: does module *m* (transitively) import module *target*?
+    def imports_module(m: str, target: str) -> bool:
+        seen: set[str] = set()
+        stack = [m]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur == target:
+                return True
+            stack.extend(module_imports.get(cur, ()))
+        return False
+
+    affected: set[str] = set()
+    for test in all_tests:
+        test_imports = module_imports.get(_path_to_module(test) or "", set())
+        for mod in test_imports:
+            if any(mod == cm or imports_module(mod, cm) for cm in changed_targets):
+                affected.add(test)
+                break
+    return affected
+
+
+def _path_to_module(path: str) -> str | None:
+    """Derive a dotted module name from a repo-relative .py path."""
+    p = Path(path)
+    if p.suffix != ".py":
+        return None
+    if p.name == "__init__.py":
+        return ".".join(p.parts[:-1]) if p.parts[:-1] else None
+    parts = list(p.parts)
+    if parts:
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts)
+
+
+def _ast_imports(root: Path, test_file: str) -> set[str]:
+    """Return dotted module names imported by *test_file* (AST, best-effort).
+
+    Relative imports are resolved against the importing file's package so
+    ``from .utils import x`` inside ``src/foo.py`` yields ``src.utils``.
+    """
+    import ast
+
+    path = root / test_file
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return set()
+
+    pkg_parts = Path(test_file).parent.parts
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            level = node.level or 0
+            name = node.module or ""
+            if level:
+                # level=1 → same package; level=2 → parent package, etc.
+                parts = list(pkg_parts)
+                if parts and level > 1:
+                    parts = parts[: -(level - 1)]
+                resolved = ".".join([*parts, name] if name else parts)
+                imports.add(resolved)
+            elif name:
+                imports.add(name)
+    return imports
+
+
+def changed_scope_commands(
+    project_root: Path | None = None,
+    base_ref: str = "origin/dev",
+    changed_files: set[str] | None = None,
+) -> list[str] | None:
+    """Return the test commands for changed-file scope, or None for full scope.
+
+    Returns None (meaning "fall back to the full suite") when:
+
+    - The repo declares custom ``suiteCommands`` in ``.pi/test-config.json``
+      (not introspectable → cannot select a subset).
+    - No changed files are found (nothing to select → full scope).
+    - The resolved changed-file selection is empty (e.g. only non-source
+      changes like README edits).
+    - The repo has no test tooling of a kind we can subset (no pytest, no
+      node suite dirs).
+
+    When a selection IS possible, returns a list with, per applicable suite:
+
+    - pytest: ``pytest <selected test files>`` (canonicalized quiet form).
+    - node: ``node --test <selected node test files>`` per node suite dir.
+
+    The selected test files are always passed explicitly so the partial run
+    is deterministic and cache-keyed distinctly from the full suite.
+
+    *changed_files* may be passed in to avoid a second ``git diff`` when the
+    caller already computed it (single source for the fallback warning).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+
+    # Custom suite commands are not introspectable — fall back to full scope.
+    if extension_suite_commands(root) is not None:
+        return None
+
+    changed = (
+        changed_files
+        if changed_files is not None
+        else compute_changed_files(root, base_ref=base_ref)
+    )
+    if not changed:
+        return None
+
+    selected = map_changed_to_tests(root, changed)
+    # Anything changed that is itself a test file is already in `selected`;
+    # leaf-only changes (e.g. a lone docs edit) → full scope.
+    if not selected:
+        return None
+
+    pytest_files = sorted(f for f in selected if f.endswith(".py") and not f.endswith(".mjs"))
+    node_files = sorted(f for f in selected if f.endswith(".mjs"))
+
+    commands: list[str] = []
+    if pytest_files and repo_has_pytest_suite(root):
+        file_args = " ".join(shlex.quote(f) for f in pytest_files)
+        commands.append(canonicalize_quiet_test_command(f"pytest {file_args}"))
+
+    if node_files:
+        # Group by node suite dir (tests/node, tests/cli, tests/unit) so we
+        # emit one node --test command per dir, mirroring full_suite_commands.
+        by_dir: dict[str, list[str]] = {}
+        for f in node_files:
+            top = f.split("/", 1)[0]
+            by_dir.setdefault(top, []).append(f)
+        for dirname, files in sorted(by_dir.items()):
+            if not (root / dirname).is_dir():
+                continue
+            file_args = " ".join(shlex.quote(f) for f in files)
+            commands.append(f"node --test {file_args}")
+
+    return commands or None
+
+
+# ---------------------------------------------------------------------------
 # Command construction
 # ---------------------------------------------------------------------------
 
@@ -466,6 +848,8 @@ def run_suite(
     force: bool = False,
     no_cache: bool = False,
     commands: list[str] | None = None,
+    scope: str = "full",
+    base_ref: str = "origin/dev",
 ) -> dict[str, Any]:
     """Run a single named suite and return structured results.
 
@@ -482,17 +866,43 @@ def run_suite(
     everything else → node parser), mirroring the audit's
     ``_run_tests_via_test_skill``.
 
+    *scope* ("full" or "changed") selects which tests run: ``full`` resolves
+    the repo's full suite (existing behavior); ``changed`` resolves only
+    tests touching files edited on this branch (via
+    :func:`changed_scope_commands`). When ``changed`` cannot produce a
+    subset (custom suite commands, no selection), it falls back to the full
+    suite and reports ``scope: "full"`` in the result so consumers never
+    mistake a partial run for a full one. The result always carries
+    ``scope`` ("full"|"changed") and, for changed scope, ``changed_files``
+    (the file set that drove selection).
+
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
-    ``cached`` and (on missing binary) ``notice``.
+    ``cached``, ``scope`` and (on missing binary) ``notice``.
     """
     cwd = cwd or REPO_ROOT
+    resolvable_scope = scope
+    changed_files: set[str] = set()
     if commands is None:
         if name == "pytest":
             commands = [pytest_command()]
         elif name == "node":
             commands = node_suite_commands()
         elif name == "all":
-            commands = full_suite_commands(cwd)
+            if scope == "changed":
+                changed_files = compute_changed_files(cwd, base_ref=base_ref)
+                changed_commands = changed_scope_commands(
+                    cwd, base_ref=base_ref, changed_files=changed_files
+                )
+                if changed_commands is not None:
+                    commands = changed_commands
+                    resolvable_scope = "changed"
+                else:
+                    # Fall back to full scope — the result reports "full" so
+                    # consumers never treat a partial selection as complete.
+                    commands = full_suite_commands(cwd)
+                    resolvable_scope = "full"
+            else:
+                commands = full_suite_commands(cwd)
         else:
             raise ValueError(f"unknown suite: {name}")
     command = " && ".join(commands)
@@ -555,6 +965,8 @@ def run_suite(
         "command": command,
         "failures": all_failures,
         "cached": use_cache and all(cached_flags) if cached_flags else False,
+        "scope": resolvable_scope,
+        "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
         "notice": "",
     }
 
@@ -566,6 +978,8 @@ def run_all(
     use_cache: bool = True,
     force: bool = False,
     no_cache: bool = False,
+    scope: str = "full",
+    base_ref: str = "origin/dev",
 ) -> dict[str, Any]:
     """Run the selected suites and aggregate failures.
 
@@ -574,10 +988,15 @@ def run_all(
     no-pytest repo never runs a phantom pytest command, and a vitest/npm repo
     runs its real ``npm --silent test``. Explicit ``("pytest",)``/``("node",)``
     selections keep the historical per-suite behavior.
+
+    *scope*: ``"changed"`` resolves changed-file-selected tests for the
+    ``"all"`` suite (falling back to full when a subset is impossible); the
+    result carries ``scope`` so consumers can distinguish partial from full.
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
     notices: list[str] = []
+    resolved_scopes: list[str] = []
     for name in suites:
         result = run_suite(
             name,
@@ -586,8 +1005,11 @@ def run_all(
             use_cache=use_cache,
             force=force,
             no_cache=no_cache,
+            scope=scope,
+            base_ref=base_ref,
         )
         results[name] = result
+        resolved_scopes.append(result["scope"])
         for failure in result["failures"]:
             all_failures.append({**failure, "suite": name})
         if result.get("notice"):
@@ -597,6 +1019,8 @@ def run_all(
         "suites": results,
         "failures": all_failures,
         "notices": notices,
+        "scope": scope,
+        "resolved_scopes": resolved_scopes,
     }
 
 
@@ -695,6 +1119,22 @@ def build_parser() -> argparse.ArgumentParser:
         "cwd via git rev-parse --show-toplevel, falling back to the framework "
         "install location).",
     )
+    parser.add_argument(
+        "--scope",
+        choices=("full", "changed"),
+        default="full",
+        help="Which tests to run: 'full' (default, the entire suite) or "
+        "'changed' (only tests touching files edited on this branch, fast "
+        "feedback for feature-branch validation). 'changed' falls back to "
+        "full when a subset cannot be resolved (custom suite commands, no "
+        "changed files, no selectable tests).",
+    )
+    parser.add_argument(
+        "--target-branch",
+        default=None,
+        help="Base branch for changed-file detection (default: origin/dev, "
+        "falling back to local 'dev' then HEAD~1).",
+    )
     return parser
 
 
@@ -765,6 +1205,8 @@ def main(argv: list[str] | None = None) -> int:
         use_cache=not args.no_cache,
         force=args.force,
         no_cache=args.no_cache,
+        scope=args.scope,
+        base_ref=args.target_branch or "origin/dev",
     )
 
     if args.rerun_failures and result["failures"]:
@@ -777,7 +1219,8 @@ def main(argv: list[str] | None = None) -> int:
         for name, suite_result in result["suites"].items():
             status = "PASS" if suite_result["success"] else "FAIL"
             cached = " [cached]" if suite_result.get("cached") else ""
-            print(f"{name}: {status}{cached} ({suite_result['command']})")
+            scope = f" [{suite_result.get('scope', 'full')} scope]"
+            print(f"{name}: {status}{cached}{scope} ({suite_result['command']})")
             if suite_result.get("notice"):
                 print(f"  notice: {suite_result['notice']}")
             for failure in suite_result["failures"]:
