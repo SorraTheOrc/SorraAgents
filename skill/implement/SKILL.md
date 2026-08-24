@@ -28,8 +28,12 @@ PRs automatically without explicit operator permission (no operator-approved
 credential exists for those actions). Pushing the feature branch into `dev`
 (Step 8) is **pre-authorized by this workflow** — the repo's pre-push hook
 enforces the same policy, blocking `main`/`master`/`HEAD` only — and requires
-no additional approval, provided the full test suite and build pass at the
-committed revision being pushed. When in doubt, produce the exact
+no additional approval, provided the build passes and the test gate is green:
+`implement.py finish` validates the worktree with **changed scope** (tests
+affected by the change — fast iteration), then runs a **final `--scope full`
+gate** before commit, and the **pre-push hook re-runs the full suite**
+(`--scope full`) on the actual push to `dev`/`main` (SA-0MT6BYQHB008DOGC).
+When in doubt, produce the exact
 `git`/`gh`/`wl` commands for a human to run.
 
 Privacy note: Avoid secrets/tokens/PII in comments or PR bodies — reference by
@@ -288,7 +292,7 @@ parent itself gets no worktree.
   - External constraints prevent complete tests → harnesses/mocks/placeholders,
     documented; follow project style; comment on significant decisions.
   - Discovered additional work → `wl create "<title>" --deps discovered-from:<work-item-id> --json`
-- Once all ACs are met: **build** (no errors); **run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`)** — run → triage → evaluate → loop until green; report; fix failures. **This MUST be `/skill:test` (`$(skill_path test)/scripts/run_tests.py`), never an ad-hoc equivalent** (`npx vitest run`, `pytest`, …): only the test-skill runner records the run in the per-repo test cache (keyed by git state, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run at the same commit is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
+- Once all ACs are met: **build** (no errors); **validate via the [test skill](../test/SKILL.md) — the loop is scope-aware (SA-0MT6BYQHB008DOGC)**: `implement.py finish` first runs a **changed-scope** validation (only the tests affected by this change — fast iteration), then a **final full-suite gate** (`--scope full`) before commit, and the **pre-push hook enforces the full suite again on the push to `dev`**. `run_tests.py` execution must go through the test-skill runner (`/skill:test`, `run_tests.py --scope full`): only the test-skill runner records runs in the per-repo test cache (keyed by git state + scope, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run (`npx vitest run`, `pytest`, …) is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
 
 6. Automated self-review
 

@@ -98,3 +98,56 @@ suite, no node dirs) is NOT an error: `run_tests.py` reports zero commands
 and the audit skill treats the repo as execution-impossible — fail-open
 partial, never blocks (F4 AC2).
 
+### 2. Scope-aware execution (SA-0MT6BYQHB008DOGC)
+
+`run_tests.py` supports execution **scope** so full-suite evidence is only
+generated at the gates that need it (push to `dev`/`main`, release, audit),
+while cheap changed-file-scoped runs back iterative validation.
+
+**`--scope full|changed`** (default `full`):
+
+- **`full`** — the complete suite (`full_suite_commands`, section 1). This is
+the ONLY scope that populates the *full-suite* cache entry and therefore the
+only scope the audit skill accepts as evidence of a green full suite.
+- **`changed`** — only the tests affected by changes since the diff base.
+Used for fast validation during feature-branch iteration (implement skill's
+worktree test loop, ad-hoc agent validation); NEVER used as full-suite
+evidence.
+
+**`--target-branch <ref>`** sets the diff base for changed-file detection
+(default `origin/dev`, falling back to `dev`). Changed files are computed as
+`git diff --name-only <base> HEAD` (merge-base resolved automatically).
+
+**Changed-file → test selection** combines:
+
+1. **Convention mapping** — a changed file maps to its own tests:
+   `src/foo.py` → `tests/test_foo.py`, a changed `tests/test_x.py` → itself,
+   etc.
+2. **AST import-graph expansion** — the mapping adds test files that import
+the changed module (deterministic, no heuristic coverage tools).
+
+Selected test files are passed explicitly (`pytest tests/test_foo.py ...`),
+so a scoped run is deterministic and cache-keyed distinctly from the full
+suite.
+
+**Fallback to full scope** (with a logged warning) happens when no subset
+can be selected: no diff base / no changed files, all changed files are
+non-test/unmapped, the repo declares custom `suiteCommands` in
+`.pi/test-config.json` (not introspectable), or the repo has no subsettable
+tooling. A scoped run never silently skips testing.
+
+**Result JSON** carries `scope` (`full`/`changed`) at the run level
+(`run_all` outputs `scope` + per-suite `resolved_scopes`); `run_suite`
+results carry `scope` on every path (normal, `FileNotFoundError`,
+timeout). `--summary` prints `{suite} summary ({scope} scope):` and the JSON
+summary carries per-suite `scopes` — a partial summary can never be
+mistaken for full-suite evidence.
+
+**Cache interaction:** scoped runs use independent cache keys
+distinct from the full suite (the command differs; the stored metadata
+also records `scope`). A `changed`-scope run NEVER populates the
+full-suite cache entry — the audit's read-only full-suite query
+(`query_cached`) filters by scope and rejects `changed` entries, so
+full-suite verification always requires a genuine `full` run at the same
+git state.
+

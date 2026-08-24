@@ -78,6 +78,23 @@ execution-dependent ACs (SA-0MSIU5HFI0024D7W). Failed (non-zero-exit) runs use
 a short 5-minute TTL so transient infra failures are not re-served as current
 results (SA-0MSJELL44009XYIL).
 
+**Scope-aware execution (SA-0MT6BYQHB008DOGC):** `run_tests.py --scope full|changed`
+— the FULL suite by default, or only the tests affected by changes since
+`--target-branch` (default `origin/dev`) via convention mapping + AST
+import-graph expansion. `full` is the only scope accepted as full-suite
+evidence: changed-scope runs get independent cache keys, record `scope:
+changed` in their metadata, and NEVER populate the full-suite cache entry —
+the audit's read-only full-suite query rejects `changed` entries, so a
+partial run can never satisfy a "full test suite passes" AC. When no subset
+can be selected (no diff base, only non-test changes, custom
+`suiteCommands`), changed scope falls back to the full suite with a warning.
+Result JSON and `--summary` output carry `scope` per suite. Pre-push
+enforcement (`.githooks/pre-push`): pushes to `refs/heads/dev`/`main` run the
+full suite (`--scope full`), feature-branch pushes skip tests
+(`TEST_SCOPE_SKIP=1` bypasses); the implement skill validates the worktree
+with changed scope and runs a final `--scope full` gate before commit.
+Details: [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
+
 ### 2. Triage every failure
 
 For each failure record, invoke the triage helper to create or link a critical
