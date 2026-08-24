@@ -1,13 +1,17 @@
 #!/bin/sh
-# worklog:pre-push-hook:v2
+# worklog:pre-push-hook:v3
 # 1. Auto-sync Worklog data before pushing (committed hooks).
 # 2. Enforce branch naming policy: block pushes to protected branches.
 # 3. Context-budget regression gate (F6, SA-0MSLK7XNZ00366YY): fail the push
 #    when the startup context surface exceeds committed thresholds.
+# 4. Scope-aware test gate (SA-0MT6CEN8D0073F61): run the FULL suite when
+#    pushing to refs/heads/dev|main; feature-branch pushes skip tests
+#    (worktree validation already ran changed-scope).
 #
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
 # Set CONTEXT_BUDGET_SKIP=1 to bypass the context-budget gate (not recommended).
+# Set TEST_SCOPE_SKIP=1 to bypass the full-suite gate (not recommended).
 set -e
 
 # ── Branch policy enforcement ────────────────────────────────────────────────
@@ -61,17 +65,54 @@ if [ "$CONTEXT_BUDGET_SKIP" != "1" ]; then
   fi
 fi
 
+# ── Scope-aware test gate + stdin capture (SA-0MT6CEN8D0073F61) ───────────
+# git feeds one line per pushed ref on stdin:
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>
+# Read every line ONCE (stdin is consumed by the first reader) and capture
+# the push targets used by both the test gate and the worklog sync below.
+need_full_suite=0
+skip_worklog_sync=0
+while read local_ref local_sha remote_ref remote_sha; do
+  [ -n "$remote_ref" ] || continue
+  case "$remote_ref" in
+    refs/heads/dev|refs/heads/main) need_full_suite=1 ;;
+    refs/worklog/data) skip_worklog_sync=1 ;;
+  esac
+done
+
+# Full-suite gate for pushes targeting dev/main (release gates). Partial
+# runs are never full-suite evidence, so the gate always runs scope=full.
+if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  runner="$repo_root/skill/test/scripts/run_tests.py"
+  if [ -n "$repo_root" ] && [ -f "$runner" ]; then
+    echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full" >&2
+    if python3 "$runner" --scope full --json >/dev/null 2>&1; then
+      echo "pre-push: full suite green (cached runs make repeat pushes cheap)" >&2
+    else
+      echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2
+      echo "  Run: python3 \"$runner\" --scope full  (or implement.py finish) and fix failures." >&2
+      echo "  Set TEST_SCOPE_SKIP=1 to bypass (not recommended)." >&2
+      exit 1
+    fi
+  else
+    echo "ERROR: $runner not found — cannot run the full-suite gate for a dev/main push." >&2
+    echo "  Set TEST_SCOPE_SKIP=1 to bypass (not recommended)." >&2
+    exit 1
+  fi
+fi
+
+# Feature-branch pushes skip test execution entirely (the worktree already
+# ran changed-scope validation) and exit before the worklog sync.
+if [ "$need_full_suite" = "0" ]; then
+  exit 0
+fi
+
 # ── Worklog sync ─────────────────────────────────────────────────────────────
 if [ "$WORKLOG_SKIP_PRE_PUSH" = "1" ]; then
   exit 0
 fi
-skip=0
-while read local_ref local_sha remote_ref remote_sha; do
-  if [ "$remote_ref" = "refs/worklog/data" ]; then
-    skip=1
-  fi
-done
-if [ "$skip" = "1" ]; then
+if [ "$skip_worklog_sync" = "1" ]; then
   exit 0
 fi
 if command -v wl >/dev/null 2>&1; then
