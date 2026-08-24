@@ -160,6 +160,18 @@ the report and prints it; the calling skill then closes its session.
 ````markdown
 ### Final step: standardized end-of-session report
 
+**Path resolution (read first):** The `$(skill_path report)` in the command
+below is resolved at runtime by the **`skill_path` shell shim** (installed at
+`~/.pi/agent/bin/skill_path`, first on PATH). When pasting this block into a
+bash command, the shim resolves `$(skill_path report)` to the absolute skill
+directory — it works from any project CWD. The shim mirrors the pi
+`skill_path` tool's search order (`~/.pi/agent/skills/<name>`, then
+`<cwd>/.pi/skills/<name>/`).
+
+> ⚠️ **Do NOT** try to "resolve via the skill_path tool" separately and then
+> paste the literal `$(skill_path report)` into bash — that was the original
+> bug (SA-0MT7U3NCB000T1SR). The shim handles it automatically.
+
 Render the canonical report before returning control to the operator:
 
 ```bash

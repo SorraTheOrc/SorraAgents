@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2086
+# skill_path — resolve the installation directory for a skill (shell shim).
+#
+# Mirrors the pi `skill_path` tool so that `$(skill_path <name>)` works in
+# bash command substitution — the pattern used in SKILL.md code blocks.
+#
+# Search order (same as the pi tool):
+#   1. ~/.pi/agent/skills/<name>/
+#   2. ~/.agents/skills/<name>/
+#   3. <cwd>/.pi/skills/<name>/  (upward dir scan)
+#
+# Usage:
+#   skill_path report              → prints the resolved skill dir
+#   python3 $(skill_path report)/scripts/render_report.py ...
+#
+# Installed to ~/.pi/agent/bin/skill_path (first on PATH) so the pattern
+# works from any project CWD.
+
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+  echo "usage: skill_path <skill-name>" >&2
+  exit 2
+fi
+name="$1"
+
+# 1. ~/.pi/agent/skills/<name>/
+for base in "$HOME/.pi/agent/skills" "$HOME/.agents/skills"; do
+  dir="$base/$name"
+  if [ -d "$dir" ]; then
+    printf '%s\n' "$dir"
+    exit 0
+  fi
+done
+
+# 3. <cwd>/.pi/skills/<name>/ (upward search)
+cwd="$(pwd -P)"
+while [ "$cwd" != "/" ]; do
+  for base in "$cwd/.pi/skills" "$cwd/.agents/skills"; do
+    dir="$base/$name"
+    if [ -d "$dir" ]; then
+      printf '%s\n' "$dir"
+      exit 0
+    fi
+  done
+  cwd="$(dirname "$cwd")"
+done
+
+echo "skill_path: skill '$name' not found in ~/.pi/agent/skills/, ~/.agents/skills/, or project .pi/skills/" >&2
+exit 1

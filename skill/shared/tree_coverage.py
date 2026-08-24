@@ -19,9 +19,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import sys
 from collections import defaultdict, deque
 from typing import Any
+
+# Ensure the shared/ package is importable regardless of cwd.
+# When invoked as ``python3 tree_coverage.py ...``, __file__ points to
+# this file inside ``skills/shared/`` — prepend the parent so
+# ``from shared.status_lifecycle`` resolves correctly.
+_skill_dir = os.path.dirname(os.path.abspath(__file__))
+_parent_dir = os.path.dirname(_skill_dir)  # .../skills/
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
 
 from shared.status_lifecycle import resolve_worklog_flags
 

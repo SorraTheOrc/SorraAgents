@@ -18,6 +18,7 @@
   - [Referencing Scripts](#referencing-scripts)
   - [Referencing Assets and Documentation](#referencing-assets-and-documentation)
   - [Cross-Skill References](#cross-skill-references)
+  - [Agent Invocation (cross-CWD resolution)](#agent-invocation-cross-cwd-resolution)
 - [Defensive Existence Checks](#defensive-existence-checks)
 - [Fallback Behaviour for Missing Scripts](#fallback-behaviour-for-missing-scripts)
 - [Examples from This Repository](#examples-from-this-repository)
@@ -111,6 +112,38 @@ sparingly. When they are necessary, the consuming skill's SKILL.md should:
 1. Document the external dependency in a clear "Dependencies" section.
 2. Include a defensive existence check (see next section).
 3. Provide a fallback for when the external skill is not installed.
+
+### Agent Invocation (cross-CWD resolution)
+
+When a SKILL.md includes bash code blocks that the agent will paste into its
+bash tool (e.g., skill runners, test commands, report renderers), the agent
+runs bash from the **project CWD**, not the skill directory. In this context
+the `$(skill_path <name>)/scripts/...` convention is used to resolve the
+skill directory at runtime:
+
+```bash
+# ✅ Agent invocation — skill_path shim resolves at runtime
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <name> \
+  --headline "..." \
+  --ac "AC description|metric|met"
+```
+
+**How it works:** The `skill_path` shell shim is installed at
+`~/.pi/agent/bin/skill_path` (first on PATH). When bash expands
+`$(skill_path report)` it searches for the `report` skill in:
+
+1. `~/.pi/agent/skills/report/` (global agent skills)
+2. `~/.agents/skills/report/` (alternate global location)
+3. `<cwd>/.pi/skills/report/` (upward directory scan)
+
+This mirrors the pi `skill_path` tool's search order. The shim is available
+in this repo at `scripts/skill_path`.
+
+**Critical:** The `skill_path` tool is a Pi **chat tool**, not a shell
+executable. The shim provides shell-level resolution so that `$(skill_path ...)`
+in bash code blocks works without the agent needing to resolve the path
+separately. The convention was introduced in commit `0d23a44`.
 
 ---
 
@@ -322,7 +355,8 @@ its canonical location.
 
 | Scenario | Recommended Path Style | Existence Check Required? |
 |----------|----------------------|--------------------------|
-| Script bundled with the same skill | `./scripts/foo.py` | Optional (recommended) |
+| Script bundled with the same skill (invoked from skill dir) | `./scripts/foo.py` | Optional (recommended) |
+| Script bundled with the same skill (agent invocation from project CWD) | `$(skill_path skillname)/scripts/foo.py` | No (shim resolves) |
 | Asset bundled with the same skill | `./assets/template.json` | No |
 | Documentation bundled with the same skill | `./references/REFERENCE.md` | No |
 | Script from another skill in the same repo | `./scripts/foo.py` (via symlink or shared location) | **Yes** |

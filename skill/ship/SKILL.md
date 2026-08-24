@@ -30,10 +30,12 @@ Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "shi
 All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `discord-notify.js` (post-release Discord notification), `remediate-spurious-closes.js`.
 
 > **Path resolution:** all `$(skill_path ship)/scripts/...` references in this
-> document are resolved at runtime via the **`skill_path` tool** — never run
-> commands with `./scripts/...` or `../` paths relative to the repo root or
-> project CWD. Resolve the skill directory with `skill_path` first, then use
-> the **absolute** path it returns.
+> document are resolved at runtime by the **`skill_path` shell shim**
+> (installed at `~/.pi/agent/bin/skill_path`). When pasting code blocks into
+> bash, `$(skill_path ship)` expands via the shim to the absolute skill
+> directory — it works from any project CWD. Never use `./scripts/...` or
+> `../` relative paths in commands. The shim mirrors the pi `skill_path`
+> tool's search order (`~/.pi/agent/skills/<name>`, then `<cwd>/.pi/skills/<name>/`).
 
 ## Usage
 
