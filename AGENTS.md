@@ -2,6 +2,11 @@
 
 Read the global agent instructions at `~/.pi/agent/AGENTS.md` — they define the core principles, the Worklog (wl) work-item workflow, and the coding disciplines that apply to every project. That file is installed from this repository's `AGENTS_GLOBAL.md` by `scripts/install_pi.sh`, which symlinks it into place.
 
+## Worktree hygiene
+
+- Run `scripts/hygiene_check.sh` periodically to detect orphaned stashes and dirty main checkouts before they block automated agents.
+- When `implement.py start` warns about orphaned stashes, triage them using the [recovery playbook](skill/implement/SKILL.md#dirty-main-checkout-recovery-playbook). Never stash or delete stashes without explicit operator permission.
+
 ## Project-specific guidance
 
 - This repository is the **canonical source** for the pi agent infrastructure: `skill/` (skills), `command/` (prompts/commands), and `AGENTS_GLOBAL.md` (global agent guidance).

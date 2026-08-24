@@ -38,6 +38,8 @@ If you already have a current work-item id, continue using it; otherwise ask the
 
 **MANDATORY — worktree requirement:** all implementation MUST happen in the worktree created by `implement.py start <WIP-id>`; `cd` into `.worklog/worktrees/wl-<WIP-id>-<slug>` and make ALL changes there — never edit, commit, or push from the main checkout; `implement.py finish` refuses if it detects changes outside the worktree. See the [implement skill](/home/rgardler/.pi/agent/skills/implement/SKILL.md).
 
+> **Worktree hygiene:** run `scripts/hygiene_check.sh` periodically to detect orphaned stashes and dirty main checkouts; when `implement.py start` warns about orphaned stashes, triage them using the [recovery playbook](skill/implement/SKILL.md#dirty-main-checkout-recovery-playbook) — never stash or delete stashes without explicit operator permission.
+
 <!-- WORKFLOW: end -->
 
 ## CRITICAL RULES

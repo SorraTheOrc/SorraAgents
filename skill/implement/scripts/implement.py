@@ -18,6 +18,7 @@ Optional flags:
   --commit-msg <msg>        Commit message override
   --parent-branch <branch>  Override parent branch (default: dev)
   --worktree-path <path>    Override worktree path
+  --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
   -v, --verbose             Verbose logging
 
 Environment:
@@ -1811,6 +1812,193 @@ def remove_state(worktree_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stash hygiene helpers
+# ---------------------------------------------------------------------------
+
+
+def git_stash_list(cwd: str | None = None) -> str:
+    """Run ``git stash list`` and return output.
+
+    Args:
+        cwd: Working directory (defaults to current directory).
+
+    Returns:
+        Stash list output, or empty string on error.
+    """
+    result = run_cmd(
+        ["git", "stash", "list"],
+        cwd=cwd,
+        capture=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _extract_work_item_ids_from_stash(stash_entry: str) -> list[str]:
+    """Extract work-item IDs from a single stash line.
+
+    Stash lines have the format:
+    ``stash@{N}: On <branch>: <message>``
+
+    Work-item IDs in the message follow the pattern ``SA-XXXXXXXXXXX`` or
+    any prefix followed by ``-`` and alphanumeric characters.
+
+    Args:
+        stash_entry: A single line from ``git stash list``.
+
+    Returns:
+        List of work-item ID strings found in the stash message.
+    """
+    # Pattern: SA-<word characters>, or any-prefix-<word characters>
+    # The stash message portion comes after "On <branch>: "
+    match = re.search(r"On\s+\S+:\s*(.*)", stash_entry)
+    if not match:
+        return []
+    message = match.group(1)
+    # Match work-item IDs: prefix (like SA, WL, etc.) followed by - and word chars
+    return re.findall(r"\b([A-Z]+-[A-Za-z0-9]+)\b", message)
+
+
+def _is_work_item_open(work_item_id: str) -> bool:
+    """Check whether a work item is currently open (not terminal).
+
+    Uses ``wl show`` to fetch the item and checks if its status is
+    ``in-progress``, ``in_progress``, ``open``, or ``blocked``.
+
+    Args:
+        work_item_id: The work item ID to check.
+
+    Returns:
+        True if the work item is open (not in_review/completed/done/deleted).
+    """
+    try:
+        cmd = ["wl", "show", work_item_id, "--json"]
+        cmd[1:1] = worklog_dir_flag()
+        result = run_cmd(cmd, check=False, timeout=30)
+        if result.returncode != 0:
+            return False
+        data = json.loads(result.stdout.strip())
+        if isinstance(data, dict) and "workItem" in data:
+            status = data["workItem"].get("status", "")
+            return status in ("open", "in-progress", "in_progress", "blocked")
+    except (json.JSONDecodeError, ValueError, RuntimeError):
+        pass
+    return False
+
+
+@dataclass
+class OrphanedStash:
+    """Represents a stash entry that is orphaned (no matching open work item)."""
+
+    stash_name: str  # e.g. "stash@{0}"
+    stash_entry: str  # Full git stash list line
+    matched_ids: list[str]  # Work item IDs found in the stash message
+    is_orphaned: bool  # True if no matched ID is open
+
+
+def check_orphaned_stashes(
+    cwd: str | None = None,
+) -> dict[str, Any]:
+    """Inspect ``git stash list`` and identify orphaned stashes.
+
+    An orphaned stash is one whose stash message does not reference any
+    work item that is currently in an open state (open, in_progress, blocked).
+    Stashes that reference an open work item are considered "matched" and
+    are NOT orphaned.
+
+    This function is called from ``phase_start`` to issue a WARNING when
+    orphaned stashes are found, but does NOT block (fail-open). Use
+    ``implement.py start --allow-orphaned-stashes`` to acknowledge the
+    warning and proceed.
+
+    Args:
+        cwd: Working directory to check (defaults to current directory).
+
+    Returns:
+        A dict with:
+        - ``total_stashes``: int — total number of stashes
+        - ``orphaned_stashes``: list[dict] — orphaned stash entries
+        - ``matched_stashes``: list[dict] — stashes matched to open work items
+        - ``has_orphaned``: bool — True if any orphaned stashes were found
+        - ``warning``: str | None — warning message if orphaned stashes exist
+    """
+    stash_output = git_stash_list(cwd)
+    if not stash_output:
+        return {
+            "total_stashes": 0,
+            "orphaned_stashes": [],
+            "matched_stashes": [],
+            "has_orphaned": False,
+            "warning": None,
+        }
+
+    all_stashes: list[OrphanedStash] = []
+    for line in stash_output.splitlines():
+        # Parse stash name from "stash@{N}: On <branch>: <message>"
+        stash_match = re.match(r"^(stash@\{\d+\}):", line)
+        if not stash_match:
+            continue
+        stash_name = stash_match.group(1)
+        matched_ids = _extract_work_item_ids_from_stash(line)
+
+        if matched_ids:
+            # Check if any matched ID is open
+            any_open = any(
+                _is_work_item_open(wid) for wid in matched_ids
+            )
+            is_orphaned = not any_open
+        else:
+            # No work item IDs found — this is orphaned
+            is_orphaned = True
+
+        all_stashes.append(OrphanedStash(
+            stash_name=stash_name,
+            stash_entry=line,
+            matched_ids=matched_ids,
+            is_orphaned=is_orphaned,
+        ))
+
+    orphaned = [s for s in all_stashes if s.is_orphaned]
+    matched = [s for s in all_stashes if not s.is_orphaned]
+
+    result: dict[str, Any] = {
+        "total_stashes": len(all_stashes),
+        "orphaned_stashes": [
+            {
+                "stash_name": s.stash_name,
+                "stash_entry": s.stash_entry,
+                "matched_ids": s.matched_ids,
+            }
+            for s in orphaned
+        ],
+        "matched_stashes": [
+            {
+                "stash_name": s.stash_name,
+                "stash_entry": s.stash_entry,
+                "matched_ids": s.matched_ids,
+            }
+            for s in matched
+        ],
+        "has_orphaned": len(orphaned) > 0,
+        "warning": None,
+    }
+
+    if orphaned:
+        orphaned_lines = "\n".join(
+            f"  - {s.stash_name}: {s.stash_entry}" for s in orphaned
+        )
+        result["warning"] = (
+            f"WARNING: {len(orphaned)} orphaned stash(es) detected on the main checkout. "
+            f"These stashes do not reference any open work item and may be lost.\n\n"
+            f"Orphaned stashes:\n{orphaned_lines}\n\n"
+            f"Triage these stashes (restore-and-commit via a proper work item, or delete if stale).\n"
+            f"Proceed anyway with --allow-orphaned-stashes."
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Phase implementations
 # ---------------------------------------------------------------------------
 
@@ -1823,6 +2011,7 @@ def phase_start(
     worktree_path_override: str | None = None,
     max_retry: int = DEFAULT_MAX_RETRY,
     verbose: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Phase 1: Setup the implementation environment.
 
@@ -1831,10 +2020,11 @@ def phase_start(
     2. Code Freeze gate: refuse when a release is in progress
     3. Claim the work item (status → in_progress)
     4. Safety gate: check for dirty working tree
-    5. Fetch work item details (audit)
-    6. Create a worktree from the parent branch
-    7. Register signal handlers
-    8. Write persistent state
+    5. Stash hygiene gate: warn on orphaned stashes (fail-open, --allow-orphaned-stashes to skip)
+    6. Fetch work item details (audit)
+    7. Create a worktree from the parent branch
+    8. Register signal handlers
+    9. Write persistent state
 
     Args:
         work_item_id: The work item ID.
@@ -1844,6 +2034,7 @@ def phase_start(
         worktree_path_override: Override worktree path.
         max_retry: Max test-fix retries.
         verbose: Enable verbose logging.
+        force: Acknowledge orphaned-stash warnings (--allow-orphaned-stashes) and proceed.
 
     Returns:
         Dict with result information.
@@ -1932,7 +2123,37 @@ def phase_start(
             print(format_json_output(report))
         return report
 
-    # ── Step 5: Fetch work item details ────────────────────────────
+    # ── Step 5: Stash hygiene gate (warn on orphaned stashes) ─────
+    LOG.info("Checking for orphaned stashes...")
+    stash_result = check_orphaned_stashes()
+    if stash_result["has_orphaned"]:
+        if not force:
+            orphaned_msg = (
+                f"WARNING: {len(stash_result['orphaned_stashes'])} orphaned stash(es) detected on the main checkout. "
+                f"These stashes do not reference any open work item and may be lost.\n"
+            )
+            if stash_result["warning"]:
+                orphaned_msg += stash_result["warning"]
+            LOG.warning("Orphaned stashes found:\n%s", orphaned_msg)
+            if not json_output:
+                print("\n⚠  Orphaned stash(es) detected")
+                print("=" * 60)
+                print(orphaned_msg)
+                print("=" * 60)
+                print("Run with --allow-orphaned-stashes to acknowledge and proceed.\n")
+            # Record the warning in the work-item comment for audit trail
+            wl_add_comment(work_item_id, f"Start phase: {len(stash_result['orphaned_stashes'])} orphaned stash(es) detected (see above). Run with --allow-orphaned-stashes to acknowledge.")
+            # Don't block — just warn. Proceed regardless.
+        else:
+            LOG.info("--allow-orphaned-stashes: acknowledged orphaned stash warning.")
+            if not json_output:
+                print(f"\n⚠  {len(stash_result['orphaned_stashes'])} orphaned stash(es) detected (--allow-orphaned-stashes: proceeding)\n")
+    elif stash_result["total_stashes"] > 0:
+        LOG.info("All %d stash(es) matched to open work items — no orphaned stashes.", stash_result["total_stashes"])
+    else:
+        LOG.info("No stashes found.")
+
+    # ── Step 6: Fetch work item details ────────────────────────────
     LOG.info("Fetching work item %s...", work_item_id)
     work_item = wl_show(work_item_id)
     if not work_item:
@@ -1952,7 +2173,7 @@ def phase_start(
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
 
-    # ── Step 6: Create worktree ────────────────────────────────────
+    # ── Step 7: Create worktree ────────────────────────────────────
     wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
     branch = branch_name_for(work_item_id, slug)
 
@@ -1991,12 +2212,12 @@ def phase_start(
         f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}",
     )
 
-    # ── Step 7: Register signal handlers ───────────────────────────
+    # ── Step 8: Register signal handlers ───────────────────────────
     repo_root = str(Path.cwd().resolve())
     _store_signal_globals(abs_wt_path, work_item_id, repo_root)
     _register_signal_handlers()
 
-    # ── Step 8: Write state ────────────────────────────────────────
+    # ── Step 9: Write state ────────────────────────────────────────
     state = ImplementState(
         work_item_id=work_item_id,
         worktree_path=abs_wt_path,
@@ -2982,6 +3203,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--allow-orphaned-stashes",
+        action="store_true",
+        help="Acknowledge the orphaned-stash warning and proceed (fail-open gate)",
+    )
     return parser.parse_args(argv)
 
 
@@ -3035,6 +3261,7 @@ def _main(argv: list[str] | None = None) -> int:
             worktree_path_override=args.worktree_path,
             max_retry=args.max_retry,
             verbose=args.verbose,
+            force=args.allow_orphaned_stashes,
         )
     elif args.action == "finish":
         result = phase_finish(
