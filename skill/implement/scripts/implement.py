@@ -60,6 +60,16 @@ try:
     from shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
+try:
+    # The shared changed-file → test selector (SA-0MT6CENPW004V2JN). Kept
+    # optional: partial skill installs (staged layouts without the test
+    # skill's scripts) must still start implement.py — changed-scope then
+    # degrades to full scope with a warning.
+    from test.scripts.run_tests import (
+        changed_scope_commands as _changed_scope_commands,
+    )
+except ModuleNotFoundError:
+    _changed_scope_commands = None  # type: ignore[assignment]
 from test_cache import run_cached
 from test_runner import canonicalize_quiet_test_command
 
@@ -1405,12 +1415,14 @@ def _detect_test_tooling(cwd: str) -> str | None:
     return None
 
 
-def _skip_test_result(message: str, tooling: str | None) -> dict[str, Any]:
+def _skip_test_result(message: str, tooling: str | None,
+                      scope: str = "full") -> dict[str, Any]:
     """Build a skipped/no-op test result.
 
     Args:
         message: Informative no-op message (also logged).
         tooling: The detected tooling, if any (e.g. ``unity``).
+        scope: The scope this run represented (``full``/``changed``).
 
     Returns:
         A result dict with ``success: True`` so finish proceeds.
@@ -1424,19 +1436,22 @@ def _skip_test_result(message: str, tooling: str | None) -> dict[str, Any]:
         "failures": [],
         "skipped": True,
         "tooling": tooling,
+        "scope": scope,
     }
 
 
-def _finalize_test_result(result: dict[str, Any], tooling: str | None) -> dict[str, Any]:
+def _finalize_test_result(result: dict[str, Any], tooling: str | None,
+                          scope: str = "full") -> dict[str, Any]:
     """Add metadata keys and parse failures from a raw run result.
 
     Args:
         result: Raw run dict (stdout/stderr/exit_code).
         tooling: The runner that produced the result.
+        scope: The scope this run represented (``full``/``changed``).
 
     Returns:
-        The result dict with ``success``, ``failures``, ``skipped: False``
-        and ``tooling`` keys.
+        The result dict with ``success``, ``failures``, ``skipped: False``,
+        ``tooling`` and ``scope`` keys.
     """
     failures: list[str] = []
     combined = f"{result['stdout']}\n{result['stderr']}"
@@ -1451,6 +1466,7 @@ def _finalize_test_result(result: dict[str, Any], tooling: str | None) -> dict[s
         "failures": failures,
         "skipped": False,
         "tooling": tooling,
+        "scope": scope,
     }
 
 
@@ -1467,8 +1483,64 @@ def _shell_command_runner(
     )
 
 
-def run_tests(cwd: str) -> dict[str, Any]:
-    """Run the full test suite, routed through the per-repo run cache.
+def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
+    """Run only the tests affected by the worktree's changes vs *base_ref*.
+
+    Reuses the shared changed-file → test selector from the test skill
+    (``skill/test/scripts/run_tests.py``) so implement's scoped validation
+    selects the exact same subset as ``run_tests.py --scope changed`` and
+    caches it under a distinct key with ``scope: "changed"`` metadata (a
+    partial run is never mistaken for full-suite evidence).
+
+    Returns ``None`` when no subset is possible so the caller falls back to
+    the full suite: no dev baseline/changed files, only non-test changes,
+    custom ``suiteCommands`` in ``.pi/test-config.json``, a selection
+    that resolves to node-only commands (implement's pytest channel cannot
+    run them), or a partial skill install without the test skill's
+    selector. npm / repo-script / override / unity toolings are not
+    subsettable — the caller warns and runs full scope.
+    """
+    if _changed_scope_commands is None:
+        LOG.warning(
+            "Implement run_tests: changed-scope selector unavailable "
+            "(test/scripts.run_tests not importable) — running full scope "
+            "on %s.",
+            cwd,
+        )
+        return None
+    commands = _changed_scope_commands(Path(cwd), base_ref=base_ref or "origin/dev")
+    if not commands:
+        return None
+    pytest_cmds = [c for c in commands if c.startswith("pytest")]
+    if not pytest_cmds:
+        return None
+    run = run_cached(
+        pytest_cmds[0],
+        cwd=cwd,
+        timeout=600,
+        runner=lambda command, cwd_, timeout_: run_cmd(
+            command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+        ),
+        scope="changed",
+    )
+    return _finalize_test_result(run, tooling="pytest", scope="changed")
+
+
+def run_tests(cwd: str, scope: str = "changed",
+              base_ref: str | None = None) -> dict[str, Any]:
+    """Run the project test suite, routed through the per-repo run cache.
+
+    *scope* selects the execution scope (SA-0MT6CENPW004V2JN):
+
+    - ``changed`` (default): run only the tests affected by the worktree's
+      changes vs *base_ref* (``origin/dev`` default). Used by the finish
+      build/test/commit loop for fast iteration. When no subset can be
+      selected (no dev baseline, no changed files, only non-test changes,
+      custom ``suiteCommands``, or a non-pytest tooling), falls back to the
+      full suite with a logged warning — a scoped run must never silently
+      skip testing.
+    - ``full``: the complete suite (populates/consumes the full-suite cache
+      entry that audit and the pre-push hook rely on).
 
     The test step is tolerant of repos with no test tooling: when neither
     pytest, an npm ``test`` script, nor a repo-local runner is detected, the
@@ -1497,30 +1569,52 @@ def run_tests(cwd: str) -> dict[str, Any]:
 
     Args:
         cwd: Working directory (worktree root).
+        scope: Execution scope (``changed`` — default — or ``full``).
+        base_ref: Base ref for changed-file detection when *scope* is
+            ``changed`` (default ``origin/dev``).
 
     Returns:
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
-        ``exit_code`` (int), ``failures`` (list[str]), plus ``skipped``
-        (bool — True when no tooling was found) and ``tooling`` (str | None —
-        the detected runner: pytest/npm/repo-script/override/unity).
+        ``exit_code`` (int), ``failures`` (list[str]), ``scope`` (str), plus
+        ``skipped`` (bool — True when no tooling was found) and ``tooling``
+        (str | None — the detected runner: pytest/npm/repo-script/override/
+        unity).
     """
     # 1. Per-repo override (env var) — highest precedence
     override = os.environ.get("IMPLEMENT_TEST_COMMAND", "").strip()
     if override:
+        if scope == "changed":
+            LOG.warning(
+                "Implement run_tests: IMPLEMENT_TEST_COMMAND override is not "
+                "subsettable — running full scope on %s.",
+                cwd,
+            )
         return _finalize_test_result(
             run_cached(
                 override,
                 cwd=cwd,
                 timeout=600,
                 runner=_shell_command_runner,
+                scope="full",
             ),
             tooling="override",
+            scope="full",
         )
 
     tooling = _detect_test_tooling(cwd)
 
     # 2. pytest (with npm test fallback when the repo also has a test script)
     if tooling == "pytest":
+        if scope == "changed":
+            scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
+            if scoped is not None:
+                return scoped
+            LOG.warning(
+                "Implement run_tests: changed-scope selection unavailable in "
+                "%s (no dev baseline, no changed tests, or custom "
+                "suiteCommands) — falling back to full scope.",
+                cwd,
+            )
         pytest_run = run_cached(
             PYTEST_CMD,
             cwd=cwd,
@@ -1528,6 +1622,7 @@ def run_tests(cwd: str) -> dict[str, Any]:
             runner=lambda command, cwd_, timeout_: run_cmd(
                 command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
             ),
+            scope="full",
         )
         result = pytest_run
         final_tooling = "pytest"
@@ -1540,16 +1635,25 @@ def run_tests(cwd: str) -> dict[str, Any]:
                 runner=lambda command, cwd_, timeout_: run_cmd(
                     command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
                 ),
+                scope="full",
             )
             if npm_run["exit_code"] == 0:
-                return _finalize_test_result(npm_run, tooling="npm")
+                return _finalize_test_result(
+                    npm_run, tooling="npm", scope="full"
+                )
             # Use the npm result if pytest also failed
             result = npm_run
             final_tooling = "npm"
-        return _finalize_test_result(result, tooling=final_tooling)
+        return _finalize_test_result(result, tooling=final_tooling, scope="full")
 
     # 3. npm test script (no pytest suite)
     if tooling == "npm":
+        if scope == "changed":
+            LOG.warning(
+                "Implement run_tests: npm tooling is not subsettable — "
+                "running full scope on %s.",
+                cwd,
+            )
         return _finalize_test_result(
             run_cached(
                 NPM_TEST_CMD,
@@ -1558,8 +1662,10 @@ def run_tests(cwd: str) -> dict[str, Any]:
                 runner=lambda command, cwd_, timeout_: run_cmd(
                     command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
                 ),
+                scope="full",
             ),
             tooling="npm",
+            scope="full",
         )
 
     # 4. Repo-local runner script
@@ -1582,9 +1688,17 @@ def run_tests(cwd: str) -> dict[str, Any]:
             command = f"cmd.exe /c {runner_script}"
         else:
             command = f"bash {runner_script}"
+        if scope == "changed":
+            LOG.warning(
+                "Implement run_tests: repo-local runner is not subsettable — "
+                "running full scope on %s.",
+                cwd,
+            )
         return _finalize_test_result(
-            run_cached(command, cwd=cwd, timeout=600, runner=_shell_command_runner),
+            run_cached(command, cwd=cwd, timeout=600, runner=_shell_command_runner,
+                       scope="full"),
             tooling="repo-script",
+            scope="full",
         )
 
     # 5. Unity project without a configured runner → Unity-specific skip
@@ -2064,9 +2178,9 @@ def phase_finish(
         return report
 
     # ── Step 3: Test with fix-and-re-run loop ──────────────────────
-    LOG.info("Running test suite...")
+    LOG.info("Running test suite (changed scope)...")
     test_attempts = 0
-    test_result = run_tests(worktree_path)
+    test_result = run_tests(worktree_path, scope="changed")
     report["steps"]["tests"] = []
     report["steps"]["tests"].append({
         "attempt": test_attempts + 1,
@@ -2074,6 +2188,7 @@ def phase_finish(
         "failures": test_result.get("failures", []),
         "skipped": test_result.get("skipped", False),
         "tooling": test_result.get("tooling"),
+        "scope": test_result.get("scope", "changed"),
     })
 
     while not test_result["success"] and test_attempts < max_retry:
@@ -2139,14 +2254,16 @@ def phase_finish(
             break
 
         # Re-run tests
-        LOG.info("Re-running test suite (attempt %d/%d)...", test_attempts + 1, max_retry)
-        test_result = run_tests(worktree_path)
+        LOG.info("Re-running test suite (attempt %d/%d, changed scope)...",
+                 test_attempts + 1, max_retry)
+        test_result = run_tests(worktree_path, scope="changed")
         report["steps"]["tests"].append({
             "attempt": test_attempts + 1,
             "success": test_result["success"],
             "failures": test_result.get("failures", []),
             "skipped": test_result.get("skipped", False),
             "tooling": test_result.get("tooling"),
+            "scope": test_result.get("scope", "changed"),
         })
 
     if not test_result["success"]:
@@ -2163,6 +2280,46 @@ def phase_finish(
         else:
             LOG.error(msg)
         return report
+
+    # ── Step 3b: Final full-suite gate (SA-0MT6CENPW004V2JN) ───────
+    # Changed-scope validation passed. Before committing and pushing to dev
+    # (the release gate), run the FULL suite so (a) a red full tree can never
+    # be pushed, and (b) the full-suite cache is populated at the pushed
+    # commit, making the pre-push hook's full check a cheap cache hit. The
+    # result records scope=full so consumers never mistake it for the
+    # partial changed-scope validation.
+    if test_result["success"] and not test_result.get("skipped"):
+        LOG.info("Running final full-suite gate (scope=full) before commit...")
+        full_result = run_tests(worktree_path, scope="full")
+        report["steps"]["tests"].append({
+            "attempt": "final-full",
+            "success": full_result["success"],
+            "failures": full_result.get("failures", []),
+            "skipped": full_result.get("skipped", False),
+            "tooling": full_result.get("tooling"),
+            "scope": "full",
+        })
+        if not full_result["success"]:
+            failures = full_result.get("failures", [])
+            failure_summary = "\n".join(failures[:20]) if failures else full_result["stderr"][:1000]
+            msg = (
+                "Full-suite gate failed after changed-scope validation passed "
+                f"(scope=full). Failures:\n{failure_summary}\n\n"
+                "Fix the failures and re-run implement.py finish; the pre-push "
+                "hook also enforces the full suite at push."
+            )
+            report["success"] = False
+            report["message"] = msg
+            wl_add_comment(work_item_id, msg)
+            try:
+                StatusLifecycle.update_status(work_item_id, "open")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", work_item_id)
+            if json_output:
+                print(format_json_output(report))
+            else:
+                print(f"\n{msg}")
+            return report
 
     LOG.info("All tests passed")
 
