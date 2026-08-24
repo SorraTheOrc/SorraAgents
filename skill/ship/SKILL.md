@@ -29,22 +29,28 @@ Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "shi
 
 All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `discord-notify.js` (post-release Discord notification), `remediate-spurious-closes.js`.
 
-> **Path resolution:** all `./scripts/...` and `../` paths in this document are **relative to the skill directory** (the `ship` skill folder under the repo's `skill/` tree, or under the installed skills folder) — not the repo root. When invoking from the repo root, prefix with the full skill path instead of `./`.
+> **Path resolution:** all `$(skill_path ship)/scripts/...` references in this
+> document are resolved at runtime via the **`skill_path` tool** — never run
+> commands with `./scripts/...` or `../` paths relative to the repo root or
+> project CWD. Resolve the skill directory with `skill_path` first, then use
+> the **absolute** path it returns.
 
 ## Usage
 
 ```bash
 # Execute a release (dev → main merge)
-node ./scripts/run-release.js
+node $(skill_path ship)/scripts/run-release.js
 ```
 
-For programmatic access to internal helpers (used by the implement workflow):
+For programmatic access to internal helpers (used by the implement workflow),
+import the modules from the skill directory resolved via `skill_path` (e.g.
+`$(skill_path ship)/scripts/ship.js`):
 
 ```javascript
-import { pushToDev } from './scripts/ship.js';
+import { pushToDev } from '<skill-path>/scripts/ship.js';  // <skill-path> = $(skill_path ship) resolved via the tool
 const result = pushToDev('origin');
 if (!result.success) { /* handle failure, e.g. create a merge-conflict work item */ }
-import { makeBranchName, validateBranchName, isBranchBlocked } from './scripts/git-helpers.js';
+import { makeBranchName, validateBranchName, isBranchBlocked } from '<skill-path>/scripts/git-helpers.js';  // <skill-path> = $(skill_path ship)
 makeBranchName('SA-001', 'fix-login-bug');     // → 'wl-SA-001-fix-login-bug'
 validateBranchName('wl-SA-001-fix-login-bug'); // → { valid: true }
 isBranchBlocked('main');                       // → true
@@ -85,7 +91,7 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 ## Release Process
 
 ```bash
-node ./scripts/run-release.js
+node $(skill_path ship)/scripts/run-release.js
 ```
 
 1. **Unmerged branches check** — abort if branches pending; `--skip-checks` bypasses.
@@ -129,7 +135,7 @@ Close-work-items unit tests must **never mutate the live worklog** (SA-0MSJ2XMQL
 
 ### Remediation sweep: test-spuriously-closed work items
 
-If the test-isolation bug recurs (items closed "Shipped in v1.0.0"/"v1.2.3" that never shipped), run the idempotent sweep from the main checkout: `node ./scripts/remediate-spurious-closes.js` — deletes close comments authored by `worklog` with exactly those reasons and restores each item to `status=completed, stage=in_review`. Legitimate close comments (real versions) are never touched; re-running after success is a no-op. Details: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md).
+If the test-isolation bug recurs (items closed "Shipped in v1.0.0"/"v1.2.3" that never shipped), run the idempotent sweep from the main checkout: `node $(skill_path ship)/scripts/remediate-spurious-closes.js` — deletes close comments authored by `worklog` with exactly those reasons and restores each item to `status=completed, stage=in_review`. Legitimate close comments (real versions) are never touched; re-running after success is a no-op. Details: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md).
 
 ## Fallback: Human Release Manager
 
@@ -137,7 +143,7 @@ For repos where the automated merge is unsuitable, follow [`docs/dev/release-pro
 
 | Approach | Description | When to use |
 |----------|-------------|-------------|
-| **Automated script** | `node ./scripts/run-release.js` manually | Script available |
+| **Automated script** | `node $(skill_path ship)/scripts/run-release.js` manually | Script available |
 | **Direct merge** | `git checkout main && git merge origin/dev --no-ff` | No branch protection on main |
 | **Manual PR** | Temp branch with merge result, open a PR | Human review desired |
 
@@ -150,9 +156,9 @@ For repos where the automated merge is unsuitable, follow [`docs/dev/release-pro
 Verifying the full suite is green before promoting `dev` to `main` is an **optional pre-release step** driven by the [test skill](../test/SKILL.md) (`/skill:test`). Route repeat verifications through the **cached runner** (`test_cache.py`, SA-0MSGN5OJ4002OZKY):
 
 ```bash
-python3 ../test/scripts/run_tests.py --scope full --json                    # fresh full-suite run (populates cache)
-python3 ../test/scripts/run_tests.py --summary --suite all                   # read-only summary (shows cached scope), never executes
-python3 ../test/scripts/run_tests.py --scope full --force --json            # fresh full-suite run for the final gate
+python3 $(skill_path test)/scripts/run_tests.py --scope full --json                    # fresh full-suite run (populates cache)
+python3 $(skill_path test)/scripts/run_tests.py --summary --suite all                   # read-only summary (shows cached scope), never executes
+python3 $(skill_path test)/scripts/run_tests.py --scope full --force --json            # fresh full-suite run for the final gate
 ```
 
 The run and final-gate commands use ``--scope full`` explicitly: the release
@@ -166,7 +172,7 @@ Cached results are valid for the same git state within the 2-hour TTL; a changed
 
 ## Preferred execution behaviour (policy)
 
-- Always invoke `./scripts/run-release.js` for dev→main merges; do NOT substitute ad-hoc git commands.
+- Always invoke `$(skill_path ship)/scripts/run-release.js` for dev→main merges; do NOT substitute ad-hoc git commands.
 - Manual fallback only in narrow edge cases: script missing, fails with operator-okayed fallback, or human explicitly requests manual steps.
 - Script unavailable → refuse automatic release and direct operator to `docs/dev/release-process.md`.
 
@@ -189,7 +195,7 @@ GitHub PR `release/dev-to-main-<timestamp>` → `main`; worklog audit comment (m
 Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
 
 ```bash
-python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \

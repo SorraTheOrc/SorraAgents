@@ -39,7 +39,7 @@ References
 Script
 ------
 
-`./scripts/check_or_create.py` — implementation using `wl` CLI.
+`$(skill_path triage)/scripts/check_or_create.py` — implementation using `wl` CLI.
 
 Matching Heuristics (in order)
 ------------------------------
@@ -72,7 +72,7 @@ cat <<'JSON' > payload.json
   "commit_hash": "abc123"
 }
 JSON
-python3 ./scripts/check_or_create.py payload.json
+python3 $(skill_path triage)/scripts/check_or_create.py payload.json
 ```
 
 Output (new issue): `{"issueId": "SA-NEW", "created": true, "reason": "No matching incomplete test-failure issue found; created new."}`
@@ -85,7 +85,7 @@ Output (matched): `{"issueId": "SA-EXISTING", "created": false, "matchedId": "SA
 Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
 
 ```bash
-python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \

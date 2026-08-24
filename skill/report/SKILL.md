@@ -163,7 +163,7 @@ the report and prints it; the calling skill then closes its session.
 Render the canonical report before returning control to the operator:
 
 ```bash
-python3 ./scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \
@@ -191,7 +191,7 @@ Rules for callers:
 
 ## Renderer
 
-`./scripts/render_report.py`:
+`$(skill_path report)/scripts/render_report.py`:
 
 - `render_report(data, *, skill_name, headline, ac_rows, producer_actions=None, notes="", next_action="review", no_icons=False)` → full report markdown.
 - `render_metadata(data, no_icons=False)` → the `## Meta-Data` bullet block.

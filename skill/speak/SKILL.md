@@ -15,13 +15,13 @@ of 5 files, and attempt playback.
 Invoke the underlying bash script directly:
 
 ```bash
-./scripts/speak.sh "Text to convert to speech"
+$(skill_path speak)/scripts/speak.sh "Text to convert to speech"
 ```
 
 Or set the `TTS_API_URL` environment variable to use a different endpoint:
 
 ```bash
-TTS_API_URL="http://localhost:8000/v1/audio/speech" ./scripts/speak.sh "Hello"
+TTS_API_URL="http://localhost:8000/v1/audio/speech" $(skill_path speak)/scripts/speak.sh "Hello"
 ```
 
 ## Arguments
@@ -99,22 +99,22 @@ A 60-second timeout is applied to the API call.
 
 ```bash
 # Basic usage
-./scripts/speak.sh "Hello, world!"
+$(skill_path speak)/scripts/speak.sh "Hello, world!"
 
 # Multi-word phrase
-./scripts/speak.sh 'The TTS system is now working.'
+$(skill_path speak)/scripts/speak.sh 'The TTS system is now working.'
 
 # Stream raw audio to stdout (pipe over SSH to local player)
-./scripts/speak.sh --stream "Hello" | aplay
-ssh user@host "cd ~/.pi/agent/skills/speak && ./scripts/speak.sh --stream 'hi'" | aplay
+$(skill_path speak)/scripts/speak.sh --stream "Hello" | aplay
+ssh user@host "$(skill_path speak)/scripts/speak.sh --stream 'hi'" | aplay
 
 # Custom API endpoint
-TTS_API_URL="http://localhost:8000/v1/audio/speech" ./scripts/speak.sh "Test"
+TTS_API_URL="http://localhost:8000/v1/audio/speech" $(skill_path speak)/scripts/speak.sh "Test"
 
 # Custom output directory
-SPEAK_DIR="/tmp/my-speech" ./scripts/speak.sh "Custom output"
+SPEAK_DIR="/tmp/my-speech" $(skill_path speak)/scripts/speak.sh "Custom output"
 ```
 
 ## See Also
 
-- `./scripts/speak.sh` -- the underlying implementation script
+- `$(skill_path speak)/scripts/speak.sh` -- the underlying implementation script

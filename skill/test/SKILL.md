@@ -33,7 +33,7 @@ Outputs
 References
 ----------
 
-- Runner: `./scripts/run_tests.py` · Usefulness: `./scripts/evaluate_usefulness.py` · Triage: `../triage/scripts/check_or_create.py`
+- Runner: `$(skill_path test)/scripts/run_tests.py` · Usefulness: `$(skill_path test)/scripts/evaluate_usefulness.py` · Triage: `$(skill_path triage)/scripts/check_or_create.py`
 - Canonicalization: `../test_runner.py` · Anti-patterns: [Test Writing Guidelines](../shared/test-writing-guidelines.md)
 
 Workflow
@@ -42,7 +42,7 @@ Workflow
 ### 1. Run the full suite in quiet mode
 
 ```bash
-python3 ./scripts/run_tests.py --json
+python3 $(skill_path test)/scripts/run_tests.py --json
 ```
 
 **Project-root resolution:** the runner targets the invoking project (see [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md)).
@@ -67,9 +67,9 @@ the same git state within the **2-hour TTL** is served from cache. Details:
 Query a cached run without executing:
 
 ```bash
-python3 ./scripts/run_tests.py --summary --suite all                         # summary lines
-python3 ./scripts/run_tests.py --summary --summary-grep "Test Files|failed"  # read-only grep
-python3 ./scripts/run_tests.py --force                                       # fresh run
+python3 $(skill_path test)/scripts/run_tests.py --summary --suite all                         # summary lines
+python3 $(skill_path test)/scripts/run_tests.py --summary --summary-grep "Test Files|failed"  # read-only grep
+python3 $(skill_path test)/scripts/run_tests.py --force                                       # fresh run
 ```
 
 The **audit skill** consumes the cache read-only via `query_cached()`: a green
@@ -84,7 +84,7 @@ For each failure record, invoke the triage helper to create or link a critical
 `test-failure` work item (no duplicates):
 
 ```bash
-python3 ../triage/scripts/check_or_create.py '{"test_name":"<test_name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
+python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<test_name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
 ```
 
 Items are tagged `test-failure`, priority `critical`, child of the invoking
@@ -96,7 +96,7 @@ Do **NOT** rely on code comments when deciding whether a test is useful —
 analyze what the test actually asserts and exercises using the evaluator:
 
 ```bash
-python3 ./scripts/evaluate_usefulness.py <test-file> --json
+python3 $(skill_path test)/scripts/evaluate_usefulness.py <test-file> --json
 ```
 
 The evaluator detects the anti-patterns from the
@@ -146,9 +146,9 @@ reasoning, the exact change needed and why, and the triaged `test-failure` ids.
 Scripts
 -------
 
-- `./scripts/run_tests.py` — runs pytest / Node suites in quiet mode, parses failures into triage-compatible records.
-- `./scripts/evaluate_usefulness.py` — code-path usefulness analysis (`keep` / `remove` / `report-to-user`).
-- `../triage/scripts/check_or_create.py` — reused unchanged to create/link critical `test-failure` items.
+- `$(skill_path test)/scripts/run_tests.py` — runs pytest / Node suites in quiet mode, parses failures into triage-compatible records.
+- `$(skill_path test)/scripts/evaluate_usefulness.py` — code-path usefulness analysis (`keep` / `remove` / `report-to-user`).
+- `$(skill_path triage)/scripts/check_or_create.py` — reused unchanged to create/link critical `test-failure` items.
 
 
 ## Final step: standardized end-of-session report
@@ -156,7 +156,7 @@ Scripts
 Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
 
 ```bash
-python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \

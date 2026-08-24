@@ -137,11 +137,13 @@ class TestSkillMdPathResolvability:
             "SKILL.md references paths that do not exist:\n" + "\n".join(missing)
 
     def test_failure_notice_points_at_shared_module(self):
-        """The failure-notice banner references ../scripts/ (one level up),
-        never the stale ./scripts/failure_notice.py (the module lives in
-        the shared scripts dir, above the audit scripts)."""
+        """The failure-notice banner content identifies the shared module
+        (``scripts.failure_notice`` in the skills-root ``scripts/`` dir),
+        never the stale ``./scripts/failure_notice.py`` (the module lives
+        above the audit scripts, in the shared scripts dir)."""
         text = SKILL_MD.read_text()
-        assert "../scripts/failure_notice.py" in text
+        assert "scripts.failure_notice" in text
+        assert "shared skills-root" in text or "shared scripts" in text
         assert not re.search(r"`\./scripts/failure_notice\.py`", text)
 
 

@@ -242,7 +242,7 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 A parent invocation recurses into its children automatically. Run:
 
 ```bash
-python3 scripts/implement.py parent <parent-id>
+python3 $(skill_path implement)/scripts/implement.py parent <parent-id>
 ```
 
 (`implement.py parent` — orchestrated by `phase_parent()`):
@@ -288,7 +288,7 @@ parent itself gets no worktree.
   - External constraints prevent complete tests → harnesses/mocks/placeholders,
     documented; follow project style; comment on significant decisions.
   - Discovered additional work → `wl create "<title>" --deps discovered-from:<work-item-id> --json`
-- Once all ACs are met: **build** (no errors); **run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`)** — run → triage → evaluate → loop until green; report; fix failures. **This MUST be `/skill:test` (`./scripts/run_tests.py`), never an ad-hoc equivalent** (`npx vitest run`, `pytest`, …): only the test-skill runner records the run in the per-repo test cache (keyed by git state, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run at the same commit is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
+- Once all ACs are met: **build** (no errors); **run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`)** — run → triage → evaluate → loop until green; report; fix failures. **This MUST be `/skill:test` (`$(skill_path test)/scripts/run_tests.py`), never an ad-hoc equivalent** (`npx vitest run`, `pytest`, …): only the test-skill runner records the run in the per-repo test cache (keyed by git state, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run at the same commit is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
 
 6. Automated self-review
 
@@ -301,7 +301,7 @@ parent itself gets no worktree.
 Before final commit, an automated refactor step may detect/remediate code smells (files modified this session; linters for mechanical issues + LLM for design smells). **Session-introduced smells fixed immediately; pre-existing smells create Worklog items with REFACTOR comments.** Skip with ``--no-refactor``:
 
 ```bash
-python3 ../refactor/scripts/refactor.py <work-item-id>
+python3 $(skill_path refactor)/scripts/refactor.py <work-item-id>
 ```
 
 See ``../refactor/SKILL.md``.
@@ -310,7 +310,7 @@ See ``../refactor/SKILL.md``.
 
 - Follow the mandatory build → test → commit order before committing.
 - **Do NOT create a Pull Request to `main`** — work is integrated into `dev`; the `dev`→`main` promotion is handled by the release process.
-- Push the feature branch into `dev` via the ship skill (`pushToDev()` from `../ship/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
+- Push the feature branch into `dev` via the ship skill (`pushToDev()` from `$(skill_path ship)/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
 
   > **Pushing from a worktree:** the repo's pre-push hook runs `wl sync`, which
   > refuses to run from a worktree (worktrees have no local `.worklog`; the
@@ -343,7 +343,7 @@ See ``../refactor/SKILL.md``.
   pre-commit, with `HEAD` still at the base `dev` commit):
 
   ```bash
-  python3 ../audit/scripts/audit_runner.py issue <work-item-id> --green-run <full-commit-sha> --no-execute
+  python3 $(skill_path audit)/scripts/audit_runner.py issue <work-item-id> --green-run <full-commit-sha> --no-execute
   ```
 
   - `<full-commit-sha>` is the FULL 40-hex sha just pushed (from `git rev-parse
@@ -417,7 +417,7 @@ End.
 Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
 
 ```bash
-python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \

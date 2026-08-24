@@ -70,7 +70,7 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 3. Run orchestrator, capture output to a **temp path outside the repository**:
 
    ```sh
-   python3 ./scripts/run_skill.py --issue <id> <<'JSON' > /tmp/effort-risk-final-<id>.json
+   python3 $(skill_path effort-and-risk)/scripts/run_skill.py --issue <id> <<'JSON' > /tmp/effort-risk-final-<id>.json
    { "items": [...], "o": ..., "m": ..., "p": ..., "overheads": {...}, "parent": {...}, "children": [...], "certainty": 85, "assumptions": [...], "unknowns": [...] }
    JSON
    ```
@@ -83,8 +83,8 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 
 ## Scripts
 
-- Orchestrator: `./scripts/orchestrate_estimate.py`
-- CLI wrapper: `./scripts/run_skill.py`
+- Orchestrator: `$(skill_path effort-and-risk)/scripts/orchestrate_estimate.py`
+- CLI wrapper: `$(skill_path effort-and-risk)/scripts/run_skill.py`
 - Calculators: `calc_effort.py`, `calc_risk.py`, `calc_effort_with_risk.py`
 - Formatters: `assemble_json.py`, `json_to_human.py`
 
@@ -96,7 +96,7 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 ### Example
 
 ```sh
-python3 ./scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > /tmp/effort-risk-final-SA-0MPYMFZXO0004ZU4.json
+python3 $(skill_path effort-and-risk)/scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > /tmp/effort-risk-final-SA-0MPYMFZXO0004ZU4.json
 { ... }
 JSON
 wl show SA-0MPYMFZXO0004ZU4 --format full
@@ -108,7 +108,7 @@ wl show SA-0MPYMFZXO0004ZU4 --format full
 Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
 
 ```bash
-python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \

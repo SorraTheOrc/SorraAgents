@@ -215,8 +215,8 @@ Synonym for "Acceptance Criteria"; **Acceptance Criteria** is canonical.
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model`, `--phase1-model`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`.
-- **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string; cwd-independent — the worklog store is auto-resolved from the work-item id prefix (prefix-to-sibling scan, cwd-chain fallback) when `--worklog-dir` is omitted, so it persists to the item's own store from any cwd (SA-0MSKQERKH002IBLG).
+- **Runner:** `$(skill_path audit)/scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model`, `--phase1-model`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`.
+- **Persister:** `$(skill_path audit)/scripts/persist_audit.py` — persist from stdin, file, or CLI string; cwd-independent — the worklog store is auto-resolved from the work-item id prefix (prefix-to-sibling scan, cwd-chain fallback) when `--worklog-dir` is omitted, so it persists to the item's own store from any cwd (SA-0MSKQERKH002IBLG).
 
 Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, test-cache auto-verification, `--run-tests`, batch/parallel Phase 2, tools-enabled invocation, bounded scanning, debug logs, file-scope manifest, child verdict reuse, phase-1/2 performance) are fully documented in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Execution-dependent ACs can also be verified via the [test skill](../test/SKILL.md) (`/skill:test`).
 
@@ -248,12 +248,12 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 - **Ready-to-close criteria:** all ACs `met`/`adjusted`, all active children `in_review`/`done`, no critical/high findings. **Children in `in_review` do NOT block closure** — only pre-review stages do.
 - **Do NOT add release-process or merge-status constraints** — not audit concerns. Sole exception: the Phase 1 merge gate (SA-0MT456M27001LRTL) verifies the item's work is integrated into its owning repo's `dev` and fails closed when integration cannot complete; everything else stays out of scope.
 - If ACs are ambiguous, return immediately and do NOT persist.
-- **Persistence is mandatory** — runner or `./scripts/persist_audit.py` with `[PERSIST-AUDIT]`.
+- **Persistence is mandatory** — runner or `$(skill_path audit)/scripts/persist_audit.py` with `[PERSIST-AUDIT]`.
 
 ### Persistence Procedure (MUST FOLLOW)
 
 1. **Print** the complete audit report to stdout.
-2. **Persist** via `python3 ./scripts/persist_audit.py --issue-id <id> --report "<report>"` (or echo-pipe; runner `audit_runner.py issue <id>` persists **and verifies** unless `--do-not-persist`). The persister targets the work-item's own worklog store from any cwd (auto-resolved via the shared prefix-to-sibling scan when `--worklog-dir` is omitted; an explicit `--worklog-dir` keeps highest precedence).
+2. **Persist** via `python3 $(skill_path audit)/scripts/persist_audit.py --issue-id <id> --report "<report>"` (or echo-pipe; runner `audit_runner.py issue <id>` persists **and verifies** unless `--do-not-persist`). The persister targets the work-item's own worklog store from any cwd (auto-resolved via the shared prefix-to-sibling scan when `--worklog-dir` is omitted; an explicit `--worklog-dir` keeps highest precedence).
    > **Readback verification is an invariant:** runner reads back via `wl audit-show <id> --json` (audit exists, `rawOutput` non-empty, content references the ID) or exits non-zero.
 3. **Verify persistence** — exit 0 does NOT guarantee storage: `wl audit-show <id> --json` must show `success=true`, audit not null, `rawOutput` non-empty with `Ready to close:` marker.
 4. **On failure:** re-print, report the error, do NOT mark as recorded.
@@ -265,14 +265,14 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 ## Examples
 
 ```bash
-python3 ./scripts/audit_runner.py issue SA-123                  # audit + persist
-python3 ./scripts/audit_runner.py issue SA-123 --do-not-persist  # dry run
-python3 ./scripts/audit_runner.py issue SA-123 --force           # in-progress item (bypasses pre-flight guard + freshness)
+python3 $(skill_path audit)/scripts/audit_runner.py issue SA-123                  # audit + persist
+python3 $(skill_path audit)/scripts/audit_runner.py issue SA-123 --do-not-persist  # dry run
+python3 $(skill_path audit)/scripts/audit_runner.py issue SA-123 --force           # in-progress item (bypasses pre-flight guard + freshness)
 ```
 
 ## Script Execution Failure Notice
 
-On runner failure (non-zero exit, timeout, exception), the report is wrapped with an `⚠ Script Execution Failure: <script_name> — <reason>` banner above and below (informational, no state changes; `../scripts/failure_notice.py` — note this module lives one level above the audit scripts in the shared scripts dir, unlike the `./scripts/...` runner/persister; JSON key `script_failure`).
+On runner failure (non-zero exit, timeout, exception), the report is wrapped with an `⚠ Script Execution Failure: <script_name> — <reason>` banner above and below (informational, no state changes; Python module `scripts.failure_notice` from the shared skills-root `scripts/` dir — note it lives one level above the audit scripts, unlike the `$(skill_path audit)/scripts/...` runner/persister; JSON key `script_failure`).
 
 ## Common failure modes
 
@@ -290,7 +290,7 @@ reconciles with the canonical template — render it as the **last step**, then
 close with: `<work-item-id>: <one-line summary>`.
 
 ```bash
-python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name audit \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \

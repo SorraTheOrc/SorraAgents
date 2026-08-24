@@ -95,12 +95,12 @@ invoked from. See `docs/dev/worklog-sync.md` for the shared resolution order.
 
 ## Script
 
-`./scripts/find_related.py` (Python 3.8+, `wl` CLI required)
+`$(skill_path find-related)/scripts/find_related.py` (Python 3.8+, `wl` CLI required)
 
 ### Usage
 
 ```bash
-python3 ./scripts/find_related.py --work-item-id <id> [--json] [--verbose] [--repo-path <path>]
+python3 $(skill_path find-related)/scripts/find_related.py --work-item-id <id> [--json] [--verbose] [--repo-path <path>]
 ```
 
 ### Arguments
@@ -197,7 +197,7 @@ End.
 Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
 
 ```bash
-python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \

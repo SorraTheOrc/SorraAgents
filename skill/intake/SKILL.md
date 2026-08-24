@@ -8,18 +8,18 @@ agent: build
 
 ## Invocation (canonical)
 
-Run the intake scripts from the **skill directory** — never from the project
-repo:
+Resolve the skill directory via the **`skill_path` tool** (never the project
+repo, which does not and must not contain copies of skill scripts):
 
 ```bash
-python3 ./scripts/intake.py <work-item-id>          # from the skill dir
-python3 $(skill_path intake)/scripts/intake.py ...  # from anywhere
+python3 $(skill_path intake)/scripts/intake.py <work-item-id>
 ```
 
-`./scripts/...` paths in this document are relative to the **skill directory**
-(the `intake/` folder inside the global skills install at `~/.pi/agent/skills`,
-or the `intake/` folder under this repo's `skill/` tree) — they are **never** relative to the project
-repo, which does not (and must not) contain copies of skill scripts.
+`$(skill_path <name>)` is the canonical runtime resolution for skill
+locations (the `<name>/` folder under the global install at
+`~/.pi/agent/skills`, or under this repo's `skill/` tree) — resolve it first
+with the `skill_path` tool, then invoke the script with the **absolute**
+path; never run `./scripts/...` relative to the project repo.
 
 ---
 
@@ -59,12 +59,12 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
 
 ## Status Lifecycle
 
-All status transitions are managed by the shared `StatusLifecycle` context manager (from `../shared/status_lifecycle.py`) — never ad-hoc `wl update --status` commands. The lifecycle script at `./scripts/intake.py` is the canonical CLI:
+All status transitions are managed by the shared `StatusLifecycle` context manager (from `../shared/status_lifecycle.py`) — never ad-hoc `wl update --status` commands. The lifecycle script at `$(skill_path intake)/scripts/intake.py` is the canonical CLI:
 
-- **Claim** (before any other step): `python3 ./scripts/intake.py start <work-item-id> --assignee "<AGENT>"` — sets `status=in_progress`, prevents concurrent claims.
-- **Auto-complete** (skip full intake for sufficiently defined items): `python3 ./scripts/intake.py auto-complete <work-item-id>`.
-- **Finish**: `python3 ./scripts/intake.py finish <work-item-id> [--description-file <path>]`.
-- **Abort** (release on failure): `python3 ./scripts/intake.py abort <work-item-id>`.
+- **Claim** (before any other step): `python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee "<AGENT>"` — sets `status=in_progress`, prevents concurrent claims.
+- **Auto-complete** (skip full intake for sufficiently defined items): `python3 $(skill_path intake)/scripts/intake.py auto-complete <work-item-id>`.
+- **Finish**: `python3 $(skill_path intake)/scripts/intake.py finish <work-item-id> [--description-file <path>]`.
+- **Abort** (release on failure): `python3 $(skill_path intake)/scripts/intake.py abort <work-item-id>`.
 
 ## Worklog resolution
 
@@ -76,7 +76,7 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 
 - **Before any other step**, claim the work item:
   ```bash
-  python3 ./scripts/intake.py start <work-item-id> --assignee Map
+  python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee Map
   ```
   This must happen before any evaluation, context gathering, or preflight checks.
 
@@ -106,7 +106,7 @@ Run a lightweight evaluation to decide whether the item is well-defined enough t
 If intake is not needed:
 
 ```bash
-python3 ./scripts/intake.py auto-complete <work-item-id>
+python3 $(skill_path intake)/scripts/intake.py auto-complete <work-item-id>
 wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (ACs present / small task)." --actor Map --json   # optional
 ```
 
@@ -187,7 +187,7 @@ Collect related work via `/skill:find-related <work-item-id>`; add a report to t
 Write the final draft to the work item description:
 
 ```bash
-python3 ./scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
+python3 $(skill_path intake)/scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
 ```
 
 **AC coverage verification:** After updating the description, run the AC coverage review:
@@ -208,7 +208,7 @@ This transitions `status=open`, `stage=intake_complete`.
 
 - Call the effort_and_risk skill on the new or updated work item:
   ```bash
-  python3 ../effort-and-risk/scripts/orchestrate_estimate.py <work-item-id>
+  python3 $(skill_path effort-and-risk)/scripts/orchestrate_estimate.py <work-item-id>
   ```
   (Refer to `../effort-and-risk/SKILL.md` for details.)
 
@@ -224,7 +224,7 @@ This transitions `status=open`, `stage=intake_complete`.
 If the intake process fails or is interrupted before completion:
 
 ```bash
-python3 ./scripts/intake.py abort <work-item-id>
+python3 $(skill_path intake)/scripts/intake.py abort <work-item-id>
 ```
 
 This resets `status=open`, releasing the item for other agents.
@@ -258,7 +258,7 @@ Behavior: append before final approval; **idempotent** (update existing records,
 Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
 
 ```bash
-python3 ~/.pi/agent/skills/report/scripts/render_report.py <work-item-id> \
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \
