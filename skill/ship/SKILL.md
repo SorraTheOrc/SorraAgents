@@ -150,10 +150,17 @@ For repos where the automated merge is unsuitable, follow [`docs/dev/release-pro
 Verifying the full suite is green before promoting `dev` to `main` is an **optional pre-release step** driven by the [test skill](../test/SKILL.md) (`/skill:test`). Route repeat verifications through the **cached runner** (`test_cache.py`, SA-0MSGN5OJ4002OZKY):
 
 ```bash
-python3 ../test/scripts/run_tests.py --json                    # fresh run (populates cache)
-python3 ../test/scripts/run_tests.py --summary --suite all     # read-only summary, never executes
-python3 ../test/scripts/run_tests.py --force --json            # fresh run for the final gate
+python3 ../test/scripts/run_tests.py --scope full --json                    # fresh full-suite run (populates cache)
+python3 ../test/scripts/run_tests.py --summary --suite all                   # read-only summary (shows cached scope), never executes
+python3 ../test/scripts/run_tests.py --scope full --force --json            # fresh full-suite run for the final gate
 ```
+
+The run and final-gate commands use ``--scope full`` explicitly: the release
+gate must be backed by **full-suite** evidence. A ``changed``-scope (partial)
+cached result is never sufficient for a release — and ``--summary`` reports
+the cached scope so a partial summary is not mistaken for full-suite
+verification — see scope-aware test execution
+([test-skill reference](../../docs/dev/test-skill-reference.md)).
 
 Cached results are valid for the same git state within the 2-hour TTL; a changed tree, expired TTL, or corrupt entry always triggers a fresh run. See [`docs/dev/release-tests.md`](../../docs/dev/release-tests.md).
 

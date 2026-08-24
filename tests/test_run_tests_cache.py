@@ -157,6 +157,103 @@ def test_summary_reports_cache_miss_clearly(
     assert "no cached result" in out.lower() or "not cached" in out.lower()
 
 
+def test_summary_json_reports_cached_scope(
+    cache_repo: Path, fake_run: list[str], capsys: pytest.CaptureFixture
+) -> None:
+    """--summary --json carries the cached entry's scope per suite."""
+    assert run_main(["--suite", "pytest", "--json"]) == 0
+    capsys.readouterr()  # drain the first run's JSON output
+    import test_cache as tc
+
+    scope = "changed"
+    # Re-run the same command under a changed scope label to prove the
+    # summary reports the *stored* scope, not the requested one.
+    git_state = tc.compute_git_state(cache_repo)
+    tc.store(
+        "pytest -q -r a --disable-warnings",
+        git_state,
+        cwd=cache_repo,
+        stdout=SUMMARY_OUTPUT,
+        stderr="",
+        exit_code=0,
+        scope=scope,
+    )
+
+    code, summary = run_main_json(capsys, ["--suite", "pytest", "--summary", "--json"])
+    assert code == 0
+    assert summary["scopes"]["pytest"] == scope
+
+
+def test_cache_metadata_scope_roundtrip(cache_repo: Path) -> None:
+    """run_cached stores scope in metadata; query_cached returns it."""
+    result = rt.run_cached(
+        "pytest -q -r a --disable-warnings",
+        cwd=cache_repo,
+        force=True,
+        scope="changed",
+        runner=_fake_green_runner,
+    )
+    assert result["scope"] == "changed"
+
+    entry = rt.query_cached(
+        "pytest -q -r a --disable-warnings", cwd=cache_repo,
+    )
+    assert entry is not None
+    assert entry["scope"] == "changed"
+
+
+def test_historical_entry_without_scope_reads_as_full(cache_repo: Path) -> None:
+    """Entries written before scope existed are treated as full-suite runs."""
+    import test_cache as tc
+
+    git_state = tc.compute_git_state(cache_repo)
+    tc.store(
+        "pytest -q -r a --disable-warnings",
+        git_state,
+        cwd=cache_repo,
+        stdout=SUMMARY_OUTPUT,
+        stderr="",
+        exit_code=0,
+    )
+
+    entry = rt.query_cached(
+        "pytest -q -r a --disable-warnings", cwd=cache_repo,
+    )
+    assert entry is not None
+    assert entry["scope"] == "full"
+
+
+def test_run_cached_scope_mismatch_refreshes(cache_repo: Path) -> None:
+    """A cache hit recorded under a different scope is not served — run again."""
+    import test_cache as tc
+
+    git_state = tc.compute_git_state(cache_repo)
+    tc.store(
+        "pytest -q -r a --disable-warnings",
+        git_state,
+        cwd=cache_repo,
+        stdout=SUMMARY_OUTPUT,
+        stderr="",
+        exit_code=0,
+        scope="changed",
+    )
+
+    # Requesting full scope must NOT be served the changed-scope entry.
+    result = rt.run_cached(
+        "pytest -q -r a --disable-warnings",
+        cwd=cache_repo,
+        runner=_fake_green_runner,
+        scope="full",
+    )
+    assert result["cached"] is False  # refreshed, not served
+    assert result["scope"] == "full"
+
+
+def _fake_green_runner(command: str, cwd: str, timeout: int):
+    """Cache runner protocol stub: always green, captures nothing."""
+    return SimpleNamespace(returncode=0, stdout=SUMMARY_OUTPUT, stderr="")
+
+
 # ---------------------------------------------------------------------------
 # Pipeline normalization sharing
 # ---------------------------------------------------------------------------

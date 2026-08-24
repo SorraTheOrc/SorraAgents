@@ -1699,7 +1699,9 @@ def _auto_green_run_prompt_block(sha: str) -> str:
 
     The block tells the model that a full test-suite run at *sha* (the audited
     HEAD) was verified green from the per-repo test cache via a READ-ONLY
-    query (``query_cached`` never executes anything), so execution-dependent
+    query (``query_cached`` never executes anything), and that the cached
+    entries are full-**scope** runs (a ``changed``-scope partial run is
+    rejected as evidence — SA-0MT6CEO700058ZEN), so execution-dependent
     criteria (e.g. 'full test suite passes') MAY be marked met based on that
     verified cached result — while the read-only mandate otherwise remains in
     force and the suite must NOT be executed. Returns a string ending in a
@@ -1709,7 +1711,8 @@ def _auto_green_run_prompt_block(sha: str) -> str:
         f"{AUTO_GREEN_RUN_BLOCK_HEADER} — A cached full test-suite run at "
         f"commit {sha} (== current HEAD) was verified green from the per-repo "
         "test cache (read-only query; the audit never executes the suite on "
-        "this path). "
+        "this path), and the cached entry's scope is verified as full "
+        "(partial changed-scope runs are rejected as evidence). "
         "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
         "marked met based on this verified cached result. The audit runner "
         "manages test execution: Do NOT execute tests yourself — the runner "
@@ -1752,18 +1755,32 @@ def _classify_full_suite_cache(
     (SA-0MSJELL44009XYIL), so a repo without tests/node is never asked
     about a phantom tests/node command.
 
+    **Scope filtering**: a cached entry is accepted as full-suite evidence
+    only when its recorded ``scope`` is ``"full"`` (entries recorded by
+    scope-aware runs before this check, or by historical runs, default to
+    ``"full"`` — see ``test_cache`` module docs). A ``changed``-scope entry
+    (a partial run) is rejected and reported as a MISS so the F3
+    auto-execution path reruns the suite for full evidence — a partial run
+    must never satisfy a "full suite passes" criterion
+    (SA-0MT6CEO700058ZEN AC1). In practice changed-scope runs already use
+    distinct cache keys (different commands), so this is defense-in-depth
+    against command-set convergence.
+
     Returns ``(status, head_sha, problems)``:
 
     - ``"green"`` — EVERY command has a cached entry at the audited git
-      state within the cache TTL AND every entry's exit code is 0
-      (``head_sha`` set, ``problems`` empty).
-    - ``"miss"``  — at least one command has NO cached entry at HEAD
-      (``head_sha`` set; ``problems`` name the missing commands). F3
+      state within the cache TTL, AND every entry's exit code is 0, AND
+      every entry's scope is ``"full"`` (``head_sha`` set, ``problems``
+      empty).
+    - ``"miss"``  — at least one command has NO cached entry at HEAD, or
+      has only a ``changed``-scope (partial) entry (``head_sha`` set;
+      ``problems`` name the offending commands). F3
       (SA-0MSTN5KRF0097TVP) auto-executes the suite on this state; F4
       (SA-0MSTN8CWM003AAU9) guarantees it never hard-blocks.
-    - ``"red"``   — every command is cached but at least one entry exited
-      non-zero (``head_sha`` set; ``problems`` name the failing commands).
-      Keeps the historical partial + diagnostic behavior — never a block.
+    - ``"red"``   — every command is cached at full scope but at least one
+      entry exited non-zero (``head_sha`` set; ``problems`` name the failing
+      commands). Keeps the historical partial + diagnostic behavior — never
+      a block.
     - ``"error"`` — HEAD could not be resolved (``head_sha`` None). A cache
       query exception propagates to the caller, which decides fail-closed
       (``_resolve_auto_green_run``).
@@ -1795,6 +1812,14 @@ def _classify_full_suite_cache(
             problems.append(
                 f"no cached full-suite run for '{command}' at HEAD {head_sha}"
             )
+        elif entry.get("scope", "full") != "full":
+            # A partial (changed-scope) run is never full-suite evidence.
+            # Report as a MISS so the caller auto-executes for full evidence
+            # (F3) instead of accepting a partial run (SA-0MT6CEO700058ZEN).
+            problems.append(
+                f"cached run for '{command}' is changed-scope (partial); "
+                f"full-suite evidence required at HEAD {head_sha}"
+            )
         elif int(entry.get("exit_code", -1)) != 0:
             problems.append(
                 f"cached full-suite run for '{command}' exited non-zero "
@@ -1802,7 +1827,10 @@ def _classify_full_suite_cache(
             )
     if not problems:
         return _FULL_SUITE_CACHE_GREEN, head_sha, []
-    if any(p.startswith("no cached full-suite run") for p in problems):
+    if any(
+        p.startswith(("no cached full-suite run", "cached run for"))
+        for p in problems
+    ):
         return _FULL_SUITE_CACHE_MISS, head_sha, problems
     return _FULL_SUITE_CACHE_RED, head_sha, problems
 

@@ -22,6 +22,7 @@ import subprocess
 # shadow <skills>/test when only the skills root is on sys.path).
 import sys as _sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -323,6 +324,119 @@ class TestChangedScopeCommands:
 # ---------------------------------------------------------------------------
 
 
+class TestPerSuiteChangedScope:
+    """Tests for scope='changed' with specific suite names (not 'all')."""
+
+    def test_pytest_scope_filters_to_pytest_only(self, tmp_path: Path) -> None:
+        """--suite pytest --scope changed runs pytest only, not node tests."""
+        from types import SimpleNamespace
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "tests").mkdir()
+        (repo / "tests" / "node").mkdir()
+        (repo / "src").mkdir()
+        (repo / "pytest.ini").write_text("[pytest]\n")
+        (repo / "tests" / "test_foo.py").write_text("\n")
+        (repo / "tests" / "node" / "utils.test.mjs").write_text("import test from \"node:test\";\n")
+        (repo / "src" / "foo.py").write_text("from src import utils\n")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+        (repo / "src" / "foo.py").write_text("from src import utils\nchanged\n")
+
+        captured: list[str] = []
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch("run_tests._run_cmd", side_effect=fake_run):
+            result = run_suite(
+                "pytest",
+                cwd=repo,
+                scope="changed",
+                base_ref="dev",
+            )
+        assert result["scope"] == "changed"
+        assert any("pytest" in c for c in captured)
+        assert not any("node" in c for c in captured)
+
+    def test_changed_scope_no_selection_falls_back_to_full(self, tmp_path: Path) -> None:
+        """When changed scope produces no tests, fall back to full pytest command."""
+        from types import SimpleNamespace
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "tests").mkdir()
+        (repo / "src").mkdir()
+        (repo / "pytest.ini").write_text("[pytest]\n")
+        (repo / "tests" / "test_foo.py").write_text("\n")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+        # change only a doc — no test files selectable
+        (repo / "README.md").write_text("# changed\n")
+
+        captured: list[str] = []
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch("run_tests._run_cmd", side_effect=fake_run):
+            result = run_suite(
+                "pytest",
+                cwd=repo,
+                scope="changed",
+                base_ref="dev",
+            )
+        assert result["scope"] == "full"
+        assert any("pytest" in c for c in captured)
+
+    def test_scope_passed_to_run_cached(self, tmp_path: Path) -> None:
+        """run_suite passes the resolved scope to run_cached."""
+        from types import SimpleNamespace
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "tests").mkdir()
+        (repo / "src").mkdir()
+        (repo / "pytest.ini").write_text("[pytest]\n")
+        (repo / "tests" / "test_utils.py").write_text("\n")
+        (repo / "src" / "utils.py").write_text("x = 1\n")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+        (repo / "src" / "utils.py").write_text("x = 2\n")
+
+        def fake_cached(command, cwd, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        # Patch run_cached (called by run_suite through use_cache) to capture scope
+        def mock_run_cached(command, *, scope="full", **kwargs):
+            cached["scope"] = scope
+            return {
+                "stdout": "passed",
+                "stderr": "",
+                "exit_code": 0,
+                "cached": False,
+                "scope": scope,
+            }
+        cached: dict[str, str] = {}
+        with mock.patch("run_tests.run_cached", side_effect=mock_run_cached):
+            result = run_suite("pytest", cwd=repo, use_cache=True, force=True, scope="changed", base_ref="dev")
+        assert cached["scope"] == "changed"
+        assert result["scope"] == "changed"
+
+
 class TestScopePropagated:
     """Tests that scope is carried through run_suite and run_all results."""
 
@@ -350,6 +464,17 @@ class TestScopePropagated:
         for suite_result in result.get("suites", {}).values():
             assert "scope" in suite_result
             assert suite_result["scope"] == "full"
+
+    def test_file_not_found_carries_scope(self) -> None:
+        """Exception paths in run_suite still carry scope in the result."""
+        result = run_suite(
+            "pytest",
+            cwd="/nonexistent-path-that-will-not-exist-xyz",
+            use_cache=True,
+            force=True,
+            scope="changed",
+        )
+        assert result.get("scope") in ("full", "changed")
 
 
 # ---------------------------------------------------------------------------

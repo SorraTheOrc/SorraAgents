@@ -688,6 +688,47 @@ class TestAutoGreenRunResolution:
         assert sha is None
         mock_q.assert_not_called()
 
+    def test_changed_scope_cached_entry_no_evidence(self, tmp_path, capsys):
+        """AC1 (SA-0MT6CEO700058ZEN): a changed-scope partial run is never
+        full-suite evidence — classified as a miss, no green verdict."""
+        _make_suite_dirs(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "tests/unit" in command:
+                entry["scope"] = "changed"  # partial run, green exit
+            return entry
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            block, sha, _ = audit_runner._auto_green_run_outcome(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert "changed-scope" in err
+        assert "full-suite evidence required" in err
+        assert "run_tests.py --force" in err or "/skill:test" in err
+
+    def test_all_changed_scope_entries_classified_miss(self, tmp_path, capsys):
+        """AC1: every suite cached but at changed scope → classified MISS so the
+        F3 path re-executes for full evidence (never accepted as green)."""
+        _make_suite_dirs(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            entry["scope"] = "changed"
+            return entry
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, sha, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == audit_runner._FULL_SUITE_CACHE_MISS
+        assert sha == _GREEN_RUN_HEAD
+        assert any("changed-scope" in p for p in problems)
+        assert not any("exited non-zero" in p for p in problems)
+
     def test_query_cached_consumed_read_only(self, tmp_path, capsys):
         """AC1: resolution consumes the cache (never executes) at the project cwd."""
         _make_suite_dirs(tmp_path)

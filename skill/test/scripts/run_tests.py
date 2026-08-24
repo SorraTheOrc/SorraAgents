@@ -178,7 +178,6 @@ def compute_changed_files(
         return set()
     return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
 
-
 def _resolve_merge_base(root: Path, base_ref: str) -> str | None:
     """Find the merge-base commit for diffing, following the fallback chain.
 
@@ -192,14 +191,19 @@ def _resolve_merge_base(root: Path, base_ref: str) -> str | None:
     candidates.append("HEAD~1")
 
     for candidate in candidates:
-        proc = subprocess.run(
-            ["git", "merge-base", candidate, "HEAD"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                ["git", "merge-base", candidate, "HEAD"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # Missing cwd / git unavailable → no diff base → caller falls
+            # back to full scope rather than crashing the run.
+            return None
         if proc.returncode == 0 and proc.stdout.strip():
             if candidate != base_ref:
                 print(
@@ -869,12 +873,17 @@ def run_suite(
     *scope* ("full" or "changed") selects which tests run: ``full`` resolves
     the repo's full suite (existing behavior); ``changed`` resolves only
     tests touching files edited on this branch (via
-    :func:`changed_scope_commands`). When ``changed`` cannot produce a
-    subset (custom suite commands, no selection), it falls back to the full
-    suite and reports ``scope: "full"`` in the result so consumers never
-    mistake a partial run for a full one. The result always carries
-    ``scope`` ("full"|"changed") and, for changed scope, ``changed_files``
-    (the file set that drove selection).
+    :func:`changed_scope_commands`), filtering the selection to the named
+    suite (pytest commands for ``name="pytest"``, node commands for
+    ``name="node"``, everything for ``name="all"``). When ``changed``
+    cannot produce a subset for this suite (custom suite commands, no
+    selection, no applicable commands), it falls back to the full suite and
+    reports ``scope: "full"`` in the result so consumers never mistake a
+    partial run for a full one. The result always carries ``scope``
+    ("full"|"changed") and, for changed scope, ``changed_files`` (the file
+    set that drove selection). The scope is recorded in the per-repo test
+    cache metadata (``run_cached(scope=...)``) so read-only consumers can
+    reject partial runs as full-suite evidence.
 
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
     ``cached``, ``scope`` and (on missing binary) ``notice``.
@@ -883,28 +892,35 @@ def run_suite(
     resolvable_scope = scope
     changed_files: set[str] = set()
     if commands is None:
-        if name == "pytest":
-            commands = [pytest_command()]
-        elif name == "node":
-            commands = node_suite_commands()
-        elif name == "all":
-            if scope == "changed":
-                changed_files = compute_changed_files(cwd, base_ref=base_ref)
-                changed_commands = changed_scope_commands(
-                    cwd, base_ref=base_ref, changed_files=changed_files
-                )
-                if changed_commands is not None:
-                    commands = changed_commands
+        if scope == "changed":
+            # Changed-file selection drives every suite name; the selection is
+            # narrowed to the named suite below. Any failure to produce a
+            # subset (custom suiteCommands, no selection) falls back to full.
+            changed_files = compute_changed_files(cwd, base_ref=base_ref)
+            changed_commands = changed_scope_commands(
+                cwd, base_ref=base_ref, changed_files=changed_files
+            )
+            if changed_commands is not None:
+                cmds = changed_commands
+                if name == "pytest":
+                    cmds = [c for c in cmds if "pytest" in c]
+                elif name == "node":
+                    cmds = [c for c in cmds if "node" in c]
+                if cmds:
+                    commands = cmds
                     resolvable_scope = "changed"
-                else:
-                    # Fall back to full scope — the result reports "full" so
-                    # consumers never treat a partial selection as complete.
-                    commands = full_suite_commands(cwd)
-                    resolvable_scope = "full"
-            else:
+        if commands is None:
+            # Full scope (including changed-scope fallback — report "full" so
+            # consumers never treat a partial selection as complete).
+            if name == "pytest":
+                commands = [pytest_command()]
+            elif name == "node":
+                commands = node_suite_commands()
+            elif name == "all":
                 commands = full_suite_commands(cwd)
-        else:
-            raise ValueError(f"unknown suite: {name}")
+            else:
+                raise ValueError(f"unknown suite: {name}")
+            resolvable_scope = "full"
     command = " && ".join(commands)
 
     all_failures: list[dict[str, str]] = []
@@ -921,6 +937,7 @@ def run_suite(
                     ttl=CACHE_TTL_SECONDS,
                     timeout=timeout,
                     runner=_cached_runner,
+                    scope=resolvable_scope,
                 )
                 proc = SimpleNamespace(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
@@ -940,6 +957,8 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"command not found: {exc.filename}",
+                "scope": resolvable_scope,
+                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
         except subprocess.TimeoutExpired:
             return {
@@ -948,6 +967,8 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"suite timed out after {timeout}s: {name}",
+                "scope": resolvable_scope,
+                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
 
         output = f"{proc.stdout}\n{proc.stderr}"
@@ -1147,12 +1168,17 @@ def run_summary(
 
     Suites with no cached entry report a clear miss. The result carries
     ``success`` (True only when every selected suite had a cached entry),
-    ``lines`` per suite, and ``missing`` (list of suite names). The ``"all"``
+    ``lines`` per suite, ``scopes`` (the recorded scope of the cached entry
+    per suite — ``"full"``, ``"changed"``, or ``"mixed"`` when the suite's
+    commands resolve to entries with different scopes), and ``missing``
+    (list of suite names). A ``changed``-scope summary is NOT full-suite
+    verification — consumers must treat it as partial evidence (the audit
+    skill rejects changed-scope entries for full-suite ACs). The ``"all"``
     suite resolves commands via ``full_suite_commands(cwd)`` — the single
     source of truth (F2 AC4).
     """
     cwd = cwd or REPO_ROOT
-    result: dict[str, Any] = {"lines": {}, "missing": [], "success": True}
+    result: dict[str, Any] = {"lines": {}, "scopes": {}, "missing": [], "success": True}
     for name in suites:
         if name == "pytest":
             commands = [pytest_command()]
@@ -1161,6 +1187,7 @@ def run_summary(
         else:
             commands = full_suite_commands(cwd)
         lines: list[str] = []
+        scopes: set[str] = set()
         for cmd in commands:
             entry = query_cached(cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS)
             if entry is None:
@@ -1168,7 +1195,9 @@ def run_summary(
                 result["success"] = False
                 continue
             lines.extend(summary_lines(entry["stdout"], entry["stderr"], pattern=pattern))
+            scopes.add(entry.get("scope", "full"))
         result["lines"][name] = lines
+        result["scopes"][name] = "mixed" if len(scopes) > 1 else (next(iter(scopes)) if scopes else "missing")
     return result
 
 
@@ -1193,7 +1222,8 @@ def main(argv: list[str] | None = None) -> int:
                 if name in summary["missing"]:
                     print(f"{name}: no cached result — run the suite first or use --force")
                 else:
-                    print(f"{name} summary:")
+                    scope = summary["scopes"].get(name, "full")
+                    print(f"{name} summary ({scope} scope):")
                     for line in lines:
                         print(f"  {line}")
         return 0 if summary["success"] else 1

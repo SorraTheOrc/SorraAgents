@@ -29,9 +29,17 @@ Entry layout (stable, documented for read-only consumers)::
 
     <cache_dir>/<key>/
         metadata.json   {"version":1, "command":..., "git_state":...,
-                         "exit_code":..., "completed_at": <epoch float>}
+                         "scope": "full"|"changed", "exit_code":...,
+                         "completed_at": <epoch float>}
         stdout.txt      full stdout of the run
         stderr.txt      full stderr of the run
+
+``scope`` records whether the run was a full-suite run (``"full"`` — the
+historical default, so older entries without the field read as full) or a
+changed-file partial run (``"changed"`` — distinct cache keys from the full
+suite anyway, but the field lets read-only consumers such as the audit skill
+reject partial runs as full-suite evidence even if command sets ever
+converge).
 
 Writes are atomic (temp file + ``os.replace``); no locking is used.
 """
@@ -183,7 +191,9 @@ def lookup(
     miss (fresh run) and never raise into the caller.
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
-    (epoch float), ``command`` (normalized), ``git_state`` and ``cached: True``.
+    (epoch float), ``command`` (normalized), ``git_state``, ``scope``
+    (``"full"`` for historical entries lacking the field — see module docs)
+    and ``cached: True``.
     """
     entry_dir = _entry_dir(command, git_state, cwd or os.getcwd())
     meta_path = entry_dir / "metadata.json"
@@ -213,6 +223,7 @@ def lookup(
         "completed_at": completed_at,
         "command": meta.get("command", normalize_test_command(command)),
         "git_state": git_state,
+        "scope": meta.get("scope", "full"),
         "cached": True,
     }
 
@@ -226,12 +237,18 @@ def store(
     stderr: str,
     exit_code: int,
     completed_at: float | None = None,
+    scope: str = "full",
 ) -> Path:
     """Persist a run result, replacing any existing entry for the same key.
 
     Writes stdout/stderr first, then metadata last (atomic each); a partial
     write is therefore treated as corrupt by :func:`lookup` and degrades to a
     fresh run.
+
+    *scope* records whether the run covered the full suite (``"full"``,
+    default — the only scope before scope-aware selection existed) or a
+    changed-file subset (``"changed"``). Read-only consumers can therefore
+    distinguish partial runs from full-suite evidence.
 
     Returns the entry directory path.
     """
@@ -243,6 +260,7 @@ def store(
         "version": _CACHE_VERSION,
         "command": normalized,
         "git_state": git_state,
+        "scope": scope,
         "exit_code": int(exit_code),
         "completed_at": completed_at if completed_at is not None else time.time(),
     }
@@ -290,6 +308,7 @@ def run_cached(
     ttl: float = DEFAULT_TTL_SECONDS,
     timeout: int = 600,
     runner: Runner = _default_runner,
+    scope: str = "full",
 ) -> dict[str, Any]:
     """Run *command* through the cache.
 
@@ -300,10 +319,12 @@ def run_cached(
       stores the result, and returns it.
     - ``force=True`` bypasses lookup but still stores (refresh).
     - ``no_cache=True`` bypasses lookup AND storage (pure bypass).
+    - *scope* (default ``"full"``) is recorded in the stored metadata so
+      read-only consumers can tell partial runs from full-suite evidence.
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
-    (epoch float), ``command`` (normalized), ``git_state`` and ``cached``
-    (True when served from cache).
+    (epoch float), ``command`` (normalized), ``git_state``, ``scope`` and
+    ``cached`` (True when served from cache).
     """
     cwd_path = Path(cwd or os.getcwd()).resolve()
     cwd_str = str(cwd_path)
@@ -311,7 +332,11 @@ def run_cached(
 
     if not force and not no_cache:
         hit = lookup(command, git_state, cwd=cwd_str, ttl=ttl)
-        if hit is not None:
+        # A cached entry recorded under a different scope is not a valid hit
+        # for this request (scope is stored in metadata; the cache key is the
+        # command+state, so this only matters if command sets ever converge —
+        # never serve a partial run as a full-suite result and vice versa).
+        if hit is not None and hit.get("scope", "full") == scope:
             return hit
 
     normalized = normalize_test_command(command)
@@ -327,6 +352,7 @@ def run_cached(
             stderr=proc.stderr or "",
             exit_code=proc.returncode,
             completed_at=completed_at,
+            scope=scope,
         )
 
     return {
@@ -336,6 +362,7 @@ def run_cached(
         "completed_at": completed_at,
         "command": normalized,
         "git_state": git_state,
+        "scope": scope,
         "cached": False,
     }
 
