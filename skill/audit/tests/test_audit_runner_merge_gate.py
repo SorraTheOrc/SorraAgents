@@ -490,6 +490,10 @@ class TestCmdIssueMergeGateFailClosed:
         pi_mock = mock.MagicMock()
         with (
             mock.patch.object(
+                audit_runner, "_resolve_owning_project_root",
+                return_value=audit_runner.TARGET_PROJECT_ROOT,
+            ),
+            mock.patch.object(
                 audit_runner, "_resolve_item_integration_evidence",
                 return_value=(["deadbeef"], "wl-WL-ABC123-rename-tab"),
             ),
@@ -546,6 +550,10 @@ class TestCmdIssueMergeGateFailClosed:
             ]),
         }
         with (
+            mock.patch.object(
+                audit_runner, "_resolve_owning_project_root",
+                return_value=audit_runner.TARGET_PROJECT_ROOT,
+            ),
             mock.patch.object(
                 audit_runner, "_resolve_item_integration_evidence",
                 return_value=(["deadbeef"], "wl-WL-ABC123-rename-tab"),

@@ -74,23 +74,48 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess]
 def _resolve_repo_root() -> Path:
     """Resolve the framework repository root from this module's location.
 
-    The module may be imported from inside a git worktree — a full checkout
-    under ``<main>/.worklog/worktrees/<name>/`` whose ``skill/`` tree is a
-    complete copy. The sibling-projects scan base must be derived from the
-    MAIN checkout: a worktree has a ``.git`` FILE (gitdir pointer) at its
-    root, while the main checkout has a ``.git`` DIRECTORY. Walking up from
-    the module file, the first ancestor that owns ``skill/shared`` and is
-    NOT a worktree is the framework main checkout.
+    Delegates to :func:`_resolve_owning_checkout_root` with this module's
+    own file (symlinks resolved) — the single seam tests exercise.
     """
-    current = Path(__file__).resolve().parent  # skill/shared
+    return _resolve_owning_checkout_root(Path(__file__).resolve())
+
+
+def _resolve_owning_checkout_root(module_file: Path) -> Path:
+    """Resolve the checkout root that owns a skill/shared module file.
+
+    The module may live inside a git worktree — a full checkout under
+    ``<main>/.worklog/worktrees/<name>/`` whose ``skill/`` tree is a complete
+    copy. The sibling-projects scan base must be derived from the MAIN
+    checkout: a worktree has a ``.git`` FILE (gitdir pointer) at its root,
+    while the main checkout has a ``.git`` DIRECTORY. Walking up from the
+    module file, the first ancestor that owns ``skill/shared`` and is
+    NOT a worktree is the framework main checkout.
+
+    A tracked nested copy ``skill/skill/shared/status_lifecycle.py`` (see
+    commit aea4c741) makes a naive existence check match the *parent* of the
+    real checkout (``<repo>/skill``) one level too deep, because that parent
+    also "owns" the nested copy. Such a parent never has a ``.git`` member
+    of its own, so the walk requires the owning candidate to be a git
+    checkout root (``.git`` directory; worktrees with a ``.git`` FILE are
+    skipped, which restores the pre-nested-copy resolution to the main
+    checkout for worktree launches). The walk therefore falls through any
+    nested-copy-only candidate to the real owner.
+    """
+    current = module_file.parent  # skill/shared
     for candidate in current.parents:
-        if not (candidate / "skill" / "shared" / "status_lifecycle.py").is_file():
+        module_copy = candidate / "skill" / "shared" / "status_lifecycle.py"
+        if not module_copy.is_file():
             continue
         if (candidate / ".git").is_file():
             continue  # worktree copy (gitdir pointer), not the main checkout
-        return candidate
-    # Fallback: conventional layout (repo root = two levels above skill/shared).
-    return Path(__file__).resolve().parents[2]
+        if (candidate / ".git").is_dir():
+            return candidate  # owns skill/shared AND is a checkout root
+        # Matched only via the nested skill/skill copy (candidate is
+        # <real-checkout>/skill) or a foreign checkout's copy — keep walking
+        # to the first ancestor that is a real checkout root.
+    # Fallback: conventional layout (repo root = two levels above
+    # skill/shared).
+    return module_file.parents[2]
 
 
 REPO_ROOT = _resolve_repo_root()
