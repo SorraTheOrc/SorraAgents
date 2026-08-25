@@ -40,6 +40,14 @@ hit the same entries because both resolve the same project root.
   `npm test 2>&1 | grep -E "Test Files|failed"`, `| tail -30`, `| head`,
   `| tee`) normalize to the underlying run and share one cache entry.
 - **Visibility**: non-JSON output marks cache hits with `[cached]`.
+- **PATH augmentation for user-installed executables (SA-0MSUZAJPC003BS66)**: the
+  default runner (`_default_runner` in `test_cache.py`) prepends
+  `~/.local/bin` to the subprocess `PATH` when it is not already present, so
+  user-installed executables (e.g. `pytest` installed via `pip --user`) are
+  found when a suite command is spawned in a restricted environment (e.g. an
+  audit runner whose PATH lacks the user-local bin directory). The path stays
+  clean for callers that already have the directory configured (no duplicate
+  entry).
 
 Query a cached run without executing anything:
 
