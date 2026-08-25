@@ -17,6 +17,7 @@ import pytest
 from test_cache import (
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
+    _default_runner,
     cache_dir,
     compute_git_state,
     lookup,
@@ -499,8 +500,6 @@ def test_default_runner_prepends_local_bin_to_path(git_repo: Path) -> None:
     (missing ~/.local/bin on PATH), user-installed executables like pytest
     must still be found (SA-0MSUZAJPC003BS66).
     """
-    from skill.test_cache import _default_runner
-
     captured_env: dict[str, str] = {}
     original_path = os.environ.get("PATH", "")
     local_bin = os.path.expanduser("~/.local/bin")
@@ -537,8 +536,6 @@ def test_default_runner_skips_dup_when_local_bin_already_on_path(git_repo: Path)
     The runner checks before prepending so the path stays clean for callers
     that already have the directory configured.
     """
-    from skill.test_cache import _default_runner
-
     captured_env: dict[str, str] = {}
     original_path = os.environ.get("PATH", "")
     # Prepend ~/.local/bin to our own PATH so it is already present.
