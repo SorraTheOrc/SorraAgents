@@ -132,14 +132,16 @@ class Timer:
     def percentage(self) -> float:
         """Percentage of total time this step represents, relative to root.
 
-        Returns 0.0 if no root is found (root timer itself).
+        Returns 100.0 for the root timer itself even when no measurable
+        time elapsed (a step is always 100% of itself); 0.0 for children
+        of a zero-total root (undefined).
         """
         root = self._find_root()
         if root is None:
             return 0.0
         total = root.total_time
         if total == 0.0:
-            return 0.0
+            return 100.0 if root is self else 0.0
         return (self.total_time / total) * 100.0
 
     def _find_root(self) -> Timer | None:

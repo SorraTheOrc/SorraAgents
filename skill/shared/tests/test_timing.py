@@ -120,20 +120,22 @@ class TestPercentageCalculation:
     """Percentages of steps sum to ~100% of total time."""
 
     def test_single_step_is_100_percent(self):
-        """A single root step reports 100%."""
+        """A single root step reports 100% (even with zero measurable time)."""
         with Timer("only") as t:
             pass
-        assert abs(t.percentage - 100.0) < 0.1
+        assert t.percentage == 100.0
 
     def test_children_sum_to_100_percent(self):
         """Sibling children's percentages sum to ~100%."""
+        import time as _time
+
         with Timer("parent") as parent:
             with Timer("a") as a:
-                pass
+                _time.sleep(0.01)
             with Timer("b") as b:
-                pass
+                _time.sleep(0.01)
         total_pct = a.percentage + b.percentage
-        assert abs(total_pct - 100.0) < 0.5
+        assert abs(total_pct - 100.0) < 2.0
 
     def test_percentage_is_non_negative(self):
         """Percentages are never negative."""

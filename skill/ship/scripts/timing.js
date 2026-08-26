@@ -90,7 +90,11 @@ class Timer {
     const root = this._findRoot();
     if (!root) return 0;
     const total = root.totalSeconds;
-    if (total === 0) return 0;
+    if (total === 0) {
+      // Degenerate: no measurable time. A root step is 100% of itself;
+      // children are undefined → 0.
+      return root === this ? 100 : 0;
+    }
     return (this.totalSeconds / total) * 100;
   }
 
