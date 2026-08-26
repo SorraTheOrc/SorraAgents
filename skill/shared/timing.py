@@ -75,13 +75,7 @@ class Timer:
 
     def __enter__(self) -> Timer:
         """Start timing; automatically link to parent from the active stack."""
-        self.start_time = time.monotonic()
-        stack = _active_stack()
-        if stack:
-            self.parent = stack[-1]
-            self.parent.nested_steps.append(self)
-        stack.append(self)
-        return self
+        return self.start()
 
     def __exit__(
         self,
@@ -90,12 +84,38 @@ class Timer:
         exc_tb: Any,  # noqa: PYI036
     ) -> bool:
         """Stop timing. Return False to propagate any exception."""
+        self.stop()
+        return False  # do not suppress exceptions
+
+    def start(self) -> Timer:
+        """Start timing manually (equivalent to entering the context manager).
+
+        Records the wall-clock start time and links the timer into the
+        active thread-local stack so nested timers roll up into the parent.
+        """
+        self.start_time = time.monotonic()
+        stack = _active_stack()
+        if stack:
+            self.parent = stack[-1]
+            self.parent.nested_steps.append(self)
+        stack.append(self)
+        return self
+
+    def stop(self) -> float:
+        """Stop timing manually and return elapsed seconds.
+
+        Equivalent to exiting the context manager. Idempotent: a second
+        ``stop()`` is a no-op.
+        """
+        if self.start_time == 0.0:
+            return self.elapsed
         self.elapsed = time.monotonic() - self.start_time
+        self.start_time = 0.0
         stack = _active_stack()
         # Pop from stack (should be the current timer)
         if stack and stack[-1] is self:
             stack.pop()
-        return False  # do not suppress exceptions
+        return self.elapsed
 
     @property
     def total_time(self) -> float:

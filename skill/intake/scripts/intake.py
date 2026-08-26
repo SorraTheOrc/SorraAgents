@@ -34,8 +34,10 @@ if str(_SKILLS_ROOT) not in sys.path:
 
 from import_guard import guard_shared_import
 
+
 try:
     from shared.status_lifecycle import StatusLifecycle, run_wl
+    from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 
@@ -218,22 +220,29 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    try:
-        if args.command == "start":
-            result = cmd_start(args.item_id, assignee=args.assignee)
-        elif args.command == "finish":
-            result = cmd_finish(args.item_id, description_file=args.description_file)
-        elif args.command == "auto-complete":
-            result = cmd_auto_complete(args.item_id)
-        elif args.command == "abort":
-            result = cmd_abort(args.item_id)
-        else:
-            print(json.dumps({"success": False, "error": f"Unknown command: {args.command}"}))
+    with Timer("intake") as timer:
+        try:
+            with Timer(f"cmd_{args.command}"):
+                if args.command == "start":
+                    result = cmd_start(args.item_id, assignee=args.assignee)
+                elif args.command == "finish":
+                    result = cmd_finish(args.item_id, description_file=args.description_file)
+                elif args.command == "auto-complete":
+                    result = cmd_auto_complete(args.item_id)
+                elif args.command == "abort":
+                    result = cmd_abort(args.item_id)
+                else:
+                    print(json.dumps({"success": False, "error": f"Unknown command: {args.command}"}))
+                    return 1
+        except Exception as exc:  # noqa: BLE001 -- command failure logged
+            LOG.error("Command failed: %s", exc)
+            print(json.dumps({"success": False, "error": str(exc)}))
             return 1
-    except Exception as exc:  # noqa: BLE001 -- command failure logged
-        LOG.error("Command failed: %s", exc)
-        print(json.dumps({"success": False, "error": str(exc)}))
-        return 1
+
+        # Timing report: human-readable on stderr, structured in JSON output
+        # (additive only — existing keys unchanged, SA-0MT319YGQ002E801 AC5).
+        print(timer.render(), file=sys.stderr)
+        result["timing"] = timer.to_dict()
 
     print(json.dumps(result))
     return 0

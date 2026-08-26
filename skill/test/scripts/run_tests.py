@@ -63,6 +63,7 @@ from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
 )
+from shared.timing import Timer
 
 REPO_ROOT = _SKILLS_ROOT.parent
 
@@ -1018,23 +1019,25 @@ def run_all(
     all_failures: list[dict[str, str]] = []
     notices: list[str] = []
     resolved_scopes: list[str] = []
-    for name in suites:
-        result = run_suite(
-            name,
-            cwd=cwd,
-            timeout=timeout,
-            use_cache=use_cache,
-            force=force,
-            no_cache=no_cache,
-            scope=scope,
-            base_ref=base_ref,
-        )
-        results[name] = result
-        resolved_scopes.append(result["scope"])
-        for failure in result["failures"]:
-            all_failures.append({**failure, "suite": name})
-        if result.get("notice"):
-            notices.append(result["notice"])
+    with Timer("run_all") as _all_timer:
+        for name in suites:
+            with Timer(f"suite:{name}"):
+                result = run_suite(
+                    name,
+                    cwd=cwd,
+                    timeout=timeout,
+                    use_cache=use_cache,
+                    force=force,
+                    no_cache=no_cache,
+                    scope=scope,
+                    base_ref=base_ref,
+                )
+            results[name] = result
+            resolved_scopes.append(result["scope"])
+            for failure in result["failures"]:
+                all_failures.append({**failure, "suite": name})
+            if result.get("notice"):
+                notices.append(result["notice"])
     return {
         "success": all(r["success"] for r in results.values()),
         "suites": results,
@@ -1042,6 +1045,7 @@ def run_all(
         "notices": notices,
         "scope": scope,
         "resolved_scopes": resolved_scopes,
+        "timing": _all_timer.to_dict(),
     }
 
 
@@ -1213,50 +1217,57 @@ def main(argv: list[str] | None = None) -> int:
     # timeoutPerCommand (F2 AC1), else the default 600.
     timeout = args.timeout or suite_timeout_per_command(project_root) or 600
 
-    if args.summary:
-        summary = run_summary(suites, cwd=project_root, pattern=args.summary_grep)
+    with Timer("run_tests") as _root_timer:
+        if args.summary:
+            with Timer("run_summary"):
+                summary = run_summary(suites, cwd=project_root, pattern=args.summary_grep)
+            if args.json:
+                summary["timing"] = _root_timer.to_dict()
+                print(json.dumps(summary, indent=2))
+            else:
+                for name, lines in summary["lines"].items():
+                    if name in summary["missing"]:
+                        print(f"{name}: no cached result — run the suite first or use --force")
+                    else:
+                        scope = summary["scopes"].get(name, "full")
+                        print(f"{name} summary ({scope} scope):")
+                        for line in lines:
+                            print(f"  {line}")
+                print(_root_timer.render(), file=sys.stderr)
+            return 0 if summary["success"] else 1
+
+        result = run_all(
+            suites=suites,
+            cwd=project_root,
+            timeout=timeout,
+            use_cache=not args.no_cache,
+            force=args.force,
+            no_cache=args.no_cache,
+            scope=args.scope,
+            base_ref=args.target_branch or "origin/dev",
+        )
+
+        if args.rerun_failures and result["failures"]:
+            with Timer("rerun_failures"):
+                result["failures"] = rerun_failures(result["failures"], timeout=timeout)
+            result["success"] = all(r["success"] for r in result["suites"].values()) and not result["failures"]
+
         if args.json:
-            print(json.dumps(summary, indent=2))
+            result["timing"] = _root_timer.to_dict()
+            print(json.dumps(result, indent=2))
         else:
-            for name, lines in summary["lines"].items():
-                if name in summary["missing"]:
-                    print(f"{name}: no cached result — run the suite first or use --force")
-                else:
-                    scope = summary["scopes"].get(name, "full")
-                    print(f"{name} summary ({scope} scope):")
-                    for line in lines:
-                        print(f"  {line}")
-        return 0 if summary["success"] else 1
-
-    result = run_all(
-        suites=suites,
-        cwd=project_root,
-        timeout=timeout,
-        use_cache=not args.no_cache,
-        force=args.force,
-        no_cache=args.no_cache,
-        scope=args.scope,
-        base_ref=args.target_branch or "origin/dev",
-    )
-
-    if args.rerun_failures and result["failures"]:
-        result["failures"] = rerun_failures(result["failures"], timeout=timeout)
-        result["success"] = all(r["success"] for r in result["suites"].values()) and not result["failures"]
-
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        for name, suite_result in result["suites"].items():
-            status = "PASS" if suite_result["success"] else "FAIL"
-            cached = " [cached]" if suite_result.get("cached") else ""
-            scope = f" [{suite_result.get('scope', 'full')} scope]"
-            print(f"{name}: {status}{cached}{scope} ({suite_result['command']})")
-            if suite_result.get("notice"):
-                print(f"  notice: {suite_result['notice']}")
-            for failure in suite_result["failures"]:
-                print(f"  FAILED: {failure['test_name']}")
-        for notice in result["notices"]:
-            print(f"notice: {notice}")
+            for name, suite_result in result["suites"].items():
+                status = "PASS" if suite_result["success"] else "FAIL"
+                cached = " [cached]" if suite_result.get("cached") else ""
+                scope = f" [{suite_result.get('scope', 'full')} scope]"
+                print(f"{name}: {status}{cached}{scope} ({suite_result['command']})")
+                if suite_result.get("notice"):
+                    print(f"  notice: {suite_result['notice']}")
+                for failure in suite_result["failures"]:
+                    print(f"  FAILED: {failure['test_name']}")
+            for notice in result["notices"]:
+                print(f"notice: {notice}")
+            print(_root_timer.render(), file=sys.stderr)
 
     return 0 if result["success"] else 1
 

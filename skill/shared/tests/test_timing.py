@@ -32,6 +32,29 @@ class TestBasicStepTiming:
             pass
         assert t.elapsed > 0
 
+    def test_manual_start_stop_records_elapsed(self):
+        """Manual start()/stop() records elapsed time (audit per-call use)."""
+        t = Timer("manual_step")
+        t.start()
+        t.stop()
+        assert t.elapsed > 0
+
+    def test_manual_stop_returns_elapsed_seconds(self):
+        """stop() returns the elapsed seconds float."""
+        t = Timer("manual_step")
+        t.start()
+        seconds = t.stop()
+        assert isinstance(seconds, float)
+        assert seconds > 0
+
+    def test_manual_stop_is_idempotent(self):
+        """A second stop() is a no-op (idempotent)."""
+        t = Timer("manual_step")
+        t.start()
+        first = t.stop()
+        second = t.stop()
+        assert second == first
+
     def test_elapsed_is_a_number(self):
         """Elapsed time is a float."""
         with Timer("step") as t:
@@ -262,14 +285,16 @@ class TestNestedStepPercentages:
 
     def test_child_percentage_in_parent_context(self):
         """Child percentage is relative to root total."""
+        import time as _time
+
         with Timer("root") as root:
             with Timer("half") as half:
-                pass
+                _time.sleep(0.02)
             with Timer("half") as half2:
-                pass
-        # Both should be ~50%
-        assert 40 < half.percentage < 60
-        assert 40 < half2.percentage < 60
+                _time.sleep(0.02)
+        # Both should be ~50% (equal sleep durations; allow scheduler noise)
+        assert 35 < half.percentage < 65
+        assert 35 < half2.percentage < 65
 
     def test_deeply_nested_child_percentage(self):
         """A deeply nested child's percentage is relative to the root."""

@@ -68,6 +68,7 @@ from import_guard import guard_shared_import
 
 try:
     from shared.status_lifecycle import resolve_worklog_flags
+    from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 
@@ -379,18 +380,25 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("WL_NO_ICONS") == "1":
         args.no_icons = True
 
-    data = _load_payload(args.work_item_id)
-    ac_rows = [_parse_ac(spec) for spec in args.ac]
-    report = render_report(
-        data,
-        skill_name=args.skill_name,
-        headline=args.headline,
-        ac_rows=ac_rows,
-        producer_actions=args.producer_actions,
-        notes=args.notes,
-        next_action=args.next_action,
-        no_icons=args.no_icons,
-    )
+    with Timer("render_report") as timer:
+        with Timer("load_payload"):
+            data = _load_payload(args.work_item_id)
+        with Timer("parse_ac_rows"):
+            ac_rows = [_parse_ac(spec) for spec in args.ac]
+        with Timer("render_report"):
+            report = render_report(
+                data,
+                skill_name=args.skill_name,
+                headline=args.headline,
+                ac_rows=ac_rows,
+                producer_actions=args.producer_actions,
+                notes=args.notes,
+                next_action=args.next_action,
+                no_icons=args.no_icons,
+            )
+        # Timing report on stderr so stdout carries only the report
+        # (SA-0MT319YGQ002E801 AC5 — additive, non-breaking).
+        print(timer.render(), file=sys.stderr)
     print(report)
     return 0
 

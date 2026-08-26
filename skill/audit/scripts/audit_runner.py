@@ -116,6 +116,7 @@ try:
     from shared.status_lifecycle import (
         resolve_worklog_flags as shared_resolve_worklog_flags,
     )
+    from shared.timing import Timer as SharedTimer
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 from test.scripts.run_tests import (
@@ -2710,8 +2711,11 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     stderr = ""
     # Wall-clock baseline for per-call timing instrumentation. Measures the
     # full call including any provider-error retries so operators can see the
-    # true per-call duration in the Phase 2 performance baseline.
-    _call_start = time.monotonic()
+    # true per-call duration in the Phase 2 performance baseline. Routed
+    # through the shared Timer so the per-call timing aligns with the unified
+    # timing utility (SA-0MT319YGQ002E801 AC2 — extends, does not remove).
+    _call_timer = SharedTimer("pi_call")
+    _call_timer.start()
     while True:
         attempt += 1
         try:
@@ -2760,7 +2764,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                         "raw_stderr": stderr,
                         "extracted_text": "",
                         "_timeout": True,
-                        "elapsed_seconds": time.monotonic() - _call_start,
+                        "elapsed_seconds": _call_timer.elapsed,
                     }
         except TimeoutError as exc:
             # Ceiling saturated past the bounded wait: do not launch yet
@@ -2779,7 +2783,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 "raw_stderr": "",
                 "extracted_text": "",
                 "_concurrency_timeout": True,
-                "elapsed_seconds": time.monotonic() - _call_start,
+                "elapsed_seconds": _call_timer.elapsed,
             }
 
         # Detect provider errors (e.g. "finish_reason: error" where the model
@@ -2789,7 +2793,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             break
         time.sleep(_PI_RETRY_BACKOFF_SECONDS * attempt)
 
-    elapsed_seconds = time.monotonic() - _call_start
+    elapsed_seconds = _call_timer.elapsed
 
     if provider_error:
         if ac_fallback_used is not None:
@@ -9938,37 +9942,43 @@ def main(argv: list[str] | None = None) -> int:
     _apply_proxy_mode_serialization()
 
     if args.command == "issue":
-        return cmd_issue(args.issue_id, persist=not args.do_not_persist,
-                         timeout=_resolve_effective_timeout(args.timeout),
-                         parent_timeout=_resolve_parent_timeout(args.parent_timeout),
-                         pi_bin=args.pi_bin, model=args.model,
-                         phase1_model=getattr(args, "phase1_model", None),
-                         model_source=args.model_source, json_mode=args.json,
-                         debug_log=args.debug_log,
-                         force=args.force,
-                         worklog_dir=args.worklog_dir,
-                         batch_phase2=_phase2_batch_enabled(args.batch_phase2),
-                         green_run=args.green_run,
-                         audit_children=args.audit_children,
-                         max_child_audits=_resolve_max_child_audits(
-                             args.max_child_audits
-                         ),
-                         max_citations_per_ac=_resolve_max_citations_per_ac(
-                             args.max_citations_per_ac
-                         ),
-                         run_tests=args.run_tests,
-                         no_execute=getattr(args, "no_execute", False),
-                         checkpoint_dir=getattr(args, "checkpoint_dir", None),
-                         no_checkpoint=getattr(args, "no_checkpoint", False))
+        with SharedTimer("audit_runner_issue") as _root_timer:
+            _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
+                            timeout=_resolve_effective_timeout(args.timeout),
+                            parent_timeout=_resolve_parent_timeout(args.parent_timeout),
+                            pi_bin=args.pi_bin, model=args.model,
+                            phase1_model=getattr(args, "phase1_model", None),
+                            model_source=args.model_source, json_mode=args.json,
+                            debug_log=args.debug_log,
+                            force=args.force,
+                            worklog_dir=args.worklog_dir,
+                            batch_phase2=_phase2_batch_enabled(args.batch_phase2),
+                            green_run=args.green_run,
+                            audit_children=args.audit_children,
+                            max_child_audits=_resolve_max_child_audits(
+                                args.max_child_audits
+                            ),
+                            max_citations_per_ac=_resolve_max_citations_per_ac(
+                                args.max_citations_per_ac
+                            ),
+                            run_tests=args.run_tests,
+                            no_execute=getattr(args, "no_execute", False),
+                            checkpoint_dir=getattr(args, "checkpoint_dir", None),
+                            no_checkpoint=getattr(args, "no_checkpoint", False))
+            print(_root_timer.render(), file=sys.stderr)
+        return _rc
     elif args.command == "project":
-        return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
-                           pi_bin=args.pi_bin, model=args.model,
-                           model_source=args.model_source, json_mode=args.json,
-                           debug_log=args.debug_log,
-                           worklog_dir=args.worklog_dir,
-                           max_citations_per_ac=_resolve_max_citations_per_ac(
-                               args.max_citations_per_ac
-                           ))
+        with SharedTimer("audit_runner_project") as _root_timer:
+            _rc = cmd_project(timeout=_resolve_effective_timeout(args.timeout),
+                              pi_bin=args.pi_bin, model=args.model,
+                              model_source=args.model_source, json_mode=args.json,
+                              debug_log=args.debug_log,
+                              worklog_dir=args.worklog_dir,
+                              max_citations_per_ac=_resolve_max_citations_per_ac(
+                                  args.max_citations_per_ac
+                              ))
+            print(_root_timer.render(), file=sys.stderr)
+        return _rc
 
     return 2
 

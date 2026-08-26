@@ -41,6 +41,7 @@ from scripts.failure_notice import FailureNotice
 
 try:
     from shared.status_lifecycle import StatusLifecycle
+    from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 
@@ -438,78 +439,86 @@ def refactor_pipeline(
         },
     }
 
-    # Step 1: Detect session files
-    session = detect_session_files(parent_branch)
-    report["session_files"] = session
+    with Timer("refactor_pipeline") as _pipeline_timer:
+        # Step 1: Detect session files
+        with Timer("step_1_detect_session_files"):
+            session = detect_session_files(parent_branch)
+        report["session_files"] = session
 
-    if not session["all_files"]:
-        report["summary"]["files_analyzed"] = 0
-        LOG.info("No files modified in current session; nothing to analyze")
-        return report
+        if not session["all_files"]:
+            report["summary"]["files_analyzed"] = 0
+            LOG.info("No files modified in current session; nothing to analyze")
+            report["timing"] = _pipeline_timer.to_dict()
+            return report
 
-    LOG.info(
-        "Session files: %d changed, %d untracked",
-        len(session["changed"]),
-        len(session["untracked"]),
-    )
-    report["summary"]["files_analyzed"] = len(session["all_files"])
-
-    # Step 2: Auto-fix session-introduced smells (before detection)
-    # Run linters with --fix to resolve auto-fixable issues in-place.
-    # This handles simple, mechanical issues (unused imports, formatting)
-    # before the detection phase, so only non-auto-fixable smells remain.
-    auto_fix_result = auto_fix_files(
-        files=session["all_files"],
-        dry_run=dry_run,
-    )
-    report["auto_fix"] = auto_fix_result
-    report["summary"]["auto_fixed"] = len(auto_fix_result["fixed_findings"])
-
-    if auto_fix_result["fixes_applied"]:
         LOG.info(
-            "Auto-fixed %d issues before smell detection",
+            "Session files: %d changed, %d untracked",
+            len(session["changed"]),
+            len(session["untracked"]),
+        )
+        report["summary"]["files_analyzed"] = len(session["all_files"])
+
+        # Step 2: Auto-fix session-introduced smells (before detection)
+        # Run linters with --fix to resolve auto-fixable issues in-place.
+        # This handles simple, mechanical issues (unused imports, formatting)
+        # before the detection phase, so only non-auto-fixable smells remain.
+        with Timer("step_2_auto_fix_files"):
+            auto_fix_result = auto_fix_files(
+                files=session["all_files"],
+                dry_run=dry_run,
+            )
+        report["auto_fix"] = auto_fix_result
+        report["summary"]["auto_fixed"] = len(auto_fix_result["fixed_findings"])
+
+        if auto_fix_result["fixes_applied"]:
+            LOG.info(
+                "Auto-fixed %d issues before smell detection",
+                len(auto_fix_result["fixed_findings"]),
+            )
+
+        # Step 3: Run smell detection (on auto-fixed files)
+        with Timer("step_3_smell_detection"):
+            smells = run_smell_detection(
+                files=session["all_files"],
+                config=config,
+                no_linter=no_linter,
+                no_llm=no_llm,
+            )
+        report["smells_detected"] = smells
+        report["summary"]["total_smells"] = len(smells)
+
+        if not smells:
+            LOG.info("No code smells detected after auto-fix")
+            report["timing"] = _pipeline_timer.to_dict()
+            return report
+
+        # Step 4: Classify smells
+        # After auto-fix, any remaining smells are non-auto-fixable and treated
+        # as pre-existing (e.g., design/architectural smells from LLM analysis,
+        # or linter issues that cannot be auto-fixed).
+        report["pre_existing_smells"] = smells
+        report["summary"]["pre_existing"] = len(smells)
+
+        # Step 5: Remediate pre-existing smells
+        with Timer("step_5_remediate_pre_existing"):
+            remediation = remediate_pre_existing(
+                smells=smells,
+                work_item_id=None,
+                dry_run=dry_run,
+            )
+        report["remediation"] = remediation
+        report["summary"]["work_items_created"] = len(remediation["work_items_created"])
+        report["summary"]["comments_injected"] = remediation["comments_injected"]
+
+        LOG.info(
+            "Refactor complete: %d auto-fixed, %d smells, %d work items, %d comments injected",
             len(auto_fix_result["fixed_findings"]),
+            len(smells),
+            len(remediation["work_items_created"]),
+            remediation["comments_injected"],
         )
 
-    # Step 3: Run smell detection (on auto-fixed files)
-    smells = run_smell_detection(
-        files=session["all_files"],
-        config=config,
-        no_linter=no_linter,
-        no_llm=no_llm,
-    )
-    report["smells_detected"] = smells
-    report["summary"]["total_smells"] = len(smells)
-
-    if not smells:
-        LOG.info("No code smells detected after auto-fix")
-        return report
-
-    # Step 4: Classify smells
-    # After auto-fix, any remaining smells are non-auto-fixable and treated
-    # as pre-existing (e.g., design/architectural smells from LLM analysis,
-    # or linter issues that cannot be auto-fixed).
-    report["pre_existing_smells"] = smells
-    report["summary"]["pre_existing"] = len(smells)
-
-    # Step 5: Remediate pre-existing smells
-    remediation = remediate_pre_existing(
-        smells=smells,
-        work_item_id=None,
-        dry_run=dry_run,
-    )
-    report["remediation"] = remediation
-    report["summary"]["work_items_created"] = len(remediation["work_items_created"])
-    report["summary"]["comments_injected"] = remediation["comments_injected"]
-
-    LOG.info(
-        "Refactor complete: %d auto-fixed, %d smells, %d work items, %d comments injected",
-        len(auto_fix_result["fixed_findings"]),
-        len(smells),
-        len(remediation["work_items_created"]),
-        remediation["comments_injected"],
-    )
-
+        report["timing"] = _pipeline_timer.to_dict()
     return report
 
 

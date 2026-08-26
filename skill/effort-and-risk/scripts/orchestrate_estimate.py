@@ -43,6 +43,7 @@ from scripts.failure_notice import FailureNotice
 
 try:
     from shared.status_lifecycle import resolve_worklog_flags
+    from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 
@@ -304,34 +305,40 @@ def _post_comment(issue_id: str, combined_text: str) -> dict:
 def main():
     data = json.load(sys.stdin)
 
-    # 1. Compute O/M/P estimates and basic effort metrics
-    o, m, p = compute_omp(data)
-    overheads = data.get("overheads", {})
+    with Timer("orchestrate_estimate") as timer:
+        # 1. Compute O/M/P estimates and basic effort metrics
+        with Timer("compute_omp"):
+            o, m, p = compute_omp(data)
+        overheads = data.get("overheads", {})
 
-    expected = (o + 4 * m + p) / 6.0
-    overheads_total = sum(float(v) for v in overheads.values()) if overheads else 0.0
-    recommended = expected + overheads_total
-    range_min = o + overheads_total
-    range_max = p + overheads_total
+        expected = (o + 4 * m + p) / 6.0
+        overheads_total = sum(float(v) for v in overheads.values()) if overheads else 0.0
+        recommended = expected + overheads_total
+        range_min = o + overheads_total
+        range_max = p + overheads_total
 
-    # 2. Validate issue_id early
-    issue_id = data.get("issue_id")
-    if not issue_id:
-        print(json.dumps({"error": "missing required field: issue_id"}))
-        sys.exit(2)
+        # 2. Validate issue_id early
+        issue_id = data.get("issue_id")
+        if not issue_id:
+            print(json.dumps({"error": "missing required field: issue_id"}))
+            sys.exit(2)
 
-    # 3. Fetch the issue stage (exits with codes 3-5 on failure)
-    input_stage = _fetch_issue_stage(issue_id)
+        # 3. Fetch the issue stage (exits with codes 3-5 on failure)
+        with Timer("fetch_issue_stage"):
+            input_stage = _fetch_issue_stage(issue_id)
 
-    # 4. Load t-shirt thresholds and compute the t-shirt size label
-    thresholds = _load_thresholds()
-    tshirt = _compute_tshirt(recommended, thresholds)
+        # 4. Load t-shirt thresholds and compute the t-shirt size label
+        with Timer("compute_tshirt"):
+            thresholds = _load_thresholds()
+            tshirt = _compute_tshirt(recommended, thresholds)
 
-    # 5. Compute certainty (stage-adjusted) and build the risk dict
-    certainty = float(data.get("certainty", 100))
-    original_certainty = certainty
-    if input_stage == "intake_complete":
-        certainty = certainty * 0.6
+        # 5. Compute certainty (stage-adjusted) and build the risk dict
+        certainty = float(data.get("certainty", 100))
+        original_certainty = certainty
+        if input_stage == "intake_complete":
+            certainty = certainty * 0.6
+
+        risk = _compute_risk(data, certainty)
 
     risk = _compute_risk(data, certainty)
 
@@ -373,29 +380,37 @@ def main():
     wl_effort = tshirt
 
     # 8. Update the work-item's effort and risk fields via wl update
-    final["update_result"] = _update_work_item(issue_id, wl_effort, wl_risk)
+    with Timer("update_work_item"):
+        final["update_result"] = _update_work_item(issue_id, wl_effort, wl_risk)
 
     # 9. Render human-readable narrative
-    human_text = _render_human_text(data, final)
+    with Timer("render_human_text"):
+        human_text = _render_human_text(data, final)
 
     # 10. Post the combined narrative + JSON as a comment
-    if human_text.strip():
-        skill_json = {
-            "effort": final.get("effort"),
-            "risk": final.get("risk"),
-            "confidence_percent": final.get("confidence_percent"),
-            "assumptions": final.get("assumptions"),
-            "unknowns": final.get("unknowns"),
-        }
-        skill_json_str = json.dumps(skill_json, indent=2)
-        combined_text = human_text + "\n\n```json\n" + skill_json_str + "\n```"
-        final["comment_result"] = _post_comment(issue_id, combined_text)
-    else:
-        final["comment_result"] = {
-            "success": False,
-            "error": "empty rendered human text",
-            "human_render_stderr": final.get("human_render_stderr", ""),
-        }
+    with Timer("post_comment"):
+        if human_text.strip():
+            skill_json = {
+                "effort": final.get("effort"),
+                "risk": final.get("risk"),
+                "confidence_percent": final.get("confidence_percent"),
+                "assumptions": final.get("assumptions"),
+                "unknowns": final.get("unknowns"),
+            }
+            skill_json_str = json.dumps(skill_json, indent=2)
+            combined_text = human_text + "\n\n```json\n" + skill_json_str + "\n```"
+            final["comment_result"] = _post_comment(issue_id, combined_text)
+        else:
+            final["comment_result"] = {
+                "success": False,
+                "error": "empty rendered human text",
+                "human_render_stderr": final.get("human_render_stderr", ""),
+            }
+
+        # Timing report: human-readable on stderr; structured dict appended to
+        # the JSON output (additive — existing keys unchanged).
+        print(timer.render(), file=sys.stderr)
+        final["timing"] = timer.to_dict()
 
     print(json.dumps(final))
 
