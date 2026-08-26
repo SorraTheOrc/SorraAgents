@@ -78,6 +78,15 @@ sys.path.insert(0, _SKILLS_ROOT_STR)
 
 REPO_ROOT = _SKILLS_ROOT.parent
 
+from audit.scripts.checkpoint_store import (
+    PHASE_CHILDREN,
+    PHASE_LABELS,
+    PHASE_PARENT,
+    PHASE_PHASE2,
+    STATUS_COMPLETED,
+    CheckpointStore,
+    resolve_checkpoint_dir,
+)
 from audit.scripts.persist_audit import (
     PERSIST_CONTENT_INVALID,
     persist_audit,
@@ -5777,6 +5786,13 @@ class _AuditContext:
     max_citations_per_ac: int | None = None
     phase1_model: str | None = None
 
+    # Phase checkpoint store (SA-0MT6EZUS9004FJ9T): bound by cmd_issue after
+    # the launch-context gate; read by _phase1_parent_screening and
+    # _phase_children to skip completed phases on a resumed run. None when
+    # checkpointing is disabled (--no-checkpoint, unresolvable HEAD, or a
+    # store failure) — behavior is then byte-identical to a pre-change run.
+    checkpoint: "CheckpointStore | None" = None
+
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
     resolved_model: str = DEFAULT_MODEL
@@ -7537,6 +7553,146 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
     return result, [], raw_text
 
 
+def _resolve_git_head_sha(runner: Runner) -> str | None:
+    """Resolve the full lowercase git HEAD sha via the run's runner.
+
+    Returns ``None`` when git is unavailable / the runner fails / the output
+    is not a 40-hex sha (checkpointing is disabled in that case — the audit
+    itself is unaffected).
+    """
+    try:
+        proc = runner(["git", "rev-parse", "HEAD"])
+    except Exception:  # noqa: BLE001 -- git is best-effort for checkpoints
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = (proc.stdout or "").strip()
+    if re.fullmatch(r"[0-9a-f]{40}", sha.lower()):
+        return sha.lower()
+    return None
+
+
+def _open_checkpoint_store(ctx: _AuditContext,
+                           checkpoint_dir: str | None = None,
+                           no_checkpoint: bool = False) -> CheckpointStore | None:
+    """Open the phase checkpoint store for this run (best-effort).
+
+    Called right after the launch-context gate so the git root + owning root
+    are resolved. Returns ``None`` when checkpointing is disabled: explicit
+    ``--no-checkpoint``, an empty ``--checkpoint-dir``/``AUDIT_CHECKPOINT_DIR``
+    value, an unresolvable git HEAD, or any store failure — the audit then
+    behaves byte-identically to a pre-change run. ``--force`` starts a fresh
+    checkpoint: the existing file is cleared so a forced re-audit never
+    reuses partial results from an earlier run.
+
+    A resume prints the completed phases + the phase the previous run died
+    in, so operators can see exactly what was preserved (clear timeout
+    reporting — AC4 of SA-0MT6EZUS9004FJ9T).
+    """
+    if no_checkpoint:
+        return None
+    try:
+        cp_dir = resolve_checkpoint_dir(ctx.owning_root, checkpoint_dir)
+        if cp_dir is None:
+            return None
+        git_head = _resolve_git_head_sha(ctx.runner)
+        if git_head is None:
+            print(
+                "Warning: audit checkpointing disabled — could not resolve "
+                "the git HEAD sha",
+                file=sys.stderr,
+            )
+            return None
+        store = CheckpointStore(ctx.issue_id, git_head, cp_dir,
+                                force=ctx.force)
+        if ctx.force:
+            store.clear()
+            print(
+                f"[checkpoint] --force: starting a fresh checkpoint run "
+                f"({store.path()})",
+                file=sys.stderr,
+            )
+        elif store.is_resuming:
+            completed = [PHASE_LABELS[p] for p in store.completed_phases()]
+            line = (
+                f"[checkpoint] Resuming audit for {ctx.issue_id}: completed="
+                f"{completed}"
+            )
+            interrupted = store.interrupted_phase()
+            if interrupted is not None:
+                line += f"; previous run interrupted during " \
+                        f"{PHASE_LABELS[interrupted]}"
+            print(line, file=sys.stderr)
+        else:
+            # Stale/partial file (different HEAD/issue, or a run that never
+            # completed a phase) — start clean.
+            store.clear()
+            print(
+                f"[checkpoint] Phase checkpointing enabled: {store.path()} "
+                f"(git {git_head[:12]})",
+                file=sys.stderr,
+            )
+        return store
+    except Exception as exc:  # noqa: BLE001 -- best-effort checkpointing
+        print(
+            f"Warning: audit checkpointing disabled: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _checkpoint_phase_start(checkpoint: CheckpointStore | None,
+                            phase: str) -> None:
+    """Record that a phase started + emit the stderr trace marker."""
+    if checkpoint is None:
+        return
+    checkpoint.mark_started(phase)
+    print(f"[checkpoint] {PHASE_LABELS[phase]} started", file=sys.stderr)
+
+
+def _checkpoint_phase_done(checkpoint: CheckpointStore | None,
+                           phase: str, state: dict | None = None) -> None:
+    """Record that a phase completed + emit the stderr trace marker."""
+    if checkpoint is None:
+        return
+    checkpoint.mark_completed(phase, state)
+    elapsed = None
+    entry = checkpoint._data.get("phases", {}).get(phase, {})
+    elapsed = entry.get("elapsed_s")
+    if elapsed is not None:
+        print(
+            f"[checkpoint] {PHASE_LABELS[phase]} completed "
+            f"({elapsed:.0f}s)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[checkpoint] {PHASE_LABELS[phase]} completed",
+            file=sys.stderr,
+        )
+
+
+def _children_need_phase2(child_results: list[dict]) -> bool:
+    """Whether any restored child still needs Phase 2 deep analysis.
+
+    Mirrors the pending-child selection inside ``_run_phase2_deep_analysis``
+    (children with AC results that are not ready / not-not-ready / not done)
+    so a resumed run re-executes deep analysis for exactly the children that
+    need it and skips the call when none do — preserving the prior run's
+    phase2 completion state (SA-0MT6EZUS9004FJ9T).
+    """
+    for child in child_results:
+        if child.get("status") == "completed" and child.get("stage") == "done":
+            continue
+        if child.get("child_audit_ready") is True:
+            continue
+        if child.get("child_audit_not_ready") is True:
+            continue
+        if child.get("ac_results"):
+            return True
+    return False
+
+
 def _phase1_parent_screening(ctx: _AuditContext) -> None:
     """Phase 3 — batched parent AC review via Pi (single call).
 
@@ -7557,6 +7713,25 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     acs = ctx.acs
     work_item = ctx.work_item
     ac_results = ctx.ac_results
+
+    # Phase checkpointing (SA-0MT6EZUS9004FJ9T): a resumed run whose parent
+    # screening already completed skips the Pi call entirely and restores the
+    # stored AC verdicts — the most expensive Phase 1 segment is never
+    # re-run after an interruption.
+    checkpoint = ctx.checkpoint
+    if (checkpoint is not None and checkpoint.is_resuming
+            and checkpoint.phase_status(PHASE_PARENT) == STATUS_COMPLETED):
+        restored = checkpoint.accumulated_state().get("ac_results")
+        if restored is not None:
+            ctx.ac_results = restored
+            print(
+                f"[checkpoint] Skipping completed phase: "
+                f"{PHASE_LABELS[PHASE_PARENT]}",
+                file=sys.stderr,
+            )
+            return
+
+    _checkpoint_phase_start(checkpoint, PHASE_PARENT)
 
     # Review parent ACs via Pi (batched into a single call for performance)
     ac_results = []
@@ -7714,6 +7889,10 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     ctx.ac_results = ac_results
     ctx.ac_fallback_used = ac_fallback_used
 
+    _checkpoint_phase_done(checkpoint, PHASE_PARENT, {
+        "ac_results": ac_results,
+    })
+
 
 def _phase_children(ctx: _AuditContext) -> int | None:
     """Phase 4 — child orchestration + Phase 2 gate.
@@ -7803,326 +7982,385 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             else _default_parent_timeout(len(active_children))
         )
 
+        # ------------------------------------------------------------------
+        # Phase checkpointing (SA-0MT6EZUS9004FJ9T): resume support. When a
+        # prior run completed phase1_children or phase2 at the same git HEAD,
+        # restore the stored pipeline state and skip the corresponding work —
+        # never re-run Pi segments that already completed.
+        # ------------------------------------------------------------------
+        checkpoint = ctx.checkpoint
+        phase1_checkpointed = (
+            checkpoint is not None
+            and checkpoint.is_resuming
+            and checkpoint.phase_status(PHASE_CHILDREN) == STATUS_COMPLETED
+        )
+        if (checkpoint is not None and checkpoint.is_resuming
+                and checkpoint.phase_status(PHASE_PHASE2) == STATUS_COMPLETED):
+            # The children + Phase 2 segment completed in a prior run:
+            # restore the final pipeline state and skip this phase entirely.
+            st = checkpoint.accumulated_state()
+            ac_results = st.get("ac_results", ac_results)
+            child_results = st.get("child_results", child_results)
+            child_persist_results = st.get(
+                "child_persist_results", child_persist_results
+            )
+            phase2_completed = st.get("phase2_completed", phase2_completed)
+            phase2_skip_note = st.get("phase2_skip_note", phase2_skip_note)
+            print(
+                f"[checkpoint] Skipping completed phase: "
+                f"{PHASE_LABELS[PHASE_PHASE2]}",
+                file=sys.stderr,
+            )
+            return None
+        elif phase1_checkpointed:
+            # Child screenings completed; only the Phase 2 segment remains.
+            st = checkpoint.accumulated_state()
+            ac_results = st.get("ac_results", ac_results)
+            child_results = st.get("child_results", child_results)
+            child_persist_results = st.get(
+                "child_persist_results", child_persist_results
+            )
+            phase2_completed = st.get("phase2_completed", phase2_completed)
+            phase2_skip_note = st.get("phase2_skip_note", phase2_skip_note)
+            print(
+                f"[checkpoint] Skipping completed phase: "
+                f"{PHASE_LABELS[PHASE_CHILDREN]}",
+                file=sys.stderr,
+            )
+        else:
+            _checkpoint_phase_start(checkpoint, PHASE_CHILDREN)
+
         if audit_children:
-            pending_children: list[tuple[int, dict]] = []
-            pre_verdicts: dict[str, tuple[bool | None, str]] = {}
-            for child in active_children:
-                cr = {
-                    "title": child.get("title", ""),
-                    "id": child.get("id", ""),
-                    "status": child.get("status", ""),
-                    "stage": child.get("stage", ""),
-                    "effort": child.get("effort"),
-                    "risk": child.get("risk"),
-                }
-                # Skip remaining children if we're too close to the parent
-                # timeout (elapsed_guard). This prevents a silent external kill
-                # and instead produces a clear diagnostic for skipped audits.
-                if _elapsed() >= elapsed_guard:
-                    print(
-                        f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
-                        f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
-                        "Manual audit required for this child. Raise the budget via "
-                        "--parent-timeout or AUDIT_PARENT_TIMEOUT.",
-                        file=sys.stderr,
+            if not phase1_checkpointed:
+                pending_children: list[tuple[int, dict]] = []
+                pre_verdicts: dict[str, tuple[bool | None, str]] = {}
+                for child in active_children:
+                    cr = {
+                        "title": child.get("title", ""),
+                        "id": child.get("id", ""),
+                        "status": child.get("status", ""),
+                        "stage": child.get("stage", ""),
+                        "effort": child.get("effort"),
+                        "risk": child.get("risk"),
+                    }
+                    # Skip remaining children if we're too close to the parent
+                    # timeout (elapsed_guard). This prevents a silent external kill
+                    # and instead produces a clear diagnostic for skipped audits.
+                    if _elapsed() >= elapsed_guard:
+                        print(
+                            f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                            f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
+                            "Manual audit required for this child. Raise the budget via "
+                            "--parent-timeout or AUDIT_PARENT_TIMEOUT.",
+                            file=sys.stderr,
+                        )
+                        cr["ac_results"] = [{
+                            "text": "Skipped due to audit timeout. Manual audit required.",
+                            "verdict": "unmet",
+                            "evidence": (
+                                f"Audit runner skipped this child after "
+                                f"{_elapsed():.0f}s total elapsed time to avoid "
+                                f"the parent process timeout ({elapsed_guard}s "
+                                f"budget; raise via --parent-timeout or "
+                                f"AUDIT_PARENT_TIMEOUT). Manual audit required."
+                            ),
+                        }]
+                        cr["child_audit_ready"] = False
+                        child_results.append(cr)
+                        continue
+
+                    # Completed/done children are exempt (AC5): their audits are not
+                    # re-checked and the Phase 1 child AC review is skipped; AC results
+                    # are sourced from their own persisted audit (fallback to met).
+                    if child.get("status") == "completed" and child.get("stage") == "done":
+                        cr["child_audit_ready"] = True
+                        cr["ac_results"] = _child_acs_from_own_audit(
+                            child, runner, worklog_dir=worklog_dir,
+                        )
+                        child_results.append(cr)
+                        continue
+
+                    verdict, reason, audited_at = _get_child_audit_verdict(
+                        runner, child["id"], worklog_dir=worklog_dir,
+                        force=force, child=child,
                     )
-                    cr["ac_results"] = [{
-                        "text": "Skipped due to audit timeout. Manual audit required.",
-                        "verdict": "unmet",
-                        "evidence": (
-                            f"Audit runner skipped this child after "
-                            f"{_elapsed():.0f}s total elapsed time to avoid "
-                            f"the parent process timeout ({elapsed_guard}s "
-                            f"budget; raise via --parent-timeout or "
-                            f"AUDIT_PARENT_TIMEOUT). Manual audit required."
-                        ),
-                    }]
-                    cr["child_audit_ready"] = False
+                    pre_verdicts[child["id"]] = (verdict, reason)
+                    if verdict is not None:
+                        # Fresh valid audit (LP-0MSQ32MF200675AR child-verdict
+                        # reuse): the content-fingerprint gate (primary) or the
+                        # legacy time gate (fingerprint-less reports) judged the
+                        # child's own audit fresh, so the parent reuses its
+                        # persisted AC verdicts with ZERO pi calls — no child
+                        # Phase 1 screening, no child Phase 2 deep/batch entry.
+                        # Applies to ready AND not-ready verdicts (P12): the
+                        # child's own pipeline already deep-analyzed these ACs.
+                        cr["child_audit_ready"] = verdict is True
+                        cr["child_audit_not_ready"] = verdict is False
+                        cr["reused_from"] = audited_at
+                        cr["ac_results"] = _child_acs_from_own_audit(
+                            child, runner, worklog_dir=worklog_dir,
+                        )
+                    else:
+                        cr["child_audit_ready"] = False
+                        # P12: record whether the child's own fresh audit produced an
+                        # explicit 'not ready to close' verdict. Such children have
+                        # already had their ACs deep-analyzed by their own audit
+                        # pipeline, so the parent's Phase 2 can skip the duplicated
+                        # phase2_child call (see _run_phase2_deep_analysis).
+                        cr["child_audit_not_ready"] = verdict is False
+                        cr["ac_results"] = []
+                        pending_children.append((len(child_results), child))
                     child_results.append(cr)
-                    continue
 
-                # Completed/done children are exempt (AC5): their audits are not
-                # re-checked and the Phase 1 child AC review is skipped; AC results
-                # are sourced from their own persisted audit (fallback to met).
-                if child.get("status") == "completed" and child.get("stage") == "done":
-                    cr["child_audit_ready"] = True
-                    cr["ac_results"] = _child_acs_from_own_audit(
-                        child, runner, worklog_dir=worklog_dir,
-                    )
-                    child_results.append(cr)
-                    continue
-
-                verdict, reason, audited_at = _get_child_audit_verdict(
-                    runner, child["id"], worklog_dir=worklog_dir,
-                    force=force, child=child,
-                )
-                pre_verdicts[child["id"]] = (verdict, reason)
-                if verdict is not None:
-                    # Fresh valid audit (LP-0MSQ32MF200675AR child-verdict
-                    # reuse): the content-fingerprint gate (primary) or the
-                    # legacy time gate (fingerprint-less reports) judged the
-                    # child's own audit fresh, so the parent reuses its
-                    # persisted AC verdicts with ZERO pi calls — no child
-                    # Phase 1 screening, no child Phase 2 deep/batch entry.
-                    # Applies to ready AND not-ready verdicts (P12): the
-                    # child's own pipeline already deep-analyzed these ACs.
-                    cr["child_audit_ready"] = verdict is True
-                    cr["child_audit_not_ready"] = verdict is False
-                    cr["reused_from"] = audited_at
-                    cr["ac_results"] = _child_acs_from_own_audit(
-                        child, runner, worklog_dir=worklog_dir,
-                    )
-                else:
-                    cr["child_audit_ready"] = False
-                    # P12: record whether the child's own fresh audit produced an
-                    # explicit 'not ready to close' verdict. Such children have
-                    # already had their ACs deep-analyzed by their own audit
-                    # pipeline, so the parent's Phase 2 can skip the duplicated
-                    # phase2_child call (see _run_phase2_deep_analysis).
-                    cr["child_audit_not_ready"] = verdict is False
-                    cr["ac_results"] = []
-                    pending_children.append((len(child_results), child))
-                child_results.append(cr)
-
-            # Review pending (no-audit / not-ready / not_ready) children with
-            # bounded parallelism; fall back to a sequential loop for a single
-            # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
-            if pending_children:
-                parallelism = _resolve_child_concurrency()
-                if parallelism > 1 and len(pending_children) > 1:
-                    with ThreadPoolExecutor(max_workers=parallelism) as executor:
-                        futures = [
-                            executor.submit(
-                                _phase1_review_child_acs,
+                # Review pending (no-audit / not-ready / not_ready) children with
+                # bounded parallelism; fall back to a sequential loop for a single
+                # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
+                if pending_children:
+                    parallelism = _resolve_child_concurrency()
+                    if parallelism > 1 and len(pending_children) > 1:
+                        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+                            futures = [
+                                executor.submit(
+                                    _phase1_review_child_acs,
+                                    ci, child,
+                                    ctx.resolved_phase1_model, ctx.resolved_model,
+                                    pi_bin, debug_log, timeout,
+                                    runner, ctx.record_script_failure,
+                                    ac_fallback_used=ac_fallback_used,
+                                )
+                                for ci, child in pending_children
+                            ]
+                            for future in futures:
+                                ci, acs = future.result()
+                                child_results[ci]["ac_results"] = acs
+                    else:
+                        for ci, child in pending_children:
+                            _ci, acs = _phase1_review_child_acs(
                                 ci, child,
                                 ctx.resolved_phase1_model, ctx.resolved_model,
                                 pi_bin, debug_log, timeout,
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                             )
-                            for ci, child in pending_children
-                        ]
-                        for future in futures:
-                            ci, acs = future.result()
                             child_results[ci]["ac_results"] = acs
-                else:
-                    for ci, child in pending_children:
-                        _ci, acs = _phase1_review_child_acs(
-                            ci, child,
-                            ctx.resolved_phase1_model, ctx.resolved_model,
-                            pi_bin, debug_log, timeout,
-                            runner, ctx.record_script_failure,
-                            ac_fallback_used=ac_fallback_used,
-                        )
-                        child_results[ci]["ac_results"] = acs
 
 
-            # ------------------------------------------------------------------
-            # Check each active child's persisted audit verdict.
-            # For children without audits or with stale audits, auto-trigger
-            # a fresh audit (if persist is True AND --audit-children is set) and
-            # re-evaluate. The recursive cascade is OPT-IN (SA-0MSKB6V5Q007YDHE):
-            # by default no child audits are auto-triggered, so a parent with many
-            # unaudited children no longer spawns an unbounded cascade. Children
-            # with unchanged content are skipped via the Feature 1 content-based
-            # freshness gate. Children with completed/done status+stage are
-            # exempt (AC5).
-            # ------------------------------------------------------------------
-            _audit_runner_path = Path(__file__).resolve()
-            max_child_audits = _resolve_max_child_audits(max_child_audits)
-            child_audits_triggered = 0
+                # ------------------------------------------------------------------
+                # Check each active child's persisted audit verdict.
+                # For children without audits or with stale audits, auto-trigger
+                # a fresh audit (if persist is True AND --audit-children is set) and
+                # re-evaluate. The recursive cascade is OPT-IN (SA-0MSKB6V5Q007YDHE):
+                # by default no child audits are auto-triggered, so a parent with many
+                # unaudited children no longer spawns an unbounded cascade. Children
+                # with unchanged content are skipped via the Feature 1 content-based
+                # freshness gate. Children with completed/done status+stage are
+                # exempt (AC5).
+                # ------------------------------------------------------------------
+                _audit_runner_path = Path(__file__).resolve()
+                max_child_audits = _resolve_max_child_audits(max_child_audits)
+                child_audits_triggered = 0
 
-            for child in child_results:
-                # Skip completed/done children (exempt per AC5)
-                if child.get("status") == "completed" and child.get("stage") == "done":
-                    child["child_audit_ready"] = True  # Exempt - treat as ready
-                    continue
-
-                # Reuse the pre-computed verdict from the Phase 1 pre-pass (P7) to
-                # avoid a second wl audit-show lookup per child.
-                verdict, reason = pre_verdicts.get(child["id"], (None, "unknown"))
-
-                if verdict is None and persist:
-                    if _elapsed() < elapsed_guard:
-                        # Content-based freshness skip (AC4): a child whose content
-                        # fingerprint is unchanged has a still-valid audit — do not
-                        # re-trigger it; re-evaluate the verdict from the stored
-                        # report instead. --force bypasses reuse entirely: every
-                        # child is re-audited (LP-0MSQ32MF200675AR AC4).
-                        fresh_report = None if force else _check_audit_freshness(
-                            runner, child["id"], worklog_dir=worklog_dir,
-                            work_item=child,
-                        )
-                        if fresh_report is not None:
-                            fresh_ready = _parse_ready_to_close(fresh_report)
-                            verdict = fresh_ready == "yes"
-                            reason = "ready" if fresh_ready == "yes" else "not_ready"
-                            child["reused_from"] = _fetch_child_audited_at(
-                                runner, child["id"], worklog_dir=worklog_dir,
-                            )
-                            print(
-                                f"Reusing fresh audit for child {child['id']} "
-                                f"({child['title']}) — content unchanged",
-                                file=sys.stderr,
-                            )
-                        elif not audit_children:
-                            # AC1: no cascade without explicit opt-in. The child
-                            # stays not-ready (a not-ready child still blocks the
-                            # parent — verdict semantics unchanged).
-                            print(
-                                f"Child {child['id']} ({child['title']}) has no "
-                                f"fresh audit; not auto-triggering a child audit. "
-                                f"Use --audit-children to enable the recursive "
-                                f"cascade (or audit the child directly).",
-                                file=sys.stderr,
-                            )
-                        elif child_audits_triggered >= max_child_audits:
-                            # AC3: per-run cap reached — stop the cascade.
-                            print(
-                                f"Warning: child audit cap ({max_child_audits}) "
-                                f"reached; not auto-auditing child {child['id']} "
-                                f"({child['title']}). Raise via --max-child-audits "
-                                f"or {AUDIT_MAX_CHILD_AUDITS_ENV}.",
-                                file=sys.stderr,
-                            )
-                        else:
-                            child_audits_triggered += 1
-                            print(
-                                f"Auto-triggering audit for child {child['id']} "
-                                f"({child['title']}) — reason: {reason}",
-                                file=sys.stderr,
-                            )
-                            try:
-                                audit_cmd = [
-                                    sys.executable or "python3",
-                                    str(_audit_runner_path),
-                                    "issue",
-                                    child["id"],
-                                    "--pi-bin", pi_bin,
-                                    "--model", resolved_model,
-                                    "--model-source", model_source,
-                                    "--force",  # Bypass freshness gate
-                                ]
-                                # Thread the tiered Phase 1 model into the
-                                # child audit so its Phase 1 screening uses the
-                                # fast/cheap model too (SA-0MSKB697P000T3HG AC2)
-                                # — only when tiering is actually configured.
-                                if ctx.resolved_phase1_model != resolved_model:
-                                    audit_cmd.extend([
-                                        "--phase1-model", ctx.resolved_phase1_model,
-                                    ])
-                                if timeout is not None:
-                                    audit_cmd.extend(["--timeout", str(timeout)])
-                                if parent_timeout is not None:
-                                    audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
-                                if run_tests:
-                                    # Thread the operator's --run-tests authorization
-                                    # into child audits so execution-dependent ACs
-                                    # auto-verify there too (SA-0MSJELSWS002UF60). In
-                                    # practice the parent's suite run already refreshed
-                                    # the cache, so children hit it read-only.
-                                    audit_cmd.append("--run-tests")
-                                # Thread the resolved worklog flags through to the child
-                                # runner process so it targets the same worklog store.
-                                child_flags = _resolve_worklog_flags(
-                                    ["wl", "show", child["id"], "--json"],
-                                    explicit_dir=worklog_dir,
-                                )
-                                if child_flags:
-                                    audit_cmd.extend(child_flags)
-                                effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
-                                subprocess.run(
-                                    audit_cmd,
-                                    check=False,
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=effective_timeout,
-                                )
-                                # Re-check verdict after triggered audit
-                                verdict, reason, _audited_at = _get_child_audit_verdict(
-                                    runner, child["id"], worklog_dir=worklog_dir,
-                                    child=child,
-                                )
-                            except subprocess.TimeoutExpired:
-                                print(
-                                    f"Warning: Auto-triggered audit for child {child['id']} "
-                                    f"timed out.", file=sys.stderr,
-                                )
-                            except Exception as exc:  # noqa: BLE001 -- audit failure warning
-                                print(
-                                    f"Warning: Auto-triggered audit for child {child['id']} "
-                                    f"failed: {exc}", file=sys.stderr,
-                                )
-                    else:
-                        print(
-                            f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
-                            f"Cannot auto-trigger audit for child {child['id']} "
-                            f"({child['title']}). Manual audit required. Raise the "
-                            f"budget via --parent-timeout or AUDIT_PARENT_TIMEOUT.",
-                            file=sys.stderr,
-                        )
-
-                # Set child_audit_ready: True/False if verdict is known, False otherwise
-                child["child_audit_ready"] = verdict if verdict is not None else False
-                # P12: record whether the child's own audit produced an explicit
-                # 'not ready to close' verdict (e.g. after the auto-triggered
-                # child audit above). The parent Phase 2 then skips the duplicated
-                # deep-analysis call and reuses the child's own persisted findings.
-                child["child_audit_not_ready"] = verdict is False
-
-            # Initialize child_persist_results for reporting
-            child_persist_results = []
-
-            # Persist child audits to individual child work items (if persist is True)
-            if persist:
                 for child in child_results:
-                    if child.get("reused_from"):
-                        # Persistence hygiene (LP-0MSQ32MF200675AR AC5): a
-                        # reused child keeps its own authoritative audit —
-                        # re-persisting it would overwrite the child's own
-                        # fingerprint-bearing report with a parent-style one
-                        # and break future content-gate reuse.
+                    # Skip completed/done children (exempt per AC5)
+                    if child.get("status") == "completed" and child.get("stage") == "done":
+                        child["child_audit_ready"] = True  # Exempt - treat as ready
                         continue
-                    child_fingerprint = _compute_content_fingerprint(
-                        runner, child["id"], worklog_dir=worklog_dir,
-                    )
-                    child_rc, _child_report = _persist_child_audit(
-                        child_id=child["id"],
-                        child_title=child["title"],
-                        child_status=child["status"],
-                        child_stage=child["stage"],
-                        ac_results=child["ac_results"],
-                        pi_bin=pi_bin,
-                        model=resolved_model,
-                        model_source=model_source,
-                        worklog_dir=worklog_dir,
-                        content_fingerprint=child_fingerprint,
-                    )
-                    child_persist_results.append({
-                        "id": child["id"],
-                        "title": child["title"],
-                        "success": child_rc == 0,
-                    })
-                    # Child persistence failure is FATAL (LP-0MSQ32HNR007AI6B): a
-                    # parent report whose child audits were never persisted is
-                    # misleading — abort with a non-zero exit instead of warning.
-                    if child_rc != 0 and child_rc != PERSIST_CONTENT_INVALID:
-                        print(
-                            f"Error: Failed to persist audit for child {child['id']} "
-                            f"({child['title']}): persist_audit returned exit code "
-                            f"{child_rc}. Aborting the run — the parent report "
-                            f"would be misleading without the child audit.",
-                            file=sys.stderr,
+
+                    # Reuse the pre-computed verdict from the Phase 1 pre-pass (P7) to
+                    # avoid a second wl audit-show lookup per child.
+                    verdict, reason = pre_verdicts.get(child["id"], (None, "unknown"))
+
+                    if verdict is None and persist:
+                        if _elapsed() < elapsed_guard:
+                            # Content-based freshness skip (AC4): a child whose content
+                            # fingerprint is unchanged has a still-valid audit — do not
+                            # re-trigger it; re-evaluate the verdict from the stored
+                            # report instead. --force bypasses reuse entirely: every
+                            # child is re-audited (LP-0MSQ32MF200675AR AC4).
+                            fresh_report = None if force else _check_audit_freshness(
+                                runner, child["id"], worklog_dir=worklog_dir,
+                                work_item=child,
+                            )
+                            if fresh_report is not None:
+                                fresh_ready = _parse_ready_to_close(fresh_report)
+                                verdict = fresh_ready == "yes"
+                                reason = "ready" if fresh_ready == "yes" else "not_ready"
+                                child["reused_from"] = _fetch_child_audited_at(
+                                    runner, child["id"], worklog_dir=worklog_dir,
+                                )
+                                print(
+                                    f"Reusing fresh audit for child {child['id']} "
+                                    f"({child['title']}) — content unchanged",
+                                    file=sys.stderr,
+                                )
+                            elif not audit_children:
+                                # AC1: no cascade without explicit opt-in. The child
+                                # stays not-ready (a not-ready child still blocks the
+                                # parent — verdict semantics unchanged).
+                                print(
+                                    f"Child {child['id']} ({child['title']}) has no "
+                                    f"fresh audit; not auto-triggering a child audit. "
+                                    f"Use --audit-children to enable the recursive "
+                                    f"cascade (or audit the child directly).",
+                                    file=sys.stderr,
+                                )
+                            elif child_audits_triggered >= max_child_audits:
+                                # AC3: per-run cap reached — stop the cascade.
+                                print(
+                                    f"Warning: child audit cap ({max_child_audits}) "
+                                    f"reached; not auto-auditing child {child['id']} "
+                                    f"({child['title']}). Raise via --max-child-audits "
+                                    f"or {AUDIT_MAX_CHILD_AUDITS_ENV}.",
+                                    file=sys.stderr,
+                                )
+                            else:
+                                child_audits_triggered += 1
+                                print(
+                                    f"Auto-triggering audit for child {child['id']} "
+                                    f"({child['title']}) — reason: {reason}",
+                                    file=sys.stderr,
+                                )
+                                try:
+                                    audit_cmd = [
+                                        sys.executable or "python3",
+                                        str(_audit_runner_path),
+                                        "issue",
+                                        child["id"],
+                                        "--pi-bin", pi_bin,
+                                        "--model", resolved_model,
+                                        "--model-source", model_source,
+                                        "--force",  # Bypass freshness gate
+                                    ]
+                                    # Thread the tiered Phase 1 model into the
+                                    # child audit so its Phase 1 screening uses the
+                                    # fast/cheap model too (SA-0MSKB697P000T3HG AC2)
+                                    # — only when tiering is actually configured.
+                                    if ctx.resolved_phase1_model != resolved_model:
+                                        audit_cmd.extend([
+                                            "--phase1-model", ctx.resolved_phase1_model,
+                                        ])
+                                    if timeout is not None:
+                                        audit_cmd.extend(["--timeout", str(timeout)])
+                                    if parent_timeout is not None:
+                                        audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
+                                    if run_tests:
+                                        # Thread the operator's --run-tests authorization
+                                        # into child audits so execution-dependent ACs
+                                        # auto-verify there too (SA-0MSJELSWS002UF60). In
+                                        # practice the parent's suite run already refreshed
+                                        # the cache, so children hit it read-only.
+                                        audit_cmd.append("--run-tests")
+                                    # Thread the resolved worklog flags through to the child
+                                    # runner process so it targets the same worklog store.
+                                    child_flags = _resolve_worklog_flags(
+                                        ["wl", "show", child["id"], "--json"],
+                                        explicit_dir=worklog_dir,
+                                    )
+                                    if child_flags:
+                                        audit_cmd.extend(child_flags)
+                                    effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
+                                    subprocess.run(
+                                        audit_cmd,
+                                        check=False,
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=effective_timeout,
+                                    )
+                                    # Re-check verdict after triggered audit
+                                    verdict, reason, _audited_at = _get_child_audit_verdict(
+                                        runner, child["id"], worklog_dir=worklog_dir,
+                                        child=child,
+                                    )
+                                except subprocess.TimeoutExpired:
+                                    print(
+                                        f"Warning: Auto-triggered audit for child {child['id']} "
+                                        f"timed out.", file=sys.stderr,
+                                    )
+                                except Exception as exc:  # noqa: BLE001 -- audit failure warning
+                                    print(
+                                        f"Warning: Auto-triggered audit for child {child['id']} "
+                                        f"failed: {exc}", file=sys.stderr,
+                                    )
+                        else:
+                            print(
+                                f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                                f"Cannot auto-trigger audit for child {child['id']} "
+                                f"({child['title']}). Manual audit required. Raise the "
+                                f"budget via --parent-timeout or AUDIT_PARENT_TIMEOUT.",
+                                file=sys.stderr,
+                            )
+
+                    # Set child_audit_ready: True/False if verdict is known, False otherwise
+                    child["child_audit_ready"] = verdict if verdict is not None else False
+                    # P12: record whether the child's own audit produced an explicit
+                    # 'not ready to close' verdict (e.g. after the auto-triggered
+                    # child audit above). The parent Phase 2 then skips the duplicated
+                    # deep-analysis call and reuses the child's own persisted findings.
+                    child["child_audit_not_ready"] = verdict is False
+
+                # Initialize child_persist_results for reporting
+                child_persist_results = []
+
+                # Persist child audits to individual child work items (if persist is True)
+                if persist:
+                    for child in child_results:
+                        if child.get("reused_from"):
+                            # Persistence hygiene (LP-0MSQ32MF200675AR AC5): a
+                            # reused child keeps its own authoritative audit —
+                            # re-persisting it would overwrite the child's own
+                            # fingerprint-bearing report with a parent-style one
+                            # and break future content-gate reuse.
+                            continue
+                        child_fingerprint = _compute_content_fingerprint(
+                            runner, child["id"], worklog_dir=worklog_dir,
                         )
-                        return 1
-                    if child_rc == PERSIST_CONTENT_INVALID:
-                        # Fallback notice WAS persisted (usable); keep the warning.
-                        print(
-                            f"Warning: audit for child {child['id']} "
-                            f"({child['title']}) persisted with fallback content "
-                            "(verdict JSON rejected); the child audit is usable.",
-                            file=sys.stderr,
+                        child_rc, _child_report = _persist_child_audit(
+                            child_id=child["id"],
+                            child_title=child["title"],
+                            child_status=child["status"],
+                            child_stage=child["stage"],
+                            ac_results=child["ac_results"],
+                            pi_bin=pi_bin,
+                            model=resolved_model,
+                            model_source=model_source,
+                            worklog_dir=worklog_dir,
+                            content_fingerprint=child_fingerprint,
                         )
+                        child_persist_results.append({
+                            "id": child["id"],
+                            "title": child["title"],
+                            "success": child_rc == 0,
+                        })
+                        # Child persistence failure is FATAL (LP-0MSQ32HNR007AI6B): a
+                        # parent report whose child audits were never persisted is
+                        # misleading — abort with a non-zero exit instead of warning.
+                        if child_rc != 0 and child_rc != PERSIST_CONTENT_INVALID:
+                            print(
+                                f"Error: Failed to persist audit for child {child['id']} "
+                                f"({child['title']}): persist_audit returned exit code "
+                                f"{child_rc}. Aborting the run — the parent report "
+                                f"would be misleading without the child audit.",
+                                file=sys.stderr,
+                            )
+                            return 1
+                        if child_rc == PERSIST_CONTENT_INVALID:
+                            # Fallback notice WAS persisted (usable); keep the warning.
+                            print(
+                                f"Warning: audit for child {child['id']} "
+                                f"({child['title']}) persisted with fallback content "
+                                "(verdict JSON rejected); the child audit is usable.",
+                                file=sys.stderr,
+                            )
+
+            if not phase1_checkpointed:
+                _checkpoint_phase_done(checkpoint, PHASE_CHILDREN, {
+                    "ac_results": ac_results,
+                    "child_results": child_results,
+                    "child_persist_results": child_persist_results,
+                    "phase2_completed": phase2_completed,
+                    "phase2_skip_note": phase2_skip_note,
+                })
+            _checkpoint_phase_start(checkpoint, PHASE_PHASE2)
 
             # ------------------------------------------------------------------
             # Phase 2 gate: check if Phase 1 automated screening has blocking issues
@@ -8223,177 +8461,193 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             #   - parent has gaps → only gap-mapped children are audited;
             #     unrelated children are not audited
             # --audit-children (Feature 2) forces the full per-child flow.
-            phase2_completed = False
-            phase2_skip_note = None
+            if not phase1_checkpointed:
+                phase2_completed = False
+                phase2_skip_note = None
             has_blocking_cq = bool(_effective_blocking_findings(
                 cq_findings, ctx.fp_screen_results
             ))
-            # 1. Parent Phase 2 deep analysis FIRST (parent-only).
-            if has_blocking_cq:
-                # Blocking CQ findings → demote met verdicts to partial and
-                # skip Phase 2 (mirrors the full-flow gate: the verdict is
-                # already "Ready to close: No" via the CQ findings, so the
-                # parent deep call would only burn model latency).
-                ac_results = _demote_met_to_partial(ac_results)
-            elif _is_low_risk_small(
-                work_item.get("effort"), work_item.get("risk")
-            ):
-                # Small effort + Low risk — skip Phase 2 per SA-0MSQ026T3009QY2L.
-                # Phase 1 verdicts stand unchanged; evidence notes the skip reason.
-                print(
-                    f"Skipping Phase 2 deep analysis (parent-first): "
-                    f"effort={work_item.get('effort')}, risk={work_item.get('risk')}. "
-                    f"Phase 1 verdicts stand unchanged.",
-                    file=sys.stderr,
-                )
-                ac_results = _annotate_skip_evidence(
-                    ac_results,
-                    f"Phase 2 deep analysis skipped (effort={work_item.get('effort')}, "
-                    f"risk={work_item.get('risk')}): small, low-risk item per "
-                    f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
-                )
-                phase2_skip_note = (
-                    f"small, low-risk item (effort={work_item.get('effort')}, "
-                    f"risk={work_item.get('risk')}) per SA-0MSQ026T3009QY2L"
-                )
-            elif acs and acs[0] != "No acceptance criteria defined.":
-                print(
-                    "Phase 1 passed: running Phase 2 deep code analysis "
-                    "(parent-first)...",
-                    file=sys.stderr,
-                )
-                ac_results, _, phase2_completed = _run_phase2_deep_analysis(
-                    work_item, ac_results, [],  # parent-only
-                    resolved_model=resolved_model,
-                    pi_bin=pi_bin,
-                    debug_log=debug_log,
-                    script_failure_callback=ctx.record_script_failure,
-                    timeout=timeout,
-                    runner=runner,
-                    batch_phase2=batch_phase2,
-                    worklog_dir=worklog_dir,
-                    ac_fallback_used=ac_fallback_used,
-                    green_run_block=green_run_block,
-                    owning_root=owning_root,
-                    max_citations_per_ac=max_citations_per_ac,
-                )
-
-            # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
-            parent_gaps = _parent_has_gaps(ac_results) or has_blocking_cq
-            gap_child_ids = set(
-                _map_gaps_to_children(ac_results, active_children)
-            ) if parent_gaps else set()
-
-            # 3. Child pass-through decision.
+            _checkpoint_phase_start(checkpoint, PHASE_PHASE2)
             pending_children: list[tuple[int, dict]] = []
-            for child in active_children:
-                cr = {
-                    "title": child.get("title", ""),
-                    "id": child.get("id", ""),
-                    "status": child.get("status", ""),
-                    "stage": child.get("stage", ""),
-                    "effort": child.get("effort"),
-                    "risk": child.get("risk"),
-                }
-                if _elapsed() >= elapsed_guard:
-                    cr["ac_results"] = [{
-                        "text": "Skipped due to audit timeout. Manual audit required.",
-                        "verdict": "unmet",
-                        "evidence": (
-                            f"Audit runner skipped this child after "
-                            f"{_elapsed():.0f}s total elapsed time to avoid "
-                            f"the parent process timeout ({elapsed_guard}s "
-                            f"budget; raise via --parent-timeout or "
-                            f"AUDIT_PARENT_TIMEOUT). Manual audit required."
-                        ),
-                    }]
-                    cr["child_audit_ready"] = False
-                    child_results.append(cr)
-                    continue
-
-                if child.get("status") == "completed" and child.get("stage") == "done":
-                    cr["child_audit_ready"] = True
-                    cr["ac_results"] = _child_acs_from_own_audit(
-                        child, runner, worklog_dir=worklog_dir,
+            if not phase1_checkpointed:
+                # 1. Parent Phase 2 deep analysis FIRST (parent-only).
+                if has_blocking_cq:
+                    # Blocking CQ findings → demote met verdicts to partial and
+                    # skip Phase 2 (mirrors the full-flow gate: the verdict is
+                    # already "Ready to close: No" via the CQ findings, so the
+                    # parent deep call would only burn model latency).
+                    ac_results = _demote_met_to_partial(ac_results)
+                elif _is_low_risk_small(
+                    work_item.get("effort"), work_item.get("risk")
+                ):
+                    # Small effort + Low risk — skip Phase 2 per SA-0MSQ026T3009QY2L.
+                    # Phase 1 verdicts stand unchanged; evidence notes the skip reason.
+                    print(
+                        f"Skipping Phase 2 deep analysis (parent-first): "
+                        f"effort={work_item.get('effort')}, risk={work_item.get('risk')}. "
+                        f"Phase 1 verdicts stand unchanged.",
+                        file=sys.stderr,
                     )
-                    child_results.append(cr)
-                    continue
+                    ac_results = _annotate_skip_evidence(
+                        ac_results,
+                        f"Phase 2 deep analysis skipped (effort={work_item.get('effort')}, "
+                        f"risk={work_item.get('risk')}): small, low-risk item per "
+                        f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
+                    )
+                    phase2_skip_note = (
+                        f"small, low-risk item (effort={work_item.get('effort')}, "
+                        f"risk={work_item.get('risk')}) per SA-0MSQ026T3009QY2L"
+                    )
+                elif acs and acs[0] != "No acceptance criteria defined.":
+                    print(
+                        "Phase 1 passed: running Phase 2 deep code analysis "
+                        "(parent-first)...",
+                        file=sys.stderr,
+                    )
+                    ac_results, _, phase2_completed = _run_phase2_deep_analysis(
+                        work_item, ac_results, [],  # parent-only
+                        resolved_model=resolved_model,
+                        pi_bin=pi_bin,
+                        debug_log=debug_log,
+                        script_failure_callback=ctx.record_script_failure,
+                        timeout=timeout,
+                        runner=runner,
+                        batch_phase2=batch_phase2,
+                        worklog_dir=worklog_dir,
+                        ac_fallback_used=ac_fallback_used,
+                        green_run_block=green_run_block,
+                        owning_root=owning_root,
+                        max_citations_per_ac=max_citations_per_ac,
+                    )
 
-                if not parent_gaps:
-                    # Parent passed with no gaps → child inherits passed
-                    # (AC2), unless the child's own content changed (AC6 —
-                    # changed children are never silently inherited-passed).
-                    if _child_content_changed(
-                        runner, child["id"], worklog_dir=worklog_dir,
-                        work_item=child,
-                    ):
+                # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
+                parent_gaps = _parent_has_gaps(ac_results) or has_blocking_cq
+                gap_child_ids = set(
+                    _map_gaps_to_children(ac_results, active_children)
+                ) if parent_gaps else set()
+
+                # 3. Child pass-through decision.
+                pending_children: list[tuple[int, dict]] = []
+                for child in active_children:
+                    cr = {
+                        "title": child.get("title", ""),
+                        "id": child.get("id", ""),
+                        "status": child.get("status", ""),
+                        "stage": child.get("stage", ""),
+                        "effort": child.get("effort"),
+                        "risk": child.get("risk"),
+                    }
+                    if _elapsed() >= elapsed_guard:
+                        cr["ac_results"] = [{
+                            "text": "Skipped due to audit timeout. Manual audit required.",
+                            "verdict": "unmet",
+                            "evidence": (
+                                f"Audit runner skipped this child after "
+                                f"{_elapsed():.0f}s total elapsed time to avoid "
+                                f"the parent process timeout ({elapsed_guard}s "
+                                f"budget; raise via --parent-timeout or "
+                                f"AUDIT_PARENT_TIMEOUT). Manual audit required."
+                            ),
+                        }]
+                        cr["child_audit_ready"] = False
+                        child_results.append(cr)
+                        continue
+
+                    if child.get("status") == "completed" and child.get("stage") == "done":
+                        cr["child_audit_ready"] = True
+                        cr["ac_results"] = _child_acs_from_own_audit(
+                            child, runner, worklog_dir=worklog_dir,
+                        )
+                        child_results.append(cr)
+                        continue
+
+                    if not parent_gaps:
+                        # Parent passed with no gaps → child inherits passed
+                        # (AC2), unless the child's own content changed (AC6 —
+                        # changed children are never silently inherited-passed).
+                        if _child_content_changed(
+                            runner, child["id"], worklog_dir=worklog_dir,
+                            work_item=child,
+                        ):
+                            cr["child_audit_ready"] = False
+                            pending_children.append((len(child_results), child))
+                        else:
+                            cr["inherited_pass"] = True
+                            cr["child_audit_ready"] = True
+                            cr["ac_results"] = [{
+                                "text": "Inherited from parent pass",
+                                "verdict": "met",
+                                "evidence": (
+                                    "Parent audit passed with no gaps; child "
+                                    "inherits passed (SA-0MSKB6VJA005N43F)."
+                                ),
+                            }]
+                    elif child["id"] in gap_child_ids:
+                        # Parent has gaps and this child owns the affected files
+                        # → full audit (AC3).
                         cr["child_audit_ready"] = False
                         pending_children.append((len(child_results), child))
                     else:
-                        cr["inherited_pass"] = True
+                        # Unrelated child → not audited (AC3), does not block.
+                        cr["pass_through"] = "unrelated_to_gaps"
                         cr["child_audit_ready"] = True
                         cr["ac_results"] = [{
-                            "text": "Inherited from parent pass",
-                            "verdict": "met",
+                            "text": "Not audited (unrelated to parent gaps)",
+                            "verdict": "partial",
                             "evidence": (
-                                "Parent audit passed with no gaps; child "
-                                "inherits passed (SA-0MSKB6VJA005N43F)."
+                                "Parent audit has gaps; this child is unrelated to "
+                                "the gap files and was not audited "
+                                "(SA-0MSKB6VJA005N43F)."
                             ),
                         }]
-                elif child["id"] in gap_child_ids:
-                    # Parent has gaps and this child owns the affected files
-                    # → full audit (AC3).
-                    cr["child_audit_ready"] = False
-                    pending_children.append((len(child_results), child))
-                else:
-                    # Unrelated child → not audited (AC3), does not block.
-                    cr["pass_through"] = "unrelated_to_gaps"
-                    cr["child_audit_ready"] = True
-                    cr["ac_results"] = [{
-                        "text": "Not audited (unrelated to parent gaps)",
-                        "verdict": "partial",
-                        "evidence": (
-                            "Parent audit has gaps; this child is unrelated to "
-                            "the gap files and was not audited "
-                            "(SA-0MSKB6VJA005N43F)."
-                        ),
-                    }]
-                child_results.append(cr)
+                    child_results.append(cr)
 
-            # 4. Phase 1 child AC review for pending (gap-mapped / changed)
-            # children only — the parent's critical path is unaffected.
-            if pending_children:
-                parallelism = _resolve_child_concurrency()
-                if parallelism > 1 and len(pending_children) > 1:
-                    with ThreadPoolExecutor(max_workers=parallelism) as executor:
-                        futures = [
-                            executor.submit(
-                                _phase1_review_child_acs,
+                # 4. Phase 1 child AC review for pending (gap-mapped / changed)
+                # children only — the parent's critical path is unaffected.
+                if pending_children:
+                    parallelism = _resolve_child_concurrency()
+                    if parallelism > 1 and len(pending_children) > 1:
+                        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+                            futures = [
+                                executor.submit(
+                                    _phase1_review_child_acs,
+                                    ci, child,
+                                    ctx.resolved_phase1_model, ctx.resolved_model,
+                                    pi_bin, debug_log, timeout,
+                                    runner, ctx.record_script_failure,
+                                    ac_fallback_used=ac_fallback_used,
+                                )
+                                for ci, child in pending_children
+                            ]
+                            for future in futures:
+                                ci, acs = future.result()
+                                child_results[ci]["ac_results"] = acs
+                    else:
+                        for ci, child in pending_children:
+                            _ci, acs = _phase1_review_child_acs(
                                 ci, child,
                                 ctx.resolved_phase1_model, ctx.resolved_model,
                                 pi_bin, debug_log, timeout,
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                             )
-                            for ci, child in pending_children
-                        ]
-                        for future in futures:
-                            ci, acs = future.result()
                             child_results[ci]["ac_results"] = acs
-                else:
-                    for ci, child in pending_children:
-                        _ci, acs = _phase1_review_child_acs(
-                            ci, child,
-                            ctx.resolved_phase1_model, ctx.resolved_model,
-                            pi_bin, debug_log, timeout,
-                            runner, ctx.record_script_failure,
-                            ac_fallback_used=ac_fallback_used,
-                        )
-                        child_results[ci]["ac_results"] = acs
+
+            if not phase1_checkpointed:
+                _checkpoint_phase_done(checkpoint, PHASE_CHILDREN, {
+                    "ac_results": ac_results,
+                    "child_results": child_results,
+                    "child_persist_results": child_persist_results,
+                    "phase2_completed": phase2_completed,
+                    "phase2_skip_note": phase2_skip_note,
+                })
 
             # 5. Child Phase 2 deep analysis for pending children only
             # (parent already deep-verified — skip_parent_deep=True).
-            if pending_children and not has_blocking_cq:
+            if (pending_children
+                    or (phase1_checkpointed
+                        and _children_need_phase2(child_results))
+            ) and not has_blocking_cq:
                 ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
                     work_item, ac_results, child_results,
                     resolved_model=resolved_model,
@@ -8467,6 +8721,14 @@ def _phase_children(ctx: _AuditContext) -> int | None:
 
 
         # ------------------------------------------------------------------
+        _checkpoint_phase_done(checkpoint, PHASE_PHASE2, {
+            "ac_results": ac_results,
+            "child_results": child_results,
+            "child_persist_results": child_persist_results,
+            "phase2_completed": phase2_completed,
+            "phase2_skip_note": phase2_skip_note,
+        })
+
     finally:
         ctx.ac_results = ac_results
         ctx.child_results = child_results
@@ -9032,7 +9294,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
               max_child_audits: int | None = None,
               run_tests: bool = False,
               no_execute: bool = False,
-              max_citations_per_ac: int | None = None) -> int:
+              max_citations_per_ac: int | None = None,
+              checkpoint_dir: str | None = None,
+              no_checkpoint: bool = False) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -9055,6 +9319,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     When *force* is ``True``, the freshness gate is bypassed and a full
     audit pipeline is always run, even if a recent audit already exists.
+    Any existing phase checkpoint is cleared so the forced run starts fresh
+    (SA-0MT6EZUS9004FJ9T).
+
+    *checkpoint_dir* (``--checkpoint-dir`` / ``AUDIT_CHECKPOINT_DIR``)
+    selects the directory for phase checkpoints, and *no_checkpoint*
+    (``--no-checkpoint``) disables checkpointing entirely. Checkpointing is
+    best-effort and OFF for ``audit project`` runs; see
+    ``_open_checkpoint_store``.
 
     *audit_children* enables the recursive child-audit cascade: when a child
     has no fresh audit, the runner auto-triggers a full child audit instead
@@ -9140,6 +9412,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
     rc = _phase_gate(ctx)
     if rc is not None:
         return rc
+
+    ctx.checkpoint = _open_checkpoint_store(ctx, checkpoint_dir, no_checkpoint)
 
     try:
         # The fetch phase (SA-0MT456M27001LRTL) runs the Phase 1 merge gate
@@ -9233,6 +9507,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
         lifecycle_rc = _apply_terminal_lifecycle(ctx)
         if lifecycle_rc != 0:
             rc = lifecycle_rc
+    if rc == 0 and ctx.checkpoint is not None:
+        try:
+            ctx.checkpoint.clear()
+        except Exception:  # noqa: BLE001 -- best-effort cleanup
+            pass
     return rc
 
 
@@ -9543,6 +9822,19 @@ def build_parser() -> argparse.ArgumentParser:
                              "runner auto-executes the repo's actual suite on a miss "
                              "via the test skill."
                          ))
+    p_issue.add_argument("--checkpoint-dir", default=None,
+                         help=(
+                             "Directory for audit phase checkpoints (default: "
+                             "<owning-repo>/.worklog/audit-checkpoints; env: "
+                             "AUDIT_CHECKPOINT_DIR). Partial results are persisted "
+                             "per phase so an interrupted audit resumes where it "
+                             "left off instead of re-running the whole pipeline."
+                         ))
+    p_issue.add_argument("--no-checkpoint", action="store_true",
+                         help=(
+                             "Disable phase checkpointing entirely — the audit runs "
+                             "as before, persisting no partial progress."
+                         ))
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--timeout", type=int, default=None,
@@ -9619,7 +9911,9 @@ def main(argv: list[str] | None = None) -> int:
                              args.max_citations_per_ac
                          ),
                          run_tests=args.run_tests,
-                         no_execute=getattr(args, "no_execute", False))
+                         no_execute=getattr(args, "no_execute", False),
+                         checkpoint_dir=getattr(args, "checkpoint_dir", None),
+                         no_checkpoint=getattr(args, "no_checkpoint", False))
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,

@@ -125,6 +125,39 @@ run:
 or contradict a runner verdict that already completed its lifecycle: if the
 runner finished, its verdict and status transitions stand untouched.
 
+### Phase checkpoints (SA-0MT6EZUS9004FJ9T) — resume after a kill
+
+Because a run can be killed at any point (stall abort, budget exhaustion,
+bash-tool timeout, `kill`), the runner persists **partial progress per phase**
+so the next `audit_runner.py issue <id>` run resumes instead of redoing the
+whole audit:
+
+- **Phases:** `phase1_parent` (parent AC screening) → `phase1_children`
+  (child screenings + child audit persistence) → `phase2` (deep analysis +
+  final state). Each completed phase saves its accumulated results
+  (`ac_results`, `child_results`, `child_persist_results`, `phase2_completed`,
+  `phase2_skip_note`) atomically to a JSON checkpoint file.
+- **Resume (AC2):** on the next run (same issue id **and** same git HEAD sha)
+  completed phases are skipped — e.g. a completed parent screening SKIPS the
+  Phase 1 Pi call entirely and restores the stored AC verdicts; a completed
+  `phase1_children` restores the child verdicts and re-runs only the Phase 2
+  segment for children that still need deep analysis. An in-progress
+  (interrupted) phase is always re-run from its start.
+- **Timeout reporting (AC4):** the resume banner on stderr prints which
+  phases completed and which phase the previous run died in, e.g.
+  `[checkpoint] Resuming audit for SA-123: completed=['Phase 1 parent
+  screening']; previous run interrupted during Phase 1 child screenings`.
+- **Config (AC3):** `--checkpoint-dir DIR` / `AUDIT_CHECKPOINT_DIR`
+  (default `<owning-repo>/.worklog/audit-checkpoints`); `--no-checkpoint`
+  disables checkpointing (byte-identical pre-change behavior).
+- **Safety:** stale checkpoints from a different git HEAD are never reused;
+  `--force` always starts fresh (clears any checkpoint); the file is removed
+  after a successful run so a finished audit never resumes.
+- **Best-effort:** any checkpoint read/write/validation failure prints a
+  warning and disables checkpointing for that run — it never affects the
+  audit verdict or the exit code. Checkpointing applies to `issue` audits
+  only; `audit project` runs are out of scope.
+
 ## Pre-flight affirmation guard
 
 Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the same work item from racing. The SKILL.md long documented a "pre-flight affirmation" with no code behind it; this guard makes docs and code agree.
@@ -200,7 +233,7 @@ No status lifecycle transitions occur, and no persistence is performed. An expli
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--phase1-model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--phase1-model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
