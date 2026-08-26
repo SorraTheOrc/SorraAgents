@@ -18,8 +18,10 @@ replace a skill's own workflow or status-lifecycle management.
 
 ## When to use
 
-- **Always at the end of a work-item skill session** — the last thing a
-  skill prints before handing control back to the operator.
+- **Always at the end of a work-item skill session** — the report is the
+  **last thing the skill puts in its final response** before handing control
+  back to the operator (paste the rendered output verbatim — never leave it
+  only as tool output).
 - When a producer asks "what happened in that session?" — the report is the
   single place to look.
 
@@ -155,7 +157,8 @@ fallback always accompanies the icon so reports stay readable everywhere.
 ## How to invoke the helper (the contract)
 
 Other skills embed this block as their **final step**. The helper renders
-the report and prints it; the calling skill then closes its session.
+the report and prints it to stdout; the calling skill then **pastes the
+printed report verbatim into its final response** so the operator sees it.
 
 ````markdown
 ### Final step: standardized end-of-session report
@@ -185,8 +188,10 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   [--next-action <review|plan|implement|...>]
 ```
 
-Then close with: `<work-item-id>: <one-line summary>`. Do NOT re-summarize
-the report in a different format — the report is the summary.
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary.
 ````
 
 Rules for callers:
@@ -198,8 +203,10 @@ Rules for callers:
    next action).
 3. Run it as the **final step**, after all status/stage transitions, so the
    Meta-Data reflects the end-of-session state.
-4. Output is stdout markdown; the calling skill prints it last. (Persisting
-   the report to the work item is a follow-up; v1 is stdout only.)
+4. Output is stdout markdown; the calling skill **pastes it verbatim into
+   its final response** — tool output alone does not put the report in front
+   of the operator. (Persisting the report to the work item is a follow-up;
+   v1 is stdout only.)
 
 ## Renderer
 

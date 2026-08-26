@@ -289,8 +289,7 @@ On runner failure (non-zero exit, timeout, exception), the report is wrapped wit
 The audit's **persisted** machine-verified report (``Ready to close:`` header,
 ``## Summary``, ``## Acceptance Criteria Status``) is unchanged and remains
 the authoritative audit record. Only the agent's end-of-session summary
-reconciles with the canonical template — render it as the **last step**, then
-close with: `<work-item-id>: <one-line summary>`.
+reconciles with the canonical template — render it as the **last step**:
 
 ```bash
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
@@ -303,4 +302,7 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   [--next-action <review|plan|implement|...>]
 ```
 
-Do NOT re-summarize the report in a different format — the report is the summary.
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary.

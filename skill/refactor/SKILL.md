@@ -175,4 +175,7 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   [--next-action <review|plan|implement|...>]
 ```
 
-Then close with: `<work-item-id>: <one-line summary>`. Do NOT re-summarize the report in a different format — the report is the summary.
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary.
