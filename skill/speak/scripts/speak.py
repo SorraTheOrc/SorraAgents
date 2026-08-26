@@ -16,7 +16,7 @@ Usage (identical CLI to ``speak.sh``)::
 The wrapper passes all arguments through to ``speak.sh`` unchanged, so
 existing environment variables (``TTS_API_URL``, ``SPEAK_DIR``) and the
 rolling-buffer behaviour are unaffected.
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(_REPO_ROOT / "skill") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "skill"))
 
-from shared.timing import Timer  # noqa: E402
+from shared.timing import Timer
 
 SCRIPT_PATH = Path(__file__).resolve().parent / "speak.sh"
 
@@ -49,14 +49,14 @@ def main(argv: list[str] | None = None) -> int:
     with Timer("speak.sh") as timer:
         if "--help" in argv or "-h" in argv:
             # Delegate help to speak.sh so usage text stays in one place.
-            proc = subprocess.run(  # noqa: S603
+            proc = subprocess.run(
                 ["bash", str(SCRIPT_PATH), *argv],
                 env=os.environ.copy(),
                 check=False,
             )
         else:
             with Timer("invoke_speak_sh"):
-                proc = subprocess.run(  # noqa: S603
+                proc = subprocess.run(
                     ["bash", str(SCRIPT_PATH), *argv],
                     env=os.environ.copy(),
                     check=False,
