@@ -12,12 +12,11 @@ These tests invoke the instrumented CLI scripts (run_tests.py,
 render_report.py, speak.py) through subprocesses so the emitted output is
 verified end-to-end. Work items are fetched through the shared worklog
 resolution so the tests work from a git worktree too.
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import time
@@ -28,7 +27,7 @@ _SKILLS = REPO_ROOT / "skill"
 if str(_SKILLS) not in sys.path:
     sys.path.insert(0, str(_SKILLS))
 
-from shared.timing import Timer  # noqa: E402
+from shared.timing import Timer
 
 RUN_TESTS_PY = REPO_ROOT / "skill" / "test" / "scripts" / "run_tests.py"
 RENDER_REPORT_PY = REPO_ROOT / "skill" / "report" / "scripts" / "render_report.py"
@@ -45,7 +44,7 @@ class TestJsonModeTiming:
 
     def test_run_tests_json_includes_timing_key(self):
         """run_tests.py --json carries a top-level ``timing`` dict."""
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             [sys.executable, str(RUN_TESTS_PY), "--suite", "pytest",
              "--summary", "--json"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
@@ -62,7 +61,7 @@ class TestJsonModeTiming:
 
     def test_run_tests_json_timing_has_expected_structure(self):
         """The timing dict reports name, elapsed, total_time, percentage."""
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             [sys.executable, str(RUN_TESTS_PY), "--suite", "pytest",
              "--summary", "--json"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
@@ -84,7 +83,7 @@ class TestHumanModeTiming:
 
     def test_run_tests_human_emits_timing_report_on_stderr(self):
         """run_tests.py in human mode prints a Timing Report to stderr."""
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             [sys.executable, str(RUN_TESTS_PY), "--suite", "pytest",
              "--summary"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
@@ -120,7 +119,7 @@ class TestHumanModeTiming:
 
     def test_render_report_emits_timing_on_stderr(self):
         """render_report.py prints the report to stdout and timing to stderr."""
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             [sys.executable, str(RENDER_REPORT_PY), "SA-0MT319YGQ002E801",
              "--skill-name", "integration-test",
              "--headline", "Integration verification",
@@ -183,7 +182,7 @@ class TestSpeakWrapperIntegration:
 
     def test_speak_wrapper_help_emits_timing(self):
         """speak.py --help delegates to speak.sh and emits timing on stderr."""
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             [sys.executable, str(SPEAK_PY), "--help"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
             timeout=120,
