@@ -53,6 +53,7 @@ if _SKILLS_ROOT_STR in sys.path:
     sys.path.remove(_SKILLS_ROOT_STR)
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
+from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
     query_cached,
@@ -63,7 +64,6 @@ from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
 )
-from shared.timing import Timer
 
 REPO_ROOT = _SKILLS_ROOT.parent
 

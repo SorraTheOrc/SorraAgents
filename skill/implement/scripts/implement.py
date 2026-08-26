@@ -84,7 +84,7 @@ NPM_TEST_CMD = canonicalize_quiet_test_command("npm test")  # npm --silent test
 LOG = logging.getLogger("implement.scripts.implement")
 
 
-def _emit_timing(timer: "Timer") -> None:
+def _emit_timing(timer: Timer) -> None:
     """Emit the timing report for a completed implement run to stderr.
 
     Timing always goes to stderr so stdout stays clean for JSON-mode output
@@ -3263,51 +3263,47 @@ def _main(argv: list[str] | None = None) -> int:
     )
 
     if args.action == "start":
-        with Timer("implement") as _root_timer:
-            with Timer("phase_start"):
-                result = phase_start(
-                    work_item_id=args.work_item_id,
-                    json_output=args.json,
-                    no_refactor=args.no_refactor,
-                    parent_branch=args.parent_branch,
-                    worktree_path_override=args.worktree_path,
-                    max_retry=args.max_retry,
-                    verbose=args.verbose,
-                    force=args.allow_orphaned_stashes,
-                )
-                _emit_timing(_root_timer)
+        with Timer("implement") as _root_timer, Timer("phase_start"):
+            result = phase_start(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                no_refactor=args.no_refactor,
+                parent_branch=args.parent_branch,
+                worktree_path_override=args.worktree_path,
+                max_retry=args.max_retry,
+                verbose=args.verbose,
+                force=args.allow_orphaned_stashes,
+            )
+            _emit_timing(_root_timer)
     elif args.action == "finish":
-        with Timer("implement") as _root_timer:
-            with Timer("phase_finish"):
-                result = phase_finish(
-                    work_item_id=args.work_item_id,
-                    json_output=args.json,
-                    no_refactor=args.no_refactor,
-                    commit_msg_override=args.commit_msg,
-                    max_retry=args.max_retry,
-                    verbose=args.verbose,
-                )
-                _emit_timing(_root_timer)
+        with Timer("implement") as _root_timer, Timer("phase_finish"):
+            result = phase_finish(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                no_refactor=args.no_refactor,
+                commit_msg_override=args.commit_msg,
+                max_retry=args.max_retry,
+                verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
     elif args.action == "abort":
-        with Timer("implement") as _root_timer:
-            with Timer("phase_abort"):
-                result = phase_abort(
-                    work_item_id=args.work_item_id,
-                    json_output=args.json,
-                    verbose=args.verbose,
-                )
-                _emit_timing(_root_timer)
+        with Timer("implement") as _root_timer, Timer("phase_abort"):
+            result = phase_abort(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
     elif args.action == "parent":
-        with Timer("implement") as _root_timer:
-            with Timer("phase_parent"):
-                result = phase_parent(
-                    work_item_id=args.work_item_id,
-                    json_output=args.json,
-                    no_refactor=args.no_refactor,
-                    parent_branch=args.parent_branch,
-                    verbose=args.verbose,
-                )
-                _emit_timing(_root_timer)
+        with Timer("implement") as _root_timer, Timer("phase_parent"):
+            result = phase_parent(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                no_refactor=args.no_refactor,
+                parent_branch=args.parent_branch,
+                verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
     else:
         LOG.error("Unknown action: %s", args.action)
         return 1

@@ -34,7 +34,6 @@ if str(_SKILLS_ROOT) not in sys.path:
 
 from import_guard import guard_shared_import
 
-
 try:
     from shared.status_lifecycle import StatusLifecycle, run_wl
     from shared.timing import Timer
