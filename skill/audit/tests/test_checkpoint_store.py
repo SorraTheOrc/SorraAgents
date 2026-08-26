@@ -29,7 +29,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
 from audit.scripts.checkpoint_store import (
     CHECKPOINT_FILE_SUFFIX,
     CHECKPOINT_VERSION,
@@ -37,7 +36,6 @@ from audit.scripts.checkpoint_store import (
     PHASE_CHILDREN,
     PHASE_LABELS,
     PHASE_PARENT,
-    PHASE_PHASE2,
     STATUS_COMPLETED,
     STATUS_IN_PROGRESS,
     STATUS_PENDING,
@@ -220,7 +218,6 @@ class TestCheckpointStoreGracefulDegradation:
     def test_unreadable_write_warns_and_does_not_raise(
         self, tmp_path, capsys
     ):
-        store = _store(tmp_path)
         blocked = tmp_path / "blocked"
         blocked.mkdir()
         (blocked / "x").write_text("", encoding="utf-8")  # placeholder

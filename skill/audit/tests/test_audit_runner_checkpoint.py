@@ -59,13 +59,16 @@ def _open_store(tmp_path, issue_id="TEST-1", head=HEAD_BASE, **kw):
 def _make_ctx(checkpoint=None, **overrides):
     runner = mock.MagicMock()
     runner.side_effect = None
-    defaults = dict(
-        issue_id="TEST-1", persist=False, timeout=None, parent_timeout=None,
-        pi_bin="pi", model=None, model_source="default", runner=runner,
-        json_mode=False, debug_log=None, force=False, worklog_dir=None,
-        batch_phase2=False, green_run=None, audit_children=False,
-        max_child_audits=None, run_tests=False,
-    )
+    defaults = {
+        "issue_id": "TEST-1", "persist": False, "timeout": None,
+        "parent_timeout": None,
+        "pi_bin": "pi", "model": None, "model_source": "default",
+        "runner": runner,
+        "json_mode": False, "debug_log": None, "force": False,
+        "worklog_dir": None,
+        "batch_phase2": False, "green_run": None, "audit_children": False,
+        "max_child_audits": None, "run_tests": False,
+    }
     defaults.update(overrides)
     ctx = audit_runner._AuditContext(**defaults)
     ctx.checkpoint = checkpoint

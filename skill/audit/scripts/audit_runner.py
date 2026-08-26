@@ -5791,7 +5791,7 @@ class _AuditContext:
     # _phase_children to skip completed phases on a resumed run. None when
     # checkpointing is disabled (--no-checkpoint, unresolvable HEAD, or a
     # store failure) — behavior is then byte-identical to a pre-change run.
-    checkpoint: "CheckpointStore | None" = None
+    checkpoint: CheckpointStore | None = None
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
@@ -9510,8 +9510,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
     if rc == 0 and ctx.checkpoint is not None:
         try:
             ctx.checkpoint.clear()
-        except Exception:  # noqa: BLE001 -- best-effort cleanup
-            pass
+        except Exception as exc:  # noqa: BLE001 -- best-effort cleanup
+            print(
+                f"Warning: could not clear audit checkpoint after success: {exc}",
+                file=sys.stderr,
+            )
     return rc
 
 
