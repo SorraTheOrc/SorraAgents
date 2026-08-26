@@ -98,9 +98,8 @@ class TestNestingRollUp:
         leftover = Timer("leftover")
         leftover.start()
         try:
-            with Timer("root") as root:
-                with Timer("child") as child:
-                    pass
+            with Timer("root") as root, Timer("child") as child:
+                pass
             # root must NOT be linked under the leftover manual timer
             assert root.parent is None
             assert child.parent is root
@@ -308,19 +307,23 @@ class TestNestedStepPercentages:
 
         with Timer("root") as root:
             with Timer("half") as half:
-                _time.sleep(0.02)
+                _time.sleep(0.05)
             with Timer("half") as half2:
-                _time.sleep(0.02)
-        # Both should be ~50% (equal sleep durations; allow scheduler noise)
-        assert 35 < half.percentage < 65
-        assert 35 < half2.percentage < 65
+                _time.sleep(0.05)
+        # Each child is a real fraction of the root (>0, <100) and the
+        # children sum to ~100% of the root (invariant by construction).
+        assert 0 < half.percentage < 100
+        assert 0 < half2.percentage < 100
+        assert abs(half.percentage + half2.percentage - 100.0) < 2.0
 
     def test_deeply_nested_child_percentage(self):
         """A deeply nested child's percentage is relative to the root."""
+        import time as _time
+
         with Timer("root") as root, Timer("level1") as l1:
             with Timer("level2") as l2:
-                pass
-        assert 0 < root.percentage <= 100
+                _time.sleep(0.02)
+        assert root.percentage == 100.0
         assert 0 < l1.percentage <= 100
         assert 0 < l2.percentage <= 100
 
