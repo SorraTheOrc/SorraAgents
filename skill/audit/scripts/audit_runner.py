@@ -2339,6 +2339,76 @@ def _phase2_batch_enabled(cli_value: bool | None = None) -> bool:
     return env_value.strip().lower() in ("1", "true", "yes", "on")
 
 
+AUDIT_CHILD_IN_MAIN_SLOT_ENV = "AUDIT_CHILD_IN_MAIN_SLOT"
+"""Environment variable for the child-audit execution mode gate.
+
+When disabled (``false`` / ``0`` / ``no`` / ``off``), child Phase-1
+AC-review screens and Phase-2 child deep analysis run in a separate
+``pi`` subprocess session per child (the historical path, unchanged).
+When enabled (default — ``true``), child audits run in the main LLM slot:
+no new ``pi`` subprocess session is spawned per child; instead the runner
+emits structured in-main-slot work items for the invoking agent session
+and a ``/compact`` instruction after each child audit before continuing.
+See SA-0MT2XRGEU0009QRE.
+"""
+
+# Stable stderr markers emitted in in-main-slot mode. The invoking agent
+# session parses these to perform each child audit inline in the main
+# LLM slot, then issues the /compact instruction before the next child.
+IN_MAIN_SLOT_WORK_MARKER = "[AUDIT_IN_MAIN_SLOT_WORK]"
+IN_MAIN_SLOT_COMPACT_MARKER = "[AUDIT_IN_MAIN_SLOT_COMPACT]"
+
+
+def _resolve_child_in_main_slot(cli_value: bool | None = None) -> bool:
+    """Resolve whether child audits run in the main LLM slot.
+
+    Precedence:
+      1. ``--child-in-main-slot`` / ``--no-child-in-main-slot`` CLI flag
+         (explicit override; flag wins)
+      2. ``AUDIT_CHILD_IN_MAIN_SLOT`` environment variable
+      3. ``True`` (default — in-main-slot mode, SA-0MT2XRGEU0009QRE AC1)
+
+    The separate-process path (a new ``pi`` subprocess session per child)
+    is retained unchanged when the gate resolves to ``False``.
+    """
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(AUDIT_CHILD_IN_MAIN_SLOT_ENV, "")
+    if env_value:
+        return env_value.strip().lower() in ("1", "true", "yes", "on")
+    return True
+
+
+def _emit_in_main_slot_work(phase_label: str, child_id: str, payload: dict) -> None:
+    """Emit one in-main-slot child-audit work item to stderr.
+
+    In-main-slot mode does not spawn a new ``pi`` subprocess session per
+    child; instead the exact child Phase-1 AC screen (``phase1_child_screen``)
+    or Phase-2 child deep-analysis prompt (``phase2_child_deep``) that would
+    have been sent is surfaced as a structured, parseable work item so the
+    invoking agent session can run it inline in the main LLM slot.
+    """
+    print(
+        f"{IN_MAIN_SLOT_WORK_MARKER} {phase_label} {child_id} "
+        f"{json.dumps(payload, ensure_ascii=False)}",
+        file=sys.stderr,
+    )
+
+
+def _emit_in_main_slot_compact(child_id: str) -> None:
+    """Emit the /compact session instruction after a child audit.
+
+    ``/compact`` is an agent-session operation (the runner cannot execute
+    it itself); emitting the marker at the right point lets the invoking
+    agent session compact after each child audit before continuing with
+    the next (SA-0MT2XRGEU0009QRE AC2).
+    """
+    print(
+        f"{IN_MAIN_SLOT_COMPACT_MARKER} /compact after child audit {child_id}",
+        file=sys.stderr,
+    )
+
+
 def _normalize_model_source(source: str | None) -> str:
     """Normalize a model_source value to a valid value (remote|local)."""
     if not source:
@@ -4480,7 +4550,8 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                              debug_log: str | None,
                              timeout: int | None, runner: Runner,
                              script_failure_callback: Callable[[str, Exception], None],
-                             ac_fallback_used: threading.Event | None = None
+                             ac_fallback_used: threading.Event | None = None,
+                             child_in_main_slot: bool = False
                              ) -> tuple[int, list[dict]]:
     """Phase 1 child AC review worker (P7, parallel-safe).
 
@@ -4494,6 +4565,14 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
     produce reliable batched verdict JSON and a distinct full model is
     configured, the SAME screen is retried once with *full_model* before
     falling back to diagnostic 'partial' verdicts.
+
+    *child_in_main_slot* (SA-0MT2XRGEU0009QRE): when True (in-main-slot
+    mode), NO ``pi`` subprocess is spawned per child. The screen prompt is
+    emitted as a structured in-main-slot work item for the invoking agent
+    session to run inline in the main LLM slot, followed by a ``/compact``
+    instruction; the child's ACs are marked pending main-session review.
+    A later parent run reuses the child's persisted audit (freshness/child
+    verdict reuse) with zero pi calls.
 
     Never raises: a Pi ``RuntimeError`` records a script failure and falls
     back to diagnostic ``partial`` verdicts (identical to the historical
@@ -4528,6 +4607,38 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
             f"Include justification in the evidence field.\n\n"
             f"Criteria: {child_ac_list}"
         )
+        if child_in_main_slot:
+            # In-main-slot mode: NO new pi subprocess session per child
+            # (SA-0MT2XRGEU0009QRE AC2). Surface the exact screen prompt
+            # for the invoking agent session and issue /compact after the
+            # child audit before continuing. The verdict is pending until
+            # the main session performs the screen and persists the child
+            # audit; a re-run reuses it at zero pi cost.
+            _emit_in_main_slot_work(
+                "phase1_child_screen", child.get("id", ""),
+                {
+                    "phase": "phase1_child_screen",
+                    "child_id": child.get("id", ""),
+                    "title": child.get("title", ""),
+                    "prompt": prompt,
+                },
+            )
+            _emit_in_main_slot_compact(child.get("id", ""))
+            child_ac_results = [
+                {
+                    "text": ac,
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": (
+                        "In-main-slot child Phase-1 AC screen emitted to the "
+                        "main LLM slot (no pi subprocess); verdict pending "
+                        "main-session review — perform the emitted screen, "
+                        "persist the child audit, and re-run the parent to "
+                        "collect the verdict (SA-0MT2XRGEU0009QRE)."
+                    ),
+                }
+                for ac in child_acs
+            ]
+            return ci, child_ac_results
         try:
             result, batch, raw_text = _call_phase1_screen(
                 child.get("id", ""), f"child:{child.get('id', '')}", prompt,
@@ -4948,6 +5059,7 @@ def _deep_analyze_child(
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
     max_citations_per_ac: int = _DEFAULT_MAX_CITATIONS_PER_AC,
+    child_in_main_slot: bool = False,
 ) -> tuple[int, dict, bool]:
     """Run Phase 2 deep analysis for a single child (worker for parallelism).
 
@@ -4963,6 +5075,14 @@ def _deep_analyze_child(
 
     *max_citations_per_ac* bounds the file:line evidence citations the model
     may emit per criterion (prompt-level only, LP-0MSQ32WM5000NCB7).
+
+    *child_in_main_slot* (SA-0MT2XRGEU0009QRE): when True (in-main-slot
+    mode), NO ``pi`` subprocess is spawned per child. The deep-analysis
+    prompt is emitted as a structured in-main-slot work item for the
+    invoking agent session to run inline in the main LLM slot, followed by
+    a ``/compact`` instruction; the child's Phase 1 ac_results are preserved
+    (pending main-session review). A later parent run reuses the child's
+    persisted audit with zero pi calls.
     """
     child_acs = child.get("ac_results", [])
     if not child_acs:
@@ -4991,6 +5111,25 @@ def _deep_analyze_child(
         "Use the same verdict guidance as the parent deep analysis.\n\n"
         f"Criteria: {child_ac_list}"
     )
+
+    if child_in_main_slot:
+        # In-main-slot mode: NO new pi subprocess session per child
+        # (SA-0MT2XRGEU0009QRE AC2). Surface the exact deep-analysis prompt
+        # for the invoking agent session and issue /compact after the child
+        # audit before continuing. Phase 1 ac_results stand (pending
+        # main-session review) until the main session performs the deep
+        # analysis, persists the child audit, and the parent is re-run.
+        _emit_in_main_slot_work(
+            "phase2_child_deep", child.get("id", ""),
+            {
+                "phase": "phase2_child_deep",
+                "child_id": child.get("id", ""),
+                "title": child.get("title", ""),
+                "prompt": child_prompt,
+            },
+        )
+        _emit_in_main_slot_compact(child.get("id", ""))
+        return ci, child, False
 
     try:
         child_result = _call_pi_and_maybe_log(
@@ -5318,6 +5457,7 @@ def _run_phase2_deep_analysis(
     skip_parent_deep: bool = False,
     owning_root: Path | None = None,
     max_citations_per_ac: int | None = None,
+    child_in_main_slot: bool = False,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -5363,6 +5503,14 @@ def _run_phase2_deep_analysis(
     resolved via ``_resolve_max_citations_per_ac``). Prompt-level only —
     verdict semantics and the canonical report format are unchanged
     (LP-0MSQ32WM5000NCB7).
+
+    *child_in_main_slot* (SA-0MT2XRGEU0009QRE): when True (in-main-slot
+    mode), child Phase-2 deep analysis runs in the main LLM slot — NO new
+    ``pi`` subprocess session is spawned per child: ``_deep_analyze_child``
+    emits structured in-main-slot work items + a ``/compact`` instruction
+    after each child audit. Batch mode (``--batch-phase2``) is skipped in
+    this mode (batch would still spawn one pi session); children are
+    processed sequentially (one main slot).
 
     Returns (updated_ac_results, updated_child_results, phase2_completed).
     The ``phase2_completed`` flag is ``False`` when the Pi call times out,
@@ -5429,7 +5577,11 @@ def _run_phase2_deep_analysis(
     # When *skip_parent_deep* is set the parent was already deep-verified
     # in a prior parent-only call (SA-0MSKB6VJA005N43F); the batch path
     # re-analyzes the parent ACs, so skip it and use the per-child path.
-    if batch_phase2 and pending and not skip_parent_deep:
+    # In-main-slot mode (SA-0MT2XRGEU0009QRE) also skips batch: batch would
+    # still spawn a fresh pi session, defeating the no-new-session-per-child
+    # contract; children are emitted as in-main-slot work instead.
+    if batch_phase2 and pending and not skip_parent_deep \
+            and not child_in_main_slot:
         batch_outcome = _run_batch_phase2(
             issue, ac_results, pending, updated_children,
             resolved_model, pi_bin, debug_log, timeout, runner,
@@ -5642,7 +5794,10 @@ def _run_phase2_deep_analysis(
     # Also run deep analysis on active children
     child_timeout_occurred = False
 
-    parallelism = _resolve_child_concurrency()
+    # In-main-slot mode runs children sequentially on the single main slot
+    # (one /compact per child in order); the separate-process path retains
+    # the slot-aware parallel ceiling (SA-0MT2XRGEU0009QRE AC2).
+    parallelism = 1 if child_in_main_slot else _resolve_child_concurrency()
 
     def _merge_result(result: tuple[int, dict, bool]) -> None:
         nonlocal child_timeout_occurred
@@ -5665,6 +5820,7 @@ def _run_phase2_deep_analysis(
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
                     max_citations_per_ac=max_citations_per_ac,
+                    child_in_main_slot=child_in_main_slot,
                 )
                 for ci, child in pending
             ]
@@ -5685,6 +5841,7 @@ def _run_phase2_deep_analysis(
                 ac_fallback_used=ac_fallback_used,
                 green_run_block=green_run_block,
                 max_citations_per_ac=max_citations_per_ac,
+                child_in_main_slot=child_in_main_slot,
             ))
 
     return updated_ac, updated_children, not child_timeout_occurred
@@ -5831,6 +5988,13 @@ class _AuditContext:
     run_tests: bool
     no_execute: bool = False
     max_citations_per_ac: int | None = None
+    child_in_main_slot: bool = False
+    """Resolved from env var / CLI flag / default true by cmd_issue
+    (SA-0MT2XRGEU0009QRE). True → child Phase-1 AC screens and Phase-2
+    child deep analysis run in the main LLM slot (no pi subprocess per
+    child; /compact after each child audit). False → the unchanged
+    separate-process path.
+    """
     phase1_model: str | None = None
 
     # Phase checkpoint store (SA-0MT6EZUS9004FJ9T): bound by cmd_issue after
@@ -8163,7 +8327,12 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                 # bounded parallelism; fall back to a sequential loop for a single
                 # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
                 if pending_children:
-                    parallelism = _resolve_child_concurrency()
+                    # In-main-slot mode (SA-0MT2XRGEU0009QRE) is inherently
+                    # sequential (one main slot): child Phase-1 screens run one at
+                    # a time with a /compact between them, so parallel dispatch is
+                    # forced to 1; the separate-process path keeps the slot-aware
+                    # parallel ceiling.
+                    parallelism = 1 if ctx.child_in_main_slot else _resolve_child_concurrency()
                     if parallelism > 1 and len(pending_children) > 1:
                         with ThreadPoolExecutor(max_workers=parallelism) as executor:
                             futures = [
@@ -8174,6 +8343,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     pi_bin, debug_log, timeout,
                                     runner, ctx.record_script_failure,
                                     ac_fallback_used=ac_fallback_used,
+                                    child_in_main_slot=ctx.child_in_main_slot,
                                 )
                                 for ci, child in pending_children
                             ]
@@ -8188,6 +8358,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 pi_bin, debug_log, timeout,
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
+                                child_in_main_slot=ctx.child_in_main_slot,
                             )
                             child_results[ci]["ac_results"] = acs
 
@@ -8476,6 +8647,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     skip_parent_deep=True,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
+                    child_in_main_slot=ctx.child_in_main_slot,
                 )
                 # The parent's deep analysis definitively did not run — never
                 # report it as completed regardless of child outcomes.
@@ -8497,6 +8669,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     green_run_block=green_run_block,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
+                    child_in_main_slot=ctx.child_in_main_slot,
                 )
         else:
             # ── PARENT-FIRST flow (default, SA-0MSKB6VJA005N43F) ──
@@ -8565,6 +8738,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         green_run_block=green_run_block,
                         owning_root=owning_root,
                         max_citations_per_ac=max_citations_per_ac,
+                        child_in_main_slot=ctx.child_in_main_slot,
                     )
 
                 # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
@@ -8652,7 +8826,12 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                 # 4. Phase 1 child AC review for pending (gap-mapped / changed)
                 # children only — the parent's critical path is unaffected.
                 if pending_children:
-                    parallelism = _resolve_child_concurrency()
+                    # In-main-slot mode (SA-0MT2XRGEU0009QRE) is inherently
+                    # sequential (one main slot): child Phase-1 screens run one at
+                    # a time with a /compact between them, so parallel dispatch is
+                    # forced to 1; the separate-process path keeps the slot-aware
+                    # parallel ceiling.
+                    parallelism = 1 if ctx.child_in_main_slot else _resolve_child_concurrency()
                     if parallelism > 1 and len(pending_children) > 1:
                         with ThreadPoolExecutor(max_workers=parallelism) as executor:
                             futures = [
@@ -8663,6 +8842,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     pi_bin, debug_log, timeout,
                                     runner, ctx.record_script_failure,
                                     ac_fallback_used=ac_fallback_used,
+                                    child_in_main_slot=ctx.child_in_main_slot,
                                 )
                                 for ci, child in pending_children
                             ]
@@ -8677,6 +8857,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 pi_bin, debug_log, timeout,
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
+                                child_in_main_slot=ctx.child_in_main_slot,
                             )
                             child_results[ci]["ac_results"] = acs
 
@@ -8710,6 +8891,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     skip_parent_deep=True,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
+                    child_in_main_slot=ctx.child_in_main_slot,
                 )
 
             # 6. Persist child audits (inherited children are explicit in the
@@ -9343,8 +9525,18 @@ def cmd_issue(issue_id: str, persist: bool = True,
               no_execute: bool = False,
               max_citations_per_ac: int | None = None,
               checkpoint_dir: str | None = None,
-              no_checkpoint: bool = False) -> int:
+              no_checkpoint: bool = False,
+              child_in_main_slot: bool | None = None) -> int:
     """Audit a single work item.
+
+    *child_in_main_slot* (SA-0MT2XRGEU0009QRE) is the config gate between
+    the two child-audit execution modes: ``True`` (default → in-main-slot
+    mode) runs child Phase-1 AC-review screens and Phase-2 child deep
+    analysis in the main LLM slot — no new ``pi`` subprocess session per
+    child, with a ``/compact`` instruction after each child audit;
+    ``False`` uses the unchanged separate-process path (a ``pi`` subprocess
+    per child). Resolution precedence: explicit value (CLI flag, flag wins)
+    > ``AUDIT_CHILD_IN_MAIN_SLOT`` env var > ``True`` (default).
 
     The resolved model name and source are included as a metadata line
     in the audit report output (issue-level and child reports).
@@ -9451,6 +9643,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         model_source=model_source, runner=runner or _default_runner,
         json_mode=json_mode, debug_log=debug_log, force=force,
         worklog_dir=worklog_dir, batch_phase2=batch_phase2,
+        child_in_main_slot=_resolve_child_in_main_slot(child_in_main_slot),
         green_run=green_run, audit_children=audit_children,
         max_child_audits=max_child_audits, run_tests=run_tests,
         no_execute=no_execute,
@@ -9793,6 +9986,24 @@ def build_parser() -> argparse.ArgumentParser:
                              "pending child ACs into ONE indexed pi call (env: "
                              "AUDIT_PHASE2_BATCH; default off)"
                          ))
+    p_issue.add_argument("--child-in-main-slot", action="store_true",
+                         default=None,
+                         help=(
+                             "Run child Phase-1 AC-review screens and Phase-2 child "
+                             "deep analysis in the main LLM slot (no new pi "
+                             "subprocess session per child; the audit flow issues "
+                             "a /compact after each child audit). Default: "
+                             "AUDIT_CHILD_IN_MAIN_SLOT env or true. Use "
+                             "--no-child-in-main-slot to force the unchanged "
+                             "separate-process path (SA-0MT2XRGEU0009QRE)"
+                         ))
+    p_issue.add_argument("--no-child-in-main-slot", dest="child_in_main_slot",
+                         action="store_false",
+                         help=(
+                             "Force the separate-process path for child audits: "
+                             "a pi subprocess session per child (in-main-slot "
+                             "mode off — SA-0MT2XRGEU0009QRE)"
+                         ))
     p_issue.add_argument("--do-not-persist", action="store_true",
                          help="Do not persist the audit report via wl update")
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -9964,7 +10175,10 @@ def main(argv: list[str] | None = None) -> int:
                             run_tests=args.run_tests,
                             no_execute=getattr(args, "no_execute", False),
                             checkpoint_dir=getattr(args, "checkpoint_dir", None),
-                            no_checkpoint=getattr(args, "no_checkpoint", False))
+                            no_checkpoint=getattr(args, "no_checkpoint", False),
+                            child_in_main_slot=getattr(
+                                args, "child_in_main_slot", None
+                            ))
             print(_root_timer.render(), file=sys.stderr)
         return _rc
     elif args.command == "project":

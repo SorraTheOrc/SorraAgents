@@ -50,9 +50,31 @@ def _default_green_full_suite_cache():
 
 
 @pytest.fixture(autouse=True)
+def _default_separate_process_child_audits():
+    """Pin the separate-process child-audit path for pre-gate tests.
+
+    The child-audit execution mode is config-gated (SA-0MT2XRGEU0009QRE):
+    ``AUDIT_CHILD_IN_MAIN_SLOT`` env var / ``--child-in-main-slot`` CLI
+    flag, default ``true`` (in-main-slot mode — child Phase-1 AC screens
+    and Phase-2 child deep analysis run in the main LLM slot with no new
+    pi subprocess session per child). The pre-existing audit tests were
+    written against the separate-process path (a pi subprocess per child)
+    and assert that behavior (e.g. one pi call per pending child), so the
+    suite pins the env var to ``false`` here; the new in-main-slot mode is
+    covered by dedicated tests (test_audit_runner_child_in_main_slot.py)
+    that pass ``child_in_main_slot=True`` / set the env var explicitly.
+    """
+    with mock.patch.dict(
+        audit_runner.os.environ,
+        {audit_runner.AUDIT_CHILD_IN_MAIN_SLOT_ENV: "false"},
+        clear=False,
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _default_resolvable_ownership():
     """Resolve undeterminable ownership to the launch project root.
-
     The undeterminable-ownership abort (SA-0MSLLGDW00098UCC) makes
     ``cmd_issue`` exit non-zero when the owning project root cannot be
     determined (no --worklog-dir, unknown item prefix, no sibling match).
