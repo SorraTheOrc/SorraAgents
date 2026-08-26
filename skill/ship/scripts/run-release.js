@@ -15,6 +15,7 @@ import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, c
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 import { sendReleaseNotification } from './discord-notify.js';
+import { Timer } from './timing.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -583,7 +584,28 @@ async function runReleaseImpl(cliArgs = []) {
   const isDryRun = args.includes('--dry-run');
   const isForce = args.includes('--force');
 
+  // Timing instrumentation (SA-0MT319YGQ002E801): every major step is
+  // wrapped in a named Timer and the report is emitted on every exit path.
+  const rootTimer = new Timer('runRelease');
+  rootTimer.start();
+  const stepTimers = {};
+  const emitTimingReport = () => {
+    if (rootTimer.stop && !rootTimer.elapsedNs) rootTimer.stop();
+    console.error('\n' + rootTimer.render());
+  };
+  const startStep = (name) => {
+    const t = new Timer(name, rootTimer);
+    t.start();
+    stepTimers[name] = t;
+    return t;
+  };
+  const finish = (exitCode) => {
+    emitTimingReport();
+    return exitCode;
+  };
+
   // ── Step 1: Check for unmerged branches (gating step) ──────────────────
+  startStep('Step 1: unmerged branch check');
   if (!skipChecks) {
     const report = checkUnmergedBranches();
     if (report.hasUnmergedBranches) {
@@ -592,11 +614,13 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(report.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 3;
+      return finish(3);
     }
   }
+  stepTimers['Step 1: unmerged branch check'].stop();
 
   // ── Step 2: Check audit readiness (gating step) ────────────────────────
+  startStep('Step 2: audit readiness check');
   if (!skipChecks) {
     const auditReport = await checkAuditReadyToClose();
     if (auditReport.hasBlockingItems) {
@@ -605,11 +629,13 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(auditReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 6;
+      return finish(6);
     }
   }
+  stepTimers['Step 2: audit readiness check'].stop();
 
   // ── Step 3: Check critical-priority items (gating step) ────────────────
+  startStep('Step 3: critical items check');
   if (!skipChecks) {
     const criticalReport = checkCriticalItems();
     if (criticalReport.hasBlockingItems) {
@@ -618,11 +644,13 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(criticalReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 7;
+      return finish(7);
     }
   }
+  stepTimers['Step 3: critical items check'].stop();
 
   // ── Step 3.5: Check worklog refs (gating step) ─────────────────────────
+  startStep('Step 3.5: worklog refs check');
   if (!skipChecks) {
     const worklogReport = checkWorklogRefs();
     if (worklogReport.hasWorklogRefs) {
@@ -631,11 +659,13 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(worklogReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 8;
+      return finish(8);
     }
   }
+  stepTimers['Step 3.5: worklog refs check'].stop();
 
   // ── Step 3.6: Check producer-review status (gating step) ───────────────
+  startStep('Step 3.6: producer review check');
   if (!skipChecks) {
     // Top-level candidates only: a child's producer review is covered by its
     // parent's review, so children must not block the release
@@ -648,11 +678,13 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(producerReviewReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 9;
+      return finish(9);
     }
   }
+  stepTimers['Step 3.6: producer review check'].stop();
 
   // ── Step 4: Find the release script ───────────────────────────────────
+  startStep('Step 4: locate release script');
   let selectedScript = null;
   if (existsSync(SKILL_RELEASE_SCRIPT)) {
     selectedScript = SKILL_RELEASE_SCRIPT;
@@ -680,10 +712,12 @@ async function runReleaseImpl(cliArgs = []) {
     ].join('\n');
 
     console.error(msg);
-    return 2;
+    return finish(2);
   }
+  stepTimers['Step 4: locate release script'].stop();
 
   // ── Step 5: Execute the release script ─────────────────────────────────
+  startStep('Step 5: execute release script');
   console.log('Executing release script...\n');
 
   // Wrapper-only flags (e.g. --skip-checks) must not reach the merge script,
@@ -705,7 +739,7 @@ async function runReleaseImpl(cliArgs = []) {
       'and was terminated. The Code Freeze marker has been cleared. ' +
       'Check for partially-created branches/PRs/refs, then re-run the release.'
     );
-    return 10;
+    return finish(10);
   }
 
   const exitCode = child.status || 0;
@@ -718,34 +752,40 @@ async function runReleaseImpl(cliArgs = []) {
 
   if (exitCode !== 0) {
     console.error(`Release script exited with code ${exitCode}.`);
-    return exitCode;
+    return finish(exitCode);
   }
 
   // If dry-run, don't do post-release steps
   if (isDryRun) {
     console.log('\nDry-run complete. No post-release actions taken.');
-    return 0;
+    stepTimers['Step 5: execute release script'].stop();
+    return finish(0);
   }
+  stepTimers['Step 5: execute release script'].stop();
 
   // ── Step 6: Post-release - wait for PR merge and sync dev ──────────────
+  startStep('Step 6: wait for PR merge');
   const prUrl = parsePRUrl(stdout);
 
   if (prUrl && !isForce) {
     const mergeResult = waitForPRMerge(prUrl);
     if (!mergeResult.success) {
       console.error(`\n⚠️  ${mergeResult.message}`);
-      return 4;
+      return finish(4);
     }
   } else if (!prUrl) {
     console.log('\nNo PR URL detected in release output. Skipping PR merge wait.');
   }
+  stepTimers['Step 6: wait for PR merge'].stop();
 
   // ── Step 7: Sync dev with main ─────────────────────────────────────────
+  startStep('Step 7: sync dev with main');
   const syncResult = syncDevWithMain();
   if (!syncResult.success) {
     console.error(`\n⚠️  ${syncResult.message}`);
-    return 5;
+    return finish(5);
   }
+  stepTimers['Step 7: sync dev with main'].stop();
 
   // ── Step 8: Verify the release merge landed on main (gating) ───────────
   // Merge-verification guard (SA-0MSJ2XMQL006CVQS): only close work items
@@ -755,6 +795,7 @@ async function runReleaseImpl(cliArgs = []) {
   // step runs without a real dev→main merge.
   //
   // Read the released version from the git tag created by the release script
+  startStep('Step 8: verify release merge');
   let version = null;
   try {
     version = execSync('git describe --tags --abbrev=0', {
@@ -781,28 +822,35 @@ async function runReleaseImpl(cliArgs = []) {
     if (!mergeVerification.success) {
       console.error(`\n⚠️  ${mergeVerification.message}`);
       console.error('Refusing to close work items (exit code 11).');
-      return 11;
+      return finish(11);
     }
+    stepTimers['Step 8: verify release merge'].stop();
 
     // ── Step 8.5: Post-release Discord notification (non-blocking) ────────
     // Send release details + changelog to the configured Discord channel
     // (SA-0MSQ6K7Z1002H14Z). Runs only after the release merge is verified
     // (never on --dry-run or failed releases). Notification failures are
     // logged as warnings and never change the release exit code.
+    startStep('Step 8.5: discord notification');
     try {
       await sendReleaseNotification({ version, prUrl, projectRoot });
     } catch (err) {
       console.warn(`\n⚠ Discord notification step failed: ${err.message} (non-blocking).`);
     }
+    stepTimers['Step 8.5: discord notification'].stop();
 
     // ── Step 9: Close work items shipped in this release (non-blocking) ──
+    startStep('Step 9: close work items');
     const closeResult = closeWorkItemsAfterRelease(version);
     if (!closeResult.success && closeResult.errorCount > 0) {
       console.warn(`\n⚠ Non-critical: ${closeResult.message}`);
     }
+    stepTimers['Step 9: close work items'].stop();
+  } else {
+    stepTimers['Step 8: verify release merge'].stop();
   }
 
-  return 0;
+  return finish(0);
 }
 
 // ── CLI Entry Point ──────────────────────────────────────────────────────────

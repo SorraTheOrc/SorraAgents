@@ -29,6 +29,7 @@ import { execSync } from 'node:child_process';
 import { isBranchBlocked, validateBranchName, makeBranchName } from './git-helpers.js';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose } from './check-audit-gate.js';
+import { Timer } from './timing.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -107,16 +108,20 @@ export function validateForcePush() {
  */
 export function pushToDev(opts = {}) {
   const { remote = 'origin', force = false } = opts;
+  const root = new Timer('pushToDev');
+  root.start();
 
   // Step 1: validate force-push (always rejected)
   if (force) {
     const forceValidation = validateForcePush();
+    root.stop();
     return { success: false, error: forceValidation.reason };
   }
 
   // Step 2: validate push target
   const targetValidation = validatePushTarget(DEV_BRANCH);
   if (!targetValidation.allowed) {
+    root.stop();
     return { success: false, error: targetValidation.reason };
   }
 
@@ -128,11 +133,13 @@ export function pushToDev(opts = {}) {
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
   } catch {
+    root.stop();
     return { success: false, error: 'Unable to determine current git branch' };
   }
 
   const branchValidation = validateBranchName(currentBranch);
   if (!branchValidation.valid) {
+    root.stop();
     return {
       success: false,
       error: `Current branch "${currentBranch}" is not a valid agent branch: ${branchValidation.reason}`,
@@ -142,6 +149,7 @@ export function pushToDev(opts = {}) {
   // Step 4: check for unmerged branches (gating step)
   const unmergedCheck = checkUnmergedBranches();
   if (unmergedCheck.hasUnmergedBranches) {
+    root.stop();
     return {
       success: false,
       error: `Cannot push to '${DEV_BRANCH}' — there are unmerged branches that should be resolved first:\n\n${unmergedCheck.message}`,
@@ -149,13 +157,14 @@ export function pushToDev(opts = {}) {
   }
 
   // Step 5: execute the push
+  root.stop();
   const command = `git push ${remote} HEAD:refs/heads/${DEV_BRANCH}`;
   try {
     execSync(command, {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return { success: true, command };
+    return { success: true, command, timing: root.toDict() };
   } catch (err) {
     const stderr = err.stderr?.toString() || '';
     // Detect non-fast-forward (conflict scenario)
@@ -164,12 +173,14 @@ export function pushToDev(opts = {}) {
         success: false,
         error: `Push to '${DEV_BRANCH}' was rejected (non-fast-forward / conflict). Record the conflict details in a comment on the owning work item and resolve manually.`,
         command,
+        timing: root.toDict(),
       };
     }
     return {
       success: false,
       error: `Push to '${DEV_BRANCH}' failed: ${stderr.trim()}`,
       command,
+      timing: root.toDict(),
     };
   }
 }
@@ -188,16 +199,20 @@ export function pushToDev(opts = {}) {
  */
 export function pushToBranch(targetBranch, opts = {}) {
   const { remote = 'origin', force = false } = opts;
+  const root = new Timer('pushToBranch');
+  root.start();
 
   // Step 1: validate force-push (always rejected)
   if (force) {
     const forceValidation = validateForcePush();
+    root.stop();
     return { success: false, error: forceValidation.reason };
   }
 
   // Step 2: validate push target
   const targetValidation = validatePushTarget(targetBranch);
   if (!targetValidation.allowed) {
+    root.stop();
     return { success: false, error: targetValidation.reason };
   }
 
@@ -209,11 +224,13 @@ export function pushToBranch(targetBranch, opts = {}) {
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
   } catch {
+    root.stop();
     return { success: false, error: 'Unable to determine current git branch' };
   }
 
   const branchValidation = validateBranchName(currentBranch);
   if (!branchValidation.valid) {
+    root.stop();
     return {
       success: false,
       error: `Current branch "${currentBranch}" is not a valid agent branch: ${branchValidation.reason}`,
@@ -224,6 +241,7 @@ export function pushToBranch(targetBranch, opts = {}) {
   if (targetBranch === DEV_BRANCH) {
     const unmergedCheck = checkUnmergedBranches();
     if (unmergedCheck.hasUnmergedBranches) {
+      root.stop();
       return {
         success: false,
         error: `Cannot push to '${DEV_BRANCH}' — there are unmerged branches that should be resolved first:\n\n${unmergedCheck.message}`,
@@ -232,13 +250,14 @@ export function pushToBranch(targetBranch, opts = {}) {
   }
 
   // Step 5: execute the push
+  root.stop();
   const command = `git push ${remote} HEAD:refs/heads/${targetBranch}`;
   try {
     execSync(command, {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return { success: true, command };
+    return { success: true, command, timing: root.toDict() };
   } catch (err) {
     const stderr = err.stderr?.toString() || '';
     if (stderr.includes('non-fast-forward') || stderr.includes('[rejected]')) {
@@ -246,12 +265,14 @@ export function pushToBranch(targetBranch, opts = {}) {
         success: false,
         error: `Push to '${targetBranch}' was rejected (non-fast-forward / conflict). Record the conflict details in a comment on the owning work item and resolve manually.`,
         command,
+        timing: root.toDict(),
       };
     }
     return {
       success: false,
       error: `Push to '${targetBranch}' failed: ${stderr.trim()}`,
       command,
+      timing: root.toDict(),
     };
   }
 }
