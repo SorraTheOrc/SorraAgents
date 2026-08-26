@@ -91,6 +91,23 @@ class TestNestingRollUp:
             pass
         assert child.parent is parent
 
+    def test_leftover_manual_timer_does_not_pollute_stack(self):
+        """A manual start()d timer left running must not become the parent
+        of later context-manager timers (audit per-call timer pattern)."""
+        # Simulate the audit runner's per-call timer: started, never stopped.
+        leftover = Timer("leftover")
+        leftover.start()
+        try:
+            with Timer("root") as root:
+                with Timer("child") as child:
+                    pass
+            # root must NOT be linked under the leftover manual timer
+            assert root.parent is None
+            assert child.parent is root
+            assert root.percentage == 100.0
+        finally:
+            leftover.stop()
+
     def test_parent_tracks_children_in_nested_steps(self):
         """Parent's nested_steps list contains child Timers."""
         with Timer("parent") as parent:

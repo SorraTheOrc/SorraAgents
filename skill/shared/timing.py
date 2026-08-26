@@ -70,12 +70,32 @@ class Timer:
         self.name = name
         self.parent: Timer | None = None
         self.start_time: float = 0.0
-        self.elapsed: float = 0.0
+        self._elapsed: float = 0.0
         self.nested_steps: list[Timer] = []
+
+    @property
+    def elapsed(self) -> float:
+        """Elapsed wall-clock seconds for this step.
+
+        Live while the timer is running (``start()`` called, ``stop()``
+        not yet); frozen at the stop instant afterwards. A manual
+        ``start()``/``stop()`` timer (e.g. per-pi-call timing in the audit
+        runner) can therefore be read at any point without an explicit stop,
+        and ``stop()`` is required only when freezing a reported value.
+        """
+        if self.start_time != 0.0:
+            return time.monotonic() - self.start_time
+        return self._elapsed
 
     def __enter__(self) -> Timer:
         """Start timing; automatically link to parent from the active stack."""
-        return self.start()
+        self.start()
+        stack = _active_stack()
+        if stack:
+            self.parent = stack[-1]
+            self.parent.nested_steps.append(self)
+        stack.append(self)
+        return self
 
     def __exit__(
         self,
@@ -85,20 +105,22 @@ class Timer:
     ) -> bool:
         """Stop timing. Return False to propagate any exception."""
         self.stop()
+        stack = _active_stack()
+        # Pop from stack (should be the current timer)
+        if stack and stack[-1] is self:
+            stack.pop()
         return False  # do not suppress exceptions
 
     def start(self) -> Timer:
         """Start timing manually (equivalent to entering the context manager).
 
-        Records the wall-clock start time and links the timer into the
-        active thread-local stack so nested timers roll up into the parent.
+        Records the wall-clock start time. Unlike ``__enter__``, this does
+        NOT push the timer onto the active thread-local stack — manual
+        timers used for instrumentation (e.g. the audit runner's per-pi-call
+        timer) are leaves and must never corrupt parent linkage for other
+        timers in the same thread.
         """
         self.start_time = time.monotonic()
-        stack = _active_stack()
-        if stack:
-            self.parent = stack[-1]
-            self.parent.nested_steps.append(self)
-        stack.append(self)
         return self
 
     def stop(self) -> float:
@@ -108,14 +130,10 @@ class Timer:
         ``stop()`` is a no-op.
         """
         if self.start_time == 0.0:
-            return self.elapsed
-        self.elapsed = time.monotonic() - self.start_time
+            return self._elapsed
+        self._elapsed = time.monotonic() - self.start_time
         self.start_time = 0.0
-        stack = _active_stack()
-        # Pop from stack (should be the current timer)
-        if stack and stack[-1] is self:
-            stack.pop()
-        return self.elapsed
+        return self._elapsed
 
     @property
     def total_time(self) -> float:
