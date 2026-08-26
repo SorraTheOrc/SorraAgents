@@ -372,6 +372,121 @@ class TestCallPiEnableTools:
         assert "timed out" in result.get("evidence", "")
 
 
+class TestCallPiFailureEvidenceNamesPhase:
+    """AC4 (SA-0MT6EZUS9004FJ9T): failure evidence names the phase that timed out.
+
+    When a pi call fails (full timeout, stall, concurrency-limit, or provider
+    error), the evidence string must name the phase (parent/child/Phase 2) so
+    the audit report is unambiguous about which phase failed, instead of a
+    bare "Manual audit required." with no phase.
+    """
+
+    def _make_timeout_process(self, timeout_value):
+        """Process whose communicate raises TimeoutExpired with the given timeout."""
+        mock_process = mock.MagicMock()
+        timeout_error = subprocess.TimeoutExpired(
+            cmd="pi", timeout=timeout_value, output="", stderr=""
+        )
+        mock_process.communicate.side_effect = [timeout_error, ("", "")]
+        return mock_process
+
+    def test_full_timeout_evidence_names_parent_phase(self):
+        """A Phase-1 parent call that hits the full budget names the parent phase."""
+        mock_process = self._make_timeout_process(audit_runner.CALL_PI_TIMEOUT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="parent"
+            )
+        assert result.get("_timeout") is True
+        assert "parent" in result.get("evidence", "")
+        assert "Manual audit required" in result.get("evidence", "")
+
+    def test_stall_evidence_names_parent_phase(self):
+        """A stalled Phase-1 parent call names the parent phase in stall evidence."""
+        mock_process = self._make_timeout_process(audit_runner._STALL_TIMEOUT_DEFAULT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="parent"
+            )
+        assert result.get("_timeout") is True
+        assert "stalled" in result.get("evidence", "")
+        assert "parent" in result.get("evidence", "")
+
+    def test_full_timeout_evidence_names_phase2_phase(self):
+        """A Phase-2 deep-analysis timeout names the phase in human-readable form."""
+        mock_process = self._make_timeout_process(audit_runner.CALL_PI_TIMEOUT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="phase2_deep"
+            )
+        assert "Phase 2 deep analysis" in result.get("evidence", "")
+
+    def test_full_timeout_evidence_names_child_phase(self):
+        """A child screening timeout names the human-readable child phase."""
+        mock_process = self._make_timeout_process(audit_runner.CALL_PI_TIMEOUT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="child:SA-123"
+            )
+        assert "Phase 1 child screening (SA-123)" in result.get("evidence", "")
+
+    def test_concurrency_limit_evidence_names_phase(self):
+        """A concurrency-limit fallback names the phase that could not launch."""
+        def _raise_busy():
+            raise TimeoutError("semaphore 'audit' busy: no slot free within 300.0s")
+        with mock.patch.object(
+            audit_runner, "_acquire_audit_slot", side_effect=_raise_busy
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="phase2_batch"
+            )
+        assert result.get("_concurrency_timeout") is True
+        assert "Phase 2 batched deep analysis" in result.get("evidence", "")
+        assert "Audit concurrency limit reached" in result.get("evidence", "")
+
+    def test_provider_error_evidence_names_phase(self):
+        """A provider-error fallback names the phase that failed."""
+        mock_process = mock.MagicMock()
+        provider_error_stream = json.dumps({
+            "type": "agent_end",
+            "messages": [{
+                "role": "assistant",
+                "stopReason": "error",
+                "errorMessage": "boom",
+            }],
+        })
+        mock_process.communicate.return_value = (provider_error_stream, "")
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="phase2_child"
+            )
+        assert result.get("_provider_error") is True
+        assert "Phase 2 child deep analysis" in result.get("evidence", "")
+        assert "Pi provider error" in result.get("evidence", "")
+
+    def test_unknown_context_does_not_break_evidence(self):
+        """An empty context still yields a usable timeout evidence string."""
+        mock_process = self._make_timeout_process(audit_runner.CALL_PI_TIMEOUT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context=""
+            )
+        assert result.get("_timeout") is True
+        assert "Manual audit required" in result.get("evidence", "")
+
+
 class TestCallPiSessionId:
     """Tests for _call_pi() --session-id construction (SA-0MSNYMKV7005P0H9)."""
 

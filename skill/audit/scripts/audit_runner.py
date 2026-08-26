@@ -2603,6 +2603,28 @@ def _communicate_with_stall(process, cmd: list[str],
     return "".join(out_chunks), "".join(err_chunks)
 
 
+def _phase_label(context: str) -> str:
+    """Human-readable phase name from the pi-call context key.
+
+    Maps the raw call-context strings (``parent``, ``child:SA-XXX``,
+    ``phase2_deep``, ``phase2_child``, ``phase2_batch``) to the audit-phase
+    name so timeout/failure evidence in the report names which phase failed
+    instead of a bare "Manual audit required." (SA-0MT6EZUS9004FJ9T AC4).
+    Falls back to the raw context, or "unknown phase" when empty.
+    """
+    if context == "parent":
+        return "Phase 1 parent screening"
+    if context.startswith("child:"):
+        return f"Phase 1 child screening ({context.split(':', 1)[1]})"
+    if context == "phase2_deep":
+        return "Phase 2 deep analysis"
+    if context.startswith("phase2_child"):
+        return "Phase 2 child deep analysis"
+    if context == "phase2_batch":
+        return "Phase 2 batched deep analysis"
+    return context or "unknown phase"
+
+
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              pi_bin: str = "pi",
              enable_tools: bool = False,
@@ -2723,11 +2745,13 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                         evidence = (
                             f"Pi model call stalled (no output for {stall_timeout}s); "
                             "aborted early. Manual audit required."
+                            f" Phase: {_phase_label(context)}."
                         )
                     else:
                         evidence = (
                             f"Pi model call timed out after {effective_timeout}s. "
                             "Manual audit required."
+                            f" Phase: {_phase_label(context)}."
                         )
                     return {
                         "verdict": "unmet",
@@ -2749,6 +2773,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 "evidence": (
                     f"Audit concurrency limit reached: {exc}. "
                     "Retry when fewer audits are running."
+                    f" Phase: {_phase_label(context)}."
                 ),
                 "raw_stdout": "",
                 "raw_stderr": "",
@@ -2771,7 +2796,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             ac_fallback_used.set()
         return {
             "verdict": "unmet",
-            "evidence": f"Pi provider error: {provider_error}",
+            "evidence": f"Pi provider error: {provider_error}. Phase: {_phase_label(context)}.",
             "raw_stdout": stdout,
             "raw_stderr": stderr,
             "extracted_text": "",
@@ -4988,7 +5013,10 @@ def _deep_analyze_child(
             timeout_acs.append({
                 "text": ac.get("text", ""),
                 "verdict": VERDICT_PARTIAL,
-                "evidence": "Deep analysis timed out \u2014 manual review required.",
+                "evidence": (
+                    "Deep analysis timed out \u2014 manual review required."
+                    " Phase: Phase 2 child deep analysis."
+                ),
             })
         updated = dict(child)
         updated["ac_results"] = timeout_acs
@@ -5012,7 +5040,10 @@ def _deep_analyze_child(
             error_acs.append({
                 "text": ac.get("text", ""),
                 "verdict": VERDICT_PARTIAL,
-                "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                "evidence": (
+                    f"Pi provider error: {provider_error} \u2014 manual review required."
+                    " Phase: Phase 2 child deep analysis."
+                ),
             })
         updated = dict(child)
         updated["ac_results"] = error_acs
@@ -5486,7 +5517,10 @@ def _run_phase2_deep_analysis(
                 timeout_acs.append({
                     "text": ac.get("text", ""),
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": "Deep analysis timed out \u2014 manual review required.",
+                    "evidence": (
+                        "Deep analysis timed out \u2014 manual review required."
+                        " Phase: Phase 2 deep analysis."
+                    ),
                 })
             # Also mark all child ACs as partial
             timeout_children = []
@@ -5497,7 +5531,10 @@ def _run_phase2_deep_analysis(
                     updated_child_acs.append({
                         "text": ac.get("text", ""),
                         "verdict": VERDICT_PARTIAL,
-                        "evidence": "Deep analysis timed out \u2014 manual review required.",
+                        "evidence": (
+                            "Deep analysis timed out \u2014 manual review required."
+                            " Phase: Phase 2 deep analysis."
+                        ),
                     })
                 timeout_children.append(dict(child))
                 timeout_children[-1]["ac_results"] = updated_child_acs
@@ -5524,7 +5561,10 @@ def _run_phase2_deep_analysis(
                 error_acs.append({
                     "text": ac.get("text", ""),
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                    "evidence": (
+                        f"Pi provider error: {provider_error} \u2014 manual review required."
+                        " Phase: Phase 2 deep analysis."
+                    ),
                 })
             error_children = []
             for child in child_results:
@@ -5534,7 +5574,10 @@ def _run_phase2_deep_analysis(
                     updated_child_acs.append({
                         "text": ac.get("text", ""),
                         "verdict": VERDICT_PARTIAL,
-                        "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                        "evidence": (
+                            f"Pi provider error: {provider_error} \u2014 manual review required."
+                            " Phase: Phase 2 deep analysis."
+                        ),
                     })
                 error_children.append(dict(child))
                 error_children[-1]["ac_results"] = updated_child_acs
