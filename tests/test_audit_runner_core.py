@@ -2547,7 +2547,8 @@ class TestRC2RCFallbackVerdict:
         )
 
         cmd_issue("SA-PARENT", runner=fake_runner, persist=False,
-                  force=True)  # fixture status is in_progress; bypass pre-flight guard
+                  force=True,  # fixture status is in_progress; bypass pre-flight guard
+                  child_in_main_slot=False)  # separate-process path: exercises the child-AC RC2 fallback
 
         # Find the child result
         child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
@@ -2711,7 +2712,8 @@ class TestRC2RCFallbackVerdict:
         )
 
         cmd_issue("SA-PARENT", runner=fake_runner, persist=False,
-                  force=True)  # fixture status is in_progress; bypass pre-flight guard
+                  force=True,  # fixture status is in_progress; bypass pre-flight guard
+                  child_in_main_slot=False)  # separate-process: exercises the child-AC provider-error fallback
 
         child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
         assert child is not None, "Child should be in results"
