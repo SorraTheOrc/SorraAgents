@@ -3,7 +3,7 @@
 Verifies the ``Timer`` context manager: step timing, nesting roll-up,
 percentage calculation, and report rendering in both human-readable and
 JSON formats.
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 
@@ -11,15 +11,12 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _SHARED = REPO_ROOT / "skill"
 if str(_SHARED) not in sys.path:
     sys.path.insert(0, str(_SHARED))
 
 from shared.timing import Timer
-
 
 # ---------------------------------------------------------------------------
 # Basic step timing
@@ -67,9 +64,8 @@ class TestNestingRollUp:
 
     def test_nested_step_has_parent_reference(self):
         """Nested Timer has a reference to its parent."""
-        with Timer("parent") as parent:
-            with Timer("child") as child:
-                pass
+        with Timer("parent") as parent, Timer("child") as child:
+            pass
         assert child.parent is parent
 
     def test_parent_tracks_children_in_nested_steps(self):
@@ -85,10 +81,9 @@ class TestNestingRollUp:
 
     def test_deep_nesting_roll_up(self):
         """Three levels of nesting roll up correctly."""
-        with Timer("level_0") as l0:
-            with Timer("level_1") as l1:
-                with Timer("level_2") as l2:
-                    pass
+        with Timer("level_0") as l0, Timer("level_1") as l1:
+            with Timer("level_2") as l2:
+                pass
         assert abs(l0.total_time - l1.total_time) < 1e-6
         assert abs(l1.total_time - l2.total_time) < 1e-6
 
@@ -119,9 +114,8 @@ class TestPercentageCalculation:
 
     def test_percentage_is_non_negative(self):
         """Percentages are never negative."""
-        with Timer("p") as p:
-            with Timer("c") as c:
-                pass
+        with Timer("p") as p, Timer("c") as c:
+            pass
         assert p.percentage >= 0
         assert c.percentage >= 0
 
@@ -180,9 +174,8 @@ class TestHumanReadableReport:
 
     def test_render_nested_steps(self):
         """Human report shows nested steps with indentation."""
-        with Timer("parent") as parent:
-            with Timer("child") as child:
-                pass
+        with Timer("parent") as parent, Timer("child") as child:
+            pass
         report = parent.render()
         assert "parent" in report
         assert "child" in report
@@ -229,9 +222,8 @@ class TestJsonSerialization:
 
     def test_to_dict_nested_structure(self):
         """Nested timers produce nested dicts."""
-        with Timer("parent") as parent:
-            with Timer("child") as _:
-                pass
+        with Timer("parent") as parent, Timer("child") as _:
+            pass
         d = parent.to_dict()
         assert len(d["nested_steps"]) == 1
         assert d["nested_steps"][0]["name"] == "child"
@@ -281,10 +273,9 @@ class TestNestedStepPercentages:
 
     def test_deeply_nested_child_percentage(self):
         """A deeply nested child's percentage is relative to the root."""
-        with Timer("root") as root:
-            with Timer("level1") as l1:
-                with Timer("level2") as l2:
-                    pass
+        with Timer("root") as root, Timer("level1") as l1:
+            with Timer("level2") as l2:
+                pass
         assert 0 < root.percentage <= 100
         assert 0 < l1.percentage <= 100
         assert 0 < l2.percentage <= 100
