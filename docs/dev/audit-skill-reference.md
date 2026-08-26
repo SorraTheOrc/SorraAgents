@@ -162,6 +162,17 @@ The item's integration evidence is derived from the item itself:
 - **Fail closed (AC3):** when integration cannot complete (fetch/ref failure, conflicts, build/test failure, push failure, or any unexpected error after evidence resolution) the gate emits "Ready to close: No" (+ `--needs-producer-review yes` via the lifecycle's no-verdict branch) — the pipeline never proceeds past Phase 1 with unmerged work. No rest of Phase 1 screening and no Phase 2 run (assessment would be misleading against unmerged code).
 - **Fail open (never blockers):** items with NO resolvable evidence (docs/admin items — no feature branch, no referenced commits) and repos with NO dev baseline proceed with the gate recorded as a note.
 
+### Stale-audit-base guard (SA-0MT9EK1UU000DT1R)
+
+The gate verifies integration against `origin/dev` (`git fetch origin dev` + `merge-base --is-ancestor`), but EVERY other git-derived audit ingredient — the audited HEAD sha, the file-scope manifest, the changed-files list (`git diff --name-only HEAD`), the repo index (`git ls-files`), the working-tree hash, and the green-run attestation — resolves against the **local checkout at the launch cwd** (cwd-aware runner, SA-0MSLLGDW00098UCC). When that checkout is stale (local `dev` behind `origin/dev`), the merge gate passes yet Phase 1/2 run against a tree MISSING the delivered commits — producing false `unmet`/`partial` verdicts that agents report as "audit run against a stale HEAD" (incidents: SA-0MSUZAJPC003BS66, SA-0MSN2ULOF007JJ35 — audits from local `030debfd` while `origin/dev` was `ddc6f6f5`).
+
+**Guard behaviour** (`_audit_base_freshness` / `_audit_base_freshness_guard_passes` in `audit_runner.py`):
+
+- After the gate concludes the item's work is on `origin/dev` (verified merged OR just integrated), the guard runs `git merge-base --is-ancestor <candidate> origin/dev` → `… HEAD` for each candidate (the item's commits + branch object + the integration's pushed sha — important when cherry-pick created new shas). A candidate that is an ancestor of `origin/dev` but NOT of local `HEAD` marks the audit base **stale**.
+- **Stale → abort before Phase 1 screening:** non-zero exit, loud stderr (or `{"stale_audit_base": …}` JSON in `--json` mode), per-commit evidence appended to `## Merge Gate Evidence (Phase 1)`. No verdict and NO persisted report — a misleading report is never produced. Remediation tells the caller to run `git fetch origin && git pull origin dev` in the owning project's main checkout (or launch the audit from a checkout containing the delivered commit) and re-run.
+- **Lifecycle:** the abort is independent of `--force` and the item is NOT demoted (`--needs-producer-review` is never set by this guard) — the finally block restores the pre-audit status/stage; the item is fine, the checkout is stale.
+- **Fail-open:** a candidate that is NOT an ancestor of `origin/dev` (unrelated/context citation, unresolvable sha) is skipped; a git error while verifying presence in `HEAD` treats the commit as present; items with no resolvable evidence never reach the guard.
+
 Evidence surfaces in the report under `## Merge Gate Evidence (Phase 1)` (before the Code Quality section) and in JSON payloads as `{merge_gate: {merged, blocker, reason}}`.
 
 ## Freshness Gate

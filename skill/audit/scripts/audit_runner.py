@@ -5817,6 +5817,19 @@ class _AuditContext:
     """Human-readable evidence of the merge gate result."""
     merge_gate_blocker: str = ""
     """Non-empty when the merge gate blocked (integration failed)."""
+    merge_gate_stale: bool = False
+    """True when the merge gate confirmed the item in origin/dev but the
+    local audit base (HEAD) does NOT contain the delivered work — auditing
+    would run against a stale tree and produce a misleading verdict
+    (SA-0MT9EK1UU000DT1R)."""
+    merge_gate_stale_reason: str = ""
+    """Human-readable reason for a stale audit base (missing delivered
+    commits, resolved HEAD, remediation)."""
+    merge_gate_pushed_sha: str = ""
+    """The exact commit sha the merge gate pushed to origin/dev during
+    integration. Cherry-pick integration creates NEW shas; captured so the
+    stale-audit-base guard can verify the delivered commit against local
+    HEAD."""
 
     def record_script_failure(self, script_name: str, exc: Exception) -> None:
         """Record a script execution failure (first failure wins)."""
@@ -6137,6 +6150,10 @@ def _integrate_into_dev(ctx: _AuditContext,
         if proc.returncode == 0:
             pushed_sha = proc.stdout.strip()
             evidence.append(f"integrated commit {pushed_sha} pushed to origin/dev")
+        # Capture the pushed sha (cherry-pick integration creates NEW shas)
+        # so the stale-audit-base guard can verify it against local HEAD
+        # (SA-0MT9EK1UU000DT1R).
+        ctx.merge_gate_pushed_sha = pushed_sha
 
         # Post-merge verification: the pushed commit must be an ancestor
         # of origin/dev (AC2).
@@ -6148,6 +6165,149 @@ def _integrate_into_dev(ctx: _AuditContext,
             ctx.runner(["git", "worktree", "remove", "--force", str(worktree_path)])
         except Exception:  # noqa: S110, BLE001 -- cleanup best-effort
             pass
+
+
+def _audit_base_freshness(ctx: _AuditContext,
+                          commits: list[str],
+                          branch: str) -> tuple[bool, str, list[str], str | None]:
+    """Verify the local audit base (HEAD) contains the item's delivered work.
+
+    The merge gate confirms the item's commits ARE in origin/dev, but the
+    audit resolves ALL git-derived content (HEAD sha, file-scope manifest,
+    changed files, repo index, working-tree hash, green-run attestation)
+    against the local checkout at the launch cwd. When that checkout is
+    stale — HEAD behind origin/dev, lacking the delivered commits — Phase 1/2
+    silently run against a tree WITHOUT the fix and produce misleading
+    "unmet"/"partial" verdicts (stale-audit reports observed on
+    SA-0MSUZAJPC003BS66 and SA-0MSN2ULOF007JJ35, both audited from a local
+    dev at 030debfd while origin/dev was at ddc6f6f5).
+
+    Returns ``(fresh, evidence, missing_commits, head_sha)``:
+      - *fresh*: True when every delivered commit (an ancestor of
+        ``origin/dev``) is also an ancestor of the local ``HEAD`` — the
+        audit base contains the delivered state.
+      - *evidence*: per-commit command + result lines (mirrors
+        ``_verify_merged_in_dev``'s style) plus the resolved HEAD.
+      - *missing_commits*: the delivered commits absent from local HEAD.
+      - *head_sha*: ``git rev-parse HEAD`` (display only; None on failure).
+
+    Never raises: git failures are recorded as evidence, never propagated.
+    Fail-open semantics: a candidate that is NOT an ancestor of origin/dev
+    (e.g. an unrelated/context citation, or an unresolvable sha) is skipped;
+    candidates whose presence in HEAD cannot be verified due to a git error
+    are treated as present. The guard only flags the deterministic
+    stale-checkout case (delivered on origin/dev, absent from HEAD).
+    """
+    evidence: list[str] = []
+    missing: list[str] = []
+
+    head_sha = _resolve_audited_head(ctx.runner)
+    if head_sha:
+        evidence.append(f"local audit base HEAD resolved to {head_sha}")
+    else:
+        evidence.append("local audit base HEAD could not be resolved")
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in list(commits) + (
+        [ctx.merge_gate_pushed_sha] if ctx.merge_gate_pushed_sha else []
+    ):
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        # Delivered? (ancestor of origin/dev). Commands are PLAIN git
+        # invocations: the cwd-aware runner (already wrapped in
+        # ``_phase_gate``) injects ``git -C <owning_root>`` when the launch
+        # cwd differs from the owning repo (SA-0MSLLGDW00098UCC).
+        try:
+            delivered = ctx.runner(["git", "merge-base", "--is-ancestor",
+                                    candidate, "origin/dev"])
+        except Exception as exc:  # noqa: BLE001 -- fail-open, record only
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} origin/dev -> "
+                f"error ({exc}) — skipping (fail-open)"
+            )
+            continue
+        if delivered.returncode != 0:
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} origin/dev -> no "
+                "(not part of the delivered state; skipping staleness check)"
+            )
+            continue
+        evidence.append(
+            f"git merge-base --is-ancestor {candidate} origin/dev -> yes "
+            "(delivered)"
+        )
+        try:
+            present = ctx.runner(["git", "merge-base", "--is-ancestor",
+                                  candidate, "HEAD"])
+        except Exception as exc:  # noqa: BLE001 -- fail-open, record only
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} HEAD -> error "
+                f"({exc}) — treating as present (fail-open)"
+            )
+            continue
+        if present.returncode != 0:
+            missing.append(candidate)
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} HEAD -> no "
+                "(delivered commit NOT in the audit base: STALE)"
+            )
+        else:
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} HEAD -> yes "
+                "(audit base contains the delivered commit)"
+            )
+
+    if not candidates:
+        evidence.append(
+            "no delivered-commit candidates — nothing to verify (fail-open)"
+        )
+
+    return not missing, "\n".join(evidence), missing, head_sha
+
+
+def _audit_base_freshness_guard_passes(ctx: _AuditContext,
+                                       commits: list[str],
+                                       branch: str) -> bool:
+    """Run the stale-audit-base guard; returns True to proceed.
+
+    Appends the freshness evidence to the merge-gate evidence. When the
+    local audit base lacks the item's delivered work, marks the gate stale
+    (``ctx.merge_gate_stale`` + reason) so cmd_issue aborts loudly BEFORE
+    Phase 1/2 — the run never produces a misleading verdict against a stale
+    tree (SA-0MT9EK1UU000DT1R).
+    """
+    fresh, freshness_evidence, missing, head_sha = _audit_base_freshness(
+        ctx, commits, branch,
+    )
+    ctx.merge_gate_evidence += (
+        "\nAudit-base freshness check (stale-audit guard):\n"
+        + freshness_evidence
+    )
+    if fresh:
+        return True
+    ctx.merge_gate_stale = True
+    ctx.merge_gate_stale_reason = (
+        "The item's delivered work IS merged into the owning repo's "
+        "origin/dev, but the local checkout the audit resolves its git "
+        "scope against (HEAD "
+        f"{head_sha or '<unresolved>'}) does NOT contain the delivered "
+        "commit(s): "
+        + ", ".join(missing)
+        + ". The audit would run against a stale tree and report "
+        "misleading verdicts."
+    )
+    print(
+        f"Audit base STALE for {ctx.issue_id} — refusing to audit a stale "
+        "tree; run `git fetch origin && git pull origin dev` in the owning "
+        "project's main checkout (or launch the audit from a checkout "
+        "containing the delivered commit) and re-run.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _phase_merge_gate(ctx: _AuditContext) -> int | None:
@@ -6187,6 +6347,12 @@ def _phase_merge_gate(ctx: _AuditContext) -> int | None:
                 f"(branch={branch or 'none'}, commits={commits})",
                 file=sys.stderr,
             )
+            # Stale-audit-base guard (SA-0MT9EK1UU000DT1R): the work is on
+            # origin/dev, but ALL git-derived audit content resolves against
+            # the LOCAL checkout — if it lacks the delivered commits the
+            # audit would run against a stale tree. Abort before Phase 1.
+            if not _audit_base_freshness_guard_passes(ctx, commits, branch):
+                return 1
             return None
 
         # No positive verification. If NO evidence at all was resolvable,
@@ -6231,6 +6397,11 @@ def _phase_merge_gate(ctx: _AuditContext) -> int | None:
                 "\nMerge gate: integration completed; item work now present "
                 "in origin/dev (post-merge verification above)."
             )
+            # Stale-audit-base guard (SA-0MT9EK1UU000DT1R): integration
+            # pushed to origin/dev, but the LOCAL audit base is unchanged —
+            # if it lacks the delivered work, abort before Phase 1/2.
+            if not _audit_base_freshness_guard_passes(ctx, commits, branch):
+                return 1
             return None
 
         # Integration failed — the audit must fail closed (AC3).
@@ -8981,6 +9152,41 @@ def cmd_issue(issue_id: str, persist: bool = True,
         rc = _phase_fetch_and_cq(ctx)
         if rc is not None:
             pass
+        elif ctx.merge_gate_stale:
+            # Stale audit base (SA-0MT9EK1UU000DT1R): the item's work is on
+            # origin/dev but the local checkout the audit resolves its git
+            # scope against does NOT contain the delivered commits. Phase 1/2
+            # would run against a tree MISSING the fix and produce misleading
+            # 'unmet'/'partial' verdicts. Abort loudly with remediation; the
+            # finally block restores the pre-audit lifecycle — no demotion,
+            # because the ITEM is fine; the checkout is stale.
+            if ctx.json_mode:
+                print(json.dumps({
+                    "stale_audit_base": {
+                        "merged": True,
+                        "reason": ctx.merge_gate_stale_reason,
+                        "remediation": (
+                            "run `git fetch origin && git pull origin dev` "
+                            "in the owning project's main checkout, or "
+                            "launch the audit from a checkout containing "
+                            "the delivered commit(s), then re-run"
+                        ),
+                    }
+                }, indent=2))
+            else:
+                print(
+                    f"Error: audit base is STALE for {ctx.issue_id}.",
+                    file=sys.stderr,
+                )
+                print(ctx.merge_gate_stale_reason, file=sys.stderr)
+                print(
+                    "Remediation: run `git fetch origin && git pull origin "
+                    "dev` in the owning project's main checkout, or launch "
+                    "the audit from a checkout containing the delivered "
+                    "commit(s), then re-run.",
+                    file=sys.stderr,
+                )
+            rc = 1
         elif ctx.merge_gate_blocker:
             # Integration failed: fail the audit closed (AC3). No further
             # Phase 1 screening and no Phase 2 — any assessment would be

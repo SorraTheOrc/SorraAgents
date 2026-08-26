@@ -651,3 +651,287 @@ class TestLifecycleMergeGateBlocker:
             "--needs-producer-review" in c and "yes" in c
             for c in update_cmds
         ), f"expected --needs-producer-review yes, got {update_cmds}"
+
+# ---------------------------------------------------------------------------
+# _audit_base_freshness — stale-audit-base guard (SA-0MT9EK1UU000DT1R)
+# ---------------------------------------------------------------------------
+
+class TestAuditBaseFreshness:
+    """The guard verifies the local audit base (HEAD) contains the item's
+    delivered commits. A stale checkout must never be audited: Phase 1/2
+    would run against a tree MISSING the delivered work and report
+    misleading 'unmet'/'partial' verdicts (observed on SA-0MSUZAJPC003BS66
+    and SA-0MSN2ULOF007JJ35)."""
+
+    def _repo_with_stale_dev(self, tmp_path):
+        """Build the incident shape: origin/dev AHEAD of the local HEAD, with
+        a delivered commit present only on origin/dev. The feature branch
+        (with feature_head) is pushed into origin/dev; local dev is then
+        rewound to dev_default so local HEAD lacks the delivered work."""
+        _wl, owning, shas = _make_real_repo(tmp_path)
+        branch = "wl-WL-0MSI4TAT70058921-rename-tab"
+        subprocess.run(["git", "push", "-q", "origin", f"{branch}:dev"],
+                       cwd=str(owning), check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "-q", "dev"],
+                       cwd=str(owning), check=True, capture_output=True)
+        subprocess.run(["git", "reset", "-q", "--hard", shas["dev_default"]],
+                       cwd=str(owning), check=True, capture_output=True)
+        subprocess.run(["git", "fetch", "-q", "origin", "dev"],
+                       cwd=str(owning), check=True, capture_output=True)
+        return owning, shas
+
+    def test_fresh_when_local_base_contains_delivered_commits(self, tmp_path):
+        """An up-to-date checkout (HEAD contains the delivered commit) is
+        fresh and the guard records the per-commit evidence."""
+        _wl, owning, shas = _make_real_repo(tmp_path)
+        ctx = _ctx_with_runner(owning, "WL-0MSI4TAT70058921")
+        fresh, evidence, missing, head = audit_runner._audit_base_freshness(
+            ctx, [shas["dev_head"]], "",
+        )
+        assert fresh is True
+        assert missing == []
+        assert head == shas["dev_head"]
+        assert "audit base contains the delivered commit" in evidence
+
+    def test_stale_when_local_base_lacks_origin_dev_delivered_commit(self, tmp_path):
+        """The incident shape: delivered commit on origin/dev but ABSENT from
+        the local HEAD -> the audit base is stale."""
+        owning, shas = self._repo_with_stale_dev(tmp_path)
+        ctx = _ctx_with_runner(owning, "WL-0MSI4TAT70058921")
+        fresh, evidence, missing, head = audit_runner._audit_base_freshness(
+            ctx, [shas["feature_head"]],
+            "wl-WL-0MSI4TAT70058921-rename-tab",
+        )
+        assert fresh is False
+        assert shas["feature_head"] in missing
+        assert head == shas["dev_default"]
+        assert "origin/dev -> yes" in evidence
+        assert "HEAD -> no" in evidence
+
+    def test_missing_commit_not_delivered_is_not_stale(self, tmp_path):
+        """A candidate that is NOT on origin/dev (unrelated/context sha) never
+        marks the base stale — only delivered commits matter (fail-open)."""
+        _wl, owning, _shas = _make_real_repo(tmp_path)
+        ctx = _ctx_with_runner(owning, "WL-Z")
+        fresh, evidence, missing, _head = audit_runner._audit_base_freshness(
+            ctx, ["0000000000000000000000000000000000000000"], "",
+        )
+        assert fresh is True
+        assert missing == []
+        assert "not part of the delivered state" in evidence
+
+    def test_no_candidates_fail_open(self, tmp_path):
+        """No delivered-commit candidates -> nothing to verify -> fresh."""
+        _wl, owning, _shas = _make_real_repo(tmp_path)
+        ctx = _ctx_with_runner(owning, "WL-Z")
+        fresh, evidence, missing, _head = audit_runner._audit_base_freshness(
+            ctx, [], "",
+        )
+        assert fresh is True
+        assert missing == []
+        assert "nothing to verify" in evidence
+
+    def test_pushed_sha_captured_from_integration_is_checked(self, tmp_path):
+        """The merge-gate pushed sha (cherry-pick integration creates NEW
+        shas) is part of the guard's candidates: a stale base lacking it is
+        detected."""
+        owning, shas = self._repo_with_stale_dev(tmp_path)
+        ctx = _ctx_with_runner(owning, "WL-0MSI4TAT70058921")
+        ctx.merge_gate_pushed_sha = shas["feature_head"]
+        fresh, _evidence, missing, _head = audit_runner._audit_base_freshness(
+            ctx, [], "",
+        )
+        assert fresh is False
+        assert shas["feature_head"] in missing
+
+
+# ---------------------------------------------------------------------------
+# _phase_merge_gate — stale-audit-base guard behaviour (SA-0MT9EK1UU000DT1R)
+# ---------------------------------------------------------------------------
+
+class TestPhaseMergeGateStaleBase:
+    """The guard aborts the gate (rc=1, merge_gate_stale set) when the local
+    audit base lacks the item's delivered work — for BOTH the verified-merged
+    and the just-integrated paths. A fresh base proceeds unchanged."""
+
+    def test_merged_but_stale_base_aborts(self):
+        ctx = _make_ctx()
+        with (
+            mock.patch.object(
+                audit_runner, "_resolve_item_integration_evidence",
+                return_value=(["deadbeef"], "wl-WL-ABC123-x"),
+            ),
+            mock.patch.object(
+                audit_runner, "_verify_merged_in_dev",
+                return_value=(True, "merge-base ... -> yes", True),
+            ),
+            mock.patch.object(
+                audit_runner, "_audit_base_freshness",
+                return_value=(False, "HEAD -> no (STALE)",
+                              ["deadbeef"], "abcdef0"),
+            ),
+        ):
+            rc = audit_runner._phase_merge_gate(ctx)
+        assert rc == 1
+        assert ctx.merge_gate_stale is True
+        assert ctx.merge_gate_merged is True
+        assert "Audit-base freshness check" in ctx.merge_gate_evidence
+        # The stale abort is NOT the (demoting) integration-failure blocker.
+        assert ctx.merge_gate_blocker == ""
+
+    def test_integration_success_but_stale_base_aborts(self):
+        """After the gate integrates+pushes into origin/dev, a local base
+        that still lacks the delivered commit must abort — never audit the
+        stale tree."""
+        ctx = _make_ctx()
+        with (
+            mock.patch.object(
+                audit_runner, "_resolve_item_integration_evidence",
+                return_value=(["deadbeef"], "wl-WL-ABC123-x"),
+            ),
+            mock.patch.object(
+                audit_runner, "_verify_merged_in_dev",
+                return_value=(False, "merge-base ... -> no", True),
+            ),
+            mock.patch.object(
+                audit_runner, "_integrate_into_dev",
+                return_value=(True, "cherry-pick ok\npush ok"),
+            ),
+            mock.patch.object(
+                audit_runner, "_audit_base_freshness",
+                return_value=(False, "HEAD -> no (STALE)",
+                              ["deadbeef"], "abcdef0"),
+            ),
+        ):
+            rc = audit_runner._phase_merge_gate(ctx)
+        assert rc == 1
+        assert ctx.merge_gate_stale is True
+        assert ctx.merge_gate_merged is True
+        assert ctx.merge_gate_blocker == ""
+
+    def test_fresh_base_proceeds_unchanged(self):
+        """Regression: a fresh base proceeds with no stale flag and no
+        evidence pollution beyond the freshness notes."""
+        ctx = _make_ctx()
+        with (
+            mock.patch.object(
+                audit_runner, "_resolve_item_integration_evidence",
+                return_value=(["deadbeef"], "wl-WL-ABC123-x"),
+            ),
+            mock.patch.object(
+                audit_runner, "_verify_merged_in_dev",
+                return_value=(True, "merge-base ... -> yes", True),
+            ),
+            mock.patch.object(
+                audit_runner, "_audit_base_freshness",
+                return_value=(True, "HEAD -> yes", [], "deadbeef"),
+            ),
+        ):
+            rc = audit_runner._phase_merge_gate(ctx)
+        assert rc is None
+        assert ctx.merge_gate_stale is False
+        assert ctx.merge_gate_merged is True
+
+
+# ---------------------------------------------------------------------------
+# cmd_issue — stale audit base aborts loudly; lifecycle untouched
+# ---------------------------------------------------------------------------
+
+class TestCmdIssueStaleAuditBase:
+    """A stale audit base aborts BEFORE Phase 1 screening with a non-zero
+    exit; the item lifecycle is NOT demoted (the item is fine — the checkout
+    is stale) and no misleading report/verdict is produced."""
+
+    def test_stale_base_aborts_without_demotion_or_screening(self, capsys):
+        recorded: list[list[str]] = []
+        runner = _wl_runner(recorded)
+        pi_mock = mock.MagicMock()
+
+        with (
+            mock.patch.object(
+                audit_runner, "_resolve_owning_project_root",
+                return_value=audit_runner.TARGET_PROJECT_ROOT,
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_item_integration_evidence",
+                return_value=(["deadbeef"], "wl-WL-ABC123-rename-tab"),
+            ),
+            mock.patch.object(
+                audit_runner, "_verify_merged_in_dev",
+                return_value=(True, "merge-base ... -> yes", True),
+            ),
+            mock.patch.object(
+                audit_runner, "_audit_base_freshness",
+                return_value=(False, "HEAD -> no (STALE)",
+                              ["deadbeef"], "abcdef0"),
+            ),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", pi_mock,
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "WL-ABC123", persist=False, force=True, runner=runner,
+            )
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "STALE" in err
+        assert "pull origin dev" in err
+        # Screening must NOT run: zero pi calls on the stale-abort path.
+        pi_mock.assert_not_called()
+        # Lifecycle restore runs (finally) but never flags producer review —
+        # the merge-gate BLOCKER (integration failure) is the only demoter.
+        updates = [c for c in recorded if "update" in " ".join(c)]
+        assert updates, "expected a lifecycle restore update"
+        assert not any(
+            "--needs-producer-review" in c and "yes" in c
+            for c in updates
+        ), f"stale abort must not flag needs-producer-review, got {updates}"
+
+    def test_stale_base_json_mode_payload(self, capsys):
+        recorded: list[list[str]] = []
+        runner = _wl_runner(recorded)
+
+        with (
+            mock.patch.object(
+                audit_runner, "_resolve_owning_project_root",
+                return_value=audit_runner.TARGET_PROJECT_ROOT,
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_item_integration_evidence",
+                return_value=(["deadbeef"], "wl-WL-ABC123-rename-tab"),
+            ),
+            mock.patch.object(
+                audit_runner, "_verify_merged_in_dev",
+                return_value=(True, "merge-base ... -> yes", True),
+            ),
+            mock.patch.object(
+                audit_runner, "_audit_base_freshness",
+                return_value=(False, "HEAD -> no (STALE)",
+                              ["deadbeef"], "abcdef0"),
+            ),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", mock.MagicMock(),
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "WL-ABC123", persist=False, force=True, runner=runner,
+                json_mode=True,
+            )
+
+        assert rc == 1
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert "stale_audit_base" in payload
+        assert payload["stale_audit_base"]["merged"] is True
+        assert "remediation" in payload["stale_audit_base"]
