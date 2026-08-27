@@ -844,7 +844,7 @@ def run_eslint(
     if fix:
         findings, fixes_applied = _run_eslint_fix_mode(root, runner)
     else:
-        findings = _run_eslint_findings_check(root, runner)
+        findings = _run_eslint_findings_check(root, runner, files)
         fixes_applied = False
 
     return {"findings": findings, "fixes_applied": fixes_applied}

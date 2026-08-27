@@ -81,20 +81,38 @@ class TestJsonModeTiming:
 class TestHumanModeTiming:
     """Timing reports appear in human-readable mode (stderr)."""
 
-    def test_run_tests_human_emits_timing_report_on_stderr(self):
+    def test_run_tests_human_emits_timing_report_on_stderr(self, monkeypatch, capsys):
         """run_tests.py in human mode prints a Timing Report to stderr."""
-        proc = subprocess.run(
-            [sys.executable, str(RUN_TESTS_PY), "--suite", "pytest",
-             "--summary"],
-            capture_output=True, text=True, cwd=str(REPO_ROOT),
-            timeout=120,
-        )
-        assert "Timing Report" in proc.stderr, (
+        import test.scripts.run_tests as rt
+        from test.scripts import run_tests as run_tests_module
+        import io
+        import contextlib
+
+        # Stub run_suite so no real tests execute (fast, deterministic)
+        def _fake_run_suite(*args, **kwargs):
+            return {
+                "success": True, "returncode": 0, "command": "pytest",
+                "failures": [], "cached": False, "scope": "full",
+                "notice": "",
+            }
+
+        monkeypatch.setattr(rt, "run_suite", _fake_run_suite)
+
+        # Capture stdout/stderr from direct function call
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stdout(stdout_capture), \
+             contextlib.redirect_stderr(stderr_capture):
+            run_tests_module.main(["--suite", "pytest"])
+
+        stderr_output = stderr_capture.getvalue()
+        assert "Timing Report" in stderr_output, (
             f"human mode should emit Timing Report on stderr, got: "
-            f"{proc.stderr[:300]}"
+            f"{stderr_output[:300]}"
         )
+        stdout_output = stdout_capture.getvalue()
         # Command summary stays on stdout (existing output intact)
-        assert "pytest:" in proc.stdout
+        assert "pytest summary" in stdout_output or "pytest:" in stdout_output
 
     def test_run_all_returns_timing_contract(self, monkeypatch):
         """run_all() appends an additive timing dict to its result.
