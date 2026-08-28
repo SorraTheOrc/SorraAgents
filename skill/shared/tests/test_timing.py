@@ -145,7 +145,7 @@ class TestPercentageCalculation:
         """Sibling children's percentages sum to ~100%."""
         import time as _time
 
-        with Timer("parent") as parent:
+        with Timer("parent"):
             with Timer("a") as a:
                 _time.sleep(0.01)
             with Timer("b") as b:
@@ -215,7 +215,7 @@ class TestHumanReadableReport:
 
     def test_render_nested_steps(self):
         """Human report shows nested steps with indentation."""
-        with Timer("parent") as parent, Timer("child") as child:
+        with Timer("parent") as parent, Timer("child"):
             pass
         report = parent.render()
         assert "parent" in report
@@ -286,9 +286,9 @@ class TestJsonSerialization:
     def test_json_serializable_from_fresh_context(self):
         """to_dict produces a fully JSON-serializable structure."""
         with Timer("root") as root:
-            with Timer("a") as a:
+            with Timer("a"):
                 pass
-            with Timer("b") as b:
+            with Timer("b"):
                 pass
         json.dumps(root.to_dict())  # must not raise
 
@@ -305,7 +305,7 @@ class TestNestedStepPercentages:
         """Child percentage is relative to root total."""
         import time as _time
 
-        with Timer("root") as root:
+        with Timer("root"):
             with Timer("half") as half:
                 _time.sleep(0.05)
             with Timer("half") as half2:
@@ -347,7 +347,6 @@ class TestJsonAdditive:
 
     def test_multiple_timer_instances_are_independent(self):
         """Two separate Timer instances don't interfere."""
-        results = []
         with Timer("t1") as t1:
             pass
         with Timer("t2") as t2:
