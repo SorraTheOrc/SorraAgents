@@ -138,7 +138,7 @@ class TestHumanModeTiming:
     def test_render_report_emits_timing_on_stderr(self):
         """render_report.py prints the report to stdout and timing to stderr."""
         proc = subprocess.run(
-            [sys.executable, str(RENDER_REPORT_PY), "SA-0MT319YGQ002E801",
+            [sys.executable, str(RENDER_REPORT_PY), "SA-0MSJ082OY003IQ8S",
              "--skill-name", "integration-test",
              "--headline", "Integration verification",
              "--ac", "AC1|metric|met"],
