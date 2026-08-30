@@ -575,3 +575,94 @@ class TestContentFreshnessGate:
             )
         assert rc == 0
 
+    # ------------------------------------------------------------------
+    # Freshness skip notice (AC2, SA-0MTFX6HMJ006QKR3): surfaces verdict
+    # + auditedAt so a re-audit short-circuits without needing to read
+    # the full raw report (re-audit coordination, SA-0MSQIA84B005NHWC).
+    # ------------------------------------------------------------------
+
+    def test_fresh_skip_notice_surfaces_verdict_and_timestamp(self):
+        """AC2: the fast-path skip notice names the verdict and auditedAt
+        of the fresh audit instead of a bare 'still fresh' line."""
+        captured = []
+
+        def _make_runner(fp: str):
+            mock_runner = mock.MagicMock()
+
+            def _side_effect(cmd):
+                cmd_str = " ".join(cmd)
+                if "audit-show" in cmd_str:
+                    report = self._report_with_fingerprint(
+                        fp, verdict="Yes",
+                    )
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "auditedAt": "2026-08-01T00:00:00.000Z",
+                                "rawOutput": report,
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "update" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True}), stderr="",
+                    )
+                if "show" in cmd_str and "--children" not in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1",
+                                "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                        }),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            mock_runner.side_effect = _side_effect
+            return mock_runner
+
+        # The stored fingerprint must match the one the gate recomputes at
+        # runtime, so derive it through the same fake runner + mocked HEAD.
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                _make_runner("f" * 64), "TEST-1",
+                work_item={"description": self._DESC},
+            )
+        assert fp is not None
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                return_value={"extracted_text": "[]"},
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+            ),
+            mock.patch(
+                "builtins.print",
+                side_effect=lambda *a, **k: captured.append(
+                    " ".join(str(x) for x in a)
+                ),
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False, runner=_make_runner(fp),
+            )
+        assert rc == 0
+        joined = "\n".join(captured)
+        assert "Skipping: audit still fresh" in joined
+        assert "Ready to close: Yes" in joined
+        assert "2026-08-01T00:00:00.000Z" in joined
+

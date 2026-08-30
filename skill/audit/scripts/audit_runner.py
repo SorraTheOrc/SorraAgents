@@ -4444,18 +4444,19 @@ def _parse_child_audit_verdict(raw_output: str,
     return False, "not_ready", audited_at
 
 
-def _fetch_child_audited_at(runner: Runner, child_id: str,
-                            worklog_dir: str | None = None) -> str | None:
-    """Return the child audit's ``auditedAt`` (None when unavailable).
+def _fetch_audited_at(runner: Runner, issue_id: str,
+                      worklog_dir: str | None = None) -> str | None:
+    """Return the audit's ``auditedAt`` for a work item (None when unavailable).
 
-    Used by the auto-trigger loop's content-freshness reuse branch to record
-    the ``reused from <auditedAt>`` marker (LP-0MSQ32MF200675AR). The branch
-    is a defense-in-depth fallback — the primary child reuse happens in the
-    Phase 1 pre-pass where ``_get_child_audit_verdict`` already returns the
-    auditedAt.
+    Used by the fresh-skip fast-path notice (AC2, SA-0MTFX6HMJ006QKR3) to
+    surface when the reused audit ran, and by the auto-trigger loop's
+    content-freshness reuse branch to record the ``reused from <auditedAt>``
+    marker (LP-0MSQ32MF200675AR). The branch is a defense-in-depth fallback
+    — the primary child reuse happens in the Phase 1 pre-pass where
+    ``_get_child_audit_verdict`` already returns the auditedAt.
     """
     try:
-        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
                        worklog_dir=worklog_dir)
     except RuntimeError:
         return None
@@ -6903,7 +6904,23 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
                                               worklog_dir=worklog_dir,
                                               work_item=wi)
         if fresh_report is not None:
-            print("Skipping: audit still fresh")
+            # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
+            # the fresh audit so a redundant re-audit is stopped before the
+            # model is invoked (re-audit coordination, SA-0MSQIA84B005NHWC).
+            # The full report still follows so the operator can inspect the
+            # evidence that produced the verdict.
+            audited_at = _fetch_audited_at(
+                runner, issue_id, worklog_dir=worklog_dir,
+            )
+            verdict = _parse_ready_to_close(fresh_report)
+            verdict_label = "Yes" if verdict == "yes" else "No"
+            notice = (
+                f"Skipping: audit still fresh — Ready to close: "
+                f"{verdict_label}"
+            )
+            if audited_at:
+                notice += f" (audited {audited_at})"
+            print(notice)
             print(fresh_report)
             return 0
 
@@ -8403,7 +8420,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 fresh_ready = _parse_ready_to_close(fresh_report)
                                 verdict = fresh_ready == "yes"
                                 reason = "ready" if fresh_ready == "yes" else "not_ready"
-                                child["reused_from"] = _fetch_child_audited_at(
+                                child["reused_from"] = _fetch_audited_at(
                                     runner, child["id"], worklog_dir=worklog_dir,
                                 )
                                 print(
