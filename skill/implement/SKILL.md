@@ -197,12 +197,10 @@ Proceed anyway with --allow-orphaned-stashes.
 
 4. Understand the work item
 
-The item is already claimed from Step 1. Check the most recent worklog action,
-comment, or audit entry (reuse a recent audit, else `/skill:audit
-<work-item-id>`). Fetch `wl show <work-item-id> --json`; pay attention to
-`description`, `acceptance criteria`, `comments`. Restate ACs/status; surface
-blockers/dependencies/missing requirements; inspect linked PRDs/plans/docs;
-confirm expected tests/validation.
+The item is already claimed from Step 1. Fetch `wl show <work-item-id> --json`;
+pay attention to `description`, `acceptance criteria`, `comments`. Restate
+ACs/status; surface blockers/dependencies/missing requirements; inspect linked
+PRDs/plans/docs; confirm expected tests/validation.
 
 4.1. Definition gate (must pass before implementation)
 
@@ -327,8 +325,9 @@ parent itself gets no worktree.
 7. Automated self-review
 
 - Build and lint; fix any issues.
-- Audit: `/skill:audit <work-item-id>` — if ACs unmet, inform the user and return to step 6. The item is `in_progress` during implementation, so pass `--force` (the audit's pre-flight affirmation guard refuses to audit an in-progress item without it — see [../audit/SKILL.md](../audit/SKILL.md)).
-- Sequential passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff. Small, goal-aligned edits; intent changes → Open Question and stop.
+- Sequential passes: completeness, dependencies & safety, scope & regression,
+  tests & acceptance, polish & handoff. Small, goal-aligned edits; intent
+  changes → Open Question and stop.
 
 8. Optional refactor step
 
@@ -371,43 +370,35 @@ See ``../refactor/SKILL.md``.
 
   > The item stays `in_review` until release promotes `dev` to `main` (see `../ship/SKILL.md`).
 
-- **Final validation — belt-and-suspenders (post-push, post-`in_review`):** run one last
-  audit at the committed state and reconcile its verdict BEFORE closing your
-  response. This catches gaps the Step 7 self-review could not see (it ran
-  pre-commit, with `HEAD` still at the base `dev` commit):
+- **Final validation — belt-and-suspenders (post-push, post-`in_review`):** run
+  the full test suite against the committed state and ensure all tests pass.
+  If any tests fail: create critical `test-failure` work items with the triage
+  helper, fix the failures, and re-run until green before closing the response.
 
   ```bash
-  python3 $(skill_path audit)/scripts/audit_runner.py issue <work-item-id> --green-run <full-commit-sha> --no-execute
+  /skill:test
   ```
 
-  - `<full-commit-sha>` is the FULL 40-hex sha just pushed (from `git rev-parse
-    HEAD`; short shas are rejected — the runner compares the value exactly
-    against the audited HEAD). It attests the pre-push `/skill:test` green
-    run against the **exact committed state**. The alias `--green-run HEAD`
-    is accepted only when the checkout is at the pushed commit (immediately
-    after `git pull origin dev`, with no intervening pushes; a mismatched
-    attestation is reported and the run proceeds without it — never silently
-    accepted).
-  - `--no-execute` guarantees the audit never re-runs the test suite: it already
-    passed pre-push, and execution-dependent ACs verify from the green-run
-    attestation (see [../audit/SKILL.md](../audit/SKILL.md)).
-  - Do **NOT** pass `--force`: the pre-flight guard passes at
-    `completed`/`in_review`, and `--force` would bypass the freshness gate and
-    child-verdict reuse.
-  - `Ready to close: Yes` (or a freshness skip) → the item is genuinely ready;
-    close your response below.
-  - `Ready to close: No` → the final validation caught a real gap: inform the
-    user, re-claim
-    (`StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`),
-    and return to Step 6 — do NOT leave the item in_review with unmet ACs.
+  - This runs the full suite (not just changed-scope) against the exact pushed
+    commit, catching any regression the pre-push gate missed.
+  - Failures → triage helper:
+    `python3 $(skill_path triage)/scripts/check_or_create.py
+    '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...",
+    "parent_work_item_id":"<this-work-item-id>"}'` → fix → re-run.
+  - All tests green → close your response.
   - **Parent/epic runs:** parent/epic items are validated per child at each
-    child's Step 9; the parent itself is covered by its own audit when it
-    advances at Step 6.1.
+    child's Step 9; the parent itself is covered by the per-child test runs
+    at Step 6.1.
 
 Pre-push blocking check
 -----------------------
 
-Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`) and fix failures before pushing; outside scope → triage helper.
+Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`).
+If any tests fail: (1) create a critical `test-failure` work item with
+`python3 $(skill_path triage)/scripts/check_or_create.py
+'{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...",
+"parent_work_item_id":"<this-work-item-id>"}'`; (2) fix the failures; (3)
+re-run until green. Only then proceed to commit/push.
 
 Final cleanup (belt-and-suspenders)
 ---------------------------------------
