@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any
+from typing import Any, Self
 
 # Thread-local stack of active timers for automatic parent resolution.
 _local = threading.local()
@@ -87,7 +87,7 @@ class Timer:
             return time.monotonic() - self.start_time
         return self._elapsed
 
-    def __enter__(self) -> Timer:
+    def __enter__(self) -> Self:
         """Start timing; automatically link to parent from the active stack."""
         self.start()
         stack = _active_stack()
