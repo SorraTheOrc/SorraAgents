@@ -666,3 +666,178 @@ class TestContentFreshnessGate:
         assert "Ready to close: Yes" in joined
         assert "2026-08-01T00:00:00.000Z" in joined
 
+    # ------------------------------------------------------------------
+    # AC4 (SA-0MTFX6VD70097OEO): second audit at the same HEAD
+    # short-circuits WITHOUT invoking the model — the re-audit-count
+    # reduction target (re-audit coordination, SA-0MSQIA84B005NHWC).
+    # ------------------------------------------------------------------
+
+    def test_second_audit_same_head_short_circuits_without_model(self):
+        """AC4: auditing twice at the same HEAD reuses the fresh audit; the
+        second run exits 0 and never invokes the model (zero pi calls)."""
+        pi_calls = []
+
+        def _pi(**kwargs):
+            pi_calls.append(kwargs)
+            raise AssertionError(
+                "model must not be invoked when a fresh audit exists "
+                f"(call #{len(pi_calls)}: {kwargs})"
+            )
+
+        def _make_runner(fp: str):
+            mock_runner = mock.MagicMock()
+
+            def _side_effect(cmd):
+                cmd_str = " ".join(cmd)
+                if "audit-show" in cmd_str:
+                    # Existing fresh audit: fingerprint matches the current
+                    # content state (HEAD + description + Key Files + tree).
+                    report = self._report_with_fingerprint(fp, verdict="Yes")
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "auditedAt": "2026-08-01T00:00:00.000Z",
+                                "rawOutput": report,
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "update" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True}), stderr="",
+                    )
+                if "show" in cmd_str and "--children" not in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1",
+                                "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                        }),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            mock_runner.side_effect = _side_effect
+            return mock_runner
+
+        # Deterministic fingerprint for the CURRENT state so the stored
+        # report matches exactly (no 60s time-gate dependence).
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                _make_runner("f" * 64), "TEST-1",
+                work_item={"description": self._DESC},
+            )
+        assert fp is not None
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_pi,
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False, runner=_make_runner(fp),
+            )
+        assert rc == 0
+        assert pi_calls == [], "the fresh audit short-circuit must skip the model"
+
+    def test_second_audit_force_still_invokes_model(self):
+        """AC4 (guard): --force bypasses the short-circuit — the model IS
+        invoked even with a matching fresh audit (re-audit target: only
+        stale/forced re-audits are allowed)."""
+        pi_calls = []
+
+        def _make_runner(fp: str):
+            mock_runner = mock.MagicMock()
+
+            def _side_effect(cmd):
+                cmd_str = " ".join(cmd)
+                if "audit-show" in cmd_str:
+                    report = self._report_with_fingerprint(fp, verdict="Yes")
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "auditedAt": "2026-08-01T00:00:00.000Z",
+                                "rawOutput": report,
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "update" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True}), stderr="",
+                    )
+                if "show" in cmd_str and "--children" not in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1",
+                                "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "--children" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1", "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                            "children": [],
+                        }),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            mock_runner.side_effect = _side_effect
+            return mock_runner
+
+        # The full pipeline needs code_quality + _call_pi to succeed; the
+        # model invocation IS recorded (proving --force re-audits).
+        def _pi(*args, **kwargs):
+            pi_calls.append(kwargs.get("prompt", "")[:50])
+            return {"extracted_text": "[]"}
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_pi,
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=_make_runner("f" * 64),
+            )
+        assert rc == 0
+        assert pi_calls, "--force must bypass the fresh-audit short-circuit"
+
