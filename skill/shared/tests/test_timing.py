@@ -120,7 +120,7 @@ class TestNestingRollUp:
 
     def test_deep_nesting_roll_up(self):
         """Three levels of nesting roll up correctly."""
-        with Timer("level_0") as l0, Timer("level_1") as l1:
+        with Timer("level_0") as l0, Timer("level_1") as l1:  # noqa: SIM117
             with Timer("level_2") as l2:
                 pass
         assert abs(l0.total_time - l1.total_time) < 1e-6
@@ -227,7 +227,7 @@ class TestHumanReadableReport:
             pass
         report = t.render()
         lines = report.splitlines()
-        header_line = [l for l in lines if "Elapsed" in l][0]
+        header_line = next(l for l in lines if "Elapsed" in l)
         assert "Step" in header_line
         assert "Elapsed" in header_line
         assert "%" in header_line
@@ -320,7 +320,7 @@ class TestNestedStepPercentages:
         """A deeply nested child's percentage is relative to the root."""
         import time as _time
 
-        with Timer("root") as root, Timer("level1") as l1:
+        with Timer("root") as root, Timer("level1") as l1:  # noqa: SIM117
             with Timer("level2") as l2:
                 _time.sleep(0.02)
         assert root.percentage == 100.0
