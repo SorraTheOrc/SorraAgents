@@ -48,7 +48,7 @@ class TestJsonModeTiming:
             [sys.executable, str(RUN_TESTS_PY), "--suite", "pytest",
              "--summary", "--json"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
-            timeout=120,
+            check=False, timeout=120,
         )
         data = json.loads(proc.stdout)
         assert "timing" in data, "run_tests.py --json must carry a 'timing' key"
@@ -65,7 +65,7 @@ class TestJsonModeTiming:
             [sys.executable, str(RUN_TESTS_PY), "--suite", "pytest",
              "--summary", "--json"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
-            timeout=120,
+            check=False, timeout=120,
         )
         data = json.loads(proc.stdout)
         timing = data["timing"]
@@ -83,10 +83,11 @@ class TestHumanModeTiming:
 
     def test_run_tests_human_emits_timing_report_on_stderr(self, monkeypatch, capsys):
         """run_tests.py in human mode prints a Timing Report to stderr."""
+        import contextlib
+        import io
+
         import test.scripts.run_tests as rt
         from test.scripts import run_tests as run_tests_module
-        import io
-        import contextlib
 
         # Stub run_suite so no real tests execute (fast, deterministic)
         def _fake_run_suite(*args, **kwargs):
@@ -142,7 +143,7 @@ class TestHumanModeTiming:
              "--skill-name", "integration-test",
              "--headline", "Integration verification",
              "--ac", "AC1|metric|met"],
-            capture_output=True, text=True, cwd=str(REPO_ROOT),
+            capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
             timeout=120,
         )
         assert proc.returncode == 0, f"render_report failed: {proc.stderr[:300]}"
@@ -202,7 +203,7 @@ class TestSpeakWrapperIntegration:
         """speak.py --help delegates to speak.sh and emits timing on stderr."""
         proc = subprocess.run(
             [sys.executable, str(SPEAK_PY), "--help"],
-            capture_output=True, text=True, cwd=str(REPO_ROOT),
+            capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
             timeout=120,
         )
         assert proc.returncode == 0
