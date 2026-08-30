@@ -39,6 +39,7 @@ def _isolate_lock_dir(tmp_path, monkeypatch):
     monkeypatch.setenv(ENV_LOCK_DIR, str(tmp_path / "locks"))
     monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
     monkeypatch.delenv("AUDIT_LOCK_TIMEOUT", raising=False)
+    monkeypatch.delenv("AUDIT_QUEUE_TIMEOUT", raising=False)
 
 
 class _MockProcess:
@@ -242,12 +243,55 @@ def test_default_lock_timeout_is_fail_fast(monkeypatch):
 
     Regression for SA-0MSGEAZMC009LHKL: the default was 300s, which
     exceeded the parent bash-tool execution timeout (~120s) and killed
-    audits mid-wait. The default must now be 0.0 so a saturated ceiling
-    fails immediately with the graceful 'unmet' verdict.
+    audits mid-wait. The per-attempt semaphore try must now be 0.0 so a
+    saturated ceiling NEVER blocks the poll loop; the TOTAL bounded wait
+    for admission is governed separately by AUDIT_QUEUE_TIMEOUT
+    (SA-0MTG5RYH8005RQNM).
     """
     monkeypatch.delenv("AUDIT_LOCK_TIMEOUT", raising=False)
     assert audit_runner.AUDIT_LOCK_TIMEOUT_DEFAULT == 0.0
     assert audit_runner._audit_lock_timeout() == 0.0
+
+
+def test_default_queue_timeout_is_bounded_not_fail_fast(monkeypatch):
+    """The default queue wait is a bounded value (not 0s fail fast).
+
+    SA-0MTG5RYH8005RQNM AC1: audits under saturation WAIT in the priority
+    queue rather than failing immediately. The default must be inside the
+    parent bash-tool budget (~120s, SA-0MSGEAZMC009LHKL) so an exhausted
+    wait still returns the graceful unmet verdict instead of being killed
+    mid-wait.
+    """
+    monkeypatch.delenv("AUDIT_QUEUE_TIMEOUT", raising=False)
+    assert 0 < audit_runner.AUDIT_QUEUE_TIMEOUT_DEFAULT <= 120.0
+    assert audit_runner._audit_queue_timeout() == audit_runner.AUDIT_QUEUE_TIMEOUT_DEFAULT
+
+
+def test_queue_timeout_env_override_still_wins(monkeypatch):
+    """AUDIT_QUEUE_TIMEOUT env var overrides the bounded default."""
+    monkeypatch.setenv("AUDIT_QUEUE_TIMEOUT", "30")
+    assert audit_runner._audit_queue_timeout() == 30.0
+
+
+def test_invalid_queue_timeout_env_falls_back(monkeypatch, capsys):
+    """A non-numeric AUDIT_QUEUE_TIMEOUT warns and uses the default."""
+    monkeypatch.setenv("AUDIT_QUEUE_TIMEOUT", "not-a-number")
+    assert audit_runner._audit_queue_timeout() == audit_runner.AUDIT_QUEUE_TIMEOUT_DEFAULT
+    assert "invalid" in capsys.readouterr().err.lower()
+
+
+def test_resolve_audit_priority_maps_worklog_levels():
+    """Worklog priority strings map to numeric queue priorities."""
+    from shared.queue import Priority
+
+    assert audit_runner._resolve_audit_priority({"priority": "critical"}) == Priority.CRITICAL
+    assert audit_runner._resolve_audit_priority({"priority": "high"}) == Priority.HIGH
+    assert audit_runner._resolve_audit_priority({"priority": "medium"}) == Priority.MEDIUM
+    assert audit_runner._resolve_audit_priority({"priority": "low"}) == Priority.LOW
+    # Unknown/missing priority defaults to medium (never crashes an audit).
+    assert audit_runner._resolve_audit_priority({}) == Priority.MEDIUM
+    assert audit_runner._resolve_audit_priority(None) == Priority.MEDIUM
+    assert audit_runner._resolve_audit_priority({"priority": "urgent"}) == Priority.MEDIUM
 
 
 def test_lock_timeout_env_override_still_wins(monkeypatch):
@@ -256,13 +300,20 @@ def test_lock_timeout_env_override_still_wins(monkeypatch):
     assert audit_runner._audit_lock_timeout() == 30.0
 
 
-def test_call_pi_saturated_ceiling_fails_fast_without_env_override(monkeypatch):
-    """With no env override, a saturated ceiling returns 'unmet' promptly
-    instead of blocking for the old 300s default wait."""
+def test_call_pi_saturated_ceiling_waits_then_times_out_bounded(monkeypatch):
+    """A saturated ceiling now WAITS on the priority queue (not fail fast).
+
+    SA-0MTG5RYH8005RQNM AC1: with both slots held, a new pi call must not
+    return immediately with an unmet verdict; it enqueues and waits for
+    the AUDIT_QUEUE_TIMEOUT bound, then reports the honest unmet
+    concurrency verdict. Regression for the SA-0MSGEAZMC009LHKL hang: the
+    wait must stay inside the parent bash-tool timeout.
+    """
     from shared.process_semaphore import Semaphore
 
-    # Saturate all slots: hold 1 slot in this process, then attempt another.
+    # Saturate the single slot, then attempt another launch.
     monkeypatch.setenv(ENV_MAX_WORKERS, "1")
+    monkeypatch.setenv("AUDIT_QUEUE_TIMEOUT", "0.3")
     monkeypatch.delenv("AUDIT_LOCK_TIMEOUT", raising=False)
 
     sem = Semaphore("audit", max_workers=1, timeout=10)
@@ -278,10 +329,37 @@ def test_call_pi_saturated_ceiling_fails_fast_without_env_override(monkeypatch):
     assert result.get("verdict") == "unmet"
     assert "concurr" in result.get("evidence", "").lower()
     assert result.get("_concurrency_timeout") is True
-    # Fail fast: must return well inside the parent bash-tool timeout
-    # (~120s) and far below the old 300s default wait. Generous bound to
-    # keep the test robust on slow CI.
+    # It WAITED (not fail-fast) but stayed inside a small multiple of the
+    # queue bound, far below the old 300s hang.
+    assert elapsed >= 0.1, f"_call_pi failed fast instead of queue-waiting ({elapsed:.1f}s)"
     assert elapsed < 5.0, f"_call_pi blocked {elapsed:.1f}s on saturated ceiling"
+
+
+def test_call_pi_saturated_ceiling_recovers_without_fail_fast(monkeypatch):
+    """When a slot frees inside the queue bound, the queued call proceeds
+    (AC1: no fail-fast unmet under momentary saturation)."""
+    from shared.process_semaphore import Semaphore
+
+    monkeypatch.setenv(ENV_MAX_WORKERS, "1")
+    monkeypatch.setenv("AUDIT_QUEUE_TIMEOUT", "30")
+
+    sem = Semaphore("audit", max_workers=1, timeout=10)
+    sem.acquire()
+
+    def _release_after_delay():
+        time.sleep(0.3)
+        sem.release()
+
+    releaser = threading.Thread(target=_release_after_delay)
+    releaser.start()
+    try:
+        with _mock_popen():
+            result = audit_runner._call_pi("prompt", model="m", pi_bin="pi")
+    finally:
+        releaser.join(timeout=10)
+
+    assert result.get("verdict") == "met", result
+    assert result.get("_concurrency_timeout") is not True
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +374,8 @@ def test_call_pi_timeout_returns_unmet_verdict(monkeypatch):
 
     # Saturate all slots: hold 1 slot in this process, then attempt another.
     monkeypatch.setenv(ENV_MAX_WORKERS, "1")
-    monkeypatch.setenv("AUDIT_LOCK_TIMEOUT", "0")  # fail fast
+    monkeypatch.setenv("AUDIT_LOCK_TIMEOUT", "0")  # fail-fast per-attempt try
+    monkeypatch.setenv("AUDIT_QUEUE_TIMEOUT", "0.2")
 
     sem = Semaphore("audit", max_workers=1, timeout=10)
     sem.acquire()

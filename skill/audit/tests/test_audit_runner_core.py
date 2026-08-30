@@ -440,7 +440,7 @@ class TestCallPiFailureEvidenceNamesPhase:
 
     def test_concurrency_limit_evidence_names_phase(self):
         """A concurrency-limit fallback names the phase that could not launch."""
-        def _raise_busy():
+        def _raise_busy(issue_id="", priority=None, max_concurrency=None):
             raise TimeoutError("semaphore 'audit' busy: no slot free within 300.0s")
         with mock.patch.object(
             audit_runner, "_acquire_audit_slot", side_effect=_raise_busy

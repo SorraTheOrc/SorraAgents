@@ -96,7 +96,8 @@ class TestPhase1ParentCheckpoint:
     def _patch_parent_screen(self, verdict="met"):
         def _fake_call(issue_id, context, prompt, model, pi_bin, debug_log,
                        timeout, ac_fallback_used, on_runtime_error,
-                       failure_label, child_screen=False, enable_tools=True):
+                       failure_label, child_screen=False, enable_tools=True,
+                       priority=None):
             return (
                 {"verdict": verdict, "evidence": "x"},
                 [{"index": 0, "verdict": verdict, "evidence": "x"}],
@@ -372,7 +373,8 @@ def _make_full_runner(head=HEAD_BASE):
 def _phase1_screen_side_effect(issue_id, context, prompt, model, pi_bin,
                                debug_log, timeout, ac_fallback_used,
                                on_runtime_error, failure_label,
-                               child_screen=False, enable_tools=True):
+                               child_screen=False, enable_tools=True,
+                               priority=None):
     return (
         {"verdict": "met", "evidence": "x"},
         [{"index": 0, "verdict": "met", "evidence": "x"}],

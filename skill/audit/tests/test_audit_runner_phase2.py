@@ -567,7 +567,7 @@ class TestPhase2TimingInstrumentation:
         def _fake_call_pi(prompt, model="test-model", pi_bin="pi",
                           enable_tools=False, timeout=None, max_retries=None,
                           ac_fallback_used=None, child_screen=False,
-                          issue_id="", context=""):
+                          issue_id="", context="", priority=None):
             return {
                 "verdict": "met",
                 "evidence": "file.py:10 works",
@@ -635,7 +635,7 @@ class TestPhase2FileScopeManifest:
         """Return a side_effect that matches _call_pi_and_maybe_log's signature."""
         def _side_effect(issue_id, context, prompt, model="m", pi_bin="pi",
                          debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                         ac_fallback_used=None, ac_count=None):
+                         ac_fallback_used=None, ac_count=None, priority=None):
             captured["prompt"] = prompt
             return {"extracted_text": "[]"}
         return _side_effect
@@ -752,7 +752,7 @@ class TestPhase2FileScopeManifest:
 
         def _fake_call(issue_id, context, prompt, model="m", pi_bin="pi",
                        debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                       ac_fallback_used=None, ac_count=None):
+                       ac_fallback_used=None, ac_count=None, priority=None):
             prompts.append(prompt)
             return {"extracted_text": "[]"}
 
@@ -1019,7 +1019,7 @@ class TestPhase2ParallelChildCalls:
 
         def _slow_call(issue_id, context, prompt, model="m", pi_bin="pi",
                        debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                       ac_fallback_used=None, ac_count=None):
+                       ac_fallback_used=None, ac_count=None, priority=None):
             if context.startswith("phase2_child"):
                 started.wait(timeout=5)  # raises BrokenBarrierError if not concurrent
             return {"extracted_text": "[]"}
@@ -1054,7 +1054,7 @@ class TestPhase2ParallelChildCalls:
 
         def _ordered_call(issue_id, context, prompt, model="m", pi_bin="pi",
                           debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                          ac_fallback_used=None, ac_count=None):
+                          ac_fallback_used=None, ac_count=None, priority=None):
             if context.startswith("phase2_child"):
                 call_order.append(issue_id)
             return {"extracted_text": "[]"}
@@ -1138,7 +1138,7 @@ class TestPhase2ParallelChildCalls:
 
         def _recording_call(issue_id, context, prompt, model="m", pi_bin="pi",
                             debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                            ac_fallback_used=None, ac_count=None):
+                            ac_fallback_used=None, ac_count=None, priority=None):
             call_ids.append(issue_id)
             return {"extracted_text": "[]"}
 
@@ -1164,7 +1164,7 @@ class TestPhase2ParallelChildCalls:
 
         def _call_with_timeout(issue_id, context, prompt, model="m", pi_bin="pi",
                                debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                               ac_fallback_used=None, ac_count=None):
+                               ac_fallback_used=None, ac_count=None, priority=None):
             if issue_id == "C-1":
                 return {"_timeout": True, "verdict": "unmet",
                         "evidence": "timed out", "extracted_text": ""}
@@ -1346,7 +1346,7 @@ class TestPhase2RetryTuning:
         def _provider_error_call(issue_id, context, prompt, model="m",
                                  pi_bin="pi", debug_log=None,
                                  enable_tools=False, timeout=None,
-                                 max_retries=None, ac_fallback_used=None, ac_count=None):
+                                 max_retries=None, ac_fallback_used=None, ac_count=None, priority=None):
             if context.startswith("phase2_child"):
                 return {
                     "verdict": "unmet",

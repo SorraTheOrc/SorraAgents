@@ -468,6 +468,73 @@ class PriorityQueue:
                 return None
             time.sleep(_RETRY_DELAY_SECONDS)
 
+    def peek(self, timeout: float | None = None) -> QueueEntry | None:
+        """Return the highest-priority item WITHOUT removing it.
+
+        Unlike :meth:`dequeue`, the item stays in the queue so the caller
+        can inspect who is at the head of the line before acting. Useful
+        for admission control: a waiter can check "am I first?" and then
+        dequeue only when its own ticket is at the head
+        (SA-0MTG5RYH8005RQNM AC2 priority ordering).
+
+        Args:
+            timeout: Override the instance timeout.  ``None`` = use
+                instance default, ``0`` = return immediately if empty.
+
+        Returns:
+            The head ``QueueEntry`` if one exists, or ``None`` when the
+            queue is empty and *timeout* expires.
+        """
+        effective_timeout = self.timeout if timeout is None else timeout
+        deadline = None
+        if effective_timeout is not None:
+            deadline = time.monotonic() + float(effective_timeout)
+
+        while True:
+            with self._locked():
+                entries = self._list_entries()
+                if entries:
+                    return entries[0]
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            time.sleep(_RETRY_DELAY_SECONDS)
+
+    def remove(self, item_id: str) -> QueueEntry | None:
+        """Remove a specific item by id, returning it (or ``None``).
+
+        Idempotent: removing an item that is not present (or was already
+        removed by a concurrent process) returns ``None`` without raising.
+        This lets an admitted waiter take its OWN ticket out of the queue
+        even when a higher-priority ticket arrived during admission — the
+        head is never stolen (SA-0MTG5RYH8005RQNM admission safety).
+        """
+        with self._locked():
+            entries = self._list_entries()
+            for entry in entries:
+                if entry.item_id == item_id:
+                    entry_file = self._queue_dir / _queue_file(item_id)
+                    try:
+                        entry_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass  # race: already gone
+                    return entry
+        return None
+
+    def rank(self, item_id: str) -> int | None:
+        """Return the 1-based position of an item in the current ordering.
+
+        The head of the line is position 1. Items are ranked by
+        (priority, timestamp) — the same ordering as :meth:`dequeue` — so
+        ``rank`` reports an exact "queue_position" for logging
+        (SA-0MTG5RYH8005RQNM AC4). Returns ``None`` when the item is not
+        present.
+        """
+        with self._locked():
+            for position, entry in enumerate(self._list_entries(), start=1):
+                if entry.item_id == item_id:
+                    return position
+        return None
+
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------

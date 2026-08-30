@@ -119,7 +119,8 @@ class TestPhase1FullModelFallback:
         def _fake_phase1_screen(issue_id, context, prompt, model, pi_bin,
                                 debug_log, timeout, ac_fallback_used,
                                 on_runtime_error, failure_label,
-                                child_screen=False, enable_tools=True):
+                                child_screen=False, enable_tools=True,
+                                priority=None):
             calls.append({
                 "context": context, "model": model, "prompt": prompt,
             })
@@ -162,7 +163,8 @@ class TestPhase1FullModelFallback:
         def _fake_phase1_screen(issue_id, context, prompt, model, pi_bin,
                                 debug_log, timeout, ac_fallback_used,
                                 on_runtime_error, failure_label,
-                                child_screen=False, enable_tools=True):
+                                child_screen=False, enable_tools=True,
+                                priority=None):
             calls.append(model)
             batch = [{"index": 0, "verdict": "met", "evidence": "a.py:1"}]
             return (
@@ -193,7 +195,8 @@ class TestPhase1FullModelFallback:
         def _fake_phase1_screen(issue_id, context, prompt, model, pi_bin,
                                 debug_log, timeout, ac_fallback_used,
                                 on_runtime_error, failure_label,
-                                child_screen=False, enable_tools=True):
+                                child_screen=False, enable_tools=True,
+                                priority=None):
             calls.append(model)
             return ({"verdict": "unmet", "evidence": "", "extracted_text": ""},
                     [], "")
@@ -220,7 +223,8 @@ class TestPhase1FullModelFallback:
         def _fake_phase1_screen(issue_id, context, prompt, model, pi_bin,
                                 debug_log, timeout, ac_fallback_used,
                                 on_runtime_error, failure_label,
-                                child_screen=False, enable_tools=True):
+                                child_screen=False, enable_tools=True,
+                                priority=None):
             calls.append(model)
             if model == "fast-model":
                 return ({"verdict": "unmet", "evidence": "", "extracted_text": "x"},
@@ -292,7 +296,8 @@ class TestPerPhaseModelThreading:
         def _fake_phase1_screen(issue_id, context, prompt, model, pi_bin,
                                 debug_log, timeout, ac_fallback_used,
                                 on_runtime_error, failure_label,
-                                child_screen=False, enable_tools=True):
+                                child_screen=False, enable_tools=True,
+                                priority=None):
             seen_models.append(model)
             batch = [{"index": 0, "verdict": "met", "evidence": "a.py:1"}]
             return (
@@ -321,7 +326,8 @@ class TestPerPhaseModelThreading:
         def _fake_phase1_screen(issue_id, context, prompt, model, pi_bin,
                                 debug_log, timeout, ac_fallback_used,
                                 on_runtime_error, failure_label,
-                                child_screen=False, enable_tools=True):
+                                child_screen=False, enable_tools=True,
+                                priority=None):
             seen_models.append(model)
             seen_prompts.append(prompt)
             batch = [{"index": 0, "verdict": "met", "evidence": "a.py:1"}]

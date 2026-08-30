@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -101,6 +102,7 @@ try:
         ENV_MAX_WORKERS,
         Semaphore,
     )
+    from shared.queue import Priority, PriorityQueue
     from shared.status_lifecycle import (
         SIBLING_SCAN_ROOT as SHARED_SIBLING_SCAN_ROOT,
     )
@@ -141,6 +143,40 @@ instead of blocking. The parent bash-tool execution timeout (~120s) is
 shorter than any long bounded wait, so a long default wait previously
 killed audits mid-wait. Operators can opt into a bounded wait via the
 ``AUDIT_LOCK_TIMEOUT`` environment variable.
+
+With the priority-queue integration (SA-0MTG5RYH8005RQNM) this value
+bounds each *individual* semaphore attempt inside the admission poll;
+the TOTAL bounded wait for a slot (including queue time) is governed by
+``AUDIT_QUEUE_TIMEOUT`` below.
+"""
+
+# ---------------------------------------------------------------------------
+# Priority-queue admission (SA-0MTG5RYH8005RQNM)
+# ---------------------------------------------------------------------------
+AUDIT_QUEUE_NAME = "audit"
+AUDIT_QUEUE_TIMEOUT_ENV = "AUDIT_QUEUE_TIMEOUT"
+AUDIT_QUEUE_TIMEOUT_DEFAULT = 90.0
+"""Bounded wait (seconds) for queue admission + a free concurrency slot.
+
+Default 90s: when the ceiling is saturated, an audit launch enqueues a
+ticket at its work item's priority and WAITS in the queue instead of
+failing fast (SA-0MTG5RYH8005RQNM AC1/AC3). The default is kept inside
+the parent bash-tool execution timeout (~120s) that killed audits
+mid-wait with the old 300s default (SA-0MSGEAZMC009LHKL): a saturated
+wait that exhausts the bound still reports the graceful ``unmet``
+"concurrency limit reached" verdict, and the audit process never
+outlives its caller. Operators whose tool wrapper tolerates longer
+waits can raise ``AUDIT_QUEUE_TIMEOUT``.
+"""
+AUDIT_QUEUE_POLL_SECONDS = 0.05
+"""Poll interval (seconds) between admission checks in the queue wait."""
+_AUDIT_TS_FORMAT = "%Y-%m-%dT%H:%M:%S"
+_AUDIT_TICKET_COUNTER = itertools.count()
+"""Per-process monotonically increasing launch ticket counter.
+
+The counter disambiguates multiple launches from the same process (one
+audit = many phased pi calls); combined with pid + issue_id it makes
+queue tickets unique host-wide.
 """
 
 # ---------------------------------------------------------------------------
@@ -2121,25 +2157,137 @@ def _audit_lock_timeout() -> float:
     return AUDIT_LOCK_TIMEOUT_DEFAULT
 
 
-def _acquire_audit_slot(max_concurrency: int | None = None) -> Semaphore:
-    """Acquire one audit concurrency slot (shared across processes).
+def _audit_queue_timeout() -> float:
+    """Resolve the bounded wait for queue admission + a free slot.
+
+    Precedence: ``AUDIT_QUEUE_TIMEOUT`` env var > default 90s (see
+    ``AUDIT_QUEUE_TIMEOUT_DEFAULT``). Unlike the old fail-fast slot wait,
+    an audit under saturation WAITS in the priority queue for this bound
+    before reporting the ``unmet`` "concurrency limit reached" verdict
+    (SA-0MTG5RYH8005RQNM AC1/AC3). An invalid value is ignored with a
+    warning.
+    """
+    env_value = os.environ.get(AUDIT_QUEUE_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_QUEUE_TIMEOUT_ENV} value "
+                f"{env_value!r}; using default queue timeout",
+                file=sys.stderr,
+            )
+    return AUDIT_QUEUE_TIMEOUT_DEFAULT
+
+
+_PRIORITY_VALUE = {
+    "critical": Priority.CRITICAL,
+    "high": Priority.HIGH,
+    "medium": Priority.MEDIUM,
+    "low": Priority.LOW,
+    "": Priority.MEDIUM,
+}
+
+
+def _resolve_audit_priority(work_item: dict | None) -> int:
+    """Map a work item's priority string to a numeric queue priority.
+
+    Unknown, empty, or missing priority resolves to ``Priority.MEDIUM``
+    (the worklog default). Every audit still gets admission; critical
+    items simply preempt lower-priority items in the queue
+    (SA-0MTG5RYH8005RQNM AC2).
+    """
+    raw = ((work_item or {}).get("priority") or "").strip().lower()
+    return _PRIORITY_VALUE.get(raw, Priority.MEDIUM)
+
+
+def _log_audit_slot(priority: int, position: int | None, ticket: str,
+                    queued_wall: float) -> None:
+    """Emit the queue-admission log line (SA-0MTG5RYH8005RQNM AC4).
+
+    Includes ``queued_at``, ``priority``, ``queue_position``,
+    ``dequeued_at`` and ``wait_seconds`` so queue behaviour is observable
+    from stderr without a debug log.
+    """
+    dequeued_wall = time.time()
+    print(
+        "Audit slot acquired: "
+        f"queued_at={time.strftime(_AUDIT_TS_FORMAT, time.localtime(queued_wall))} "
+        f"priority={Priority.to_str(priority).lower()} "
+        f"queue_position={position} "
+        f"dequeued_at={time.strftime(_AUDIT_TS_FORMAT, time.localtime(dequeued_wall))} "
+        f"wait_seconds={max(0.0, dequeued_wall - queued_wall):.2f} "
+        f"ticket={ticket}",
+        file=sys.stderr,
+    )
+
+
+def _acquire_audit_slot(issue_id: str = "",
+                        priority: int = Priority.MEDIUM,
+                        max_concurrency: int | None = None) -> Semaphore:
+    """Acquire one audit concurrency slot, waiting in a priority queue.
 
     Bounds concurrent pi/audit subprocesses host-wide via the shared
-    flock-based semaphore (skill/shared/process_semaphore.py). Returns a
-    held :class:`Semaphore` whose :meth:`release` must be called (or use
-    it as a context manager) to free the slot.
+    flock-based semaphore (skill/shared/process_semaphore.py). When the
+    ceiling is saturated the launch NO LONGER fails fast: it enqueues a
+    ticket at the work item's priority, waits for priority-ordered
+    admission (``AUDIT_QUEUE_TIMEOUT`` bound), then takes a host-wide
+    semaphore slot. Returns a held :class:`Semaphore` whose
+    :meth:`release` must be called (or use it as a context manager) to
+    free the slot.
+
+    Admission protocol (priority ordering under concurrency):
+      1. Enqueue a unique ticket at ``priority``; a full queue waits
+         (bounded, not fail-fast) for capacity.
+      2. Poll: when OUR ticket is at the head (``peek``), try a
+         semaphore slot; when a slot is free, remove OUR ticket
+         (``remove`` — never the head of a later arrival) and return.
+         Higher-priority tickets always beat lower-priority tickets at
+         the head check, so the next freed slot goes to the highest-
+         priority waiter, not whoever polls first.
 
     Raises:
-        TimeoutError: When the ceiling stays saturated past the bounded
-            wait (``AUDIT_LOCK_TIMEOUT``; default 0s = fail fast).
+        TimeoutError: When admission + slot wait exceeds
+            ``AUDIT_QUEUE_TIMEOUT`` (enqueue-full or persistently
+            saturated). The existing call site converts this to the
+            ``unmet`` "Audit concurrency limit reached" verdict.
     """
     sem = Semaphore(
         AUDIT_SEMAPHORE_NAME,
         max_workers=_audit_semaphore_max_workers(max_concurrency),
         timeout=_audit_lock_timeout(),
     )
-    sem.acquire()
-    return sem
+    queue = PriorityQueue(AUDIT_QUEUE_NAME)
+    ticket = (
+        f"audit:{issue_id or 'anon'}:{os.getpid()}:"
+        f"{next(_AUDIT_TICKET_COUNTER)}"
+    )
+    queue_timeout = _audit_queue_timeout()
+    queued_wall = time.time()
+    # Bounded enqueue: a full queue waits up to queue_timeout (AC3).
+    queue.enqueue(ticket, priority, timeout=queue_timeout)
+    position = queue.rank(ticket)
+    deadline = time.monotonic() + queue_timeout
+    while True:
+        head = queue.peek(timeout=0)
+        if head is not None and head.item_id == ticket:
+            try:
+                sem.acquire()
+            except TimeoutError:
+                pass  # all slots busy — hold position and retry
+            else:
+                if queue.remove(ticket) is not None:
+                    _log_audit_slot(priority, position, ticket, queued_wall)
+                    return sem
+                # Ticket vanished between peek and remove (unexpected):
+                # free the slot and re-enter the poll.
+                sem.release()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"audit concurrency queue '{AUDIT_QUEUE_NAME}' saturated: "
+                f"no slot within {queue_timeout:.0f}s"
+            )
+        time.sleep(AUDIT_QUEUE_POLL_SECONDS)
 
 
 def _resolve_parallelism() -> int:
@@ -2704,7 +2852,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              ac_fallback_used: threading.Event | None = None,
              child_screen: bool = False,
              issue_id: str = "",
-             context: str = "") -> dict:
+             context: str = "",
+             priority: int = Priority.MEDIUM) -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
 
     Args:
@@ -2737,6 +2886,9 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         context: Phase/context string used in the ``--session-id`` flag
                  (e.g. ``phase2_deep``, ``parent``, ``child:SA-XXX``).
                  Colons are replaced with underscores in the output.
+        priority: Queue priority for slot admission (lower number =
+                 more urgent). Drives priority-ordered waiting under
+                 concurrency saturation (SA-0MTG5RYH8005RQNM AC2).
 
     Returns a dict with keys ``verdict`` and ``evidence``.
     On success, implementations may also include additional diagnostic keys
@@ -2791,9 +2943,11 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         try:
             # Concurrency cap: bound concurrent pi subprocesses host-wide
             # (fan-out investigation SA-0MSAEKOQE009TEB4). Each pi launch
-            # holds one audit slot; the wait is AUDIT_LOCK_TIMEOUT (default
-            # 0s = fail fast when the ceiling is saturated).
-            with _acquire_audit_slot():
+            # holds one audit slot; under saturation the launch waits on
+            # the priority queue (AUDIT_QUEUE_TIMEOUT bound) instead of
+            # failing fast, then acquires a slot when one is free
+            # (SA-0MTG5RYH8005RQNM).
+            with _acquire_audit_slot(issue_id=issue_id, priority=priority):
                 try:
                     process = subprocess.Popen(
                         cmd,
@@ -4187,7 +4341,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            max_retries: int | None = None,
                            ac_fallback_used: threading.Event | None = None,
                            child_screen: bool = False,
-                           ac_count: int | None = None) -> dict:
+                           ac_count: int | None = None,
+                           priority: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -4225,7 +4380,13 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries, ac_fallback_used=ac_fallback_used, child_screen=child_screen, issue_id=issue_id, context=context)
+    result = _call_pi(
+        prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools,
+        timeout=timeout, max_retries=max_retries,
+        ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+        issue_id=issue_id, context=context,
+        priority=priority if priority is not None else Priority.MEDIUM,
+    )
 
     # Emit a per-call timing line to stderr (performance baseline). Includes
     # issue id, call context, and elapsed seconds so Phase 2 durations are
@@ -4646,6 +4807,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                 phase1_model, pi_bin, debug_log, timeout, ac_fallback_used,
                 script_failure_callback, failure_label="child AC review",
                 child_screen=True, enable_tools=True,
+                priority=_resolve_audit_priority(child),
             )
         except RuntimeError as exc:
             script_failure_callback("pi (child AC review)", exc)
@@ -4668,6 +4830,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                 full_model, pi_bin, debug_log, timeout, ac_fallback_used,
                 script_failure_callback, failure_label="child AC review",
                 child_screen=True, enable_tools=True,
+                priority=_resolve_audit_priority(child),
             )
         if isinstance(batch, list) and batch and any(
             isinstance(item, dict) and "index" in item for item in batch
@@ -5140,6 +5303,7 @@ def _deep_analyze_child(
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
             ac_count=len(child_acs),
+            priority=_resolve_audit_priority(child),
         )
     except RuntimeError:
         return ci, child, False
@@ -5389,6 +5553,7 @@ def _run_batch_phase2(
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
             ac_count=len(ac_list),
+            priority=_resolve_audit_priority(issue),
         )
     except RuntimeError:
         return None
@@ -5649,6 +5814,7 @@ def _run_phase2_deep_analysis(
                 max_retries=_PHASE2_MAX_RETRIES,
                 ac_fallback_used=ac_fallback_used,
                 ac_count=len(ac_results),
+                priority=_resolve_audit_priority(issue),
             )
         except RuntimeError as exc:
             # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
@@ -5897,6 +6063,7 @@ def _reask_verdict_array_once(
             issue.get("id", ""), "verdict_reask", prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             timeout=timeout,
+            priority=_resolve_audit_priority(issue),
         )
     except RuntimeError:
         return None
@@ -7119,7 +7286,8 @@ def _fp_classification_for(finding: dict, fp_screen_results: list[dict]) -> str 
 def _screen_ruff_findings(issue_id: str, findings: list[dict],
                           pi_bin: str, resolved_model: str,
                           debug_log: str | None, timeout: int | None,
-                          ac_fallback_used: threading.Event) -> list[dict]:
+                          ac_fallback_used: threading.Event,
+                          priority: int | None = None) -> list[dict]:
     """Model-judged false-positive screen over ruff findings (F1 scope).
 
     Classifies each ruff finding via a SINGLE batched Pi call
@@ -7173,6 +7341,7 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
             issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
             pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
             ac_fallback_used=ac_fallback_used, child_screen=True,
+            priority=priority,
         )
     except RuntimeError as exc:
         ac_fallback_used.set()
@@ -7677,6 +7846,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
             debug_log=ctx.debug_log,
             timeout=ctx.timeout,
             ac_fallback_used=ctx.ac_fallback_used,
+            priority=_resolve_audit_priority(ctx.work_item),
         )
     except Exception as exc:  # noqa: BLE001 -- the screen must never crash the audit
         ctx.record_script_failure("false-positive screen", exc)
@@ -7745,7 +7915,8 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
                         on_runtime_error: Callable[[str, Exception], None],
                         failure_label: str,
                         child_screen: bool = False,
-                        enable_tools: bool = True) -> tuple[dict, list, str]:
+                        enable_tools: bool = True,
+                        priority: int | None = None) -> tuple[dict, list, str]:
     """Call Pi for one Phase 1 batched AC screen and parse the verdict JSON.
 
     Returns ``(result, batch, raw_text)`` where *batch* is the parsed list
@@ -7761,6 +7932,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
             issue_id, context, prompt, model=model, pi_bin=pi_bin,
             debug_log=debug_log, enable_tools=enable_tools, timeout=timeout,
             ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+            priority=priority,
         )
     except RuntimeError as exc:
         on_runtime_error(f"pi ({failure_label})", exc)
@@ -8004,6 +8176,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             issue_id, "parent", prompt, phase1_model, pi_bin, debug_log,
             timeout, ac_fallback_used, ctx.record_script_failure,
             failure_label="parent AC review", enable_tools=True,
+            priority=_resolve_audit_priority(ctx.work_item),
         )
         # AC4 safe fallback (SA-0MSKB697P000T3HG): when a fast Phase 1 model
         # is configured and it cannot produce reliable batched verdict JSON
@@ -8023,6 +8196,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                 debug_log, timeout, ac_fallback_used,
                 ctx.record_script_failure, failure_label="parent AC review",
                 enable_tools=True,
+                priority=_resolve_audit_priority(ctx.work_item),
             )
         if isinstance(batch, list) and batch and any(
             isinstance(item, dict) and "index" in item for item in batch

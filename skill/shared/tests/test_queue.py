@@ -185,6 +185,79 @@ def test_priority_constants_map_correctly():
 
 
 # ---------------------------------------------------------------------------
+# peek / remove / rank (SA-0MTG5RYH8005RQNM admission control)
+# ---------------------------------------------------------------------------
+
+
+def test_peek_returns_head_without_removing():
+    """peek inspects the head of the line without consuming it."""
+    pq = PriorityQueue("unit-peek", max_depth=10, timeout=5.0)
+    pq.enqueue("low", Priority.LOW)
+    pq.enqueue("high", Priority.HIGH)
+
+    head = pq.peek(timeout=0)
+    assert head is not None
+    assert head.item_id == "high"
+    # Still present: dequeue still returns it, and the queue is unchanged.
+    assert len(pq) == 2
+    assert pq.dequeue(timeout=0).item_id == "high"
+    assert len(pq) == 1
+
+
+def test_peek_empty_returns_none(pq):
+    """peek on an empty queue returns None (never raises)."""
+    assert pq.peek(timeout=0) is None
+
+
+def test_remove_takes_specific_item_only():
+    """remove deletes exactly the requested ticket, not the head."""
+    pq = PriorityQueue("unit-remove", max_depth=10, timeout=5.0)
+    pq.enqueue("second", Priority.HIGH)
+    pq.enqueue("first", Priority.CRITICAL)
+
+    removed = pq.remove("second")
+    assert removed is not None
+    assert removed.item_id == "second"
+    # The (higher-priority) head is untouched.
+    assert pq.peek(timeout=0).item_id == "first"
+    assert len(pq) == 1
+
+
+def test_remove_idempotent_and_missing_returns_none(pq):
+    """remove of an absent id returns None; removal twice is a no-op."""
+    pq.enqueue("a", Priority.MEDIUM)
+    assert pq.remove("a") is not None
+    assert pq.remove("a") is None
+    assert pq.remove("never-added") is None
+    assert len(pq) == 0
+
+
+def test_rank_reports_position_in_line():
+    """rank returns the 1-based position under (priority, timestamp)."""
+    pq = PriorityQueue("unit-rank", max_depth=10, timeout=5.0)
+    pq.enqueue("low", Priority.LOW)
+    pq.enqueue("critical", Priority.CRITICAL)
+    pq.enqueue("high", Priority.HIGH)
+    pq.enqueue("medium", Priority.MEDIUM)
+
+    assert pq.rank("critical") == 1
+    assert pq.rank("high") == 2
+    assert pq.rank("medium") == 3
+    assert pq.rank("low") == 4
+    assert pq.rank("absent") is None
+
+
+def test_rank_updates_after_head_admission():
+    """After the head is admitted (removed), remaining ranks shift up."""
+    pq = PriorityQueue("unit-rank-admit", max_depth=10, timeout=5.0)
+    pq.enqueue("low", Priority.LOW)
+    pq.enqueue("high", Priority.HIGH)
+    assert pq.rank("low") == 2
+    pq.remove("high")
+    assert pq.rank("low") == 1
+
+
+# ---------------------------------------------------------------------------
 # Bounded capacity
 # ---------------------------------------------------------------------------
 
