@@ -123,6 +123,34 @@ Short-circuits item-level audits when a recent, valid audit exists. Full behavio
 3. Fresh → skip fast-path notice (e.g. `Skipping: audit still fresh — Ready to close: Yes (audited <ISO timestamp>)`), exit 0, **no** lifecycle/persistence.
 4. `--force` bypasses. Config: `AUDIT_FRESHNESS_BUFFER_SECONDS = 60`.
 
+## Re-audit coordination check (SA-0MSQIA84B005NHWC)
+
+Before starting a **full** audit (or re-audit) of an item, always run the
+coordination check — this prevents redundant re-audits that repeat work
+another session already did at the same HEAD (the 2026-08-12 release wasted
+~1h re-auditing SA-0MSOK041Z0027964, which another session had already
+completed + audited at the same HEAD):
+
+```bash
+wl audit-show <id> --json   # existing audit + auditedAt + rawOutput verdict
+wl comment list <id> --json # recent session activity on this item
+```
+
+Then decide:
+
+- **Do NOT re-audit** an item that is `completed`/`in_review` **with a fresh
+  audit** (content fingerprint unchanged → the runner's freshness gate would
+  short-circuit anyway) **unless the code actually changed** (new commits,
+  edited description/ACs, or changed working-tree state invalidate the
+  fingerprint and make the stored audit stale).
+- The runner already short-circuits via the freshness gate: `--force` is the
+  only way to bypass it and must be justified (stale fingerprint, changed
+  code, or an explicit operator request).
+- If `wl audit-show` shows a fresh audit with verdict `Ready to close: Yes`
+  at the current HEAD, treat the item as audited — do not launch a new run.
+
+Full behavior: [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md).
+
 ## Safety and prompt design
 
 - Audit executions are read-only except explicit persistence, the automatic status lifecycle, and the ruff config remediation loop. Mark read-only phases `[READ-ONLY AUDIT]`; persistence `[PERSIST-AUDIT]`.

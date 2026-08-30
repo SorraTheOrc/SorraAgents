@@ -231,6 +231,34 @@ No status lifecycle transitions occur, and no persistence is performed. An expli
 
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). A child whose stored audit carries an unchanged fingerprint AND a parseable verdict is reused: its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
 
+## Re-audit coordination check
+
+Cross-session coordination for anyone about to launch a full audit
+(SA-0MSQIA84B005NHWC): **always** run the two read-only checks before
+starting (or re-starting) a full audit so a session never repeats an audit
+another session already completed at the same HEAD:
+
+```bash
+wl audit-show <id> --json   # existing audit: auditedAt + rawOutput verdict
+wl comment list <id> --json # recent session activity on this item
+```
+
+Decision rules:
+
+- **Do NOT re-audit** an item that is `completed`/`in_review` **with a fresh
+  audit** (content fingerprint unchanged) **unless the code actually
+  changed** — a new commit, an edited description/ACs, or changed
+  working-tree state invalidates the fingerprint and makes the stored audit
+  stale (see the content-based gate above).
+- When the stored audit is fresh with `Ready to close: Yes` at the current
+  HEAD, the item is already audited: launch nothing, treat the verdict as
+  authoritative.
+- `--force` is the only way to bypass the freshness gate and must be
+  justified (stale fingerprint / changed code / explicit operator request).
+
+This is the agent-facing brief; the agent-facing summary lives in
+[`skill/audit/SKILL.md`](../../skill/audit/SKILL.md).
+
 ## Scripts
 
 - **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--phase1-model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`
