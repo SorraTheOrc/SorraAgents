@@ -299,6 +299,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 5. **Closing sentence** (issue-level): `Yes` → "Audit passed. The item is ready for release."; otherwise → "Work item is not ready to close (see above), would you like me to address the gaps in the audit?"
 
 > **Critical:** `persist_audit.py` / `wl audit-set` may return success without storing — **always verify with `wl audit-show`**.
+> - `persist_audit.py` internally calls `wl audit-set` then `wl update --audit-text` **without** `--stage`.  Adding `--stage` would cause worklog's `db.update()` to bump `updatedAt`, potentially invalidating freshness checks if `updatedAt` advances past `auditedAt + 60 s` (SA-0MTHC710X003ORZM).  The status/stage transition is applied separately by the runner's `_apply_terminal_lifecycle` after persistence completes.
 - Do NOT run arbitrary `wl`/`git` commands outside the authorized flow; use `--debug-log` for debugging.
 
 ## Examples
