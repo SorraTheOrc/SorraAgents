@@ -215,7 +215,10 @@ class TestFallbackNotice:
         audit_text_calls = [c for c in runner.calls if "--audit-text" in c]  # type: ignore[attr-defined]
         for call in audit_text_calls:
             assert call[1:3] == ["--worklog-dir", "/explicit/.worklog"]
-            assert "--stage" in call and "plan_complete" in call
+            # SA-0MTHC710X003ORZM: --stage must NOT be present on audit-text
+            # updates; the status/stage transition is handled by the runner's
+            # _apply_terminal_lifecycle (not persist_audit).
+            assert "--stage" not in call
 
 
 # ---------------------------------------------------------------------------
