@@ -259,6 +259,69 @@ Decision rules:
 This is the agent-facing brief; the agent-facing summary lives in
 [`skill/audit/SKILL.md`](../../skill/audit/SKILL.md).
 
+## Batch drain (SA-0MTG5TP5Z008QBL5)
+
+The runner can process MULTIPLE queued work items per dispatch window
+instead of one item at a time, resolving the livelock/starvation pattern
+when concurrent multi-agent dispatch lets each window audit only a single
+item while the backlog grows.
+
+### Activation trigger
+
+Batch mode activates when the `audit-batch` priority queue holds at least
+2 pending work items (`AUDIT_BATCH_MIN_QUEUE_DEPTH`); below that the
+runner is backward compatible — it processes only its own single item.
+The automatic post-audit drain (a successful `issue` run drains the
+backlog) is opt-outable with `AUDIT_BATCH_DRAIN=0` or the `--no-batch-drain`
+flag (`--batch-drain` forces it on); drained items always run with
+`batch_drain=False` so the drain cannot recurse.
+
+### Queueing model
+
+- The **batch queue** (`audit-batch`) holds WORK-ITEM ids (e.g.
+  `SA-XXX`) with their priorities — never `audit:` admission tickets. It
+  is separate from the per-launch admission queue (`audit`), so draining
+  never steals a live launch's admission ticket and never perturbs queue
+  positions of contending audits (SA-0MTG5RYH8005RQNM).
+- A producer (operator/herdr dispatch) enqueues items, or the `batch`
+  subcommand **primes** the queue from `wl list --stage in_review --json`
+  when it is below the depth threshold: candidates are ordered by queue
+  priority (critical > high > medium > low) then by `createdAt`
+  (oldest first = FIFO within tier), capped at N. Re-priming is
+  idempotent (duplicate ids are not re-written).
+
+### Drain loop
+
+`_batch_drain_cycle` dequeues in strict priority + FIFO order and per
+item: skips `audit:` tickets, the caller's own primary item, and
+duplicates; audits via the FULL single-item pipeline (`cmd_issue`:
+claim, freshness gate, phase gates, persist, verified lifecycle); every
+item's pi calls acquire/release host-wide slots, so the **concurrency
+slot is released between items** — another process can use the slot
+before the next item is dequeued. The loop stops when the queue is
+empty, `--max-items N` is reached, or the wall-clock budget elapses —
+whichever comes first; remaining items stay queued for the next window.
+A single item's audit failure is logged and does not abort the window.
+
+### Configuration
+
+| Setting | Env var | Default |
+|---|---|---|
+| Items per window | `AUDIT_BATCH_MAX_ITEMS` | 5 |
+| Wall-clock budget | `AUDIT_BATCH_TIMEOUT` (seconds) | 1800 (30 min) |
+| Activation depth | `AUDIT_BATCH_MIN_QUEUE_DEPTH` | 2 |
+| Auto-drain opt-out | `AUDIT_BATCH_DRAIN=0` | enabled |
+
+CLI: `audit_runner.py batch [--max-items N] [--timeout S]` (standalone
+window; `--json` emits a machine-readable summary), and
+`audit_runner.py issue <id> [--batch-drain | --no-batch-drain]`.
+
+### Observability (AC5)
+
+Every window emits exactly one stderr line with
+`batch_start`, `batch_end`, `items_processed`, `queue_remaining`,
+`items_included` (ISO timestamps; including zero-item windows).
+
 ## Scripts
 
 - **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--phase1-model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`

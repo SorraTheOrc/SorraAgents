@@ -170,6 +170,48 @@ waits can raise ``AUDIT_QUEUE_TIMEOUT``.
 """
 AUDIT_QUEUE_POLL_SECONDS = 0.05
 """Poll interval (seconds) between admission checks in the queue wait."""
+
+# ---------------------------------------------------------------------------
+# Batch drain (SA-0MTG5TP5Z008QBL5)
+# ---------------------------------------------------------------------------
+AUDIT_BATCH_QUEUE_NAME = "audit-batch"
+"""Dedicated priority-queue name for batch-drain work items.
+
+The batch drain dequeues WORK-ITEM ids (e.g. ``SA-XXX``) enqueued by a
+producer (operator/herdr dispatch or the ``batch`` subcommand's
+``_enqueue_pending_audit_items``), NOT ``audit:`` admission tickets — the
+admission queue (``AUDIT_QUEUE_NAME``) and the batch queue are separate
+so queued work items never collide with a live launch's admission
+protocol (SA-0MTG5RYH8005RQNM).
+"""
+AUDIT_BATCH_MAX_ITEMS_ENV = "AUDIT_BATCH_MAX_ITEMS"
+"""Environment variable for the per-window batch-drain item ceiling.
+
+Defaults to ``AUDIT_BATCH_MAX_ITEMS_DEFAULT`` (5). Invalid values are
+ignored with a warning.
+"""
+AUDIT_BATCH_MAX_ITEMS_DEFAULT = 5
+"""Default number of queued items drained per dispatch window (AC1)."""
+AUDIT_BATCH_TIMEOUT_ENV = "AUDIT_BATCH_TIMEOUT"
+"""Environment variable for the batch-drain wall-clock budget (seconds).
+
+Defaults to ``AUDIT_BATCH_TIMEOUT_DEFAULT`` (1800s / 30 min). Invalid
+values are ignored with a warning.
+"""
+AUDIT_BATCH_TIMEOUT_DEFAULT = 1800.0
+"""Default wall-clock budget (seconds) for one batch-drain window (AC3)."""
+AUDIT_BATCH_MIN_QUEUE_DEPTH = 2
+"""Queue-depth threshold that activates batch mode.
+
+When the batch queue holds at least this many pending work items, an
+``issue`` audit that completes successfully drains additional queued
+items within the same dispatch window instead of stopping after a
+single item. Below this threshold the runner is backward compatible:
+it processes only its own single item (AC1 trigger).
+"""
+AUDIT_BATCH_DISABLE_ENV = "AUDIT_BATCH_DRAIN"
+"""Opt-out env var: set to ``0`` to disable automatic post-audit drain.
+"""
 _AUDIT_TS_FORMAT = "%Y-%m-%dT%H:%M:%S"
 _AUDIT_TICKET_COUNTER = itertools.count()
 """Per-process monotonically increasing launch ticket counter.
@@ -2288,6 +2330,227 @@ def _acquire_audit_slot(issue_id: str = "",
                 f"no slot within {queue_timeout:.0f}s"
             )
         time.sleep(AUDIT_QUEUE_POLL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Batch drain (SA-0MTG5TP5Z008QBL5)
+# ---------------------------------------------------------------------------
+
+_ADMISSION_TICKET_PREFIX = "audit:"
+"""Prefix of admission tickets enqueued by ``_acquire_audit_slot``.
+
+Entries in the batch queue must be WORK-ITEM ids (e.g. ``SA-XXX``), never
+admission tickets; the cycle defensively skips ``audit:``-prefixed entries
+so a misconfigured producer cannot make the drain steal a live launch's
+admission slot.
+"""
+
+
+def _resolve_batch_max_items() -> int:
+    """Resolve the per-window batch-drain item ceiling.
+
+    Precedence: ``AUDIT_BATCH_MAX_ITEMS`` env var > default 5
+    (``AUDIT_BATCH_MAX_ITEMS_DEFAULT``). Values below 1 are clamped to 1;
+an invalid (non-integer) value is ignored with a warning so a
+misconfigured environment cannot break the drain (SA-0MTG5TP5Z008QBL5
+AC1).
+    """
+    env_value = os.environ.get(AUDIT_BATCH_MAX_ITEMS_ENV)
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_BATCH_MAX_ITEMS_ENV} value "
+                f"{env_value!r}; using default batch max items",
+                file=sys.stderr,
+            )
+    return AUDIT_BATCH_MAX_ITEMS_DEFAULT
+
+
+def _resolve_batch_timeout() -> float:
+    """Resolve the batch-drain wall-clock budget (seconds).
+
+    Precedence: ``AUDIT_BATCH_TIMEOUT`` env var > default 1800s (30 min,
+    ``AUDIT_BATCH_TIMEOUT_DEFAULT``). Invalid values are ignored with a
+    warning (SA-0MTG5TP5Z008QBL5 AC3).
+    """
+    env_value = os.environ.get(AUDIT_BATCH_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_BATCH_TIMEOUT_ENV} value "
+                f"{env_value!r}; using default batch timeout",
+                file=sys.stderr,
+            )
+    return AUDIT_BATCH_TIMEOUT_DEFAULT
+
+
+def _batch_drain_should_run(depth: int) -> bool:
+    """Decide whether batch drain activates for a given pending depth.
+
+    Batch mode activates when the batch queue holds at least
+    ``AUDIT_BATCH_MIN_QUEUE_DEPTH`` (2) pending work items; below that the
+    runner processes only its own single item (backward compatible).
+    (SA-0MTG5TP5Z008QBL5 AC1 trigger).
+    """
+    return depth >= AUDIT_BATCH_MIN_QUEUE_DEPTH
+
+
+def _batch_drain_enabled() -> bool:
+    """Opt-out check for the automatic post-audit batch drain.
+
+    Automatic drain is ON by default (trigger = queue depth)
+    (SA-0MTG5TP5Z008QBL5 AC1); ``AUDIT_BATCH_DRAIN=0`` disables it so
+    operators/CI can keep strict single-item behavior.
+    """
+    return os.environ.get(AUDIT_BATCH_DISABLE_ENV, "1") != "0"
+
+
+def _log_batch_metrics(metrics: dict) -> None:
+    """Emit the batch-drain metrics line to stderr (AC5).
+
+    Fields: ``batch_start``, ``batch_end``, ``items_processed``,
+    ``queue_remaining``, ``items_included``. Every batch run (even a
+    zero-item run) emits exactly one line so the dispatcher can observe
+    window utilization.
+    """
+    print(
+        "Audit batch drain: "
+        f"batch_start={metrics.get('batch_start')} "
+        f"batch_end={metrics.get('batch_end')} "
+        f"items_processed={metrics.get('items_processed', 0)} "
+        f"queue_remaining={metrics.get('queue_remaining', 0)} "
+        f"items_included={metrics.get('items_included', [])}",
+        file=sys.stderr,
+    )
+
+
+def _enqueue_pending_audit_items(max_items: int | None = None,
+                                 runner: Runner | None = None,
+                                 worklog_dir: str | None = None) -> list[str]:
+    """Prime the batch queue with the oldest, highest-priority in_review items.
+
+    Queries ``wl list --stage in_review --json`` (the canonical pending-audit
+    source per the audit skill), orders candidates by queue priority
+    (critical > high > medium > low) then by ``createdAt`` (oldest first =
+    FIFO within tier), and enqueues up to ``max_items`` work-item ids into
+    the batch queue. Enqueue is idempotent (the shared queue returns the
+    existing entry for a duplicate id), so re-priming never duplicates.
+
+    Returns the list of enqueued work-item ids (already-queued items are
+    included in the return value but not re-written).
+
+    Best-effort: a worklog query failure returns an empty list with the
+    failure printed to stderr — the caller degrades to draining whatever is
+    already queued (SA-0MTG5TP5Z008QBL5 AC1).
+    """
+    runner = runner if runner is not None else _default_runner
+    try:
+        data = _run_wl(runner, ["wl", "list", "--stage", "in_review", "--json"],
+                       worklog_dir=worklog_dir)
+    except Exception as exc:  # noqa: BLE001 — best-effort priming
+        print(f"Warning: could not discover pending in_review items: {exc}",
+              file=sys.stderr)
+        return []
+    items = data.get("workItems", data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    max_items = _resolve_batch_max_items() if max_items is None else max_items
+
+    def _sort_key(item: dict):
+        raw = ((item or {}).get("priority") or "").strip().lower()
+        prio = _PRIORITY_VALUE.get(raw, Priority.MEDIUM)
+        created = (item or {}).get("createdAt") or ""
+        return (prio, created)
+
+    candidates = sorted(items, key=_sort_key)[:max_items]
+    queue = PriorityQueue(AUDIT_BATCH_QUEUE_NAME)
+    enqueued: list[str] = []
+    for item in candidates:
+        item_id = (item or {}).get("id")
+        if not item_id:
+            continue
+        raw = ((item or {}).get("priority") or "").strip().lower()
+        prio = _PRIORITY_VALUE.get(raw, Priority.MEDIUM)
+        queue.enqueue(item_id, prio, timeout=_resolve_batch_timeout())
+        enqueued.append(item_id)
+    return enqueued
+
+
+def _batch_drain_cycle(audit_one: Callable[[str, int], int],
+                       max_items: int | None = None,
+                       timeout: float | None = None,
+                       worklog_dir: str | None = None,
+                       skip_ids: frozenset[str] = frozenset()) -> dict:
+    """Drain up to N queued work items in priority order within a budget.
+
+    The batch-drain loop (SA-0MTG5TP5Z008QBL5):
+
+      1. Dequeue the next entry from the batch queue — strict priority
+         order (critical > high > medium > low), FIFO within tier (AC2).
+      2. Skip ``audit:`` admission tickets, the caller's own primary item
+         (*skip_ids*), and duplicates (defensive; the queue holds work-item
+         ids).
+      3. Audit the item via ``audit_one(item_id, priority)``. The caller's
+         callback owns the concurrency slot discipline (each item's pi
+         calls acquire/release slots host-wide), so the slot is released
+         between items — another process can use it before the next item
+         is dequeued (AC4).
+      4. Continue until the queue is empty, ``max_items`` is reached, or
+         the wall-clock *timeout* (AC3) elapses — whichever comes first.
+         Remaining items stay queued for the next window.
+
+    Returns a metrics dict ``{batch_start, batch_end, items_processed,
+    queue_remaining, items_included}`` and emits the AC5 metrics line.
+    Errors from a single item's audit are caught per-item (logged, item
+    still counted as processed) so one bad item never aborts the window.
+    """
+    max_items = _resolve_batch_max_items() if max_items is None else max_items
+    timeout = _resolve_batch_timeout() if timeout is None else timeout
+    queue = PriorityQueue(AUDIT_BATCH_QUEUE_NAME)
+    batch_start = time.time()
+    batch_start_ts = time.strftime(_AUDIT_TS_FORMAT, time.localtime(batch_start))
+    items_processed = 0
+    items_included: list[str] = []
+    seen: set[str] = set()
+
+    while items_processed < max_items:
+        if time.time() - batch_start >= timeout:
+            break
+        entry = queue.dequeue(timeout=0)
+        if entry is None:
+            break  # queue empty — window done
+        item_id = entry.item_id
+        # Defensive: only drain work-item ids, never admission tickets,
+        # the caller's own primary item, or duplicates.
+        if (not item_id or item_id.startswith(_ADMISSION_TICKET_PREFIX)
+                or item_id in skip_ids or item_id in seen):
+            continue
+        seen.add(item_id)
+        items_included.append(item_id)
+        try:
+            audit_one(item_id, entry.priority)
+        except Exception as exc:  # noqa: BLE001 — per-item isolation
+            print(
+                f"Warning: batch item {item_id} audit failed: {exc}",
+                file=sys.stderr,
+            )
+        items_processed += 1
+
+    queue_remaining = len(queue)
+    batch_end = time.time()
+    metrics = {
+        "batch_start": batch_start_ts,
+        "batch_end": time.strftime(_AUDIT_TS_FORMAT, time.localtime(batch_end)),
+        "items_processed": items_processed,
+        "queue_remaining": queue_remaining,
+        "items_included": items_included,
+    }
+    _log_batch_metrics(metrics)
+    return metrics
 
 
 def _resolve_parallelism() -> int:
@@ -9717,8 +9980,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
               max_citations_per_ac: int | None = None,
               checkpoint_dir: str | None = None,
               no_checkpoint: bool = False,
-              child_in_main_slot: bool | None = None) -> int:
+              child_in_main_slot: bool | None = None,
+              batch_drain: bool | None = None) -> int:
     """Audit a single work item.
+
+    *batch_drain* (SA-0MTG5TP5Z008QBL5) controls the post-audit batch
+    drain: ``None`` (default) resolves to ON unless ``AUDIT_BATCH_DRAIN=0``
+    — when the batch queue holds >= 2 pending work items, the runner
+    continues draining additional queued items (priority order, wall-clock
+    budget) within the same dispatch window instead of stopping after this
+    item; ``False`` disables the drain for this run (nested drained audits
+    pass ``False`` so the drain never recurses).
 
     *child_in_main_slot* (SA-0MT2XRGEU0009QRE) is the config gate between
     the two child-audit execution modes: ``True`` (default → in-main-slot
@@ -9946,7 +10218,82 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"Warning: could not clear audit checkpoint after success: {exc}",
                 file=sys.stderr,
             )
+    # Batch drain (SA-0MTG5TP5Z008QBL5): after a successful primary audit,
+    # drain additional queued work items within the same dispatch window.
+    # Never changes the primary's exit code — drained items persist and
+    # lifecycle-transition independently via their own cmd_issue calls.
+    if rc == 0 and batch_drain is not False:
+        try:
+            if _batch_drain_enabled():
+                _maybe_run_batch_drain(ctx)
+        except Exception as exc:  # noqa: BLE001 -- best-effort drain
+            print(f"Warning: batch drain failed: {exc}", file=sys.stderr)
     return rc
+
+
+def _maybe_run_batch_drain(ctx: _AuditContext) -> None:
+    """Post-audit batch drain: drain queued work items if backlogged.
+
+    Called at the tail of a successful ``cmd_issue`` run. When the batch
+    queue holds at least ``AUDIT_BATCH_MIN_QUEUE_DEPTH`` (2) pending work
+    items, the drain processes up to ``AUDIT_BATCH_MAX_ITEMS`` (5) in
+    priority order within ``AUDIT_BATCH_TIMEOUT`` (30 min), releasing the
+    concurrency slot between items and logging batch metrics. Nested
+    drained audits run with ``batch_drain=False`` so the drain never
+    recurses. The drain is best-effort: any failure is logged, never
+    propagated (the primary audit's verdict and exit code stand).
+    """
+    queue = PriorityQueue(AUDIT_BATCH_QUEUE_NAME)
+    if not _batch_drain_should_run(len(queue)):
+        return
+    _batch_drain_cycle(
+        audit_one=_batch_audit_one(ctx),
+        max_items=_resolve_batch_max_items(),
+        timeout=_resolve_batch_timeout(),
+        worklog_dir=ctx.worklog_dir,
+        skip_ids=frozenset({ctx.issue_id}),
+    )
+
+
+def _batch_audit_one(origin: _AuditContext) -> Callable[[str, int], int]:
+    """Build the per-item audit callback for a batch drain.
+
+    Returns a closure that audits a drained work item via the full
+    ``cmd_issue`` pipeline (claim, freshness, phase gates, persist,
+    verified lifecycle). Every drained item shares the origin run's
+    configuration (model, worklog dir, persistence, etc.) but runs with
+    ``batch_drain=False`` so the drain cannot recurse. The callback owns
+    slot discipline: each item's pi calls acquire/release host-wide slots,
+    so the concurrency slot is free between items (AC4).
+    """
+    def _audit_one(item_id: str, priority: int) -> int:
+        return cmd_issue(
+            item_id,
+            persist=origin.persist,
+            timeout=origin.timeout,
+            parent_timeout=origin.parent_timeout,
+            pi_bin=origin.pi_bin,
+            model=origin.model,
+            phase1_model=origin.phase1_model,
+            model_source=origin.model_source,
+            runner=origin.runner,
+            json_mode=origin.json_mode,
+            debug_log=origin.debug_log,
+            force=origin.force,
+            worklog_dir=origin.worklog_dir,
+            batch_phase2=origin.batch_phase2,
+            green_run=origin.green_run,
+            audit_children=origin.audit_children,
+            max_child_audits=origin.max_child_audits,
+            run_tests=origin.run_tests,
+            no_execute=origin.no_execute,
+            max_citations_per_ac=origin.max_citations_per_ac,
+            checkpoint_dir=None,
+            no_checkpoint=True,
+            child_in_main_slot=origin.child_in_main_slot,
+            batch_drain=False,
+        )
+    return _audit_one
 
 
 def _build_project_json(summary: str, recommendation: str) -> dict:
@@ -10143,6 +10490,117 @@ def cmd_project(timeout: int | None = None,
     return 0
 
 
+def cmd_batch(max_items: int | None = None,
+              timeout: float | None = None,
+              persist: bool = True,
+              pi_bin: str = "pi", model: str | None = None,
+              phase1_model: str | None = None,
+              model_source: str = DEFAULT_MODEL_SOURCE,
+              runner: Runner | None = None,
+              json_mode: bool = False,
+              debug_log: str | None = None,
+              force: bool = False,
+              worklog_dir: str | None = None,
+              max_citations_per_ac: int | None = None,
+              green_run: str | None = None) -> int:
+    """Batch drain: audit up to N queued in_review items per window.
+
+    The standalone batch entry point (SA-0MTG5TP5Z008QBL5): primes the
+    batch queue from the pending ``in_review`` backlog when it is empty
+    (oldest-first, critical-before-high, ..., ``AUDIT_BATCH_MAX_ITEMS``
+    cap), then drains it — each item audited via the full ``cmd_issue``
+    pipeline in priority + FIFO order, the concurrency slot released
+    between items, within the ``AUDIT_BATCH_TIMEOUT`` wall-clock budget.
+    Emits the AC5 batch-metrics line and (in ``json_mode``) a JSON
+    summary of the window.
+
+    Returns 0 when the window drained (even if individual items reported
+    unmet verdicts — those are per-item audit outcomes, not batch
+    failures), 1 when the drain itself failed to start.
+    """
+    runner = runner if runner is not None else _default_runner
+    max_items = _resolve_batch_max_items() if max_items is None else max_items
+    timeout = _resolve_batch_timeout() if timeout is None else timeout
+
+    # Prime the batch queue when empty/under threshold so a bare
+    # ``audit_runner.py batch`` invocation drains the backlog instead of
+    # relying on an external producer having enqueued items.
+    queue = PriorityQueue(AUDIT_BATCH_QUEUE_NAME)
+    if not _batch_drain_should_run(len(queue)):
+        _enqueue_pending_audit_items(max_items, runner=runner,
+                                     worklog_dir=worklog_dir)
+        if not _batch_drain_should_run(len(queue)):
+            # Zero-item window: still emit the AC5 metrics line so stderr
+            # parsers see a uniform per-window record.
+            now = time.time()
+            zero_metrics = {
+                "batch_start": time.strftime(
+                    _AUDIT_TS_FORMAT, time.localtime(now)),
+                "batch_end": time.strftime(
+                    _AUDIT_TS_FORMAT, time.localtime(now)),
+                "items_processed": 0,
+                "queue_remaining": 0,
+                "items_included": [],
+            }
+            _log_batch_metrics(zero_metrics)
+            if json_mode:
+                print(json.dumps({
+                    "batch": {
+                        "items_processed": 0,
+                        "queue_remaining": 0,
+                        "items_included": [],
+                        "note": "no pending in_review items to audit",
+                    }
+                }, indent=2))
+            else:
+                print("No pending in_review items to audit.")
+            return 0
+
+    def _audit_one(item_id: str, priority: int) -> int:
+        return cmd_issue(
+            item_id,
+            persist=persist,
+            pi_bin=pi_bin,
+            model=model,
+            phase1_model=phase1_model,
+            model_source=model_source,
+            runner=runner,
+            json_mode=json_mode,
+            debug_log=debug_log,
+            force=force,
+            worklog_dir=worklog_dir,
+            max_citations_per_ac=max_citations_per_ac,
+            green_run=green_run,
+            checkpoint_dir=None,
+            no_checkpoint=True,
+            batch_drain=False,
+        )
+
+    try:
+        metrics = _batch_drain_cycle(
+            audit_one=_audit_one,
+            max_items=max_items,
+            timeout=timeout,
+            worklog_dir=worklog_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 -- drain must fail gracefully
+        if json_mode:
+            print(json.dumps({"error": str(exc)}, indent=2))
+        else:
+            print(f"Error: batch drain failed: {exc}", file=sys.stderr)
+        return 1
+
+    if json_mode:
+        print(json.dumps({"batch": metrics}, indent=2))
+    else:
+        print(
+            f"Batch drain complete: processed={metrics['items_processed']} "
+            f"remaining={metrics['queue_remaining']} "
+            f"items={metrics['items_included']}"
+        )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -10287,6 +10745,69 @@ def build_parser() -> argparse.ArgumentParser:
                              "Disable phase checkpointing entirely — the audit runs "
                              "as before, persisting no partial progress."
                          ))
+    p_issue.add_argument("--batch-drain", dest="batch_drain",
+                         action="store_true",
+                         default=None,
+                         help=(
+                             "Force batch drain on after a successful audit: "
+                             "when the batch queue holds >= 2 pending work items, "
+                             "the runner continues draining additional queued items "
+                             "(priority order, wall-clock budget) within the same "
+                             "dispatch window instead of stopping after this item. "
+                             "Default: automatic when batch queue is backlogged, "
+                             "opt-out via AUDIT_BATCH_DRAIN=0. "
+                             "(SA-0MTG5TP5Z008QBL5)"
+                         ))
+    p_issue.add_argument("--no-batch-drain", dest="batch_drain",
+                         action="store_false",
+                         help=(
+                             "Disable automatic batch drain for this run. "
+                             "(SA-0MTG5TP5Z008QBL5)"
+                         ))
+
+    p_batch = sub.add_parser("batch", help="Batch-drain queued in_review audits")
+    p_batch.add_argument("--max-items", type=int, default=None,
+                         help=(
+                             "Max work items audited per dispatch window "
+                             f"(default: {AUDIT_BATCH_MAX_ITEMS_ENV} env or "
+                             f"{AUDIT_BATCH_MAX_ITEMS_DEFAULT})"
+                         ))
+    p_batch.add_argument("--timeout", type=float, default=None,
+                         help=(
+                             "Wall-clock budget in seconds for one batch window "
+                             f"(default: {AUDIT_BATCH_TIMEOUT_ENV} env or "
+                             f"{AUDIT_BATCH_TIMEOUT_DEFAULT}s)"
+                         ))
+    p_batch.add_argument("--do-not-persist", action="store_true",
+                         help="Do not persist drained audits via wl update")
+    p_batch.add_argument("--pi-bin", default="pi", help="Path to the pi binary")
+    p_batch.add_argument("--model", default=None,
+                         help="Pi model to use for review")
+    p_batch.add_argument("--phase1-model", default=None,
+                         help="Pi model for Phase 1 AC screening")
+    p_batch.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
+                         choices=sorted(MODEL_SOURCES),
+                         help="Model source: remote or local (default: local)")
+    p_batch.add_argument("--json", action="store_true",
+                         help="Emit a machine-readable JSON summary of the window")
+    p_batch.add_argument("--debug-log", default=None,
+                         help="Append Pi debug output to this file (JSONL)")
+    p_batch.add_argument("--force", action="store_true",
+                         help="Bypass the freshness gate for drained items")
+    p_batch.add_argument("--worklog-dir", default=None,
+                         help="Explicit .worklog directory to target")
+    p_batch.add_argument("--max-citations-per-ac", type=int, default=None,
+                         help=(
+                             "Max file:line evidence citations per criterion in "
+                             "Phase 2 deep analysis "
+                             f"(default: audit.max_citations_per_ac config key or "
+                             f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
+                         ))
+    p_batch.add_argument("--green-run", default=None, metavar="SHA|HEAD",
+                         help=(
+                             "Operator-attested green test run for execution-dependent "
+                             "ACs (same semantics as the issue subcommand)"
+                         ))
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--timeout", type=int, default=None,
@@ -10369,7 +10890,25 @@ def main(argv: list[str] | None = None) -> int:
                             no_checkpoint=getattr(args, "no_checkpoint", False),
                             child_in_main_slot=getattr(
                                 args, "child_in_main_slot", None
-                            ))
+                            ),
+                            batch_drain=getattr(args, "batch_drain", None))
+            print(_root_timer.render(), file=sys.stderr)
+        return _rc
+    elif args.command == "batch":
+        with SharedTimer("audit_runner_batch") as _root_timer:
+            _rc = cmd_batch(max_items=args.max_items,
+                            timeout=args.timeout,
+                            persist=not args.do_not_persist,
+                            pi_bin=args.pi_bin, model=args.model,
+                            phase1_model=args.phase1_model,
+                            model_source=args.model_source, json_mode=args.json,
+                            debug_log=args.debug_log,
+                            force=args.force,
+                            worklog_dir=args.worklog_dir,
+                            max_citations_per_ac=_resolve_max_citations_per_ac(
+                                args.max_citations_per_ac
+                            ),
+                            green_run=args.green_run)
             print(_root_timer.render(), file=sys.stderr)
         return _rc
     elif args.command == "project":
