@@ -43,7 +43,7 @@ _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"  # <skills>/test/scripts
 if str(_RUNNER_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNNER_DIR))
 
-from run_tests import (  # noqa: E402
+from run_tests import (
     TEST_LOCK_TIMEOUT_DEFAULT,
     TEST_LOCK_TIMEOUT_ENV,
     TEST_MAX_CONCURRENCY_DEFAULT,
@@ -58,7 +58,7 @@ from run_tests import (  # noqa: E402
 
 pytest.importorskip("shared.process_semaphore")
 
-from shared.process_semaphore import ENV_LOCK_DIR, Semaphore  # noqa: E402
+from shared.process_semaphore import ENV_LOCK_DIR, Semaphore
 
 
 @pytest.fixture(autouse=True)

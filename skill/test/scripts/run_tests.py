@@ -50,10 +50,11 @@ import re
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2]
 _SKILLS_ROOT_STR = str(_SKILLS_ROOT)
@@ -848,7 +849,7 @@ class TestConcurrencyTimeout(RuntimeError):
     (SA-0MTG5U75A001F1RG AC4).
     """
 
-    __test__ = False  # noqa: D102  # suppress pytest collection warning
+    __test__ = False  # suppress pytest collection warning
 
 
 def _test_semaphore_max_workers() -> int:
