@@ -79,6 +79,43 @@ Since F3 (SA-0MSTN5KRF0097TVP) a cache miss triggers auto-execution via this
 skill's machinery instead of blocking; since F4 (SA-0MSTN8CWM003AAU9) the
 audit never hard-blocks on execution-impossible repos.
 
+### 0.5. Concurrency bounding (SA-0MTG5U75A001F1RG)
+
+Concurrent test-suite executions are bounded host-wide via the shared flock
+semaphore in `skill/shared/process_semaphore.py`.
+
+**Separate namespace:** test runs use the **"test"** semaphore name, which is
+completely independent of the **"audit"** semaphore. Holding the audit slot
+never blocks a test run and vice-versa. Each workload has its own ceiling.
+
+**Configuration via environment variables:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TEST_MAX_CONCURRENCY` | `2` | Maximum concurrent test-suite executions |
+| `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot |
+
+Both env vars are validated at runtime: invalid values produce a stderr
+warning and fall back to the documented default (never breaking the test run).
+Values below 1 are clamped to 1.
+
+**Bounded wait semantics:** unlike the audit runner's fail-fast slot wait, a
+test run under saturation WAITS (bounded) for a free slot. If no slot frees
+within `TEST_LOCK_TIMEOUT`, the run reports a clear failure notice (e.g.
+`"test concurrency slot busy: no free slot within 600s"`) instead of failing
+immediately or crashing. This means multiple agents running tests concurrently
+will serialize gracefully — each waits its turn and succeeds once a slot
+becomes free.
+
+**Cache hits never block:** the semaphore is acquired ONLY when an actual
+execution is about to happen (cache miss path). A cached result is served
+without acquiring a slot, so read-only `--summary` queries and fast cached
+hits are completely unaffected by concurrency saturation.
+
+**Interaction with `--force`:** `--force` bypasses the cache lookup but still
+acquires the concurrency slot before executing. Under saturation, a forced run
+waits bounded rather than failing fast.
+
 ### 1. Suite-command resolution order (F2, SA-0MSTMYE79006NA61)
 
 The full suite is `full_suite_commands(project_root)`, resolved in this

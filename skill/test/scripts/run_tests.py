@@ -20,6 +20,13 @@ per-command timeout (F2 AC1).
 Results are cached per-repo (see skill/test_cache.py) by default so repeated
 verification at the same git state is served without re-executing the suite.
 
+Concurrent suite executions are bounded host-wide via the shared "test"
+semaphore (skill/shared/process_semaphore.py): TEST_MAX_CONCURRENCY (default
+2) ceilings concurrent runs, TEST_LOCK_TIMEOUT (default 600s) bounds the wait
+for a free slot. Only ACTUAL executions acquire a slot — cache hits are
+served without executing and never block on the semaphore
+(SA-0MTG5U75A001F1RG).
+
 Emits structured per-failure records (test_name, stdout_excerpt, stack_trace)
 compatible with the triage skill's check_or_create.py input.
 
@@ -43,9 +50,10 @@ import re
 import shlex
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterator
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2]
 _SKILLS_ROOT_STR = str(_SKILLS_ROOT)
@@ -53,6 +61,7 @@ if _SKILLS_ROOT_STR in sys.path:
     sys.path.remove(_SKILLS_ROOT_STR)
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
+from shared.process_semaphore import Semaphore
 from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
@@ -76,6 +85,17 @@ CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
 # (SA-0MSQ012QG005N22S).
 PYTEST_CMD = canonicalize_quiet_test_command("pytest")
 NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
+
+# Test-run concurrency bounding (SA-0MTG5U75A001F1RG): concurrent test
+# suite executions are bounded host-wide via the shared flock "test"
+# semaphore (skill/shared/process_semaphore.py) — a separate namespace
+# from the "audit" semaphore so the two workloads have independent
+# ceilings. Cache hits never execute and never consume a slot.
+TEST_SEMAPHORE_NAME = "test"
+TEST_MAX_CONCURRENCY_ENV = "TEST_MAX_CONCURRENCY"
+TEST_MAX_CONCURRENCY_DEFAULT = 2
+TEST_LOCK_TIMEOUT_ENV = "TEST_LOCK_TIMEOUT"
+TEST_LOCK_TIMEOUT_DEFAULT = 600.0
 
 # pytest config markers, mirroring implement.py's _has_pytest_markers so the
 # test/implement/audit skills agree on whether a repo has a pytest suite
@@ -817,6 +837,95 @@ def _extract_yaml_block(block: str, key: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class TestConcurrencyTimeout(RuntimeError):
+    """Raised when a test run cannot acquire a concurrency slot in time.
+
+    Bounded-wait semantics (SA-0MTG5U75A001F1RG AC1): the shared "test"
+    semaphore is acquired with ``TEST_LOCK_TIMEOUT`` (default 600s); when
+    the ceiling stays saturated past the deadline the run reports a clear
+    failure notice instead of failing fast or hanging. Cache hits never
+    execute, so they never acquire a slot and never raise
+    (SA-0MTG5U75A001F1RG AC4).
+    """
+
+    __test__ = False  # noqa: D102  # suppress pytest collection warning
+
+
+def _test_semaphore_max_workers() -> int:
+    """Resolve the test-run concurrency ceiling.
+
+    Precedence: ``TEST_MAX_CONCURRENCY`` env var > default 2. Values below
+    1 are clamped to 1; an invalid (non-integer) value is ignored with a
+    warning so a misconfigured environment cannot break test runs. The
+    ceiling bounds concurrent suite executions host-wide via the shared
+    "test" semaphore — a separate namespace from the audit semaphore
+    (SA-0MTG5U75A001F1RG AC1/AC2/AC3).
+    """
+    env_value = os.environ.get(TEST_MAX_CONCURRENCY_ENV)
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {TEST_MAX_CONCURRENCY_ENV} value "
+                f"{env_value!r}; using default ceiling",
+                file=sys.stderr,
+            )
+    return TEST_MAX_CONCURRENCY_DEFAULT
+
+
+def _test_lock_timeout() -> float:
+    """Resolve the bounded wait for a free test-run slot.
+
+    Precedence: ``TEST_LOCK_TIMEOUT`` env var > default 600s. Unlike the
+    audit's fail-fast slot wait, a test run under saturation WAITS
+    (bounded) for a free slot instead of failing immediately — the same
+    no-fail-fast philosophy as the audit priority queue
+    (SA-0MTG5U75A001F1RG AC1).
+    """
+    env_value = os.environ.get(TEST_LOCK_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {TEST_LOCK_TIMEOUT_ENV} value "
+                f"{env_value!r}; using default lock timeout",
+                file=sys.stderr,
+            )
+    return TEST_LOCK_TIMEOUT_DEFAULT
+
+
+@contextmanager
+def _test_concurrency_slot() -> Iterator[None]:
+    """Hold a shared test-run slot for the duration of an actual execution.
+
+    Bounds concurrent test suite executions via the shared "test"
+    semaphore (ceiling ``TEST_MAX_CONCURRENCY``, bounded wait
+    ``TEST_LOCK_TIMEOUT``). Only ACTUAL executions acquire a slot — a
+    cached result is served without executing and never blocks on the
+    semaphore, so cache behavior is unchanged (SA-0MTG5U75A001F1RG AC4).
+
+    Raises:
+        TestConcurrencyTimeout: when no slot frees within the bound.
+    """
+    max_workers = _test_semaphore_max_workers()
+    lock_timeout = _test_lock_timeout()
+    sem = Semaphore(
+        TEST_SEMAPHORE_NAME,
+        max_workers=max_workers,
+        timeout=lock_timeout,
+    )
+    try:
+        with sem:
+            yield
+    except TimeoutError as exc:
+        raise TestConcurrencyTimeout(
+            f"test concurrency slot busy: no free slot within "
+            f"{lock_timeout:.0f}s (TEST_MAX_CONCURRENCY={max_workers})"
+        ) from exc
+
+
 def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
     """Run a suite command capturing stdout/stderr."""
     return subprocess.run(
@@ -842,7 +951,8 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
     the canonical command (cache key) is unchanged.
     """
     executable = executable_test_command(command)
-    return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
+    with _test_concurrency_slot():
+        return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
 
 
 def run_suite(
@@ -945,11 +1055,12 @@ def run_suite(
                 )
                 cached_flags.append(run["cached"])
             else:
-                proc = _run_cmd(
-                    shlex.split(executable_test_command(cmd)),
-                    cwd=cwd,
-                    timeout=timeout,
-                )
+                with _test_concurrency_slot():
+                    proc = _run_cmd(
+                        shlex.split(executable_test_command(cmd)),
+                        cwd=cwd,
+                        timeout=timeout,
+                    )
                 cached_flags.append(False)
         except FileNotFoundError as exc:
             return {
@@ -968,6 +1079,19 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"suite timed out after {timeout}s: {name}",
+                "scope": resolvable_scope,
+                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
+            }
+        except TestConcurrencyTimeout as exc:
+            # Concurrency ceiling stayed saturated past the bounded wait:
+            # report a clear failure notice (never a crash, never fail-fast
+            # before the bound) — SA-0MTG5U75A001F1RG AC1.
+            return {
+                "success": False,
+                "returncode": None,
+                "command": command,
+                "failures": [],
+                "notice": str(exc),
                 "scope": resolvable_scope,
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
@@ -1070,12 +1194,18 @@ def rerun_failures(
             stable.append(failure)
             continue
         try:
-            proc = _run_cmd(
-                shlex.split(executable_test_command(cmd)),
-                cwd=cwd or REPO_ROOT,
-                timeout=timeout,
-            )
+            with _test_concurrency_slot():
+                proc = _run_cmd(
+                    shlex.split(executable_test_command(cmd)),
+                    cwd=cwd or REPO_ROOT,
+                    timeout=timeout,
+                )
         except FileNotFoundError:
+            stable.append(failure)
+            continue
+        except TestConcurrencyTimeout as exc:
+            # Saturation prevented the rerun: keep as stable with a note.
+            failure["note"] = f"rerun skipped (concurrency saturated): {exc}"
             stable.append(failure)
             continue
         if proc.returncode == 0:
