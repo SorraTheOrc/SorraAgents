@@ -158,6 +158,14 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 
 Skip if the seed context suffices to draft a clear brief. Otherwise: soft limit of 3 questions per round (1+ rounds); do NOT ask questions answerable by repo search — use gathered context; goal is enough understanding to draft a problem definition with user stories, ACs, and related work (not a complete spec); if ambiguous, ask for clarification rather than guessing; do not proceed until sufficient information is gathered.
 
+**Producer review:** When the agent cannot proceed without producer input (clarifying questions unanswered, critical information missing), mark the work item as needing producer review:
+
+```bash
+wl reviewed <work-item-id> true
+```
+
+This flags the item so the producer knows attention is required. The agent should STOP and wait for the producer's response. Once answers are received, continue the interview or proceed.
+
 ### 5. Draft intake brief (agent responsibility)
 
 - Write a brief to `.worklog/tmp/intake-draft-<title>-<work-item-id>.md` with: **Problem statement** (1–2 sentences), **Users** (with example user stories), **Acceptance Criteria** (3–5 measurable bullets), **Constraints**, **Existing state**, **Desired change**, **Key Files (predicted)** (published as a `**Key Files:**` section; e.g. ``- `path/to/file.py` — Needs new function for X feature``), **Related work**.

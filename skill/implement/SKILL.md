@@ -211,6 +211,18 @@ If the gate fails: (1) `StatusLifecycle.update_status(<work-item-id>, "open")`;
 (2) not well-defined → intake interview (`../intake/SKILL.md`); too large →
 plan interview (`/skill:plan`); (3) inform the user and ask whether to restart.
 
+**Producer review:** When the agent cannot proceed because the work item is
+ill-defined (unclear scope, untestable ACs, missing constraints) and needs
+producer input to resolve, mark the work item as needing producer review:
+
+```bash
+wl reviewed <work-item-id> true
+```
+
+This flags the item so the producer knows the work item needs clarification
+before implementation can proceed. The agent should STOP and wait for the
+producer's response.
+
 4.2. Detect "already implemented" and close gaps (if applicable)
 
 Before creating a worktree, check whether the work item has **already been

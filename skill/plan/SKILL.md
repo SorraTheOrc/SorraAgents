@@ -44,7 +44,11 @@ before starting, and always leave the item in a **valid terminal status**
 (`open`, `blocked`, or `completed`) when the skill ends — including on error:
 
 - **On completion:** `StatusLifecycle.update_status(<work-item-id>, "open", stage="plan_complete")`
-- **Pausing for producer input:** `StatusLifecycle.update_status(<work-item-id>, "open", needs_producer_review=True)` — released to `open`, flagged for producer triage.
+- **Pausing for producer input:** Release the item to `open` AND mark it as needing producer review:
+  ```bash
+  wl reviewed <work-item-id> true
+  ```
+  (Alternatively: `StatusLifecycle.update_status(<work-item-id>, "open", needs_producer_review=True)`)
 - **On error/abort:** `StatusLifecycle.update_status(<work-item-id>, "open")` + a comment describing the failure.
 
 Never leave an item in `in_progress` when control returns to the operator — an orphaned `in_progress` item is invisible to `wl next` and blocks downstream work.
@@ -222,6 +226,14 @@ Then output a summary of what each stage checked/found.
 3. Interview
 
    In iterations (≤3 questions each), gather the minimum information for an actionable plan. Per feature capture: **Target outcome**, **Definition of done** (pass/fail checks + automated tests), **Constraints** (performance, compatibility, rollout, timeline), **Risky assumptions** (where a prototype is needed and what "success" means). Iterate until the breakdown is clear. Review existing Appendix entries first — don't re-ask answered questions.
+
+   **Producer review:** When the agent cannot proceed without producer input (clarifying questions unanswered, critical information missing), mark the work item as needing producer review:
+
+   ```bash
+   wl reviewed <work-item-id> true
+   ```
+
+   This flags the item so the producer knows attention is required. The agent should STOP and wait for the producer's response. Once answers are received, continue the interview or proceed.
 
 4. Propose feature plan (agent responsibility + user confirmation)
 

@@ -130,7 +130,7 @@ def _wl_show_children(
             "wl show children returned error target=%s", work_item_id
         )
         return []
-    return data.get("workItem", {}).get("children", []) if isinstance(data, dict) else []
+    return data.get("children", []) if isinstance(data, dict) else []
 
 
 def _get_title_from_children(

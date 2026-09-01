@@ -92,7 +92,7 @@ class _FakeWlRunner:
         if key.startswith("dep:list:"):
             payload = json.dumps({"success": True, "dependencies": data})
         elif isinstance(data, list):
-            payload = json.dumps({"success": True, "workItem": {"children": data}})
+            payload = json.dumps({"success": True, "children": data})
         else:
             payload = json.dumps({"success": True, "workItem": data})
         return _FakeResult(payload)
@@ -494,9 +494,9 @@ class TestRunCoverageReview:
                 return _FakeResult(
                     json.dumps({
                         "success": True,
-                        "workItem": {"children": [
+                        "children": [
                             {"id": "SA-02", "title": "Child"},
-                        ]},
+                        ],
                     })
                 )
             if "SA-01" in cmd:
@@ -536,10 +536,10 @@ class TestRunCoverageReview:
                 return _FakeResult(
                     json.dumps({
                         "success": True,
-                        "workItem": {"children": [
+                        "children": [
                             {"id": "SA-02", "title": "Child 1"},
                             {"id": "SA-03", "title": "Child 2"},
-                        ]},
+                        ],
                     })
                 )
             if "SA-01" in cmd:
