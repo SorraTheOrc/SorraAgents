@@ -442,6 +442,37 @@ class TestExtractACs:
         acs = _extract_acs(desc)
         assert acs == ["Must do X", "Must do Y"]
 
+    def test_parenthetical_heading_suffix(self):
+        """Headings like '## Acceptance criteria (testable)' with a trailing
+        parenthetical must be recognized — the parenthetical is optional.
+
+        Regression: the original regex required the heading to end at
+        ``Criteria``/``Criteria:``, so headings like
+        ``## Acceptance criteria (testable)`` were missed entirely.
+        """
+        desc = (
+            "## Acceptance criteria (testable)\n"
+            "1. First criterion\n"
+            "2. Second criterion\n\n"
+            "## Other section\n"
+        )
+        acs = _extract_acs(desc)
+        assert acs == ["First criterion", "Second criterion"]
+
+    def test_parenthetical_heading_with_colon_and_suffix(self):
+        """Headings like '## Acceptance Criteria: (testable)' must also work.
+
+        Combines the colon suffix and parenthetical suffix support.
+        """
+        desc = (
+            "## Acceptance Criteria: (testable)\n"
+            "1. Must pass CI\n"
+            "2. Must pass lint\n\n"
+            "## Notes\n"
+        )
+        acs = _extract_acs(desc)
+        assert acs == ["Must pass CI", "Must pass lint"]
+
 
 # ---------------------------------------------------------------------------
 # Persistence delegation tests
