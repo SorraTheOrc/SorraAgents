@@ -8,6 +8,7 @@ Verifies that:
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -118,14 +119,20 @@ class TestEslintParsing:
         """Run eslint on each previously-failing file and expect 0 errors."""
         import subprocess
 
+        if shutil.which("eslint") is None:
+            pytest.skip("eslint binary not available — skipping ESM parsing check")
+
         file_path = REPO_ROOT / rel_path
         if not file_path.exists():
             pytest.skip(f"File does not exist: {file_path}")
 
-        result = subprocess.run(  # noqa: PLW1510
-            ["eslint", str(file_path), "-f", "json", "--quiet"],
-            capture_output=True, text=True, timeout=30,
-        )
+        try:
+            result = subprocess.run(  # noqa: PLW1510
+                ["eslint", str(file_path), "-f", "json", "--quiet"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except FileNotFoundError:
+            pytest.skip("eslint binary not available — skipping ESM parsing check")
 
         if result.returncode not in (0, 1):
             pytest.fail(f"ESLint failed for {rel_path}: {result.stderr}")

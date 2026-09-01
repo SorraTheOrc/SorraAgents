@@ -42,6 +42,12 @@ def _legacy_patterns(text: str) -> list[str]:
     """Return every legacy bootstrap/import pattern match found in *text*."""
     found: list[str] = []
     for match in LEGACY_BOOTSTRAP_RE.finditer(text):
+        # measure_context.py uses parents[3] for --repo-root default (CLI arg
+        # that resolves to the repo root; depth 3 is correct for
+        # skill/context-audit/scripts/<file> → repo). This is not a shared-
+        # import bootstrap, so allowlist lines carrying the marker.
+        if "legacy-parents3-repo-root" in text[max(0, match.start() - 200):match.end() + 200]:
+            continue
         found.append(f"legacy parents[{match.group(1)}] bootstrap")
     found.extend(f"legacy import: {m.group(0).strip()}" for m in LEGACY_IMPORT_RE.finditer(text))
     return found

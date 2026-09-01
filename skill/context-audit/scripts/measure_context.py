@@ -278,7 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repo-root",
         type=Path,
-        default=Path(__file__).resolve().parents[2],
+        default=Path(__file__).resolve().parents[3],  # noqa: legacy-parents3-repo-root — depth 3 is correct for skill/context-audit/scripts/<file> → repo root (not parents[2]=skill/); allowlisted by tests/test_skill_bootstrap_hygiene.py via file-level exemption
         help="Repository root to measure (default: repo containing this script).",
     )
     output = parser.add_mutually_exclusive_group()

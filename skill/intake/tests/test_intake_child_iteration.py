@@ -46,9 +46,7 @@ def _build_runner(
         if "--children" in cmd:
             payload = json.dumps({
                 "success": True,
-                "workItem": {
-                    "children": children_data or [],
-                },
+                "children": children_data or [],
             })
             return _FakeResult(payload)
 

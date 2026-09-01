@@ -20,6 +20,7 @@ a live launch's admission protocol (SA-0MTG5RYH8005RQNM).
 
 import json
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -75,9 +76,9 @@ def _recording_audit_one():
 
 def test_batch_drain_processes_multiple_items_in_one_window():
     """Three queued items are all drained in one pass (multi-item window)."""
-    _enqueue("SA-A", Priority.MEDIUM, timestamp=1.0)
-    _enqueue("SA-B", Priority.MEDIUM, timestamp=2.0)
-    _enqueue("SA-C", Priority.MEDIUM, timestamp=3.0)
+    _enqueue("SA-A", Priority.MEDIUM, timestamp=time.monotonic() + 1.0)
+    _enqueue("SA-B", Priority.MEDIUM, timestamp=time.monotonic() + 2.0)
+    _enqueue("SA-C", Priority.MEDIUM, timestamp=time.monotonic() + 3.0)
 
     records, audit_one = _recording_audit_one()
     metrics = audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
@@ -132,11 +133,11 @@ def test_batch_timeout_configurable_via_env(monkeypatch):
 
 def test_batch_drain_priority_order_fifo_within_tier():
     """Drain order is critical > high > medium > low; FIFO within a tier."""
-    _enqueue("SA-HI1", Priority.HIGH, timestamp=1.0)
-    _enqueue("SA-CRIT", Priority.CRITICAL, timestamp=0.5)
-    _enqueue("SA-MED", Priority.MEDIUM, timestamp=1.0)
-    _enqueue("SA-LO", Priority.LOW, timestamp=1.0)
-    _enqueue("SA-HI2", Priority.HIGH, timestamp=2.0)
+    _enqueue("SA-HI1", Priority.HIGH, timestamp=time.monotonic() + 1.0)
+    _enqueue("SA-CRIT", Priority.CRITICAL, timestamp=time.monotonic() + 0.5)
+    _enqueue("SA-MED", Priority.MEDIUM, timestamp=time.monotonic() + 1.0)
+    _enqueue("SA-LO", Priority.LOW, timestamp=time.monotonic() + 1.0)
+    _enqueue("SA-HI2", Priority.HIGH, timestamp=time.monotonic() + 2.0)
 
     records, audit_one = _recording_audit_one()
     audit_runner._batch_drain_cycle(audit_one, max_items=10, timeout=60)
@@ -158,7 +159,7 @@ def test_batch_drain_stops_at_max_items_any_priority():
     """More queued items than max_items: only max_items are drained, the
     rest stay queued for the next window."""
     for i in range(7):
-        _enqueue(f"SA-{i}", Priority.MEDIUM, timestamp=float(i))
+        _enqueue(f"SA-{i}", Priority.MEDIUM, timestamp=time.monotonic() + float(i))
 
     records, audit_one = _recording_audit_one()
     metrics = audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
@@ -174,7 +175,7 @@ def test_batch_drain_stops_at_budget():
     import time
 
     for i in range(3):
-        _enqueue(f"SA-{i}", Priority.MEDIUM, timestamp=float(i))
+        _enqueue(f"SA-{i}", Priority.MEDIUM, timestamp=time.monotonic() + float(i))
 
     records = []
 
@@ -206,7 +207,7 @@ def test_batch_drain_releases_slot_between_items(monkeypatch):
 
     monkeypatch.setenv(ENV_MAX_WORKERS, "1")
     for i in range(3):
-        _enqueue(f"SA-{i}", Priority.MEDIUM, timestamp=float(i))
+        _enqueue(f"SA-{i}", Priority.MEDIUM, timestamp=time.monotonic() + float(i))
 
     acquisitions = []
 
@@ -231,8 +232,8 @@ def test_batch_drain_releases_slot_between_items(monkeypatch):
 
 def test_batch_drain_logs_metrics_line(capsys):
     """Each window emits one metrics line with all AC5 fields."""
-    _enqueue("SA-1", Priority.MEDIUM, timestamp=1.0)
-    _enqueue("SA-2", Priority.MEDIUM, timestamp=2.0)
+    _enqueue("SA-1", Priority.MEDIUM, timestamp=time.monotonic() + 1.0)
+    _enqueue("SA-2", Priority.MEDIUM, timestamp=time.monotonic() + 2.0)
 
     records, audit_one = _recording_audit_one()
     audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
@@ -270,11 +271,11 @@ def test_batch_drain_metrics_line_emitted_even_when_empty(capsys):
 def test_batch_drain_skips_admission_tickets_and_primary():
     """The drain never audits `audit:` admission tickets or the caller's
     own primary item."""
-    _enqueue("audit:SA-GHOST:999:1", Priority.CRITICAL, timestamp=0.0)
-    _enqueue("SA-PRIMARY", Priority.HIGH, timestamp=0.5)
-    _enqueue("SA-REAL", Priority.MEDIUM, timestamp=1.0)
+    _enqueue("audit:SA-GHOST:999:1", Priority.CRITICAL, timestamp=time.monotonic())
+    _enqueue("SA-PRIMARY", Priority.HIGH, timestamp=time.monotonic() + 0.5)
+    _enqueue("SA-REAL", Priority.MEDIUM, timestamp=time.monotonic() + 1.0)
     # An idempotent re-enqueue of SA-REAL (same id) must not double-audit.
-    _enqueue("SA-REAL", Priority.MEDIUM, timestamp=1.5)
+    _enqueue("SA-REAL", Priority.MEDIUM, timestamp=time.monotonic() + 1.5)
 
     records, audit_one = _recording_audit_one()
     audit_runner._batch_drain_cycle(
@@ -407,8 +408,8 @@ def _fake_context(**overrides):
 def test_maybe_run_batch_drain_runs_when_backlogged(monkeypatch, capsys):
     """Queue depth >= 2 triggers a drain over the batch queue with the
     primary item skipped."""
-    _enqueue("SA-Q1", Priority.HIGH, timestamp=1.0)
-    _enqueue("SA-Q2", Priority.MEDIUM, timestamp=2.0)
+    _enqueue("SA-Q1", Priority.HIGH, timestamp=time.monotonic() + 1.0)
+    _enqueue("SA-Q2", Priority.MEDIUM, timestamp=time.monotonic() + 2.0)
 
     records = []
 
@@ -431,7 +432,7 @@ def test_maybe_run_batch_drain_runs_when_backlogged(monkeypatch, capsys):
 
 def test_maybe_run_batch_drain_noop_when_queue_shallow():
     """Depth < 2: no drain runs (backward-compatible single item)."""
-    _enqueue("SA-ONLY", Priority.MEDIUM, timestamp=1.0)
+    _enqueue("SA-ONLY", Priority.MEDIUM, timestamp=time.monotonic() + 1.0)
     with mock.patch.object(audit_runner, "_batch_drain_cycle",
                            wraps=audit_runner._batch_drain_cycle) as cycle:
         audit_runner._maybe_run_batch_drain(_fake_context())

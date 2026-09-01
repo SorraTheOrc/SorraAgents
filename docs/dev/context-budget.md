@@ -110,17 +110,26 @@ Startup static-context budget (bytes / tokens):
 
 ## Thresholds / regression gate
 
-`docs/dev/context-budget.thresholds.json` ships an example gate that fails a
-PR/CI run when the startup budget regresses above the pre-change baseline:
+`docs/dev/context-budget.thresholds.json` ships the committed regression gate
+(the approved startup budget, including the hygiene guidance added in
+SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 8192,
-  "project_agents": 1334,
-  "skills_prose": 3523,
-  "total": 13049
+  "global_agents": 8335,
+  "project_agents": 1723,
+  "skills_prose": 1694,
+  "total": 11752
 }
 ```
+
+> **Scope — what counts:** thresholds are measured with
+> `measure_context.py --include-hidden` (all 16 skills, including the 5 hidden
+> helpers that the pre-push gate audits). The visible-skills surface is
+> smaller (1,168 B prose, 11,226 B total excluding hidden helpers).
+> **Historical baseline (F1):** the pre-change table above (`24,375 B` total)
+> is preserved for reference; the committed gate has always tracked the
+> accepted budget, not that baseline — see F2/F4/F6 updates.
 
 Use it in CI as:
 
@@ -147,6 +156,15 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > This is a **~54% reduction** in startup static context (~13.1 KB saved per
 > session, well above the epic's ≥15% target). On-demand SKILL.md content also
 > dropped ~48% (F5: 135,798 → 70,919 B across the six largest skills).
+>
+> **Post-F6 hygiene bump (2026-08-24, SA-0MT4DFE8Y004J8SP / SA-0MT7VTFIA000EFG6):**
+> the stash-hygiene guidance added ~143 B to `AGENTS_GLOBAL.md` and ~389 B to
+> `AGENTS.md`. Thresholds were bumped to the new measured surface
+> (`global_agents 8335`, `project_agents 1723`, `skills_prose 1694` with
+> `--include-hidden` / `1168` visible, `total 11752` / `11226` visible) so
+> the gate remains green for the approved content. The measurement tool's
+> default repo-root was also corrected (`parents[2]` → `parents[3]`) so the
+> gate measures the repo root rather than the `skill/` directory.
 >
 > ### Enforcement (committed gate)
 >
