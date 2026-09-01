@@ -22,7 +22,6 @@ ACs tested:
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +31,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from audit.scripts import persist_audit
-
 
 # ------------------------------------------------------------------
 # Helpers
