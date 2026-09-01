@@ -21,7 +21,7 @@ if str(_SKILLS_ROOT) not in sys.path:
     sys.path.append(str(_SKILLS_ROOT))
 
 from shared import status_lifecycle as status_lifecycle_module
-from shared.status_lifecycle import StatusLifecycle
+from shared.status_lifecycle import ClaimError, StatusLifecycle
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -416,6 +416,99 @@ class TestStatusLifecycleUnit:
 
             calls = [c.args[0] for c in mock_run.call_args_list]
             assert calls[0] == ["wl", "update", "TEST-123", "--status", "in_progress", "--json"]
+
+    # ------------------------------------------------------------------
+    # Claim invariant (SA-0MTFTFUIH000UWM9): require_claimed / ensure_claimed
+    # ------------------------------------------------------------------
+
+    def test_require_claimed_passes_when_in_progress(self, mock_run):
+        """require_claimed returns the show payload when status is in_progress."""
+        mock_run.side_effect = [_make_wl_show_proc(status="in_progress")]
+        data = StatusLifecycle.require_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in_progress"
+        assert mock_run.call_count == 1
+        assert mock_run.call_args_list[0].args[0] == ["wl", "show", "TEST-123", "--json"]
+
+    def test_require_claimed_raises_claim_error_when_open(self, mock_run):
+        """require_claimed raises ClaimError (subclass of RuntimeError) when open."""
+        mock_run.side_effect = [_make_wl_show_proc(status="open")]
+        with pytest.raises(ClaimError, match="must be in_progress"):
+            StatusLifecycle.require_claimed("TEST-123")
+        # Legacy handlers catching RuntimeError must still catch ClaimError
+        mock_run.side_effect = [_make_wl_show_proc(status="open")]
+        with pytest.raises(RuntimeError, match="must be in_progress"):
+            StatusLifecycle.require_claimed("TEST-123")
+
+    def test_require_claimed_uses_runner(self, mock_run):  # noqa: ARG002
+        """require_claimed honors an injected runner."""
+        seen: list[list[str]] = []
+
+        def runner(cmd: list[str]):
+            seen.append(cmd)
+            return _make_wl_show_proc(status="in_progress")
+
+        StatusLifecycle.require_claimed("TEST-123", runner=runner)
+        assert seen[0][0] == "wl"
+
+    def test_ensure_claimed_noop_when_in_progress(self, mock_run):
+        """ensure_claimed is a no-op (show only) when already in_progress."""
+        mock_run.side_effect = [_make_wl_show_proc(status="in_progress")]
+        data = StatusLifecycle.ensure_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in_progress"
+        assert mock_run.call_count == 1
+
+    def test_ensure_claimed_reclaims_when_open(self, mock_run):
+        """ensure_claimed reclaims via wl update when status is open."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+        ]
+        StatusLifecycle.ensure_claimed("TEST-123")
+        assert mock_run.call_count == 2
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0] == ["wl", "show", "TEST-123", "--json"]
+        assert calls[1][:5] == ["wl", "update", "TEST-123", "--status", "in_progress"]
+
+    def test_ensure_claimed_propagates_assignee_on_reclaim(self, mock_run):
+        """ensure_claimed passes assignee through to wl update when reclaiming."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+        ]
+        StatusLifecycle.ensure_claimed("TEST-123", assignee="bot")
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert "--assignee" in calls[1]
+        assert "bot" in calls[1]
+
+    def test_reclaim_alias_is_idempotent(self, mock_run):
+        """reclaim() is an alias for ensure_claimed with identical behavior."""
+        mock_run.side_effect = [_make_wl_show_proc(status="in_progress")]
+        data = StatusLifecycle.reclaim("TEST-123")
+        assert data["workItem"]["status"] == "in_progress"
+        assert mock_run.call_count == 1
+
+    def test_pause_approval_reclaim_lifecycle(self, mock_run):
+        """Pause→approval→reclaim window stays continuously in_progress.
+
+        Reproduces the AH-0MTFPDKDU006QUDC gap (12:08:51Z released to open, never
+        reclaimed after 12:09:42Z approval): a resumed run that forgot to
+        re-claim would fail the require_claimed guard; with the re-claim it
+        passes and stays in_progress through mutation.
+        """
+        # Pre-approval: item is open (paused for approval)
+        mock_run.side_effect = [_make_wl_show_proc(status="open")]
+        with pytest.raises(ClaimError):
+            StatusLifecycle.require_claimed("TEST-123")
+        # Post-approval re-claim: ensure_claimed restores in_progress
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+        ]
+        StatusLifecycle.ensure_claimed("TEST-123")
+        # Subsequent mutation guard now passes
+        mock_run.side_effect = [_make_wl_show_proc(status="in_progress")]
+        data = StatusLifecycle.require_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in_progress"
 
 
 # ===========================================================================

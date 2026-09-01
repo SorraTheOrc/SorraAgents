@@ -51,6 +51,12 @@ wraps build/test/commit/push in `with StatusLifecycle(..., target_stage="in_revi
 use: `StatusLifecycle.update_status()` or the context-manager pattern in
 `../shared/status_lifecycle.py`.
 
+**Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No
+`wl` mutation (description/comment/child creation) while `status: open`. Guard
+with `StatusLifecycle.require_claimed(<id>)` before any mutation; on any
+in-session resume, re-claim first via `StatusLifecycle.ensure_claimed(<id>)`
+(idempotent).
+
 ## Test Anti-Patterns
 
 Review the shared [Test Writing Guidelines](../shared/test-writing-guidelines.md)

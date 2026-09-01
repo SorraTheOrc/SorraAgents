@@ -306,3 +306,121 @@ class TestWlSubprocessWorklogFlags:
             result = plan_if_needed("SA-TEST")
         assert result["decision"] == "error"
         assert "could not fetch" in result["error"]
+
+
+# =========================================================================
+# 4. Claim invariant — approval gate reclaim (SA-0MTFTFUIH000UWM9)
+#
+# The AH-0MTFPDKDU006QUDC incident released to `open` at 12:08:51Z to pause
+# for producer approval and never re-claimed after 12:09:42Z approval,
+# leaving `open` while 3 children were created until 12:18:40Z — allowing
+# herdr downtime to dispatch a duplicate plan at 12:13:02Z. With
+# --reclaim-if-open the gate re-claims in_progress before any mutation.
+# =========================================================================
+
+
+class _SequenceRunner:
+    """Runner that returns a pre-defined sequence of _FakeResult payloads."""
+
+    def __init__(self, results: list):
+        self._results = list(results)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd):
+        self.calls.append(list(cmd))
+        assert self._results, "SequenceRunner exhausted"
+        return self._results.pop(0)
+
+
+def _show_payload(work_item: dict) -> str:
+    return json.dumps({"success": True, "workItem": work_item})
+
+
+def _update_payload() -> str:
+    return json.dumps({"success": True})
+
+
+class TestPlanApprovalReclaimInvariant:
+    """The approval gate re-claims in_progress before evaluation when requested."""
+
+    def test_reclaim_if_open_reclaims_open_before_gate(self):
+        """With reclaim_if_open=True and status open, gate re-claims before evaluating."""
+        runner = _SequenceRunner([
+            _FakeResult(_show_payload({"id": "X", "status": "open", "effort": "Extra Small", "risk": "Low"})),
+            _FakeResult(_update_payload()),
+            _FakeResult(_show_payload({"id": "X", "effort": "Extra Small", "risk": "Low"})),
+        ])
+        result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
+        assert result["request_approval"] is False
+        # Calls: 1) show for reclaim check, 2) update in_progress, 3) show for gate
+        assert len(runner.calls) == 3
+        assert "show" in runner.calls[0]
+        assert "update" in runner.calls[1]
+        assert "in_progress" in runner.calls[1]
+        assert "show" in runner.calls[2]
+
+    def test_reclaim_if_open_noop_when_already_in_progress(self):
+        """With reclaim_if_open=True and already in_progress, no update is issued."""
+        runner = _SequenceRunner([
+            _FakeResult(_show_payload({"id": "X", "status": "in_progress", "effort": "Extra Small", "risk": "Low"})),
+            _FakeResult(_show_payload({"id": "X", "effort": "Extra Small", "risk": "Low"})),
+        ])
+        result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
+        assert result["request_approval"] is False
+        assert len(runner.calls) == 2
+        assert all("update" not in c for c in runner.calls)
+
+    def test_without_reclaim_flag_does_not_reclaim(self):
+        """Without reclaim_if_open the gate never touches status — only shows."""
+        runner = _SequenceRunner([
+            _FakeResult(_show_payload({"id": "X", "effort": "Extra Small", "risk": "Low"})),
+        ])
+        result = plan_approval_gate("X", runner=runner)
+        assert result["request_approval"] is False
+        assert len(runner.calls) == 1
+        assert "update" not in runner.calls[0]
+
+    def test_reclaim_failure_is_best_effort_gate_still_evaluates(self):
+        """A failing reclaim (show error) does not abort the gate — it proceeds."""
+        runner = _SequenceRunner([
+            _FakeResult("{}", returncode=1, stderr="wl show failed"),
+            _FakeResult(_show_payload({"id": "X", "effort": "Large", "risk": "Low"})),
+        ])
+        result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
+        assert result["request_approval"] is True
+        assert "Large" in result["reason"]
+
+    def test_continuous_in_progress_from_approval_through_gate(self):
+        """End-to-end: open at approval → reclaim → gate + subsequent require_claimed."""
+        # Step 1: approval resume re-claims
+        gate_runner = _SequenceRunner([
+            _FakeResult(_show_payload({"id": "X", "status": "open", "effort": "Small", "risk": "Low"})),
+            _FakeResult(_update_payload()),
+            _FakeResult(_show_payload({"id": "X", "effort": "Small", "risk": "Low"})),
+        ])
+        gate = plan_approval_gate("X", runner=gate_runner, reclaim_if_open=True)
+        assert gate["request_approval"] is False
+        # Step 2: mutation guard would pass (verified via StatusLifecycle with shim)
+        from skill.plan.plan_helpers import _wl_reclaim
+
+        # After gate reclaim, a subsequent require_claimed == in_progress
+        verify_runner = _FakeResult(_show_payload({"id": "X", "status": "in_progress", "effort": "Small", "risk": "Low"}))
+
+        class _VerifyRunner:
+            def __call__(self, cmd):
+                return verify_runner
+
+        # _wl_reclaim is a no-op when already in_progress
+        assert _wl_reclaim("X", runner=_VerifyRunner()) is not None
+
+    def test_does_not_regress_existing_gate_behavior(self):
+        """Without the flag, gate semantics are byte-identical to before."""
+        for effort, risk, expected in [
+            ("Extra Small", "Low", False),
+            ("Large", "Low", True),
+            ("Extra Small", "High", True),
+        ]:
+            runner = _FakeWlShow({"id": "X", "effort": effort, "risk": risk})
+            result = plan_approval_gate("X", runner=runner)
+            assert result["request_approval"] is expected
+

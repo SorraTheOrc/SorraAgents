@@ -64,6 +64,15 @@ from pathlib import Path
 
 LOG = logging.getLogger("skill.shared.status_lifecycle")
 
+
+class ClaimError(RuntimeError):
+    """Raised when a work-item mutation is attempted without holding the claim.
+
+    Subclasses :class:`RuntimeError` for backward compatibility — existing
+    ``except RuntimeError`` handlers continue to catch it (SA-0MTFTFUIH000UWM9).
+    """
+
+
 # Type alias for an injectable command runner.
 # Takes a command list, returns a CompletedProcess (like subprocess.run).
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
@@ -555,6 +564,101 @@ class StatusLifecycle:
             cmd.extend(["--needs-producer-review", npr_value])
         r = runner or _default_runner
         return _run_wl_with_runner(r, cmd)
+
+    @staticmethod
+    def require_claimed(
+        work_item_id: str,
+        runner: Runner | None = None,
+    ) -> dict:
+        """Assert the work item is currently ``in_progress`` (claim held).
+
+        Fails closed when work is attempted without a claim — the invariant
+        ``actively worked => in_progress``. Call before any ``wl`` mutation
+        (create children, update description, wire deps, add comments) and
+        immediately after an in-session producer-approval resume (SA-0MTFTFUIH000UWM9).
+
+        Args:
+            work_item_id: The work item ID to check.
+            runner: Optional injectable runner for testing.
+
+        Returns:
+            The ``wl show`` response dict when the item is ``in_progress``.
+
+        Raises:
+            ClaimError: If the item's status is not ``in_progress`` (subclasses
+                :class:`RuntimeError` for backward compatibility; the ``open``
+                window caused duplicate dispatch of AH-0MTFPDKDU006QUDC on
+                2026-08-30).
+            RuntimeError: If ``wl show`` itself fails.
+        """
+        data = StatusLifecycle.show(work_item_id, runner=runner)
+        wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+        status = wi.get("status", "") if isinstance(wi, dict) else ""
+        if status != "in_progress":
+            raise ClaimError(
+                f"Work item {work_item_id} must be in_progress before mutation "
+                f"(current status: {status or 'unknown'}). "
+                f"Re-claim with StatusLifecycle.update_status({work_item_id!r}, 'in_progress') "
+                f"or StatusLifecycle.ensure_claimed({work_item_id!r}) before mutating."
+            )
+        return data
+
+    @staticmethod
+    def ensure_claimed(
+        work_item_id: str,
+        *,
+        assignee: str | None = None,
+        runner: Runner | None = None,
+    ) -> dict:
+        """Ensure the work item is ``in_progress``, reclaiming if needed.
+
+        Idempotent re-claim helper for in-session resume paths (e.g. plan
+        approval gate — SA-0MTFTFUIH000UWM9). If the item is already
+        ``in_progress`` this is a no-op (verified via ``wl show``); otherwise
+        it transitions to ``in_progress`` (optionally setting assignee) before
+        any further mutation. Prefer :meth:`require_claimed` when the caller
+        must *not* silently reclaim.
+
+        Args:
+            work_item_id: The work item ID to ensure is claimed.
+            assignee: Optional assignee to set when reclaiming. Ignored
+                when already ``in_progress``.
+            runner: Optional injectable runner for testing.
+
+        Returns:
+            The ``wl show`` response when already claimed, otherwise the
+            ``wl update`` response from the reclaim.
+
+        Raises:
+            RuntimeError: If ``wl show`` or the reclaim ``wl update`` fails.
+        """
+        data = StatusLifecycle.show(work_item_id, runner=runner)
+        wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+        status = wi.get("status", "") if isinstance(wi, dict) else ""
+        if status == "in_progress":
+            LOG.debug("ensure_claimed: %s already in_progress — no-op", work_item_id)
+            return data
+        kwargs: dict = {"status": "in_progress", "runner": runner}
+        if assignee is not None:
+            kwargs["assignee"] = assignee
+        LOG.info(
+            "ensure_claimed: reclaiming %s to in_progress (was %s)",
+            work_item_id,
+            status or "unknown",
+        )
+        return StatusLifecycle.update_status(work_item_id, **kwargs)
+
+    @staticmethod
+    def reclaim(
+        work_item_id: str,
+        *,
+        assignee: str | None = None,
+        runner: Runner | None = None,
+    ) -> dict:
+        """Alias for :meth:`ensure_claimed` — idempotent re-claim (SA-0MTFTFUIH000UWM9)."""
+        return StatusLifecycle.ensure_claimed(
+            work_item_id, assignee=assignee, runner=runner
+        )
 
     # ------------------------------------------------------------------
     # Context manager protocol

@@ -29,7 +29,7 @@ Implemented as a lightweight entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY). B
 
 ## Status Lifecycle
 
-The runner manages the item's `status`/`stage` during execution to prevent concurrent audits and leave it consistent with the verdict (via `try/finally`, guaranteed even on failure):
+The runner manages the item's `status`/`stage` during execution to prevent concurrent audits and leave it consistent with the verdict (via `try/finally`, guaranteed even on failure). **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No `wl` mutation (description/comment/child creation) while `status: open` — guard with `StatusLifecycle.require_claimed(<id>)` / `ensure_claimed(<id>)` on any in-session resume path:
 
 - Capture original status+stage at `cmd_issue()` start; set `in_progress`.
 - `Ready to close: Yes` → `completed`/`in_review` (keep `done` if terminal); `No` → `open`/`plan_complete`. A top-level item (no parent) with a `Yes` verdict also gets `needsProducerReview: true` (via `--needs-producer-review yes`) so the release gate (`closeWorkItemsAfterRelease`) blocks until the producer reviews it; child items (with a parent) are **not** flagged — their parent's review covers the subtree (SA-0MSSVKYEW008PJ9H).

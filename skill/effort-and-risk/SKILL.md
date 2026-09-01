@@ -15,7 +15,7 @@ Produce a machine-readable engineering estimate (effort + risk) and human-readab
 
 `run_skill.py` does **not** modify the work item's `status` or `stage`.
 
-The pre-run status is captured and restored deterministically via the shared `StatusLifecycle` helpers (`StatusLifecycle.show` / `StatusLifecycle.update_status`). The `StatusLifecycle` **context manager** is deliberately not used here: its success exit sets `status=completed`, which would violate the documented lifecycle — items at `intake_complete`/`plan_complete` stay `open` until the post-release close.
+The pre-run status is captured and restored deterministically via the shared `StatusLifecycle` helpers (`StatusLifecycle.show` / `StatusLifecycle.update_status`). The `StatusLifecycle` **context manager** is deliberately not used here: its success exit sets `status=completed`, which would violate the documented lifecycle — items at `intake_complete`/`plan_complete` stay `open` until the post-release close. **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No `wl` mutation while `status: open`; callers that resume in-session must `StatusLifecycle.ensure_claimed` before mutating, or gate with `require_claimed`.
 
 ## Worklog resolution
 

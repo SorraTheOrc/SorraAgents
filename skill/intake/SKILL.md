@@ -66,6 +66,8 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 - **Finish**: `python3 $(skill_path intake)/scripts/intake.py finish <work-item-id> [--description-file <path>]`.
 - **Abort** (release on failure): `python3 $(skill_path intake)/scripts/intake.py abort <work-item-id>`.
 
+**Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No `wl` mutation (description/comment/child creation) while `status: open`. Guard with `StatusLifecycle.require_claimed(<id>)` before any mutation; on in-session resume after producer approval, re-claim first via `StatusLifecycle.ensure_claimed(<id>)` (idempotent). Release to `open` only at true handoff (open-ended wait with no in-session resume), completion, or error/abort.
+
 ## Worklog resolution
 
 `intake.py` routes every `wl` call through the shared `run_wl` helper, which injects `--worklog-dir` with precedence: (1) explicit `--worklog-dir`, (2) prefix-to-sibling scan (item-id prefix → sibling projects' worklog stores), (3) cwd chain (`<cwd>/.worklog`, git root, nearest ancestor), (4) no flag — `wl` resolves from cwd. Full detail: [docs/dev/intake-skill-reference.md](../../docs/dev/intake-skill-reference.md) and `docs/dev/worklog-sync.md`.

@@ -727,9 +727,40 @@ def plan_if_needed(
     }
 
 
+def _wl_reclaim(
+    work_item_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> dict | None:
+    """Idempotent re-claim before approval-gate evaluation (SA-0MTFTFUIH000UWM9).
+
+    Ensures the item is ``in_progress`` before any plan mutations. When the
+    item is already ``in_progress`` this is a no-op (via ``wl show``); when
+    ``open`` (e.g. a prior run released for approval and resumed in-session),
+    it re-claims via ``wl update --status in_progress``. Best-effort — a
+    failed show/update is logged and the gate proceeds; callers that require
+    a hard claim should use ``StatusLifecycle.require_claimed`` instead.
+    """
+    try:
+        from shared.status_lifecycle import StatusLifecycle  # noqa: PLC0415
+
+        # Plan helpers' runners use the FakeRunner convention (payload as trailing
+        # arg / cmd list), while StatusLifecycle helpers expect the shared
+        # Runner signature — adapt with a shim when a runner is supplied.
+        if runner is not None:
+            def _shim(cmd: list[str]):
+                return _execute_subprocess(cmd, runner=runner)
+            return StatusLifecycle.ensure_claimed(work_item_id, runner=_shim)
+        return StatusLifecycle.ensure_claimed(work_item_id)
+    except Exception as exc:  # noqa: BLE001  # best-effort reclaim
+        logger.debug("plan_helpers.reclaim_best_effort target=%s exc=%s", work_item_id, exc)
+        return None
+
+
 def plan_approval_gate(
     target_id: str,
     runner: Callable[..., Any] | None = None,
+    *,
+    reclaim_if_open: bool = False,
 ) -> dict[str, Any]:
     """CLI helper for the plan skill's step-4 approval gate.
 
@@ -740,7 +771,14 @@ def plan_approval_gate(
         to approve the proposed feature plan
       - reason (str): human-readable explanation of the gate decision
         (empty when approval is not needed)
+
+    When ``reclaim_if_open`` is True (SA-0MTFTFUIH000UWM9), the gate first
+    ensures the item is ``in_progress`` via an idempotent re-claim so a
+    resumed approval run never mutates while ``open`` (the 2026-08-30 gap
+    that caused duplicate dispatch of AH-0MTFPDKDU006QUDC).
     """
+    if reclaim_if_open:
+        _wl_reclaim(target_id, runner=runner)
     item = _wl_show(target_id, runner=runner)
     request_approval, reason = should_request_plan_approval(item)
     return {
@@ -798,6 +836,12 @@ def main() -> None:
         help="Check whether the plan skill should ask the user to approve the feature plan",
     )
     gate_parser.add_argument("target_id", help="Work item ID to check")
+    gate_parser.add_argument(
+        "--reclaim-if-open",
+        action="store_true",
+        default=False,
+        help="Idempotently re-claim in_progress before evaluating (SA-0MTFTFUIH000UWM9)",
+    )
 
     args = parser.parse_args()
 
@@ -808,7 +852,7 @@ def main() -> None:
         result = check_effort_risk(args.target_id)
         print(json.dumps(result, indent=2))
     elif args.command == "plan-approval-gate":
-        result = plan_approval_gate(args.target_id)
+        result = plan_approval_gate(args.target_id, reclaim_if_open=args.reclaim_if_open)
         print(json.dumps(result, indent=2))
 
 
