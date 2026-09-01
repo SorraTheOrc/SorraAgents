@@ -741,7 +741,7 @@ def _wl_reclaim(
     a hard claim should use ``StatusLifecycle.require_claimed`` instead.
     """
     try:
-        from shared.status_lifecycle import StatusLifecycle  # noqa: PLC0415
+        from shared.status_lifecycle import StatusLifecycle
 
         # Plan helpers' runners use the FakeRunner convention (payload as trailing
         # arg / cmd list), while StatusLifecycle helpers expect the shared

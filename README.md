@@ -23,6 +23,10 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
 
+## Agent Status Lifecycle (SA-0MTFTFUIH000UWM9)
+
+Agents must hold `status: in_progress` for the entire duration they are actively working on a work item (`actively worked => in_progress`). Releasing to `open` is only valid at a true handoff — completion, error/abort, or an open-ended session end with no in-session resume. Before any work-item mutation (create children, update description, wire deps, add comments) agents must hold the claim; after any in-session producer-approval resume they must re-claim first. The shared helper `skill/shared/status_lifecycle.py` enforces this via `StatusLifecycle.require_claimed(id)` (fail-closed `ClaimError` guard) and `StatusLifecycle.ensure_claimed`/`reclaim` (idempotent re-claim); `skill/plan/plan_helpers.py:plan_approval_gate --reclaim-if-open` adapts it for the plan approval gate. `StatusLifecycle` also manages worklog-dir resolution (`--worklog-dir` precedence: explicit > prefix-to-sibling scan > cwd chain) so lifecycle calls resolve the correct store regardless of caller cwd. See the StatusLifecycle sections in `skill/plan/SKILL.md`, `skill/implement/SKILL.md`, `skill/intake/SKILL.md`, `skill/audit/SKILL.md`, and `skill/effort-and-risk/SKILL.md`, and `docs/dev/worklog-sync.md`.
+
 ## Prerequisites
 
 ### Code Quality Linters (Optional)

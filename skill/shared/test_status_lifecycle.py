@@ -439,7 +439,7 @@ class TestStatusLifecycleUnit:
         with pytest.raises(RuntimeError, match="must be in_progress"):
             StatusLifecycle.require_claimed("TEST-123")
 
-    def test_require_claimed_uses_runner(self, mock_run):  # noqa: ARG002
+    def test_require_claimed_uses_runner(self, mock_run):
         """require_claimed honors an injected runner."""
         seen: list[list[str]] = []
 
