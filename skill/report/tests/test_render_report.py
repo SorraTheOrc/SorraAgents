@@ -14,7 +14,6 @@ import os
 import sys
 import textwrap
 import unittest
-from unittest.mock import patch, MagicMock
 
 # Ensure the scripts directory is on the path so we can import the renderer.
 SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), '..', 'scripts')
@@ -121,6 +120,8 @@ class TestReportSectionsPresent(unittest.TestCase):
             next_action="review",
         )
         self.assertIn("SA-0TEST0000000001", result)
+        # Title should be bold and id in parens per canonical template
+        self.assertIn("**Test title**", result)
 
 
 class TestACTableRows(unittest.TestCase):
@@ -192,7 +193,7 @@ class TestACTableRows(unittest.TestCase):
         self.assertIn("AC three", result)
 
     def test_empty_ac_list(self):
-        """No AC rows should appear if the list is empty (but header still present)."""
+        """Empty AC list renders the placeholder row."""
         result = self.render_report(
             skill_name="test-skill",
             work_item_id="SA-0TEST0000000001",
@@ -205,6 +206,7 @@ class TestACTableRows(unittest.TestCase):
             next_action="review",
         )
         self.assertIn("## Acceptance Criteria", result)
+        self.assertIn("No acceptance criteria supplied", result)
 
 
 class TestMetaDataIcons(unittest.TestCase):
@@ -459,6 +461,36 @@ class TestConclusion(unittest.TestCase):
         )
         self.assertIn("This completes the implement process for SA-0TEST0000000001 (Test title).", result)
         self.assertIn("Ready for plan.", result)
+
+
+class TestParseAcArgs(unittest.TestCase):
+    """Verify the _parse_ac_args helper function."""
+
+    def setUp(self):
+        from render_report import _parse_ac_args
+        self._parse_ac_args = _parse_ac_args
+
+    def test_empty_list(self):
+        result = self._parse_ac_args(None)
+        self.assertEqual(result, [])
+
+    def test_single_ac(self):
+        result = self._parse_ac_args(["desc|metric|met"])
+        self.assertEqual(result, [("1", "desc", "metric", "met")])
+
+    def test_multiple_acs(self):
+        result = self._parse_ac_args(["desc1|metric1|met", "desc2|metric2|unmet"])
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], ("1", "desc1", "metric1", "met"))
+        self.assertEqual(result[1], ("2", "desc2", "metric2", "unmet"))
+
+    def test_bad_format_defaults_to_unmet(self):
+        result = self._parse_ac_args(["bad format"])
+        self.assertEqual(result[0][3], "unmet")
+
+    def test_verdict_normalization(self):
+        result = self._parse_ac_args(["desc|metric|MET"])
+        self.assertEqual(result[0][3], "met")
 
 
 class TestRendererWithFixture(unittest.TestCase):

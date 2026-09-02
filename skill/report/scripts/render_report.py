@@ -81,8 +81,8 @@ PRIORITY_ICONS = {
 PRIORITY_FALLBACK = {
     "critical": "[CRIT]",
     "high":     "[HIGH]",
-    "medium":   "[MED ]",
-    "low":      "[LOW ]",
+    "medium":   "[MED]",
+    "low":      "[LOW]",
 }
 
 STATUS_ICONS = {
@@ -98,7 +98,7 @@ STATUS_FALLBACK = {
     "in-progress":   "[INPR]",
     "completed":     "[DONE]",
     "blocked":       "[BLKD]",
-    "deleted":       "[DEL ]",
+    "deleted":       "[DEL]",
     "input_needed":  "[HELP]",
 }
 
@@ -286,7 +286,7 @@ def render_report(
     # Header
     lines.append(f"# Completed {skill_name}")
     lines.append("")
-    lines.append(f"**Work Item:** {work_item_id} — {title}")
+    lines.append(f"**{title}** ({work_item_id})")
     lines.append("")
 
     # Headline
@@ -297,10 +297,13 @@ def render_report(
     # Acceptance Criteria
     lines.append("## Acceptance Criteria")
     lines.append("")
-    lines.append("| # | Description | Metric | Status |")
-    lines.append("|---|-------------|--------|--------|")
-    for ac_num, desc, metric, verdict in acceptance_criteria:
-        lines.append(f"|{ac_num}|{desc}|{metric}|{verdict}|")
+    lines.append("| AC# | Description | Metric | Verdict |")
+    lines.append("|-----|-------------|--------|---------|")
+    if not acceptance_criteria:
+        lines.append("| \u2014 | No acceptance criteria supplied | \u2014 | \u2014 |")
+    else:
+        for ac_num, desc, metric, verdict in acceptance_criteria:
+            lines.append(f"|{ac_num}|{desc}|{metric}|{verdict}|")
     lines.append("")
 
     # Meta-Data
@@ -379,13 +382,13 @@ def render_from_wl(
     cmd = ["wl", "show", work_item_id, "--json"]
     try:
         wl_flags = worklog_dir_flag()
-    except Exception:
+    except (RuntimeError, OSError):
         wl_flags = []
     if wl_flags:
         cmd[1:1] = wl_flags
     result = subprocess.run(
         cmd,
-        capture_output=True, text=True,
+        capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
         print(f"ERROR: wl show failed: {result.stderr}", file=sys.stderr)
@@ -405,10 +408,37 @@ def render_from_wl(
 
 # ─── CLI entry-point ───────────────────────────────────────────────────
 
+def _parse_ac_args(ac_values: list[str] | None) -> list[tuple[str, str, str, str]]:
+    """Parse repeated ``--ac`` values into ``(ac#, desc, metric, verdict)`` tuples.
+
+    Each ``--ac`` is ``"<description>|<metric>|met"``; AC numbers are 1..N in
+    order supplied. ``verdict`` is normalised to lower-case.
+    """
+    rows: list[tuple[str, str, str, str]] = []
+    for idx, raw in enumerate(ac_values or [], start=1):
+        parts = raw.split("|", 2)
+        if len(parts) != 3:
+            # Gracefully degrade: treat the whole string as description.
+            desc = raw.strip()
+            rows.append((str(idx), desc, "\u2014", "unmet"))
+            continue
+        desc, metric, verdict = (p.strip() for p in parts)
+        verdict = verdict.lower().strip()
+        if verdict not in ("met", "unmet"):
+            verdict = "unmet"
+        rows.append((str(idx), desc, metric, verdict))
+    return rows
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
         description="Render a canonical end-of-session report.",
+    )
+    parser.add_argument(
+        "work_item_id_pos",
+        nargs="?",
+        help="Work-item ID (positional, preferred).",
     )
     parser.add_argument(
         "--json",
@@ -417,7 +447,8 @@ def main():
     )
     parser.add_argument(
         "--work-item-id",
-        help="Work-item ID (required when not using --json).",
+        dest="work_item_id",
+        help="Work-item ID (flag form, alias for positional).",
     )
     parser.add_argument(
         "--skill-name",
@@ -427,39 +458,68 @@ def main():
     parser.add_argument(
         "--headline",
         default="",
-        help="1–3 sentence headline summary.",
+        help="1\u20133 sentence headline summary.",
+    )
+    parser.add_argument(
+        "--ac",
+        action="append",
+        dest="ac",
+        default=None,
+        help="AC row as \"<description>|<metric>|met|unmet\" (repeatable).",
+    )
+    parser.add_argument(
+        "--producer-actions",
+        default=None,
+        help="Actions for the producer (or omit for 'None needed').",
+    )
+    parser.add_argument(
+        "--notes",
+        default=None,
+        help="Freeform context/caveats/assumptions.",
     )
     parser.add_argument(
         "--next-action",
         default="review",
         help="Next action (review, plan, ship, etc.).",
     )
+    parser.add_argument(
+        "--no-icons",
+        action="store_true",
+        help="Use bracketed-text fallbacks instead of emoji icons.",
+    )
     args = parser.parse_args()
 
     if args.json:
         data = json.load(sys.stdin)
+        # ``data`` may be a ``{workItem: {...}}`` envelope or the item itself.
+        work_item = data.get("workItem", data) if isinstance(data, dict) else data
+        ac_rows = _parse_ac_args(args.ac)
         report = render_report_from_workitem(
-            work_item=data,
+            work_item=work_item if isinstance(work_item, dict) else {},
             skill_name=args.skill_name,
             headline=args.headline,
-            acceptance_criteria=[],
-            producer_actions=None,
-            notes=None,
+            acceptance_criteria=ac_rows,
+            producer_actions=args.producer_actions,
+            notes=args.notes,
             next_action=args.next_action,
         )
         print(report)
-    else:
-        # Read from wl show
-        report = render_from_wl(
-            skill_name=args.skill_name,
-            work_item_id=args.work_item_id,
-            headline=args.headline,
-            acceptance_criteria=[],
-            producer_actions=None,
-            notes=None,
-            next_action=args.next_action,
-        )
-        print(report)
+        return
+
+    work_item_id = args.work_item_id or args.work_item_id_pos
+    if not work_item_id:
+        parser.error("work-item ID is required (positional <id> or --work-item-id)")
+    ac_rows = _parse_ac_args(args.ac)
+    report = render_from_wl(
+        skill_name=args.skill_name,
+        work_item_id=work_item_id,
+        headline=args.headline,
+        acceptance_criteria=ac_rows,
+        producer_actions=args.producer_actions,
+        notes=args.notes,
+        next_action=args.next_action,
+    )
+    print(report)
 
 
 if __name__ == "__main__":
