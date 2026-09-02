@@ -53,6 +53,21 @@ Public API
 import json
 import subprocess
 import sys
+from pathlib import Path
+
+# Ensure ``skill/`` is on sys.path so shared modules are importable
+# regardless of whether this script is run from cwd, worktree, or as module.
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
+
+try:
+    from shared.status_lifecycle import (
+        worklog_dir_flag,  # type: ignore[import-not-found]
+    )
+except ImportError:
+    def worklog_dir_flag(*_a, **_kw):  # type: ignore[no-redef]
+        return []
 
 # ─── Icon mappings (sourced from ContextHub) ───────────────────────────
 
@@ -361,8 +376,15 @@ def render_from_wl(
     next_action: str = "review",
 ) -> str:
     """Fetch work-item data via ``wl show`` and render a report."""
+    cmd = ["wl", "show", work_item_id, "--json"]
+    try:
+        wl_flags = worklog_dir_flag()
+    except Exception:
+        wl_flags = []
+    if wl_flags:
+        cmd[1:1] = wl_flags
     result = subprocess.run(
-        ["wl", "show", work_item_id, "--json"],
+        cmd,
         capture_output=True, text=True,
     )
     if result.returncode != 0:

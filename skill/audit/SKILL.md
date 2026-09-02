@@ -300,6 +300,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 
 > **Critical:** `persist_audit.py` / `wl audit-set` may return success without storing — **always verify with `wl audit-show`**.
 > - `persist_audit.py` internally calls `wl audit-set` then `wl update --audit-text` **without** `--stage`.  Adding `--stage` would cause worklog's `db.update()` to bump `updatedAt`, potentially invalidating freshness checks if `updatedAt` advances past `auditedAt + 60 s` (SA-0MTHC710X003ORZM).  The status/stage transition is applied separately by the runner's `_apply_terminal_lifecycle` after persistence completes.
+> - **Ordering contract (SA-0MTHC710X003ORZM):** any `wl comment add` that records an audit result MUST be ordered **before** `persist_audit.py` / `wl audit-set`.  The persisted audit report itself is the record of the audit — no separate post-persist audit-result comment is needed.  A comment added after `wl audit-set` bumps `workItem.updatedAt` via `touchWorkItemUpdatedAt()`, which can push `updatedAt` past `auditedAt + 60 s` and make `isAuditFresh` return stale (⏳) for a just-persisted passed audit.  If a post-persist comment is unavoidable, re-verify freshness via the content-fingerprint gate; the 30 s persistence-write tolerance on the legacy time gate (SA-0MSI3XH34001LLU4, SA-0MTHC710X003ORZM) covers the runner's own writes only.
 - Do NOT run arbitrary `wl`/`git` commands outside the authorized flow; use `--debug-log` for debugging.
 
 ## Examples

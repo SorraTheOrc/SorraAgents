@@ -1328,6 +1328,19 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     if _audit_time_is_fresh(audit_time, update_time):
         return raw_output
 
+    # Persistence-write tolerance (SA-0MTHC710X003ORZM, mirrors the child
+    # gate at ~_get_child_audit_verdict:4849) — the item's own persistence
+    # writes (wl audit-set + wl update --audit-text) bump updatedAt to just
+    # after auditedAt; a stale check from such a bump is the audit's own
+    # write and must be treated as fresh for legacy (fingerprint-less)
+    # audits. Without this the 60 s time gate can mark a just-persisted
+    # audit stale and the stale icon (\u23f3) appears on passed audits.
+    write_delta = update_time - audit_time
+    if timedelta(0) <= write_delta <= timedelta(
+        seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS
+    ):
+        return raw_output
+
     return None
 
 

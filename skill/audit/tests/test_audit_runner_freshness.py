@@ -434,6 +434,44 @@ class TestContentFreshnessGate:
         )
         assert self._check(run_wl) is None
 
+    def test_legacy_audit_persistence_write_within_tolerance_is_fresh(self):
+        """SA-0MTHC710X003ORZM / SA-0MSI3XH34001LLU4: legacy (fingerprint-less)
+        audits whose updatedAt is the runner's own persistence write (wl
+        audit-set + wl update --audit-text, ≤ 30 s after auditedAt) are
+        treated as fresh even though auditedAt <= updatedAt + 60 s.
+
+        Without this tolerance a just-persisted legacy audit would be marked
+        stale by the time gate and the selection list would show \u23f3 instead
+        of \u2705. Mirrors the child gate at _get_child_audit_verdict:4849."""
+        legacy_report = "Ready to close: Yes\n\n## Summary\nlegacy audit"
+        # auditedAt 00:00:00, updatedAt 00:00:10 (own write, within 30 s) → fresh
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-01T00:00:10.000Z",
+        )
+        assert self._check(run_wl) == legacy_report
+
+        # Boundary: exactly 30 s is still fresh (inclusive, per timedelta check)
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-01T00:00:30.000Z",
+        )
+        assert self._check(run_wl) == legacy_report
+
+        # Just past tolerance (31 s) and still inside the 60 s freshness buffer
+        # — NOT fresh, because the gap is no longer the runner's own write.
+        # (The 60 s buffer measures auditedAt > updatedAt + 60; here auditedAt
+        # is BEFORE updatedAt so the time gate fails, and 31 s > 30 s so the
+        # tolerance also fails.)
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-01T00:00:31.000Z",
+        )
+        assert self._check(run_wl) is None
+
     def test_fingerprint_gate_not_blocked_by_recent_update(self):
         """AC1: the content gate skips even when updatedAt moved after the
         audit (e.g. a comment added) — the 60s floor only applies to legacy
