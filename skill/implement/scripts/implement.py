@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1530,7 +1531,7 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
         cwd=cwd,
         timeout=600,
         runner=lambda command, cwd_, timeout_: run_cmd(
-            command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+            shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
         ),
         scope="changed",
     )
@@ -1631,7 +1632,7 @@ def run_tests(cwd: str, scope: str = "changed",
             cwd=cwd,
             timeout=600,
             runner=lambda command, cwd_, timeout_: run_cmd(
-                command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
             ),
             scope="full",
         )
@@ -1644,7 +1645,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd=cwd,
                 timeout=600,
                 runner=lambda command, cwd_, timeout_: run_cmd(
-                    command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
                 ),
                 scope="full",
             )
@@ -1671,7 +1672,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd=cwd,
                 timeout=600,
                 runner=lambda command, cwd_, timeout_: run_cmd(
-                    command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
                 ),
                 scope="full",
             ),
