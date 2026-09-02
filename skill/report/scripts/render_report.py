@@ -1,407 +1,444 @@
 #!/usr/bin/env python3
-"""Render the canonical end-of-session report for a work item (report skill).
+"""
+render_report.py — Canonical end-of-session report renderer.
 
-Canonical template (spec: parent item SA-0MSJ082OY003IQ8S):
+Produces a standardized, scannable markdown report at the end of a skill
+session.  The report is produced by calling the public functions defined
+below; the CLI entry-point (``--json`` mode) reads ``wl show <id> --json``
+output when invoked directly.
 
-    # Completed <skill_name>
+Usage
+-----
+    # As a library (preferred):
+    from render_report import render_report, render_report_from_workitem
+    report = render_report(
+        skill_name="implement",
+        work_item_id="SA-0MSJ082OY003IQ8S",
+        title="Standardize skill session end-of-session reporting",
+        headline="Implemented the report helper and wired it into all skills.",
+        acceptance_criteria=[
+            ("1", "Report helper exists", "file present", "met"),
+            ("2", "All skills wired", "grep verified", "met"),
+        ],
+        metadata={
+            "Type": "🔷 feature",
+            "Priority": "⭐ high",
+            "Status": "🔄 in-progress",
+            "Stage": "🛠️ in_progress",
+            "Risk": "⚠️ medium",
+            "Effort": "🐕 M",
+            "Children": "👥 4",
+            "Audit": "✅ passed",
+        },
+        producer_actions="Review the wiring grep output.",
+        notes="Icons sourced from ContextHub.",
+        next_action="ship",
+    )
+    print(report)
 
-    **<title>** (<id>)
+    # CLI mode: read a work-item JSON blob from stdin or a file, render
+    # a minimal report from the work-item fields.
+    $ echo '{"id":"SA-0XXX","title":"Foo"}' | python3 render_report.py --json
 
-    <headline summary>
+ContextHub Icon Mappings
+-------------------------
+Icon values are sourced from the ContextHub canonical set
+(../ContextHub/src/icons.ts + docs/icons-design.md).  See the
+``render_metadata()`` function for the mapping table.
 
-    ## Acceptance Criteria
+Public API
+----------
+"""
 
-    | AC# | Description | Metric | Verdict |
-    |-----|-------------|--------|---------|
-    | 1 | <Description> | <Metric> | met |
-    | 2 | <Description> | <Metric> | unmet |
-
-    ## Meta-Data
-
-    - Type: <icon> <text>
-    - Priority: <icon> <text>
-    - Status: <icon> <text>
-    - Stage: <icon> <text>
-    - Risk: <icon> <text>
-    - Effort: <icon> <text>
-    - Children: <count>
-    - Audit: <icon> <text>
-
-    ## Producer Actions
-
-    None needed
-
-    ## Notes
-
-    <freeform>
-
-    ## Conclusion
-
-    This completes the <skill_name> process for <id> (<title>). Ready for <next_action>.
-
-Meta-Data values are populated deterministically from ``wl show <id> --children
---json`` (``workItem``, ``auditResult``, ``children``). Icons come from the
-ContextHub canonical set (``../ContextHub/docs/icons-design.md`` /
-``src/icons.ts``): priority, status, stage, risk, effort, audit, epic. Each
-entry maps a value to an emoji and a bracketed-text fallback; the fallback is
-used when ``no_icons`` is requested (``--no-icons`` / ``WL_NO_ICONS=1``).
-Missing/unset values render the neutral marker ``— N/A``; known values with no
-ContextHub icon (e.g. non-epic issue types) render as plain text.
-"""  # noqa: EXE001
-from __future__ import annotations
-
-import argparse
 import json
-import os
 import subprocess
 import sys
-from pathlib import Path
 
-# Add repo root to sys.path for shared utility access.
-_SKILLS_ROOT = Path(__file__).resolve().parents[2]
-_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
-if _SKILLS_ROOT_STR in sys.path:
-    sys.path.remove(_SKILLS_ROOT_STR)
-sys.path.insert(0, _SKILLS_ROOT_STR)
+# ─── Icon mappings (sourced from ContextHub) ───────────────────────────
 
-from import_guard import guard_shared_import
-
-try:
-    from shared.status_lifecycle import resolve_worklog_flags
-    from shared.timing import Timer
-except ModuleNotFoundError as _missing_shared:
-    guard_shared_import(_missing_shared.name)
-
-# ── Icon mappings: ContextHub canonical set ────────────────────────────────
-# Source: ../ContextHub/docs/icons-design.md (spec) and ../ContextHub/src/icons.ts
-# (implementation consumed by the wl CLI). Value → (emoji, bracketed fallback).
-# NOTE: src/icons.ts pads some CLI fallbacks for column alignment (e.g. '[MED ]',
-# '[LOW ]', '[DEL ]'); the report uses the unpadded documented values ('[MED]',
-# '[LOW]', '[DEL]') so the bracketed text stays clean in markdown.
-
+# See: ../ContextHub/src/icons.ts
 PRIORITY_ICONS = {
-    "critical": ("🚨", "[CRIT]"),
-    "high": ("⭐", "[HIGH]"),
-    "medium": ("📋", "[MED]"),
-    "low": ("🐢", "[LOW]"),
+    "critical": "\U0001F6A8",   # 🚨
+    "high":     "\U00002B50",    # ⭐
+    "medium":   "\U0001F4CB",   # 📋
+    "low":      "\U0001F422",   # 🐢
+}
+PRIORITY_FALLBACK = {
+    "critical": "[CRIT]",
+    "high":     "[HIGH]",
+    "medium":   "[MED ]",
+    "low":      "[LOW ]",
 }
 
 STATUS_ICONS = {
-    "open": ("🔓", "[OPEN]"),
-    "in-progress": ("🔄", "[INPR]"),
-    "completed": ("✔️", "[DONE]"),
-    "blocked": ("⛔", "[BLKD]"),
-    "deleted": ("🗑️", "[DEL]"),
-    "input_needed": ("💬", "[HELP]"),
+    "open":          "\U0001F513",   # 🔓
+    "in-progress":   "\U0001F504",   # 🔄
+    "completed":     "\u2714\ufe0f",  # ✔️
+    "blocked":       "\u26d4",       # ⛔
+    "deleted":       "\U0001f5d1\ufe0f",  # 🗑️
+    "input_needed":  "\U0001f4ac",   # 💬
+}
+STATUS_FALLBACK = {
+    "open":          "[OPEN]",
+    "in-progress":   "[INPR]",
+    "completed":     "[DONE]",
+    "blocked":       "[BLKD]",
+    "deleted":       "[DEL ]",
+    "input_needed":  "[HELP]",
 }
 
 STAGE_ICONS = {
-    "idea": ("💡", "[IDEA]"),
-    "intake_complete": ("📥", "[INTAKE]"),
-    "plan_complete": ("📋", "[PLAN]"),
-    "in_progress": ("🛠️", "[PROG]"),
-    "in_review": ("🔍", "[REVIEW]"),
-    "done": ("🏁", "[DONE]"),
+    "idea":            "\U0001f4a1",          # 💡
+    "intake_complete": "\U0001f4e5",          # 📥
+    "plan_complete":   "\U0001f4cb",          # 📋
+    "in_progress":     "\U0001f6e0\ufe0f",    # 🛠️
+    "in_review":       "\U0001f50d",          # 🔍
+    "done":            "\U0001f3c1",          # 🏁
+}
+STAGE_FALLBACK = {
+    "idea":            "[IDEA]",
+    "intake_complete": "[INTAKE]",
+    "plan_complete":   "[PLAN]",
+    "in_progress":     "[PROG]",
+    "in_review":       "[REVIEW]",
+    "done":            "[DONE]",
 }
 
 RISK_ICONS = {
-    "low": ("🌱", "[LOW]"),
-    "medium": ("⚠️", "[MED]"),
-    "high": ("🔥", "[HIGH]"),
-    "severe": ("🚨", "[SEV]"),
+    "low":    "\U0001f331",  # 🌱
+    "medium": "\u26a0\ufe0f", # ⚠️
+    "high":   "\U0001f525",  # 🔥
+    "severe": "\U0001f6a8",  # 🚨
+}
+RISK_FALLBACK = {
+    "low":    "[LOW]",
+    "medium": "[MED]",
+    "high":   "[HIGH]",
+    "severe": "[SEV]",
 }
 
 EFFORT_ICONS = {
-    "xs": ("🐜", "[XS]"),
-    "s": ("🐇", "[S]"),
-    "m": ("🐕", "[M]"),
-    "l": ("🐘", "[L]"),
-    "xl": ("🐋", "[XL]"),
-    # Full-text aliases used by the Worklog CLI and effort-and-risk skill.
-    "extra small": ("🐜", "[XS]"),
-    "small": ("🐇", "[S]"),
-    "medium": ("🐕", "[M]"),
-    "large": ("🐘", "[L]"),
-    "extra large": ("🐋", "[XL]"),
-    "xlarge": ("🐋", "[XL]"),
+    "xs":        "\U0001f41c",  # 🐜
+    "s":         "\U0001f407",  # 🐇
+    "m":         "\U0001f415",  # 🐕
+    "l":         "\U0001f418",  # 🐘
+    "xl":        "\U0001f40b",  # 🐋
+    "extra small": "\U0001f41c",
+    "small":       "\U0001f407",
+    "medium":      "\U0001f415",
+    "large":       "\U0001f418",
+    "extra large": "\U0001f40b",
+    "xlarge":      "\U0001f40b",
 }
-
-EPIC_ICONS = {
-    "epic": ("🏰", "[EPIC]"),
+EFFORT_FALLBACK = {
+    "xs":        "[XS]",
+    "s":         "[S]",
+    "m":         "[M]",
+    "l":         "[L]",
+    "xl":        "[XL]",
+    "extra small": "[XS]",
+    "small":       "[S]",
+    "medium":      "[M]",
+    "large":       "[L]",
+    "extra large": "[XL]",
+    "xlarge":      "[XL]",
 }
 
 AUDIT_ICONS = {
-    "yes": ("✅", "[YES]"),
-    "no": ("❌", "[NO]"),
-    "unknown": ("❔", "[UNKN]"),
+    "yes":     "\u2705",   # ✅
+    "no":      "\u274c",   # ❌
+    "unknown": "\u2754",   # ❔
+}
+AUDIT_FALLBACK = {
+    "yes":     "[YES]",
+    "no":      "[NO]",
+    "unknown": "[UNKN]",
 }
 
-NEUTRAL_MARKER = "—"
-NEUTRAL_TEXT = "N/A"
+# ─── Icon lookup helpers ───────────────────────────────────────────────
 
-# ── Icon helpers ───────────────────────────────────────────────────────────
-
-def _pair(mapping: dict, value) -> tuple | None:
-    """Return ``(emoji, fallback)`` for a value, or ``None`` when unmapped."""
-    if not value:
-        return None
-    return mapping.get(str(value).strip().lower())
-
-
-def _icon(mapping: dict, value, no_icons: bool = False) -> str | None:
-    """Return the emoji (or bracketed fallback) for a mapped value, else ``None``."""
-    pair = _pair(mapping, value)
-    if pair is None:
-        return None
-    emoji, fallback = pair
-    return fallback if no_icons else emoji
+def _icon(lookup_table, fallback_table, key, default_emoji=""):
+    """Return (emoji, label) for a given key."""
+    k = (key or "").lower().strip()
+    icon = lookup_table.get(k, default_emoji)
+    if icon:
+        return icon, k
+    return default_emoji, k or ""
 
 
-def _meta_line(label: str, mapping: dict, value, no_icons: bool = False) -> str:
-    """Render one ``- Label: <icon> <text>`` line for a Meta-Data field.
+def _fallback(lookup_table, key, default="[?]", label=""):
+    """Return the bracketed-text fallback."""
+    k = (key or "").lower().strip()
+    return lookup_table.get(k, default), k or label or default
 
-    Kept as a small public-ish helper so tests and other skills can render a
-    single field line without building a full payload.
+
+# ─── Metadata rendering ────────────────────────────────────────────────
+
+def render_metadata(work_item: dict) -> dict:
+    """Populate the Meta-Data block from a ``wl show --json`` dict.
+
+    Returns a dict keyed by field name with ``<icon> <value>`` strings.
     """
-    if not value:
-        return f"- {label}: {NEUTRAL_MARKER} {NEUTRAL_TEXT}"
-    icon = _icon(mapping, value, no_icons)
-    if icon is None:
-        return f"- {label}: {value}"
-    return f"- {label}: {icon} {value}"
+    metadata = {}
+
+    # Type
+    issue_type = work_item.get("issueType", "task")
+    type_icon = "\U0001f537"  # 🔷 blue diamond (generic)
+    metadata["Type"] = f"{type_icon} {issue_type}"
+
+    # Priority
+    p_icon, p_label = _icon(PRIORITY_ICONS, PRIORITY_FALLBACK,
+                             work_item.get("priority"))
+    metadata["Priority"] = f"{p_icon} {p_label}"
+
+    # Status
+    s_icon, s_label = _icon(STATUS_ICONS, STATUS_FALLBACK,
+                             work_item.get("status"))
+    metadata["Status"] = f"{s_icon} {s_label}"
+
+    # Stage
+    st_icon, st_label = _icon(STAGE_ICONS, STAGE_FALLBACK,
+                               work_item.get("stage"))
+    metadata["Stage"] = f"{st_icon} {st_label}"
+
+    # Risk
+    r_icon, r_label = _icon(RISK_ICONS, RISK_FALLBACK,
+                             work_item.get("risk"))
+    metadata["Risk"] = f"{r_icon} {r_label}" if r_icon else f"❓ {r_label or 'unknown'}"
+
+    # Effort
+    e_icon, e_label = _icon(EFFORT_ICONS, EFFORT_FALLBACK,
+                             work_item.get("effort"))
+    metadata["Effort"] = f"{e_icon} {e_label}" if e_icon else f"❓ {e_label or 'unknown'}"
+
+    # Children
+    child_count = work_item.get("childCount", 0) or 0
+    children_icon = "\U0001f465"  # 👥
+    metadata["Children"] = f"{children_icon} {child_count}"
+
+    # Audit
+    audit_result = work_item.get("auditResult")
+    a_key = "yes" if audit_result is True else ("no" if audit_result is False else "unknown")
+    a_icon = AUDIT_ICONS.get(a_key, "")
+    metadata["Audit"] = f"{a_icon} {'passed' if a_key == 'yes' else ('failed' if a_key == 'no' else 'not run')}"
+
+    return metadata
 
 
-def _audit_state(audit_result) -> tuple[str, str]:
-    """Map ``auditResult`` JSON to ``(text, icon_key)``: passed/failed/not run."""
-    if audit_result is None:
-        return "not run", "unknown"
-    if audit_result.get("readyToClose") is True:
-        return "passed", "yes"
-    return "failed", "no"
+# ─── Report rendering ──────────────────────────────────────────────────
 
+def render_report(
+    skill_name: str,
+    work_item_id: str,
+    title: str,
+    headline: str,
+    acceptance_criteria: list,
+    metadata: dict,
+    producer_actions=None,
+    notes=None,
+    next_action: str = "review",
+) -> str:
+    """Render the full canonical end-of-session report.
 
-# ── Metadata extraction (deterministic from wl show --json) ────────────────
+    Parameters
+    ----------
+    skill_name : str
+        Name of the skill that produced the report (e.g. "implement").
+    work_item_id : str
+        The Worklog work-item ID (e.g. "SA-0MSJ082OY003IQ8S").
+    title : str
+        Work-item title.
+    headline : str
+        1–3 sentence summary of what was done.
+    acceptance_criteria : list of (str, str, str, str)
+        Tuples of (ac#, description, metric, verdict).
+    metadata : dict
+        Pre-computed metadata mapping (from ``render_metadata()``).
+    producer_actions : str or None
+        Actions for the producer. Defaults to "None needed".
+    notes : str or None
+        Freeform agent commentary.
+    next_action : str
+        The next action (e.g. "review", "plan", "ship").
 
-def extract_metadata(data: dict, no_icons: bool = False) -> dict:
-    """Extract the Meta-Data fields from a ``wl show --children --json`` payload.
-
-    Returns an ordered dict mapping field label → (icon_text, raw_text) where
-    icon_text is the emoji/bracketed fallback plus trailing space (or the
-    neutral marker ``—``, or empty for fields with no ContextHub icon such as
-    Children) and raw_text is the worklog value (``N/A`` when unset).
+    Returns
+    -------
+    str
+        The rendered markdown report.
     """
-    work_item = data.get("workItem", {})
-    audit_result = data.get("auditResult")
-    children = data.get("children") or []
-    audit_text, audit_key = _audit_state(audit_result)
+    lines = []
 
-    fields: dict[str, tuple[str, str]] = {}
-    for label, mapping, key in (
-        ("Type", EPIC_ICONS, "issueType"),
-        ("Priority", PRIORITY_ICONS, "priority"),
-        ("Status", STATUS_ICONS, "status"),
-        ("Stage", STAGE_ICONS, "stage"),
-        ("Risk", RISK_ICONS, "risk"),
-        ("Effort", EFFORT_ICONS, "effort"),
-    ):
-        value = work_item.get(key, "")
-        if not value:
-            fields[label] = (f"{NEUTRAL_MARKER} ", NEUTRAL_TEXT)
-            continue
-        icon = _icon(mapping, value, no_icons=no_icons)
-        fields[label] = ((f"{icon} " if icon else ""), value)
+    # Header
+    lines.append(f"# Completed {skill_name}")
+    lines.append("")
+    lines.append(f"**Work Item:** {work_item_id} — {title}")
+    lines.append("")
 
-    audit_icon = _icon(AUDIT_ICONS, audit_key, no_icons=no_icons)
-    fields["Children"] = ("", str(len(children)))
-    fields["Audit"] = ((f"{audit_icon} " if audit_icon else ""), audit_text)
-    return fields
+    # Headline
+    if headline:
+        lines.append(headline)
+        lines.append("")
 
+    # Acceptance Criteria
+    lines.append("## Acceptance Criteria")
+    lines.append("")
+    lines.append("| # | Description | Metric | Status |")
+    lines.append("|---|-------------|--------|--------|")
+    for ac_num, desc, metric, verdict in acceptance_criteria:
+        lines.append(f"|{ac_num}|{desc}|{metric}|{verdict}|")
+    lines.append("")
 
-# ── Section renderers ──────────────────────────────────────────────────────
+    # Meta-Data
+    lines.append("## Meta-Data")
+    lines.append("")
+    for key in ["Type", "Priority", "Status", "Stage", "Risk", "Effort",
+                "Children", "Audit"]:
+        value = metadata.get(key, f"❓ {key.lower()}")
+        lines.append(f"- **{key}:** {value}")
+    lines.append("")
 
-def render_ac_table(ac_rows: list[dict]) -> str:
-    """Render the ``## Acceptance Criteria`` table body.
-
-    Each row: ``{ac#} | {description} | {metric} | met|unmet``.
-
-    Accepts rows with either a boolean ``met`` field (backward compat)
-    or a string ``verdict`` field (audit-runner format: met/unmet/adjusted/partial).
-    """
-    lines = ["| AC# | Description | Metric | Verdict |", "|---|---|---|---|"]
-    if not ac_rows:
-        lines.append("| — | No acceptance criteria supplied | — | — |")
+    # Producer Actions
+    lines.append("## Producer Actions")
+    lines.append("")
+    if not producer_actions or not producer_actions.strip():
+        lines.append("None needed")
     else:
-        for i, row in enumerate(ac_rows, start=1):
-            # Prefer an explicit string verdict (audit-runner format or
-            # adjusted/partial passed via --ac); fall back to the met
-            # boolean for backward compat.
-            v = row.get("verdict")
-            if v is None:
-                met = row.get("met")
-                if isinstance(met, str):
-                    v = met
-                else:
-                    v = "met" if met else "unmet"
-            lines.append(f"| {i} | {row['description']} | {row['metric']} | {v} |")
+        lines.append(producer_actions)
+    lines.append("")
+
+    # Notes
+    lines.append("## Notes")
+    lines.append("")
+    if notes and notes.strip():
+        lines.append(notes)
+    else:
+        lines.append("None")
+    lines.append("")
+
+    # Conclusion
+    lines.append("## Conclusion")
+    lines.append("")
+    lines.append(
+        f"This completes the {skill_name} process for "
+        f"{work_item_id} ({title}). Ready for {next_action}."
+    )
+    lines.append("")
+
     return "\n".join(lines)
 
 
-def render_metadata(data: dict, no_icons: bool = False) -> str:
-    """Render the ``## Meta-Data`` bullet block (icons or bracketed fallbacks)."""
-    fields = extract_metadata(data, no_icons=no_icons)
-    return "\n".join(f"- {label}: {icon}{text}" for label, (icon, text) in fields.items())
-
-
-def render_report(
-    data: dict,
-    *,
+def render_report_from_workitem(
+    work_item: dict,
     skill_name: str,
     headline: str,
-    ac_rows: list[dict],
-    producer_actions: str | None = None,
-    notes: str = "",
+    acceptance_criteria: list,
+    producer_actions=None,
+    notes=None,
     next_action: str = "review",
-    no_icons: bool = False,
 ) -> str:
-    """Render the full canonical end-of-session report for a work item.
+    """Convenience wrapper: read metadata from a work-item dict and render."""
+    metadata = render_metadata(work_item)
+    return render_report(
+        skill_name=skill_name,
+        work_item_id=work_item.get("id", "unknown"),
+        title=work_item.get("title", "Untitled"),
+        headline=headline,
+        acceptance_criteria=acceptance_criteria,
+        metadata=metadata,
+        producer_actions=producer_actions,
+        notes=notes,
+        next_action=next_action,
+    )
 
-    Args:
-        data: parsed ``wl show <id> --children --json`` payload.
-        skill_name: name of the calling skill (e.g. ``plan``).
-        headline: one-paragraph headline summary supplied by the calling skill.
-        ac_rows: list of ``{"description", "metric", "met": bool}`` dicts with
-            the calling skill's own per-criterion verdicts.
-        producer_actions: actions for the producer; ``None``/empty renders
-            ``None needed``.
-        notes: freeform agent commentary (between Producer Actions and
-            Conclusion).
-        next_action: where the work item goes next (e.g. ``review``).
-        no_icons: render bracketed-text fallbacks instead of emoji.
-    """
+
+def render_from_wl(
+    skill_name: str,
+    work_item_id: str,
+    headline: str,
+    acceptance_criteria: list,
+    producer_actions=None,
+    notes=None,
+    next_action: str = "review",
+) -> str:
+    """Fetch work-item data via ``wl show`` and render a report."""
+    result = subprocess.run(
+        ["wl", "show", work_item_id, "--json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"ERROR: wl show failed: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    data = json.loads(result.stdout)
     work_item = data.get("workItem", {})
-    title = work_item.get("title", "")
-    item_id = work_item.get("id", "")
-
-    producer_actions = producer_actions if producer_actions else "None needed"
-
-    sections = [
-        f"# Completed {skill_name}",
-        "",
-        f"**{title}** ({item_id})",
-        "",
-        headline,
-        "",
-        "## Acceptance Criteria",
-        "",
-        render_ac_table(ac_rows),
-        "",
-        "## Meta-Data",
-        "",
-        render_metadata(data, no_icons=no_icons),
-        "",
-        "## Producer Actions",
-        "",
-        producer_actions,
-        "",
-        "## Notes",
-        "",
-        notes,
-        "",
-        "## Conclusion",
-        "",
-        f"This completes the {skill_name} process for {item_id} ({title}). Ready for {next_action}.",
-    ]
-    return "\n".join(sections)
+    return render_report_from_workitem(
+        work_item=work_item,
+        skill_name=skill_name,
+        headline=headline,
+        acceptance_criteria=acceptance_criteria,
+        producer_actions=producer_actions,
+        notes=notes,
+        next_action=next_action,
+    )
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────
+# ─── CLI entry-point ───────────────────────────────────────────────────
 
-def _load_payload(work_item_id: str) -> dict:
-    """Fetch ``wl show <id> --children --json`` output for a work item.
-
-    ``--worklog-dir`` flags are resolved via the shared prefix-to-sibling
-    scan so the item is fetched from its own worklog store regardless of cwd
-    (including git worktrees).
-    """
-    cmd = ["wl", "show", work_item_id, "--children", "--json"]
-    worklog_flags = resolve_worklog_flags(cmd)
-    if worklog_flags:
-        cmd[1:1] = worklog_flags
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return json.loads(result.stdout)
-
-
-def _parse_ac(spec: str) -> dict:
-    """Parse an ``--ac`` argument: ``description|metric|verdict``.
-
-    Exactly three pipe-separated fields; ``verdict`` is one of ``met``,
-    ``unmet``, ``adjusted`` or ``partial`` (case-insensitive;
-    ``yes``/``true``/``1`` accepted as met, ``no``/``false``/``0`` as unmet).
-    """
-    parts = spec.split("|")
-    if len(parts) != 3:
-        raise SystemExit(
-            "--ac expects 'description|metric|verdict' "
-            "(VERDICT: met|unmet|adjusted|partial), got: {spec!r}"
-        )
-    description, metric, verdict = (p.strip() for p in parts)
-    v = verdict.lower()
-    if v in {"met", "yes", "true", "1"}:
-        met: bool | str = True
-    elif v in {"unmet", "no", "false", "0"}:
-        met = False
-    else:
-        # Pass through adjusted/partial as strings; render_ac_table treats
-        # a non-boolean met as an explicit verdict string.
-        met = v
-    return {"description": description, "metric": metric, "met": met}
-
-
-def main(argv: list[str] | None = None) -> int:
+def main():
+    import argparse
     parser = argparse.ArgumentParser(
-        description="Render the canonical end-of-session report for a work item."
+        description="Render a canonical end-of-session report.",
     )
-    parser.add_argument("work_item_id", help="Work item ID (fetched via `wl show --children --json`)")
-    parser.add_argument("--skill-name", required=True, help="Calling skill name, e.g. plan")
-    parser.add_argument("--headline", required=True, help="One-paragraph headline summary")
     parser.add_argument(
-        "--ac",
-        action="append",
-        default=[],
-        metavar="DESCRIPTION|METRIC|VERDICT",
-        help="Acceptance criterion row; repeat for each AC (VERDICT: met or unmet)",
+        "--json",
+        help="Read work-item JSON from stdin and render a minimal report.",
+        action="store_true",
     )
-    parser.add_argument("--producer-actions", default=None, help="Producer actions (default: None needed)")
-    parser.add_argument("--notes", default="", help="Freeform notes section")
-    parser.add_argument("--next-action", default="review", help="Next action for the conclusion")
-    parser.add_argument("--no-icons", action="store_true", help="Use bracketed-text fallbacks instead of emoji")
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--work-item-id",
+        help="Work-item ID (required when not using --json).",
+    )
+    parser.add_argument(
+        "--skill-name",
+        default="skill",
+        help="Name of the calling skill.",
+    )
+    parser.add_argument(
+        "--headline",
+        default="",
+        help="1–3 sentence headline summary.",
+    )
+    parser.add_argument(
+        "--next-action",
+        default="review",
+        help="Next action (review, plan, ship, etc.).",
+    )
+    args = parser.parse_args()
 
-    if os.environ.get("WL_NO_ICONS") == "1":
-        args.no_icons = True
-
-    with Timer("render_report") as timer:
-        with Timer("load_payload"):
-            data = _load_payload(args.work_item_id)
-        with Timer("parse_ac_rows"):
-            ac_rows = [_parse_ac(spec) for spec in args.ac]
-        with Timer("render_report"):
-            report = render_report(
-                data,
-                skill_name=args.skill_name,
-                headline=args.headline,
-                ac_rows=ac_rows,
-                producer_actions=args.producer_actions,
-                notes=args.notes,
-                next_action=args.next_action,
-                no_icons=args.no_icons,
-            )
-        # Timing report on stderr so stdout carries only the report
-        # (SA-0MT319YGQ002E801 AC5 — additive, non-breaking).
-        print(timer.render(), file=sys.stderr)
-    print(report)
-    return 0
+    if args.json:
+        data = json.load(sys.stdin)
+        report = render_report_from_workitem(
+            work_item=data,
+            skill_name=args.skill_name,
+            headline=args.headline,
+            acceptance_criteria=[],
+            producer_actions=None,
+            notes=None,
+            next_action=args.next_action,
+        )
+        print(report)
+    else:
+        # Read from wl show
+        report = render_from_wl(
+            skill_name=args.skill_name,
+            work_item_id=args.work_item_id,
+            headline=args.headline,
+            acceptance_criteria=[],
+            producer_actions=None,
+            notes=None,
+            next_action=args.next_action,
+        )
+        print(report)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
