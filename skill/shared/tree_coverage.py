@@ -587,3 +587,41 @@ def run_coverage_review(
         "unresolvable_conflicts": unresolvable_conflicts,
         "recommendation": recommendation,
     }
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    """CLI entry point for tree_coverage.py.
+
+    Usage:
+        python3 tree_coverage.py run-coverage-review <work-item-id>
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Tree coverage helpers for plan/intake skills."
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    review_parser = subparsers.add_parser(
+        "run-coverage-review",
+        help="Run a full AC coverage review for a work item.",
+    )
+    review_parser.add_argument("work_item_id", help="The parent work item ID.")
+
+    args = parser.parse_args()
+
+    if args.command == "run-coverage-review":
+        result = run_coverage_review(args.work_item_id)
+        print(json.dumps(result, indent=2))
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
