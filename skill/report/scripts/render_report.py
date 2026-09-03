@@ -341,6 +341,7 @@ def render_report(
         f"{work_item_id} ({title}). Ready for {next_action}."
     )
     lines.append("")
+    lines.append("</end_session>")
 
     return "\n".join(lines)
 

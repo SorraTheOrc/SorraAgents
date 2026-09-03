@@ -281,4 +281,4 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the
 tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
-re-summarize the report in a different format — the report is the summary.
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

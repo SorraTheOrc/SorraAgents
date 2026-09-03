@@ -88,6 +88,7 @@ This completes the <skill_name> process for <id> (<title>). Ready for <next_acti
   `## Conclusion`**.
 - **Conclusion**: the literal sentence
   `This completes the <skill_name> process for <id> (<title>). Ready for <next_action>.`
+- **Terminator**: the rendered report's final line is `</end_session>` on its own line (only for terminal sessions; question-ended sessions omit the report and the marker).
 
 ## Meta-Data
 
@@ -207,6 +208,7 @@ Rules for callers:
    its final response** — tool output alone does not put the report in front
    of the operator. (Persisting the report to the work item is a follow-up;
    v1 is stdout only.)
+5. The rendered report ends with `</end_session>` on its own line as its final line for terminal sessions; question-ended sessions do not render the report or the marker.
 
 ## Renderer
 
