@@ -43,7 +43,7 @@ WORK_ITEM_SKILLS = [
     "triage",
 ]
 
-NON_WORK_ITEM_SKILLS = ["speak"]
+NON_WORK_ITEM_SKILLS = ["speak", "standup"]
 
 FINAL_STEP_HEADER = "## Final step: standardized end-of-session report"
 INVOCATION = (

@@ -41,8 +41,9 @@ class TestDescriptionTemplate:
         prose = _prose()
         # 18 skills at F2 (SA-0MSLK78W7009HIXC + report helper
         # SA-0MSRFTP2Y008BH6L); 16 after retiring two helper skills
-        # (SA-0MSN81W9G006K0K8).
-        assert len(prose) == 16, f"expected 16 skills, got {len(prose)}"
+        # (SA-0MSN81W9G006K0K8); 17 after adding standup
+        # (SA-0MTOMCML900254CI).
+        assert len(prose) == 17, f"expected 17 skills, got {len(prose)}"
 
     def test_each_description_within_140_chars(self):
         for name, desc in _prose().items():
