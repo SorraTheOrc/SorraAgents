@@ -1,4 +1,13 @@
 {
+  // Disable Pi client-side auto-compaction for Local Proxy/plan fallback path.
+  // The Local Proxy (192.168.0.199:8000) handles server-side compaction at ~88k/120k
+  // before reaching the Qwen context limit. Pi's client-side compaction double-fires
+  // and miscalculates context size when the proxy has no `contextWindow` configured,
+  // causing Pi to assume a default 128k window and use stale `totalTokens` values.
+  // See SA-0MTT7EUH30054I41 for full rationale.
+  "compaction": {
+    "enabled": false
+  },
   "llm-wiki": {
     "notices": false
   },

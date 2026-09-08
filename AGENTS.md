@@ -7,6 +7,10 @@ Read the global agent instructions at `~/.pi/agent/AGENTS.md` — they define th
 - Run `scripts/hygiene_check.sh` periodically to detect orphaned stashes and dirty main checkouts before they block automated agents.
 - When `implement.py start` warns about orphaned stashes, triage them using the [recovery playbook](skill/implement/SKILL.md#dirty-main-checkout-recovery-playbook). Never stash or delete stashes without explicit operator permission.
 
+## Compaction Configuration
+
+Pi client-side auto-compaction is **disabled** (`.pi/settings.json` → `compaction.enabled: false`) for the Local Proxy/plan fallback model path. The Local Proxy at `192.168.0.199:8000` handles server-side compaction at ~88k/120k tokens before reaching the Qwen context limit. Pi's client-side compaction double-fires and miscalculates context size because the proxy has no `contextWindow` configured, causing Pi to assume a default 128k window and use stale `totalTokens` values for threshold estimation. This configuration change prevents compaction artefacts (stale token counts, double-fired compaction cycles) in long sessions using the Local Proxy fallback path. See **SA-0MTT7EUH30054I41** for full details.
+
 ## Project-specific guidance
 
 - This repository is the **canonical source** for the pi agent infrastructure: `skill/` (skills), `command/` (prompts/commands), and `AGENTS_GLOBAL.md` (global agent guidance).
