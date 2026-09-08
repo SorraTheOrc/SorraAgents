@@ -1,7 +1,9 @@
 """Session boundary detection for the refactor step.
 
 Identifies files modified in the current implementation session by
-comparing the current branch against a parent branch (default: ``dev``).
+comparing the current branch against a parent branch (default: ``dev``),
+and provides a full-project enumeration path when no work-item context is
+available.
 
 Usage:
 
@@ -9,6 +11,7 @@ Usage:
         get_changed_files,
         get_untracked_files,
         get_session_files,
+        get_all_source_files,
         has_changes,
     )
 
@@ -16,6 +19,7 @@ Usage:
     untracked = get_untracked_files()
     session_files = get_session_files(parent_branch="dev")
     changed = has_changes(parent_branch="dev")
+    all_files = get_all_source_files()  # full-project scan (no work item)
 """
 
 from __future__ import annotations
@@ -182,3 +186,82 @@ def _run_diff(commit: str) -> list[dict[str, str]]:
         files.append(entry)
 
     return files
+
+
+# ---------------------------------------------------------------------------
+# Full-project file enumeration
+# ---------------------------------------------------------------------------
+
+# Source file extensions to include in full-project scans.
+_SOURCE_EXTENSIONS: tuple[str, ...] = (
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+)
+
+# Path components that are never source files.
+_EXCLUDED_DIRS: set[str] = {
+    ".git", "node_modules", "__pycache__", "build", "dist",
+    ".venv", "venv", ".tox", ".eggs", "*.egg-info", ".worklog",
+}
+
+
+def get_all_source_files() -> list[str]:
+    """Return all source files in the project (tracked and untracked).
+
+    This is used for full-project scans when no work-item context is
+    provided.  It enumerates tracked files via ``git ls-files`` and
+    additionally picks up untracked source files.
+
+    Non-source directories (``node_modules``, ``.git``, ``__pycache__``,
+    ``.venv``, etc.) are excluded.
+
+    Returns:
+        A list of file paths (relative to repo root).
+    """
+    files: list[str] = []
+
+    # Tracked files
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            for line in (proc.stdout or "").splitlines():
+                path = line.strip()
+                if path and _is_source_file(path):
+                    files.append(path)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Failed to list tracked files: %s", exc)
+
+    # Untracked files
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            for line in (proc.stdout or "").splitlines():
+                path = line.strip()
+                if path and _is_source_file(path) and path not in files:
+                    files.append(path)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Failed to list untracked files: %s", exc)
+
+    return files
+
+
+def _is_source_file(path: str) -> bool:
+    """Return ``True`` if *path* is a source file worth scanning.
+
+    A file is considered a source file when:
+    - Its path contains no excluded directory component.
+    - Its extension is in :data:`_SOURCE_EXTENSIONS`.
+    """
+    for part in path.split("/"):
+        if part in _EXCLUDED_DIRS:
+            return False
+    return any(path.endswith(ext) for ext in _SOURCE_EXTENSIONS)

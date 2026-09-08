@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Refactor orchestration script.
 
-Runs the refactor pipeline: session boundary detection → auto-fix
-session-introduced smells → hybrid smell detection → remediation
-(create work items and inject REFACTOR comments for pre-existing smells).
+Runs the refactor pipeline: file discovery → auto-fix → hybrid smell
+detection → remediation (create work items and inject REFACTOR comments
+for pre-existing smells).
+
+When a work-item ID is provided the pipeline analyses only session changes
+(git diff against the parent branch).  When no work-item ID is given the
+pipeline does a complete scan of the entire project (every tracked source
+file) for lint errors and refactor opportunities.
 
 Usage:
-  refactor.py                          # Auto-detect session, run all
-  refactor.py <work-item-id>           # Explicit work item context
-  refactor.py --dry-run                # Show what would be changed
+  refactor.py                          # Full-project scan (no work item)
+  refactor.py <work-item-id>           # Session-only scan
+  refactor.py --dry-run                # Full-project scan, no changes
   refactor.py --json                   # JSON output for agents
   refactor.py --no-llm                 # Linter only
   refactor.py --no-linter              # LLM only
@@ -50,6 +55,7 @@ REPO_ROOT = _SKILLS_ROOT.parent
 from code_review.scripts.linter_runner import probe_linter
 from refactor.comment_injection import inject_refactor_comment
 from refactor.session_boundary import (
+    get_all_source_files,
     get_changed_files,
     get_untracked_files,
 )
@@ -258,15 +264,31 @@ def auto_fix_files(
 # ---------------------------------------------------------------------------
 
 
-def detect_session_files(parent_branch: str) -> dict[str, Any]:
-    """Detect files modified in the current session.
+def detect_session_files(
+    parent_branch: str,
+    full_project: bool = False,
+) -> dict[str, Any]:
+    """Detect files to analyse in the current run.
 
     Args:
-        parent_branch: The parent branch to diff against.
+        parent_branch: The parent branch to diff against (used when
+            ``full_project`` is ``False``).
+        full_project: If ``True`` the entire project is scanned instead
+            of only session changes.  In this mode ``changed`` and
+            ``untracked`` are empty and ``all_files`` contains every
+            source file found by :func:`get_all_source_files`.
 
     Returns:
         A dict with ``changed``, ``untracked``, and ``all_files`` lists.
     """
+    if full_project:
+        all_files = get_all_source_files()
+        return {
+            "changed": [],
+            "untracked": [],
+            "all_files": all_files,
+        }
+
     changed = get_changed_files(parent_branch=parent_branch)
     untracked = get_untracked_files()
     all_files: list[str] = []
@@ -400,6 +422,7 @@ def refactor_pipeline(
     no_linter: bool = False,
     no_llm: bool = False,
     dry_run: bool = False,
+    full_project: bool = False,
 ) -> dict[str, Any]:
     """Run the full refactor pipeline.
 
@@ -409,6 +432,8 @@ def refactor_pipeline(
         no_linter: Skip linter detection.
         no_llm: Skip LLM detection.
         dry_run: Show what would be changed without making changes.
+        full_project: If ``True`` the entire project is scanned instead
+            of only session changes.
 
     Returns:
         A dict with the full refactor report.
@@ -440,22 +465,30 @@ def refactor_pipeline(
     }
 
     with Timer("refactor_pipeline") as _pipeline_timer:
-        # Step 1: Detect session files
+        # Step 1: Detect files (session changes or full project)
         with Timer("step_1_detect_session_files"):
-            session = detect_session_files(parent_branch)
+            session = detect_session_files(
+                parent_branch, full_project=full_project,
+            )
         report["session_files"] = session
 
         if not session["all_files"]:
             report["summary"]["files_analyzed"] = 0
-            LOG.info("No files modified in current session; nothing to analyze")
+            LOG.info("No files to analyse; nothing to analyze")
             report["timing"] = _pipeline_timer.to_dict()
             return report
 
-        LOG.info(
-            "Session files: %d changed, %d untracked",
-            len(session["changed"]),
-            len(session["untracked"]),
-        )
+        if full_project:
+            LOG.info(
+                "Full-project scan: %d source files",
+                len(session["all_files"]),
+            )
+        else:
+            LOG.info(
+                "Session files: %d changed, %d untracked",
+                len(session["changed"]),
+                len(session["untracked"]),
+            )
         report["summary"]["files_analyzed"] = len(session["all_files"])
 
         # Step 2: Auto-fix session-introduced smells (before detection)
@@ -530,13 +563,20 @@ def refactor_pipeline(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Refactor skill: detect and remediate code smells",
+        description=(
+            "Refactor skill: detect and remediate code smells.  "
+            "With a work-item ID only session changes are analysed; "
+            "without it the entire project is scanned."
+        ),
     )
     parser.add_argument(
         "work_item_id",
         nargs="?",
         default=None,
-        help="Work item ID for context (optional)",
+        help=(
+            "Work item ID for context.  When omitted the entire "
+            "project is scanned for lint errors and code smells."
+        ),
     )
     parser.add_argument(
         "--parent-branch",
@@ -599,7 +639,12 @@ def _build_pipeline_runner(args: argparse.Namespace) -> Callable[[], dict[str, A
     When a ``work_item_id`` is provided (and ``--dry-run`` is not set),
     wraps the pipeline execution in a ``StatusLifecycle`` context manager
     so work item status is managed automatically (``in_progress`` on entry,
-    restored on failure).
+    restored on failure).  The pipeline operates on session changes only
+    (git diff against the parent branch).
+
+    When no ``work_item_id`` is given the pipeline switches to **full-
+    project** mode: every source file in the repository is scanned for
+    lint errors and code smells.
 
     Args:
         args: The parsed CLI arguments.
@@ -608,6 +653,7 @@ def _build_pipeline_runner(args: argparse.Namespace) -> Callable[[], dict[str, A
         A callable that runs the pipeline and returns the report dict.
     """
     config = _load_config(args.config)
+    full_project = args.work_item_id is None
 
     def _run() -> dict[str, Any]:
         return refactor_pipeline(
@@ -616,6 +662,7 @@ def _build_pipeline_runner(args: argparse.Namespace) -> Callable[[], dict[str, A
             no_linter=args.no_linter,
             no_llm=args.no_llm,
             dry_run=args.dry_run,
+            full_project=full_project,
         )
 
     if args.work_item_id and not args.dry_run:
