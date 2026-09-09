@@ -10,5 +10,8 @@
     "Local Proxy/plan",
     "Local Proxy/code"
   ],
-  "theme": "dark"
+  "theme": "dark",
+  "compaction": {
+    "enabled": false
+  }
 }
