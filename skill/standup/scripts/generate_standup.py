@@ -21,7 +21,10 @@ Usage:
 Flags:
     --json           Output raw JSON data instead of the formatted report
     --verbose        Include extra detail (priority, status, stage) in output
-    --output-path    Write report to a file instead of stdout
+    --output-path    Write report to a file (default: ./standups/YYYY_MM_DD.md)
+                     Relative to project root (worklog parent when --worklog-dir
+                     / WL_WORKLOG_DIR is set, otherwise cwd); directory is created
+                     if missing. Overrides to a custom path are always honored.
     --count N        Herdr browse window (default: from herdr config or 20)
     --startTime STR  Window start (ISO8601, e.g. 2026-09-03T06:00:00 or 2026-09-03 06:00)
     --duration H     Window duration in hours (default 24)
@@ -1026,12 +1029,20 @@ def main():
     else:
         output = format_report(data, browse_count)
 
-    if output_path:
-        with open(output_path, "w") as f:
-            f.write(output)
-        print(f"Report written to {output_path}", file=sys.stderr)
-    else:
-        print(output)
+    # Default output path: ./standups/YYYY_MM_DD.md relative to project root
+    if not output_path:
+        if WORKLOG_DIR:
+            project_root = str(Path(WORKLOG_DIR).resolve().parent)
+        else:
+            project_root = str(Path.cwd().resolve())
+        today = datetime.now().strftime("%Y_%m_%d")
+        standups_dir = Path(project_root) / "standups"
+        standups_dir.mkdir(parents=True, exist_ok=True)
+        output_path = str(standups_dir / f"{today}.md")
+
+    with open(output_path, "w") as f:
+        f.write(output)
+    print(f"Report written to {output_path}", file=sys.stderr)
 
     return 0
 
