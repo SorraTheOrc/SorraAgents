@@ -170,8 +170,8 @@ class TestWorklogDirNormalization:
                     return subprocess.CompletedProcess(cmd, 1, "", "")
                 m.side_effect = fake_run
                 with mock.patch("builtins.print"):
-                    rc = mod.main()
-                # Regardless of rc, WORKLOG_DIR should be normalized
+                    mod.main()
+                # Regardless of the return code, WORKLOG_DIR should be normalized
                 assert mod.WORKLOG_DIR is not None
                 assert Path(mod.WORKLOG_DIR).name == ".worklog"
                 assert Path(mod.WORKLOG_DIR).resolve() == worklog.resolve()
