@@ -44,6 +44,7 @@ If you already have a current work-item id, continue using it; otherwise ask the
 
 ## CRITICAL RULES
 
+- **Write in UK English.** All written output must use UK English spelling (e.g. "colour" not "color", "organise" not "organize").
 - Use wl for ALL task tracking — never markdown TODOs or task lists.
 - Never write directly to `.worklog/worklog-data.jsonl`; use `wl` commands only.
 - A child may be closed independently; a parent only once all children closed, blockers resolved, ACs met, and a Producer approved.
