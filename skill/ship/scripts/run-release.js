@@ -570,7 +570,7 @@ export async function runRelease(cliArgs = []) {
   const projectRoot = resolveProjectRoot();
   setCodeFreezeMarker(projectRoot);
   try {
-    return await runReleaseImpl(cliArgs);
+    return await runReleaseImpl(cliArgs, projectRoot);
   } finally {
     // Cleared on EVERY exit path: success, failure, abort, dry-run, and
     // gating failures (trap/finally-equivalent, contract WL-0MSBU4KMA004PKSR).
@@ -578,7 +578,7 @@ export async function runRelease(cliArgs = []) {
   }
 }
 
-async function runReleaseImpl(cliArgs = []) {
+async function runReleaseImpl(cliArgs = [], projectRoot) {
   const args = [...cliArgs];
   const skipChecks = args.includes('--skip-checks');
   const isDryRun = args.includes('--dry-run');
