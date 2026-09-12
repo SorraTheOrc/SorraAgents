@@ -404,7 +404,7 @@ export function checkProducerReviewStatus(items) {
  *   runner script path.
  * @returns {Promise<{ status: 'passing'|'blocking'|'runner-failed', reason: string, summary: string|null }>}
  */
-async function attemptAuditRemediation(workItem, { runAuditShow, runAuditCommand, resolveAuditRunnerFn }) {
+export async function attemptAuditRemediation(workItem, { runAuditShow, runAuditCommand, resolveAuditRunnerFn }) {
   try {
     const runnerPath = resolveAuditRunnerFn();
     runAuditCommand(runnerPath, workItem.id);

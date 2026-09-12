@@ -27,7 +27,7 @@ Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "shi
 
 ## Internal Scripts and Modules
 
-All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `discord-notify.js` (post-release Discord notification), `remediate-spurious-closes.js`.
+All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-final-validation.js` (final validation sweep), `check-critical-items.js`, `check-worklog-refs.js`, `discord-notify.js` (post-release Discord notification), `remediate-spurious-closes.js`.
 
 > **Path resolution:** all `$(skill_path ship)/scripts/...` references in this
 > document are resolved at runtime by the **`skill_path` shell shim**
@@ -60,13 +60,14 @@ isBranchBlocked('main');                       // → true
 
 ## Gating
 
-The `release` action runs five gating checks before merging `dev` to `main`:
+The `release` action runs six gating checks before merging `dev` to `main`:
 
 1. **Unmerged branches check** — abort if feature branches pending; exit 3.
 2. **Audit readiness gate** — verifies **top-level** `in_review` items (`parentId == null`) pass audits; exit 6. Child items are covered by their parent's audit and never block. Missing/transient audits (timeout, provider error, FailureNotice) are **auto-remediated conservatively**: the gate re-runs `audit_runner.py issue <id>` and re-checks `wl audit-show`, blocking only if the item still fails after the re-run; successfully-remediated items are reported separately. Genuine "not ready to close" verdicts block immediately with **no** re-audit attempt. A remediation-runner failure is treated as blocking with the manual remediation command surfaced — never silently passed.
 3. **Critical-items gate** — abort if non-terminal critical items exist; exit 7.
 4. **Worklog refs gate** — abort if worklog refs remain in merged code; exit 8.
 5. **Producer-review gate** — abort if **top-level** items need producer review; exit 9. Child items (covered by their parent's review) never block.
+6. **Final validation sweep** — comprehensive sweep of **ALL** `in_review` items (top-level *and* children, no `parentId` filter); exit 12. Blocks on missing, stale, or failing audits and on `needsProducerReview === true`. Missing/stale/transient audits are auto-remediated via `audit_runner.py issue <id>` and re-checked; genuine "not ready to close" verdicts block immediately. Unlike Steps 2 and 5 this gate is deliberately **not** top-level-scoped — child audit gaps must not slip through to the release.
 
 All gates bypass with `--skip-checks`. CI is **optional**: PR status checks must pass if present; none → merge proceeds without waiting.
 
@@ -89,6 +90,7 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 | 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
 | 10 | Release script timed out (`SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
 | 11 | Release merge verification failed (no verified dev→main merge) |
+| 12 | Final-validation gate failure — `in_review` item(s) (including children) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation |
 
 ## Release Process
 
@@ -99,14 +101,15 @@ node $(skill_path ship)/scripts/run-release.js
 1. **Unmerged branches check** — abort if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verify `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — exit 7 if non-terminal critical items exist.
-4. **Merge commit** — fetch dev/main, `--no-ff` merge commit.
-5. **PR creation** — push `release/dev-to-main-<timestamp>`, create PR to `main`.
-6. **Status check wait & merge** — if the PR has status checks, wait for them (default 10 min), then `gh pr merge --merge --delete-branch`; no checks → merge immediately; `--force` skips the wait.
-7. **Audit logging** — record merge hash, PR URL in worklog.
-8. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push. Release ops run from **main checkout**, not worktrees.
-9. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): close only after the release landed on main — tag `v<version>` exists on origin AND is an ancestor of `origin/main`; else exit 11, no items closed.
-10. **Discord notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` posts version, tag (`vX.Y.Z`), release date, PR URL, and the new version's changelog section from `CHANGELOG.md` to a configured Discord channel via webhook. Runs only after merge verification (never on `--dry-run` or failed releases). Failure (network, HTTP error, timeout) logs a warning and never changes the release exit code. See [Discord release notification](#discord-release-notification).
-11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items only when `needsProducerReview === false`; others skipped + logged.
+4. **Final validation sweep** — exit 12 if any `in_review` item (including children) has a missing/stale/failing audit or a producer-review flag after auto-remediation.
+5. **Merge commit** — fetch dev/main, `--no-ff` merge commit.
+6. **PR creation** — push `release/dev-to-main-<timestamp>`, create PR to `main`.
+7. **Status check wait & merge** — if the PR has status checks, wait for them (default 10 min), then `gh pr merge --merge --delete-branch`; no checks → merge immediately; `--force` skips the wait.
+8. **Audit logging** — record merge hash, PR URL in worklog.
+9. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push. Release ops run from **main checkout**, not worktrees.
+10. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): close only after the release landed on main — tag `v<version>` exists on origin AND is an ancestor of `origin/main`; else exit 11, no items closed.
+11. **Discord notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` posts version, tag (`vX.Y.Z`), release date, PR URL, and the new version's changelog section from `CHANGELOG.md` to a configured Discord channel via webhook. Runs only after merge verification (never on `--dry-run` or failed releases). Failure (network, HTTP error, timeout) logs a warning and never changes the release exit code. See [Discord release notification](#discord-release-notification).
+12. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items only when `needsProducerReview === false`; others skipped + logged.
 
 ### Discord release notification
 

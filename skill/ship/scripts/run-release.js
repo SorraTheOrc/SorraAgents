@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
+import { checkFinalValidation } from './check-final-validation.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 import { sendReleaseNotification } from './discord-notify.js';
@@ -555,6 +556,7 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * 3. Check critical-priority items (gating, exit code 7)
  * 3.5. Check worklog refs (gating, exit code 8)
  * 3.6. Check producer-review status (gating, exit code 9)
+ * 3.7. Final validation sweep — ALL in_review items (gating, exit code 12)
  * 4. Find and execute the release script
  * 5. Parse PR URL from release script output
  * 6. Wait for PR merge (if not already merged with --force)
@@ -682,6 +684,27 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     }
   }
   stepTimers['Step 3.6: producer review check'].stop();
+
+  // ── Step 3.7: Final validation sweep (gating step) ─────────────────────
+  // Comprehensive sweep of ALL in_review items (top-level and children) for
+  // missing/stale/failing audits and producer-review flags
+  // (SA-0MTMSPKEX003JGIX). Missing/stale/transient audits are auto-remediated
+  // conservatively (re-run `audit_runner.py issue <id>`, re-check); genuine
+  // "not ready to close" verdicts block immediately. Unlike Steps 2 and 3.6
+  // this gate is NOT scoped to top-level items — child audit gaps block too.
+  startStep('Step 3.7: final validation check');
+  if (!skipChecks) {
+    const finalValidationReport = await checkFinalValidation();
+    if (finalValidationReport.hasBlockingItems) {
+      console.error(
+        '⚠️  Final-validation gate check failed — some in_review items have unresolved audit or producer-review issues:\n',
+      );
+      console.error(finalValidationReport.message);
+      console.error('\nTo bypass this check, re-run with --skip-checks.');
+      return finish(12);
+    }
+  }
+  stepTimers['Step 3.7: final validation check'].stop();
 
   // ── Step 4: Find the release script ───────────────────────────────────
   startStep('Step 4: locate release script');

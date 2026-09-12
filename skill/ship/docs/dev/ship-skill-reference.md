@@ -56,6 +56,7 @@ characters with an ellipsis marker (`…`) when it exceeds the limit.
 |------|-------------|-----------|
 | 1 | Pre-flight checks (`gh`, `wl`, clean worktree) | Yes |
 | 2 | Critical-priority items check (exit 7 if non-terminal) | Yes |
+| 2.5 | Final validation sweep — all `in_review` items (exit 12) | Yes |
 | 3 | Merge commit (`--no-ff`) | Yes |
 | 4 | PR creation (`release/dev-to-main-<timestamp>`) | Yes |
 | 5 | Status check wait & merge (default 10 min) | Yes |
@@ -64,6 +65,41 @@ characters with an ellipsis marker (`…`) when it exceeds the limit.
 | 8 | Verify release merge (gating — tag exists, ancestor of main) | Yes |
 | 8.5 | Discord notification (non-blocking) | No |
 | 9 | Close work items (non-blocking) | No |
+
+### Step 3.7: Final validation sweep (exit 12)
+
+The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX)
+complements the scoped audit gate. Whereas the audit gate (exit 6) and
+producer-review gate (exit 9) inspect **top-level** `in_review` items only,
+this gate queries **every** `in_review` item — no `parentId` filter — and
+blocks the release (exit code 12) when any item has:
+
+1. a **missing** audit (no audit record);
+2. a **stale** audit (audit predates the item's last update, per the same
+   freshness buffer/tolerance constants as the audit runner);
+3. a **failing** audit (a fresh "not ready to close" verdict); or
+4. a producer-review flag (`needsProducerReview === true`).
+
+Missing, stale, and transient audits are auto-remediated conservatively by
+re-running `audit_runner.py issue <id>` and re-checking `wl audit-show`;
+successfully-remediated items are unblocked and reported separately. Genuine
+"not ready to close" verdicts block immediately with **no** re-audit attempt.
+The gate never calls `wl update` directly. `--skip-checks` bypasses it.
+
+**Script:** `scripts/check-final-validation.js`
+
+**Exports:**
+
+| Export | Purpose |
+|--------|---------|
+| `checkFinalValidation(options)` | Runs the sweep; returns `{ hasBlockingItems, blockingItems, remediatedItems, passingCount, message }` |
+| `getInReviewItems()` | Queries all `in_review` items (id, title, needsProducerReview, parentId, updatedAt) |
+| `classifyAudit(workItem, auditData)` | Classifies an audit as `missing`/`transient`/`stale`/`failing`/`passing` |
+| `isAuditStale(workItem, auditData)` | Time-gate staleness check (mirrors the audit runner's freshness floor) |
+| `parseIsoUtc(value)` | ISO-8601 parse helper (naive timestamps treated as UTC) |
+
+All command boundaries (`getItemsFn`, `runAuditShow`, `runAuditCommand`,
+`resolveAuditRunnerFn`) are injectable for hermetic tests.
 
 ### Step 8.5: Discord notification
 
@@ -175,6 +211,7 @@ Verifying the full suite before promotion uses the test skill's cached runner
 | `git-helpers.js` | Branch naming & policy |
 | `check-unmerged-branches.js` | Detect unmerged branches |
 | `check-audit-gate.js` | Pre-release audit gate |
+| `check-final-validation.js` | Final validation sweep (all `in_review` items, exit 12) |
 | `check-critical-items.js` | Critical item gating |
 | `check-worklog-refs.js` | Validate worklog references |
 | `discord-notify.js` | Post-release Discord notification |
