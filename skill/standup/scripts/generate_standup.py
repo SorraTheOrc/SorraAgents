@@ -39,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import yaml
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -50,6 +51,41 @@ DEFAULT_WINDOW_START_HOUR = 6  # 06:00 local
 # This ensures cwd-independent operation when launched from outside the project root.
 # Evaluated at import time from env; may be overridden by --worklog-dir argv in main().
 WORKLOG_DIR = os.environ.get("WL_WORKLOG_DIR", None)  # type: str | None
+
+
+def resolve_project_name(worklog_dir: str | None = None) -> str:
+    """Resolve the project name from the worklog config.
+
+    Reads ``.worklog/config.yaml`` for a ``projectName`` key. Falls back to
+    the project root directory name if the config is unavailable or the
+    key is missing.
+
+    Args:
+        worklog_dir: Path to the ``.worklog`` directory. If None, uses
+            the global ``WORKLOG_DIR``.
+
+    Returns:
+        Project name string (never empty).
+    """
+    wd = worklog_dir or WORKLOG_DIR
+    config_path: Path | None = None
+    if wd:
+        config_path = Path(wd) / "config.yaml"
+    if config_path and config_path.exists():
+        try:
+            cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            name = (cfg or {}).get("projectName", "")
+            if name:
+                return str(name).strip()
+        except Exception:
+            pass
+    # Fallback: use the parent directory name of the worklog dir
+    if wd:
+        try:
+            return Path(wd).parent.name
+        except Exception:
+            pass
+    return Path.cwd().name
 
 
 # ── CLI helpers ────────────────────────────────────────────────────────
@@ -875,6 +911,7 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
         "regressions_tts": regressions_tts,
         "blockers": blocker_lines,
         "blockers_tts": blockers_tts,
+        "project_name": resolve_project_name(),
         "window": {
             "start": window_start.isoformat() if window_start else None,
             "end": window_end.isoformat() if window_end else None,
@@ -888,9 +925,10 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
     }
 
 
-def format_report(data, browse_count=None):
+def format_report(data, browse_count=None, project_name: str | None = None):
     now = datetime.now()
-    lines = [f"## Standup Report ({format_date_tts(now)})", ""]
+    name = project_name or data.get("project_name") or resolve_project_name()
+    lines = [f"## {name} Standup Report ({format_date_tts(now)})", ""]
 
     # Prefer TTS-friendly fields if present; fall back to legacy fields for back-compat
     yesterday_lines = data.get("yesterday_tts") if data.get("yesterday_tts") is not None else data.get("yesterday", [])

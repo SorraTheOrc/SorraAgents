@@ -37,10 +37,10 @@ Default time window: **24 hours starting at 06:00 the previous day** (yesterday 
 
 ## Report Structure
 
-Output only the report defined below — no preamble or postamble. Report is rendered in the first person for TTS. Dates are spoken-form (e.g. "5th September 2026", "4th September 2026 6:00 am"), never ISO timestamps.
+Output only the report defined below — no preamble or postamble. Report is rendered in the first person for TTS. Dates are spoken-form (e.g. "5th September 2026", "4th September 2026 6:00 am"), never ISO timestamps. The header includes the **project name** resolved from `.worklog/config.yaml` (`projectName`), falling back to the project directory name.
 
 ```markdown
-## Standup Report (5th September 2026)
+## <project_name> Standup Report (5th September 2026)
 
 ### Yesterday I completed work on...
 
@@ -113,7 +113,7 @@ Script internals mirror `fetcher.ts` exactly: `wl next -n N --include-in-progres
 ## Example
 
 ```markdown
-## Standup Report (5th September 2026)
+## Sorra Agents Standup Report (5th September 2026)
 
 ### Yesterday I completed work on...
 
