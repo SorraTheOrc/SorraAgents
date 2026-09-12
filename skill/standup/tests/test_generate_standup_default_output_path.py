@@ -36,8 +36,6 @@ _MODULE_NAME = "generate_standup"
 
 def _reload_standup(env_value=None):
     """(Re)import generate_standup with optional WL_WORKLOG_DIR env; returns module."""
-    sentinel = object()
-    orig_wl = (__builtins__.get if isinstance(__builtins__, dict) else getattr)(__builtins__, "WL_WORKLOG_DIR", sentinel) if False else None  # keep linter quiet
     if env_value is not None:
         import os as _os
 
