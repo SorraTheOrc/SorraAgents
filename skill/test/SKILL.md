@@ -22,6 +22,7 @@ Inputs
 ------
 
 - Optional: work-item id for triaged `test-failure` children (`parent_work_item_id`); `--rerun-failures` checks flakiness before triage.
+- Optional: `--type full|unit|smoke|<local-type>` (default `full`) selects the command profile; `--scope full|changed` (default `full`) selects full-vs-changed within it.
 
 Outputs
 -------
@@ -57,6 +58,48 @@ python3 $(skill_path test)/scripts/run_tests.py --json
 An empty resolved set (no extension file, no npm test script, no pytest suite, no node dirs) is NOT an error — the runner reports zero commands and the audit skill treats the repo as execution-impossible (fail-open partial, never blocks — F4 AC2).
 
 Output: JSON with per-suite results and a flat `failures` array (`test_name`, `stdout_excerpt`, `stack_trace`).
+
+### 1a. Typed runs (`--type`) — fast feedback vs release evidence
+
+`--type <T>` selects the command **profile**; `--scope full|changed` selects
+full-vs-changed *within* that profile (the two axes are orthogonal):
+
+| Type | Meaning | Populates full-suite cache? |
+|------|---------|-----------------------------|
+| `full` (default) | The complete project suite. Bare `/skill:test` = `--type full`. | **Yes** — the only audit-accepted evidence. |
+| `unit` | The convention unit subset (`tests/unit`) or the local extension's `unit` commands. | No — independent cache key. |
+| `smoke` | The convention smoke subset (`tests/smoke`) or the local extension's `smoke` commands. | No — independent cache key. |
+
+- **Use `unit`/`smoke` during implementation** for fast feedback; use `full`
+  (or bare `/skill:test`) at the pre-`in_review` gate and before release.
+- A project may define **additional types** (`dev`, `e2e`, …) in its local
+  extension; the global skill dispatches any locally-defined type.
+- Only `--type full` writes the audit-accepted full-suite cache entry —
+  non-`full` runs use independent cache keys and record `type` in the result
+  JSON and `--summary` output, so a partial run can never satisfy a "full test
+  suite passes" AC.
+- An unknown type exits non-zero, listing the allowed values (the minimum set
+  plus any locally-defined types).
+
+**Local extension contract.** Type→command maps are project-local and
+machine-readable: `<project_root>/.pi/skills_extensions/test/extension.json`:
+
+```json
+{ "types": { "unit": ["npx vitest run --project unit"], "e2e": ["npx playwright test"] } }
+```
+
+Values are a command string or a non-empty list of command strings. When the
+extension exists but omits a requested minimum type, the runner fails naming
+the type and the file — it never silently runs the full suite. A `full` type
+that the extension omits still falls back to the suite commands, so a bare
+invocation is never broken. Convention fallback applies only when no local type
+map exists. Full contract:
+[skill-extensions.md](../../docs/dev/skill-extensions.md).
+
+```bash
+python3 $(skill_path test)/scripts/run_tests.py --type unit --json   # fast feedback
+python3 $(skill_path test)/scripts/run_tests.py --type full --json   # release evidence
+```
 
 ### 0. Cached execution (default)
 

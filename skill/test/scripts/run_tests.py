@@ -63,6 +63,11 @@ if _SKILLS_ROOT_STR in sys.path:
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
 from shared.process_semaphore import Semaphore
+from shared.skill_extensions import (
+    DATA_FILENAME,
+    SkillExtensionError,
+    load_extension,
+)
 from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
@@ -112,6 +117,18 @@ _PYTEST_CONFIG_MARKERS = (
 # (the primary command list; convention detection is skipped when present) and
 # an optional ``timeoutPerCommand`` (per-command timeout in seconds).
 TEST_CONFIG_FILE = ".pi/test-config.json"
+
+# --- Test-type (profile) selection (SA-0MTJQB2MA008HMO6) ------------------
+# Minimum types every project accepts. ``full`` is the default and preserves
+# the existing full-suite contract; ``unit``/``smoke`` fall back to convention
+# detection (``tests/unit``, ``tests/smoke``) when no local extension defines
+# them. A project may define additional types via its local extension
+# (``.pi/skills_extensions/test/extension.json`` → ``types`` map).
+MINIMUM_TEST_TYPES = ("smoke", "unit", "full")
+#: Type used when ``--type`` is omitted (backwards compatibility, AC5).
+DEFAULT_TEST_TYPE = "full"
+#: The global skill name whose project extension supplies the type map.
+TEST_SKILL_NAME = "test"
 
 
 def detect_project_root() -> Path:
@@ -728,6 +745,178 @@ def full_suite_commands(project_root: Path | None = None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Test-type (profile) resolution
+# ---------------------------------------------------------------------------
+
+
+class TypeResolutionError(RuntimeError):
+    """Raised when a requested test type cannot be resolved to commands.
+
+    Covers both unknown types and minimum types that a present local extension
+    omits. Callers surface the message and exit non-zero — never silently
+    substitute the full suite (SA-0MTJQB2MA008HMO6 AC2/AC4).
+    """
+
+
+class UnknownTestTypeError(TypeResolutionError):
+    """Raised when ``--type`` names no known or locally-defined type."""
+
+
+def local_test_types(project_root: Path | None = None) -> dict[str, list[str]] | None:
+    """Return the project's local type→commands map, or None when absent.
+
+    Reads ``<project_root>/.pi/skills_extensions/test/extension.json`` through
+    the shared loader (SA-0MSQ7MQEJ0064ZB0). Returns None when there is no
+    extension or it defines no ``types`` map (so convention fallback applies).
+    A present-but-malformed map raises :class:`SkillExtensionError` naming the
+    file — never a silent fallback.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    ext = load_extension(TEST_SKILL_NAME, root)
+    if not ext.present:
+        return None
+    data_path = ext.data_path or (ext.directory / DATA_FILENAME)
+    raw_types = ext.data.get("types")
+    if raw_types is None:
+        # Extension present but no type map (e.g. prose-only hooks): there are
+        # no local type definitions, so minimum types use conventions.
+        return None
+    if not isinstance(raw_types, dict):
+        raise SkillExtensionError(
+            f"Invalid test type map in {data_path}: 'types' must be a JSON object."
+        )
+    normalized: dict[str, list[str]] = {}
+    for key, value in raw_types.items():
+        if not isinstance(key, str) or not key:
+            raise SkillExtensionError(
+                f"Invalid test type name {key!r} in {data_path}: names must be "
+                "non-empty strings."
+            )
+        if isinstance(value, str):
+            commands = [value]
+        elif (
+            isinstance(value, list)
+            and value
+            and all(isinstance(item, str) and item.strip() for item in value)
+        ):
+            commands = list(value)
+        else:
+            raise SkillExtensionError(
+                f"Invalid commands for test type '{key}' in {data_path}: "
+                "expected a non-empty string or a non-empty list of strings."
+            )
+        normalized[key] = commands
+    return normalized
+
+
+def extension_file(project_root: Path | None = None) -> Path:
+    """Return the path of the test-skill extension data file."""
+    root = Path(project_root or REPO_ROOT).resolve()
+    return root / ".pi" / "skills_extensions" / TEST_SKILL_NAME / DATA_FILENAME
+
+
+def allowed_test_types(project_root: Path | None = None) -> list[str]:
+    """Return the sorted allowed type names (minimum set + local types)."""
+    local = local_test_types(project_root)
+    return sorted(set(MINIMUM_TEST_TYPES) | set(local or {}))
+
+
+def convention_type_commands(
+    project_root: Path | None = None,
+    test_type: str = "unit",
+) -> list[str]:
+    """Return convention-detected commands for *test_type*, if any.
+
+    The convention is a ``tests/<type>/`` directory: pytest when the repo
+    declares a pytest suite and the dir holds ``.py`` tests; node when it
+    holds ``.mjs`` tests. An empty list means no convention applies (the
+    caller then raises a clear diagnostic rather than running the full suite).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    type_dir = root / "tests" / test_type
+    if not type_dir.is_dir():
+        return []
+    commands: list[str] = []
+    if repo_has_pytest_suite(root) and any(type_dir.rglob("*.py")):
+        commands.append(canonicalize_quiet_test_command(f"pytest tests/{test_type}"))
+    if any(type_dir.rglob("*.mjs")):
+        commands.append(f'node --test "tests/{test_type}/**/*.mjs"')
+    return commands
+
+
+def resolve_type_commands(
+    project_root: Path | None = None,
+    test_type: str = DEFAULT_TEST_TYPE,
+) -> list[str]:
+    """Resolve a test type to its command list.
+
+    Resolution order (AC2/AC3/AC4/AC5):
+
+    1. A locally-defined type (``.pi/skills_extensions/test/extension.json``)
+       wins, including extra types beyond the minimum set.
+    2. ``full`` always falls back to :func:`full_suite_commands` when the
+       local map omits it, so a bare invocation (no ``--type``) preserves the
+       existing full-suite contract even when an extension exists (AC5).
+    3. A minimum type (``unit``/``smoke``) with a present local map that omits
+       it fails with a diagnostic naming the type and the extension file —
+       never a silent full-suite substitution (AC2).
+    4. A minimum type with no local map falls back to convention detection
+       (``tests/<type>``); when no convention applies it fails with a clear
+       diagnostic (AC4).
+    5. Anything else is an unknown type (AC3).
+
+    Raises:
+        UnknownTestTypeError: the type is neither minimum nor locally defined.
+        TypeResolutionError: the type cannot be resolved to commands.
+        SkillExtensionError: the local extension is malformed.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    local = local_test_types(root)
+    if local is not None and test_type in local:
+        return list(local[test_type])
+
+    if test_type == DEFAULT_TEST_TYPE:
+        return full_suite_commands(root)
+
+    if test_type in MINIMUM_TEST_TYPES:
+        if local is not None:
+            raise TypeResolutionError(
+                f"Local test extension {extension_file(root)} does not define "
+                f"the minimum test type '{test_type}' (defined: "
+                f"{', '.join(sorted(local))}). Add it to extension.json or "
+                "remove the extension to use convention detection."
+            )
+        commands = convention_type_commands(root, test_type)
+        if commands:
+            return commands
+        raise TypeResolutionError(
+            f"No commands resolved for test type '{test_type}': no local test "
+            f"extension defines it and no tests/{test_type} convention exists."
+        )
+
+    raise UnknownTestTypeError(
+        f"Unknown test type '{test_type}': it is not one of the minimum types "
+        f"({', '.join(MINIMUM_TEST_TYPES)}) and is not defined by the local "
+        f"test extension {extension_file(root)}."
+    )
+
+
+def filter_commands_for_suite(name: str, commands: list[str]) -> list[str]:
+    """Filter a type's commands to the named suite (pytest/node/all).
+
+    Raising for empty results is the caller's responsibility so it can add a
+    context-specific diagnostic.
+    """
+    if name == "all":
+        return list(commands)
+    if name == "pytest":
+        return [c for c in commands if "pytest" in c]
+    if name == "node":
+        return [c for c in commands if "node" in c]
+    raise ValueError(f"unknown suite: {name}")
+
+
+# ---------------------------------------------------------------------------
 # Failure parsing
 # ---------------------------------------------------------------------------
 
@@ -966,6 +1155,7 @@ def run_suite(
     commands: list[str] | None = None,
     scope: str = "full",
     base_ref: str = "origin/dev",
+    test_type: str = DEFAULT_TEST_TYPE,
 ) -> dict[str, Any]:
     """Run a single named suite and return structured results.
 
@@ -997,14 +1187,20 @@ def run_suite(
     cache metadata (``run_cached(scope=...)``) so read-only consumers can
     reject partial runs as full-suite evidence.
 
+    *test_type* selects the command profile (``full`` default, ``unit``,
+    ``smoke``, or a locally-defined type). It is orthogonal to *scope*:
+    ``test_type`` chooses the profile, *scope* chooses full-vs-changed within
+    it. Only ``full`` populates the audit-accepted full-suite cache entry;
+    other types use independent cache keys and record ``type`` in the result.
+
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
-    ``cached``, ``scope`` and (on missing binary) ``notice``.
+    ``cached``, ``scope``, ``type`` and (on missing binary) ``notice``.
     """
     cwd = cwd or REPO_ROOT
-    resolvable_scope = scope
+    resolvable_scope = "full"
     changed_files: set[str] = set()
     if commands is None:
-        if scope == "changed":
+        if scope == "changed" and test_type == DEFAULT_TEST_TYPE:
             # Changed-file selection drives every suite name; the selection is
             # narrowed to the named suite below. Any failure to produce a
             # subset (custom suiteCommands, no selection) falls back to full.
@@ -1024,15 +1220,30 @@ def run_suite(
         if commands is None:
             # Full scope (including changed-scope fallback — report "full" so
             # consumers never treat a partial selection as complete).
-            if name == "pytest":
-                commands = [pytest_command()]
-            elif name == "node":
-                commands = node_suite_commands()
-            elif name == "all":
-                commands = full_suite_commands(cwd)
+            if test_type == DEFAULT_TEST_TYPE:
+                # Legacy name-based resolution (AC5, unchanged for full runs).
+                if name == "pytest":
+                    commands = [pytest_command()]
+                elif name == "node":
+                    commands = node_suite_commands()
+                elif name == "all":
+                    commands = full_suite_commands(cwd)
+                else:
+                    raise ValueError(f"unknown suite: {name}")
             else:
-                raise ValueError(f"unknown suite: {name}")
+                type_cmds = resolve_type_commands(cwd, test_type)
+                commands = filter_commands_for_suite(name, type_cmds)
+                if not commands:
+                    raise TypeResolutionError(
+                        f"Test type '{test_type}' defines no commands for the "
+                        f"'{name}' suite (resolved: {', '.join(type_cmds)})."
+                    )
             resolvable_scope = "full"
+    else:
+        # Explicit command override (a resolved type profile, or a test): a
+        # changed subset cannot be derived from an opaque override, so the run
+        # is full-profile and honestly reports scope=full.
+        resolvable_scope = "full"
     command = " && ".join(commands)
 
     all_failures: list[dict[str, str]] = []
@@ -1050,6 +1261,7 @@ def run_suite(
                     timeout=timeout,
                     runner=_cached_runner,
                     scope=resolvable_scope,
+                    test_type=test_type,
                 )
                 proc = SimpleNamespace(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
@@ -1071,6 +1283,7 @@ def run_suite(
                 "failures": [],
                 "notice": f"command not found: {exc.filename}",
                 "scope": resolvable_scope,
+                "type": test_type,
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
         except subprocess.TimeoutExpired:
@@ -1081,6 +1294,7 @@ def run_suite(
                 "failures": [],
                 "notice": f"suite timed out after {timeout}s: {name}",
                 "scope": resolvable_scope,
+                "type": test_type,
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
         except TestConcurrencyTimeout as exc:
@@ -1094,6 +1308,7 @@ def run_suite(
                 "failures": [],
                 "notice": str(exc),
                 "scope": resolvable_scope,
+                "type": test_type,
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
 
@@ -1113,6 +1328,7 @@ def run_suite(
         "failures": all_failures,
         "cached": use_cache and all(cached_flags) if cached_flags else False,
         "scope": resolvable_scope,
+        "type": test_type,
         "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
         "notice": "",
     }
@@ -1127,6 +1343,8 @@ def run_all(
     no_cache: bool = False,
     scope: str = "full",
     base_ref: str = "origin/dev",
+    commands: list[str] | None = None,
+    test_type: str = DEFAULT_TEST_TYPE,
 ) -> dict[str, Any]:
     """Run the selected suites and aggregate failures.
 
@@ -1139,6 +1357,10 @@ def run_all(
     *scope*: ``"changed"`` resolves changed-file-selected tests for the
     ``"all"`` suite (falling back to full when a subset is impossible); the
     result carries ``scope`` so consumers can distinguish partial from full.
+
+    *commands* / *test_type*: an explicit typed command profile (resolved by
+    :func:`resolve_type_commands`) and the type name it belongs to. The type
+    is recorded in each suite result and in the aggregate.
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
@@ -1154,8 +1376,10 @@ def run_all(
                     use_cache=use_cache,
                     force=force,
                     no_cache=no_cache,
+                    commands=commands,
                     scope=scope,
                     base_ref=base_ref,
+                    test_type=test_type,
                 )
             results[name] = result
             resolved_scopes.append(result["scope"])
@@ -1169,6 +1393,7 @@ def run_all(
         "failures": all_failures,
         "notices": notices,
         "scope": scope,
+        "type": test_type,
         "resolved_scopes": resolved_scopes,
         "timing": _all_timer.to_dict(),
     }
@@ -1231,6 +1456,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("pytest", "node", "all"),
         default="all",
         help="Which suite(s) to run (default: all).",
+    )
+    parser.add_argument(
+        "--type",
+        dest="test_type",
+        default=DEFAULT_TEST_TYPE,
+        metavar="TYPE",
+        help="Test type/profile to run: 'full' (default), 'unit', 'smoke', or "
+        "any type defined by the project's local test extension "
+        "(.pi/skills_extensions/test/extension.json). The type selects the "
+        "command profile; --scope selects full-vs-changed within it. Only "
+        "'full' populates the audit-accepted full-suite cache entry.",
     )
     parser.add_argument(
         "--json",
@@ -1298,6 +1534,8 @@ def run_summary(
     suites: tuple[str, ...],
     cwd: Path | None = None,
     pattern: str | None = None,
+    test_type: str = DEFAULT_TEST_TYPE,
+    commands: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return summary lines for each suite from the cache, executing nothing.
 
@@ -1305,44 +1543,98 @@ def run_summary(
     ``success`` (True only when every selected suite had a cached entry),
     ``lines`` per suite, ``scopes`` (the recorded scope of the cached entry
     per suite — ``"full"``, ``"changed"``, or ``"mixed"`` when the suite's
-    commands resolve to entries with different scopes), and ``missing``
-    (list of suite names). A ``changed``-scope summary is NOT full-suite
-    verification — consumers must treat it as partial evidence (the audit
-    skill rejects changed-scope entries for full-suite ACs). The ``"all"``
-    suite resolves commands via ``full_suite_commands(cwd)`` — the single
-    source of truth (F2 AC4).
+    commands resolve to entries with different scopes), ``types`` (the
+    recorded test type per suite, same ``"mixed"``/``"missing"`` rules) and
+    ``missing`` (list of suite names). A ``changed``-scope summary is NOT
+    full-suite verification — consumers must treat it as partial evidence
+    (the audit skill rejects changed-scope entries for full-suite ACs). The
+    ``"all"`` suite resolves commands via ``full_suite_commands(cwd)`` — the
+    single source of truth (F2 AC4) — unless an explicit typed *commands*
+    profile is supplied.
     """
     cwd = cwd or REPO_ROOT
-    result: dict[str, Any] = {"lines": {}, "scopes": {}, "missing": [], "success": True}
+    result: dict[str, Any] = {
+        "lines": {},
+        "scopes": {},
+        "types": {},
+        "missing": [],
+        "success": True,
+    }
     for name in suites:
-        if name == "pytest":
-            commands = [pytest_command()]
+        if commands is not None:
+            suite_commands = filter_commands_for_suite(name, commands)
+        elif name == "pytest":
+            suite_commands = [pytest_command()]
         elif name == "node":
-            commands = node_suite_commands()
+            suite_commands = node_suite_commands()
         else:
-            commands = full_suite_commands(cwd)
+            suite_commands = full_suite_commands(cwd)
         lines: list[str] = []
         scopes: set[str] = set()
-        for cmd in commands:
-            entry = query_cached(cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS)
+        types: set[str] = set()
+        for cmd in suite_commands:
+            entry = query_cached(
+                cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS, test_type=test_type
+            )
             if entry is None:
                 result["missing"].append(name)
                 result["success"] = False
                 continue
             lines.extend(summary_lines(entry["stdout"], entry["stderr"], pattern=pattern))
             scopes.add(entry.get("scope", "full"))
+            types.add(entry.get("test_type", "full"))
         result["lines"][name] = lines
         result["scopes"][name] = "mixed" if len(scopes) > 1 else (next(iter(scopes)) if scopes else "missing")
+        result["types"][name] = "mixed" if len(types) > 1 else (next(iter(types)) if types else "missing")
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     suites = (args.suite,)
+    test_type = args.test_type
 
     # Resolve the project root: explicit flag wins, else detect from cwd at
     # CLI time so a non-framework invocation tests that project (SA-0MSNQV9J20010LE7).
     project_root = Path(args.project_root).resolve() if args.project_root else detect_project_root()
+
+    # Validate the requested type against the allowed set (minimum set plus any
+    # locally-defined types) and report the full list on error (AC1/AC3).
+    try:
+        allowed_types = allowed_test_types(project_root)
+    except SkillExtensionError as exc:
+        print(f"run_tests: {exc}", file=sys.stderr)
+        return 2
+    if test_type not in allowed_types:
+        print(
+            f"run_tests: unknown test type '{test_type}'. Allowed types: "
+            f"{', '.join(allowed_types)}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Resolve the type's command profile once, failing fast with a clear
+    # diagnostic — never silently substituting the full suite (AC2/AC4).
+    try:
+        type_commands = resolve_type_commands(project_root, test_type)
+    except (TypeResolutionError, SkillExtensionError) as exc:
+        print(f"run_tests: {exc}", file=sys.stderr)
+        return 2
+
+    # Legacy path (AC5): a full-type run with no local override lets run_suite
+    # resolve by suite name exactly as before. Otherwise the resolved profile
+    # is passed explicitly and narrowed to --suite.
+    if test_type == DEFAULT_TEST_TYPE and type_commands == full_suite_commands(project_root):
+        override_commands: list[str] | None = None
+    else:
+        override_commands = filter_commands_for_suite(args.suite, type_commands)
+        if not override_commands:
+            print(
+                f"run_tests: test type '{test_type}' defines no commands for "
+                f"the '{args.suite}' suite.",
+                file=sys.stderr,
+            )
+            return 2
 
     # Per-command timeout: explicit --timeout wins, else the extension file's
     # timeoutPerCommand (F2 AC1), else the default 600.
@@ -1351,7 +1643,13 @@ def main(argv: list[str] | None = None) -> int:
     with Timer("run_tests") as _root_timer:
         if args.summary:
             with Timer("run_summary"):
-                summary = run_summary(suites, cwd=project_root, pattern=args.summary_grep)
+                summary = run_summary(
+                    suites,
+                    cwd=project_root,
+                    pattern=args.summary_grep,
+                    test_type=test_type,
+                    commands=override_commands,
+                )
             if args.json:
                 summary["timing"] = _root_timer.to_dict()
                 print(json.dumps(summary, indent=2))
@@ -1361,7 +1659,8 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{name}: no cached result — run the suite first or use --force")
                     else:
                         scope = summary["scopes"].get(name, "full")
-                        print(f"{name} summary ({scope} scope):")
+                        recorded_type = summary["types"].get(name, test_type)
+                        print(f"{name} summary ({scope} scope, type={recorded_type}):")
                         for line in lines:
                             print(f"  {line}")
                 print(_root_timer.render(), file=sys.stderr)
@@ -1376,6 +1675,8 @@ def main(argv: list[str] | None = None) -> int:
             no_cache=args.no_cache,
             scope=args.scope,
             base_ref=args.target_branch or "origin/dev",
+            commands=override_commands,
+            test_type=test_type,
         )
 
         if args.rerun_failures and result["failures"]:
@@ -1391,7 +1692,8 @@ def main(argv: list[str] | None = None) -> int:
                 status = "PASS" if suite_result["success"] else "FAIL"
                 cached = " [cached]" if suite_result.get("cached") else ""
                 scope = f" [{suite_result.get('scope', 'full')} scope]"
-                print(f"{name}: {status}{cached}{scope} ({suite_result['command']})")
+                type_info = f" [type {suite_result.get('type', test_type)}]"
+                print(f"{name}: {status}{cached}{scope}{type_info} ({suite_result['command']})")
                 if suite_result.get("notice"):
                     print(f"  notice: {suite_result['notice']}")
                 for failure in suite_result["failures"]:

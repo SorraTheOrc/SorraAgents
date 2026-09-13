@@ -53,8 +53,13 @@ Test verification during releases (and repeated audits/implement loops) is
 routed through a per-repo cache so identical full-suite runs at the same git
 state are not re-executed: use
 `python3 skill/test/scripts/run_tests.py --json` (cached) and
-`--summary` (read-only query). See [`skill/test_cache.py`](skill/test_cache.py)
-and [`docs/dev/release-tests.md`](docs/dev/release-tests.md).
+`--summary` (read-only query). Typed profiles give fast feedback without losing
+the full-suite evidence contract: `--type unit|smoke` (or a project-defined
+type in `.pi/skills_extensions/test/extension.json`) runs a lighter profile,
+while only `--type full` (the default) populates the audit-accepted full-suite
+cache entry. See [`skill/test/SKILL.md`](skill/test/SKILL.md),
+[`skill/test_cache.py`](skill/test_cache.py) and
+[`docs/dev/release-tests.md`](docs/dev/release-tests.md).
 
 ### For Release Managers
 

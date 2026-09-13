@@ -143,6 +143,64 @@ suite, no node dirs) is NOT an error: `run_tests.py` reports zero commands
 and the audit skill treats the repo as execution-impossible — fail-open
 partial, never blocks (F4 AC2).
 
+### 1a. Test types (`--type`) and the local extension contract (SA-0MTJQB2MA008HMO6)
+
+`--type <TYPE>` selects the **command profile** (default `full`). It is
+orthogonal to `--scope`: the type chooses *which* commands form the profile,
+the scope chooses *full vs changed* within it.
+
+**Minimum types** (accepted by every project):
+
+| Type | Without a local extension |
+|------|---------------------------|
+| `full` (default) | `full_suite_commands(project_root)` (section 1) — unchanged. |
+| `unit` | Convention subset: `pytest tests/unit` when the repo declares pytest and the dir holds `.py`; `node --test "tests/unit/**/*.mjs"` when it holds `.mjs`. |
+| `smoke` | Convention subset: `tests/smoke` (same pytest/node rules). |
+
+When no convention subset exists (e.g. `--type smoke` in a repo without
+`tests/smoke`), the runner exits non-zero with a clear diagnostic — it never
+silently runs the full suite.
+
+**Local extension (machine-readable).** A project declares its own type→command
+map at `<project_root>/.pi/skills_extensions/test/extension.json` (the
+SA-0MSQ7MQEJ0064ZB0 convention, loaded via
+`shared.skill_extensions.load_extension`):
+
+```json
+{ "types": { "unit": ["npx vitest run --project unit"], "e2e": ["npx playwright test"] } }
+```
+
+- Values are a command string or a **non-empty** list of command strings.
+- A locally-defined type wins over the convention/minimum rules, so projects may
+  add extra types (`dev`, `e2e`, `quick`, …).
+- If the extension exists but omits a requested **minimum** type
+  (`unit`/`smoke`), the runner fails with a diagnostic naming the type and the
+  extension file — never a silent full-suite substitution. `full` that the
+  extension omits still falls back to `full_suite_commands` so a bare invocation
+  is never broken.
+- A malformed `extension.json` (bad JSON, non-object top level, non-string
+  commands) raises a clear error naming the file.
+- Convention fallback applies only when no local `types` map exists (a
+  prose-only `SKILL_PREFIX.md`/`SKILL_POSTFIX.md` extension does not define
+  types).
+
+**Unknown types** exit non-zero listing the allowed values — the minimum set
+plus all locally-defined types.
+
+**Cache and evidence.** Only `--type full` populates the audit-accepted
+full-suite cache entry. The cache key namespaces non-`full` types
+(`test_cache.cache_key(..., test_type=...)`), each entry's metadata records
+`test_type`, and `query_cached`/`run_cached` match on it, so a typed run can
+never be served as (or mistaken for) full-suite evidence. `run_suite`/`run_all`
+results carry `type`; `--summary` reports the recorded type per suite
+(`types` in JSON, `type=<T>` in text). The audit skill queries with the
+default `test_type="full"` and is therefore unaffected.
+
+```bash
+python3 ./scripts/run_tests.py --type unit --json    # fast implementation feedback
+python3 ./scripts/run_tests.py --type full --json    # release/audit evidence
+```
+
 ### 2. Scope-aware execution (SA-0MT6BYQHB008DOGC)
 
 `run_tests.py` supports execution **scope** so full-suite evidence is only
