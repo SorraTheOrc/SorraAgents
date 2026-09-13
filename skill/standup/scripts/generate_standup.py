@@ -39,7 +39,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_BROWSE_COUNT = 20
@@ -88,14 +88,15 @@ def run_cmd(cmd):
     try:
         decorated, use_shell = _inject_worklog_dir(cmd)
         result = subprocess.run(
-            decorated,
-            shell=use_shell,
-            capture_output=True, text=True, timeout=30,
-        )
+                decorated,
+                shell=use_shell,
+                capture_output=True, text=True, timeout=30,
+                check=False,
+            )
         return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
     except subprocess.TimeoutExpired:
         return False, "", "Command timed out"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return False, "", str(e)
 
 
@@ -181,14 +182,14 @@ def get_browse_count(cli_count=None):
         try:
             n = int(cli_count)
             return max(1, min(50, n))
-        except:
+        except Exception:  # noqa: BLE001,S110
             pass
     try:
         if HERDR_CONFIG_PATH.exists():
             data = json.loads(HERDR_CONFIG_PATH.read_text())
             n = int(data.get("browseItemCount", DEFAULT_BROWSE_COUNT))
             return max(1, min(50, n))
-    except:
+    except Exception:  # noqa: BLE001,S110
         pass
     return DEFAULT_BROWSE_COUNT
 
@@ -491,14 +492,14 @@ def parse_start_time(s: str):
         "%H:%M",
     ):
         try:
-            dt = datetime.strptime(s_norm, fmt)
+            dt = datetime.strptime(s_norm, fmt).replace(tzinfo=timezone.utc)
             # date-only → treat as midnight (caller decides hour)
             if fmt == "%Y-%m-%d" or fmt == "%Y/%m/%d":
                 dt = dt.replace(hour=DEFAULT_WINDOW_START_HOUR)
             elif fmt in ("%H:%M", "%H:%M:%S"):
-                today = datetime.now().replace(hour=dt.hour, minute=dt.minute, second=getattr(dt, 'second', 0), microsecond=0)
+                today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).replace(hour=dt.hour, minute=dt.minute, second=getattr(dt, 'second', 0), microsecond=0)
                 # if time-only and today is in future, use yesterday
-                if today > datetime.now():
+                if today > datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None):
                     today -= timedelta(days=1)
                 return today
             return dt
@@ -511,7 +512,7 @@ def parse_start_time(s: str):
         if dt.tzinfo is not None:
             dt = dt.astimezone().replace(tzinfo=None)
         return dt
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     raise ValueError(f"Cannot parse --startTime '{s}'. Use ISO8601 e.g. 2026-09-03T06:00:00")
 
@@ -519,7 +520,7 @@ def parse_start_time(s: str):
 def compute_window(start_time_str=None, duration_hours=None, now=None):
     """Return (window_start, window_end) as naive local datetimes."""
     if now is None:
-        now = datetime.now()
+        now = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
     if start_time_str is not None:
         ws = parse_start_time(start_time_str)
         hours = float(duration_hours) if duration_hours is not None else DEFAULT_WINDOW_HOURS
@@ -542,7 +543,7 @@ def parse_updated_at(s):
         if dt.tzinfo is not None:
             dt = dt.astimezone().replace(tzinfo=None)
         return dt
-    except Exception:
+    except Exception:  # noqa: BLE001  
         return None
 
 
@@ -564,7 +565,7 @@ def extract_user_story(description):
         return ""
     for line in description.split("\n"):
         s = line.strip()
-        if s.startswith("- As a") or s.startswith("**As a"):
+        if s.startswith(("- As a", "**As a")):
             return s.lstrip("- ").lstrip("*").rstrip("*").strip()[:200]
         if s.startswith("As a"):
             return s[:200]
@@ -616,7 +617,7 @@ def fetch_blockers(items):
     blockers = []
     for it in items:
         iid = it["id"]
-        data, err = fetch_json(f"wl dep list {iid} --json")
+        data, _err = fetch_json(f"wl dep list {iid} --json")
         if not data:
             continue
         deps = []
@@ -645,7 +646,7 @@ def fetch_blockers(items):
 
 def fetch_all_completions_in_window(window_start, window_end):
     """Fetch ALL completed/in_review items whose updatedAt falls within window (not limited to Herdr list)."""
-    data, err = fetch_json("wl list --status completed --stage in_review --json")
+    data, _err = fetch_json("wl list --status completed --stage in_review --json")
     if not data:
         return []
     items = extract_items(data)
@@ -666,11 +667,11 @@ def _run_git(args):
     git_prefix = _git_dir_flag()
     cmd = ["git"] + git_prefix + args
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
         return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
     except subprocess.TimeoutExpired:
         return False, "", "Command timed out"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return False, "", str(e)
 
 
@@ -680,7 +681,7 @@ def get_snapshot_before(window_start):
         return None
     try:
         date_str = window_start.strftime("%Y-%m-%dT%H:%M:%S")
-        success, stdout, stderr = _run_git(["log", "--all", f'--before={date_str}', "--format=%H", "-n", "20", "--", ".worklog/worklog-data.jsonl"])
+        success, stdout, _stderr = _run_git(["log", "--all", f'--before={date_str}', "--format=%H", "-n", "20", "--", ".worklog/worklog-data.jsonl"])
         if not success or not stdout.strip():
             return None
         hashes = [h.strip() for h in stdout.strip().splitlines() if h.strip()]
@@ -693,13 +694,13 @@ def get_snapshot_before(window_start):
                 if "__worklog_sync__" not in head_line:
                     return h
         return None
-    except Exception:
+    except Exception:  # noqa: BLE001  
         return None
 
 
 def load_snapshot_map(snapshot_hash):
     """Load snapshot work items into id -> (status, stage) map."""
-    success, stdout, stderr = _run_git(["show", f"{snapshot_hash}:.worklog/worklog-data.jsonl"])
+    success, stdout, _stderr = _run_git(["show", f"{snapshot_hash}:.worklog/worklog-data.jsonl"])
     if not success or not stdout:
         return {}
     before = {}
@@ -709,7 +710,7 @@ def load_snapshot_map(snapshot_hash):
             continue
         try:
             rec = json.loads(line)
-        except:
+        except Exception:  # noqa: BLE001,S112
             continue
         if rec.get("__worklog_sync__"):
             continue
@@ -735,7 +736,7 @@ def detect_regressions(window_start, window_end):
     before = load_snapshot_map(snapshot_hash)
     if not before:
         return []
-    data, err = fetch_json("wl list --json")
+    data, _err = fetch_json("wl list --json")
     if not data:
         return []
     current = extract_items(data)
@@ -750,9 +751,7 @@ def detect_regressions(window_start, window_end):
             cur_status = item.get("status")
             cur_stage = item.get("stage")
             is_regressed = not (cur_status == "completed" and cur_stage == "in_review")
-            if is_regressed and in_window(item, window_start, window_end):
-                # Flag if now in an actionable open state
-                if cur_status in ("open", "in_progress", "in-progress", "blocked") or cur_stage in ("idea", "intake_complete", "plan_complete", "in_progress") or cur_status != "completed" or cur_stage != "in_review":
+            if is_regressed and in_window(item, window_start, window_end) and cur_status in ("open", "in_progress", "in-progress", "blocked") or cur_stage in ("idea", "intake_complete", "plan_complete", "in_progress") or cur_status != "completed" or cur_stage != "in_review":
                     regs.append(item)
     seen = set()
     out = []
@@ -815,7 +814,7 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
         try:
             fetched = fetch_all_completions_in_window(window_start, window_end)
             yesterday_items = sorted(fetched, key=lambda x: (x.get("updatedAt") or "", x["id"]))
-        except Exception:
+        except Exception:  # noqa: BLE001  
             yesterday_all = [i for i in herdr_items_sorted if i.get("status") == "completed" and i.get("stage") == "in_review"]
             yesterday_items = [i for i in yesterday_all if in_window(i, window_start, window_end)]
     else:
@@ -846,7 +845,7 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
     # Regressions: items that were completed/in_review before window but moved back during window
     try:
         regressions = detect_regressions(window_start, window_end)
-    except Exception:
+    except Exception:  # noqa: BLE001  
         regressions = []
 
     # TTS-friendly formatted variants
@@ -889,7 +888,7 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
 
 
 def format_report(data, browse_count=None):
-    now = datetime.now()
+    now = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
     lines = [f"## Standup Report ({format_date_tts(now)})", ""]
 
     # Prefer TTS-friendly fields if present; fall back to legacy fields for back-compat
@@ -967,13 +966,13 @@ def main():
             # normalize bare project-root path to <root>/.worklog
             try:
                 _p = Path(WORKLOG_DIR)
-                if _p.exists() and not _p.name == ".worklog":
+                if _p.exists() and _p.name != ".worklog":
                     _cand = _p / ".worklog"
                     if _cand.exists() and _cand.is_dir():
                         WORKLOG_DIR = str(_cand.resolve())
                 else:
                     WORKLOG_DIR = str(_p.resolve()) if _p.exists() else WORKLOG_DIR
-            except Exception:
+            except Exception as _e:  # noqa: BLE001,S110
                 pass
 
     json_output = "--json" in args
@@ -992,7 +991,7 @@ def main():
         if idx + 1 < len(args):
             try:
                 browse_count = int(args[idx + 1])
-            except:
+            except Exception as _e:  # noqa: BLE001,S110
                 pass
     # also support -n
     if "-n" in args and browse_count is None:
@@ -1000,7 +999,7 @@ def main():
         if idx + 1 < len(args):
             try:
                 browse_count = int(args[idx + 1])
-            except:
+            except Exception as _e:  # noqa: BLE001,S110
                 pass
     if "--startTime" in args:
         idx = args.index("--startTime")
@@ -1018,7 +1017,7 @@ def main():
 
     try:
         window_start, window_end = compute_window(start_time_str, duration_hours)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
@@ -1035,7 +1034,7 @@ def main():
             project_root = str(Path(WORKLOG_DIR).resolve().parent)
         else:
             project_root = str(Path.cwd().resolve())
-        today = datetime.now().strftime("%Y_%m_%d")
+        today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
         standups_dir = Path(project_root) / "standups"
         standups_dir.mkdir(parents=True, exist_ok=True)
         output_path = str(standups_dir / f"{today}.md")
