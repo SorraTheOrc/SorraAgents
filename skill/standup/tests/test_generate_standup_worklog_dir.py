@@ -84,7 +84,7 @@ class TestWlFlagInjection:
             m.return_value = subprocess.CompletedProcess(
                 ["wl"], 0, '{"results":[]}', ""
             )
-            data, err = mod.fetch_json("wl next -n 1 --include-in-progress --json")
+            _data, err = mod.fetch_json("wl next -n 1 --include-in-progress --json")
             # Should have been called with list including --worklog-dir
             assert m.called
             cmd = m.call_args[0][0]
@@ -116,7 +116,7 @@ class TestGitAnchoring:
             m.return_value = subprocess.CompletedProcess(
                 ["git", "-C", str(tmp_path / "proj"), "log"], 0, "abc123\n", ""
             )
-            ok, stdout, stderr = mod._run_git(["log", "--all", "--format=%H"])
+            ok, stdout, _stderr = mod._run_git(["log", "--all", "--format=%H"])
             assert ok is True
             assert stdout == "abc123"
             cmd = m.call_args[0][0]
@@ -157,25 +157,24 @@ class TestWorklogDirNormalization:
         # Mock subprocess for wl call + git
         mod = _reload_standup()
         # Simulate running main with --worklog-dir <repo_root> (bare, not .worklog)
-        with mock.patch.object(sys, "argv", ["generate_standup.py", "--worklog-dir", str(repo_root), "--json"]):
-            with mock.patch.object(mod.subprocess, "run") as m:
-                def fake_run(cmd, *args, **kwargs):
-                    cap = " ".join(cmd) if isinstance(cmd, list) else cmd
-                    if isinstance(cmd, list) and cmd[0] == "wl":
-                        return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "workItems": []}), "")
-                    if isinstance(cmd, list) and cmd[0] == "git":
-                        return subprocess.CompletedProcess(cmd, 1, "", "not a git repo")
-                    if isinstance(cmd, str) and "wl " in cap:
-                        return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "workItems": []}), "")
-                    return subprocess.CompletedProcess(cmd, 1, "", "")
-                m.side_effect = fake_run
-                with mock.patch("builtins.print"):
-                    mod.main()
-                # Regardless of the return code, WORKLOG_DIR should be normalized
-                assert mod.WORKLOG_DIR is not None
-                assert Path(mod.WORKLOG_DIR).name == ".worklog"
-                assert Path(mod.WORKLOG_DIR).resolve() == worklog.resolve()
-            # No extra cleanup needed; WL_WORKLOG_DIR not set
+        with mock.patch.object(sys, "argv", ["generate_standup.py", "--worklog-dir", str(repo_root), "--json"]), mock.patch.object(mod.subprocess, "run") as m:
+            def fake_run(cmd, *args, **kwargs):
+                cap = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if isinstance(cmd, list) and cmd[0] == "wl":
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "workItems": []}), "")
+                if isinstance(cmd, list) and cmd[0] == "git":
+                    return subprocess.CompletedProcess(cmd, 1, "", "not a git repo")
+                if isinstance(cmd, str) and "wl " in cap:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "workItems": []}), "")
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            m.side_effect = fake_run
+            with mock.patch("builtins.print"):
+                mod.main()
+            # Regardless of the return code, WORKLOG_DIR should be normalized
+            assert mod.WORKLOG_DIR is not None
+            assert Path(mod.WORKLOG_DIR).name == ".worklog"
+            assert Path(mod.WORKLOG_DIR).resolve() == worklog.resolve()
+        # No extra cleanup needed; WL_WORKLOG_DIR not set
 
     def test_worklog_dir_explicit_dotworklog_preserved(self, tmp_path):
         import json
@@ -185,18 +184,17 @@ class TestWorklogDirNormalization:
         worklog.mkdir(parents=True)
         (worklog / "config.yaml").write_text("prefix: YY\n", encoding="utf-8")
         mod = _reload_standup()
-        with mock.patch.object(sys, "argv", ["generate_standup.py", "--worklog-dir", str(worklog), "--json"]):
-            with mock.patch.object(mod.subprocess, "run") as m:
-                def fake_run(cmd, *args, **kwargs):
-                    if isinstance(cmd, list) and cmd[0] == "wl":
-                        return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "workItems": []}), "")
-                    if isinstance(cmd, list) and cmd[0] == "git":
-                        return subprocess.CompletedProcess(cmd, 1, "", "")
-                    cap = " ".join(cmd) if isinstance(cmd, list) else cmd
-                    if isinstance(cmd, str) and "wl " in cap:
-                        return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "workItems": []}), "")
+        with mock.patch.object(sys, "argv", ["generate_standup.py", "--worklog-dir", str(worklog), "--json"]), mock.patch.object(mod.subprocess, "run") as m:
+            def fake_run(cmd, *args, **kwargs):
+                if isinstance(cmd, list) and cmd[0] == "wl":
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "workItems": []}), "")
+                if isinstance(cmd, list) and cmd[0] == "git":
                     return subprocess.CompletedProcess(cmd, 1, "", "")
-                m.side_effect = fake_run
-                with mock.patch("builtins.print"):
-                    mod.main()
-                assert Path(mod.WORKLOG_DIR).resolve() == worklog.resolve()
+                cap = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if isinstance(cmd, str) and "wl " in cap:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "workItems": []}), "")
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            m.side_effect = fake_run
+            with mock.patch("builtins.print"):
+                mod.main()
+            assert Path(mod.WORKLOG_DIR).resolve() == worklog.resolve()
