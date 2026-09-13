@@ -337,6 +337,17 @@ Where `wl` stores live: worklog state is kept per repository at
 detection in `skill/shared/status_lifecycle.py` (`--worklog-dir` flags for
 `wl` subprocesses). The global skills install does **not** hold worklog data.
 
+## Project-Local Skill Extensions
+
+Projects may augment a global skill without editing it by placing optional
+prose hooks and machine-readable data under
+`<project_root>/.pi/skills_extensions/<skill-name>/` (resolved from the
+invoking git root, cwd fallback). The convention, schema guidance,
+precedence, and trust notes are documented in
+[skill-extensions.md](skill-extensions.md); the loader lives at
+`skill/shared/skill_extensions.py`. When no extension directory exists,
+global skill behaviour is unchanged.
+
 ## Graceful Failure for Missing Shared Modules
 
 If a script cannot resolve a required shared module (partial or copied
@@ -379,3 +390,7 @@ its canonical location.
 - **Agent Skills specification:** [https://agentskills.io/specification](https://agentskills.io/specification)
 - **Skills in this repository:** `skill/ship/`, `skill/cleanup/`,
   `skill/triage/`, `skill/audit/`
+- **Project-local skill extensions:**
+  [skill-extensions.md](skill-extensions.md) — the
+  `.pi/skills_extensions/<skill-name>/` convention consumed by skill scripts
+  (loader: `skill/shared/skill_extensions.py`).

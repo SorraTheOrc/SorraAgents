@@ -61,6 +61,15 @@ If you already have a current work-item id, continue using it; otherwise ask the
 
 - wl is the primary source of truth; only source code is more authoritative. Always use `--json` for programmatic use. New work items discovered during work → `wl create`: child if blocking (`--parent <current-id>`), else `discovered-from:<current-id>` in the description. Check `wl next` before asking what to work on.
 
+## Local skill extensions
+
+A project may augment a global skill from its repo via
+`.pi/skills_extensions/<skill>/`: optional `SKILL_PREFIX.md` /
+`SKILL_POSTFIX.md` (prose before the first / after the final step) and
+`extension.json` (machine-readable script data). Absence is a no-op;
+extensions are additive and cannot weaken safety/gating steps — see
+[docs/dev/skill-extensions.md](docs/dev/skill-extensions.md).
+
 ## Stage vs Status distinction
 
 Two lifecycle axes, managed independently:
