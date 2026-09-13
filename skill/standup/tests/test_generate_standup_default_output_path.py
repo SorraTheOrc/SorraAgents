@@ -20,7 +20,7 @@ import builtins
 import json
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -98,7 +98,7 @@ class TestDefaultOutputPath:
                     with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
                         rc = mod.main()
                     assert rc == 0, "main() should succeed"
-                today = datetime.now().strftime("%Y_%m_%d")
+                today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
                 expected = repo_root / "standups" / f"{today}.md"
                 assert standups_dir.is_dir(), "standups/ directory should be created"
                 assert expected.is_file(), f"Expected report at {expected}"
@@ -120,7 +120,7 @@ class TestDefaultOutputPath:
                     with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
                         rc = mod.main()
                     assert rc == 0
-                today = datetime.now().strftime("%Y_%m_%d")
+                today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
                 expected = repo_root / "standups" / f"{today}.md"
                 assert expected.is_file()
                 # Verify naming shape: YYYY_MM_DD.md (zero-padded)
@@ -147,7 +147,7 @@ class TestDefaultOutputPath:
                     with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
                         rc = mod.main()
                     assert rc == 0
-                today = datetime.now().strftime("%Y_%m_%d")
+                today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
                 expected = repo_root / "standups" / f"{today}.md"
                 assert expected.is_file()
                 raw = expected.read_text(encoding="utf-8")
@@ -186,7 +186,7 @@ class TestDefaultOutputPath:
                 # a short confirmation goes to stderr.
                 assert "".join(printed_stdout) == "", f"Expected no stdout, got: {printed_stdout}"
                 assert "Report written to" in " ".join(printed_stderr)
-                today = datetime.now().strftime("%Y_%m_%d")
+                today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
                 assert (repo_root / "standups" / f"{today}.md").is_file()
         finally:
             _cleanup_standup_env()
@@ -204,24 +204,22 @@ class TestOverridePath:
 
         mod = _reload_standup()
         try:
-            with mock.patch.object(sys, "argv", ["generate_standup.py", "--output-path", explicit_path, "--worklog-dir", str(worklog)]):
-                with _fake_run_wl_empty_git_fail(mod):
-                    written = {}
-                    orig_open = builtins.open
+            with mock.patch.object(sys, "argv", ["generate_standup.py", "--output-path", explicit_path, "--worklog-dir", str(worklog)]), _fake_run_wl_empty_git_fail(mod):
+                written = {}
+                orig_open = builtins.open
 
-                    def _open(path, *a, **kw):
-                        written[str(path)] = True
-                        return orig_open(path, *a, **kw)
+                def _open(path, *a, **kw):
+                    written[str(path)] = True
+                    return orig_open(path, *a, **kw)
 
-                    with mock.patch("builtins.open", _open):
-                        with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
-                            rc = mod.main()
-                    assert rc == 0
-                    assert explicit_path in written
-                    today = datetime.now().strftime("%Y_%m_%d")
-                    default_hits = [f for f in written if "standups" in f and today in f]
-                    assert default_hits == [], f"Should not write default dated file, but wrote {default_hits}"
-                    assert Path(explicit_path).is_file()
+                with mock.patch("builtins.open", _open), mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
+                    rc = mod.main()
+                assert rc == 0
+                assert explicit_path in written
+                today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
+                default_hits = [f for f in written if "standups" in f and today in f]
+                assert default_hits == [], f"Should not write default dated file, but wrote {default_hits}"
+                assert Path(explicit_path).is_file()
         finally:
             _cleanup_standup_env()
 
@@ -234,14 +232,13 @@ class TestOverridePath:
 
         mod = _reload_standup()
         try:
-            with mock.patch.object(sys, "argv", ["generate_standup.py", "--json", "--output-path", explicit_path, "--worklog-dir", str(worklog)]):
-                with _fake_run_wl_empty_git_fail(mod):
-                    with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
-                        rc = mod.main()
-                    assert rc == 0
-                    assert Path(explicit_path).is_file()
-                    data = json.loads(Path(explicit_path).read_text(encoding="utf-8"))
-                    assert "herdr_count" in data or "yesterday" in data
+            with mock.patch.object(sys, "argv", ["generate_standup.py", "--json", "--output-path", explicit_path, "--worklog-dir", str(worklog)]), _fake_run_wl_empty_git_fail(mod):
+                with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
+                    rc = mod.main()
+                assert rc == 0
+                assert Path(explicit_path).is_file()
+                data = json.loads(Path(explicit_path).read_text(encoding="utf-8"))
+                assert "herdr_count" in data or "yesterday" in data
         finally:
             _cleanup_standup_env()
 
@@ -257,7 +254,7 @@ class TestWorklogDirPathResolution:
 
         mod = _reload_standup(env_value=str(worklog_b))
         try:
-            today = datetime.now().strftime("%Y_%m_%d")
+            today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
             project_root = str(Path(mod.WORKLOG_DIR).resolve().parent)
             computed = Path(project_root) / "standups" / f"{today}.md"
             assert str(computed) == str((project_b / "standups" / f"{today}.md").resolve())
@@ -276,17 +273,16 @@ class TestWorklogDirPathResolution:
         mod = _reload_standup(env_value=str(project_env / ".worklog"))
         try:
             # argv sets --worklog-dir to worklog_arg, so main() should update WORKLOG_DIR to it
-            with mock.patch.object(sys, "argv", ["generate_standup.py", "--worklog-dir", str(worklog_arg)]):
-                with _fake_run_wl_empty_git_fail(mod):
-                    with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
-                        rc = mod.main()
-                    assert rc == 0
-                    assert mod.WORKLOG_DIR is not None
-                    today = datetime.now().strftime("%Y_%m_%d")
-                    expected = project_arg / "standups" / f"{today}.md"
-                    assert expected.is_file(), f"Expected {expected}"
-                    # Must NOT write to the env-based project
-                    not_expected = project_env / "standups" / f"{today}.md"
-                    assert not not_expected.exists(), f"Should not write to env project {not_expected}"
+            with mock.patch.object(sys, "argv", ["generate_standup.py", "--worklog-dir", str(worklog_arg)]), _fake_run_wl_empty_git_fail(mod):
+                with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
+                    rc = mod.main()
+                assert rc == 0
+                assert mod.WORKLOG_DIR is not None
+                today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
+                expected = project_arg / "standups" / f"{today}.md"
+                assert expected.is_file(), f"Expected {expected}"
+                # Must NOT write to the env-based project
+                not_expected = project_env / "standups" / f"{today}.md"
+                assert not not_expected.exists(), f"Should not write to env project {not_expected}"
         finally:
             _cleanup_standup_env()
