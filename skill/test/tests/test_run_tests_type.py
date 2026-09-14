@@ -331,18 +331,61 @@ class TestTypeAwareCache:
         run_cached("echo full", cwd=tmp_path, runner=_fake_runner(), test_type="full")
         assert query_cached("echo full", cwd=tmp_path) is not None
 
-    def test_run_suite_records_type_and_uses_typed_cache(self, tmp_path: Path) -> None:
+    def test_run_suite_records_type_and_passes_it_to_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """run_suite routes the type into the cache layer without executing.
+
+        The runner is stubbed so the test never spawns a command or contends
+        for the host-wide test semaphore (which would deadlock under an outer
+        suite run holding the only slot).
+        """
+        calls: list[dict] = []
+
+        def fake_run_cached(command, **kwargs):
+            calls.append({"command": command, **kwargs})
+            return {
+                "stdout": "1 passed\n",
+                "stderr": "",
+                "exit_code": 0,
+                "completed_at": 0.0,
+                "command": command,
+                "git_state": "test",
+                "scope": kwargs.get("scope", "full"),
+                "test_type": kwargs.get("test_type", "full"),
+                "cached": False,
+            }
+
+        monkeypatch.setattr(run_tests, "run_cached", fake_run_cached)
         with mock.patch.object(
             run_tests, "resolve_type_commands", return_value=["echo typed-unit"]
         ):
             result = run_suite("all", cwd=tmp_path, test_type="unit")
         assert result["type"] == "unit"
+        assert result["scope"] == "full"
         assert result["success"] is True
-        assert "echo typed-unit" in result["command"]
-        assert query_cached("echo typed-unit", cwd=tmp_path) is None
-        assert query_cached("echo typed-unit", cwd=tmp_path, test_type="unit") is not None
+        assert calls[0]["command"] == "echo typed-unit"
+        assert calls[0]["test_type"] == "unit"
 
-    def test_run_all_aggregate_records_type(self, tmp_path: Path) -> None:
+    def test_run_all_aggregate_records_type(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """run_all propagates the type into every suite result."""
+
+        def fake_run_cached(command, **kwargs):
+            return {
+                "stdout": "1 passed\n",
+                "stderr": "",
+                "exit_code": 0,
+                "completed_at": 0.0,
+                "command": command,
+                "git_state": "test",
+                "scope": kwargs.get("scope", "full"),
+                "test_type": kwargs.get("test_type", "full"),
+                "cached": False,
+            }
+
+        monkeypatch.setattr(run_tests, "run_cached", fake_run_cached)
         with mock.patch.object(
             run_tests, "resolve_type_commands", return_value=["echo typed-smoke"]
         ):
