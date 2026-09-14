@@ -250,9 +250,28 @@ describe('isTimeoutOrTransientAudit', () => {
 test('check-audit-gate: checkAuditReadyToClose returns expected structure', async () => {
   const mod = await import(MODULE_PATH);
 
-  // Inject empty candidates so the gate runs hermitically without live wl/audit calls.
+  // Hermetic (SA-0MSRN0Q64005YR5A): inject the candidate query and the
+  // audit-show boundary. Calling the live gate here would query the real
+  // worklog and, for any top-level in_review item with a missing/transient
+  // audit, run auto-remediation — spawning real `audit_runner.py issue <id>`
+  // runs (each capped at a 600s runner timeout) that also mutate the
+  // worklog. That makes the unit suite slow, order-dependent and stateful.
+  // One ready-to-close candidate exercises the main path and produces the
+  // report shape with no live boundary.
+  let remediationCalls = 0;
   const report = await mod.checkAuditReadyToClose({
-    getCandidateItemsFn: () => [],
+    getCandidateItemsFn: () => [
+      { id: 'SA-TOP-1', title: 'Top Level Item', needsProducerReview: false, parentId: null },
+    ],
+    runAuditShow: () => JSON.stringify({
+      success: true,
+      workItemId: 'SA-TOP-1',
+      audit: { readyToClose: true, summary: 'All good' },
+    }),
+    runAuditCommand: () => {
+      remediationCalls += 1;
+      return '';
+    },
   });
 
   // Should always return the expected shape
@@ -264,6 +283,14 @@ test('check-audit-gate: checkAuditReadyToClose returns expected structure', asyn
   assert.ok(Array.isArray(report.blockingItems));
   assert.ok(Array.isArray(report.transientItems));
   assert.equal(typeof report.message, 'string');
+
+  // Behaviour: a ready-to-close candidate passes the gate and never triggers
+  // audit auto-remediation (no live runner invocation from the unit suite).
+  assert.equal(report.hasBlockingItems, false);
+  assert.deepEqual(report.blockingItems, []);
+  assert.deepEqual(report.transientItems, []);
+  assert.match(report.message, /Audit gate passed/);
+  assert.equal(remediationCalls, 0, 'a passing audit must not spawn audit remediation');
 });
 
 // ---------------------------------------------------------------------------

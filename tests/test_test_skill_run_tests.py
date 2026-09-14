@@ -43,6 +43,60 @@ FAILED test_demo.py::test_error - RuntimeError: boom
 2 failed, 1 passed in 0.03s
 """
 
+# Error-only run: pytest exits non-zero with no FAILED line, only an
+# ``ERROR ...`` short-summary entry (collection / setup / teardown error).
+# Produced the unattributable ``<suite exited N>: pytest ...`` triage
+# signature before ERROR lines were parsed (SA-0MSRN0Q64005YR5A).
+PYTEST_ERROR_ONLY_OUTPUT = """\
+..E                                                                      [100%]
+==================================== ERRORS ====================================
+___________________ ERROR at setup of test_needs_service ______________________
+
+@pytest.fixture
+def service():
+>       raise RuntimeError("service unavailable")
+E       RuntimeError: service unavailable
+
+test_infra.py:7: RuntimeError
+=========================== short test summary info ============================
+ERROR test_infra.py::test_needs_service - RuntimeError: service unavailable
+1 error, 2 passed in 0.05s
+"""
+
+# Collection error with no " - message" suffix on the short-summary line.
+PYTEST_BARE_ERROR_OUTPUT = """\
+E                                                                        [100%]
+=========================== short test summary info ============================
+ERROR tests/test_collect.py
+1 error in 0.01s
+"""
+
+# A run carrying both failure and error summary lines.
+PYTEST_MIXED_FAILURE_AND_ERROR_OUTPUT = """\
+.FE                                                                      [100%]
+=================================== FAILURES ===================================
+__________________________________ test_fail ___________________________________
+
+    def test_fail():
+>       assert 1 == 2
+E       assert 1 == 2
+
+test_demo.py:5: AssertionError
+==================================== ERRORS ====================================
+___________________ ERROR at setup of test_needs_service _______________________
+
+@pytest.fixture
+def service():
+>       raise RuntimeError("boom")
+E       RuntimeError: boom
+
+test_infra.py:7: RuntimeError
+=========================== short test summary info ============================
+FAILED test_demo.py::test_fail - assert 1 == 2
+ERROR test_infra.py::test_needs_service - RuntimeError: boom
+1 failed, 1 error, 1 passed in 0.06s
+"""
+
 NODE_FAILURE_OUTPUT = """\
 TAP version 13
 # Subtest: failing test
@@ -240,6 +294,40 @@ def test_parse_pytest_failures_include_stack_trace() -> None:
     )
     assert "AssertionError" in fail_record["stack_trace"]
     assert "test_demo.py:5" in fail_record["stack_trace"]
+
+
+def test_parse_pytest_error_only_run_is_attributed_to_the_erroring_test() -> None:
+    """An ERROR-only run must name the erroring test, not the bare suite.
+
+    Regression guard for the ``<suite exited 1>: pytest ...`` signature
+    (SA-0MSRN0Q64005YR5A): pytest exits non-zero with no FAILED line, so the
+    error summary line is the only attribution available.
+    """
+    records = parse_pytest_failures(PYTEST_ERROR_ONLY_OUTPUT)
+    assert len(records) == 1
+    record = records[0]
+    assert record["test_name"] == "test_infra.py::test_needs_service"
+    assert "RuntimeError: service unavailable" in record["stack_trace"]
+    assert record["stdout_excerpt"]
+
+
+def test_parse_pytest_bare_error_line_without_message() -> None:
+    """A collection-error summary line without a message still parses."""
+    records = parse_pytest_failures(PYTEST_BARE_ERROR_OUTPUT)
+    assert len(records) == 1
+    record = records[0]
+    assert record["test_name"] == "tests/test_collect.py"
+    assert record["stdout_excerpt"]
+    assert record["stack_trace"]
+
+
+def test_parse_pytest_failures_and_errors_together() -> None:
+    """A run with both failure and error lines yields one record each."""
+    records = parse_pytest_failures(PYTEST_MIXED_FAILURE_AND_ERROR_OUTPUT)
+    names = [r["test_name"] for r in records]
+    assert names == ["test_demo.py::test_fail", "test_infra.py::test_needs_service"]
+    error_record = records[1]
+    assert "RuntimeError: boom" in error_record["stack_trace"]
 
 
 def test_parse_node_failures_shape() -> None:

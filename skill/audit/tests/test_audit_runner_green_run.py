@@ -1481,6 +1481,60 @@ class TestRunTestsViaTestSkill:
         assert "<suite exited 1>" in result["failures"][0]["test_name"]
         assert mock_triage.call_count == 1
 
+    def test_error_only_run_attributes_named_test(self, tmp_path):
+        """An ERROR-only non-zero run names the erroring test for triage.
+
+        Regression guard for SA-0MSRN0Q64005YR5A: pytest exits non-zero with
+        no FAILED line for collection/setup/teardown errors, so the error
+        summary line is the only attribution available — the run must not
+        degrade to a bare ``<suite exited 1>`` entry that triage cannot act on.
+        """
+        _with_pytest_config(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": (
+                        "..E\n"
+                        "==================== ERRORS ====================\n"
+                        "________ ERROR at setup of test_needs_service ________\n\n"
+                        "@pytest.fixture\ndef service():\n"
+                        ">       raise RuntimeError(\"boom\")\n"
+                        "E       RuntimeError: boom\n\n"
+                        "test_infra.py:7: RuntimeError\n"
+                        "=========================== short test summary info "
+                        "============================\n"
+                        "ERROR tests/test_infra.py::test_needs_service - "
+                        "RuntimeError: boom\n"
+                        "1 error, 2 passed in 0.05s\n"
+                    ),
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "triage.scripts.check_or_create.check_or_create",
+            return_value={"issueId": "SA-TRIAGE-1", "created": True},
+        ) as mock_triage:
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert len(result["failures"]) == 1
+        failure = result["failures"][0]
+        assert failure["test_name"] == "tests/test_infra.py::test_needs_service"
+        assert "<suite exited" not in failure["test_name"]
+        assert "RuntimeError: boom" in failure["stack_trace"]
+        assert mock_triage.call_count == 1
+        assert mock_triage.call_args.args[0]["test_name"] == (
+            "tests/test_infra.py::test_needs_service"
+        )
+
     def test_timeout_notice_fail_closed(self, tmp_path):
         """A suite timeout yields a notice, no evidence, no crash."""
         _with_pytest_config(tmp_path)

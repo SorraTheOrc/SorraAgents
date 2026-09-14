@@ -160,7 +160,17 @@ def detect_project_root() -> Path:
         pass
     return REPO_ROOT
 
-_FAILED_RE = re.compile(r"^FAILED\s+(.+?)\s+-\s+(.*)$", re.MULTILINE)
+# "Red" short-test-summary lines emitted by pytest ``-r a`` on a non-zero
+# run: ``FAILED <nodeid> - <message>`` for test failures and
+# ``ERROR <nodeid> - <message>`` for collection/setup/teardown errors (the
+# message is absent for some collection errors). Parsing only ``FAILED``
+# left error-only runs — which exit non-zero with no FAILED line — recorded
+# as a bare ``<suite exited N>: pytest ...`` entry with no named test, which
+# triage cannot act on (SA-0MSRN0Q64005YR5A).
+_RED_SUMMARY_RE = re.compile(
+    r"^(?P<kind>FAILED|ERROR)\s+(?P<name>.+?)(?:\s+-\s+(?P<message>.*))?$",
+    re.MULTILINE,
+)
 _SECTION_RE = re.compile(r"^_{5,}\s+(.+?)\s+_{5,}$", re.MULTILINE)
 _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
 
@@ -924,29 +934,41 @@ def filter_commands_for_suite(name: str, commands: list[str]) -> list[str]:
 def parse_pytest_failures(output: str) -> list[dict[str, str]]:
     """Parse pytest ``-r a`` output into per-failure structured records.
 
+    Both ``FAILED`` (test failures) and ``ERROR`` (collection / setup /
+    teardown errors) short-summary lines are parsed: an error-only run exits
+    non-zero without any ``FAILED`` line, and treating it as an unnamed
+    suite-level failure hid the responsible test from triage
+    (SA-0MSRN0Q64005YR5A).
+
     Each record contains ``test_name``, ``stdout_excerpt`` and ``stack_trace``
     in the shape expected by triage check_or_create.py.
     """
     records: list[dict[str, str]] = []
-    failed = list(_FAILED_RE.finditer(output))
-    for match in failed:
-        test_name = match.group(1).strip()
-        # Extract the traceback section for this test from the FAILURES block.
+    for match in _RED_SUMMARY_RE.finditer(output):
+        test_name = match.group("name").strip()
+        message = (match.group("message") or "").strip()
+        # Extract the traceback section for this test from the FAILURES or
+        # ERRORS block (both use the same ``____ <nodeid> ____`` header).
         stack_trace = _extract_pytest_section(output, test_name)
-        excerpt = stack_trace[:1000] if stack_trace else match.group(2).strip()
+        excerpt = stack_trace[:1000] if stack_trace else message
         records.append(
             {
                 "test_name": test_name,
-                "stdout_excerpt": excerpt,
-                "stack_trace": stack_trace or excerpt,
+                "stdout_excerpt": excerpt or test_name,
+                "stack_trace": stack_trace or excerpt or test_name,
             }
         )
     return records
 
 
 def _extract_pytest_section(output: str, test_name: str) -> str:
-    """Return the pytest FAILURES section body for a given test name."""
-    # The section header is the test node id's tail (function name or full id).
+    """Return the pytest FAILURES/ERRORS section body for a test name.
+
+    The section header is the test node id's tail (function name or full id),
+    optionally prefixed for errors — e.g. ``ERROR at setup of test_x`` — so
+    the tail is matched both exactly and as a header suffix
+    (SA-0MSRN0Q64005YR5A).
+    """
     tail = test_name.split("::")[-1]
     lines = output.splitlines()
     section_start = None
@@ -955,7 +977,9 @@ def _extract_pytest_section(output: str, test_name: str) -> str:
         if not m:
             continue
         header = m.group(1).strip()
-        if header == tail or header == test_name or header.endswith("::" + tail):
+        if header == test_name or re.search(
+            rf"(?:^|[\s:]){re.escape(tail)}$", header
+        ):
             section_start = i
             break
     if section_start is None:
