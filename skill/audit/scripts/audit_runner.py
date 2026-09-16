@@ -55,10 +55,12 @@ import argparse
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import select
 import shlex
+import statistics
 import subprocess
 import sys
 import threading
@@ -1495,6 +1497,135 @@ def _default_parent_timeout(n_children: int) -> int:
     / ``AUDIT_PARENT_TIMEOUT`` overrides replace this computed value entirely.
     """
     return PARENT_TIMEOUT_DEFAULT + n_children * PARENT_TIMEOUT_PER_CHILD
+
+
+# ---------------------------------------------------------------------------
+# Budget baseline derivation (SA-0MU32T6O0001UALR)
+# ---------------------------------------------------------------------------
+_PER_CALL_TIMING_RE = re.compile(
+    r"Per-call timing: "
+    r"issue_id=(\S+) "
+    r"context=(\S+) "
+    r"elapsed_seconds=([\d.]+)"
+)
+"""Regex to parse ``Per-call timing:`` debug-log lines emitted by
+``_maybe_log_debug_info``. Captures (issue_id, context, elapsed_seconds)."""
+
+
+def _parse_per_call_timing_lines(
+    timing_lines: list[str],
+) -> dict[str, list[float]]:
+    """Parse ``Per-call timing:`` lines into per-context elapsed seconds.
+
+    Args:
+        timing_lines: Lines from stderr/debug output matching the
+            ``Per-call timing:`` format.
+
+    Returns:
+        A ``dict`` mapping *context* (e.g. ``phase1_parent``,
+        ``phase2_deep``) to a list of elapsed-second floats collected
+        across all matching lines.
+
+    Example::
+
+        >>> lines = [
+        ...     "Per-call timing: issue_id=SA-1 context=phase1_parent elapsed_seconds=12.34",
+        ...     "Per-call timing: issue_id=SA-2 context=phase2_deep elapsed_seconds=45.67",
+        ...     "Per-call timing: issue_id=SA-3 context=phase1_parent elapsed_seconds=15.21",
+        ... ]
+        >>> result = _parse_per_call_timing_lines(lines)
+        >>> result["phase1_parent"]
+        [12.34, 15.21]
+        >>> result["phase2_deep"]
+        [45.67]
+    """
+    result: dict[str, list[float]] = {}
+    for line in timing_lines:
+        match = _PER_CALL_TIMING_RE.search(line)
+        if match:
+            context = match.group(2)
+            elapsed = float(match.group(3))
+            result.setdefault(context, []).append(elapsed)
+    return result
+
+
+def _derive_budget_baseline(
+    timing_lines: list[str],
+    safety_margin: float = 1.5,
+) -> dict[str, dict]:
+    """Derive right-sized per-phase budgets from measured timing data.
+
+    Parses ``Per-call timing:`` debug-log lines, computes the p50 and p95
+    per audit phase (context), applies a safety margin to the p95, and
+    returns a budget model summary.
+
+    Args:
+        timing_lines: Lines from stderr/debug output matching the
+            ``Per-call timing:`` format.
+        safety_margin: Multiplier applied to p95 to derive the per-call
+            budget. Default 1.5 (p95 + 50 % headroom).
+
+    Returns:
+        A ``dict`` keyed by context with values::
+
+            {
+                "context": str,
+                "count": int,
+                "p50": float,
+                "p95": float,
+                "budget": float,  # p95 * safety_margin
+                "mean": float,
+                "min": float,
+                "max": float,
+            }
+
+    If there are fewer than two samples for a phase, p95 falls back to the
+    max value (single-sample case).
+
+    Budget derivation formula::
+
+        budget = p95_per_phase × safety_margin
+
+    The parent-process budget is derived as::
+
+        parent_budget = PARENT_TIMEOUT_DEFAULT + sum(derived budgets)
+
+    This replaces the previous inconsistent ad-hoc values (~120s, 900s,
+    1500s, 3110s) with a single right-sized derivation based on measured
+    per-call timing data.
+    """
+    parsed = _parse_per_call_timing_lines(timing_lines)
+    if not parsed:
+        return {}
+
+    result: dict[str, dict] = {}
+    for context, elapsed_list in sorted(parsed.items()):
+        n = len(elapsed_list)
+        p50 = statistics.median(elapsed_list)
+        if n >= 2:
+            # Nearest-rank method for p95
+            sorted_vals = sorted(elapsed_list)
+            rank = math.ceil(0.95 * n)
+            p95 = sorted_vals[min(rank - 1, n - 1)]
+        else:
+            p95 = elapsed_list[0]
+        budget = round(p95 * safety_margin, 2)
+        result[context] = {
+            "count": n,
+            "p50": round(p50, 2),
+            "p95": round(p95, 2),
+            "budget": budget,
+            "mean": round(statistics.mean(elapsed_list), 2),
+            "min": round(min(elapsed_list), 2),
+            "max": round(max(elapsed_list), 2),
+        }
+    return result
+
+
+BUDGET_SAFE_MARGIN_DEFAULT = 1.5
+"""Default safety margin multiplier applied to p95 per-phase latency to
+derive the per-call budget. A value of 1.5 means the budget covers 95 % of
+observed calls with a 50 % headroom (SA-0MU32T6O0001UALR)."""
 
 
 def _resolve_max_child_audits(cli_value: int | None = None) -> int:
