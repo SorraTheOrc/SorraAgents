@@ -2469,9 +2469,14 @@ def _acquire_audit_slot(issue_id: str = "",
                 # free the slot and re-enter the poll.
                 sem.release()
         if time.monotonic() >= deadline:
+            elapsed = time.monotonic() - queued_wall
+            queue_depth = len(queue)
+            retry_seconds = max(1, int(queue_timeout / 3))
             raise TimeoutError(
                 f"audit concurrency queue '{AUDIT_QUEUE_NAME}' saturated: "
-                f"no slot within {queue_timeout:.0f}s"
+                f"no slot within {queue_timeout:.0f}s (waited {elapsed:.1f}s, "
+                f"{queue_depth} item(s) in queue); "
+                f"retry in {retry_seconds}s after fewer audits complete"
             )
         time.sleep(AUDIT_QUEUE_POLL_SECONDS)
 
@@ -8333,13 +8338,22 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
     Never raises: a ``RuntimeError`` is recorded via *on_runtime_error*
     (script name ``pi (<failure_label>)``) and converts to a diagnostic
     fallback result.
+
+    When *context* is ``"parent"``, the priority is forced to
+    ``Priority.CRITICAL`` (SA-0MU32T8SH001R8MZ) so that Phase 1 parent
+    screening is never starved by lower-priority concurrent audit calls.
     """
+    # Force CRITICAL priority for parent-screening calls so they are never
+    # starved by lower-priority concurrent audits (SA-0MU32T8SH001R8MZ AC1).
+    effective_priority = priority
+    if context == "parent":
+        effective_priority = Priority.CRITICAL
     try:
         result = _call_pi_and_maybe_log(
             issue_id, context, prompt, model=model, pi_bin=pi_bin,
             debug_log=debug_log, enable_tools=enable_tools, timeout=timeout,
             ac_fallback_used=ac_fallback_used, child_screen=child_screen,
-            priority=priority,
+            priority=effective_priority,
         )
     except RuntimeError as exc:
         on_runtime_error(f"pi ({failure_label})", exc)
