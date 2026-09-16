@@ -8962,8 +8962,26 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             and checkpoint.is_resuming
             and checkpoint.phase_status(PHASE_CHILDREN) == STATUS_COMPLETED
         )
-        if (checkpoint is not None and checkpoint.is_resuming
-                and checkpoint.phase_status(PHASE_PHASE2) == STATUS_COMPLETED):
+        phase2_checkpointed = (
+            checkpoint is not None
+            and checkpoint.is_resuming
+            and checkpoint.phase_status(PHASE_PHASE2) == STATUS_COMPLETED
+        )
+        # Budget-exceeded children are the ONE exception to "completed phase →
+        # skip": a prior run that recorded them `partial (budget exceeded)`
+        # never verified their ACs. The checkpoint markers identify exactly
+        # which children must be re-audited on resume (SA-0MU33XG8P004GX8K).
+        budget_exceeded_ids = (
+            set(checkpoint.budget_exceeded_children())
+            if checkpoint is not None else set()
+        )
+        budget_reaudit_needed = audit_children and bool(budget_exceeded_ids)
+        # When Phase 2 already completed but budget-exceeded children remain,
+        # the parent deep analysis MUST NOT be re-run — re-audit only the
+        # affected children and deep-analyse just those (AC3).
+        child_only_phase2 = phase2_checkpointed and budget_reaudit_needed
+
+        if phase2_checkpointed and not budget_reaudit_needed:
             # The children + Phase 2 segment completed in a prior run:
             # restore the final pipeline state and skip this phase entirely.
             st = checkpoint.accumulated_state()
@@ -8995,15 +9013,10 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                 f"{PHASE_LABELS[PHASE_CHILDREN]}",
                 file=sys.stderr,
             )
-            # Budget-exceeded children are the ONE exception to "completed
-            # phase → skip": their ACs were never verified, only recorded as
-            # `partial (budget exceeded)`. Re-audit exactly those children so
-            # a resumed run completes them without re-running any completed
-            # segment (SA-0MU32T6O0001UALR / SA-0MU33XG8P004GX8K AC1-AC3).
-            if audit_children and checkpoint.budget_exceeded_children():
+            if budget_reaudit_needed:
                 child_results, _reaudit_rc = _reaudit_budget_exceeded_children(
                     ctx, child_results,
-                    set(checkpoint.budget_exceeded_children()),
+                    budget_exceeded_ids,
                     child_persist_results,
                 )
                 if _reaudit_rc is not None:
@@ -9444,6 +9457,10 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    # A phase2-completed resume that is only re-auditing
+                    # budget-exceeded children must NOT re-run the parent
+                    # deep analysis (AC3) — children only.
+                    skip_parent_deep=child_only_phase2,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
                     child_in_main_slot=ctx.child_in_main_slot,
