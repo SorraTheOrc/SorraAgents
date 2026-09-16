@@ -314,7 +314,7 @@ class CheckpointStore:
         self,
         child_id: str,
         elapsed_s: float,
-        budget_s: int | float,
+        budget_s: float,
     ) -> None:
         """Record a child skipped because the parent-process budget ran out.
 
@@ -350,6 +350,25 @@ class CheckpointStore:
         entry = self._data.get("phases", {}).get(PHASE_CHILDREN) or {}
         exceeded = entry.get("budget_exceeded") or {}
         return dict(exceeded)
+
+    def clear_budget_exceeded(self, child_id: str) -> None:
+        """Remove the budget-exceeded marker for *child_id*.
+
+        Called by a resumed run once a previously budget-exceeded child has
+        been re-audited: the marker no longer represents an unverified
+        child, so the checkpoint can be cleared after the run succeeds
+        (SA-0MU33XG8P004GX8K). Idempotent and a no-op when no marker exists.
+        """
+        entry = self._data.get("phases", {}).get(PHASE_CHILDREN)
+        if not isinstance(entry, dict):
+            return
+        exceeded = entry.get("budget_exceeded")
+        if not isinstance(exceeded, dict) or child_id not in exceeded:
+            return
+        del exceeded[child_id]
+        if not exceeded:
+            entry.pop("budget_exceeded", None)
+        self._write()
 
     # ------------------------------------------------------------------
     # Reporting

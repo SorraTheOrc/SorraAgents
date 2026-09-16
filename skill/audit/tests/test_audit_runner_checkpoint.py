@@ -503,3 +503,228 @@ class TestCmdIssueCheckpoint:
         fresh = _open_store(tmp_path, head=HEAD_BASE)
         assert fresh.is_resuming is False
         assert not fresh.path().exists()
+
+# ---------------------------------------------------------------------------
+# Budget-exceeded resume completion (SA-0MU32T6O0001UALR / SA-0MU33XG8P004GX8K)
+# ---------------------------------------------------------------------------
+
+
+class TestBudgetExceededReaudit:
+    """A resumed run re-audits exactly the children a prior run skipped for
+    budget reasons, while completed phases/children are never re-run."""
+
+    def _seed_resume_store(self, tmp_path, child_results):
+        """Seed a checkpoint whose phase1_parent + phase1_children completed,
+        then reopen it as a resuming store."""
+        store = _open_store(tmp_path)
+        store.mark_completed(
+            PHASE_PARENT,
+            {"ac_results": [{"text": "AC1: x", "verdict": "met",
+                             "evidence": "parent"}]},
+        )
+        store.mark_completed(PHASE_CHILDREN, {
+            "ac_results": [{"text": "AC1: x", "verdict": "met",
+                            "evidence": "parent"}],
+            "child_results": child_results,
+            "child_persist_results": [],
+            "phase2_completed": False,
+            "phase2_skip_note": None,
+        })
+        return _open_store(tmp_path)
+
+    def test_helper_reaudits_only_budget_exceeded_child(self, tmp_path, capsys):
+        """AC1: the helper screens exactly the budget-exceeded child using the
+        full child dict (description), replaces the placeholder verdicts and
+        clears the checkpoint marker — leaving completed children untouched."""
+        store = _open_store(tmp_path)
+        store.mark_child_budget_exceeded("CHILD-1", 800.0, 710)
+        child_results = [
+            {"id": "CHILD-1", "title": "C1", "status": "open",
+             "child_audit_ready": False, "budget_exceeded": True,
+             "ac_results": [{"text": "partial (budget exceeded)",
+                             "verdict": "partial", "evidence": "budget"}]},
+            {"id": "CHILD-2", "title": "C2", "status": "completed",
+             "child_audit_ready": True,
+             "ac_results": [{"text": "AC2", "verdict": "met",
+                             "evidence": "done"}]},
+        ]
+        ctx = _make_ctx(checkpoint=store)
+        ctx.children = [
+            {"id": "CHILD-1", "title": "C1",
+             "description": "## Acceptance Criteria\n- AC1: c1"},
+            {"id": "CHILD-2", "title": "C2",
+             "description": "## Acceptance Criteria\n- AC2: c2"},
+        ]
+        persisted: list[dict] = []
+        with mock.patch.object(
+            audit_runner, "_phase1_review_child_acs",
+            return_value=(0, [{"text": "AC1: c1", "verdict": "met",
+                               "evidence": "reaudited"}]),
+        ) as review:
+            result, rc = audit_runner._reaudit_budget_exceeded_children(
+                ctx, child_results, {"CHILD-1"}, persisted,
+            )
+
+        assert rc is None
+        review.assert_called_once()
+        # The full child dict (with description) was passed, not the
+        # description-less restored result.
+        assert "AC1: c1" in review.call_args.args[1]["description"]
+        # Placeholder replaced and marker removed.
+        assert result[0]["ac_results"][0]["evidence"] == "reaudited"
+        assert result[0]["reaudited_after_budget_exceeded"] is True
+        assert "budget_exceeded" not in result[0]
+        assert store.budget_exceeded_children() == {}
+        # Completed child untouched (never re-screened).
+        assert result[1]["ac_results"][0]["evidence"] == "done"
+        assert "reaudited_after_budget_exceeded" not in result[1]
+        assert "[checkpoint] Re-auditing 1 budget-exceeded child(ren)" in \
+            capsys.readouterr().err
+
+    def test_helper_persists_reaudited_child_on_success(self, tmp_path):
+        """AC1: with persist set, a re-audited child's report is persisted and
+        recorded in child_persist_results (no orphaned in-memory verdict)."""
+        store = _open_store(tmp_path)
+        store.mark_child_budget_exceeded("CHILD-1", 800.0, 710)
+        child_results = [{
+            "id": "CHILD-1", "title": "C1", "status": "open", "stage": "",
+            "child_audit_ready": False, "budget_exceeded": True,
+            "ac_results": [{"text": "partial (budget exceeded)",
+                            "verdict": "partial", "evidence": "budget"}],
+        }]
+        ctx = _make_ctx(checkpoint=store)
+        ctx.persist = True
+        ctx.children = [{"id": "CHILD-1", "title": "C1",
+                         "description": "## Acceptance Criteria\n- AC1: c1"}]
+        persisted: list[dict] = []
+        with mock.patch.object(
+            audit_runner, "_phase1_review_child_acs",
+            return_value=(0, [{"text": "AC1: c1", "verdict": "met",
+                               "evidence": "reaudited"}]),
+        ), mock.patch.object(
+            audit_runner, "_persist_child_audit",
+            return_value=(0, "report"),
+        ) as persist_mock:
+            _result, rc = audit_runner._reaudit_budget_exceeded_children(
+                ctx, child_results, {"CHILD-1"}, persisted,
+            )
+        assert rc is None
+        persist_mock.assert_called_once()
+        assert persisted == [{"id": "CHILD-1", "title": "C1",
+                              "success": True}]
+
+    def test_helper_persist_failure_aborts(self, tmp_path):
+        """A re-audited child whose audit fails to persist aborts the run
+        (mirrors the normal path's fatal child-persist rule)."""
+        store = _open_store(tmp_path)
+        store.mark_child_budget_exceeded("CHILD-1", 800.0, 710)
+        child_results = [{
+            "id": "CHILD-1", "title": "C1", "status": "open", "stage": "",
+            "child_audit_ready": False, "budget_exceeded": True,
+            "ac_results": [{"text": "partial (budget exceeded)",
+                            "verdict": "partial", "evidence": "budget"}],
+        }]
+        ctx = _make_ctx(checkpoint=store)
+        ctx.persist = True
+        ctx.children = [{"id": "CHILD-1", "title": "C1",
+                         "description": "## Acceptance Criteria\n- AC1: c1"}]
+        with mock.patch.object(
+            audit_runner, "_phase1_review_child_acs",
+            return_value=(0, [{"text": "AC1: c1", "verdict": "met",
+                               "evidence": "reaudited"}]),
+        ), mock.patch.object(
+            audit_runner, "_persist_child_audit", return_value=(1, "report"),
+        ):
+            _result, rc = audit_runner._reaudit_budget_exceeded_children(
+                ctx, child_results, {"CHILD-1"}, [],
+            )
+        assert rc == 1
+
+    def test_resume_reaudits_without_rerunning_completed_phase(
+        self, tmp_path, capsys
+    ):
+        """AC1-AC3: _phase_children on a resumed run re-audits the
+        budget-exceeded child, skips the completed child, clears the
+        checkpoint marker and proceeds to Phase 2 — the completed parent
+        phase is never re-run."""
+        child_results = [
+            {"id": "CHILD-1", "title": "C1", "status": "completed",
+             "stage": "in_review",
+             "child_audit_ready": False, "budget_exceeded": True,
+             "ac_results": [{"text": "partial (budget exceeded)",
+                             "verdict": "partial", "evidence": "budget"}]},
+            {"id": "CHILD-2", "title": "C2", "status": "completed",
+             "stage": "done", "child_audit_ready": True,
+             "ac_results": [{"text": "AC2", "verdict": "met",
+                             "evidence": "done"}]},
+        ]
+        reopened = self._seed_resume_store(tmp_path, child_results)
+        reopened.mark_child_budget_exceeded("CHILD-1", 800.0, 710)
+        reopened = _open_store(tmp_path)
+        assert reopened.is_resuming is True
+        ctx = _make_ctx(checkpoint=reopened)
+        ctx.audit_children = True
+        ctx.children = [
+            {"id": "CHILD-1", "title": "C1",
+             "description": "## Acceptance Criteria\n- AC1: c1"},
+            {"id": "CHILD-2", "title": "C2",
+             "description": "## Acceptance Criteria\n- AC2: c2"},
+        ]
+        with mock.patch.object(
+            audit_runner, "_phase1_review_child_acs",
+            return_value=(0, [{"text": "AC1: c1", "verdict": "met",
+                               "evidence": "reaudited"}]),
+        ) as review, mock.patch.object(
+            audit_runner, "_run_phase2_deep_analysis",
+            side_effect=lambda issue, ac, cr, **kw: (ac, cr, True),
+        ) as deep:
+            rc = audit_runner._phase_children(ctx)
+
+        assert rc is None
+        # Only the budget-exceeded child was re-screened.
+        review.assert_called_once()
+        assert review.call_args.args[0] == 0
+        assert ctx.child_results[0]["reaudited_after_budget_exceeded"] is True
+        assert ctx.child_results[0]["ac_results"][0]["evidence"] == "reaudited"
+        assert "budget_exceeded" not in ctx.child_results[0]
+        assert ctx.child_results[1]["ac_results"][0]["evidence"] == "done"
+        # Marker cleared → the checkpoint can be cleared on success.
+        assert reopened.budget_exceeded_children() == {}
+        assert deep.called
+        err = capsys.readouterr().err
+        assert "Re-auditing 1 budget-exceeded child(ren)" in err
+        assert "Re-audited budget-exceeded child CHILD-1" in err
+
+    def test_resume_without_markers_skips_reaudit(self, tmp_path):
+        """A resume with no budget-exceeded markers is unchanged: no Phase 1
+        child screening is re-run."""
+        child_results = [
+            {"id": "CHILD-2", "title": "C2", "status": "open",
+             "child_audit_ready": False,
+             "ac_results": [{"text": "AC2", "verdict": "met",
+                             "evidence": "screened"}]},
+        ]
+        reopened = self._seed_resume_store(tmp_path, child_results)
+        ctx = _make_ctx(checkpoint=reopened)
+        ctx.audit_children = True
+        ctx.children = [{"id": "CHILD-2", "title": "C2",
+                         "description": "## Acceptance Criteria\n- AC2: c2"}]
+        with mock.patch.object(
+            audit_runner, "_phase1_review_child_acs", return_value=(0, [])
+        ) as review, mock.patch.object(
+            audit_runner, "_run_phase2_deep_analysis",
+            side_effect=lambda issue, ac, cr, **kw: (ac, cr, True),
+        ):
+            rc = audit_runner._phase_children(ctx)
+        assert rc is None
+        review.assert_not_called()
+        assert ctx.child_results[0]["ac_results"][0]["evidence"] == "screened"
+
+    def test_completed_budget_marker_from_other_head_not_reused(self, tmp_path):
+        """Safety: a budget-exceeded marker written under a different git HEAD
+        is never loaded, so the resumed run does not act on a stale child."""
+        seed = _open_store(tmp_path, head=HEAD_OTHER)
+        seed.mark_child_budget_exceeded("CHILD-1", 800.0, 710)
+        current = _open_store(tmp_path, head=HEAD_BASE)
+        assert current.is_resuming is False
+        assert current.budget_exceeded_children() == {}

@@ -31,7 +31,6 @@ import pytest
 from audit.scripts import audit_runner
 from audit.scripts.checkpoint_store import (
     PHASE_CHILDREN,
-    STATUS_COMPLETED,
     CheckpointStore,
 )
 from audit.tests.wl_helpers import stateful_wl_side_effect
@@ -145,6 +144,29 @@ class TestCheckpointBudgetExceeded:
         store.mark_child_budget_exceeded("CHILD-1", 800.0, 710)
         store.mark_completed(PHASE_CHILDREN, {"child_results": []})
         assert store.budget_exceeded_children()["CHILD-1"]["elapsed_s"] == 800.0
+
+    def test_clear_budget_exceeded_removes_one_marker(self, tmp_path):
+        """clear_budget_exceeded drops a single re-audited child's marker
+        (AC1: the resume no longer treats it as unverified)."""
+        store = self._open_store(tmp_path)
+        store.mark_child_budget_exceeded("CHILD-1", 800.0, 710)
+        store.mark_child_budget_exceeded("CHILD-2", 900.0, 710)
+        store.clear_budget_exceeded("CHILD-1")
+        assert set(store.budget_exceeded_children()) == {"CHILD-2"}
+        assert store.budget_exceeded_children()["CHILD-2"]["elapsed_s"] == 900.0
+
+    def test_clear_budget_exceeded_persists_to_disk(self, tmp_path):
+        """The cleared state survives a reopen (a resumed run sees no
+        remaining budget-exceeded markers)."""
+        store = self._open_store(tmp_path)
+        store.mark_child_budget_exceeded("CHILD-1", 800.0, 710)
+        store.clear_budget_exceeded("CHILD-1")
+        assert self._open_store(tmp_path).budget_exceeded_children() == {}
+
+    def test_clear_budget_exceeded_unknown_child_is_noop(self, tmp_path):
+        store = self._open_store(tmp_path)
+        store.clear_budget_exceeded("CHILD-1")  # no marker / no phase
+        assert store.budget_exceeded_children() == {}
 
 
 class TestRecordChildBudgetExceeded:

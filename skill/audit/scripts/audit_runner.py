@@ -8532,6 +8532,112 @@ def _record_child_budget_exceeded(
     )
 
 
+def _reaudit_budget_exceeded_children(
+    ctx: _AuditContext,
+    child_results: list[dict],
+    exceeded_ids: set[str],
+    child_persist_results: list[dict],
+) -> tuple[list[dict], int | None]:
+    """Re-audit the children a prior run skipped for budget reasons.
+
+    A resumed run skips the Phase 1 child screening entirely because the
+    phase completed in the checkpoint — but a child recorded as
+    budget-exceeded only carries ``partial (budget exceeded)`` placeholder
+    AC verdicts, never verified ones. This re-runs the Phase 1 child AC
+    screen for EXACTLY those children (the full child dict with description
+    is looked up from ``ctx.children``), replaces the placeholders with real
+    verdicts, clears the checkpoint markers, and (when ``persist``) persists
+    each re-audited child's report — without touching any other restored
+    child result, so completed phases/children are never re-run
+    (SA-0MU32T6O0001UALR / SA-0MU33XG8P004GX8K AC1-AC3).
+
+    Args:
+        ctx: The audit context (runner, models, persist flags).
+        child_results: Restored child results from the checkpoint; the
+            budget-exceeded placeholders are replaced in-place.
+        exceeded_ids: Ids of children marked budget-exceeded in the
+            checkpoint (``checkpoint.budget_exceeded_children()``).
+        child_persist_results: Reporting list accumulated from the prior
+            run; successful re-audit persists are appended.
+
+    Returns:
+        ``(child_results, None)`` on success, or ``(child_results, rc)``
+        with a non-zero exit code when a re-audited child's audit could not
+        be persisted (mirrors the fatal child-persist rule of the normal
+        path — a parent report whose child audits never landed is
+        misleading).
+    """
+    targets = [
+        (i, cr) for i, cr in enumerate(child_results)
+        if cr.get("id") in exceeded_ids
+    ]
+    if not targets:
+        return child_results, None
+    checkpoint = ctx.checkpoint
+    children_by_id = {
+        c.get("id"): c for c in ctx.children if c.get("id")
+    }
+    print(
+        f"[checkpoint] Re-auditing {len(targets)} budget-exceeded "
+        f"child(ren): {', '.join(cr.get('id', '') for _, cr in targets)}",
+        file=sys.stderr,
+    )
+    for ci, cr in targets:
+        child_id = cr.get("id", "")
+        source = children_by_id.get(child_id, cr)
+        _, acs = _phase1_review_child_acs(
+            ci, source,
+            ctx.resolved_phase1_model, ctx.resolved_model,
+            ctx.pi_bin, ctx.debug_log, ctx.timeout,
+            ctx.runner, ctx.record_script_failure,
+            ac_fallback_used=ctx.ac_fallback_used,
+            child_in_main_slot=ctx.child_in_main_slot,
+        )
+        cr["ac_results"] = acs
+        cr["child_audit_ready"] = False
+        cr["child_audit_not_ready"] = False
+        cr["reaudited_after_budget_exceeded"] = True
+        cr.pop("budget_exceeded", None)
+        if checkpoint is not None:
+            checkpoint.clear_budget_exceeded(child_id)
+        if ctx.persist:
+            fingerprint = _compute_content_fingerprint(
+                ctx.runner, child_id, worklog_dir=ctx.worklog_dir,
+            )
+            child_rc, _report = _persist_child_audit(
+                child_id=child_id,
+                child_title=cr.get("title", ""),
+                child_status=cr.get("status", ""),
+                child_stage=cr.get("stage", ""),
+                ac_results=acs,
+                pi_bin=ctx.pi_bin,
+                model=ctx.resolved_model,
+                model_source=ctx.model_source,
+                worklog_dir=ctx.worklog_dir,
+                content_fingerprint=fingerprint,
+            )
+            child_persist_results.append({
+                "id": child_id,
+                "title": cr.get("title", ""),
+                "success": child_rc == 0,
+            })
+            if child_rc != 0 and child_rc != PERSIST_CONTENT_INVALID:
+                print(
+                    f"Error: Failed to persist re-audited child {child_id}: "
+                    f"persist_audit returned exit code {child_rc}. Aborting "
+                    "the run — the parent report would be misleading without "
+                    "the child audit.",
+                    file=sys.stderr,
+                )
+                return child_results, 1
+        print(
+            f"[checkpoint] Re-audited budget-exceeded child {child_id} — "
+            f"{len(acs)} AC result(s) restored",
+            file=sys.stderr,
+        )
+    return child_results, None
+
+
 def _children_need_phase2(child_results: list[dict]) -> bool:
     """Whether any restored child still needs Phase 2 deep analysis.
 
@@ -8889,6 +8995,19 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                 f"{PHASE_LABELS[PHASE_CHILDREN]}",
                 file=sys.stderr,
             )
+            # Budget-exceeded children are the ONE exception to "completed
+            # phase → skip": their ACs were never verified, only recorded as
+            # `partial (budget exceeded)`. Re-audit exactly those children so
+            # a resumed run completes them without re-running any completed
+            # segment (SA-0MU32T6O0001UALR / SA-0MU33XG8P004GX8K AC1-AC3).
+            if audit_children and checkpoint.budget_exceeded_children():
+                child_results, _reaudit_rc = _reaudit_budget_exceeded_children(
+                    ctx, child_results,
+                    set(checkpoint.budget_exceeded_children()),
+                    child_persist_results,
+                )
+                if _reaudit_rc is not None:
+                    return _reaudit_rc
         else:
             _checkpoint_phase_start(checkpoint, PHASE_CHILDREN)
 
