@@ -8479,6 +8479,59 @@ def _checkpoint_phase_done(checkpoint: CheckpointStore | None,
         )
 
 
+BUDGET_EXCEEDED_TEXT = "partial (budget exceeded)"
+"""Canonical AC text for a child skipped because the parent-process
+elapsed-time budget ran out (SA-0MU32T6O0001UALR). A budget-exceeded
+verdict is ``partial`` (fail-closed: an unverified AC never becomes
+``met``) and is distinct from a genuine ``partial`` code finding."""
+
+
+def _budget_exceeded_ac_result(elapsed_s: float, budget_s: float) -> dict:
+    """Build the AC result recorded when the parent-process budget is spent.
+
+    The verdict is ``partial`` (never ``met``) with the canonical
+    ``partial (budget exceeded)`` text and a diagnostic naming the elapsed
+    time, the budget, and the remediation (``--parent-timeout`` /
+    ``AUDIT_PARENT_TIMEOUT``) — replacing the old bare
+    "Skipped due to audit timeout" skip that hid the cause
+    (SA-0MU32T6O0001UALR AC2).
+    """
+    return {
+        "text": BUDGET_EXCEEDED_TEXT,
+        "verdict": "partial",
+        "evidence": (
+            f"Budget exceeded: child skipped after {elapsed_s:.0f}s total "
+            f"elapsed time (parent-process budget {budget_s:.0f}s). The "
+            f"child's ACs were NOT verified; raise the budget via "
+            f"--parent-timeout or AUDIT_PARENT_TIMEOUT and re-run. A resumed "
+            f"run re-audits budget-exceeded children."
+        ),
+    }
+
+
+def _record_child_budget_exceeded(
+    checkpoint: CheckpointStore | None,
+    child_id: str,
+    elapsed_s: float,
+    budget_s: float,
+) -> None:
+    """Persist a budget-exceeded child marker to the checkpoint immediately.
+
+    Best-effort: a ``None`` checkpoint (checkpointing disabled) is a no-op.
+    The write happens at the moment the budget trips (mid-phase), so a run
+    killed after the guard fires still leaves a resumable record
+    (SA-0MU32T6O0001UALR AC2/AC3).
+    """
+    if checkpoint is None:
+        return
+    checkpoint.mark_child_budget_exceeded(child_id, elapsed_s, budget_s)
+    print(
+        f"[checkpoint] recorded budget-exceeded child {child_id} "
+        f"({elapsed_s:.0f}s elapsed / {budget_s:.0f}s budget)",
+        file=sys.stderr,
+    )
+
+
 def _children_need_phase2(child_results: list[dict]) -> bool:
     """Whether any restored child still needs Phase 2 deep analysis.
 
@@ -8852,30 +8905,37 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         "effort": child.get("effort"),
                         "risk": child.get("risk"),
                     }
-                    # Skip remaining children if we're too close to the parent
-                    # timeout (elapsed_guard). This prevents a silent external kill
-                    # and instead produces a clear diagnostic for skipped audits.
+                    # Stop auditing remaining children once the parent-process
+                    # elapsed-time budget (elapsed_guard) is spent. The previous
+                    # run silently skips with a bare "Skipped due to audit
+                    # timeout"; instead record an explicit
+                    # ``partial (budget exceeded)`` verdict, persist a resumable
+                    # checkpoint marker immediately, and name the remediation
+                    # (SA-0MU32T6O0001UALR AC2/AC3).
                     if _elapsed() >= elapsed_guard:
+                        elapsed_now = _elapsed()
                         print(
-                            f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
-                            f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
-                            "Manual audit required for this child. Raise the budget via "
-                            "--parent-timeout or AUDIT_PARENT_TIMEOUT.",
+                            f"Warning: parent-process budget exceeded "
+                            f"({elapsed_now:.0f}s elapsed / {elapsed_guard}s "
+                            f"budget). Recording child {child.get('id', '')} "
+                            f"({child.get('title', '')}) as "
+                            f"{BUDGET_EXCEEDED_TEXT}. Raise the budget via "
+                            f"--parent-timeout or AUDIT_PARENT_TIMEOUT and "
+                            f"re-run to complete the audit.",
                             file=sys.stderr,
                         )
-                        cr["ac_results"] = [{
-                            "text": "Skipped due to audit timeout. Manual audit required.",
-                            "verdict": "unmet",
-                            "evidence": (
-                                f"Audit runner skipped this child after "
-                                f"{_elapsed():.0f}s total elapsed time to avoid "
-                                f"the parent process timeout ({elapsed_guard}s "
-                                f"budget; raise via --parent-timeout or "
-                                f"AUDIT_PARENT_TIMEOUT). Manual audit required."
-                            ),
-                        }]
+                        cr["ac_results"] = [
+                            _budget_exceeded_ac_result(
+                                elapsed_now, float(elapsed_guard)
+                            )
+                        ]
                         cr["child_audit_ready"] = False
+                        cr["budget_exceeded"] = True
                         child_results.append(cr)
+                        _record_child_budget_exceeded(
+                            checkpoint, cr["id"], elapsed_now,
+                            float(elapsed_guard),
+                        )
                         continue
 
                     # Completed/done children are exempt (AC5): their audits are not
@@ -9357,19 +9417,29 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         "risk": child.get("risk"),
                     }
                     if _elapsed() >= elapsed_guard:
-                        cr["ac_results"] = [{
-                            "text": "Skipped due to audit timeout. Manual audit required.",
-                            "verdict": "unmet",
-                            "evidence": (
-                                f"Audit runner skipped this child after "
-                                f"{_elapsed():.0f}s total elapsed time to avoid "
-                                f"the parent process timeout ({elapsed_guard}s "
-                                f"budget; raise via --parent-timeout or "
-                                f"AUDIT_PARENT_TIMEOUT). Manual audit required."
-                            ),
-                        }]
+                        elapsed_now = _elapsed()
+                        print(
+                            f"Warning: parent-process budget exceeded "
+                            f"({elapsed_now:.0f}s elapsed / {elapsed_guard}s "
+                            f"budget). Recording child {child.get('id', '')} "
+                            f"({child.get('title', '')}) as "
+                            f"{BUDGET_EXCEEDED_TEXT}. Raise the budget via "
+                            f"--parent-timeout or AUDIT_PARENT_TIMEOUT and "
+                            f"re-run to complete the audit.",
+                            file=sys.stderr,
+                        )
+                        cr["ac_results"] = [
+                            _budget_exceeded_ac_result(
+                                elapsed_now, float(elapsed_guard)
+                            )
+                        ]
                         cr["child_audit_ready"] = False
+                        cr["budget_exceeded"] = True
                         child_results.append(cr)
+                        _record_child_budget_exceeded(
+                            checkpoint, cr["id"], elapsed_now,
+                            float(elapsed_guard),
+                        )
                         continue
 
                     if child.get("status") == "completed" and child.get("stage") == "done":
@@ -10355,13 +10425,24 @@ def cmd_issue(issue_id: str, persist: bool = True,
         if lifecycle_rc != 0:
             rc = lifecycle_rc
     if rc == 0 and ctx.checkpoint is not None:
-        try:
-            ctx.checkpoint.clear()
-        except Exception as exc:  # noqa: BLE001 -- best-effort cleanup
+        if ctx.checkpoint.budget_exceeded_children():
+            # Budget-exceeded children remain unverified: KEEP the checkpoint
+            # so a resumed run can re-audit exactly those children without
+            # re-running completed phases (SA-0MU32T6O0001UALR AC3). Clearing
+            # here would silently lose which children were skipped.
             print(
-                f"Warning: could not clear audit checkpoint after success: {exc}",
+                "[checkpoint] budget-exceeded children remain; checkpoint "
+                "kept for resume",
                 file=sys.stderr,
             )
+        else:
+            try:
+                ctx.checkpoint.clear()
+            except Exception as exc:  # noqa: BLE001 -- best-effort cleanup
+                print(
+                    f"Warning: could not clear audit checkpoint after success: {exc}",
+                    file=sys.stderr,
+                )
     # Batch drain (SA-0MTG5TP5Z008QBL5): after a successful primary audit,
     # drain additional queued work items within the same dispatch window.
     # Never changes the primary's exit code — drained items persist and

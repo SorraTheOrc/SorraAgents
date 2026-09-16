@@ -308,6 +308,50 @@ class CheckpointStore:
         self._write()
 
     # ------------------------------------------------------------------
+    # Budget-exceeded tracking (SA-0MU32T6O0001UALR)
+    # ------------------------------------------------------------------
+    def mark_child_budget_exceeded(
+        self,
+        child_id: str,
+        elapsed_s: float,
+        budget_s: int | float,
+    ) -> None:
+        """Record a child skipped because the parent-process budget ran out.
+
+        Persists *immediately* (mid-phase checkpoint write) so an interrupted
+        or externally-killed run leaves a resumable record of which children
+        were skipped for budget reasons — rather than silently losing them.
+
+        The marker is stored under
+        ``phases[phase1_children].budget_exceeded[child_id]`` as
+        ``{"elapsed_s": float, "budget_s": float, "recorded_at": epoch}``.
+        A resume can then re-audit exactly those children (the
+        budget-exceeded contract; SA-0MU33XG8P004GX8K).
+        """
+        entry = self._data.setdefault("phases", {}).setdefault(
+            PHASE_CHILDREN, {"status": STATUS_PENDING}
+        )
+        exceeded = entry.setdefault("budget_exceeded", {})
+        exceeded[child_id] = {
+            "elapsed_s": float(elapsed_s),
+            "budget_s": float(budget_s),
+            "recorded_at": time.time(),
+        }
+        self._write()
+
+    def budget_exceeded_children(self) -> dict[str, dict]:
+        """Return the per-child budget-exceeded markers recorded so far.
+
+        Empty when no child was skipped for budget reasons. The mapping is
+        loaded from the phase-1-children checkpoint entry and is safe to call
+        on a resumed store (stale/foreign HEAD checkpoints are never loaded —
+        see the class docstring).
+        """
+        entry = self._data.get("phases", {}).get(PHASE_CHILDREN) or {}
+        exceeded = entry.get("budget_exceeded") or {}
+        return dict(exceeded)
+
+    # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
     def summary(self) -> str:

@@ -1496,18 +1496,25 @@ class TestParentTimeoutGuardBehavior:
     def test_default_guard_skips_child_in_pathological_run(self, capsys):
         """AC5/AC3: The scaled default guard (710s for a 1-child parent) still
         trips for a pathological elapsed time (800s), and the skip diagnostic
-        names the computed budget and the override."""
+        records an explicit ``partial (budget exceeded)`` verdict naming the
+        computed budget and the override (SA-0MU32T6O0001UALR AC2) — never a
+        bare "Skipped due to audit timeout" skip."""
         rc = self._run(parent_timeout=None, elapsed=800.0)
-        payload = json.loads(capsys.readouterr().out)
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        err = captured.err
 
         assert rc == 0
         child = payload["children"][0]
         ac = child["ac_results"][0]
-        assert ac["verdict"] == "unmet"
-        assert ac["text"] == "Skipped due to audit timeout. Manual audit required."
-        assert "(710s budget" in ac["evidence"]
+        assert ac["verdict"] == "partial"
+        assert ac["text"] == "partial (budget exceeded)"
+        assert "710s" in ac["evidence"]
         assert "--parent-timeout" in ac["evidence"]
         assert "AUDIT_PARENT_TIMEOUT" in ac["evidence"]
+        assert child.get("budget_exceeded") is True
+        assert "Skipped due to audit timeout" not in err
+        assert "Skipped due to audit timeout" not in json.dumps(payload)
 
     def test_override_audits_child_previously_skipped(self, capsys):
         """AC3: With --parent-timeout 600, the same run audits the child."""
