@@ -143,6 +143,20 @@ whole audit:
   `phase1_children` restores the child verdicts and re-runs only the Phase 2
   segment for children that still need deep analysis. An in-progress
   (interrupted) phase is always re-run from its start.
+- **Budget-exceeded children resume (SA-0MU32T6O0001UALR /
+  SA-0MU33XG8P004GX8K):** the ONE exception to "completed phase → skip". When
+  the parent-process elapsed-time guard trips, each remaining child is
+  recorded with a single `partial (budget exceeded)` AC result and a
+  per-child marker `phases[phase1_children].budget_exceeded[<child-id>]` is
+  written to the checkpoint **immediately** (mid-phase — never deferred to
+  phase completion) so an interrupted/killed run still leaves a resumable
+  record. On a resumed run (same issue id + HEAD) exactly the marked children
+  are re-audited in Phase 1 and their markers cleared; every other
+  (completed) child result is restored untouched. If Phase 2 had already
+  completed, only the affected children are deep-analysed (`skip_parent_deep`)
+  — the completed parent deep analysis is never re-run. The checkpoint is KEPT
+  while any marker remains and cleared only once all budget-exceeded children
+  have been re-audited.
 - **Timeout reporting (AC4):** the resume banner on stderr prints which
   phases completed and which phase the previous run died in, e.g.
   `[checkpoint] Resuming audit for SA-123: completed=['Phase 1 parent
@@ -407,11 +421,17 @@ python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NV
 Failure diagnostics surface the real `wl` error (stdout JSON error field first,
 then stdout text, then stderr) instead of empty stderr.
 
-**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `600s` per child — e.g. ~710s for a single child, ~6,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, the skip diagnostic names the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override. On timeout, returns `unmet` with evidence "Pi model call timed out."
+**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `600s` per child — e.g. ~710s for a single child, ~6,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, each remaining child is recorded as `partial (budget exceeded)` — never a bare skip — with a diagnostic naming the elapsed time, the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override, and a resumable checkpoint marker is written immediately (see the budget-exceeded contract below). On timeout, returns `unmet` with evidence "Pi model call timed out."
 
 **Child Phase-1 screen budget (LP-0MSQ32S2M001EA74):** lightweight child Phase-1 AC-review screens use a short per-call budget — default 600s, configurable via `--child-screen-timeout SECONDS` (flag wins) or the `AUDIT_CHILD_SCREEN_TIMEOUT` env var. A screen that exceeds its budget returns a clean timeout verdict (`_timeout` marker + timeout evidence) and never burns the full 1800s. Parent Phase-1 screens and all Phase 2 calls (parent + child deep analysis) keep the 1800s budget.
 
 **Budget baseline derivation (SA-0MU32T6O0001UALR):** the cumulative elapsed-time guard (`elapsed_guard`) previously used inconsistent ad-hoc values (~120s, 900s, 1500s, 3110s) across different runs. SA-0MU32T6O0001UALR introduced the `Per-call timing:` debug-log line (emitted by `_maybe_log_debug_info` for every Pi call) and the `_derive_budget_baseline()` helper that parses these lines to compute p50/p95 per phase context (e.g. `phase1_parent`, `phase2_deep`). The derived budget per phase is `p95 × BUDGET_SAFE_MARGIN_DEFAULT` (default safety margin 1.5 = p95 + 50 % headroom). The parent-process budget defaults to `PARENT_TIMEOUT_DEFAULT + N × PARENT_TIMEOUT_PER_CHILD` (110s base + 600s per child), which is itself derived from the same timing data for consistency. The derived baseline can be used to right-size `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` for future runs. Example timing line: ``Per-call timing: issue_id=SA-XXX context=phase2_deep elapsed_seconds=30.5 input_tokens=5000 ac_count=3 model=gpt-4``. The helper functions `_parse_per_call_timing_lines()` and `_derive_budget_baseline()` are available in `audit_runner.py` for one-time analysis.
+
+**Budget-exceeded contract (SA-0MU32T6O0001UALR):** when the cumulative guard trips, each remaining child's ACs are represented by a single AC result with `text` `partial (budget exceeded)` and `verdict` `partial`. This is **fail-closed** — an unverified AC can never become `met` — and it replaces the old `unmet` "Skipped due to audit timeout. Manual audit required." placeholder that hid the cause. It is **distinct from a genuine `partial` code finding**: `partial (budget exceeded)` means "not evaluated", not "partially satisfied". The `evidence` names the elapsed time, the budget and the remediation, and the child dict carries `budget_exceeded: true`. Example diagnostic:
+
+> Budget exceeded: child skipped after 837s total elapsed time (parent-process budget 710s). The child's ACs were NOT verified; raise the budget via `--parent-timeout` or `AUDIT_PARENT_TIMEOUT` and re-run. A resumed run re-audits budget-exceeded children.
+
+The check operates at two points in Phase 1 child orchestration (the pre-pass and the auto-trigger pass); at each trip the per-child checkpoint marker is persisted immediately so a killed run remains resumable.
 
 **In-process stall abort (LP-0MSQ32S2M001EA74):** any single Pi call (Phase 1 or Phase 2) that produces no output/progress for ≥ `AUDIT_STALL_TIMEOUT` seconds (default 600 = 10 min) is aborted in-process inside `_call_pi` — the process is killed, a `_timeout` verdict with stall evidence is returned, and the existing `partial — manual review required` path is followed (no fabricated verdicts). This complements the external monitored-run stale-log abort (≥10 min), which remains as a backstop.
 
