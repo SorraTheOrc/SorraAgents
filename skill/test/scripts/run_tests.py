@@ -1249,7 +1249,7 @@ def run_suite(
                 if name == "pytest":
                     commands = [pytest_command()]
                 elif name == "node":
-                    commands = node_suite_commands()
+                    commands = node_suite_commands(cwd)
                 elif name == "all":
                     commands = full_suite_commands(cwd)
                 else:
@@ -1590,7 +1590,7 @@ def run_summary(
         elif name == "pytest":
             suite_commands = [pytest_command()]
         elif name == "node":
-            suite_commands = node_suite_commands()
+            suite_commands = node_suite_commands(cwd)
         else:
             suite_commands = full_suite_commands(cwd)
         lines: list[str] = []
