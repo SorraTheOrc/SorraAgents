@@ -656,6 +656,52 @@ def test_timeout_error_contains_retry_seconds(monkeypatch):
     assert re.search(r"\d+s", evidence), f"Expected 'retry in Ns' in: {evidence}"
 
 
+def test_timeout_error_elapsed_time_is_positive(monkeypatch):
+    """The elapsed wait time in the TimeoutError must be a positive,
+    human-readable number — not a garbage value from mixing
+    time.monotonic() with time.time() (SA-0MU32T8SH001R8MZ AC2).
+
+    Prior to the fix, the code computed
+    ``time.monotonic() - queued_wall`` where ``queued_wall`` was a
+    ``time.time()`` value, producing large negative numbers
+    (e.g. -1788131492.7s).
+    """
+    from shared.process_semaphore import Semaphore
+
+    monkeypatch.setenv(ENV_MAX_WORKERS, "1")
+    monkeypatch.setenv("AUDIT_QUEUE_TIMEOUT", "0.2")
+    monkeypatch.delenv("AUDIT_LOCK_TIMEOUT", raising=False)
+
+    sem = Semaphore("audit", max_workers=1, timeout=10)
+    sem.acquire()
+    try:
+        with _mock_popen():
+            result = audit_runner._call_pi("prompt", model="m", pi_bin="pi")
+    finally:
+        sem.release()
+
+    evidence = result.get("evidence", "")
+
+    # Extract the elapsed wait time from the message: "waited X.Xs"
+    import re
+    match = re.search(r"waited ([\d.]+)s", evidence)
+    assert match is not None, (
+        f"Expected 'waited Ns' in TimeoutError: {evidence}"
+    )
+    elapsed = float(match.group(1))
+    # The elapsed time must be a positive, reasonable value
+    # (the queue timeout is 0.2s, so elapsed should be close to that).
+    assert elapsed >= 0, (
+        f"Elapsed wait time must be non-negative, got {elapsed:.1f}s. "
+        "This indicates clock-mixing (time.monotonic() vs time.time()). "
+        "Evidence: {evidence}"
+    )
+    assert elapsed < 10, (
+        f"Elapsed wait time {elapsed:.1f}s exceeds expected bound. "
+        f"Evidence: {evidence}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC3: Concurrency test — parent screen completes under saturation
 # ---------------------------------------------------------------------------

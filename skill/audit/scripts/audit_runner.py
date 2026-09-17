@@ -2450,6 +2450,7 @@ def _acquire_audit_slot(issue_id: str = "",
     )
     queue_timeout = _audit_queue_timeout()
     queued_wall = time.time()
+    queued_mono = time.monotonic()
     # Bounded enqueue: a full queue waits up to queue_timeout (AC3).
     queue.enqueue(ticket, priority, timeout=queue_timeout)
     position = queue.rank(ticket)
@@ -2469,7 +2470,7 @@ def _acquire_audit_slot(issue_id: str = "",
                 # free the slot and re-enter the poll.
                 sem.release()
         if time.monotonic() >= deadline:
-            elapsed = time.monotonic() - queued_wall
+            elapsed = time.monotonic() - queued_mono
             queue_depth = len(queue)
             retry_seconds = max(1, int(queue_timeout / 3))
             raise TimeoutError(
