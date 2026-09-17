@@ -83,7 +83,6 @@ never written by the extension.
   wiring: `after_provider_response` + `context`)
 - `pi-client/proxy-compaction-bridge/compaction-bridge.js` — pure,
   dependency-free parsing/reshaping + per-session bridge
-- `pi-client/proxy-compaction-bridge/package.json` — extension metadata
 - `pi-client/proxy-compaction-bridge/README.md` — install/usage
 - `tests/unit/test_compaction-bridge.mjs` — unit tests (node:test)
 

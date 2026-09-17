@@ -84,7 +84,6 @@ passthrough on missing/malformed headers, input immutability).
   `context`).
 - `compaction-bridge.js` — pure, dependency-free parsing/reshaping
   (unit tested).
-- `package.json` — extension metadata.
 
 ## Coupling point (AC8)
 
