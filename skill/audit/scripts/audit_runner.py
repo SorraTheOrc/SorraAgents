@@ -403,6 +403,24 @@ Never ``confident-false-positive``: a finding the model did not see cannot
 be declared a confident false positive (T1 AC1).
 """
 
+# ---------------------------------------------------------------------------
+# Batched false-positive screen (SA-0MSYPAV1R000SMHK)
+# ---------------------------------------------------------------------------
+FP_SCREEN_BATCH_SIZE_ENV = "AUDIT_FP_SCREEN_BATCH_SIZE"
+"""Environment variable for the false-positive screen batch size.
+
+Defaults to ``FP_SCREEN_BATCH_SIZE_DEFAULT`` (500 findings per batch).
+Invalid values (non-int, zero, negative) are ignored with a warning
+and the default is used.
+"""
+
+FP_SCREEN_BATCH_SIZE_DEFAULT = 500
+"""Default number of findings per false-positive screen batch (AC2).
+
+Kept at 500 so a single batch fits comfortably within the OS ARG_MAX
+limit (~2 MB on Linux) with the full prompt preamble and JSON encoding.
+"""
+
 
 AUDIT_REMEDIATION_MAX_ITERATIONS_ENV = "AUDIT_REMEDIATION_MAX_ITERATIONS"
 """Environment variable name for the config-fix iteration cap.
@@ -7696,6 +7714,28 @@ def _fp_classification_for(finding: dict, fp_screen_results: list[dict]) -> str 
     return None
 
 
+def _resolve_fp_screen_batch_size() -> int:
+    """Resolve the false-positive screen batch size from the env var.
+
+    Defaults to ``FP_SCREEN_BATCH_SIZE_DEFAULT`` (500); invalid values
+    (non-int, zero, negative) are ignored with a warning and the default
+    is used (SA-0MSYPAV1R000SMHK AC2).
+    """
+    try:
+        value = int(os.environ.get(FP_SCREEN_BATCH_SIZE_ENV, ""))
+    except (TypeError, ValueError):
+        return FP_SCREEN_BATCH_SIZE_DEFAULT
+    if value <= 0:
+        print(
+            f"Warning: {FP_SCREEN_BATCH_SIZE_ENV}={value!r} is not a "
+            f"positive integer; using default batch size "
+            f"{FP_SCREEN_BATCH_SIZE_DEFAULT}.",
+            file=sys.stderr,
+        )
+        return FP_SCREEN_BATCH_SIZE_DEFAULT
+    return value
+
+
 def _screen_ruff_findings(issue_id: str, findings: list[dict],
                           pi_bin: str, resolved_model: str,
                           debug_log: str | None, timeout: int | None,
@@ -7703,11 +7743,16 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
                           priority: int | None = None) -> list[dict]:
     """Model-judged false-positive screen over ruff findings (F1 scope).
 
-    Classifies each ruff finding via a SINGLE batched Pi call
+    Classifies each ruff finding via one or more batched Pi calls
     (``FP_SCREEN_CONTEXT``); non-ruff findings are never sent to the screen.
     Returns one entry per ruff finding (see ``_parse_fp_screen_response``
     for the schema) or ``[]`` when there are no ruff findings — the screen
     is skipped entirely, so zero Pi calls happen (T1 AC3).
+
+    When the ruff finding set exceeds ``FP_SCREEN_BATCH_SIZE_DEFAULT``
+    (configurable via ``AUDIT_FP_SCREEN_BATCH_SIZE``), findings are
+    chunked into bounded batches so no single Pi invocation exceeds the
+    OS ``ARG_MAX`` limit (SA-0MSYPAV1R000SMHK AC1/AC2).
 
     Caution-first degradation (T1 AC2): a provider error, timeout,
     concurrency-limit marker, unparseable output, or RuntimeError from the
@@ -7720,18 +7765,10 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
     if not ruff_findings:
         return []
 
-    finding_list_json = json.dumps([
-        {
-            "index": i,
-            "file": f.get("file", "?"),
-            "line": f.get("line", 0),
-            "severity": f.get("severity", "?"),
-            "code": f.get("code", "?"),
-            "message": f.get("message", ""),
-        }
-        for i, f in enumerate(ruff_findings)
-    ])
-    prompt = (
+    batch_size = _resolve_fp_screen_batch_size()
+
+    # Build the shared prompt preamble (constant across batches)
+    preamble = (
         "[READ-ONLY AUDIT] You are performing a read-only audit. "
         "Do NOT close, modify, or delete any work items; you MAY create "
         "a chore work item to track a false-positive finding (config-fix "
@@ -7747,54 +7784,147 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
         "(integer, matching the input), 'classification' (one of: "
         "genuine, confident-false-positive, uncertain) and 'justification' "
         "(a one-line written reason).\n\n"
-        f"Findings: {finding_list_json}"
     )
-    try:
-        result = _call_pi_and_maybe_log(
-            issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
-            pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
-            ac_fallback_used=ac_fallback_used, child_screen=True,
-            priority=priority,
-        )
-    except RuntimeError as exc:
-        ac_fallback_used.set()
-        print(
-            f"Warning: Pi call failed for false-positive screen: {exc} — "
-            "all findings defaulted to uncertain (caution-first).",
-            file=sys.stderr,
-        )
-        entries, _ = _parse_fp_screen_response("", ruff_findings)
-        return entries
 
-    degraded = bool(
-        result.get("_provider_error")
-        or result.get("_timeout")
-        or result.get("_concurrency_timeout")
-    )
-    if degraded:
-        # Infra failure: _call_pi already set ac_fallback_used for
-        # timeout/concurrency/provider-error paths; belt-and-suspenders here.
-        ac_fallback_used.set()
-        print(
-            "Warning: false-positive screen degraded (provider error / timeout / "
-            "concurrency limit) — all findings defaulted to uncertain "
-            "(caution-first).",
-            file=sys.stderr,
-        )
-        entries, _ = _parse_fp_screen_response("", ruff_findings)
-        return entries
+    # Merge map: global_index -> parsed entry
+    merged: dict[int, dict] = {}
+    screen_failed = False
+    batch_count = 0
 
-    raw_text = result.get("extracted_text", "") or result.get("evidence", "") or ""
-    entries, failed = _parse_fp_screen_response(raw_text, ruff_findings)
-    if failed:
-        ac_fallback_used.set()
-        print(
-            "Warning: unparseable Pi output for false-positive screen — "
-            "all findings defaulted to uncertain (caution-first).",
-            file=sys.stderr,
+    for batch_start in range(0, len(ruff_findings), batch_size):
+        batch_end = min(batch_start + batch_size, len(ruff_findings))
+        batch = ruff_findings[batch_start:batch_end]
+
+        # Re-index within the batch (0 .. batch_size-1) for the model
+        finding_list_json = json.dumps([
+            {
+                "index": i,
+                "file": f.get("file", "?"),
+                "line": f.get("line", 0),
+                "severity": f.get("severity", "?"),
+                "code": f.get("code", "?"),
+                "message": f.get("message", ""),
+            }
+            for i, f in enumerate(batch)
+        ])
+        prompt = preamble + f"Findings: {finding_list_json}"
+
+        try:
+            result = _call_pi_and_maybe_log(
+                issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
+                pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
+                ac_fallback_used=ac_fallback_used, child_screen=True,
+                priority=priority,
+            )
+        except RuntimeError as exc:
+            screen_failed = True
+            ac_fallback_used.set()
+            print(
+                f"Warning: Pi call failed for false-positive screen batch "
+                f"{batch_start // batch_size + 1}: {exc} — all findings "
+                f"in this batch defaulted to uncertain (caution-first).",
+                file=sys.stderr,
+            )
+            # Degrade the entire batch
+            for i in range(batch_start, batch_end):
+                if i not in merged:
+                    merged[i] = {
+                        "index": i,
+                        "finding": ruff_findings[i],
+                        "classification": "uncertain",
+                        "justification": FP_SCREEN_FAILED_JUSTIFICATION,
+                        "remediable": False,
+                        "screen_failed": True,
+                    }
+            batch_count += 1
+            continue
+
+        degraded = bool(
+            result.get("_provider_error")
+            or result.get("_timeout")
+            or result.get("_concurrency_timeout")
         )
+        if degraded:
+            screen_failed = True
+            # Infra failure: _call_pi already set ac_fallback_used for
+            # timeout/concurrency/provider-error paths.
+            print(
+                f"Warning: false-positive screen batch {batch_start // batch_size + 1} "
+                f"degraded (provider error / timeout / concurrency limit) — "
+                f"all findings in this batch defaulted to uncertain "
+                f"(caution-first).",
+                file=sys.stderr,
+            )
+            for i in range(batch_start, batch_end):
+                if i not in merged:
+                    merged[i] = {
+                        "index": i,
+                        "finding": ruff_findings[i],
+                        "classification": "uncertain",
+                        "justification": FP_SCREEN_FAILED_JUSTIFICATION,
+                        "remediable": False,
+                        "screen_failed": True,
+                    }
+            batch_count += 1
+            continue
+
+        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or ""
+        batch_entries, batch_failed = _parse_fp_screen_response(raw_text, batch)
+        if batch_failed:
+            screen_failed = True
+            print(
+                "Warning: unparseable Pi output for false-positive screen "
+                f"batch {batch_start // batch_size + 1} — all findings in "
+                f"this batch defaulted to uncertain (caution-first).",
+                file=sys.stderr,
+            )
+            for i in range(batch_start, batch_end):
+                if i not in merged:
+                    merged[i] = {
+                        "index": i,
+                        "finding": ruff_findings[i],
+                        "classification": "uncertain",
+                        "justification": FP_SCREEN_FAILED_JUSTIFICATION,
+                        "remediable": False,
+                        "screen_failed": True,
+                    }
+        # Merge entries back using the global index
+        for entry in batch_entries:
+            global_idx = entry["index"] + batch_start
+            merged[global_idx] = {
+                "index": global_idx,
+                "finding": ruff_findings[global_idx],
+                "classification": entry["classification"],
+                "justification": entry["justification"],
+                "remediable": entry.get("remediable", False) and (
+                    ruff_findings[global_idx].get("severity") in ("critical", "high")
+                ),
+                "screen_failed": entry.get("screen_failed", False),
+            }
+        batch_count += 1
+
+    if screen_failed:
+        ac_fallback_used.set()
+
+    # Sort by global index and return
+    entries = [merged[i] for i in range(len(ruff_findings)) if i in merged]
+
+    if len(entries) != len(ruff_findings):
+        # Some findings are still missing (shouldn't happen, but safety net)
+        ac_fallback_used.set()
+        for i, f in enumerate(ruff_findings):
+            if i not in merged:
+                entries.append({
+                    "index": i,
+                    "finding": f,
+                    "classification": "uncertain",
+                    "justification": FP_SCREEN_MISSING_JUSTIFICATION,
+                    "remediable": False,
+                    "screen_failed": True,
+                })
+        entries.sort(key=lambda e: e["index"])
+
     return entries
-
 
 def _effective_blocking_findings(cq_findings: list[dict],
                                  fp_screen_results: list[dict]) -> list[dict]:
