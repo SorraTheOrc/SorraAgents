@@ -2426,6 +2426,46 @@ def _log_audit_slot(priority: int, position: int | None, ticket: str,
     )
 
 
+def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
+    """Remove audit queue tickets whose owning process is no longer alive.
+
+    Ticket ids have the shape ``audit:{issue_id}:{pid}:{counter}``. A
+    crashed or killed audit process (SIGKILL, OOM, host reboot) never
+    removes its own ticket, so the file lingers until the 24h TTL prune.
+    With enough such leftovers the queue saturates and every subsequent
+    audit times out with "audit concurrency queue saturated", even though
+    no audit is actually running (the observed failure mode).
+
+    Returns the number of tickets pruned. Never raises: a malformed id or
+    a transient ``remove`` race is ignored (the caller retries the poll).
+    """
+    try:
+        entries = queue._list_entries()
+    except Exception:
+        return 0
+    pruned = 0
+    for entry in entries:
+        parts = entry.item_id.split(":")
+        if len(parts) < 4 or parts[0] != "audit":
+            continue  # not an audit admission ticket — leave it alone
+        try:
+            pid = int(parts[2])
+        except (ValueError, IndexError):
+            continue
+        if pid == os.getpid():
+            continue  # never prune our own live process
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            # Owner is gone — safe to drop the stale ticket.
+            if queue.remove(entry.item_id) is not None:
+                pruned += 1
+        except PermissionError:
+            # Process exists but is not ours — not stale.
+            continue
+    return pruned
+
+
 def _acquire_audit_slot(issue_id: str = "",
                         priority: int = Priority.MEDIUM,
                         max_concurrency: int | None = None) -> Semaphore:
@@ -2450,6 +2490,12 @@ def _acquire_audit_slot(issue_id: str = "",
          the head check, so the next freed slot goes to the highest-
          priority waiter, not whoever polls first.
 
+    Stale-ticket hygiene: before enqueueing, tickets whose owning PID is
+    no longer alive are pruned, and on timeout our own ticket is removed
+    before raising — a timed-out or crashed audit never leaves a stale
+    ticket behind (they would accumulate and saturate the queue for all
+    subsequent audits).
+
     Raises:
         TimeoutError: When admission + slot wait exceeds
             ``AUDIT_QUEUE_TIMEOUT`` (enqueue-full or persistently
@@ -2466,9 +2512,15 @@ def _acquire_audit_slot(issue_id: str = "",
         f"audit:{issue_id or 'anon'}:{os.getpid()}:"
         f"{next(_AUDIT_TICKET_COUNTER)}"
     )
+    # Stale-ticket hygiene: remove tickets whose owning PID is no longer
+    # alive (crashed/timed-out audits would otherwise leave them until the
+    # 24h TTL prune, accumulating and saturating the queue for all
+    # subsequent audits).
+    _prune_dead_audit_tickets(queue)
     queue_timeout = _audit_queue_timeout()
     queued_wall = time.time()
     queued_mono = time.monotonic()
+    last_prune_mono = queued_mono
     # Bounded enqueue: a full queue waits up to queue_timeout (AC3).
     queue.enqueue(ticket, priority, timeout=queue_timeout)
     position = queue.rank(ticket)
@@ -2487,10 +2539,20 @@ def _acquire_audit_slot(issue_id: str = "",
                 # Ticket vanished between peek and remove (unexpected):
                 # free the slot and re-enter the poll.
                 sem.release()
-        if time.monotonic() >= deadline:
+        # Slow-path stale prune (~every 5s) so peers that crashed while we
+        # waited do not keep the queue saturated; keep it off the hot path
+        # to avoid per-poll lock churn.
+        now_mono = time.monotonic()
+        if now_mono - last_prune_mono >= 5.0:
+            _prune_dead_audit_tickets(queue)
+            last_prune_mono = now_mono
+        if now_mono >= deadline:
             elapsed = time.monotonic() - queued_mono
             queue_depth = len(queue)
             retry_seconds = max(1, int(queue_timeout / 3))
+            # Remove OUR OWN ticket before raising so a timed-out audit does
+            # not leave a stale ticket behind (they accumulate and saturate).
+            queue.remove(ticket)
             raise TimeoutError(
                 f"audit concurrency queue '{AUDIT_QUEUE_NAME}' saturated: "
                 f"no slot within {queue_timeout:.0f}s (waited {elapsed:.1f}s, "
@@ -4242,12 +4304,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
         lines.extend(["", "## Summary", ""])
 
-    # Count verdicts across all criteria (parent + children)
+    # Count verdicts across parent criteria only (children have their own
+    # section below).  "all_criteria" is kept for the not_reviewed check.
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
-    _met_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_MET)
-    adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
-    unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
-    partial_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_PARTIAL)
+    _met_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_MET)
+    adjusted_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_ADJUSTED)
+    unmet_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_UNMET)
+    partial_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_PARTIAL)
 
     not_reviewed = [
         c for c in child_results
@@ -5795,43 +5858,64 @@ def _deep_analyze_child(
         or child_result.get("text", "")
     )
     child_batch = _extract_json_array(child_raw)
+    child_parse_failed = False
     if child_batch is None:
         try:
             child_batch = json.loads(child_raw)
         except json.JSONDecodeError:
             child_batch = []
+            child_parse_failed = True
 
     updated_child_acs = list(child_acs)
     if isinstance(child_batch, list):
-        reviewed = {
-            item["index"]: item
-            for item in child_batch
-            if isinstance(item, dict) and "index" in item
-        }
-        for i in range(len(updated_child_acs)):
-            item = reviewed.get(i, {})
-            deep_verdict = _normalize_verdict(item.get("verdict", ""))
-            deep_evidence = _evidence_text(item.get("evidence"))
-            if deep_verdict:
-                initial = updated_child_acs[i]["verdict"]
-                if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
-                    updated_child_acs[i] = {
-                        "text": updated_child_acs[i]["text"],
-                        "verdict": VERDICT_MET,
-                        "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
-                    }
-                elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
-                    updated_child_acs[i] = {
-                        "text": updated_child_acs[i]["text"],
-                        "verdict": deep_verdict,
-                        "evidence": f"Phase 1: {updated_child_acs[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
-                    }
-                else:
-                    updated_child_acs[i] = {
-                        "text": updated_child_acs[i]["text"],
-                        "verdict": deep_verdict,
-                        "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
-                    }
+        if not child_batch and child_parse_failed:
+            # Child Phase 2 output unparseable — disclose it explicitly
+            # rather than silently keeping stale Phase 1 verdicts.  A valid
+            # empty array is not a parse failure (existing contract).
+            if ac_fallback_used is not None:
+                ac_fallback_used.set()
+            for i in range(len(updated_child_acs)):
+                prev_evidence = _evidence_text(updated_child_acs[i].get("evidence"))
+                updated_child_acs[i] = {
+                    "text": updated_child_acs[i]["text"],
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": (
+                        (f"{prev_evidence} " if prev_evidence else "")
+                        + "Phase 2 child deep analysis did not return "
+                        "parseable results (model output could not be "
+                        "parsed). Phase: Phase 2 child deep analysis."
+                    ),
+                }
+        else:
+            reviewed = {
+                item["index"]: item
+                for item in child_batch
+                if isinstance(item, dict) and "index" in item
+            }
+            for i in range(len(updated_child_acs)):
+                item = reviewed.get(i, {})
+                deep_verdict = _normalize_verdict(item.get("verdict", ""))
+                deep_evidence = _evidence_text(item.get("evidence"))
+                if deep_verdict:
+                    initial = updated_child_acs[i]["verdict"]
+                    if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": VERDICT_MET,
+                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                        }
+                    elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": f"Phase 1: {updated_child_acs[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                        }
+                    else:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                        }
 
     updated = dict(child)
     updated["ac_results"] = updated_child_acs
@@ -6189,6 +6273,7 @@ def _run_phase2_deep_analysis(
         if batch_outcome is not None:
             return batch_outcome
 
+    parent_parse_failed = False
     if not skip_parent_deep:
         file_scope = _build_file_scope_manifest(issue, ac_results, runner=runner)
         # Validate the Phase 2 FILE SCOPE manifest covers the item repository
@@ -6344,46 +6429,76 @@ def _run_phase2_deep_analysis(
             or result.get("text", "")
         )
         batch = _extract_json_array(raw_text)
+        batch_parse_failed = False
         if batch is None:
             try:
                 batch = json.loads(raw_text)
             except json.JSONDecodeError:
                 batch = []
+                batch_parse_failed = True
 
         updated_ac = list(ac_results)
         if isinstance(batch, list):
-            reviewed = {
-                item["index"]: item
-                for item in batch
-                if isinstance(item, dict) and "index" in item
-            }
-            for i in range(len(updated_ac)):
-                item = reviewed.get(i, {})
-                deep_verdict = _normalize_verdict(item.get("verdict", ""))
-                deep_evidence = _evidence_text(item.get("evidence"))
-                if deep_verdict:
-                    # Final verdict = Phase 1 passes AND Phase 2 confirms
-                    initial = updated_ac[i]["verdict"]
-                    if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
-                        updated_ac[i] = {
-                            "text": updated_ac[i]["text"],
-                            "verdict": VERDICT_MET,
-                            "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
-                        }
-                    elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
-                        # Phase 1 said met, Phase 2 disagrees → downgrade
-                        updated_ac[i] = {
-                            "text": updated_ac[i]["text"],
-                            "verdict": deep_verdict,
-                            "evidence": f"Phase 1: {updated_ac[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
-                        }
-                    else:
-                        # Use Phase 2 verdict (deep override for initial non-met)
-                        updated_ac[i] = {
-                            "text": updated_ac[i]["text"],
-                            "verdict": deep_verdict,
-                            "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
-                        }
+            if not batch and batch_parse_failed:
+                # Phase 2 output could not be parsed at all (e.g. an
+                # infrastructure error string).  Mark all ACs as partial
+                # with explicit evidence — never silently present stale
+                # Phase 1 verdicts as if Phase 2 had confirmed them.  A
+                # *valid* empty array ([]) is not a parse failure and keeps
+                # the existing Phase 1-verdict contract.
+                if ac_fallback_used is not None:
+                    ac_fallback_used.set()
+                parent_parse_failed = True
+                print(
+                    "Warning: Phase 2 deep analysis output could not be "
+                    f"parsed ({len(ac_results)} ACs marked partial).",
+                    file=sys.stderr,
+                )
+                for i in range(len(updated_ac)):
+                    prev_evidence = _evidence_text(updated_ac[i].get("evidence"))
+                    updated_ac[i] = {
+                        "text": updated_ac[i]["text"],
+                        "verdict": VERDICT_PARTIAL,
+                        "evidence": (
+                            (f"{prev_evidence} " if prev_evidence else "")
+                            + "Phase 2 deep analysis did not return parseable "
+                            "results (model output could not be parsed — raw "
+                            "output logged). Phase: Phase 2 deep analysis."
+                        ),
+                    }
+            else:
+                reviewed = {
+                    item["index"]: item
+                    for item in batch
+                    if isinstance(item, dict) and "index" in item
+                }
+                for i in range(len(updated_ac)):
+                    item = reviewed.get(i, {})
+                    deep_verdict = _normalize_verdict(item.get("verdict", ""))
+                    deep_evidence = _evidence_text(item.get("evidence"))
+                    if deep_verdict:
+                        # Final verdict = Phase 1 passes AND Phase 2 confirms
+                        initial = updated_ac[i]["verdict"]
+                        if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                            updated_ac[i] = {
+                                "text": updated_ac[i]["text"],
+                                "verdict": VERDICT_MET,
+                                "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                            }
+                        elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                            # Phase 1 said met, Phase 2 disagrees → downgrade
+                            updated_ac[i] = {
+                                "text": updated_ac[i]["text"],
+                                "verdict": deep_verdict,
+                                "evidence": f"Phase 1: {updated_ac[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                            }
+                        else:
+                            # Use Phase 2 verdict (deep override for initial non-met)
+                            updated_ac[i] = {
+                                "text": updated_ac[i]["text"],
+                                "verdict": deep_verdict,
+                                "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                            }
 
     else:
         # Parent Phase 2 already completed in a prior parent-only call
@@ -6442,7 +6557,9 @@ def _run_phase2_deep_analysis(
                 child_in_main_slot=child_in_main_slot,
             ))
 
-    return updated_ac, updated_children, not child_timeout_occurred
+    return updated_ac, updated_children, not (
+        child_timeout_occurred or parent_parse_failed
+    )
 
 
 def _reask_verdict_array_once(
