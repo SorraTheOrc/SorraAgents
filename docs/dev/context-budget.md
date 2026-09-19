@@ -166,6 +166,13 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > default repo-root was also corrected (`parents[2]` → `parents[3]`) so the
 > gate measures the repo root rather than the `skill/` directory.
 >
+> **Game/Gym scene parity section bump (2026-09-19, SA-0MU8HLU640065P42 /
+> SA-0MU8QC3PI0047OWE):** the "Game Scenes and Gym Scenes Parity" section
+> added ~816 B to `AGENTS.md` (`project_agents 2469` → `3285`; `total 13201` →
+> `14017`; `global_agents` and `skills_prose` unchanged). Thresholds were
+> regenerated to the new measured surface so the gate remains green for the
+> approved content.
+>
 > ### Enforcement (committed gate)
 >
 > The regression gate is enforced in two places:

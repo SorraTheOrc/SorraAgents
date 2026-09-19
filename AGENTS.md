@@ -18,3 +18,17 @@ Pi client-side auto-compaction is **disabled** (`.pi/settings.json` → `compact
 - Global pi configuration for the agent is tracked in `.pi-config/agent/` (`settings.json`, `models.json`) and installed/exported by the same script. Never store real credentials (`auth.json`) in the repository — run `pi login` locally instead.
 - Changes to `skill/`, `command/`, or `AGENTS_GLOBAL.md` affect every project once installed, so they must be tracked here with work items, built, tested, and pushed to `dev` per the global workflow before the install script is re-run.
 - When adding or modifying skills/commands, follow the conventions of the existing files and keep tests in the corresponding `tests/` directories.
+
+### Game Scenes and Gym Scenes Parity
+
+Game scenes and Gym Scenes must implement identical functionality. Gym Scenes
+provide a deterministic, headless environment for exercising the same game
+logic — not a separate gameplay variant — so any functional divergence between
+a game scene and its corresponding Gym Scene is a bug in one or both
+implementations. If divergence appears, extract the shared logic into a common
+helper rather than maintaining two copies. When testing, avoid the
+[`test-writing-guidelines.md`](skill/shared/test-writing-guidelines.md)
+anti-patterns **Self-Referential Simulations** (a Gym Scene test re-implementing
+game logic instead of exercising production code) and **Duplicates of Existing
+Core Coverage** (a Gym Scene test re-testing behaviour already covered by a
+core game test).
