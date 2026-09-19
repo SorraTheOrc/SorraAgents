@@ -160,6 +160,7 @@ Example config (project root):
 | god_class | Class with too many responsibilities | LLM | High |
 | feature_envy | Method overly interested in another class | LLM | Medium |
 | shotgun_surgery | Single change requires many file modifications | LLM | Medium |
+| scene-gym divergence | Game scenes and Gym Scenes implementing different functionality — they must remain functionally equivalent; divergence indicates a bug in one or both implementations. Cross-references the [test-writing-guidelines.md](../shared/test-writing-guidelines.md) anti-patterns "Self-Referential Simulations" and "Duplicates of Existing Core Coverage" | Compare functionality between gym scene tests and their corresponding game scene tests (LLM review) | High |
 | inappropriate_intimacy | Classes that know too much about each other | LLM | Medium |
 
 ## REFACTOR Comments
