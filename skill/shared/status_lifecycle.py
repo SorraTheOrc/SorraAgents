@@ -594,11 +594,11 @@ class StatusLifecycle:
         data = StatusLifecycle.show(work_item_id, runner=runner)
         wi = data.get("workItem", {}) if isinstance(data, dict) else {}
         status = wi.get("status", "") if isinstance(wi, dict) else ""
-        if status != "in_progress":
+        if status != "in-progress":
             raise ClaimError(
-                f"Work item {work_item_id} must be in_progress before mutation "
+                f"Work item {work_item_id} must be in-progress before mutation "
                 f"(current status: {status or 'unknown'}). "
-                f"Re-claim with StatusLifecycle.update_status({work_item_id!r}, 'in_progress') "
+                f"Re-claim with StatusLifecycle.update_status({work_item_id!r}, 'in-progress') "
                 f"or StatusLifecycle.ensure_claimed({work_item_id!r}) before mutating."
             )
         return data
@@ -635,14 +635,14 @@ class StatusLifecycle:
         data = StatusLifecycle.show(work_item_id, runner=runner)
         wi = data.get("workItem", {}) if isinstance(data, dict) else {}
         status = wi.get("status", "") if isinstance(wi, dict) else ""
-        if status == "in_progress":
-            LOG.debug("ensure_claimed: %s already in_progress — no-op", work_item_id)
+        if status == "in-progress":
+            LOG.debug("ensure_claimed: %s already in-progress — no-op", work_item_id)
             return data
-        kwargs: dict = {"status": "in_progress", "runner": runner}
+        kwargs: dict = {"status": "in-progress", "runner": runner}
         if assignee is not None:
             kwargs["assignee"] = assignee
         LOG.info(
-            "ensure_claimed: reclaiming %s to in_progress (was %s)",
+            "ensure_claimed: reclaiming %s to in-progress (was %s)",
             work_item_id,
             status or "unknown",
         )
@@ -685,7 +685,7 @@ class StatusLifecycle:
 
         # Set in_progress
         try:
-            kwargs: dict = {"status": "in_progress", "runner": self._runner}
+            kwargs: dict = {"status": "in-progress", "runner": self._runner}
             if self._assignee is not None:
                 kwargs["assignee"] = self._assignee
             self.update_status(self._work_item_id, **kwargs)
