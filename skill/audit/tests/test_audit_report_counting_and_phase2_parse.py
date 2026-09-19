@@ -16,12 +16,9 @@ Discovered during the WL-0MU6UL3XY001M3VT audit (2026-09-18):
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from unittest import mock
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:

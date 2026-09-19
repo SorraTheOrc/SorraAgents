@@ -29,7 +29,7 @@ for _path in (str(REPO_ROOT), str(_SKILLS_ROOT)):
     if _path not in sys.path:
         sys.path.append(_path)
 
-from shared.skill_extensions import (  # noqa: E402
+from shared.skill_extensions import (
     DATA_FILENAME,
     EXTENSIONS_DIR,
     POSTFIX_FILENAME,
@@ -39,7 +39,6 @@ from shared.skill_extensions import (  # noqa: E402
     load_extension,
     resolve_project_root,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

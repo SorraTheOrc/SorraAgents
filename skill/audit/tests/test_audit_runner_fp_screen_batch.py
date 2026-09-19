@@ -18,7 +18,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

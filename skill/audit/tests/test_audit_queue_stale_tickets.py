@@ -16,7 +16,6 @@ Fixes under test:
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 from unittest import mock
 
@@ -81,13 +80,15 @@ def test_acquire_audit_slot_removes_own_ticket_on_timeout():
     for entry in q._list_entries():
         q.remove(entry.item_id)
 
-    with mock.patch.object(
-        audit_runner.Semaphore, "acquire", side_effect=TimeoutError("busy"),
+    with (
+        mock.patch.object(
+            audit_runner.Semaphore, "acquire", side_effect=TimeoutError("busy"),
+        ),
+        pytest.raises(TimeoutError, match="saturated"),
     ):
-        with pytest.raises(TimeoutError, match="saturated"):
-            audit_runner._acquire_audit_slot(
-                "TEST-OWN-TICKET", priority=audit_runner.Priority.MEDIUM,
-            )
+        audit_runner._acquire_audit_slot(
+            "TEST-OWN-TICKET", priority=audit_runner.Priority.MEDIUM,
+        )
 
     remaining = [e.item_id for e in q._list_entries()]
     assert remaining == [], f"stale ticket left behind: {remaining}"

@@ -2441,7 +2441,7 @@ def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
     """
     try:
         entries = queue._list_entries()
-    except Exception:
+    except OSError:
         return 0
     pruned = 0
     for entry in entries:
@@ -4305,8 +4305,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         lines.extend(["", "## Summary", ""])
 
     # Count verdicts across parent criteria only (children have their own
-    # section below).  "all_criteria" is kept for the not_reviewed check.
-    all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+    # section below).
     _met_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_MET)
     adjusted_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_ADJUSTED)
     unmet_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_UNMET)
