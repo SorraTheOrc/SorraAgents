@@ -89,6 +89,24 @@ anything. Every test must assert observable behaviour via the public API.
 - Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev ([AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
 - Use `StatusLifecycle` for all status transitions — never ad-hoc `wl update --status` commands.
 
+## Test Timeout Configuration
+
+The finish step runs the project test suite through `implement.py finish` with a
+per-command timeout (default **600 seconds**). Repos with slow test suites can
+override this via `.pi/test-config.json`:
+
+```json
+{"timeoutPerCommand": 1500}
+```
+
+The `timeoutPerCommand` field is read from `.pi/test-config.json` in the project
+root. When the file is absent, the field is missing, or the value is invalid,
+the default of 600 seconds is used. This keeps other repos unaffected — only
+projects that explicitly create the file get the override.
+
+Set the value high enough to cover the full suite with headroom (e.g. TCE uses
+1500 to cover its ~19-minute suite).
+
 ## Status Safety & Abort Handling
 
 ### Critical Rule: Always Reset Status on Abort

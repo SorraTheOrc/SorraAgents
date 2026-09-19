@@ -104,6 +104,38 @@ DEFAULT_MAX_RETRY = 3
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
 
+# ---------------------------------------------------------------------------
+# Per-repo test-timeout configuration (SA-0MTXKIIRV009MJWG)
+# ---------------------------------------------------------------------------
+_TEST_CONFIG_FILE = ".pi/test-config.json"
+_DEFAULT_TIMEOUT_PER_COMMAND = 600
+
+
+def _resolve_test_timeout(cwd: str) -> int:
+    """Return the per-command timeout (seconds) for the project at *cwd*.
+
+    Reads ``.pi/test-config.json`` from the project root, extracts the
+    ``timeoutPerCommand`` value, and falls back to 600 when the file is
+    absent, the field is missing, or the value is invalid.
+
+    This allows per-repo overrides (e.g. TCE sets 1500 to cover its
+    ~19‑minute full suite) while keeping repos without the config file
+    on the original 600‑second default.
+    """
+    root = Path(cwd).resolve()
+    config_path = root / _TEST_CONFIG_FILE
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return _DEFAULT_TIMEOUT_PER_COMMAND
+    if not isinstance(data, dict):
+        return _DEFAULT_TIMEOUT_PER_COMMAND
+    timeout = data.get("timeoutPerCommand")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return _DEFAULT_TIMEOUT_PER_COMMAND
+    timeout = int(timeout)
+    return timeout if timeout > 0 else _DEFAULT_TIMEOUT_PER_COMMAND
+
 # State file name stored inside the worktree
 STATE_FILE_NAME = ".implement_state.json"
 
@@ -1529,7 +1561,7 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     run = run_cached(
         pytest_cmds[0],
         cwd=cwd,
-        timeout=600,
+        timeout=_resolve_test_timeout(cwd),
         runner=lambda command, cwd_, timeout_: run_cmd(
             shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
         ),
@@ -1605,7 +1637,7 @@ def run_tests(cwd: str, scope: str = "changed",
             run_cached(
                 override,
                 cwd=cwd,
-                timeout=600,
+                timeout=_resolve_test_timeout(cwd),
                 runner=_shell_command_runner,
                 scope="full",
             ),
@@ -1630,7 +1662,7 @@ def run_tests(cwd: str, scope: str = "changed",
         pytest_run = run_cached(
             PYTEST_CMD,
             cwd=cwd,
-            timeout=600,
+            timeout=_resolve_test_timeout(cwd),
             runner=lambda command, cwd_, timeout_: run_cmd(
                 shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
             ),
@@ -1643,7 +1675,7 @@ def run_tests(cwd: str, scope: str = "changed",
             npm_run = run_cached(
                 NPM_TEST_CMD,
                 cwd=cwd,
-                timeout=600,
+                timeout=_resolve_test_timeout(cwd),
                 runner=lambda command, cwd_, timeout_: run_cmd(
                     shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
                 ),
@@ -1670,7 +1702,7 @@ def run_tests(cwd: str, scope: str = "changed",
             run_cached(
                 NPM_TEST_CMD,
                 cwd=cwd,
-                timeout=600,
+                timeout=_resolve_test_timeout(cwd),
                 runner=lambda command, cwd_, timeout_: run_cmd(
                     shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
                 ),
@@ -1707,8 +1739,13 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd,
             )
         return _finalize_test_result(
-            run_cached(command, cwd=cwd, timeout=600, runner=_shell_command_runner,
-                       scope="full"),
+            run_cached(
+                command,
+                cwd=cwd,
+                timeout=_resolve_test_timeout(cwd),
+                runner=_shell_command_runner,
+                scope="full",
+            ),
             tooling="repo-script",
             scope="full",
         )
