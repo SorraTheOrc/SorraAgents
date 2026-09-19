@@ -352,17 +352,17 @@ class TestPlanApprovalReclaimInvariant:
         ])
         result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
         assert result["request_approval"] is False
-        # Calls: 1) show for reclaim check, 2) update in_progress, 3) show for gate
+        # Calls: 1) show for reclaim check, 2) update in-progress, 3) show for gate
         assert len(runner.calls) == 3
         assert "show" in runner.calls[0]
         assert "update" in runner.calls[1]
-        assert "in_progress" in runner.calls[1]
+        assert "in-progress" in runner.calls[1]
         assert "show" in runner.calls[2]
 
     def test_reclaim_if_open_noop_when_already_in_progress(self):
         """With reclaim_if_open=True and already in_progress, no update is issued."""
         runner = _SequenceRunner([
-            _FakeResult(_show_payload({"id": "X", "status": "in_progress", "effort": "Extra Small", "risk": "Low"})),
+            _FakeResult(_show_payload({"id": "X", "status": "in-progress", "effort": "Extra Small", "risk": "Low"})),
             _FakeResult(_show_payload({"id": "X", "effort": "Extra Small", "risk": "Low"})),
         ])
         result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
@@ -404,7 +404,7 @@ class TestPlanApprovalReclaimInvariant:
         from skill.plan.plan_helpers import _wl_reclaim
 
         # After gate reclaim, a subsequent require_claimed == in_progress
-        verify_runner = _FakeResult(_show_payload({"id": "X", "status": "in_progress", "effort": "Small", "risk": "Low"}))
+        verify_runner = _FakeResult(_show_payload({"id": "X", "status": "in-progress", "effort": "Small", "risk": "Low"}))
 
         class _VerifyRunner:
             def __call__(self, cmd):
