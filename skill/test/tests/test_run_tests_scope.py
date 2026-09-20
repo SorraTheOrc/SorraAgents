@@ -452,12 +452,13 @@ class TestScopePropagated:
         with mock.patch("run_tests._run_cmd", side_effect=fake_run):
             result = run_suite(
                 "pytest",
-                cwd="/tmp",  # won't execute — just checking structure
+                cwd="/tmp",
                 use_cache=False,
                 force=True,
             )
         assert "scope" in result
         assert result["scope"] == "full"
+        assert captured  # verify command was "executed" (mocked)
 
     def test_run_all_carries_scope_per_suite(self) -> None:
         """run_all results carry scope for each suite."""
@@ -480,6 +481,7 @@ class TestScopePropagated:
         for suite_result in result.get("suites", {}).values():
             assert "scope" in suite_result
             assert suite_result["scope"] == "full"
+        assert captured  # verify command was "executed" (mocked)
 
     def test_file_not_found_carries_scope(self) -> None:
         """Exception paths in run_suite still carry scope in the result."""
