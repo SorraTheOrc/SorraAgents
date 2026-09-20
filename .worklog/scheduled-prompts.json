@@ -1,0 +1,17 @@
+{
+  "entries": [
+    {
+      "id": "/skill:refactor",
+      "prompt": "/skill:refactor",
+      "intervalDays": 3,
+      "lastTriggeredAt": null
+    },
+    {
+      "id": "/skill:standup",
+      "prompt": "/skill:standup",
+      "intervalDays": 1,
+      "time": "06:05",
+      "lastTriggeredAt": null
+    }
+  ]
+}
