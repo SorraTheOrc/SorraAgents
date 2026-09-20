@@ -442,23 +442,39 @@ class TestScopePropagated:
 
     def test_run_suite_carries_scope(self) -> None:
         """run_suite result dict carries scope field."""
-        result = run_suite(
-            "pytest",
-            cwd="/tmp",  # won't execute — just checking structure
-            use_cache=False,
-            force=True,
-        )
+        from types import SimpleNamespace
+
+        captured: list[str] = []
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch("run_tests._run_cmd", side_effect=fake_run):
+            result = run_suite(
+                "pytest",
+                cwd="/tmp",  # won't execute — just checking structure
+                use_cache=False,
+                force=True,
+            )
         assert "scope" in result
         assert result["scope"] == "full"
 
     def test_run_all_carries_scope_per_suite(self) -> None:
         """run_all results carry scope for each suite."""
-        result = run_all(
-            suites=("pytest",),
-            cwd="/tmp",
-            use_cache=False,
-            force=True,
-        )
+        from types import SimpleNamespace
+
+        captured: list[str] = []
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch("run_tests._run_cmd", side_effect=fake_run):
+            result = run_all(
+                suites=("pytest",),
+                cwd="/tmp",
+                use_cache=False,
+                force=True,
+            )
         assert "scope" in result
         assert result["scope"] == "full"
         for suite_result in result.get("suites", {}).values():
