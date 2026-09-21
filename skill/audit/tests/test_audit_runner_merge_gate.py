@@ -935,3 +935,83 @@ class TestCmdIssueStaleAuditBase:
         assert "stale_audit_base" in payload
         assert payload["stale_audit_base"]["merged"] is True
         assert "remediation" in payload["stale_audit_base"]
+
+
+# ---------------------------------------------------------------------------
+# Comment-referenced evidence + foreign-hex filtering (SA-0MTQAF62U0085BEV)
+# ---------------------------------------------------------------------------
+
+class TestCommentReferencedEvidence:
+    """The merge gate must consume commit citations that live ONLY in
+    top-level comments — `wl show --json` returns `comments` at the payload
+    top level, NOT under `workItem` — and must ignore hex tokens that are
+    not commit objects in the owning repo (upstream pins, URL fragments).
+
+    Regression: audits failed closed because comment-referenced commits were
+    never discovered and a foreign hex in prose was treated as a
+    cherry-pick candidate (`fatal: bad object`).
+    """
+
+    FOREIGN_SHA = "9b0f500f11f345ae106f727a8347f123bfa7fd9b"
+
+    def test_bind_fetched_item_binds_top_level_comments(self):
+        """`wl show --children --json` payload: comments at TOP level, not
+        under workItem (AC1/AC4)."""
+        ctx = _make_ctx()
+        audit_runner._bind_fetched_item(ctx, {
+            "workItem": {"id": "WL-ABC123", "description": "no shas here"},
+            "comments": [{"comment": "pushed c661f3c5aabb onto dev"}],
+            "children": [],
+        })
+        assert ctx.description == "no shas here"
+        assert ctx.comments == [{"comment": "pushed c661f3c5aabb onto dev"}]
+
+    def test_comment_only_citation_resolved_from_ctx_comments(self):
+        """A commit cited only in top-level comments (no branch, no
+        description hex) is resolved (AC1)."""
+        ctx = _make_ctx(
+            comments=[{"comment": "real fix landed as c661f3c5aabb"}],
+        )
+        commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert "c661f3c5aabb" in commits
+        assert branch == ""
+
+    def test_foreign_hex_filtered_but_real_commit_kept(self, tmp_path):
+        """A foreign 40-hex (upstream pin) is NOT an object in the owning
+        repo and is dropped; the real comment-referenced commit survives
+        (AC2)."""
+        _wl, owning, shas = _make_real_repo(tmp_path, feature_branch=False)
+        real = shas["dev_head"]
+        ctx = _ctx_with_runner(owning, "WL-0MSI4TAT70058921")
+        ctx.comments = [{
+            "comment": (
+                f"pinned upstream ref {self.FOREIGN_SHA}, our fix {real}"
+            )
+        }]
+        commits, _branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert real in commits
+        assert self.FOREIGN_SHA not in commits
+
+    def test_comment_only_citation_verifies_merged_in_dev(self, tmp_path):
+        """AC1 end-to-end at the evidence level: the comment-only commit is
+        resolved and verified as an ancestor of origin/dev (no branch)."""
+        _wl, owning, shas = _make_real_repo(tmp_path, feature_branch=False)
+        ctx = _ctx_with_runner(owning, "WL-0MSI4TAT70058921")
+        ctx.comments = [{"comment": f"landed as {shas['dev_head']}"}]
+        commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
+        merged, evidence, baseline = audit_runner._verify_merged_in_dev(
+            ctx, commits, branch
+        )
+        assert merged is True
+        assert baseline is True
+        assert "-> yes" in evidence
+
+    def test_description_referenced_commits_still_resolved(self):
+        """AC3 regression: description-referenced commits keep resolving;
+        the mock runner asserts every candidate exists."""
+        ctx = _make_ctx(
+            description="Implemented in commit 4f1f0452abc",
+        )
+        commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert "4f1f0452abc" in commits
+        assert branch == ""

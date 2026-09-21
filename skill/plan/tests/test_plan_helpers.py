@@ -2,7 +2,8 @@
 
 The plan skill's step 4 asks the user to approve a proposed feature plan.
 Approval is requested only when the work item's effort t-shirt size is
-Medium/Large/Extra Large ("scale") OR its risk level is Medium/High.
+Medium/Large/Extra Large ("scale") OR its risk level is High (Medium risk
+no longer triggers the gate on its own — dev commit a9d8b8b9).
 When effort is Extra Small/Small AND risk is Low, the plan proceeds
 directly to the automated review stages without an approval pause.
 
@@ -68,17 +69,24 @@ class TestShouldRequestPlanApproval:
         assert request is True
         assert effort in reason
 
-    @pytest.mark.parametrize(
-        "risk",
-        ["Medium", "High"],
-    )
-    def test_medium_or_high_risk_requests_approval(self, risk):
-        """Medium/High risk requests approval even with Extra Small effort."""
+    @pytest.mark.parametrize("risk", ["High"])
+    def test_high_risk_requests_approval(self, risk):
+        """High risk requests approval even with Extra Small effort."""
         request, reason = should_request_plan_approval(
             {"effort": "Extra Small", "risk": risk}
         )
         assert request is True
         assert risk in reason
+
+    def test_medium_risk_alone_no_longer_triggers_approval(self):
+        """Medium risk no longer triggers the gate by itself
+        (PLAN_APPROVAL_RISK is High-only since dev commit a9d8b8b9); a
+        small, Medium-risk item proceeds without an approval pause."""
+        request, reason = should_request_plan_approval(
+            {"effort": "Small", "risk": "Medium"}
+        )
+        assert request is False
+        assert reason == ""
 
     def test_high_effort_and_high_risk_lists_both_reasons(self):
         """The reason names both the scale and the risk that triggered the gate."""

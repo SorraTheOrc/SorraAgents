@@ -6736,6 +6736,11 @@ class _AuditContext:
     work_item: dict = field(default_factory=dict)
     children: list = field(default_factory=list)
     description: str = ""
+    comments: list = field(default_factory=list)
+    """Top-level ``comments`` from the ``wl show --json`` payload. ``wl show``
+    returns comments beside ``workItem`` (not nested under it), so the fetch
+    phase binds them explicitly for the merge gate's evidence resolution
+    (SA-0MTQAF62U0085BEV)."""
     acs: list = field(default_factory=list)
     content_fingerprint: str | None = None
     cq_findings: list = field(default_factory=list)
@@ -6778,6 +6783,42 @@ class _AuditContext:
         if self.script_failure is not None:
             return
         self.script_failure = _format_script_failure(script_name, exc)
+
+
+def _commit_object_exists(ctx: _AuditContext, sha: str) -> bool:
+    """True when *sha* resolves to a commit object in the owning repo.
+
+    Foreign hex cited in prose (upstream pins, URL fragments, decimal
+    fractions) is not an object in the owning repo. Treating it as a
+    cherry-pick candidate produced ``fatal: bad object`` and a spurious
+    merge-gate block (SA-0MTQAF62U0085BEV AC2). Git errors fail open (the
+    sha is kept) so a transient git failure never silently drops a real
+    candidate.
+    """
+    try:
+        proc = ctx.runner(
+            ["git", "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"]
+        )
+    except Exception:  # noqa: BLE001 -- fail open; never drop on error
+        return True
+    return getattr(proc, "returncode", 1) == 0
+
+
+def _bind_fetched_item(ctx: _AuditContext, data: dict) -> None:
+    """Bind a ``wl show --children --json`` payload onto *ctx*.
+
+    ``wl show --json`` returns ``comments`` at the TOP level of the payload
+    (beside ``workItem``), not nested under ``workItem``; binding it
+    explicitly keeps the merge gate's comment-referenced evidence reachable
+    (SA-0MTQAF62U0085BEV AC1/AC4). The binding lives in the audit runner
+    only — ``wl show`` clients are unaffected (AC4).
+    """
+    payload = data or {}
+    work_item = payload.get("workItem", {}) or {}
+    ctx.work_item = work_item
+    ctx.children = payload.get("children", []) or []
+    ctx.description = work_item.get("description", "") or ""
+    ctx.comments = payload.get("comments", []) or []
 
 
 def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], str]:
@@ -6850,10 +6891,23 @@ def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], s
     desc = ctx.description or ""
     for m in re.finditer(r"\b[0-9a-f]{7,40}\b", desc, re.IGNORECASE):
         _add_sha(m.group(0))
-    for comment in (ctx.work_item.get("comments", []) or []):
+    # ``wl show --json`` returns comments at the TOP level of the payload, not
+    # under ``workItem``; prefer the explicitly-bound ``ctx.comments``,
+    # falling back to a work-item-nested list for callers that pass one
+    # (SA-0MTQAF62U0085BEV AC1).
+    comment_list = ctx.comments or (ctx.work_item.get("comments", []) or [])
+    for comment in comment_list:
         text = comment.get("comment", "") or ""
         for m in re.finditer(r"\b[0-9a-f]{7,40}\b", text, re.IGNORECASE):
             _add_sha(m.group(0))
+
+    # Drop hex tokens that are not commit objects in the owning repo
+    # (upstream pins, URL fragments, decimal fractions): cherry-picking them
+    # fails with ``fatal: bad object`` and blocks the gate spuriously
+    # (SA-0MTQAF62U0085BEV AC2). Fail-open when the owning repo is unknown —
+    # integration is not attempted in that case anyway.
+    if owning_root is not None and commits:
+        commits = [c for c in commits if _commit_object_exists(ctx, c)]
 
     return commits, branch
 
@@ -8423,15 +8477,15 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
             print(fail_report)
         return 1
 
-    work_item = data.get("workItem", {})
-    children = data.get("children", [])
-    description = work_item.get("description", "")
-
     # Populate ctx early so the merge gate (below) reuses the fetched item
-    # instead of issuing its own ``wl show``.
-    ctx.work_item = work_item
-    ctx.children = children
-    ctx.description = description
+    # instead of issuing its own ``wl show``. ``_bind_fetched_item`` also
+    # binds the TOP-LEVEL ``comments`` (``wl show --json`` returns them
+    # beside ``workItem``, not nested under it) so comment-referenced
+    # integration evidence is reachable (SA-0MTQAF62U0085BEV AC1/AC4).
+    _bind_fetched_item(ctx, data)
+    work_item = ctx.work_item
+    children = ctx.children
+    description = ctx.description
 
     # Merge gate (SA-0MT456M27001LRTL) — very start of Phase 1, BEFORE the
     # code-quality scan, children-stage check, or surface AC assessment.
