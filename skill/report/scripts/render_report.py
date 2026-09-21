@@ -189,7 +189,7 @@ def _fallback(lookup_table, key, default="[?]", label=""):
 
 # ─── Metadata rendering ────────────────────────────────────────────────
 
-def render_metadata(work_item: dict) -> dict:
+def render_metadata(work_item: dict, children: list | None = None) -> dict:
     """Populate the Meta-Data block from a ``wl show --json`` dict.
 
     Returns a dict keyed by field name with ``<icon> <value>`` strings.
@@ -227,7 +227,7 @@ def render_metadata(work_item: dict) -> dict:
     metadata["Effort"] = f"{e_icon} {e_label}" if e_icon else f"❓ {e_label or 'unknown'}"
 
     # Children
-    child_count = work_item.get("childCount", 0) or 0
+    child_count = len(children) if children else 0
     children_icon = "\U0001f465"  # 👥
     metadata["Children"] = f"{children_icon} {child_count}"
 
@@ -354,9 +354,10 @@ def render_report_from_workitem(
     producer_actions=None,
     notes=None,
     next_action: str = "review",
+    children: list | None = None,
 ) -> str:
     """Convenience wrapper: read metadata from a work-item dict and render."""
-    metadata = render_metadata(work_item)
+    metadata = render_metadata(work_item, children=children)
     return render_report(
         skill_name=skill_name,
         work_item_id=work_item.get("id", "unknown"),
@@ -380,7 +381,7 @@ def render_from_wl(
     next_action: str = "review",
 ) -> str:
     """Fetch work-item data via ``wl show`` and render a report."""
-    cmd = ["wl", "show", work_item_id, "--json"]
+    cmd = ["wl", "show", work_item_id, "--json", "--children"]
     try:
         wl_flags = worklog_dir_flag()
     except (RuntimeError, OSError):
@@ -396,6 +397,7 @@ def render_from_wl(
         sys.exit(1)
     data = json.loads(result.stdout)
     work_item = data.get("workItem", {})
+    children = data.get("children", [])
     return render_report_from_workitem(
         work_item=work_item,
         skill_name=skill_name,
@@ -404,6 +406,7 @@ def render_from_wl(
         producer_actions=producer_actions,
         notes=notes,
         next_action=next_action,
+        children=children,
     )
 
 
