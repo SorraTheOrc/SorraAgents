@@ -143,6 +143,14 @@ suite, no node dirs) is NOT an error: `run_tests.py` reports zero commands
 and the audit skill treats the repo as execution-impossible — fail-open
 partial, never blocks (F4 AC2).
 
+**Project-specific note (SorraAgents):** this repo declares
+`.pi/test-config.json` with `{"timeoutPerCommand": 1500}` (added under
+SA-0MTYMFLZD004O2VV / commit 715806bb). The default 600s cap kills the full
+suite (~412s measured wall-clock) before it can finish, so the timeout was
+raised to 1500s (~3.6x margin) to allow both the test skill and the audit
+runner's auto-execute path to complete. No `suiteCommands` override is set
+— command detection continues to use the convention-based resolution above.
+
 ### 1a. Test types (`--type`) and the local extension contract (SA-0MTJQB2MA008HMO6)
 
 `--type <TYPE>` selects the **command profile** (default `full`). It is
