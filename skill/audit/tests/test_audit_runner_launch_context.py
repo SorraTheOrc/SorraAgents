@@ -21,11 +21,11 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
+
+import pytest
 
 # ---------------------------------------------------------------------------
 # Ensure repo root is on sys.path so the audit_runner module is importable.
@@ -502,26 +502,22 @@ class TestRootFileOnlyRepoManifest:
         tmp_path resolved to the project root and git add/commit wiped 472
         files.
         """
-        # --- Defensive guard: tmp_path must not be inside any enclosing repo ---
+        # --- Defensive guard: tmp_path must not be inside ANY git repository ---
+        # Reject both the live repo root and any path nested inside an
+        # enclosing repository: a nested tmp_path would still let the fixture
+        # create and commit a repository inside the live checkout.
         try:
-            enclosing_repo = (
-                subprocess.run(
-                    ["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"],
-                    capture_output=True, text=True, check=True,
-                ).stdout.strip()
-            )
-            # If tmp_path is inside a git repo, that repo must BE tmp_path itself
-            # (i.e. tmp_path is the repo root and we will create a subdirectory
-            # inside it for the fixture).  Since tmp_path is a pytest tmp
-            # directory under /tmp, it should never be a repo root.
-            assert enclosing_repo != str(tmp_path.resolve()), (
-                f"_init_repo refused: tmp_path {tmp_path} is a git repo root. "
-                "Running the fixture here would risk committing into the live "
-                "repository."
-            )
+            enclosing_repo = subprocess.run(
+                ["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
         except subprocess.CalledProcessError:
-            # tmp_path is not inside a git repo — safe to proceed.
-            pass
+            enclosing_repo = ""  # not inside any git repo — safe to proceed.
+        assert not enclosing_repo, (
+            f"_init_repo refused: tmp_path {tmp_path} is inside git repository "
+            f"{enclosing_repo!r}. Running the fixture here would risk "
+            "committing into the live repository."
+        )
 
         repo = tmp_path / "root-file-repo"
         repo.mkdir()
@@ -604,15 +600,19 @@ class TestRootFileOnlyRepoManifest:
         assert "Audit scope error" in error
 
     def test_init_repo_refuses_live_repo_tmp_path(self):
-        """AC1 regression: _init_repo must refuse when tmp_path is a git repo.
+        """AC1 regression: _init_repo refuses any tmp_path inside a git repo.
 
         Reproduces the guard for the SA-0MU8EKJYY007PT42 incident where
         tmp_path resolved to the live project root and the fixture committed
-        into the repo, deleting 472 files.
+        into the repo, deleting 472 files. The guard rejects both the repo
+        root itself and any path nested inside an enclosing repository, since
+        a nested path would still let the fixture create and commit a
+        repository inside the live checkout.
         """
-        with pytest.raises(AssertionError) as exc_info:
-            self._init_repo(REPO_ROOT)
-        assert "is a git repo root" in str(exc_info.value)
+        for unsafe_path in (REPO_ROOT, REPO_ROOT / "skill"):
+            with pytest.raises(AssertionError) as exc_info:
+                self._init_repo(unsafe_path)
+            assert "is inside git repository" in str(exc_info.value)
 
     def test_repo_index_root_file_list_is_bounded(self, tmp_path):
         """Risk mitigation: the root-file name list is bounded so a repo with
