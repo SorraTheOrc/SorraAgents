@@ -481,7 +481,9 @@ class TestRootFileOnlyRepoManifest:
     SAFETY CONTEXT (SA-0MU8EKJYY007PT42): On 2026-09-19, the _init_repo
     fixture committed against the live repo when pytest's tmp_path resolved
     to the project root (author T <t@t.com>, commit 2c30dbfe). The fixture
-    now asserts that tmp_path is not a git repo root before proceeding.
+    now asserts that tmp_path is not inside any git repository — neither the
+    repository root itself nor any path nested within a checkout — before
+    proceeding.
     Root cause: pytest's tmp_path / --basetemp can be overridden by TMPDIR
     environment variable or by the test-skill runner's working directory.
     When run_tests.py invoked pytest from the project root without an
@@ -499,8 +501,12 @@ class TestRootFileOnlyRepoManifest:
 
         SAFETY GUARD: refuse to run if tmp_path sits inside the live repo.
         This prevents the historical incident (SA-0MU8EKJYY007PT42) where
-        tmp_path resolved to the project root and git add/commit wiped 472
-        files.
+        tmp_path resolved to the project root and the fixture's git surface —
+        ``git init``, ``git add -A`` and ``git commit`` — wiped 472 files
+        from the live checkout. The guard is the only thing standing between
+        the fixture's git commands and the surrounding repository, so it must
+        reject any tmp_path nested inside a git repository, not merely the
+        repository root.
         """
         # --- Defensive guard: tmp_path must not be inside ANY git repository ---
         # Reject both the live repo root and any path nested inside an
