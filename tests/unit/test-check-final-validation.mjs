@@ -45,6 +45,8 @@ test('check-final-validation: exports expected functions', async () => {
   assert.equal(typeof mod.classifyAudit, 'function');
   assert.equal(typeof mod.isAuditStale, 'function');
   assert.equal(typeof mod.parseIsoUtc, 'function');
+  assert.equal(typeof mod.getItemById, 'function');
+  assert.equal(typeof mod.resolveChildScope, 'function');
 });
 
 // ── parseIsoUtc ──────────────────────────────────────────────────────────────
@@ -440,24 +442,174 @@ describe('checkFinalValidation - producer-review flag', () => {
   });
 });
 
-describe('checkFinalValidation - children are in scope', () => {
-  test('a child with a failing audit blocks the release', async () => {
-    const { report } = await runGate({
-      items: [CHILD_ITEM],
-      auditShowResults: [AUDIT_FAILING],
+describe('checkFinalValidation - parent coverage and out-of-scope children', () => {
+  const PARENT_IN_REVIEW = {
+    id: 'SA-P1',
+    title: 'Parent One',
+    stage: 'in_review',
+    parentId: null,
+    updatedAt: '2026-09-04T09:00:00Z',
+  };
+  const GRANDPARENT_IN_REVIEW = {
+    id: 'SA-GP1',
+    title: 'Grandparent One',
+    stage: 'in_review',
+    parentId: null,
+    updatedAt: '2026-09-04T09:00:00Z',
+  };
+  const SCOPED_CHILD = {
+    id: 'SA-CHILD-1',
+    title: 'Child One',
+    needsProducerReview: false,
+    parentId: 'SA-P1',
+    updatedAt: '2026-09-04T10:00:00Z',
+  };
+
+  /** Build a runAuditShow that dispatches canned payloads by work-item id. */
+  function auditDispatch(map) {
+    return (id) => JSON.stringify(map[id] ?? { success: true, workItemId: id, audit: null });
+  }
+
+  /** Run the gate with a parent-map resolver and a per-id audit dispatcher. */
+  async function runScopedGate({ items, parents = {}, audits = {}, runAuditCommand } = {}) {
+    const mod = await import(MODULE_PATH);
+    return mod.checkFinalValidation({
+      getItemsFn: () => items,
+      getItemByIdFn: (id) => (id in parents ? parents[id] : null),
+      runAuditShow: auditDispatch(audits),
+      runAuditCommand: runAuditCommand || (() => 'ok'),
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
     });
-    assert.equal(report.hasBlockingItems, true);
-    assert.equal(report.blockingItems[0].workItemId, 'SA-CHILD-1');
+  }
+
+  test('a child covered by a passing in_review parent audit never blocks', async () => {
+    const report = await runScopedGate({
+      items: [SCOPED_CHILD],
+      parents: { 'SA-P1': PARENT_IN_REVIEW },
+      audits: {
+        'SA-P1': { success: true, audit: { readyToClose: true, auditedAt: '2026-09-04T09:30:00Z', summary: 'ok' } },
+        // failing child audit must NOT be consulted when the child is covered
+        'SA-CHILD-1': AUDIT_FAILING,
+      },
+    });
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.coveredChildren.length, 1);
+    assert.equal(report.coveredChildren[0].parentId, 'SA-P1');
+    assert.match(report.message, /covered by passing parent audit SA-P1/);
   });
 
-  test('a child flagged for producer review blocks', async () => {
-    const flaggedChild = { ...CHILD_ITEM, needsProducerReview: true };
-    const { report } = await runGate({
-      items: [flaggedChild],
-      auditShowResults: [AUDIT_PASSING],
+  test('a covered child with a producer-review flag is skipped (does not block)', async () => {
+    const report = await runScopedGate({
+      items: [{ ...SCOPED_CHILD, needsProducerReview: true }],
+      parents: { 'SA-P1': PARENT_IN_REVIEW },
+      audits: { 'SA-P1': AUDIT_PASSING },
+    });
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.coveredChildren.length, 1);
+  });
+
+  test('an uncovered child (parent not passing) with a failing audit blocks', async () => {
+    const report = await runScopedGate({
+      items: [SCOPED_CHILD],
+      parents: { 'SA-P1': PARENT_IN_REVIEW },
+      audits: {
+        'SA-P1': AUDIT_MISSING, // in_review but no passing audit → no coverage
+        'SA-CHILD-1': AUDIT_FAILING,
+      },
     });
     assert.equal(report.hasBlockingItems, true);
     assert.equal(report.blockingItems[0].workItemId, 'SA-CHILD-1');
+    assert.equal(report.coveredChildren.length, 0);
+  });
+
+  test('a child whose parent is not in_review is excluded (never blocks)', async () => {
+    const report = await runScopedGate({
+      items: [SCOPED_CHILD],
+      parents: { 'SA-P1': { id: 'SA-P1', stage: 'open', parentId: null } },
+      audits: { 'SA-CHILD-1': AUDIT_FAILING },
+    });
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.excludedChildren.length, 1);
+    assert.equal(report.excludedChildren[0].parentStage, 'open');
+  });
+
+  test('a deleted/non-existent parent excludes the child (AC13)', async () => {
+    const report = await runScopedGate({
+      items: [SCOPED_CHILD],
+      parents: {}, // resolver returns null for SA-P1
+      audits: { 'SA-CHILD-1': AUDIT_FAILING },
+    });
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.excludedChildren.length, 1);
+    assert.match(report.excludedChildren[0].reason, /does not exist/);
+  });
+
+  test('a stale passing parent audit does not cover the child', async () => {
+    const report = await runScopedGate({
+      items: [SCOPED_CHILD],
+      parents: { 'SA-P1': PARENT_IN_REVIEW },
+      audits: {
+        // parent audit predates the parent's last update → stale → no coverage
+        'SA-P1': { success: true, audit: { readyToClose: true, auditedAt: '2026-09-04T08:00:00Z', summary: 'old' } },
+        'SA-CHILD-1': AUDIT_PASSING,
+      },
+    });
+    assert.equal(report.coveredChildren.length, 0);
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.passingCount, 1);
+  });
+
+  test('a grandchild resolves via its nearest passing in_review ancestor (AC5)', async () => {
+    const grandchild = {
+      id: 'SA-GC1',
+      title: 'Grandchild',
+      needsProducerReview: false,
+      parentId: 'SA-CHILD-1',
+      updatedAt: '2026-09-04T10:00:00Z',
+    };
+    const report = await runScopedGate({
+      items: [grandchild],
+      parents: {
+        'SA-CHILD-1': { id: 'SA-CHILD-1', stage: 'in_review', parentId: 'SA-GP1' },
+        'SA-GP1': GRANDPARENT_IN_REVIEW,
+      },
+      audits: {
+        'SA-CHILD-1': AUDIT_MISSING, // non-passing → walk continues up
+        'SA-GP1': { success: true, audit: { readyToClose: true, auditedAt: '2026-09-04T09:30:00Z', summary: 'ok' } },
+      },
+    });
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.coveredChildren.length, 1);
+    assert.equal(report.coveredChildren[0].parentId, 'SA-GP1');
+  });
+
+  test('a parent cycle is broken conservatively (uncovered, never covered)', async () => {
+    const cyclic = {
+      id: 'SA-C1',
+      title: 'Cyclic',
+      needsProducerReview: false,
+      parentId: 'SA-C2',
+      updatedAt: '2026-09-04T10:00:00Z',
+    };
+    const report = await runScopedGate({
+      items: [cyclic],
+      parents: { 'SA-C2': { id: 'SA-C2', stage: 'in_review', parentId: 'SA-C1' } },
+      audits: { 'SA-C2': AUDIT_MISSING },
+    });
+    assert.equal(report.coveredChildren.length, 0);
+    assert.equal(report.excludedChildren.length, 0);
+  });
+
+  test('top-level items are evaluated unchanged (no coverage lookup)', async () => {
+    const report = await runScopedGate({
+      items: [ITEM],
+      parents: {},
+      audits: { 'SA-1': AUDIT_PASSING },
+    });
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.passingCount, 1);
+    assert.equal(report.coveredChildren.length, 0);
+    assert.equal(report.excludedChildren.length, 0);
   });
 });
 

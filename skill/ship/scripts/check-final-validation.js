@@ -209,6 +209,143 @@ export function getInReviewItems() {
   }
 }
 
+// ── getItemById ──────────────────────────────────────────────────────────────
+
+/**
+ * Resolve a single work item (any stage) by id — used to walk a child's
+ * parent chain for parent-coverage / out-of-scope resolution.
+ *
+ * Returns `null` when the item genuinely does not exist (deleted/missing);
+ * throws on a command failure so the caller can treat the child as
+ * *uncovered* (evaluate its own audit) rather than silently excluding it.
+ *
+ * @param {string} itemId - Work item id.
+ * @returns {{id: string, title: string, stage: string|null, parentId: string|null, updatedAt: string|null}|null}
+ */
+export function getItemById(itemId) {
+  try {
+    const output = execSync(`wl show ${itemId} --json`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const parsed = JSON.parse(output);
+    if (!parsed || parsed.success === false || !parsed.workItem) {
+      return null;
+    }
+    const wi = parsed.workItem;
+    return {
+      id: wi.id || itemId,
+      title: wi.title || wi.id || itemId,
+      stage: wi.stage !== undefined ? wi.stage : null,
+      parentId: wi.parentId !== undefined ? wi.parentId : null,
+      updatedAt: wi.updatedAt !== undefined ? wi.updatedAt : null,
+    };
+  } catch (err) {
+    const stdout = err && err.stdout ? err.stdout.toString() : '';
+    if (/"success"\s*:\s*false/.test(stdout) || /not found/i.test(stdout)) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+// ── resolveChildScope ────────────────────────────────────────────────────────
+
+/**
+ * Resolve a child item's release scope by walking its parent chain
+ * (SA-0MU2OY1N9000XL2H).
+ *
+ * Precedence (first match wins):
+ *   1. A parent that does not exist (deleted) → `excluded`.
+ *   2. An ancestor whose stage is not `in_review` → `excluded`
+ *      (the subtree is not part of the release).
+ *   3. The nearest `in_review` ancestor with a fresh passing audit →
+ *      `covered` (the child is covered by the parent's audit/review).
+ *   4. Otherwise → `uncovered` (evaluate the child's own audit/flag).
+ *
+ * A non-passing `in_review` ancestor does NOT provide coverage; the walk
+ * continues to the next ancestor so a higher passing `in_review` ancestor can
+ * still cover the child. Cycles are broken conservatively (`uncovered`).
+ *
+ * @param {{id: string, parentId: string|null}} item - The child item.
+ * @param {object} boundaries - Injectable command boundaries.
+ * @param {(id: string) => (object|null)} boundaries.getItemByIdFn
+ * @param {(id: string) => string} boundaries.runAuditShow
+ * @returns {{outcome: 'covered'|'excluded'|'uncovered', reason: string, ancestorId: string|null, parentStage: string|null}}
+ */
+export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
+  const visited = new Set([item.id]);
+  let ancestorId = item.parentId;
+  while (ancestorId) {
+    if (visited.has(ancestorId)) {
+      return {
+        outcome: 'uncovered',
+        reason: `parent cycle detected at ${ancestorId}`,
+        ancestorId,
+        parentStage: null,
+      };
+    }
+    visited.add(ancestorId);
+
+    let parentItem;
+    try {
+      parentItem = getItemByIdFn(ancestorId);
+    } catch (err) {
+      return {
+        outcome: 'uncovered',
+        reason: `failed to resolve parent ${ancestorId}: ${err.message}`,
+        ancestorId,
+        parentStage: null,
+      };
+    }
+    if (parentItem == null) {
+      return {
+        outcome: 'excluded',
+        reason: `parent ${ancestorId} does not exist (deleted/missing)`,
+        ancestorId,
+        parentStage: null,
+      };
+    }
+    if (parentItem.stage !== 'in_review') {
+      return {
+        outcome: 'excluded',
+        reason: `parent ${ancestorId} is not in_review (stage=${parentItem.stage ?? 'unknown'})`,
+        ancestorId,
+        parentStage: parentItem.stage ?? null,
+      };
+    }
+
+    let auditData = null;
+    try {
+      auditData = JSON.parse(runAuditShow(ancestorId));
+    } catch (_err) {
+      return {
+        outcome: 'uncovered',
+        reason: `failed to query parent ${ancestorId} audit`,
+        ancestorId,
+        parentStage: parentItem.stage,
+      };
+    }
+    const classification = classifyAudit(parentItem, auditData);
+    if (classification.kind === 'passing') {
+      return {
+        outcome: 'covered',
+        reason: `covered by passing parent audit ${ancestorId}`,
+        ancestorId,
+        parentStage: parentItem.stage,
+      };
+    }
+    // Non-passing in_review ancestor: look further up the chain.
+    ancestorId = parentItem.parentId;
+  }
+  return {
+    outcome: 'uncovered',
+    reason: 'no in_review ancestor with a passing audit',
+    ancestorId: null,
+    parentStage: null,
+  };
+}
+
 // ── checkFinalValidation ─────────────────────────────────────────────────────
 
 /**
@@ -235,6 +372,8 @@ export function getInReviewItems() {
  *   Runs the audit remediation (`python3 <runner> issue <id>`).
  * @param {() => string} [options.resolveAuditRunnerFn] - Resolves the audit
  *   runner script path; defaults to `resolveAuditRunner`.
+ * @param {(id: string) => (object|null)} [options.getItemByIdFn] - Resolves a
+ *   work item by id (for parent-chain coverage); defaults to {@link getItemById}.
  * @returns {Promise<{
  *   hasBlockingItems: boolean,
  *   blockingItems: Array<{
@@ -246,6 +385,8 @@ export function getInReviewItems() {
  *     remediation: string
  *   }>,
  *   remediatedItems: Array<{ workItemId: string, title: string, reason: string }>,
+ *   coveredChildren: Array<{ workItemId: string, title: string, parentId: string|null, reason: string }>,
+ *   excludedChildren: Array<{ workItemId: string, title: string, parentId: string|null, parentStage: string|null, reason: string }>,
  *   passingCount: number,
  *   message: string
  * }>}
@@ -263,6 +404,7 @@ export async function checkFinalValidation(options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 600000 },
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
+    getItemByIdFn = getItemById,
   } = options;
 
   const items = getItemsFn();
@@ -272,6 +414,8 @@ export async function checkFinalValidation(options = {}) {
       hasBlockingItems: false,
       blockingItems: [],
       remediatedItems: [],
+      coveredChildren: [],
+      excludedChildren: [],
       passingCount: 0,
       message: 'No in_review work items found. Final-validation gate passed.',
     };
@@ -279,9 +423,39 @@ export async function checkFinalValidation(options = {}) {
 
   const blockingItems = [];
   const remediatedItems = [];
+  const coveredChildren = [];
+  const excludedChildren = [];
   let passingCount = 0;
 
   for (const item of items) {
+    // ── Child scope: parent coverage / out-of-scope exclusion ───────────
+    // Top-level items (parentId == null) are always evaluated. A child is
+    // skipped when covered by a passing in_review parent audit or excluded
+    // (parent deleted / not in_review); it never blocks in those cases.
+    if (item.parentId) {
+      const scope = resolveChildScope(item, { getItemByIdFn, runAuditShow });
+      if (scope.outcome === 'covered') {
+        coveredChildren.push({
+          workItemId: item.id,
+          title: item.title,
+          parentId: scope.ancestorId,
+          reason: scope.reason,
+        });
+        continue;
+      }
+      if (scope.outcome === 'excluded') {
+        excludedChildren.push({
+          workItemId: item.id,
+          title: item.title,
+          parentId: scope.ancestorId,
+          parentStage: scope.parentStage,
+          reason: scope.reason,
+        });
+        continue;
+      }
+      // 'uncovered' → fall through and evaluate the child's own audit/flag.
+    }
+
     const reasons = [];
     let summary = null;
     let remediated = false;
@@ -369,6 +543,28 @@ export async function checkFinalValidation(options = {}) {
   }
 
   // ── Build report ───────────────────────────────────────────────────────
+  const buildScopeNote = (lines) => {
+    if (coveredChildren.length > 0) {
+      const byParent = new Map();
+      for (const child of coveredChildren) {
+        byParent.set(child.parentId, (byParent.get(child.parentId) || 0) + 1);
+      }
+      lines.push('', 'Child scope — covered by a passing in_review parent audit:', '');
+      for (const [parentId, count] of byParent) {
+        lines.push(`  - ${count} child(ren) covered by passing parent audit ${parentId}`);
+      }
+    }
+    if (excludedChildren.length > 0) {
+      lines.push('', 'Child scope — excluded (out of release scope):', '');
+      excludedChildren.forEach((entry, i) => {
+        lines.push(
+          `${i + 1}. ${entry.title} (${entry.workItemId}) — ` +
+          `parent ${entry.parentId} (stage=${entry.parentStage ?? 'unknown'}): ${entry.reason}`,
+        );
+      });
+    }
+  };
+
   const buildRemediatedNote = (lines) => {
     if (remediatedItems.length === 0) {
       return;
@@ -387,14 +583,19 @@ export async function checkFinalValidation(options = {}) {
   if (blockingItems.length === 0) {
     const lines = [
       `All ${items.length} in_review work item(s) passed final validation ` +
-        `(${passingCount} audit-clean, ${remediatedItems.length} auto-remediated). ` +
+        `(${passingCount} audit-clean, ${remediatedItems.length} auto-remediated, ` +
+        `${coveredChildren.length} covered by a passing parent audit, ` +
+        `${excludedChildren.length} excluded as out-of-scope). ` +
         'Final-validation gate passed.',
     ];
     buildRemediatedNote(lines);
+    buildScopeNote(lines);
     return {
       hasBlockingItems: false,
       blockingItems: [],
       remediatedItems,
+      coveredChildren,
+      excludedChildren,
       passingCount,
       message: lines.join('\n'),
     };
@@ -421,18 +622,21 @@ export async function checkFinalValidation(options = {}) {
   });
 
   buildRemediatedNote(lines);
+  buildScopeNote(lines);
 
   lines.push(
-    'This sweep covers ALL in_review items (top-level and children), unlike the',
-    'scoped audit (Step 2) and producer-review (Step 3.6) gates. After remediation,',
-    're-run the release without --skip-checks to re-validate. Use --skip-checks to',
-    'bypass this gate.',
+    'Top-level items and uncovered children are validated independently; children',
+    'covered by a passing parent audit (or excluded as out-of-scope) are skipped.',
+    'After remediation, re-run the release without --skip-checks to re-validate.',
+    'Use --skip-checks to bypass this gate.',
   );
 
   return {
     hasBlockingItems: true,
     blockingItems,
     remediatedItems,
+    coveredChildren,
+    excludedChildren,
     passingCount,
     message: lines.join('\n'),
   };

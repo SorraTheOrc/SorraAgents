@@ -242,6 +242,49 @@ export function verifyReleaseMerge(version, options = {}) {
   };
 }
 
+// ── getDescendants ───────────────────────────────────────────────────────────
+
+/**
+ * Recursively resolve all descendant ids of a work item.
+ *
+ * Uses `wl show <id> --children --json` per node, bounded by a visited set so
+ * cycles terminate, and returns descendant ids excluding the root. The close
+ * step uses this to refuse closing a candidate whose `wl close --force` would
+ * sweep in descendants that are not themselves release candidates
+ * (SA-0MU2OY1N9000XL2H AC9/AC10).
+ *
+ * @param {string} itemId - Root work item id.
+ * @returns {string[]} Descendant ids (excluding `itemId`).
+ */
+export function getDescendants(itemId) {
+  const found = [];
+  const visited = new Set([itemId]);
+  const stack = [itemId];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let parsed = null;
+    try {
+      const output = execSync(`wl show ${current} --children --json`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      parsed = JSON.parse(output);
+    } catch (_err) {
+      continue;
+    }
+    const children = (parsed && parsed.children) || [];
+    for (const child of children) {
+      if (!child || !child.id || visited.has(child.id)) {
+        continue;
+      }
+      visited.add(child.id);
+      found.push(child.id);
+      stack.push(child.id);
+    }
+  }
+  return found;
+}
+
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
@@ -274,7 +317,10 @@ export function verifyReleaseMerge(version, options = {}) {
  *   check-audit-gate.js (real `wl list`).
  * @param {(itemId: string, reason: string) => void} [options.runCloseCommand] -
  *   Close-command runner; defaults to `wl close <id> --force --reason <r>`.
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}> }}
+ * @param {(itemId: string) => string[]} [options.getDescendantsFn] -
+ *   Descendant resolver (for candidate-set scoping); defaults to
+ *   {@link getDescendants}.
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -283,6 +329,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       `wl close ${itemId} --force --reason "${reason}" --json`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
+    getDescendantsFn = getDescendants,
   } = options;
 
   if (!version) {
@@ -293,6 +340,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: 0,
       skippedItems: [],
+      refusedCount: 0,
+      refusedItems: [],
     };
   }
 
@@ -310,6 +359,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: 0,
       skippedItems: [],
+      refusedCount: 0,
+      refusedItems: [],
     };
   }
 
@@ -337,8 +388,35 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     console.log('');
   }
 
-  if (toClose.length === 0) {
-    const message = `No work items to close (${skippedItems.length} skipped, needs producer review).`;
+  // Scope the close (SA-0MU2OY1N9000XL2H AC9/AC10): `wl close --force`
+  // recursively closes ALL descendants, so a candidate whose subtree contains
+  // a descendant that is not itself a close candidate must not be force-closed
+  // — it would close out-of-scope work. Such candidates are refused and
+  // reported (an explicit, reversible exclusion decision) instead.
+  const candidateIds = new Set(toClose.map((item) => item.id));
+  const refusedItems = [];
+  const closable = [];
+  for (const item of toClose) {
+    let descendants = [];
+    try {
+      descendants = getDescendantsFn(item.id) || [];
+    } catch (err) {
+      console.warn(`  ⚠ Could not resolve descendants for ${item.id}: ${err.message}`);
+      descendants = [];
+    }
+    const collateral = descendants.filter((id) => !candidateIds.has(id));
+    if (collateral.length > 0) {
+      const reason = `Refused: --force close would sweep descendant(s) outside the candidate set: ${collateral.join(', ')}`;
+      console.log(`  ○ ${item.title || item.id} (${item.id}) — ${reason}`);
+      refusedItems.push({ id: item.id, title: item.title, reason, collateral });
+    } else {
+      closable.push(item);
+    }
+  }
+
+  if (closable.length === 0) {
+    const message = `No work items to close (${skippedItems.length} skipped, needs producer review; `
+      + `${refusedItems.length} refused, collateral descendants outside candidate set).`;
     console.log(message);
     return {
       success: true,
@@ -347,16 +425,18 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: skippedItems.length,
       skippedItems,
+      refusedCount: refusedItems.length,
+      refusedItems,
     };
   }
 
-  console.log(`Closing ${toClose.length} work item(s)...`);
+  console.log(`Closing ${closable.length} work item(s)...`);
 
   let closedCount = 0;
   let errorCount = 0;
   const errors = [];
 
-  for (const item of toClose) {
+  for (const item of closable) {
     try {
       const reason = `Shipped in v${version}`;
       // --force: the audit gate (Step 2) already verified audit readiness for
@@ -386,6 +466,9 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   if (skippedItems.length > 0) {
     summary += ` ${skippedItems.length} item(s) skipped (needs producer review).`;
   }
+  if (refusedItems.length > 0) {
+    summary += ` ${refusedItems.length} item(s) refused (collateral descendants outside candidate set).`;
+  }
 
   console.log(`\n${summary}`);
 
@@ -398,6 +481,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     errorCount,
     skippedCount: skippedItems.length,
     skippedItems,
+    refusedCount: refusedItems.length,
+    refusedItems,
   };
 }
 

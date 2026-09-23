@@ -117,6 +117,7 @@ test('close-work-items: closes only needsProducerReview=false candidates', async
     runCloseCommand: (itemId, reason) => {
       closed.push({ itemId, reason });
     },
+    getDescendantsFn: () => [],
   });
 
   assert.deepEqual(
@@ -153,6 +154,7 @@ test('close-work-items: reports close failures without aborting the sweep', asyn
         throw new Error('wl close failed');
       }
     },
+    getDescendantsFn: () => [],
   });
 
   assert.equal(result.closedCount, 1);
@@ -212,6 +214,50 @@ test('close-work-items: release-process.md documents auto-close after release', 
     content.includes('closing'),
     'release-process.md should mention closing work items after release',
   );
+});
+
+// ---------------------------------------------------------------------------
+// AC9/AC10: close step scopes to the candidate set (SA-0MU2OY1N9000XL2H)
+// ---------------------------------------------------------------------------
+test('close-work-items: getDescendants is exported', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  assert.equal(typeof mod.getDescendants, 'function');
+});
+
+test('close-work-items: refuses to force-close a candidate with collateral descendants', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.3.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-CHILD', title: 'Child', needsProducerReview: false },
+    ],
+    // SA-PARENT has a descendant (SA-OTHER) outside the candidate set
+    getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-CHILD', 'SA-OTHER'] : []),
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(closed, ['SA-CHILD'], 'only the collateral-free candidate is closed');
+  assert.equal(result.refusedCount, 1);
+  assert.equal(result.refusedItems[0].id, 'SA-PARENT');
+  assert.deepEqual(result.refusedItems[0].collateral, ['SA-OTHER']);
+});
+
+test('close-work-items: force-closes a candidate whose descendants are all candidates', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.3.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-CHILD', title: 'Child', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-CHILD'] : []),
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.ok(closed.includes('SA-PARENT'), 'a fully in-set subtree is closed');
+  assert.ok(closed.includes('SA-CHILD'));
+  assert.equal(result.refusedCount, 0);
 });
 
 // ---------------------------------------------------------------------------

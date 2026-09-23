@@ -56,7 +56,7 @@ characters with an ellipsis marker (`…`) when it exceeds the limit.
 |------|-------------|-----------|
 | 1 | Pre-flight checks (`gh`, `wl`, clean worktree) | Yes |
 | 2 | Critical-priority items check (exit 7 if non-terminal) | Yes |
-| 2.5 | Final validation sweep — all `in_review` items (exit 12) | Yes |
+| 2.5 | Final validation sweep — top-level + uncovered children, parent-coverage aware (exit 12) | Yes |
 | 3 | Merge commit (`--no-ff`) | Yes |
 | 4 | PR creation (`release/dev-to-main-<timestamp>`) | Yes |
 | 5 | Status check wait & merge (default 10 min) | Yes |
@@ -68,11 +68,24 @@ characters with an ellipsis marker (`…`) when it exceeds the limit.
 
 ### Step 3.7: Final validation sweep (exit 12)
 
-The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX)
-complements the scoped audit gate. Whereas the audit gate (exit 6) and
-producer-review gate (exit 9) inspect **top-level** `in_review` items only,
-this gate queries **every** `in_review` item — no `parentId` filter — and
-blocks the release (exit code 12) when any item has:
+The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX,
+SA-0MU2OY1N9000XL2H) complements the scoped audit gate. It queries **every**
+`in_review` item — no `parentId` filter — but resolves each child's scope
+first (parent-coverage / out-of-scope rules):
+
+**Child scope precedence (first match wins):**
+
+1. Parent **does not exist** (deleted) → `excluded` (out of release scope).
+2. Parent stage is **not** `in_review` → `excluded`.
+3. Nearest `in_review` ancestor with a **fresh passing** audit → `covered`
+   (the child is skipped; its own audit/flag is not consulted).
+4. Otherwise → `uncovered` (evaluate the child's own audit/flag).
+
+A non-passing `in_review` ancestor does not provide coverage; the walk
+continues up the chain so a higher passing `in_review` ancestor can still
+cover the child. Cycles are broken conservatively (`uncovered`).
+
+**Blocking (exit 12):** a top-level item or an **uncovered child** with:
 
 1. a **missing** audit (no audit record);
 2. a **stale** audit (audit predates the item's last update, per the same
@@ -80,11 +93,13 @@ blocks the release (exit code 12) when any item has:
 3. a **failing** audit (a fresh "not ready to close" verdict); or
 4. a producer-review flag (`needsProducerReview === true`).
 
-Missing, stale, and transient audits are auto-remediated conservatively by
-re-running `audit_runner.py issue <id>` and re-checking `wl audit-show`;
-successfully-remediated items are unblocked and reported separately. Genuine
-"not ready to close" verdicts block immediately with **no** re-audit attempt.
-The gate never calls `wl update` directly. `--skip-checks` bypasses it.
+Covered and excluded children are reported in `coveredChildren` /
+`excludedChildren` and never block. Missing, stale, and transient audits are
+auto-remediated conservatively by re-running `audit_runner.py issue <id>` and
+re-checking `wl audit-show`; successfully-remediated items are unblocked and
+reported separately. Genuine "not ready to close" verdicts block immediately
+with **no** re-audit attempt. The gate never calls `wl update` directly.
+`--skip-checks` bypasses it.
 
 **Script:** `scripts/check-final-validation.js`
 
@@ -92,14 +107,16 @@ The gate never calls `wl update` directly. `--skip-checks` bypasses it.
 
 | Export | Purpose |
 |--------|---------|
-| `checkFinalValidation(options)` | Runs the sweep; returns `{ hasBlockingItems, blockingItems, remediatedItems, passingCount, message }` |
+| `checkFinalValidation(options)` | Runs the sweep; returns `{ hasBlockingItems, blockingItems, remediatedItems, coveredChildren, excludedChildren, passingCount, message }` |
 | `getInReviewItems()` | Queries all `in_review` items (id, title, needsProducerReview, parentId, updatedAt) |
+| `getItemById(itemId)` | Resolves a single item (any stage) for parent-chain coverage; `null` = deleted/missing |
+| `resolveChildScope(item, boundaries)` | Resolves a child as `covered`/`excluded`/`uncovered` |
 | `classifyAudit(workItem, auditData)` | Classifies an audit as `missing`/`transient`/`stale`/`failing`/`passing` |
 | `isAuditStale(workItem, auditData)` | Time-gate staleness check (mirrors the audit runner's freshness floor) |
 | `parseIsoUtc(value)` | ISO-8601 parse helper (naive timestamps treated as UTC) |
 
-All command boundaries (`getItemsFn`, `runAuditShow`, `runAuditCommand`,
-`resolveAuditRunnerFn`) are injectable for hermetic tests.
+All command boundaries (`getItemsFn`, `getItemByIdFn`, `runAuditShow`,
+`runAuditCommand`, `resolveAuditRunnerFn`) are injectable for hermetic tests.
 
 ### Step 8.5: Discord notification
 
@@ -181,8 +198,16 @@ Minimal YAML parser for config files (top-level keys + one nesting level).
 Close-work-items tests must **never mutate the live worklog** (SA-0MSJ2XMQL006CVQS):
 
 - `closeWorkItemsAfterRelease` accepts injectable `getCandidateItemsFn` /
-  `runCloseCommand` boundaries.
+  `runCloseCommand` / `getDescendantsFn` boundaries.
 - Tests inject fakes (or mock `wl`) and never call with the default boundary.
+
+**Candidate-set scoping (SA-0MU2OY1N9000XL2H AC9/AC10):** because `wl close
+--force` recursively closes ALL descendants, a candidate whose subtree
+contains a descendant that is not itself a close candidate must not be
+force-closed. Such candidates are **refused** and reported in `refusedItems`
+(an explicit, reversible exclusion decision) rather than swept; only
+collateral-free candidates are closed. `getDescendants(itemId)` resolves the
+subtree recursively via `wl show <id> --children --json` (cycle-bounded).
 
 ## Remediation: test-spuriously-closed items
 
@@ -211,7 +236,7 @@ Verifying the full suite before promotion uses the test skill's cached runner
 | `git-helpers.js` | Branch naming & policy |
 | `check-unmerged-branches.js` | Detect unmerged branches |
 | `check-audit-gate.js` | Pre-release audit gate |
-| `check-final-validation.js` | Final validation sweep (all `in_review` items, exit 12) |
+| `check-final-validation.js` | Final validation sweep (parent-coverage / out-of-scope aware, exit 12) |
 | `check-critical-items.js` | Critical item gating |
 | `check-worklog-refs.js` | Validate worklog references |
 | `discord-notify.js` | Post-release Discord notification |

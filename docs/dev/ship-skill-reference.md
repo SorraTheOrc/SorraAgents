@@ -130,7 +130,7 @@ Steps:
    - the tag commit is an ancestor of `origin/main` (`git merge-base --is-ancestor`).
    If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
 10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
-11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
+11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Logs warnings on individual close failures.
 
 ### Discord release notification
 
