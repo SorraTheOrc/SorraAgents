@@ -31,6 +31,8 @@ _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"  # <skills>/test/scripts
 if str(_RUNNER_DIR) not in _sys.path:
     _sys.path.insert(0, str(_RUNNER_DIR))
 
+import run_tests
+
 from run_tests import (
     build_parser,
     changed_scope_commands,
@@ -353,7 +355,7 @@ class TestPerSuiteChangedScope:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch("run_tests._run_cmd", side_effect=fake_run):
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
             result = run_suite(
                 "pytest",
                 cwd=repo,
@@ -388,7 +390,7 @@ class TestPerSuiteChangedScope:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch("run_tests._run_cmd", side_effect=fake_run):
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
             result = run_suite(
                 "pytest",
                 cwd=repo,
@@ -449,7 +451,7 @@ class TestScopePropagated:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch("run_tests._run_cmd", side_effect=fake_run):
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
             result = run_suite(
                 "pytest",
                 cwd="/tmp",
@@ -469,7 +471,7 @@ class TestScopePropagated:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch("run_tests._run_cmd", side_effect=fake_run):
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
             result = run_all(
                 suites=("pytest",),
                 cwd="/tmp",
