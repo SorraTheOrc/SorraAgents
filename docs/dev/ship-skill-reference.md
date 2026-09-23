@@ -18,6 +18,7 @@ All scripts below are internal implementation details — they are not exposed a
 | `./skill/ship/scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
 | `./skill/ship/scripts/check-unmerged-branches.js` | Unmerged branch detection |
 | `./skill/ship/scripts/check-audit-gate.js` | Audit readiness and producer-review gating (`getCandidateItems`, `getTopLevelCandidateItems`, `checkAuditReadyToClose`, `checkProducerReviewStatus`, `resolveAuditRunner`) |
+| `./skill/ship/scripts/check-final-validation.js` | Final-validation sweep (parent-coverage / out-of-scope aware; `checkFinalValidation`, `getInReviewItems`, `getItemById`, `resolveChildScope`, `classifyAudit`, `isAuditStale`) |
 | `./skill/ship/scripts/check-critical-items.js` | Critical-items gating |
 | `./skill/ship/scripts/check-worklog-refs.js` | Worklog refs gating |
 | `./skill/ship/scripts/discord-notify.js` | Post-release Discord notification (`sendReleaseNotification`, config resolution, changelog extraction/truncation, embed payload, non-blocking webhook POST) |
@@ -56,6 +57,7 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
 | 10 | Release script timed out (killed after `SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
 | 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
+| 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
 
 ## Audit & Producer-Review Gates
 
@@ -107,6 +109,31 @@ The gate never mutates state destructively: it only invokes
 `run-release.js` Step 3.6 call site passes `getTopLevelCandidateItems()`, so
 child items never block this gate either.
 
+### Final-validation sweep (exit 12)
+
+`check-final-validation.js` (SA-0MTMSPKEX003JGIX, SA-0MU2OY1N9000XL2H)
+complements the scoped audit/producer gates. It queries **every** `in_review`
+item but resolves each child's scope first (parent-coverage / out-of-scope
+precedence, first match wins):
+
+1. Parent **does not exist** (deleted) → `excluded` (out of release scope).
+2. Parent stage is **not** `in_review` → `excluded`.
+3. Nearest `in_review` ancestor with a **fresh passing** audit → `covered`
+   (the child is skipped; its own audit/flag is not consulted).
+4. Otherwise → `uncovered` (evaluate the child's own audit/flag).
+
+A non-passing `in_review` ancestor does not provide coverage; the walk
+continues up the chain so a higher passing ancestor can still cover the child.
+Cycles are broken conservatively (`uncovered`). Blocking items are top-level
+items or **uncovered children** with a missing/stale/failing audit or
+`needsProducerReview === true`. Covered and excluded children never block and
+are reported in `coveredChildren`/`excludedChildren` (with the parent id and
+stage). Missing/stale/transient audits are auto-remediated via
+`audit_runner.py issue <id>`; genuine "not ready to close" verdicts block
+immediately with no re-audit attempt. Command boundaries (`getItemsFn`,
+`getItemByIdFn`, `runAuditShow`, `runAuditCommand`, `resolveAuditRunnerFn`)
+are injectable for hermetic tests. `--skip-checks` bypasses the gate.
+
 ## Release Process
 ## Release Process
 
@@ -119,6 +146,7 @@ Steps:
 1. **Unmerged branches check** — aborts with report if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verifies `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — aborts with exit 7 if non-terminal critical items exist.
+3.5. **Final-validation sweep** — aborts with exit 12 if any top-level or **uncovered child** `in_review` item has a missing/stale/failing audit or a producer-review flag after conservative auto-remediation. Children covered by a passing `in_review` parent audit, or excluded (parent deleted / not `in_review`), are skipped and reported.
 4. **Merge commit** — fetch latest dev/main, create `--no-ff` merge commit.
 5. **PR creation** — push to `release/dev-to-main-<timestamp>`, create PR targeting `main`.
 6. **Status check wait & merge** — if the PR has status checks, waits for them to pass (default 10 min), then `gh pr merge --merge --delete-branch`. If the PR has **no** status checks (no CI configured), the merge proceeds immediately. `--force` skips the wait.
@@ -161,9 +189,12 @@ of SA-0MSJ2XMQL006CVQS: `tests/unit/test-close-work-items-after-release.mjs`
 called the real `closeWorkItemsAfterRelease('1.0.0'/'1.2.3')` export against the
 live worklog, spuriously closing ~360 real work items with "Shipped in v1.0.0"/
 "v1.2.3" reasons on every suite run. `closeWorkItemsAfterRelease` therefore
-accepts injectable `getCandidateItemsFn`/`runCloseCommand` boundaries; tests must
-inject fakes (or mock `wl` on PATH) and must never invoke the close function
-with the default worklog boundary outside a real, verified release flow.
+accepts injectable `getCandidateItemsFn`/`runCloseCommand`/`getDescendantsFn`
+boundaries; tests must inject fakes (or mock `wl` on PATH) and must never invoke
+the close function with the default worklog boundary outside a real, verified
+release flow. Because `wl close --force` recursively closes all descendants, a
+candidate whose subtree contains a descendant outside the close-candidate set is
+**refused** and reported in `refusedItems` rather than swept (AC9/AC10).
 
 ### Remediation sweep: test-spuriously-closed work items
 ### Remediation sweep: test-spuriously-closed work items
