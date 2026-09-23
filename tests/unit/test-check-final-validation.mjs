@@ -544,19 +544,21 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
     assert.match(report.excludedChildren[0].reason, /does not exist/);
   });
 
-  test('a stale passing parent audit does not cover the child', async () => {
+  test('a time-gate "stale" but passing parent audit still covers the child', async () => {
     const report = await runScopedGate({
       items: [SCOPED_CHILD],
       parents: { 'SA-P1': PARENT_IN_REVIEW },
       audits: {
-        // parent audit predates the parent's last update → stale → no coverage
+        // Parent audit predates the parent's last update (time-gate stale) but
+        // readyToClose === true → Step 2 is authoritative → covers the child.
+        // The child's own FAILING audit must NOT be consulted.
         'SA-P1': { success: true, audit: { readyToClose: true, auditedAt: '2026-09-04T08:00:00Z', summary: 'old' } },
-        'SA-CHILD-1': AUDIT_PASSING,
+        'SA-CHILD-1': AUDIT_FAILING,
       },
     });
-    assert.equal(report.coveredChildren.length, 0);
     assert.equal(report.hasBlockingItems, false);
-    assert.equal(report.passingCount, 1);
+    assert.equal(report.coveredChildren.length, 1);
+    assert.equal(report.coveredChildren[0].parentId, 'SA-P1');
   });
 
   test('a grandchild resolves via its nearest passing in_review ancestor (AC5)', async () => {

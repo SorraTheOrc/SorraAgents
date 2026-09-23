@@ -118,12 +118,16 @@ precedence, first match wins):
 
 1. Parent **does not exist** (deleted) → `excluded` (out of release scope).
 2. Parent stage is **not** `in_review` → `excluded`.
-3. Nearest `in_review` ancestor with a **fresh passing** audit → `covered`
-   (the child is skipped; its own audit/flag is not consulted).
+3. Nearest `in_review` ancestor with a **passing** audit (`readyToClose === true`) → `covered`
+   (the child is skipped; its own audit/flag is not consulted). The Step-2
+   audit gate is authoritative for top-level readiness, so a passing parent
+   audit covers even when the conservative time-gate heuristic would label it
+   stale.
 4. Otherwise → `uncovered` (evaluate the child's own audit/flag).
 
-A non-passing `in_review` ancestor does not provide coverage; the walk
-continues up the chain so a higher passing ancestor can still cover the child.
+A missing, transient, or failing (`readyToClose !== true`) `in_review`
+ancestor does not provide coverage; the walk continues up the chain so a higher
+passing ancestor can still cover the child.
 Cycles are broken conservatively (`uncovered`). Blocking items are top-level
 items or **uncovered children** with a missing/stale/failing audit or
 `needsProducerReview === true`. Covered and excluded children never block and

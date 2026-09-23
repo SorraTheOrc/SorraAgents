@@ -259,13 +259,17 @@ export function getItemById(itemId) {
  *   1. A parent that does not exist (deleted) → `excluded`.
  *   2. An ancestor whose stage is not `in_review` → `excluded`
  *      (the subtree is not part of the release).
- *   3. The nearest `in_review` ancestor with a fresh passing audit →
- *      `covered` (the child is covered by the parent's audit/review).
+ *   3. The nearest `in_review` ancestor with a passing audit
+ *      (`readyToClose === true`) → `covered` (the child is covered by the
+ *      parent's audit/review). The Step-2 audit gate is authoritative for
+ *      top-level readiness, so a passing parent audit covers even when the
+ *      conservative time-gate heuristic would label it stale.
  *   4. Otherwise → `uncovered` (evaluate the child's own audit/flag).
  *
- * A non-passing `in_review` ancestor does NOT provide coverage; the walk
- * continues to the next ancestor so a higher passing `in_review` ancestor can
- * still cover the child. Cycles are broken conservatively (`uncovered`).
+ * A missing, transient, or failing (`readyToClose !== true`) `in_review`
+ * ancestor does NOT provide coverage; the walk continues to the next ancestor so
+ * a higher passing `in_review` ancestor can still cover the child. Cycles are
+ * broken conservatively (`uncovered`).
  *
  * @param {{id: string, parentId: string|null}} item - The child item.
  * @param {object} boundaries - Injectable command boundaries.
@@ -326,8 +330,8 @@ export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
         parentStage: parentItem.stage,
       };
     }
-    const classification = classifyAudit(parentItem, auditData);
-    if (classification.kind === 'passing') {
+    const parentStatus = getAuditStatus(parentItem, auditData);
+    if (!parentStatus.isBlocking && !parentStatus.transient) {
       return {
         outcome: 'covered',
         reason: `covered by passing parent audit ${ancestorId}`,
