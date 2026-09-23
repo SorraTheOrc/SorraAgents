@@ -90,8 +90,15 @@ def _build_ruff_fix_cmd(files: list[str]) -> list[str]:
 
 
 def _build_eslint_fix_cmd(files: list[str]) -> list[str]:
-    """Build the eslint --fix command for the given files."""
-    return ["eslint", "--fix", "--format", "json", "--quiet"] + files
+    """Build the eslint --fix command for the given files.
+
+    Uses ``npx eslint`` rather than the bare ``eslint`` command to ensure
+    the project's flat config (``eslint.config.js``) is loaded.  The system
+    ``eslint`` (e.g. v6.x via /usr/bin/eslint) uses the legacy
+    ``.eslintrc.json`` and lacks a TypeScript parser, causing unavoidable
+    "Parsing error" diagnostics on every .ts/.tsx file.
+    """
+    return ["npx", "eslint", "--fix", "--format", "json", "--quiet"] + files
 
 
 def _parse_ruff_fix_output(raw: list[Any]) -> list[dict[str, Any]]:
