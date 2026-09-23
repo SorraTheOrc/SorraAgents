@@ -317,23 +317,31 @@ class PriorityQueue:
     # ------------------------------------------------------------------
 
     def _list_entries(self) -> list[QueueEntry]:
-        """Return all valid (non-stale) entries sorted by (priority, timestamp)."""
-        self._prune_stale()
-        entries: list[QueueEntry] = []
-        for entry_file in self._queue_dir.glob(f"*{_QUEUE_FILE_EXT}"):
-            try:
-                with open(entry_file, "r") as f:
-                    data = json.load(f)
-                entry = QueueEntry.from_dict(data)
-                entries.append(entry)
-            except (json.JSONDecodeError, OSError, KeyError):
-                # Corrupt entry — remove silently
-                entry_file.unlink(missing_ok=True)
+        """Return all valid (non-stale) entries sorted by (priority, timestamp).
 
-        # Sort by (priority, timestamp) — lower priority value first,
-        # then earlier timestamp first
-        entries.sort(key=lambda e: (e.priority, e.timestamp))
-        return entries
+        Acquires the directory lock to prevent a concurrent writer
+        (e.g. :meth:`enqueue` creating a ticket file before flushing its
+        JSON payload) from being observed in an incomplete state.  The
+        lock is re-entrant via :meth:`_locked`, so callers that already
+        hold it are unaffected.
+        """
+        with self._locked():
+            self._prune_stale()
+            entries: list[QueueEntry] = []
+            for entry_file in self._queue_dir.glob(f"*{_QUEUE_FILE_EXT}"):
+                try:
+                    with open(entry_file, "r") as f:
+                        data = json.load(f)
+                    entry = QueueEntry.from_dict(data)
+                    entries.append(entry)
+                except (json.JSONDecodeError, OSError, KeyError):
+                    # Corrupt entry — remove silently
+                    entry_file.unlink(missing_ok=True)
+
+            # Sort by (priority, timestamp) — lower priority value first,
+            # then earlier timestamp first
+            entries.sort(key=lambda e: (e.priority, e.timestamp))
+            return entries
 
     # ------------------------------------------------------------------
     # Public API
