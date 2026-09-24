@@ -355,7 +355,11 @@ class TestPerSuiteChangedScope:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
+        # Bypass the shared concurrency semaphore so the test is not
+        # flaky when the host-wide TEST_MAX_CONCURRENCY slot is saturated
+        # (SA-0MUF9TXFN009I6Q2).
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
             result = run_suite(
                 "pytest",
                 cwd=repo,
