@@ -3,14 +3,20 @@ Worklog Specific Ignores
 ##################################
 
 # Ignore Worklog directory by default
-.worklog/
+.worklog/*
 
 # Keep config and defaults tracked
 !.worklog/config.yaml
 !.worklog/config.defaults.yaml
+# Private (secret) config — gitignored, never tracked
+.worklog/config.private.yaml
+# ...but keep the example template tracked
+!.worklog/config.private.yaml.example
 
 # Only track plugin config (yaml), not the plugin code itself
 !.worklog/plugins/
+.worklog/plugins/**/*
+!.worklog/plugins/**/
 !.worklog/plugins/**/*.yaml
 
 # Agent framework temporary files

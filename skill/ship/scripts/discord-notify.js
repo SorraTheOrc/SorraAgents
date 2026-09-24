@@ -8,11 +8,13 @@
  * (version, git tag, release date, PR URL, and the new version's changelog
  * section) to a configured Discord channel via a webhook.
  *
- * Configuration (AC2 — precedence: per-project first, then global):
- *   1. <project>/.worklog/config.yaml  →  discord.webhook_url
- *   2. ~/.pi/agent/config.yaml         →  discord.webhook_url  (global fallback)
- * If neither is set, the notification is skipped with an info log — the
- * release completes normally.
+ * Configuration (AC2 — precedence: private → project → global):
+ *   1. <project>/.worklog/config.private.yaml  →  discord.webhook_url
+ *   2. <project>/.worklog/config.yaml          →  discord.webhook_url
+ *   3. ~/.pi/agent/config.yaml                 →  discord.webhook_url  (global fallback)
+ * The first file that defines discord.webhook_url wins. If none set,
+ * the notification is skipped with an info log — the release completes
+ * normally.
  *
  * Behaviour (AC3 — non-blocking): every failure path (fetch rejection, HTTP
  * error status, timeout, missing changelog) logs a warning and returns a
@@ -104,20 +106,28 @@ export function readWebhookUrlFromConfig(configPath) {
 }
 
 /**
- * Resolve the Discord webhook URL with per-project precedence over the
- * global fallback (AC2).
+ * Resolve the Discord webhook URL with three-layer precedence (AC2):
+ *   1. <project>/.worklog/config.private.yaml  (project private)
+ *   2. <project>/.worklog/config.yaml          (project, tracked)
+ *   3. ~/.pi/agent/config.yaml                 (global fallback)
+ * The first file that defines discord.webhook_url wins.
  *
  * @param {string} [projectRoot] - Project root (default: process.cwd()).
  * @param {object} [options] - Injectable paths (used by unit tests).
+ * @param {string} [options.privateConfigPath] - Default <root>/.worklog/config.private.yaml.
  * @param {string} [options.projectConfigPath] - Default <root>/.worklog/config.yaml.
  * @param {string} [options.globalConfigPath] - Default ~/.pi/agent/config.yaml.
  * @returns {string|null} The resolved webhook URL, or null when unset.
  */
 export function resolveDiscordWebhookUrl(projectRoot, options = {}) {
   const {
+    privateConfigPath = join(projectRoot || process.cwd(), '.worklog', 'config.private.yaml'),
     projectConfigPath = join(projectRoot || process.cwd(), '.worklog', 'config.yaml'),
     globalConfigPath = join(homedir(), '.pi', 'agent', 'config.yaml'),
   } = options;
+
+  const privateUrl = readWebhookUrlFromConfig(privateConfigPath);
+  if (privateUrl) return privateUrl;
 
   const projectUrl = readWebhookUrlFromConfig(projectConfigPath);
   if (projectUrl) return projectUrl;
@@ -256,7 +266,7 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
   if (!webhookUrl) {
     console.log(
       'Discord release notification skipped: no discord.webhook_url configured ' +
-      '(checked <project>/.worklog/config.yaml and ~/.pi/agent/config.yaml).',
+      '(checked <project>/.worklog/config.private.yaml, <project>/.worklog/config.yaml, and ~/.pi/agent/config.yaml).',
     );
     return { success: true, notified: false, skipped: true, reason: 'no webhook configured' };
   }

@@ -1,0 +1,9 @@
+# Example: per-project private (secret) configuration
+#
+# Copy this file to .worklog/config.private.yaml (gitignored) and fill in
+# your values. Never commit real tokens or secrets.
+#
+# This file is gitignored — it never enters version control.
+
+discord:
+  webhook_url: https://discord.com/api/webhooks/<webhook_id>/<webhook_token>

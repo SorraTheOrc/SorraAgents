@@ -118,7 +118,13 @@ After a successful, verified release the ship skill posts release details + chan
 **Config schema** — the webhook URL is read from `discord.webhook_url`:
 
 ```yaml
-# <project>/.worklog/config.yaml (per-project, takes precedence)
+# <project>/.worklog/config.private.yaml (per-project, secret — gitignored)
+discord:
+  webhook_url: https://discord.com/api/webhooks/<id>/<token>
+```
+
+```yaml
+# <project>/.worklog/config.yaml (per-project, tracked — non-secret settings only)
 discord:
   webhook_url: https://discord.com/api/webhooks/<id>/<token>
 ```
@@ -129,10 +135,12 @@ discord:
   webhook_url: https://discord.com/api/webhooks/<id>/<token>
 ```
 
-- **Precedence (AC2):** per-project `.worklog/config.yaml` first; global `~/.pi/agent/config.yaml` fallback. Neither set → the step is skipped with an info log and the release completes normally (no error).
+- **Precedence (AC2):** per-project `.worklog/config.private.yaml` (gitignored secret) first; then `.worklog/config.yaml` (tracked); then global `~/.pi/agent/config.yaml` fallback. The first file that defines `discord.webhook_url` wins. Neither set → the step is skipped with an info log and the release completes normally (no error).
+- **Gitignored private file:** `.worklog/config.private.yaml` is explicitly gitignored (see `.gitignore`). An example template is provided at `.worklog/config.private.yaml.example` — copy it and fill in your webhook URL.
 - **Non-blocking (AC3):** a failed or slow webhook POST logs a warning and does not change the release exit code; an already-landed release is never failed by a notification failure.
 - **Discord limits (AC4):** the embed description (changelog) is truncated to ≤ 4096 chars with an ellipsis marker.
-- **Secret:** the webhook URL contains an auth token — do **not** commit it to a repository. Prefer the global `~/.pi/agent/config.yaml` (outside any repo); a repo may override via its own `.worklog/config.yaml` but must then keep that file out of version control or accept the exposure.
+- **Secret:** the webhook URL contains an auth token — do **not** commit it to a repository. The recommended location is `.worklog/config.private.yaml` (per-project, gitignored); the global `~/.pi/agent/config.yaml` is also supported as a fallback. Never store the webhook in `.worklog/config.yaml` (tracked).
+- **Migration:** an existing global `discord.webhook_url` in `~/.pi/agent/config.yaml` can be moved to `.worklog/config.private.yaml` for per-project isolation; the global fallback remains supported.
 
 #### Test isolation (mandatory)
 

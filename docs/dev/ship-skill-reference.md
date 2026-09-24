@@ -174,10 +174,14 @@ After a successful, verified release (`verifyReleaseMerge` passed, Step 9), `run
 
 | Priority | File | Notes |
 |----------|------|-------|
-| 1 (project) | `<project>/.worklog/config.yaml` | Takes precedence; committed to the repo in most projects — do **not** store the webhook secret here |
-| 2 (global) | `~/.pi/agent/config.yaml` | Global fallback, outside any repo — preferred location for the secret |
+| 1 (project private) | `<project>/.worklog/config.private.yaml` | Gitignored — recommended location for secrets; copy from `.worklog/config.private.yaml.example` |
+| 2 (project) | `<project>/.worklog/config.yaml` | Tracked; non-secret settings only — never store the webhook here |
+| 3 (global) | `~/.pi/agent/config.yaml` | Global fallback, outside any repo |
 
-Neither set → the step logs an info message, skips, and the release completes normally (not an error).
+The first file that defines `discord.webhook_url` wins. Neither set → the step logs an info message, skips, and the release completes normally (not an error).
+
+- **Gitignore:** `.worklog/config.private.yaml` is explicitly gitignored; `.worklog/config.private.yaml.example` provides a placeholder template.
+- **Migration:** if you already have `discord.webhook_url` in the global `~/.pi/agent/config.yaml`, you can move it to `.worklog/config.private.yaml` for per-project isolation. The global fallback remains supported.
 
 **Behaviour:**
 - Message content: released version, git tag `vX.Y.Z`, release date, PR URL, and the new version's changelog section from `CHANGELOG.md` (sections are `## vX.Y.Z (YYYY-MM-DD)` blocks; the date is read from the section header, falling back to today).

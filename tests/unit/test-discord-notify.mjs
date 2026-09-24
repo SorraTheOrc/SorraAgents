@@ -1,12 +1,13 @@
 /**
  * Unit tests for skill/ship/scripts/discord-notify.js
  *
- * Covers AC1–AC6 of SA-0MSQ6K7Z1002H14Z:
+ * Covers AC1–AC6 of SA-0MSQ6K7Z1002H14Z and AC1–AC9 of SA-0MUF833QL001WJXD:
  *  - AC1/AC4: changelog extraction, embed payload shape, 4096-char truncation
- *  - AC2: config precedence (project → global) + skip-when-unset
+ *  - AC2: config precedence (private → project → global) + skip-when-unset
+ *  - AC2/AC4 (SA-0MUF833QL001WJXD): gitignored private file + example template
  *  - AC3: non-blocking failure behaviour (release exit code unchanged)
  *  - run-release.js hook placement (post merge-verification, never on dry-run)
- *  - AC6: SKILL.md / reference docs document the feature
+ *  - AC6/AC7: SKILL.md / reference docs document the feature and private layer
  *
  * All config reads use injected temp paths and every send uses an injected
  * fetchFn — the suite never touches the live home config or the network.
@@ -15,6 +16,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,9 +27,15 @@ const DISCORD_NOTIFY_PATH = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'discord
 const RUN_RELEASE_PATH = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'run-release.js');
 const SKILL_MD_PATH = join(REPO_ROOT, 'skill', 'ship', 'SKILL.md');
 const REFERENCE_PATH = join(REPO_ROOT, 'docs', 'dev', 'ship-skill-reference.md');
+const SHIP_REFERENCE_PATH = join(REPO_ROOT, 'skill', 'ship', 'docs', 'dev', 'ship-skill-reference.md');
+const EXAMPLE_PATH = join(REPO_ROOT, '.worklog', 'config.private.yaml.example');
 
 const WEBHOOK_PROJECT = 'https://discord.com/api/webhooks/PROJECT/token';
 const WEBHOOK_GLOBAL = 'https://discord.com/api/webhooks/GLOBAL/token';
+const WEBHOOK_PRIVATE = 'https://discord.com/api/webhooks/PRIVATE/token';
+
+// Gitignore path — repo root
+const GITIGNORE_PATH = join(REPO_ROOT, '.gitignore');
 
 const SAMPLE_CHANGELOG = `# Changelog
 
@@ -87,10 +95,24 @@ describe('discord-notify: module exports', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC2 — config precedence (project → global) and skip-when-unset
+// AC2 — config precedence (private → project → global) and skip-when-unset
 // ---------------------------------------------------------------------------
 describe('discord-notify: config resolution (AC2)', () => {
-  test('project config takes precedence over the global fallback', async () => {
+  test('private config takes precedence over project and global', async () => {
+    const dir = makeTempProject();
+    writeWebhookConfig(join(dir, '.worklog', 'config.private.yaml'), WEBHOOK_PRIVATE);
+    writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
+    const globalDir = makeTempProject();
+    writeWebhookConfig(join(globalDir, 'config.yaml'), WEBHOOK_GLOBAL);
+
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const url = mod.resolveDiscordWebhookUrl(dir, {
+      globalConfigPath: join(globalDir, 'config.yaml'),
+    });
+    assert.equal(url, WEBHOOK_PRIVATE);
+  });
+
+  test('project config takes precedence over the global fallback when private is absent', async () => {
     const dir = makeTempProject();
     writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
     const globalDir = makeTempProject();
@@ -103,7 +125,7 @@ describe('discord-notify: config resolution (AC2)', () => {
     assert.equal(url, WEBHOOK_PROJECT);
   });
 
-  test('falls back to the global config when the project config has no discord.webhook_url', async () => {
+  test('falls back to the global config when private and project configs have no webhook', async () => {
     const dir = makeTempProject();
     writeFileSync(join(dir, '.worklog', 'config.yaml'), 'projectName: Test\nprefix: TP\n');
     const globalDir = makeTempProject();
@@ -114,6 +136,17 @@ describe('discord-notify: config resolution (AC2)', () => {
       globalConfigPath: join(globalDir, 'config.yaml'),
     });
     assert.equal(url, WEBHOOK_GLOBAL);
+  });
+
+  test('missing private config file is a no-op — falls through to project config', async () => {
+    const dir = makeTempProject();
+    writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
+
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const url = mod.resolveDiscordWebhookUrl(dir, {
+      privateConfigPath: join(dir, '.worklog', 'nonexistent.yaml'),
+    });
+    assert.equal(url, WEBHOOK_PROJECT);
   });
 
   test('returns null when neither config sets discord.webhook_url', async () => {
@@ -136,6 +169,20 @@ describe('discord-notify: config resolution (AC2)', () => {
       globalConfigPath: join(dir, 'no-such-config.yaml'),
     });
     assert.equal(url, null);
+  });
+
+  test('private config webhook_url is a secret — never read from tracked file', async () => {
+    // Simulate: a project config.yaml accidentally has a discord webhook,
+    // but the private file takes precedence and the real secret is in private.
+    const dir = makeTempProject();
+    // Tracked config has a DIFFERENT (stale/wrong) webhook — private wins.
+    writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
+    writeWebhookConfig(join(dir, '.worklog', 'config.private.yaml'), WEBHOOK_PRIVATE);
+
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const url = mod.resolveDiscordWebhookUrl(dir);
+    assert.equal(url, WEBHOOK_PRIVATE,
+      'the private config must take precedence, never returning the project (tracked) value');
   });
 });
 
@@ -375,6 +422,119 @@ describe('discord-notify: run-release.js hook', () => {
 });
 
 // ---------------------------------------------------------------------------
+// AC2 — gitignore (private file must never be tracked)
+// ---------------------------------------------------------------------------
+describe('discord-notify: gitignore (AC2)', () => {
+  test('.gitignore explicitly ignores .worklog/config.private.yaml', async () => {
+    const content = readFileSync(GITIGNORE_PATH, 'utf-8');
+    const lines = content.split('\n').map((l) => l.trim());
+    assert.ok(
+      lines.includes('.worklog/config.private.yaml'),
+      '.gitignore must contain an explicit ignore entry for .worklog/config.private.yaml',
+    );
+    assert.ok(
+      !lines.includes('!.worklog/config.private.yaml'),
+      '.worklog/config.private.yaml must not be re-included (it is a secret)',
+    );
+  });
+
+  test('.gitignore re-includes the example template so it can be committed', async () => {
+    const content = readFileSync(GITIGNORE_PATH, 'utf-8');
+    assert.ok(
+      content.includes('!.worklog/config.private.yaml.example'),
+      '.gitignore must re-include .worklog/config.private.yaml.example so the template is trackable',
+    );
+  });
+
+  test('.worklog/config.yaml is still tracked (un-ignore present)', async () => {
+    const content = readFileSync(GITIGNORE_PATH, 'utf-8');
+    assert.ok(
+      content.includes('!.worklog/config.yaml'),
+      '.gitignore must un-ignore .worklog/config.yaml so it remains tracked',
+    );
+  });
+
+  test('git reports .worklog/config.private.yaml as ignored', () => {
+    const res = spawnSync('git', ['check-ignore', '.worklog/config.private.yaml'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    });
+    assert.equal(res.status, 0, `git check-ignore should report the private file as ignored: ${res.stderr}`);
+    assert.ok(
+      res.stdout.includes('.worklog/config.private.yaml'),
+      'git check-ignore should name the private config file',
+    );
+  });
+
+  test('git does NOT ignore the example template', () => {
+    const res = spawnSync('git', ['check-ignore', '.worklog/config.private.yaml.example'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    });
+    assert.equal(res.status, 1, 'the example template must not be ignored (green addable)');
+  });
+
+  test('git does NOT ignore the tracked .worklog/config.yaml', () => {
+    const res = spawnSync('git', ['check-ignore', '.worklog/config.yaml'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    });
+    assert.equal(res.status, 1, '.worklog/config.yaml must remain tracked (not ignored)');
+  });
+
+  test('git still ignores .worklog runtime files (e.g. worklog.db)', () => {
+    const res = spawnSync('git', ['check-ignore', '.worklog/worklog.db'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    });
+    assert.equal(res.status, 0, '.worklog/worklog.db must stay ignored after the .worklog/* change');
+  });
+
+  test('git tracks plugin config yaml but ignores plugin code', () => {
+    const yamlRes = spawnSync('git', ['check-ignore', '.worklog/plugins/example/plugin.yaml'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    });
+    assert.equal(yamlRes.status, 1, 'plugin config yaml should be trackable');
+
+    const codeRes = spawnSync('git', ['check-ignore', '.worklog/plugins/example/plugin.js'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    });
+    assert.equal(codeRes.status, 0, 'plugin code must stay ignored');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC4 — committed example template (placeholder, no real token)
+// ---------------------------------------------------------------------------
+describe('discord-notify: example template (AC4)', () => {
+  test('.worklog/config.private.yaml.example exists and shows the expected shape', async () => {
+    assert.ok(existsSync(EXAMPLE_PATH), '.worklog/config.private.yaml.example should exist');
+    const content = readFileSync(EXAMPLE_PATH, 'utf-8');
+    assert.ok(content.includes('discord:'), 'example should document the discord config block');
+    assert.ok(
+      content.includes('webhook_url:'),
+      'example should document the discord.webhook_url key',
+    );
+    assert.ok(
+      content.includes('<webhook_id>') || content.includes('<id>') || content.includes('<token>'),
+      'example must use a placeholder, not a real token',
+    );
+  });
+
+  test('the example contains no real Discord token URL', async () => {
+    const content = readFileSync(EXAMPLE_PATH, 'utf-8');
+    // A real token is a long numeric id + alphanumeric secret; placeholders use <...>.
+    const realTokenLike = /api\/webhooks\/\d+\/[A-Za-z0-9_-]{20,}/;
+    assert.ok(
+      !realTokenLike.test(content),
+      'the example must not contain a real Discord webhook token',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // AC6 — documentation
 // ---------------------------------------------------------------------------
 describe('discord-notify: documentation (AC6)', () => {
@@ -392,6 +552,10 @@ describe('discord-notify: documentation (AC6)', () => {
       content.includes('non-blocking'),
       'SKILL.md should document the non-blocking notification semantics',
     );
+    assert.ok(
+      content.includes('config.private.yaml'),
+      'SKILL.md should document the private config file layer',
+    );
   });
 
   test('ship-skill-reference.md documents the module, hook point and config schema', () => {
@@ -403,6 +567,34 @@ describe('discord-notify: documentation (AC6)', () => {
     assert.ok(
       content.includes('discord.webhook_url'),
       'the reference doc should document the discord.webhook_url config key',
+    );
+    assert.ok(
+      content.includes('config.private.yaml'),
+      'docs/dev/ship-skill-reference.md should document the private config layer',
+    );
+    assert.ok(
+      /globalConfigPath|global fallback/i.test(content),
+      'the reference doc should document the global fallback',
+    );
+  });
+
+  test('skill/ship/docs/dev/ship-skill-reference.md documents the private layer and precedence', () => {
+    const content = readFileSync(SHIP_REFERENCE_PATH, 'utf-8');
+    assert.ok(
+      content.includes('config.private.yaml'),
+      'skill/ship/docs/dev/ship-skill-reference.md should document the private config layer',
+    );
+    assert.ok(
+      content.includes('discord.webhook_url'),
+      'skill/ship/docs/dev/ship-skill-reference.md should document the webhook key',
+    );
+  });
+
+  test('skill/ship/SKILL.md documents the gitignore requirement for the private file', () => {
+    const content = readFileSync(SKILL_MD_PATH, 'utf-8');
+    assert.ok(
+      /gitignor/i.test(content),
+      'SKILL.md should state the private file is gitignored',
     );
   });
 });
