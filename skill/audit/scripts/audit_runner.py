@@ -3970,12 +3970,21 @@ def _git_changed_files(runner: Runner) -> list[str]:
     root = Path(TARGET_PROJECT_ROOT).resolve()
     existing: list[str] = []
     for path in changed:
-        p = Path(path)
-        if p.is_absolute():
-            if p.exists():
+        # The ghost-path stat is best-effort: a pathological entry (e.g. a
+        # path component longer than NAME_MAX, an unreadable link, or a
+        # non-path payload returned by a mocked runner) raises OSError from
+        # ``Path.exists()``. Skip such entries rather than letting the
+        # manifest build abort (SA-0MUERWHED002FNQ4 regression: 13 audit
+        # tests failed with "File name too long").
+        try:
+            p = Path(path)
+            if p.is_absolute():
+                if p.exists():
+                    existing.append(path)
+            elif (root / p).exists() or Path(path).exists():
                 existing.append(path)
-        elif (root / p).exists() or Path(path).exists():
-            existing.append(path)
+        except OSError:
+            continue
     return existing[:_FILE_SCOPE_MAX_FILES]
 
 
