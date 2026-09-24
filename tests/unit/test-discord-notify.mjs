@@ -84,6 +84,8 @@ describe('discord-notify: module exports', () => {
     const mod = await import(DISCORD_NOTIFY_PATH);
     for (const fn of [
       'resolveDiscordWebhookUrl',
+      'readProjectNameFromConfig',
+      'resolveProjectName',
       'extractChangelogSection',
       'truncateForDiscord',
       'buildDiscordPayload',
@@ -253,11 +255,12 @@ describe('discord-notify: embed payload shape (AC1)', () => {
       date: '2026-01-15',
       prUrl: 'https://github.com/org/repo/pull/42',
       changelog: longChangelog,
+      projectName: 'TestProject',
     });
 
     assert.ok(Array.isArray(payload.embeds) && payload.embeds.length === 1);
     const embed = payload.embeds[0];
-    assert.equal(embed.title, 'Release v1.2.3');
+    assert.equal(embed.title, 'TestProject Release v1.2.3');
     assert.ok(
       embed.description.length <= 4096,
       'embed description must respect Discord limits',
@@ -276,6 +279,35 @@ describe('discord-notify: embed payload shape (AC1)', () => {
     const embed = payload.embeds[0];
     assert.ok(embed.title, 'payload should still have a title');
     assert.ok(embed.description, 'payload should still have a description');
+    assert.equal(embed.title, 'Release vunknown', 'title falls back when projectName is absent (AC3)');
+  });
+
+  test('buildDiscordPayload includes the project name in the title when supplied (AC1)', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const payload = mod.buildDiscordPayload({ version: '2.0.0', projectName: 'ContextHub' });
+    assert.equal(payload.embeds[0].title, 'ContextHub Release v2.0.0');
+  });
+
+  test('buildDiscordPayload includes the project name and version in the description (AC4)', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const payload = mod.buildDiscordPayload({
+      version: '1.2.3',
+      changelog: '### Features\n- Added something\n',
+      projectName: 'ContextHub',
+    });
+    const description = payload.embeds[0].description;
+    assert.ok(description.includes('ContextHub v1.2.3'), 'description should name the project and version');
+    assert.ok(description.includes('Added something'), 'description should still carry the changelog');
+    assert.ok(
+      description.length <= 4096,
+      'the project header must not push the description past the Discord limit',
+    );
+  });
+
+  test('buildDiscordPayload omits the project header from the description when projectName is absent (AC3/AC4)', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const payload = mod.buildDiscordPayload({ version: '1.2.3', changelog: '### Features\n- X\n' });
+    assert.ok(!payload.embeds[0].description.includes('**'), 'no header markdown without a project name');
   });
 });
 
@@ -325,7 +357,8 @@ describe('discord-notify: non-blocking notification (AC3)', () => {
     assert.equal(result.success, true);
     assert.equal(result.notified, true);
     assert.equal(postedUrl, WEBHOOK_PROJECT);
-    assert.equal(body.embeds[0].title, 'Release v1.2.3');
+    // The config's projectName ('Test Project') is included in the title (AC1).
+    assert.equal(body.embeds[0].title, 'Test Project Release v1.2.3');
     assert.ok(
       body.embeds[0].description.includes('Added something (SA-ABC1)'),
       'the posted changelog should be the released version section',

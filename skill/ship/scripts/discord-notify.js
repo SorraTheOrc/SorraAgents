@@ -135,6 +135,57 @@ export function resolveDiscordWebhookUrl(projectRoot, options = {}) {
   return readWebhookUrlFromConfig(globalConfigPath);
 }
 
+// ── Project name resolution ─────────────────────────────────────────────────
+
+/**
+ * Read `projectName` from a YAML config file, or null if the file is
+ * missing or the key is absent.
+ *
+ * @param {string} configPath - Absolute path to a YAML config file.
+ * @returns {string|null} The project name, or null.
+ */
+export function readProjectNameFromConfig(configPath) {
+  if (!configPath || !existsSync(configPath)) return null;
+  try {
+    const parsed = parseSimpleYaml(readFileSync(configPath, 'utf-8'));
+    const name = parsed.projectName;
+    return typeof name === 'string' && name.trim() !== '' ? name.trim() : null;
+  } catch {
+    // A corrupt/unreadable config must never break the release — skip quietly.
+    return null;
+  }
+}
+
+/**
+ * Resolve the project name with the same precedence as the webhook URL (AC2):
+ *   1. <project>/.worklog/config.private.yaml  (project private)
+ *   2. <project>/.worklog/config.yaml          (project, tracked)
+ *   3. ~/.pi/agent/config.yaml                 (global fallback)
+ * The first file that defines projectName wins.
+ *
+ * @param {string} [projectRoot] - Project root (default: process.cwd()).
+ * @param {object} [options] - Injectable paths (used by unit tests).
+ * @param {string} [options.privateConfigPath] - Default <root>/.worklog/config.private.yaml.
+ * @param {string} [options.projectConfigPath] - Default <root>/.worklog/config.yaml.
+ * @param {string} [options.globalConfigPath] - Default ~/.pi/agent/config.yaml.
+ * @returns {string|null} The resolved project name, or null when unset.
+ */
+export function resolveProjectName(projectRoot, options = {}) {
+  const {
+    privateConfigPath = join(projectRoot || process.cwd(), '.worklog', 'config.private.yaml'),
+    projectConfigPath = join(projectRoot || process.cwd(), '.worklog', 'config.yaml'),
+    globalConfigPath = join(homedir(), '.pi', 'agent', 'config.yaml'),
+  } = options;
+
+  const privateName = readProjectNameFromConfig(privateConfigPath);
+  if (privateName) return privateName;
+
+  const projectName = readProjectNameFromConfig(projectConfigPath);
+  if (projectName) return projectName;
+
+  return readProjectNameFromConfig(globalConfigPath);
+}
+
 // ── Changelog extraction (AC1) ──────────────────────────────────────────────
 
 /**
@@ -192,18 +243,30 @@ export function truncateForDiscord(text, maxLength = DISCORD_DESCRIPTION_LIMIT) 
  * @param {string} [details.date] - Release date (YYYY-MM-DD).
  * @param {string} [details.prUrl] - Release PR URL.
  * @param {string} [details.changelog] - Changelog section (truncated to 4096).
+ * @param {string} [details.projectName] - Project name (read from worklog config).
  * @returns {{ embeds: Array<object> }} Discord webhook payload.
  */
-export function buildDiscordPayload({ version, tag, date, prUrl, changelog } = {}) {
+export function buildDiscordPayload({ version, tag, date, prUrl, changelog, projectName } = {}) {
   const versionText = version || 'unknown';
   const tagText = tag || (version ? `v${version}` : 'unknown');
-  const truncated = truncateForDiscord(changelog);
-  const description = truncated || `No changelog available for v${versionText}.`;
+
+  // Build title with project name (AC1).
+  const title = projectName
+    ? `${projectName} Release v${versionText}`
+    : `Release v${versionText}`; // fallback when projectName absent (AC3).
+
+  // Include the project name alongside the version in the description (AC4).
+  const body = changelog
+    ? truncateForDiscord(changelog)
+    : `No changelog available for v${versionText}.`;
+  const description = projectName
+    ? truncateForDiscord(`**${projectName} v${versionText}**\n\n${body}`)
+    : body;
 
   return {
     embeds: [
       {
-        title: `Release v${versionText}`,
+        title,
         description,
         color: 0x2ecc71, // green — successful release
         fields: [
@@ -271,6 +334,9 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
     return { success: true, notified: false, skipped: true, reason: 'no webhook configured' };
   }
 
+  // Resolve the project name (AC1, AC2, AC3 — same precedence as webhook URL).
+  const projectName = resolveProjectName(projectRoot, { projectConfigPath, globalConfigPath });
+
   let changelog = changelogContent;
   if (changelog === undefined) {
     try {
@@ -287,6 +353,7 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
     date: (section && section.date) || toISODate(now()),
     prUrl,
     changelog: section ? section.text : '',
+    projectName,
   });
 
   try {
