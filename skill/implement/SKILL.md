@@ -33,6 +33,11 @@ no additional approval, provided the build passes and the test gate is green:
 affected by the change — fast iteration), then runs a **final `--scope full`
 gate** before commit, and the **pre-push hook re-runs the full suite**
 (`--scope full`) on the actual push to `dev`/`main` (SA-0MT6BYQHB008DOGC).
+Changed-scope selection ignores deleted/non-existent test paths and falls
+back to the full suite when nothing selectable remains; a scoped pytest
+exit 4 ("file or directory not found") is likewise treated as selection
+unavailable and falls back to full scope, while a genuine failure (exit 1)
+still blocks the gate (LP-0MTZYRTNF0092JKW).
 When in doubt, produce the exact
 `git`/`gh`/`wl` commands for a human to run.
 

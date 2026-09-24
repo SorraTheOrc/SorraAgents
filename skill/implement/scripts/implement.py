@@ -1567,6 +1567,21 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
         ),
         scope="changed",
     )
+    # pytest exit 4 is a *usage* error: "file or directory not found" (or a
+    # similar no-valid-items condition). It means the selection referenced a
+    # path that is not runnable — typically a deleted/renamed test file that
+    # still appeared in `git diff`. That is not a test failure: return None so
+    # the caller falls back to the full suite (fail-closed) instead of
+    # aborting finish with a phantom "Test run failed". A genuine failure is
+    # exit 1 and must still block (LP-0MTZYRTNF0092JKW).
+    if run.get("exit_code") == 4:
+        LOG.warning(
+            "Implement run_tests: changed-scope pytest exited 4 (no valid "
+            "test paths — likely a deleted/renamed test file) in %s — "
+            "falling back to full scope.",
+            cwd,
+        )
+        return None
     return _finalize_test_result(run, tooling="pytest", scope="changed")
 
 
