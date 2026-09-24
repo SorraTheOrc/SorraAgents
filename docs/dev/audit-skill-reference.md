@@ -211,7 +211,7 @@ The item's integration evidence is derived from the item itself:
 
 ### Stale-audit-base guard (SA-0MT9EK1UU000DT1R)
 
-The gate verifies integration against `origin/dev` (`git fetch origin dev` + `merge-base --is-ancestor`), but EVERY other git-derived audit ingredient — the audited HEAD sha, the file-scope manifest, the changed-files list (`git diff --name-only HEAD`), the repo index (`git ls-files`), the working-tree hash, and the green-run attestation — resolves against the **local checkout at the launch cwd** (cwd-aware runner, SA-0MSLLGDW00098UCC). When that checkout is stale (local `dev` behind `origin/dev`), the merge gate passes yet Phase 1/2 run against a tree MISSING the delivered commits — producing false `unmet`/`partial` verdicts that agents report as "audit run against a stale HEAD" (incidents: SA-0MSUZAJPC003BS66, SA-0MSN2ULOF007JJ35 — audits from local `030debfd` while `origin/dev` was `ddc6f6f5`).
+The gate verifies integration against `origin/dev` (`git fetch origin dev` + `merge-base --is-ancestor`), but EVERY other git-derived audit ingredient — the audited HEAD sha, the file-scope manifest, the changed-files list (`git diff --name-only HEAD`), the repo index (`git ls-files`), the per-touched-file working-tree state, and the green-run attestation — resolves against the **local checkout at the launch cwd** (cwd-aware runner, SA-0MSLLGDW00098UCC). When that checkout is stale (local `dev` behind `origin/dev`), the merge gate passes yet Phase 1/2 run against a tree MISSING the delivered commits — producing false `unmet`/`partial` verdicts that agents report as "audit run against a stale HEAD" (incidents: SA-0MSUZAJPC003BS66, SA-0MSN2ULOF007JJ35 — audits from local `030debfd` while `origin/dev` was `ddc6f6f5`).
 
 **Guard behaviour** (`_audit_base_freshness` / `_audit_base_freshness_guard_passes` in `audit_runner.py`):
 
@@ -228,11 +228,17 @@ Short-circuits item-level audits when a recent, valid audit exists to avoid unne
 
 ### Behavior
 
-1. **Content-based gate (primary):** each audit captures a content fingerprint — git HEAD sha + work-item description hash + Key Files list + working-tree state (hash of `git status --porcelain` + `git diff --name-only HEAD` output) — and embeds it in the persisted report (`Audit content fingerprint: <sha256hex>`). Re-auditing an item whose fingerprint is unchanged returns the existing report in seconds instead of re-running the pipeline (SA-0MSKB6US1009CNHT). A change in ANY fingerprint component (new commit, edited description/ACs, changed Key Files, uncommitted or untracked working-tree changes) invalidates freshness and re-runs the full audit. The working-tree component degrades to an empty marker when git is unavailable (fail-open).
+1. **Content-based gate (primary):** each audit captures a content fingerprint over the **work item's own scope** — the per-touched-file state (each touched path's committed state plus its narrowed working-tree state) + work-item description hash + Key Files list — and embeds it in the persisted report (`Audit content fingerprint: <sha256hex>`). Re-auditing an item whose fingerprint is unchanged returns the existing report in seconds instead of re-running the pipeline (SA-0MSKB6US1009CNHT, SA-0MSPZDALB000S18P). **Touched-file resolution** is the union of (a) files in commits referencing the item id (`git log --all --fixed-strings --grep=<id> --name-only`), (b) files in commit hashes recorded in the item's comments by the implement skill, and (c) the description's `Key Files` (normalised, de-duplicated, sorted). **Per-path state** is the blob hash at HEAD (`git rev-parse HEAD:<path>`) when present, else the latest commit touching the path (`git log -1 --format=%H -- <path>`), plus the narrowed worktree state (`git status --porcelain -- <paths>` + `git diff --name-only HEAD -- <paths>`). The whole-repo HEAD sha is **no longer** a component: a commit or working-tree change that touches only **unrelated** files does **not** invalidate a stored audit (AC1). A change to **any touched file** (committed or uncommitted), or to the description/ACs/Key Files, invalidates freshness and re-runs the full audit (AC2/AC3). The comment-hash source is used only when the caller supplies the fetched comments; the grep + Key Files sources keep the set stable when it does not.
 2. **Time gate (floor):** audits persisted without a fingerprint (legacy reports) fall back to the 60s timestamp gate — compare ``auditedAt`` against ``updatedAt + 60s``.
 3. If fresh: prints ``Skipping: audit still fresh`` + existing report, exits code 0 **without** status lifecycle.
 4. If stale or error: falls through to normal full audit.
 5. ``--force`` bypasses the gate — both for the item being audited and, on a parent run, for child verdict reuse (LP-0MSQ32MF200675AR): ``--force`` re-audits every child instead of reusing stored verdicts.
+
+**Fail-open (AC4):** when the touched-file set cannot be determined — no recorded commits **and** no Key Files, git unavailable, or any git call needed for the payload fails — no fingerprint is computed/stored and the pipeline re-runs. The gate is deliberately **fail-stale, never fail-fresh**: being stale is only wasteful, while being fresh when the work changed is a correctness bug.
+
+**Tool-artefact policy (AC5):** tool-generated artefacts (e.g. Unity ``ProjectSettings/**`` or ``*.meta`` churn from batch runs) receive **no ignore-list exemption**. When such a path is inside the item's touched-file set, a rewrite invalidates freshness exactly like any other file change (the safe direction). Excluding known tool artefacts is a possible follow-up; the interim policy is documented always-invalidating and covered by a test.
+
+**Known trade-off:** the gate is no longer a cheap whole-repo hash — it resolves the touched set and probes each touched path (bounded: one ``git log`` for resolution, at most one ``rev-parse`` + one fallback ``log -1`` per touched path, with the worktree queries batched). Tool-artefact rewrites may still invalidate; the safe direction remains stale ⇒ re-run.
 
 Configuration: ``AUDIT_FRESHNESS_BUFFER_SECONDS = 60`` (in ``./scripts/audit_runner.py``).
 
@@ -260,15 +266,16 @@ wl comment list <id> --json # recent session activity on this item
 Decision rules:
 
 - **Do NOT re-audit** an item that is `completed`/`in_review` **with a fresh
-  audit** (content fingerprint unchanged) **unless the code actually
-  changed** — a new commit, an edited description/ACs, or changed
-  working-tree state invalidates the fingerprint and makes the stored audit
-  stale (see the content-based gate above).
+  audit** (content fingerprint unchanged) **unless the work actually
+  changed** — a new commit or uncommitted edit touching one of the item's
+  files, or an edited description/ACs/Key Files, invalidates the fingerprint
+  and makes the stored audit stale. Unrelated repo commits or working-tree
+  changes no longer do (SA-0MSPZDALB000S18P).
 - When the stored audit is fresh with `Ready to close: Yes` at the current
   HEAD, the item is already audited: launch nothing, treat the verdict as
   authoritative.
 - `--force` is the only way to bypass the freshness gate and must be
-  justified (stale fingerprint / changed code / explicit operator request).
+  justified (stale fingerprint / changed work / explicit operator request).
 
 This is the agent-facing brief; the agent-facing summary lives in
 [`skill/audit/SKILL.md`](../../skill/audit/SKILL.md).
@@ -452,7 +459,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --audit-children
 
 - `--audit-children` forces the full per-child flow (override of the default parent-first pass-through): each child without a fresh audit is independently reviewed; children without fresh audits that stay not-ready block the parent, verdict semantics unchanged.
 - `--max-child-audits N` (env `AUDIT_MAX_CHILD_AUDITS`) bounds the number of child audits a single run may auto-trigger (default: `5`).
-- Children with a fresh valid audit (content fingerprint unchanged + verdict present, LP-0MSQ32MF200675AR) are **reused with zero pi calls** — no child Phase 1 screening, no child Phase 2 deep/batch entry — and their persisted verdict table appears in the parent report with a `Child verdict reused from <auditedAt>` marker. `--force` bypasses reuse: all children are re-audited. Children WITHOUT a fresh audit are audited exactly as before (cascade, cap, and verdict semantics unchanged); reused children are NOT re-persisted (their own audit is authoritative), and child audits persisted by the parent embed the content fingerprint so they stay reusable on future runs.
+- Children with a fresh valid audit (per-touched-file content fingerprint unchanged + verdict present, LP-0MSQ32MF200675AR, SA-0MSPZDALB000S18P) are **reused with zero pi calls** — no child Phase 1 screening, no child Phase 2 deep/batch entry — and their persisted verdict table appears in the parent report with a `Child verdict reused from <auditedAt>` marker. `--force` bypasses reuse: all children are re-audited. Children WITHOUT a fresh audit are audited exactly as before (cascade, cap, and verdict semantics unchanged); reused children are NOT re-persisted (their own audit is authoritative), and child audits persisted by the parent embed the content fingerprint so they stay reusable on future runs.
 
 **Operator-attested green test run (`--green-run` / `AUDIT_GREEN_RUN`):** Some acceptance criteria are inherently execution-dependent — e.g. "Full project test suite passes with the new changes" — and the audit's read-only mandate forbids the runner (and its Phase 1/2 models) from executing the suite. Without external evidence such criteria can NEVER be verified inside the audit, so they always return `partial`. Operators should run the full suite via the [test skill](../../skill/test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) so the run is quiet-mode, triaged, and genuinely green. An operator who has verifiably run the full suite at the audited commit can then attest that fact and unblock those criteria:
 
@@ -602,7 +609,7 @@ wall-clock cost (unbounded repository exploration during AC screening):
   `scan.py` helpers instead of unbounded `find`/`grep -r`/`ls -R` exploration.
   Phase 1 prompts keep the same verdict guidance (met/unmet/partial/adjusted
   with the same normalization) — only the reading strategy changed.
-- **Child verdict reuse (Phase 1, LP-0MSQ32MF200675AR):** The child persisted-audit verdict is computed **before** the Phase 1 child AC review loop, using the same content-fingerprint freshness gate as the item-level gate (stored fingerprint unchanged + verdict present = fresh; legacy time gate only for fingerprint-less reports). A child with a fresh valid audit — ready OR explicit not-ready verdict — **skips the Phase 1 child AC screening call entirely** (zero pi calls) and reuses the AC verdicts persisted in its own audit report (parsed from the report's AC table; if the table cannot be parsed, each extracted AC falls back to `met` with a reuse note, since a fresh ready audit deems all ACs acceptable). The child result records `reused_from=<auditedAt>` and the parent report marks it (`Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`). `--force` bypasses reuse (all children re-audited); reused children are NOT re-persisted by the parent (their own audit is authoritative) and child reports the parent does persist embed the content fingerprint. Completed/done children remain exempt (AC5). The auto-trigger loop reuses these pre-computed verdicts instead of re-querying `wl audit-show` per child.
+- **Child verdict reuse (Phase 1, LP-0MSQ32MF200675AR):** The child persisted-audit verdict is computed **before** the Phase 1 child AC review loop, using the same per-touched-file content-fingerprint freshness gate as the item-level gate (stored fingerprint unchanged + verdict present = fresh; legacy time gate only for fingerprint-less reports). A child with a fresh valid audit — ready OR explicit not-ready verdict — **skips the Phase 1 child AC screening call entirely** (zero pi calls) and reuses the AC verdicts persisted in its own audit report (parsed from the report's AC table; if the table cannot be parsed, each extracted AC falls back to `met` with a reuse note, since a fresh ready audit deems all ACs acceptable). The child result records `reused_from=<auditedAt>` and the parent report marks it (`Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`). `--force` bypasses reuse (all children re-audited); reused children are NOT re-persisted by the parent (their own audit is authoritative) and child reports the parent does persist embed the content fingerprint. Completed/done children remain exempt (AC5). The auto-trigger loop reuses these pre-computed verdicts instead of re-querying `wl audit-show` per child.
 - **Parallel Phase 1 child screening:** Pending (no-audit / not-ready)
   children are reviewed concurrently with the same slot-aware dynamic
   ceiling used by Phase 2 (`_resolve_child_concurrency()` — see

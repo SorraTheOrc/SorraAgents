@@ -118,10 +118,11 @@ The runner also protects individual Pi calls in-process, so the external monitor
 
 Short-circuits item-level audits when a recent, valid audit exists. Full behavior in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md):
 
-1. **Content-based (primary):** fingerprint = HEAD sha + description hash + Key Files + working-tree state (`git status --porcelain` + `git diff --name-only HEAD`); unchanged → existing report (SA-0MSKB6US1009CNHT).
+1. **Content-based (primary):** fingerprint = the work item's **per-touched-file state** + description hash + Key Files (SA-0MSPZDALB000S18P). The touched-file set is the union of files in commits referencing the item id (`git log --all --grep=<id> --name-only`), commit hashes recorded in the item's comments, and the description's `Key Files`. Each touched path contributes its committed state (blob hash at HEAD, else latest touching commit) plus its narrowed working-tree state (`git status --porcelain -- <paths>` + `git diff --name-only HEAD -- <paths>`); unchanged → existing report. A change to **any touched file** (committed or uncommitted), or to the description/Key Files, invalidates; an **unrelated** commit or working-tree change elsewhere no longer does (SA-0MSKB6US1009CNHT, SA-0MSL1YXG7004F2BZ).
 2. **Time gate (floor):** legacy reports use the 60s gate (`auditedAt` vs `updatedAt + 60s`).
 3. Fresh → skip fast-path notice (e.g. `Skipping: audit still fresh — Ready to close: Yes (audited <ISO timestamp>)`), exit 0, **no** lifecycle/persistence.
 4. `--force` bypasses. Config: `AUDIT_FRESHNESS_BUFFER_SECONDS = 60`.
+5. **Fail-open:** when the touched-file set cannot be resolved (no recorded commits and no Key Files, git unavailable, or a git call fails), no fingerprint is stored/computed and the pipeline re-runs (stale ⇒ re-run, never fail fresh). Tool-generated artefacts (e.g. Unity `ProjectSettings/**`, `*.meta`) are **always invalidating** when touched — no ignore-list is applied.
 
 ## Re-audit coordination check (SA-0MSQIA84B005NHWC)
 
@@ -140,9 +141,10 @@ Then decide:
 
 - **Do NOT re-audit** an item that is `completed`/`in_review` **with a fresh
   audit** (content fingerprint unchanged → the runner's freshness gate would
-  short-circuit anyway) **unless the code actually changed** (new commits,
-  edited description/ACs, or changed working-tree state invalidate the
-  fingerprint and make the stored audit stale).
+  short-circuit anyway) **unless the work actually changed** (a new commit or
+  an uncommitted edit touching one of the item's files, or an edited
+  description/AC/Key Files, invalidates the fingerprint and makes the stored
+  audit stale; unrelated repo commits no longer do — SA-0MSPZDALB000S18P).
 - The runner already short-circuits via the freshness gate: `--force` is the
   only way to bypass it and must be justified (stale fingerprint, changed
   code, or an explicit operator request).

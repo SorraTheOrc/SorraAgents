@@ -686,12 +686,21 @@ with a fingerprint are gated on content match instead (see
 AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint: "
 """Prefix of the content-fingerprint metadata line embedded in audit reports.
 
-The content fingerprint (git HEAD sha + work-item description hash + Key Files
-list, captured at audit time) is embedded in the persisted report so a re-audit
-of an unchanged item can skip the pipeline in seconds instead of re-running it
-(SA-0MSKB6US1009CNHT). The line is parsed back out by
+The content fingerprint (per-work-item touched-file state + work-item
+description hash + Key Files list, captured at audit time) is embedded in the
+persisted report so a re-audit of an unchanged item can skip the pipeline in
+seconds instead of re-running it (SA-0MSKB6US1009CNHT,
+SA-0MSPZDALB000S18P). The line is parsed back out by
 ``_extract_content_fingerprint``.
 """
+
+#: Marker prefix used to separate commit headers from file names in
+#: ``git log --name-only`` output (SA-0MSPZDALB000S18P).
+_TOUCHED_FILES_COMMIT_MARKER = "__WL_COMMIT__"
+
+#: Regex matching a candidate 7-40 char hex commit sha (mirrors the merge
+#: gate's reference extraction in ``_resolve_item_commits``).
+_COMMIT_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
 
 AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30
 """Tolerance (seconds) for treating an audit as fresh despite a stale check.
@@ -1255,19 +1264,22 @@ def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
 
 def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None,
-                           work_item: dict | None = None) -> str | None:
+                           work_item: dict | None = None,
+                           comments: Sequence[dict] | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
 
     1. **Content-based gate (primary, SA-0MSKB6US1009CNHT):** when the
-       stored audit report carries a content fingerprint (git HEAD sha +
-       work-item description hash + Key Files list captured at audit time),
-       the audit is fresh iff the fingerprint is unchanged. This makes
-       re-audits of unchanged items return the existing report in seconds
-       instead of re-running the pipeline, even when ``updatedAt`` moved for
-       non-content reasons (e.g. a comment was added). A change in ANY
-       fingerprint component invalidates freshness and re-runs the pipeline.
+       stored audit report carries a content fingerprint (the work item's
+       per-touched-file state + description hash + Key Files list captured
+       at audit time, SA-0MSPZDALB000S18P), the audit is fresh iff the
+       fingerprint is unchanged. This makes re-audits of unchanged items
+       return the existing report in seconds instead of re-running the
+       pipeline, even when ``updatedAt`` moved for non-content reasons
+       (e.g. a comment was added), or when an UNRELATED file was committed
+       or left dirty. A change to any file the item itself touched (or to
+       its description / Key Files) invalidates freshness and re-runs.
     2. **Time gate (floor):** when the stored report carries no fingerprint
        (e.g. legacy audits persisted before the fingerprint feature), the
        existing 60s time gate is retained as the freshness floor: compare
@@ -1283,8 +1295,14 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
 
     *work_item* may be passed in to avoid a redundant ``wl show`` when the
     caller already fetched the work item (SA-0MSL1Z7E9005TLBA): it is used
-    for the fingerprint computation and the time-gate ``updatedAt``.
-    When omitted, the work item is fetched via ``wl show``.
+    for the fingerprint computation and the time-gate ``updatedAt``. When
+    omitted, the work item is fetched via ``wl show``.
+
+    *comments* is the item's already-fetched ``wl show`` comment list. It is
+    passed into the fingerprint computation so comment-recorded commit hashes
+    contribute to the touched-file set; callers must pass the SAME comments
+    at audit time and check time for the resolved set to be stable (see
+    ``_resolve_touched_files``).
     """
 
     try:
@@ -1307,13 +1325,15 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
 
     # ── Content-based freshness gate (SA-0MSKB6US1009CNHT) ─────────────
     # When the stored audit carries a content fingerprint, freshness is
-    # decided by content match: re-auditing an item whose git HEAD sha,
-    # description hash, and Key Files are unchanged returns the existing
-    # report in seconds instead of re-running the pipeline.
+    # decided by content match: re-auditing an item whose touched-file
+    # state, description hash, and Key Files are unchanged returns the
+    # existing report in seconds instead of re-running the pipeline
+    # (SA-0MSPZDALB000S18P: unrelated repo changes no longer invalidate it).
     stored_fingerprint = _extract_content_fingerprint(raw_output)
     if stored_fingerprint is not None:
         current_fingerprint = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+            comments=comments,
         )
         if current_fingerprint is None:
             # Fingerprint cannot be computed now (e.g. git unavailable) —
@@ -1381,74 +1401,296 @@ def _extract_content_fingerprint(report_text: str) -> str | None:
     return None
 
 
-def _compute_content_fingerprint(runner: Runner, issue_id: str,
-                                 worklog_dir: str | None = None,
-                                 work_item: dict | None = None) -> str | None:
-    """Compute the content fingerprint for a work item at the current state.
+def _normalise_repo_path(path: str) -> str:
+    """Normalise a git-reported or Key-Files path for comparison.
 
-    The fingerprint combines four components so that a change in ANY of them
-    invalidates freshness (SA-0MSKB6US1009CNHT, SA-0MSL1YXG7004F2BZ):
-
-    1. **git HEAD sha** — the repository state being audited.
-    2. **work-item description hash** — the audited acceptance criteria text.
-    3. **Key Files list** — the file-scope manifest of the audited item.
-    4. **working-tree state** — a hash of ``git status --porcelain`` +
-       ``git diff --name-only HEAD`` output, so uncommitted/untracked
-       changes between audits invalidate freshness (the audit reads the
-       working tree, not just HEAD). Degrades to an empty marker when git
-       is unavailable so fail-open callers keep working.
-
-    *work_item* may be passed in to avoid a redundant ``wl show`` call when
-    the caller already fetched the work item (e.g. ``cmd_issue``). When
-    omitted, the work item is fetched via ``wl show``.
-
-    Returns a sha256 hex digest of the canonical JSON payload, or ``None``
-    when the fingerprint cannot be determined (git unavailable, wl show
-    failure, or missing data) so callers fail open and re-run the pipeline.
+    Strips surrounding whitespace/backticks/quotes and a leading ``./`` so
+    the same file resolved from ``git log --name-only`` (which may quote
+    paths containing special characters) and from the description's Key
+    Files section compares equal (SA-0MSPZDALB000S18P).
     """
-    head_sha = _resolve_audited_head(runner)
-    if head_sha is None:
-        return None
+    p = (path or "").strip().strip("`").strip()
+    if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+        p = p[1:-1]
+    p = p.replace("\\\"", '"').replace("\\\\", "\\")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.strip()
+
+
+def _extract_comment_commit_hashes(comments: Sequence[dict] | None) -> list[str]:
+    """Extract candidate commit shas recorded in a work item's comments.
+
+    The implement skill records each change's commit hash in a comment on the
+    item; this parses every 7-40 hex-char token from the comment text, mirroring
+    the merge gate's reference extraction (``_resolve_item_commits``). The
+    candidates are de-duplicated (case-folded) and sorted; they are validated
+    against git when resolved, so stray hex-looking tokens are harmless.
+    Returns an empty list when there are no comments (SA-0MSPZDALB000S18P).
+    """
+    if not comments:
+        return []
+    shas: set[str] = set()
+    for comment in comments:
+        text = comment.get("comment", "") if isinstance(comment, dict) else str(comment)
+        for match in _COMMIT_SHA_RE.finditer(text or ""):
+            shas.add(match.group(0).lower())
+    return sorted(shas)
+
+
+def _resolve_touched_files(runner: Runner, issue_id: str,
+                           worklog_dir: str | None = None,
+                           work_item: dict | None = None,
+                           comments: Sequence[dict] | None = None) -> list[str] | None:
+    """Resolve the set of repository paths a work item touched.
+
+    The set is the union of (SA-0MSPZDALB000S18P):
+
+    1. files in commits whose message references the work item id
+       (``git log --all --fixed-strings --grep=<id> --name-only``) — the
+       primary source, because the implement-skill commit convention embeds
+       the item id in every commit message (``<WIP-id>: <summary>``);
+    2. files in commits whose hashes are recorded in the item's *comments*
+       (the implement skill records each change's commit hash there) — a
+       best-effort safety net for commits whose message lacks the id. Only
+       resolved when the caller supplies *comments* (see the determinism
+       note below);
+    3. the ``Key Files`` entries parsed from the description.
+
+    Paths are normalised, de-duplicated, and sorted. Returns ``None`` (the
+    fail-open signal for callers) when the set cannot be determined: git is
+    unavailable / the ``git log`` call fails, or no paths are recorded. An
+    empty set is never returned, because it would make the fingerprint blind
+    to any file change (a correctness hazard — fail stale, never fail fresh).
+
+    **Determinism.** The fingerprint is recomputed on every freshness check,
+    so the touched-file set must be identical at audit time and check time.
+    Comment-derived hashes are therefore used only when the caller explicitly
+    supplies *comments*; callers that hold the fetched item pass the same
+    comments list at both points. Callers that avoid an extra fetch (child
+    reuse paths, SA-0MSL1Z7E9005TLBA) pass ``None`` and rely on the grep +
+    Key Files sources, which keeps the two computations consistent.
+
+    *work_item* may be passed in to reuse an already-fetched item; when
+    omitted it is fetched via ``wl show`` (unless *comments* are supplied).
+    """
     if work_item is None:
         try:
             data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                            worklog_dir=worklog_dir)
-        except RuntimeError:
+        except Exception:  # noqa: BLE001 -- fail open on any wl/runner failure
+            return None
+        work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
+    description = work_item.get("description", "") or ""
+
+    paths: set[str] = set()
+
+    # (1) Files in commits referencing the work item id. One git call.
+    try:
+        proc = runner([
+            "git", "log", "--all", "--fixed-strings",
+            f"--grep={issue_id}", "--name-only",
+            f"--format={_TOUCHED_FILES_COMMIT_MARKER}%H",
+        ])
+    except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+        return None
+    if proc.returncode != 0:
+        return None  # git unavailable / not a repository ⇒ fail open
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(_TOUCHED_FILES_COMMIT_MARKER):
+            continue
+        normalised = _normalise_repo_path(stripped)
+        if normalised:
+            paths.add(normalised)
+
+    # (2) Comment-recorded commit hashes (best-effort; one batched git call).
+    #     A failure here is swallowed — the grep + Key Files sources still
+    #     determine the set, and erring toward extra paths keeps the gate
+    #     fail-stale (SA-0MSPZDALB000S18P).
+    recorded_shas = _extract_comment_commit_hashes(comments)
+    if recorded_shas:
+        try:
+            proc = runner([
+                "git", "log", "--no-walk", "--name-only", "--format=",
+                *recorded_shas,
+            ])
+        except Exception:  # noqa: BLE001 -- best-effort source
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                normalised = _normalise_repo_path(line)
+                if normalised:
+                    paths.add(normalised)
+
+    # (3) Key Files from the description.
+    for key_file in _extract_key_files(description):
+        normalised = _normalise_repo_path(key_file)
+        if normalised:
+            paths.add(normalised)
+
+    if not paths:
+        return None  # cannot determine the touched set ⇒ fail open
+    return sorted(paths)
+
+
+def _parse_porcelain_path(line: str) -> str:
+    """Extract the path from a ``git status --porcelain`` entry.
+
+    Handles the rename/copy form (``R  old -> new`` → ``new``) and the plain
+    form (``XY path`` → ``path``). The leading status column is significant
+    (a leading space is part of the two-char status), so only trailing
+    whitespace is stripped. Returns ``""`` for malformed lines.
+    """
+    entry = line.rstrip()
+    if not entry:
+        return ""
+    if " -> " in entry:
+        entry = entry.split(" -> ", 1)[1]
+    elif len(entry) > 3:
+        entry = entry[3:]
+    else:
+        return ""
+    return _normalise_repo_path(entry)
+
+
+def _compute_path_fingerprints(runner: Runner,
+                               paths: Sequence[str]) -> dict | None:
+    """Capture the current state of each touched path for the fingerprint.
+
+    For every path this records:
+
+    * ``head`` — the path's committed state: its blob hash at HEAD
+      (``git rev-parse HEAD:<path>``) when present at HEAD, else the hash of
+      the latest commit touching it (``git log -1 --format=%H -- <path>``),
+      else ``""`` for a path never committed (e.g. an untracked new file).
+    * ``worktree`` — the path's narrowed working-tree state from
+      ``git status --porcelain -- <paths>`` and
+      ``git diff --name-only HEAD -- <paths>`` (empty when clean).
+
+    Returns a ``{path: {"head": ..., "worktree": ...}}`` dict, or ``None``
+    when a git call needed for the payload fails — callers fail open and
+    re-run the pipeline (SA-0MSPZDALB000S18P). The working-tree queries are
+    batched (two calls for all paths) and the per-path budget is one
+    ``rev-parse`` (plus one fallback ``log -1`` only when the path is not at
+    HEAD), honouring the bounded-cost constraint.
+    """
+    path_list = list(paths)
+    if not path_list:
+        return None
+
+    worktree: dict[str, list[str]] = {p: [] for p in path_list}
+    for cmd in (
+        ["git", "status", "--porcelain", "--", *path_list],
+        ["git", "diff", "--name-only", "HEAD", "--", *path_list],
+    ):
+        try:
+            proc = runner(cmd)
+        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+            return None
+        if proc.returncode != 0:
+            return None  # cannot determine worktree state ⇒ fail open
+        diff_only = cmd[1] == "diff"
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if diff_only:
+                path = _normalise_repo_path(stripped)
+            else:
+                # Pass the RAW line: the leading status column is significant
+                # (a leading space is part of git's two-char status code).
+                path = _parse_porcelain_path(line)
+            if path and path in worktree:
+                worktree[path].append(stripped)
+
+    states: dict[str, dict] = {}
+    for path in path_list:
+        head_state = ""
+        try:
+            proc = runner(["git", "rev-parse", f"HEAD:{path}"])
+        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+            return None
+        if proc.returncode == 0 and proc.stdout.strip():
+            head_state = proc.stdout.strip()
+        else:
+            # Not present at HEAD (deleted / untracked): fall back to the
+            # latest commit that touched the path (empty when never committed).
+            try:
+                proc = runner(["git", "log", "-1", "--format=%H", "--", path])
+            except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+                return None
+            if proc.returncode != 0:
+                return None
+            head_state = proc.stdout.strip()
+        states[path] = {
+            "head": head_state,
+            "worktree": "\n".join(sorted(set(worktree.get(path, [])))),
+        }
+    return states
+
+
+def _compute_content_fingerprint(runner: Runner, issue_id: str,
+                                 worklog_dir: str | None = None,
+                                 work_item: dict | None = None,
+                                 comments: Sequence[dict] | None = None,
+                                 ) -> str | None:
+    """Compute the content fingerprint for a work item at the current state.
+
+    The fingerprint is taken over the work item's OWN scope — the files it
+    touched — instead of the whole repository, so an unrelated commit or an
+    unrelated working-tree change no longer invalidates a still-valid stored
+    audit (SA-0MSPZDALB000S18P). It combines (a change in ANY invalidates):
+
+    1. **per-touched-path state** — each touched path's committed state (blob
+       hash at HEAD, else latest touching commit) plus its narrowed
+       working-tree state (``_compute_path_fingerprints``), so a committed OR
+       uncommitted change to a touched file invalidates freshness;
+    2. **work-item description hash** — the audited acceptance-criteria text;
+    3. **Key Files list** — the file-scope manifest of the audited item.
+
+    The touched-file set is resolved by ``_resolve_touched_files`` (commits
+    referencing the item id + comment-recorded commit hashes + Key Files).
+
+    Tool-generated artefacts (e.g. Unity ``ProjectSettings/**`` or ``*.meta``
+    churn from batch runs) are **always invalidating** when they fall inside
+    the touched-file set: no ignore-list is applied, so a rewrite of a touched
+    artefact is treated as a genuine change (the safe direction — stale ⇒
+    re-run). See ``docs/dev/audit-skill-reference.md``.
+
+    *work_item* / *comments* may be passed in to avoid a redundant ``wl show``
+    call when the caller already fetched the item (SA-0MSL1Z7E9005TLBA). Both
+    must be supplied consistently at audit time and check time so the resolved
+    touched-file set is stable (see ``_resolve_touched_files``).
+
+    Returns a sha256 hex digest of the canonical JSON payload, or ``None``
+    when the fingerprint cannot be determined (touched set unresolved, git
+    unavailable, wl show failure, or missing data) so callers fail open and
+    re-run the pipeline.
+    """
+    if work_item is None:
+        try:
+            data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                           worklog_dir=worklog_dir)
+        except Exception:  # noqa: BLE001 -- fail open on any wl/runner failure
             return None
         work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
     description = work_item.get("description", "") or ""
     key_files = _extract_key_files(description)
+    touched = _resolve_touched_files(
+        runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+        comments=comments,
+    )
+    if touched is None:
+        return None
+    path_states = _compute_path_fingerprints(runner, touched)
+    if path_states is None:
+        return None
     payload = json.dumps({
-        "head_sha": head_sha,
+        "path_states": path_states,
         "description_hash": hashlib.sha256(description.encode("utf-8")).hexdigest(),
         "key_files": key_files,
-        "working_tree_hash": _resolve_working_tree_hash(runner),
     }, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _resolve_working_tree_hash(runner: Runner) -> str:
-    """Hash the working-tree state for the fingerprint (SA-0MSL1YXG7004F2BZ).
-
-    Combines ``git status --porcelain`` (untracked + unstaged changes) with
-    ``git diff --name-only HEAD`` (staged changes) into a deterministic
-    sorted payload, hashed with sha256. Returns a fixed empty-string marker
-    when git is unavailable so the fingerprint still works fail-open.
-    """
-    lines: list[str] = []
-    for cmd in (["git", "status", "--porcelain"], ["git", "diff", "--name-only", "HEAD"]):
-        try:
-            proc = runner(cmd)
-        except Exception:  # noqa: S112, BLE001 -- git is best-effort; swallow to stay fail-open
-            continue
-        if proc.returncode == 0:
-            for line in proc.stdout.splitlines():
-                line = line.strip()
-                if line:
-                    lines.append(line)
-    if not lines:
-        return ""
-    payload = "\n".join(sorted(set(lines)))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -4178,8 +4420,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       line is emitted near the header so the report records the evidence
       source distinctly from the cache-consumption path.
 
-    *content_fingerprint* is the content fingerprint (git HEAD sha +
-      description hash + Key Files, see ``_compute_content_fingerprint``)
+    *content_fingerprint* is the content fingerprint (per-touched-file state
+      + description hash + Key Files, see ``_compute_content_fingerprint``)
       captured at audit time. When provided, an
       ``Audit content fingerprint: <hex>`` line is emitted near the header so
       the persisted report carries the freshness gate data
@@ -4626,8 +4868,8 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict],
       no model line is emitted. When ``None`` or empty, the fallback
       ``Model: manual (no provider)`` is used.
     *model_source* is the source of the model (``"local"`` or ``"remote"``).
-    *content_fingerprint* is the content fingerprint (git HEAD sha +
-      description hash + Key Files, see ``_compute_content_fingerprint``)
+    *content_fingerprint* is the content fingerprint (per-touched-file state
+      + description hash + Key Files, see ``_compute_content_fingerprint``)
       captured at audit time. When provided, an
       ``Audit content fingerprint: <hex>`` line is emitted near the header so
       the persisted child report stays content-gate-able on future parent
@@ -4991,10 +5233,11 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
     Freshness (LP-0MSQ32MF200675AR) uses the CONTENT-fingerprint gate
     FIRST — same logic as the item-level gate (_check_audit_freshness,
     SA-0MSKB6US1009CNHT): when the stored report carries a content
-    fingerprint (git HEAD sha + description hash + Key Files captured at
-    audit time), the audit is fresh iff the fingerprint is unchanged, so a
-    child whose updatedAt moved for non-content reasons (comments, status
-    bumps) is reused instead of re-audited. The legacy TIME gate
+    fingerprint (the child's touched-file state + description hash + Key
+    Files captured at audit time, SA-0MSPZDALB000S18P), the audit is fresh
+    iff the fingerprint is unchanged, so a child whose updatedAt moved for
+    non-content reasons (comments, status bumps), or whose unrelated repo
+    files changed, is reused instead of re-audited. The legacy TIME gate
     (auditedAt vs updatedAt + AUDIT_FRESHNESS_BUFFER_SECONDS) is kept as
     the floor for fingerprint-less legacy reports. When *force* is set,
     BOTH gates are bypassed and every child is re-audited.
@@ -7658,6 +7901,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     original_status = "open"  # safe default
     original_stage = ""       # safe default (unknown)
     wi: dict | None = None
+    wi_comments: list = []
     try:
         item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                             worklog_dir=worklog_dir)
@@ -7667,6 +7911,10 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             wi = item_data.get("workItem")
             if not isinstance(wi, dict):
                 wi = item_data
+            # Comments live beside ``workItem`` at the top level; they carry
+            # the commit hashes the implement skill recorded, which feed the
+            # touched-file fingerprint (SA-0MSPZDALB000S18P).
+            wi_comments = item_data.get("comments", []) or []
             original_status = wi.get("status", "open")
             original_stage = wi.get("stage", "")
     except RuntimeError:
@@ -7679,7 +7927,8 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     if not force:
         fresh_report = _check_audit_freshness(runner, issue_id,
                                               worklog_dir=worklog_dir,
-                                              work_item=wi)
+                                              work_item=wi,
+                                              comments=wi_comments)
         if fresh_report is not None:
             # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
             # the fresh audit so a redundant re-audit is stopped before the
@@ -8246,6 +8495,7 @@ def _run_remediation_loop(
     worklog_dir: str | None,
     work_item: dict,
     content_fingerprint: str | None,
+    comments: Sequence[dict] | None = None,
 ) -> dict:
     """Confident-false-positive config remediation loop (F2 scope).
 
@@ -8341,6 +8591,7 @@ def _run_remediation_loop(
             })
         new_fp = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+            comments=comments,
         )
         results["commits"].append({
             "sha": sha,
@@ -8509,14 +8760,18 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     if merge_gate_rc is not None:
         return None
 
-    # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT):
-    # git HEAD sha + work-item description hash + Key Files list. The
-    # fingerprint is embedded in the persisted report so a re-audit of an
-    # unchanged item skips the pipeline (content-based freshness gate).
-    # Fail-open: if the fingerprint cannot be computed (git unavailable,
-    # wl failure), the audit proceeds and simply stores no fingerprint.
+    # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT,
+    # SA-0MSPZDALB000S18P): per-touched-file state + work-item description
+    # hash + Key Files list. The fingerprint is embedded in the persisted
+    # report so a re-audit of an unchanged item skips the pipeline
+    # (content-based freshness gate), while unrelated commits / working-tree
+    # changes elsewhere no longer invalidate it.
+    # Fail-open: if the fingerprint cannot be computed (touched set
+    # unresolved, git unavailable, wl failure), the audit proceeds and
+    # simply stores no fingerprint.
     content_fingerprint = _compute_content_fingerprint(
         runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+        comments=ctx.comments,
     )
 
     # ------------------------------------------------------------------
@@ -8608,6 +8863,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         worklog_dir=worklog_dir,
         work_item=work_item,
         content_fingerprint=content_fingerprint,
+        comments=ctx.comments,
     )
     cq_findings = remediation_results.get("cq_findings", cq_findings)
     fp_screen_results = remediation_results.get(

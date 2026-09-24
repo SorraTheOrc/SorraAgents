@@ -84,6 +84,14 @@ def _git_runner():
 
     def _side(cmd, **kwargs):
         cmd_str = " ".join(cmd)
+        if cmd_str.startswith("git log --all"):
+            # One commit referencing the item, touching the changed file, so
+            # the touched-file fingerprint resolves (SA-0MSPZDALB000S18P).
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{audit_runner._TOUCHED_FILES_COMMIT_MARKER}abc1234\nsrc/bad.py\n",
+                stderr="",
+            )
         if cmd_str.startswith("git rev-parse"):
             return SimpleNamespace(returncode=0, stdout="abc1234\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
