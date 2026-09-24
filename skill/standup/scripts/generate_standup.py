@@ -751,7 +751,7 @@ def detect_regressions(window_start, window_end):
             cur_status = item.get("status")
             cur_stage = item.get("stage")
             is_regressed = not (cur_status == "completed" and cur_stage == "in_review")
-            if is_regressed and in_window(item, window_start, window_end) and cur_status in ("open", "in_progress", "in-progress", "blocked") or cur_stage in ("idea", "intake_complete", "plan_complete", "in_progress") or cur_status != "completed" or cur_stage != "in_review":
+            if is_regressed and in_window(item, window_start, window_end):
                     regs.append(item)
     seen = set()
     out = []
