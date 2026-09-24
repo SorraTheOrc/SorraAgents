@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -16,8 +17,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -187,7 +188,7 @@ class TestCodeQualityUsesTargetProjectRoot:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def test_code_quality_passed_target_project_root(self):
@@ -205,7 +206,7 @@ class TestCodeQualityUsesTargetProjectRoot:
         mock_runner = self._make_mock_runner()
 
         with mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality", mock_cq
+            "code_review.scripts.code_quality.run_code_quality", mock_cq
         ):
             audit_runner.cmd_issue(
                 "TEST-1",
@@ -235,7 +236,7 @@ class TestCodeQualityUsesTargetProjectRoot:
         mock_runner = self._make_mock_runner()
 
         with mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality", mock_cq
+            "code_review.scripts.code_quality.run_code_quality", mock_cq
         ):
             audit_runner.cmd_issue(
                 "TEST-1",
@@ -369,6 +370,246 @@ class TestCallPiEnableTools:
         assert result.get("_timeout") is True
         assert result.get("verdict") == "unmet"
         assert "timed out" in result.get("evidence", "")
+
+
+class TestCallPiFailureEvidenceNamesPhase:
+    """AC4 (SA-0MT6EZUS9004FJ9T): failure evidence names the phase that timed out.
+
+    When a pi call fails (full timeout, stall, concurrency-limit, or provider
+    error), the evidence string must name the phase (parent/child/Phase 2) so
+    the audit report is unambiguous about which phase failed, instead of a
+    bare "Manual audit required." with no phase.
+    """
+
+    def _make_timeout_process(self, timeout_value):
+        """Process whose communicate raises TimeoutExpired with the given timeout."""
+        mock_process = mock.MagicMock()
+        timeout_error = subprocess.TimeoutExpired(
+            cmd="pi", timeout=timeout_value, output="", stderr=""
+        )
+        mock_process.communicate.side_effect = [timeout_error, ("", "")]
+        return mock_process
+
+    def test_full_timeout_evidence_names_parent_phase(self):
+        """A Phase-1 parent call that hits the full budget names the parent phase."""
+        mock_process = self._make_timeout_process(audit_runner.CALL_PI_TIMEOUT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="parent"
+            )
+        assert result.get("_timeout") is True
+        assert "parent" in result.get("evidence", "")
+        assert "Manual audit required" in result.get("evidence", "")
+
+    def test_stall_evidence_names_parent_phase(self):
+        """A stalled Phase-1 parent call names the parent phase in stall evidence."""
+        mock_process = self._make_timeout_process(audit_runner._STALL_TIMEOUT_DEFAULT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="parent"
+            )
+        assert result.get("_timeout") is True
+        assert "stalled" in result.get("evidence", "")
+        assert "parent" in result.get("evidence", "")
+
+    def test_full_timeout_evidence_names_phase2_phase(self):
+        """A Phase-2 deep-analysis timeout names the phase in human-readable form."""
+        mock_process = self._make_timeout_process(audit_runner.CALL_PI_TIMEOUT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="phase2_deep"
+            )
+        assert "Phase 2 deep analysis" in result.get("evidence", "")
+
+    def test_full_timeout_evidence_names_child_phase(self):
+        """A child screening timeout names the human-readable child phase."""
+        mock_process = self._make_timeout_process(audit_runner.CALL_PI_TIMEOUT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="child:SA-123"
+            )
+        assert "Phase 1 child screening (SA-123)" in result.get("evidence", "")
+
+    def test_concurrency_limit_evidence_names_phase(self):
+        """A concurrency-limit fallback names the phase that could not launch."""
+        def _raise_busy(issue_id="", priority=None, max_concurrency=None):
+            raise TimeoutError("semaphore 'audit' busy: no slot free within 300.0s")
+        with mock.patch.object(
+            audit_runner, "_acquire_audit_slot", side_effect=_raise_busy
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="phase2_batch"
+            )
+        assert result.get("_concurrency_timeout") is True
+        assert "Phase 2 batched deep analysis" in result.get("evidence", "")
+        assert "Audit concurrency limit reached" in result.get("evidence", "")
+
+    def test_provider_error_evidence_names_phase(self):
+        """A provider-error fallback names the phase that failed."""
+        mock_process = mock.MagicMock()
+        provider_error_stream = json.dumps({
+            "type": "agent_end",
+            "messages": [{
+                "role": "assistant",
+                "stopReason": "error",
+                "errorMessage": "boom",
+            }],
+        })
+        mock_process.communicate.return_value = (provider_error_stream, "")
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context="phase2_child"
+            )
+        assert result.get("_provider_error") is True
+        assert "Phase 2 child deep analysis" in result.get("evidence", "")
+        assert "Pi provider error" in result.get("evidence", "")
+
+    def test_unknown_context_does_not_break_evidence(self):
+        """An empty context still yields a usable timeout evidence string."""
+        mock_process = self._make_timeout_process(audit_runner.CALL_PI_TIMEOUT)
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ):
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", context=""
+            )
+        assert result.get("_timeout") is True
+        assert "Manual audit required" in result.get("evidence", "")
+
+
+class TestCallPiSessionId:
+    """Tests for _call_pi() --session-id construction (SA-0MSNYMKV7005P0H9)."""
+
+    def _make_mock_popen(self, stdout_text: str = "{\"text\": \"test\"}"):
+        """Create a mock Popen that returns a process-like object."""
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        return mock_process
+
+    def test_session_id_added_when_issue_id_given(self):
+        """AC1: _call_pi() adds --session-id when issue_id is supplied.
+
+        The session-id must start with ``audit-`` and contain the issue id
+        and the phase context.
+        """
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi(
+                "test prompt", model="test-model",
+                issue_id="SA-0MSNYMKV7005P0H9", context="phase2_deep",
+            )
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--session-id" in args
+        idx = args.index("--session-id")
+        session_id = args[idx + 1]
+        assert session_id.startswith("audit-SA-0MSNYMKV7005P0H9-phase2_deep-")
+        # 8 hex chars UUID suffix
+        suffix = session_id.rsplit("-", 1)[1]
+        assert len(suffix) == 8
+        int(suffix, 16)
+
+    def test_session_id_absent_when_issue_id_empty(self):
+        """Existing callers (no issue_id) do not get --session-id."""
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi("test prompt", model="test-model")
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--session-id" not in args
+
+    def test_session_id_sanitizes_colons_in_context(self):
+        """AC3: colons in context are replaced with underscores.
+
+        ``assertValidSessionId`` rejects ``:``, so ``child:SA-XXX`` must
+        become ``child_SA-XXX``.
+        """
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi(
+                "test prompt", model="test-model",
+                issue_id="SA-0MSNYMKV7005P0H9", context="child:SA-XXX",
+            )
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--session-id" in args
+        idx = args.index("--session-id")
+        session_id = args[idx + 1]
+        assert "child_SA-XXX" in session_id
+        assert ":" not in session_id
+        # assertValidSessionId regex: alphanumeric, -, _, . only
+        assert re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", session_id)
+
+    def test_session_id_fresh_uuid_per_invocation(self):
+        """AC1: each invocation gets its own unique UUID suffix."""
+        mock_process = self._make_mock_popen()
+
+        session_ids = []
+        for _ in range(3):
+            with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+                audit_runner._call_pi(
+                    "test prompt", model="test-model",
+                    issue_id="SA-0MSNYMKV7005P0H9", context="phase2_deep",
+                )
+            args = mock_popen.call_args[0][0]
+            assert "--session-id" in args
+            idx = args.index("--session-id")
+            session_ids.append(args[idx + 1])
+
+        assert len(set(session_ids)) == 3
+
+    def test_session_id_does_not_break_context_reduction_flags(self):
+        """AC4: --no-context-files --no-skills remain in the command."""
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi(
+                "test prompt", model="test-model",
+                issue_id="SA-0MSNYMKV7005P0H9", context="phase2_deep",
+                enable_tools=True,
+            )
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--no-context-files" in args
+        assert "--no-skills" in args
+        assert "--tools" in args
+
+
+class TestCallPiAndMaybeLogSessionId:
+    """Tests for _call_pi_and_maybe_log() forwarding issue_id/context."""
+
+    def test_forwards_issue_id_and_context_to_call_pi(self):
+        """issue_id and context are forwarded to _call_pi()."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call_pi:
+            mock_call_pi.return_value = {"verdict": "met", "evidence": "ok"}
+            audit_runner._call_pi_and_maybe_log(
+                "SA-0MSNYMKV7005P0H9", "phase2_deep", "test prompt",
+                model="test-model",
+            )
+
+        mock_call_pi.assert_called_once()
+        _args, kwargs = mock_call_pi.call_args
+        assert kwargs.get("issue_id") == "SA-0MSNYMKV7005P0H9"
+        assert kwargs.get("context") == "phase2_deep"
+
 
 class TestCallPiAndMaybeLogEnableTools:
     """Tests for _call_pi_and_maybe_log() forwarding enable_tools (AC1-AC3)."""
@@ -1201,7 +1442,7 @@ class TestParentTimeoutGuardBehavior:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run(self, parent_timeout=None, elapsed=120.0):
@@ -1235,7 +1476,7 @@ class TestParentTimeoutGuardBehavior:
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(
@@ -1255,18 +1496,25 @@ class TestParentTimeoutGuardBehavior:
     def test_default_guard_skips_child_in_pathological_run(self, capsys):
         """AC5/AC3: The scaled default guard (710s for a 1-child parent) still
         trips for a pathological elapsed time (800s), and the skip diagnostic
-        names the computed budget and the override."""
+        records an explicit ``partial (budget exceeded)`` verdict naming the
+        computed budget and the override (SA-0MU32T6O0001UALR AC2) — never a
+        bare "Skipped due to audit timeout" skip."""
         rc = self._run(parent_timeout=None, elapsed=800.0)
-        payload = json.loads(capsys.readouterr().out)
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        err = captured.err
 
         assert rc == 0
         child = payload["children"][0]
         ac = child["ac_results"][0]
-        assert ac["verdict"] == "unmet"
-        assert ac["text"] == "Skipped due to audit timeout. Manual audit required."
-        assert "(710s budget" in ac["evidence"]
+        assert ac["verdict"] == "partial"
+        assert ac["text"] == "partial (budget exceeded)"
+        assert "710s" in ac["evidence"]
         assert "--parent-timeout" in ac["evidence"]
         assert "AUDIT_PARENT_TIMEOUT" in ac["evidence"]
+        assert child.get("budget_exceeded") is True
+        assert "Skipped due to audit timeout" not in err
+        assert "Skipped due to audit timeout" not in json.dumps(payload)
 
     def test_override_audits_child_previously_skipped(self, capsys):
         """AC3: With --parent-timeout 600, the same run audits the child."""
@@ -1315,7 +1563,7 @@ class TestParentTimeoutGuardBehavior:
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(
@@ -1379,7 +1627,7 @@ class TestParentTimeoutGuardBehavior:
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(
@@ -1698,6 +1946,107 @@ class TestExtractAcs:
         acs = audit_runner._extract_acs(desc)
         assert acs == ["First criterion", "Second criterion"]
 
+
+class TestZeroAcSentinelWarning:
+    """SA-0MSRLLQ0V008EW3J: zero-AC sentinel yields warning, not met.
+
+    The sentinel string (returned by _extract_acs on heading mismatch) must
+    produce a ``warning`` verdict so the item is NOT auto-approved.
+    """
+
+    def test_verdict_warning_constant_exists(self):
+        """VERDICT_WARNING is defined and equals 'warning'."""
+        assert hasattr(audit_runner, "VERDICT_WARNING")
+        assert audit_runner.VERDICT_WARNING == "warning"
+
+    def test_warning_not_in_acceptable_verdicts(self):
+        """VERDICT_WARNING is NOT in _ACCEPTABLE_VERDICTS."""
+        assert "warning" not in audit_runner._ACCEPTABLE_VERDICTS
+
+    def test_normalize_verdict_passes_through_warning(self):
+        """_normalize_verdict passes 'warning' through unchanged."""
+        assert audit_runner._normalize_verdict("warning") == "warning"
+        assert audit_runner._normalize_verdict("WARNING") == "warning"
+
+    def test_assemble_report_ready_no_with_warning(self):
+        """_assemble_issue_report produces 'Ready to close: No' when any AC
+        has a 'warning' verdict."""
+        ac_results = [{
+            "text": "No acceptance criteria defined.",
+            "verdict": audit_runner.VERDICT_WARNING,
+            "evidence": "ACs could not be extracted",
+        }]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, [], model="test-model",
+            model_source="remote",
+        )
+        assert "Ready to close: No" in report
+
+    def test_assemble_report_ready_yes_with_all_met(self):
+        """_assemble_issue_report still produces 'Ready to close: Yes' when
+        all ACs are 'met' (no regression on happy path)."""
+        ac_results = [
+            {"text": "AC one", "verdict": audit_runner.VERDICT_MET, "evidence": "ok"},
+            {"text": "AC two", "verdict": audit_runner.VERDICT_MET, "evidence": "ok"},
+        ]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, [], model="test-model",
+            model_source="remote",
+        )
+        assert "Ready to close: Yes" in report
+
+    def test_sentinel_path_includes_evidence_message(self):
+        """The sentinel ac_result includes an evidence message directing
+        the operator to check the heading format."""
+        ac_results = [{
+            "text": "No acceptance criteria defined.",
+            "verdict": audit_runner.VERDICT_WARNING,
+            "evidence": "ACs could not be extracted — verify item",
+        }]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, [], model="test-model",
+            model_source="remote",
+        )
+        # The verdict is 'warning' so the report says 'Ready to close: No'
+        assert "Ready to close: No" in report
+        # The sentinel text still appears in the report (display unchanged)
+        assert "No acceptance criteria defined." in report
+
+    def test_adjusted_still_acceptable_with_warning_present(self):
+        """'adjusted' remains acceptable; only 'warning' blocks closure."""
+        ac_results = [
+            {"text": "AC one", "verdict": audit_runner.VERDICT_ADJUSTED, "evidence": "variance"},
+            {"text": "AC two", "verdict": audit_runner.VERDICT_WARNING, "evidence": "unextracted"},
+        ]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, [], model="test-model",
+            model_source="remote",
+        )
+        assert "Ready to close: No" in report
+
+    def test_warning_with_children_all_met_blocks_closure(self):
+        """Even when all children are met, a parent warning blocks closure."""
+        ac_results = [{
+            "text": "No acceptance criteria defined.",
+            "verdict": audit_runner.VERDICT_WARNING,
+            "evidence": "unextracted",
+        }]
+        child_results = [{
+            "id": "CHILD-1",
+            "title": "Child task",
+            "status": "in_progress",
+            "stage": "in_review",
+            "ac_results": [
+                {"text": "child AC", "verdict": audit_runner.VERDICT_MET, "evidence": "ok"},
+            ],
+        }]
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, ac_results, child_results,
+            model="test-model", model_source="remote",
+        )
+        assert "Ready to close: No" in report
+
+
 class TestCmdIssuePhases:
     """SA-0MSL1ZB5J005ENLI: the decomposed cmd_issue phases are
     independently callable module-level functions operating on a shared
@@ -1747,7 +2096,7 @@ class TestCmdIssuePhases:
 
         ctx = self._make_ctx(_runner)
         with mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             return_value={"success": True, "findings": [], "fixes_applied": 0},
         ):
             rc = audit_runner._phase_fetch_and_cq(ctx)
@@ -1793,17 +2142,46 @@ class TestCmdIssuePhases:
     # ------------------------------------------------------------------
 
     def _run_terminal_lifecycle(self, *, fallback_tainted=False, **ctx_overrides):
-        """Run _apply_terminal_lifecycle on a ctx with an update-recording runner.
+        """Run _apply_terminal_lifecycle on a ctx with a stateful runner.
 
-        *fallback_tainted* sets the ctx's ``ac_fallback_used`` event so the
-        infra-fallback provenance flag is visible to the lifecycle.
+        The runner models a real worklog: ``wl update --status/--stage``
+        mutates the item state that subsequent ``wl show`` calls return, so
+        the post-update readback verification (WL-0MSVVFBJ2003RRYK)
+        observes the applied transition. *fallback_tainted* sets the ctx's
+        ``ac_fallback_used`` event so the infra-fallback provenance flag is
+        visible to the lifecycle.
         """
         updates = []
+        state = {
+            "status": ctx_overrides.get("original_status", "open"),
+            "stage": ctx_overrides.get("original_stage", "plan_complete"),
+        }
 
         def _runner(cmd):
             cs = " ".join(cmd)
             if "update" in cs:
                 updates.append(list(cmd))
+                for i, tok in enumerate(cmd):
+                    if tok == "--status" and i + 1 < len(cmd):
+                        state["status"] = cmd[i + 1]
+                    elif tok == "--stage" and i + 1 < len(cmd):
+                        state["stage"] = cmd[i + 1]
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            if "show" in cs and "--children" not in cs:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "status": state["status"],
+                            "stage": state["stage"],
+                        },
+                    }),
+                    stderr="",
+                )
             return SimpleNamespace(
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
@@ -2014,7 +2392,7 @@ class TestWlShowDedup:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        return _side_effect
+        return stateful_wl_side_effect(_side_effect)
 
     def _run_single_child_audit(self, calls, child_audit=None):
         """Run a full cmd_issue for a single-child item; return its rc."""
@@ -2035,7 +2413,7 @@ class TestWlShowDedup:
                 return_value="Ready to close: Yes\n\n## Summary\nall met",
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
         ):
@@ -2055,8 +2433,12 @@ class TestWlShowDedup:
             c for c in calls if "show" in c and "TEST-1" in c
             and "--children" not in c
         ]
-        assert len(parent_shows) == 1, \
-            f"expected exactly 1 parent wl show, got {len(parent_shows)}: {parent_shows}"
+        # Exactly one fetch: the pre-audit status capture. The single extra
+        # readback is the post-update lifecycle verification
+        # (WL-0MSVVFBJ2003RRYK) — a deliberate new fetch that confirms the
+        # terminal transition actually applied.
+        assert len(parent_shows) == 2, \
+            f"expected 2 parent wl shows (capture + lifecycle readback), got {len(parent_shows)}: {parent_shows}"
 
     def test_child_verdict_reuses_in_hand_child_data(self):
         """AC1: a legacy (fingerprint-less) child audit forces the time
@@ -2455,7 +2837,7 @@ class TestChildScreenShortBudget:
             return_value={"extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}, {"index": 1, "verdict": "met", "evidence": "ok"}]'},
         ) as mock_call, mock.patch.object(audit_runner, "_build_file_scope_manifest", return_value="manifest"):
             audit_runner._phase1_review_child_acs(
-                0, child, "test-model", "pi", None, None,
+                0, child, "test-model", "test-model", "pi", None, None,
                 mock.MagicMock(), lambda *a, **k: None,
             )
         _args, kwargs = mock_call.call_args

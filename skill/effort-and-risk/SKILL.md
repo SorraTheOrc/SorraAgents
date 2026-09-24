@@ -15,7 +15,7 @@ Produce a machine-readable engineering estimate (effort + risk) and human-readab
 
 `run_skill.py` does **not** modify the work item's `status` or `stage`.
 
-The pre-run status is captured and restored deterministically via the shared `StatusLifecycle` helpers (`StatusLifecycle.show` / `StatusLifecycle.update_status`). The `StatusLifecycle` **context manager** is deliberately not used here: its success exit sets `status=completed`, which would violate the documented lifecycle — items at `intake_complete`/`plan_complete` stay `open` until the post-release close.
+The pre-run status is captured and restored deterministically via the shared `StatusLifecycle` helpers (`StatusLifecycle.show` / `StatusLifecycle.update_status`). The `StatusLifecycle` **context manager** is deliberately not used here: its success exit sets `status=completed`, which would violate the documented lifecycle — items at `intake_complete`/`plan_complete` stay `open` until the post-release close. **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No `wl` mutation while `status: open`; callers that resume in-session must `StatusLifecycle.ensure_claimed` before mutating, or gate with `require_claimed`.
 
 ## Worklog resolution
 
@@ -70,7 +70,7 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 3. Run orchestrator, capture output to a **temp path outside the repository**:
 
    ```sh
-   python3 ./scripts/run_skill.py --issue <id> <<'JSON' > /tmp/effort-risk-final-<id>.json
+   python3 $(skill_path effort-and-risk)/scripts/run_skill.py --issue <id> <<'JSON' > /tmp/effort-risk-final-<id>.json
    { "items": [...], "o": ..., "m": ..., "p": ..., "overheads": {...}, "parent": {...}, "children": [...], "certainty": 85, "assumptions": [...], "unknowns": [...] }
    JSON
    ```
@@ -83,8 +83,8 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 
 ## Scripts
 
-- Orchestrator: `./scripts/orchestrate_estimate.py`
-- CLI wrapper: `./scripts/run_skill.py`
+- Orchestrator: `$(skill_path effort-and-risk)/scripts/orchestrate_estimate.py`
+- CLI wrapper: `$(skill_path effort-and-risk)/scripts/run_skill.py`
 - Calculators: `calc_effort.py`, `calc_risk.py`, `calc_effort_with_risk.py`
 - Formatters: `assemble_json.py`, `json_to_human.py`
 
@@ -96,8 +96,29 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 ### Example
 
 ```sh
-python3 ./scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > /tmp/effort-risk-final-SA-0MPYMFZXO0004ZU4.json
+python3 $(skill_path effort-and-risk)/scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > /tmp/effort-risk-final-SA-0MPYMFZXO0004ZU4.json
 { ... }
 JSON
 wl show SA-0MPYMFZXO0004ZU4 --format full
 ```
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

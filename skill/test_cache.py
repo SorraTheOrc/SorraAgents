@@ -29,9 +29,24 @@ Entry layout (stable, documented for read-only consumers)::
 
     <cache_dir>/<key>/
         metadata.json   {"version":1, "command":..., "git_state":...,
+                         "scope": "full"|"changed",
+                         "test_type": "full"|"unit"|...,
                          "exit_code":..., "completed_at": <epoch float>}
         stdout.txt      full stdout of the run
         stderr.txt      full stderr of the run
+
+``scope`` records whether the run was a full-suite run (``"full"`` — the
+historical default, so older entries without the field read as full) or a
+changed-file partial run (``"changed"`` — distinct cache keys from the full
+suite anyway, but the field lets read-only consumers such as the audit skill
+reject partial runs as full-suite evidence even if command sets ever
+converge).
+
+``test_type`` records the typed profile a run belongs to (``"full"`` — the
+historical default, so older entries without the field read as full). Only
+``test_type == "full"`` populates the audit-accepted full-suite entry; other
+types use independent cache keys (the type is part of the key) so a partial
+typed run can never satisfy a "full test suite passes" acceptance criterion.
 
 Writes are atomic (temp file + ``os.replace``); no locking is used.
 """
@@ -48,7 +63,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from skill.test_runner import normalize_test_command
+from test_runner import normalize_test_command
 
 DEFAULT_TTL_SECONDS = 2 * 60 * 60  # 2 hours (operator decision)
 # Non-zero-exit runs get a much shorter TTL (SA-0MSJELL44009XYIL): a failed
@@ -145,16 +160,31 @@ def cache_dir(repo_root: str | Path) -> Path:
     return repo_root / ".test-cache"
 
 
-def cache_key(normalized_command: str, git_state: str) -> str:
-    """Return the deterministic cache key for a normalized command + state."""
+def cache_key(normalized_command: str, git_state: str, test_type: str = "full") -> str:
+    """Return the deterministic cache key for a normalized command + state.
+
+    *test_type* namespaces non-``full`` typed profiles so they never share a
+    key with (and can never be mistaken for) a full-suite run. The ``full``
+    type keeps the historical key (command + git state only), preserving all
+    existing cached entries and audit queries.
+    """
     raw = f"{normalized_command}{_KEY_SEPARATOR}{git_state}"
+    if test_type != "full":
+        raw += f"{_KEY_SEPARATOR}type:{test_type}"
     return hashlib.sha256(raw.encode()).hexdigest()[: _KEY_LENGTH]
 
 
-def _entry_dir(command: str, git_state: str, cwd: str | Path) -> Path:
+def _entry_dir(
+    command: str,
+    git_state: str,
+    cwd: str | Path,
+    test_type: str = "full",
+) -> Path:
     """Resolve the entry directory for a command at *cwd*."""
     repo_root = Path(cwd or os.getcwd()).resolve()
-    return cache_dir(repo_root) / cache_key(normalize_test_command(command), git_state)
+    return cache_dir(repo_root) / cache_key(
+        normalize_test_command(command), git_state, test_type
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -175,17 +205,22 @@ def lookup(
     *,
     cwd: str | Path | None = None,
     ttl: float = DEFAULT_TTL_SECONDS,
+    test_type: str = "full",
 ) -> dict[str, Any] | None:
     """Return a cached run entry or None on miss/corruption/expiry.
 
-    A hit requires the stored git state to match *git_state* AND the run to be
-    within *ttl* seconds old. Corrupt or unreadable entries are treated as a
-    miss (fresh run) and never raise into the caller.
+    A hit requires the stored git state to match *git_state*, the stored
+    ``test_type`` to match *test_type*, AND the run to be within *ttl*
+    seconds old. Corrupt or unreadable entries are treated as a miss (fresh
+    run) and never raise into the caller.
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
-    (epoch float), ``command`` (normalized), ``git_state`` and ``cached: True``.
+    (epoch float), ``command`` (normalized), ``git_state``, ``scope``
+    (``"full"`` for historical entries lacking the field — see module docs),
+    ``test_type`` (``"full"`` for historical entries lacking the field) and
+    ``cached: True``.
     """
-    entry_dir = _entry_dir(command, git_state, cwd or os.getcwd())
+    entry_dir = _entry_dir(command, git_state, cwd or os.getcwd(), test_type)
     meta_path = entry_dir / "metadata.json"
     try:
         meta = json.loads(meta_path.read_text())
@@ -198,6 +233,8 @@ def lookup(
         return None
     if meta.get("git_state") != git_state:
         return None  # stale state: never return stale data silently
+    if meta.get("test_type", "full") != test_type:
+        return None  # type mismatch: never serve one profile as another
     completed_at = float(meta.get("completed_at", 0))
     exit_code = int(meta.get("exit_code", 0))
     # Failed runs expire after the short failed-run TTL; green runs keep the
@@ -213,6 +250,8 @@ def lookup(
         "completed_at": completed_at,
         "command": meta.get("command", normalize_test_command(command)),
         "git_state": git_state,
+        "scope": meta.get("scope", "full"),
+        "test_type": meta.get("test_type", "full"),
         "cached": True,
     }
 
@@ -226,6 +265,8 @@ def store(
     stderr: str,
     exit_code: int,
     completed_at: float | None = None,
+    scope: str = "full",
+    test_type: str = "full",
 ) -> Path:
     """Persist a run result, replacing any existing entry for the same key.
 
@@ -233,9 +274,18 @@ def store(
     write is therefore treated as corrupt by :func:`lookup` and degrades to a
     fresh run.
 
+    *scope* records whether the run covered the full suite (``"full"``,
+    default — the only scope before scope-aware selection existed) or a
+    changed-file subset (``"changed"``). Read-only consumers can therefore
+    distinguish partial runs from full-suite evidence.
+
+    *test_type* records the typed profile (``"full"``, default). Non-``full``
+    types are keyed independently (see :func:`cache_key`) so they can never be
+    mistaken for full-suite evidence.
+
     Returns the entry directory path.
     """
-    entry_dir = _entry_dir(command, git_state, cwd or os.getcwd())
+    entry_dir = _entry_dir(command, git_state, cwd or os.getcwd(), test_type)
     entry_dir.mkdir(parents=True, exist_ok=True)
 
     normalized = normalize_test_command(command)
@@ -243,6 +293,8 @@ def store(
         "version": _CACHE_VERSION,
         "command": normalized,
         "git_state": git_state,
+        "scope": scope,
+        "test_type": test_type,
         "exit_code": int(exit_code),
         "completed_at": completed_at if completed_at is not None else time.time(),
     }
@@ -258,7 +310,18 @@ def store(
 
 
 def _default_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
-    """Execute a normalized command string, capturing stdout/stderr."""
+    """Execute a normalized command string, capturing stdout/stderr.
+
+    Prepend ``~/.local/bin`` to PATH if not already present so that
+    user-installed executables (e.g. pytest at ``~/.local/bin/pytest``)
+    are found when the audit runner spawns suite commands in a restricted
+    environment (SA-0MSUZAJPC003BS66).
+    """
+    env = os.environ.copy()
+    local_bin = os.path.expanduser("~/.local/bin")
+    path_value = env.get("PATH", "")
+    if local_bin not in path_value.split(os.pathsep):
+        env["PATH"] = local_bin + os.pathsep + path_value
     return subprocess.run(
         shlex.split(command),
         cwd=cwd,
@@ -266,6 +329,7 @@ def _default_runner(command: str, cwd: str, timeout: int) -> subprocess.Complete
         text=True,
         timeout=timeout,
         check=False,
+        env=env,
     )
 
 
@@ -278,28 +342,39 @@ def run_cached(
     ttl: float = DEFAULT_TTL_SECONDS,
     timeout: int = 600,
     runner: Runner = _default_runner,
+    scope: str = "full",
+    test_type: str = "full",
 ) -> dict[str, Any]:
     """Run *command* through the cache.
 
-    - A valid cached result (matching git state, within TTL) is returned
-      without executing — verified by tests asserting the underlying command
-      is not spawned.
+    - A valid cached result (matching git state and type, within TTL) is
+      returned without executing — verified by tests asserting the underlying
+      command is not spawned.
     - A miss, changed git-state, or expired TTL runs the normalized command,
       stores the result, and returns it.
     - ``force=True`` bypasses lookup but still stores (refresh).
     - ``no_cache=True`` bypasses lookup AND storage (pure bypass).
+    - *scope* (default ``"full"``) is recorded in the stored metadata so
+      read-only consumers can tell partial runs from full-suite evidence.
+    - *test_type* (default ``"full"``) selects the typed-profile cache
+      namespace; non-``full`` types use independent keys and only ``full``
+      populates the audit-accepted full-suite entry.
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
-    (epoch float), ``command`` (normalized), ``git_state`` and ``cached``
-    (True when served from cache).
+    (epoch float), ``command`` (normalized), ``git_state``, ``scope``,
+    ``test_type`` and ``cached`` (True when served from cache).
     """
     cwd_path = Path(cwd or os.getcwd()).resolve()
     cwd_str = str(cwd_path)
     git_state = compute_git_state(cwd_str)
 
     if not force and not no_cache:
-        hit = lookup(command, git_state, cwd=cwd_str, ttl=ttl)
-        if hit is not None:
+        hit = lookup(command, git_state, cwd=cwd_str, ttl=ttl, test_type=test_type)
+        # A cached entry recorded under a different scope is not a valid hit
+        # for this request (scope is stored in metadata; the cache key is the
+        # command+state, so this only matters if command sets ever converge —
+        # never serve a partial run as a full-suite result and vice versa).
+        if hit is not None and hit.get("scope", "full") == scope:
             return hit
 
     normalized = normalize_test_command(command)
@@ -315,6 +390,8 @@ def run_cached(
             stderr=proc.stderr or "",
             exit_code=proc.returncode,
             completed_at=completed_at,
+            scope=scope,
+            test_type=test_type,
         )
 
     return {
@@ -324,6 +401,8 @@ def run_cached(
         "completed_at": completed_at,
         "command": normalized,
         "git_state": git_state,
+        "scope": scope,
+        "test_type": test_type,
         "cached": False,
     }
 
@@ -333,16 +412,18 @@ def query_cached(
     *,
     cwd: str | Path | None = None,
     ttl: float = DEFAULT_TTL_SECONDS,
+    test_type: str = "full",
 ) -> dict[str, Any] | None:
     """Read-only cache query: never executes anything.
 
-    Returns the cached entry for *command* at the current git state, or None
-    on miss. Intended for ``--summary`` and read-only consumers (e.g. the
-    audit skill) that may READ the cache but must not execute the suite.
+    Returns the cached entry for *command* at the current git state and
+    *test_type*, or None on miss. Defaults to the ``full`` profile so the
+    audit skill's full-suite verification is unchanged; read-only consumers
+    must pass a non-``full`` *test_type* to inspect a typed profile.
     """
     cwd_str = str(Path(cwd or os.getcwd()).resolve())
     git_state = compute_git_state(cwd_str)
-    return lookup(command, git_state, cwd=cwd_str, ttl=ttl)
+    return lookup(command, git_state, cwd=cwd_str, ttl=ttl, test_type=test_type)
 
 
 # ---------------------------------------------------------------------------

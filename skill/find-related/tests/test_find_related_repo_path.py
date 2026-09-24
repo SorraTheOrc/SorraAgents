@@ -26,6 +26,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
 
 import importlib.util
 
@@ -64,14 +67,14 @@ class TestDefaultRepoPath:
     def test_sibling_project_item_resolves_to_its_repo_root(self, tmp_path):
         """AC1: an OSL item's default repo path is the OSL project root."""
         projects = _make_projects(tmp_path)
-        with mock.patch("skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects):
+        with mock.patch("shared.status_lifecycle.SIBLING_SCAN_ROOT", projects):
             repo = mod._default_repo_path("OSL-0MSABC7SB001NVUN")
         assert repo == projects / "open_source_llm"
 
     def test_framework_item_resolves_to_framework_root(self, tmp_path):
         """AC5: a SorraAgents item's default repo path is unchanged."""
         projects = _make_projects(tmp_path)
-        with mock.patch("skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects):
+        with mock.patch("shared.status_lifecycle.SIBLING_SCAN_ROOT", projects):
             repo = mod._default_repo_path("SA-0MSABC7SB001NVUN")
         assert repo == projects / "SorraAgents"
 
@@ -80,9 +83,9 @@ class TestDefaultRepoPath:
         empty = tmp_path / "empty-projects"
         empty.mkdir()
         with (
-            mock.patch("skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", empty),
+            mock.patch("shared.status_lifecycle.SIBLING_SCAN_ROOT", empty),
             mock.patch(
-                "skill.shared.status_lifecycle._detect_worklog_dir",
+                "shared.status_lifecycle._detect_worklog_dir",
                 return_value=None,
             ),
         ):
@@ -125,7 +128,7 @@ class TestMainRepoPathWiring:
             argv += ["--repo-path", repo_path]
 
         with (
-            mock.patch("skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects),
+            mock.patch("shared.status_lifecycle.SIBLING_SCAN_ROOT", projects),
             mock.patch.object(mod, "StatusLifecycle"),
             mock.patch.object(
                 mod, "run_wl_show",
@@ -228,7 +231,7 @@ class TestUpdateDescriptionReplacesAllSections:
 
         argv = ["find_related.py", "--work-item-id", "OSL-0MSABC7SB001NVUN", "--json"]
         with (
-            mock.patch("skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects),
+            mock.patch("shared.status_lifecycle.SIBLING_SCAN_ROOT", projects),
             mock.patch.object(mod, "StatusLifecycle"),
             mock.patch.object(mod, "run_wl_show", side_effect=fake_show),
             mock.patch.object(mod, "is_semantic_available", return_value=False),

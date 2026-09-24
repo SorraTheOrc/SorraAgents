@@ -13,7 +13,7 @@ Provides:
 
 Usage:
 
-    from skill.refactor.workitem_creation import (
+    from refactor.workitem_creation import (
         create_smell_work_item,
         create_smell_work_items,
         has_existing_smell_comment,

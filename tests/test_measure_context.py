@@ -278,3 +278,102 @@ class TestThresholds:
             mc.main(["--repo-root", str(tmp_path / "nope")])
             == mc.EXIT_ERROR
         )
+
+
+# ── Threshold generation helper (AC2, SA-0MT1WO815009KXUC) ─────────────────
+
+
+class TestGenerateThresholds:
+    """Tests for the `--generate-thresholds` and `--write-thresholds` flags.
+
+    AC1: `--generate-thresholds` prints a JSON file to stdout with the
+        current measurements as threshold values.
+    AC2: `--write-thresholds <path>` writes a valid JSON file at the path.
+    AC3: Output includes all four keys: global_agents, project_agents,
+        skills_prose, total (byte values).
+    AC4: Output values match the measured components from the same repo.
+    """
+
+    def test_generate_thresholds_prints_valid_json(self, repo_root: Path, capsys):
+        """`--generate-thresholds` prints a JSON object with all four keys."""
+        code = mc.main(["--repo-root", str(repo_root), "--generate-thresholds"])
+        assert code == mc.EXIT_OK
+        data = json.loads(capsys.readouterr().out)
+        for component in ("global_agents", "project_agents", "skills_prose", "total"):
+            assert component in data, f"missing threshold component {component!r}"
+            assert isinstance(data[component], int), (
+                f"threshold {component!r} must be an int, got {data[component]!r}"
+            )
+            assert data[component] > 0, f"threshold {component!r} must be positive"
+
+    def test_generate_thresholds_match_measured(self, repo_root: Path, capsys):
+        """Generated threshold values match the measured component bytes."""
+        code = mc.main(["--repo-root", str(repo_root), "--generate-thresholds"])
+        assert code == mc.EXIT_OK
+        threshold_data = json.loads(capsys.readouterr().out)
+
+        comps = mc.measure(repo_root)
+        for name, comp in comps.items():
+            if name == "total":
+                continue
+            assert threshold_data[name] == comp["bytes"], (
+                f"threshold {name}={threshold_data[name]} != measured {comp['bytes']}"
+            )
+        assert threshold_data["total"] == comps["total"]["bytes"]
+
+    def test_generate_thresholds_tracks_include_hidden(self, tmp_path: Path, capsys):
+        """`--generate-thresholds --include-hidden` counts hidden skills."""
+        (tmp_path / "AGENTS_GLOBAL.md").write_text("G" * 20, encoding="utf-8")
+        (tmp_path / "AGENTS.md").write_text("P" * 20, encoding="utf-8")
+        hidden = tmp_path / "skill" / "hidden_skill"
+        hidden.mkdir(parents=True)
+        (hidden / "SKILL.md").write_text(
+            "---\ndisable-model-invocation: true\ndescription: secret prose\n---\n",
+            encoding="utf-8",
+        )
+
+        code = mc.main(
+            ["--repo-root", str(tmp_path), "--generate-thresholds", "--include-hidden"]
+        )
+        assert code == mc.EXIT_OK
+        data = json.loads(capsys.readouterr().out)
+        # hidden prose = "secret prose" (12 chars), matching measure(include_hidden=True)
+        comps = mc.measure(tmp_path, include_hidden=True)
+        assert data["skills_prose"] == comps["skills_prose"]["bytes"]
+
+    def test_write_thresholds_writes_file(self, repo_root: Path, tmp_path: Path, capsys):
+        """`--write-thresholds <path>` writes a valid JSON file."""
+        out_file = tmp_path / "thresholds-out.json"
+        code = mc.main(
+            ["--repo-root", str(repo_root), "--write-thresholds", str(out_file)]
+        )
+        assert code == mc.EXIT_OK
+        assert out_file.exists(), "--write-thresholds should create the file"
+        data = json.loads(out_file.read_text(encoding="utf-8"))
+        for component in ("global_agents", "project_agents", "skills_prose", "total"):
+            assert component in data
+
+    def test_write_thresholds_contents_match_measured(
+        self, repo_root: Path, tmp_path: Path, capsys
+    ):
+        """The written file contains the measured byte values."""
+        out_file = tmp_path / "thresholds-out.json"
+        mc.main(["--repo-root", str(repo_root), "--write-thresholds", str(out_file)])
+        data = json.loads(out_file.read_text(encoding="utf-8"))
+        comps = mc.measure(repo_root)
+        assert data["total"] == comps["total"]["bytes"]
+        assert data["global_agents"] == 100
+        assert data["project_agents"] == 40
+        assert data["skills_prose"] == 31
+
+    def test_mutually_exclusive_with_other_output_flags(
+        self, repo_root: Path, capsys
+    ):
+        """`--generate-thresholds` and `--json` are mutually exclusive output modes."""
+        try:
+            mc.main(["--repo-root", str(repo_root), "--generate-thresholds", "--json"])
+        except SystemExit:
+            # argparse rejects mutually exclusive flags with exit 2
+            pass
+        else:
+            raise AssertionError("expected SystemExit for mutually exclusive flags")

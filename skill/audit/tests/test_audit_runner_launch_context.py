@@ -22,7 +22,10 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest import mock
+
+import pytest
 
 # ---------------------------------------------------------------------------
 # Ensure repo root is on sys.path so the audit_runner module is importable.
@@ -31,8 +34,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner
-from skill.audit.scripts.persist_audit import PERSIST_CONTENT_INVALID
+from audit.scripts import audit_runner
+from audit.scripts.persist_audit import PERSIST_CONTENT_INVALID
+from audit.tests.wl_helpers import make_stateful_runner
 
 # ===========================================================================
 # Helpers
@@ -79,7 +83,7 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, P
     # by the file-scope manifest validation; the framework repo has no src/).
     (target_root / "src").mkdir()
     patcher = mock.patch(
-        "skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+        "shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
     )
     return target, target_root, patcher
 
@@ -146,7 +150,7 @@ def _make_minimal_runner(recorded: list[list[str]] | None = None,
             )
         return _make_wl_success_proc()
 
-    return fake_runner
+    return make_stateful_runner(fake_runner)
 
 
 # ===========================================================================
@@ -272,7 +276,7 @@ class TestLaunchContextGuard:
             patcher,
             mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", target_root),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -300,7 +304,7 @@ class TestLaunchContextGuard:
                 audit_runner, "TARGET_PROJECT_ROOT", tmp_path / "elsewhere"
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -402,7 +406,7 @@ class TestFileScopeManifestValidation:
                 audit_runner, "_call_pi_and_maybe_log"
             ) as pi_mock,
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -442,7 +446,7 @@ class TestFileScopeManifestValidation:
                 audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -453,6 +457,191 @@ class TestFileScopeManifestValidation:
             )
 
         assert rc == 0
+
+
+# ===========================================================================
+# SA-0MSUBX8PP0087OEA: FILE SCOPE manifest false positive for repos whose
+# distinctive markers are all root-level files.
+#
+# _repo_index aggregates root-level files under "(root)/ (N files)", so a
+# work item whose changes touch only framework-shared subdirectories never
+# surfaces the owning repo's distinctive root-file markers in the manifest
+# and the Phase 2 validation falsely aborts with an audit scope error.
+# The fix exposes a bounded list of root file names in the (root) entry so
+# root-file markers stay verifiable (AC1) while a manifest built from the
+# wrong repo is still rejected (AC2). Fixture repos are used per the work
+# item (never live dev-scripts state).
+# ===========================================================================
+
+
+class TestRootFileOnlyRepoManifest:
+    """AC1/AC2: root-file-only-marker repos must not false-positive the
+    FILE SCOPE validation, and mis-scoped manifests are still rejected.
+
+    SAFETY CONTEXT (SA-0MU8EKJYY007PT42): On 2026-09-19, the _init_repo
+    fixture committed against the live repo when pytest's tmp_path resolved
+    to the project root (author T <t@t.com>, commit 2c30dbfe). The fixture
+    now asserts that tmp_path is not inside any git repository — neither the
+    repository root itself nor any path nested within a checkout — before
+    proceeding.
+    Root cause: pytest's tmp_path / --basetemp can be overridden by TMPDIR
+    environment variable or by the test-skill runner's working directory.
+    When run_tests.py invoked pytest from the project root without an
+    explicit --basetemp, tmp_path fell back to the live repo.
+    """
+
+    ROOT_FILES: ClassVar[list[str]] = [
+        "install.sh", "remote", "sshl", "update", "ai.home.conf"
+    ]
+    SHARED_SUBDIR = "tests"  # present in the framework repo too -> not distinctive
+
+    @staticmethod
+    def _init_repo(tmp_path: Path) -> Path:
+        """Init a real git repo whose distinctive markers are all root files.
+
+        SAFETY GUARD: refuse to run if tmp_path sits inside the live repo.
+        This prevents the historical incident (SA-0MU8EKJYY007PT42) where
+        tmp_path resolved to the project root and the fixture's git surface —
+        ``git init``, ``git add -A`` and ``git commit`` — wiped 472 files
+        from the live checkout. The guard is the only thing standing between
+        the fixture's git commands and the surrounding repository, so it must
+        reject any tmp_path nested inside a git repository, not merely the
+        repository root.
+        """
+        # --- Defensive guard: tmp_path must not be inside ANY git repository ---
+        # Reject both the live repo root and any path nested inside an
+        # enclosing repository: a nested tmp_path would still let the fixture
+        # create and commit a repository inside the live checkout.
+        try:
+            enclosing_repo = subprocess.run(
+                ["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            enclosing_repo = ""  # not inside any git repo — safe to proceed.
+        assert not enclosing_repo, (
+            f"_init_repo refused: tmp_path {tmp_path} is inside git repository "
+            f"{enclosing_repo!r}. Running the fixture here would risk "
+            "committing into the live repository."
+        )
+
+        repo = tmp_path / "root-file-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "t@t.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "T"], check=True
+        )
+        for name in TestRootFileOnlyRepoManifest.ROOT_FILES:
+            (repo / name).write_text("x\n", encoding="utf-8")
+        shared = repo / TestRootFileOnlyRepoManifest.SHARED_SUBDIR
+        shared.mkdir()
+        (shared / "test_a.py").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+        return repo
+
+    @staticmethod
+    def _git_runner(repo: Path):
+        """Runner resolving git commands against the fixture repo."""
+        def runner(cmd):
+            if cmd and cmd[0] == "git":
+                cmd = ["git", "-C", str(repo)] + list(cmd[1:])
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  check=False)
+        return runner
+
+    def test_repo_index_exposes_root_file_names(self, tmp_path):
+        """AC1: _repo_index lists root-level file names in the (root) entry so
+        distinctive root-file markers appear in the manifest.
+        """
+        repo = self._init_repo(tmp_path)
+        index = audit_runner._repo_index(self._git_runner(repo))
+        joined = "\n".join(index)
+        for name in self.ROOT_FILES:
+            assert name in joined, f"root file {name!r} missing from index: {index}"
+        assert any(line.startswith("(root)/ (5 files)") for line in index), (
+            f"aggregate (root) count must be preserved: {index}"
+        )
+
+    def test_root_file_markers_are_distinctive(self, tmp_path):
+        """AC1: the fixture repo's root files (not the shared subdir) are the
+        distinctive markers the validation verifies against.
+        """
+        repo = self._init_repo(tmp_path)
+        distinctive = audit_runner._distinctive_project_top_levels(repo)
+        assert set(distinctive) == set(self.ROOT_FILES), (
+            f"expected only root-file markers to be distinctive: {distinctive}"
+        )
+
+    def test_manifest_with_root_file_markers_passes_validation(self, tmp_path):
+        """AC1: a manifest for a root-file-only-marker repo whose changes touch
+        only a framework-shared subdir does NOT abort with a scope error.
+        """
+        repo = self._init_repo(tmp_path)
+        index = audit_runner._repo_index(self._git_runner(repo))
+        manifest = (
+            "Changed files (git diff / status):\n"
+            "- `tests/test_a.py`\n\n"
+            "Repository index (top-level layout):\n"
+            + "\n".join(f"- {line}" for line in index)
+        )
+        error = audit_runner._validate_file_scope_manifest(manifest, repo)
+        assert error is None, f"false positive scope error: {error}"
+
+    def test_mis_scoped_manifest_still_rejected_for_root_file_repo(self, tmp_path):
+        """AC2: a manifest built from the wrong repo (no owning root-file
+        markers) is still rejected — the guard is not disabled.
+        """
+        repo = self._init_repo(tmp_path)
+        wrong_manifest = (
+            "Repository index (top-level layout):\n"
+            "- skill/ (42 files)\n- tests/ (11 files)\n- (root)/ (3 files)"
+        )
+        error = audit_runner._validate_file_scope_manifest(wrong_manifest, repo)
+        assert error is not None
+        assert "Audit scope error" in error
+
+    def test_init_repo_refuses_live_repo_tmp_path(self):
+        """AC1 regression: _init_repo refuses any tmp_path inside a git repo.
+
+        Reproduces the guard for the SA-0MU8EKJYY007PT42 incident where
+        tmp_path resolved to the live project root and the fixture committed
+        into the repo, deleting 472 files. The guard rejects both the repo
+        root itself and any path nested inside an enclosing repository, since
+        a nested path would still let the fixture create and commit a
+        repository inside the live checkout.
+        """
+        for unsafe_path in (REPO_ROOT, REPO_ROOT / "skill"):
+            with pytest.raises(AssertionError) as exc_info:
+                self._init_repo(unsafe_path)
+            assert "is inside git repository" in str(exc_info.value)
+
+    def test_repo_index_root_file_list_is_bounded(self, tmp_path):
+        """Risk mitigation: the root-file name list is bounded so a repo with
+        many root files cannot bloat the manifest.
+        """
+        repo = self._init_repo(tmp_path)
+        # (root) bucket has 5 files; cap the inline list at 2 and expect "..."
+        index = audit_runner._repo_index(
+            self._git_runner(repo), max_root_files=2
+        )
+        root_line = next(
+            line for line in index if line.startswith("(root)/")
+        )
+        shown = root_line.split(":", 1)[1] if ":" in root_line else ""
+        truncated = shown.rstrip().endswith(", ...")
+        names = [
+            p.strip()
+            for p in shown.rstrip()[:-5].split(",") if p.strip()
+        ] if truncated else [p.strip() for p in shown.split(",") if p.strip()]
+        assert len(names) <= 2, (
+            f"root-file list must be capped at max_root_files: {root_line}"
+        )
+        assert truncated, f"truncated list must be marked: {root_line}"
 
 
 # ===========================================================================
@@ -552,7 +741,7 @@ class TestChildPersistFailureFatal:
                 )
             return _make_wl_success_proc()
 
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def _run_with_child(self, persist_rc: int, tmp_path):
         """Run cmd_issue with one child and a canned persist_audit return."""
@@ -588,7 +777,7 @@ class TestChildPersistFailureFatal:
                 audit_runner, "persist_audit", return_value=persist_rc
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -659,7 +848,7 @@ class TestGitResolutionFromNonOwningCwd:
                 audit_runner, "_verify_launch_context", return_value=None
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -696,7 +885,7 @@ class TestGitResolutionFromNonOwningCwd:
                 audit_runner, "TARGET_PROJECT_ROOT", launch_root
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -728,7 +917,7 @@ class TestGitResolutionFromNonOwningCwd:
                 audit_runner, "TARGET_PROJECT_ROOT", target_root
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -837,7 +1026,7 @@ class TestWorktreeLaunchGitResolution:
                 audit_runner, "TARGET_PROJECT_ROOT", worktree_path
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -872,7 +1061,7 @@ class TestWorktreeLaunchGitResolution:
                 audit_runner, "TARGET_PROJECT_ROOT", worktree_path
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -892,14 +1081,22 @@ class TestWorktreeLaunchGitResolution:
         )
         # File-scope manifest reflects the worktree state: worktree-only
         # tracked file in the repo index + worktree-only untracked file in
-        # the changed-files list.
+        # the changed-files list.  (Manifest is built inside the patch
+        # context so TARGET_PROJECT_ROOT is correct for the existence
+        # filter in _git_changed_files — SA-0MSXVXVUL0011JKX.)
         manifest = audit_runner._build_file_scope_manifest(
             {}, [], runner=runner
         )
         assert "wt_only" in manifest, (
             f"manifest must reflect worktree-only files: {manifest!r}"
         )
-        changed = audit_runner._git_changed_files(runner)
+        # Direct _git_changed_files call must also be inside the patch
+        # context for the TARGET_PROJECT_ROOT-based existence filter to
+        # resolve paths correctly.
+        with mock.patch.object(
+            audit_runner, "TARGET_PROJECT_ROOT", worktree_path
+        ):
+            changed = audit_runner._git_changed_files(runner)
         assert "wt_uncommitted.txt" in changed, (
             f"changed files must reflect the worktree working tree: {changed}"
         )

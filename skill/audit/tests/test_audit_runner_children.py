@@ -12,8 +12,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -169,7 +169,7 @@ class TestOptInChildAuditCascade:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run(self, triggered, **cmd_kwargs):
@@ -200,7 +200,7 @@ class TestOptInChildAuditCascade:
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(
@@ -252,7 +252,7 @@ class TestOptInChildAuditCascade:
         re-audited even with --audit-children — the Phase 1 pre-pass reuses
         its stored verdict via the content gate (zero pi calls, no
         auto-triggered child audit)."""
-        from skill.audit.scripts import audit_runner as ar
+        from audit.scripts import audit_runner as ar
         head = "a" * 40
         child_desc = "## Acceptance Criteria\n- CAC1: child criterion"
         with mock.patch.object(ar, "_resolve_audited_head", return_value=head):
@@ -464,7 +464,7 @@ class TestChildVerdictReuseInParentAudits:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run(self, child_pi_contexts, triggered, *, n_children=1,
@@ -509,7 +509,7 @@ class TestChildVerdictReuseInParentAudits:
                 audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -736,7 +736,7 @@ class TestChildVerdictReuseInParentAudits:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         with mock.patch.object(
             ar, "_resolve_audited_head", return_value=self.PARENT_HEAD
         ):
@@ -780,7 +780,7 @@ class TestChildVerdictReuseInParentAudits:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def test_verdict_content_fresh_ready(self):
@@ -926,7 +926,7 @@ class TestParentFirstChildPassThrough:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run(self, children, parent_verdict="met", gap_file=None,
@@ -965,7 +965,7 @@ class TestParentFirstChildPassThrough:
             stack.enter_context(mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_pi))
             stack.enter_context(mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0}))
             stack.enter_context(mock.patch.object(
                 audit_runner, "_assemble_issue_report",
@@ -1118,7 +1118,7 @@ class TestParentFirstChildPassThrough:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        runner.side_effect = _side_effect
+        runner.side_effect = stateful_wl_side_effect(_side_effect)
         captured = {}
         pi_calls = []
 
@@ -1142,7 +1142,7 @@ class TestParentFirstChildPassThrough:
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(audit_runner, "_assemble_issue_report",
@@ -1190,7 +1190,7 @@ class TestParentFirstChildPassThrough:
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": blocking,
                               "fixes_applied": 0},
             ),
@@ -1256,7 +1256,7 @@ class TestParentFirstChildPassThrough:
 
     def test_child_content_changed_fresh_audit_false(self):
         """_child_content_changed: a content-fresh audit → unchanged."""
-        from skill.audit.scripts import audit_runner as ar
+        from audit.scripts import audit_runner as ar
         head = "a" * 40
         child_desc = "## Acceptance Criteria\n- CAC1: child criterion"
         with mock.patch.object(ar, "_resolve_audited_head", return_value=head):
@@ -1293,7 +1293,7 @@ class TestParentFirstChildPassThrough:
     def test_child_content_changed_stale_audit_true(self):
         """_child_content_changed: an audit whose fingerprint no longer
         matches (different HEAD) → content changed."""
-        from skill.audit.scripts import audit_runner as ar
+        from audit.scripts import audit_runner as ar
         # Store the fingerprint under HEAD 'a', then re-check under 'b'.
         with mock.patch.object(ar, "_resolve_audited_head", return_value="a" * 40):
             fp = ar._compute_content_fingerprint(
@@ -1331,7 +1331,7 @@ class TestParentFirstChildPassThrough:
     def test_child_content_changed_no_audit_false(self):
         """_child_content_changed: no stored audit → nothing to compare →
         unchanged (inheritance safe)."""
-        from skill.audit.scripts import audit_runner as ar
+        from audit.scripts import audit_runner as ar
 
         def _fake_run_wl(runner, cmd, worklog_dir=None):
             cmd_str = " ".join(cmd)

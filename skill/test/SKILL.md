@@ -22,6 +22,7 @@ Inputs
 ------
 
 - Optional: work-item id for triaged `test-failure` children (`parent_work_item_id`); `--rerun-failures` checks flakiness before triage.
+- Optional: `--type full|unit|smoke|<local-type>` (default `full`) selects the command profile; `--scope full|changed` (default `full`) selects full-vs-changed within it.
 
 Outputs
 -------
@@ -33,7 +34,7 @@ Outputs
 References
 ----------
 
-- Runner: `./scripts/run_tests.py` · Usefulness: `./scripts/evaluate_usefulness.py` · Triage: `../triage/scripts/check_or_create.py`
+- Runner: `$(skill_path test)/scripts/run_tests.py` · Usefulness: `$(skill_path test)/scripts/evaluate_usefulness.py` · Triage: `$(skill_path triage)/scripts/check_or_create.py`
 - Canonicalization: `../test_runner.py` · Anti-patterns: [Test Writing Guidelines](../shared/test-writing-guidelines.md)
 
 Workflow
@@ -42,7 +43,7 @@ Workflow
 ### 1. Run the full suite in quiet mode
 
 ```bash
-python3 ./scripts/run_tests.py --json
+python3 $(skill_path test)/scripts/run_tests.py --json
 ```
 
 **Project-root resolution:** the runner targets the invoking project (see [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md)).
@@ -58,6 +59,48 @@ An empty resolved set (no extension file, no npm test script, no pytest suite, n
 
 Output: JSON with per-suite results and a flat `failures` array (`test_name`, `stdout_excerpt`, `stack_trace`).
 
+### 1a. Typed runs (`--type`) — fast feedback vs release evidence
+
+`--type <T>` selects the command **profile**; `--scope full|changed` selects
+full-vs-changed *within* that profile (the two axes are orthogonal):
+
+| Type | Meaning | Populates full-suite cache? |
+|------|---------|-----------------------------|
+| `full` (default) | The complete project suite. Bare `/skill:test` = `--type full`. | **Yes** — the only audit-accepted evidence. |
+| `unit` | The convention unit subset (`tests/unit`) or the local extension's `unit` commands. | No — independent cache key. |
+| `smoke` | The convention smoke subset (`tests/smoke`) or the local extension's `smoke` commands. | No — independent cache key. |
+
+- **Use `unit`/`smoke` during implementation** for fast feedback; use `full`
+  (or bare `/skill:test`) at the pre-`in_review` gate and before release.
+- A project may define **additional types** (`dev`, `e2e`, …) in its local
+  extension; the global skill dispatches any locally-defined type.
+- Only `--type full` writes the audit-accepted full-suite cache entry —
+  non-`full` runs use independent cache keys and record `type` in the result
+  JSON and `--summary` output, so a partial run can never satisfy a "full test
+  suite passes" AC.
+- An unknown type exits non-zero, listing the allowed values (the minimum set
+  plus any locally-defined types).
+
+**Local extension contract.** Type→command maps are project-local and
+machine-readable: `<project_root>/.pi/skills_extensions/test/extension.json`:
+
+```json
+{ "types": { "unit": ["npx vitest run --project unit"], "e2e": ["npx playwright test"] } }
+```
+
+Values are a command string or a non-empty list of command strings. When the
+extension exists but omits a requested minimum type, the runner fails naming
+the type and the file — it never silently runs the full suite. A `full` type
+that the extension omits still falls back to the suite commands, so a bare
+invocation is never broken. Convention fallback applies only when no local type
+map exists. Full contract:
+[skill-extensions.md](../../docs/dev/skill-extensions.md).
+
+```bash
+python3 $(skill_path test)/scripts/run_tests.py --type unit --json   # fast feedback
+python3 $(skill_path test)/scripts/run_tests.py --type full --json   # release evidence
+```
+
 ### 0. Cached execution (default)
 
 `run_tests.py` caches each suite run per-repo — re-running the same command at
@@ -67,9 +110,9 @@ the same git state within the **2-hour TTL** is served from cache. Details:
 Query a cached run without executing:
 
 ```bash
-python3 ./scripts/run_tests.py --summary --suite all                         # summary lines
-python3 ./scripts/run_tests.py --summary --summary-grep "Test Files|failed"  # read-only grep
-python3 ./scripts/run_tests.py --force                                       # fresh run
+python3 $(skill_path test)/scripts/run_tests.py --summary --suite all                         # summary lines
+python3 $(skill_path test)/scripts/run_tests.py --summary --summary-grep "Test Files|failed"  # read-only grep
+python3 $(skill_path test)/scripts/run_tests.py --force                                       # fresh run
 ```
 
 The **audit skill** consumes the cache read-only via `query_cached()`: a green
@@ -78,13 +121,30 @@ execution-dependent ACs (SA-0MSIU5HFI0024D7W). Failed (non-zero-exit) runs use
 a short 5-minute TTL so transient infra failures are not re-served as current
 results (SA-0MSJELL44009XYIL).
 
+**Scope-aware execution (SA-0MT6BYQHB008DOGC):** `run_tests.py --scope full|changed`
+— the FULL suite by default, or only the tests affected by changes since
+`--target-branch` (default `origin/dev`) via convention mapping + AST
+import-graph expansion. `full` is the only scope accepted as full-suite
+evidence: changed-scope runs get independent cache keys, record `scope:
+changed` in their metadata, and NEVER populate the full-suite cache entry —
+the audit's read-only full-suite query rejects `changed` entries, so a
+partial run can never satisfy a "full test suite passes" AC. When no subset
+can be selected (no diff base, only non-test changes, custom
+`suiteCommands`), changed scope falls back to the full suite with a warning.
+Result JSON and `--summary` output carry `scope` per suite. Pre-push
+enforcement (`.githooks/pre-push`): pushes to `refs/heads/dev`/`main` run the
+full suite (`--scope full`), feature-branch pushes skip tests
+(`TEST_SCOPE_SKIP=1` bypasses); the implement skill validates the worktree
+with changed scope and runs a final `--scope full` gate before commit.
+Details: [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
+
 ### 2. Triage every failure
 
 For each failure record, invoke the triage helper to create or link a critical
 `test-failure` work item (no duplicates):
 
 ```bash
-python3 ../triage/scripts/check_or_create.py '{"test_name":"<test_name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
+python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<test_name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
 ```
 
 Items are tagged `test-failure`, priority `critical`, child of the invoking
@@ -96,7 +156,7 @@ Do **NOT** rely on code comments when deciding whether a test is useful —
 analyze what the test actually asserts and exercises using the evaluator:
 
 ```bash
-python3 ./scripts/evaluate_usefulness.py <test-file> --json
+python3 $(skill_path test)/scripts/evaluate_usefulness.py <test-file> --json
 ```
 
 The evaluator detects the anti-patterns from the
@@ -146,6 +206,27 @@ reasoning, the exact change needed and why, and the triaged `test-failure` ids.
 Scripts
 -------
 
-- `./scripts/run_tests.py` — runs pytest / Node suites in quiet mode, parses failures into triage-compatible records.
-- `./scripts/evaluate_usefulness.py` — code-path usefulness analysis (`keep` / `remove` / `report-to-user`).
-- `../triage/scripts/check_or_create.py` — reused unchanged to create/link critical `test-failure` items.
+- `$(skill_path test)/scripts/run_tests.py` — runs pytest / Node suites in quiet mode, parses failures into triage-compatible records.
+- `$(skill_path test)/scripts/evaluate_usefulness.py` — code-path usefulness analysis (`keep` / `remove` / `report-to-user`).
+- `$(skill_path triage)/scripts/check_or_create.py` — reused unchanged to create/link critical `test-failure` items.
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

@@ -6,7 +6,7 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--run-tests] [--no-execute]
+  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--phase1-model <name>] [--run-tests] [--no-execute]
   audit_runner.py project [--pi-bin pi] [--model <name>]
 
 Verdicts:
@@ -53,59 +53,83 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
+import math
 import os
 import re
 import select
 import shlex
+import statistics
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
+import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.audit.scripts.persist_audit import (
+REPO_ROOT = _SKILLS_ROOT.parent
+
+from audit.scripts.checkpoint_store import (
+    PHASE_CHILDREN,
+    PHASE_LABELS,
+    PHASE_PARENT,
+    PHASE_PHASE2,
+    STATUS_COMPLETED,
+    CheckpointStore,
+    resolve_checkpoint_dir,
+)
+from audit.scripts.persist_audit import (
     PERSIST_CONTENT_INVALID,
     persist_audit,
 )
-from skill.scripts.failure_notice import FailureNotice
-from skill.scripts.pi_utils import extract_pi_text
-from skill.shared.process_semaphore import (
-    DEFAULT_MAX_WORKERS,
-    ENV_MAX_WORKERS,
-    Semaphore,
-)
-from skill.shared.status_lifecycle import (
-    SIBLING_SCAN_ROOT as SHARED_SIBLING_SCAN_ROOT,
-)
-from skill.shared.status_lifecycle import (
-    _extract_work_item_prefix as _extract_work_item_prefix_shared,
-)
-from skill.shared.status_lifecycle import (
-    _find_worklog_dir_by_prefix as _find_worklog_dir_by_prefix_shared,
-)
-from skill.shared.status_lifecycle import (
-    _wl_error_detail,
-)
-from skill.shared.status_lifecycle import (
-    resolve_worklog_flags as shared_resolve_worklog_flags,
-)
-from skill.test.scripts.run_tests import (
+from import_guard import guard_shared_import
+from scripts.failure_notice import FailureNotice
+from scripts.pi_utils import extract_pi_text
+
+try:
+    from shared.process_semaphore import (
+        DEFAULT_MAX_WORKERS,
+        ENV_MAX_WORKERS,
+        Semaphore,
+    )
+    from shared.queue import Priority, PriorityQueue
+    from shared.status_lifecycle import (
+        SIBLING_SCAN_ROOT as SHARED_SIBLING_SCAN_ROOT,
+    )
+    from shared.status_lifecycle import (
+        _extract_work_item_prefix as _extract_work_item_prefix_shared,
+    )
+    from shared.status_lifecycle import (
+        _find_worklog_dir_by_prefix as _find_worklog_dir_by_prefix_shared,
+    )
+    from shared.status_lifecycle import (
+        _wl_error_detail,
+    )
+    from shared.status_lifecycle import (
+        resolve_worklog_flags as shared_resolve_worklog_flags,
+    )
+    from shared.timing import Timer as SharedTimer
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
+from test.scripts.run_tests import (
     full_suite_commands,
     parse_node_failures,
     parse_pytest_failures,
     suite_timeout_per_command,
 )
-from skill.test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
+from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
 # ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
@@ -121,7 +145,109 @@ instead of blocking. The parent bash-tool execution timeout (~120s) is
 shorter than any long bounded wait, so a long default wait previously
 killed audits mid-wait. Operators can opt into a bounded wait via the
 ``AUDIT_LOCK_TIMEOUT`` environment variable.
+
+With the priority-queue integration (SA-0MTG5RYH8005RQNM) this value
+bounds each *individual* semaphore attempt inside the admission poll;
+the TOTAL bounded wait for a slot (including queue time) is governed by
+``AUDIT_QUEUE_TIMEOUT`` below.
 """
+
+# ---------------------------------------------------------------------------
+# Priority-queue admission (SA-0MTG5RYH8005RQNM)
+# ---------------------------------------------------------------------------
+AUDIT_QUEUE_NAME = "audit"
+AUDIT_QUEUE_TIMEOUT_ENV = "AUDIT_QUEUE_TIMEOUT"
+AUDIT_QUEUE_TIMEOUT_DEFAULT = 90.0
+"""Bounded wait (seconds) for queue admission + a free concurrency slot.
+
+Default 90s: when the ceiling is saturated, an audit launch enqueues a
+ticket at its work item's priority and WAITS in the queue instead of
+failing fast (SA-0MTG5RYH8005RQNM AC1/AC3). The default is kept inside
+the parent bash-tool execution timeout (~120s) that killed audits
+mid-wait with the old 300s default (SA-0MSGEAZMC009LHKL): a saturated
+wait that exhausts the bound still reports the graceful ``unmet``
+"concurrency limit reached" verdict, and the audit process never
+outlives its caller. Operators whose tool wrapper tolerates longer
+waits can raise ``AUDIT_QUEUE_TIMEOUT``.
+"""
+AUDIT_QUEUE_POLL_SECONDS = 0.05
+"""Poll interval (seconds) between admission checks in the queue wait."""
+
+# ---------------------------------------------------------------------------
+# Batch drain (SA-0MTG5TP5Z008QBL5)
+# ---------------------------------------------------------------------------
+AUDIT_BATCH_QUEUE_NAME = "audit-batch"
+"""Dedicated priority-queue name for batch-drain work items.
+
+The batch drain dequeues WORK-ITEM ids (e.g. ``SA-XXX``) enqueued by a
+producer (operator/herdr dispatch or the ``batch`` subcommand's
+``_enqueue_pending_audit_items``), NOT ``audit:`` admission tickets — the
+admission queue (``AUDIT_QUEUE_NAME``) and the batch queue are separate
+so queued work items never collide with a live launch's admission
+protocol (SA-0MTG5RYH8005RQNM).
+"""
+AUDIT_BATCH_MAX_ITEMS_ENV = "AUDIT_BATCH_MAX_ITEMS"
+"""Environment variable for the per-window batch-drain item ceiling.
+
+Defaults to ``AUDIT_BATCH_MAX_ITEMS_DEFAULT`` (5). Invalid values are
+ignored with a warning.
+"""
+AUDIT_BATCH_MAX_ITEMS_DEFAULT = 5
+"""Default number of queued items drained per dispatch window (AC1)."""
+AUDIT_BATCH_TIMEOUT_ENV = "AUDIT_BATCH_TIMEOUT"
+"""Environment variable for the batch-drain wall-clock budget (seconds).
+
+Defaults to ``AUDIT_BATCH_TIMEOUT_DEFAULT`` (1800s / 30 min). Invalid
+values are ignored with a warning.
+"""
+AUDIT_BATCH_TIMEOUT_DEFAULT = 1800.0
+"""Default wall-clock budget (seconds) for one batch-drain window (AC3)."""
+AUDIT_BATCH_MIN_QUEUE_DEPTH = 2
+"""Queue-depth threshold that activates batch mode.
+
+When the batch queue holds at least this many pending work items, an
+``issue`` audit that completes successfully drains additional queued
+items within the same dispatch window instead of stopping after a
+single item. Below this threshold the runner is backward compatible:
+it processes only its own single item (AC1 trigger).
+"""
+AUDIT_BATCH_DISABLE_ENV = "AUDIT_BATCH_DRAIN"
+"""Opt-out env var: set to ``0`` to disable automatic post-audit drain.
+"""
+_AUDIT_TS_FORMAT = "%Y-%m-%dT%H:%M:%S"
+_AUDIT_TICKET_COUNTER = itertools.count()
+"""Per-process monotonically increasing launch ticket counter.
+
+The counter disambiguates multiple launches from the same process (one
+audit = many phased pi calls); combined with pid + issue_id it makes
+queue tickets unique host-wide.
+"""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _sanitize_session_id_segment(value: str) -> str:
+    """Replace characters that are invalid in a session-id with underscores.
+
+    ``--session-id`` must match ``^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$``
+    (``assertValidSessionId`` in the pi core), so colons are replaced with
+    underscores to keep values like ``child:SA-XXX`` valid.
+    """
+    return value.replace(":", "_")
+
+
+def _build_session_id(issue_id: str, context: str) -> str:
+    """Build a descriptive session-id for audit pi invocations.
+
+    Format: ``audit-{issue_id}-{context}-{uuid8}`` where the UUID is the
+    first 8 hex chars of ``uuid4()``.  Colons in *context* are replaced
+    with underscores so the result passes ``assertValidSessionId``.
+    """
+    safe_context = _sanitize_session_id_segment(context)
+    short_uuid = uuid.uuid4().hex[:8]
+    return f"audit-{issue_id}-{safe_context}-{short_uuid}"
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -275,6 +401,24 @@ FP_SCREEN_MISSING_JUSTIFICATION = (
 
 Never ``confident-false-positive``: a finding the model did not see cannot
 be declared a confident false positive (T1 AC1).
+"""
+
+# ---------------------------------------------------------------------------
+# Batched false-positive screen (SA-0MSYPAV1R000SMHK)
+# ---------------------------------------------------------------------------
+FP_SCREEN_BATCH_SIZE_ENV = "AUDIT_FP_SCREEN_BATCH_SIZE"
+"""Environment variable for the false-positive screen batch size.
+
+Defaults to ``FP_SCREEN_BATCH_SIZE_DEFAULT`` (500 findings per batch).
+Invalid values (non-int, zero, negative) are ignored with a warning
+and the default is used.
+"""
+
+FP_SCREEN_BATCH_SIZE_DEFAULT = 500
+"""Default number of findings per false-positive screen batch (AC2).
+
+Kept at 500 so a single batch fits comfortably within the OS ARG_MAX
+limit (~2 MB on Linux) with the full prompt preamble and JSON encoding.
 """
 
 
@@ -568,6 +712,7 @@ VERDICT_MET = "met"
 VERDICT_UNMET = "unmet"
 VERDICT_PARTIAL = "partial"
 VERDICT_ADJUSTED = "adjusted"
+VERDICT_WARNING = "warning"  # zero-AC sentinel / extraction failure (SA-0MSRLLQ0V008EW3J)
 _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
 
 
@@ -615,6 +760,7 @@ RALPH_CONFIG_FILES = [
     Path("ralph.config.json"),
 ]
 AUDIT_PHASE = "audit"
+AUDIT_PHASE1 = "audit_phase1"
 
 # ---------------------------------------------------------------------------
 # Types
@@ -1049,7 +1195,10 @@ def _validate_file_scope_manifest(file_scope: str,
     The check is inclusion-based (per the risk mitigation): at least one
     distinctive top-level entry of the item repo must appear in the manifest
     — the manifest need not equal the item repo, so mono-repo items whose
-    files legitimately live in the framework tree stay valid.
+    files legitimately live in the framework tree stay valid. Repos whose
+    distinctive markers are all root-level files are handled by
+    ``_repo_index``, which lists root file names in the ``(root)`` index
+    entry so the markers surface in the manifest (SA-0MSUBX8PP0087OEA).
     """
     if owning_root is None:
         return None
@@ -1197,6 +1346,19 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return None  # Unparseable timestamps → not fresh (fail open)
 
     if _audit_time_is_fresh(audit_time, update_time):
+        return raw_output
+
+    # Persistence-write tolerance (SA-0MTHC710X003ORZM, mirrors the child
+    # gate at ~_get_child_audit_verdict:4849) — the item's own persistence
+    # writes (wl audit-set + wl update --audit-text) bump updatedAt to just
+    # after auditedAt; a stale check from such a bump is the audit's own
+    # write and must be treated as fresh for legacy (fingerprint-less)
+    # audits. Without this the 60 s time gate can mark a just-persisted
+    # audit stale and the stale icon (\u23f3) appears on passed audits.
+    write_delta = update_time - audit_time
+    if timedelta(0) <= write_delta <= timedelta(
+        seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS
+    ):
         return raw_output
 
     return None
@@ -1353,6 +1515,135 @@ def _default_parent_timeout(n_children: int) -> int:
     / ``AUDIT_PARENT_TIMEOUT`` overrides replace this computed value entirely.
     """
     return PARENT_TIMEOUT_DEFAULT + n_children * PARENT_TIMEOUT_PER_CHILD
+
+
+# ---------------------------------------------------------------------------
+# Budget baseline derivation (SA-0MU32T6O0001UALR)
+# ---------------------------------------------------------------------------
+_PER_CALL_TIMING_RE = re.compile(
+    r"Per-call timing: "
+    r"issue_id=(\S+) "
+    r"context=(\S+) "
+    r"elapsed_seconds=([\d.]+)"
+)
+"""Regex to parse ``Per-call timing:`` debug-log lines emitted by
+``_maybe_log_debug_info``. Captures (issue_id, context, elapsed_seconds)."""
+
+
+def _parse_per_call_timing_lines(
+    timing_lines: list[str],
+) -> dict[str, list[float]]:
+    """Parse ``Per-call timing:`` lines into per-context elapsed seconds.
+
+    Args:
+        timing_lines: Lines from stderr/debug output matching the
+            ``Per-call timing:`` format.
+
+    Returns:
+        A ``dict`` mapping *context* (e.g. ``phase1_parent``,
+        ``phase2_deep``) to a list of elapsed-second floats collected
+        across all matching lines.
+
+    Example::
+
+        >>> lines = [
+        ...     "Per-call timing: issue_id=SA-1 context=phase1_parent elapsed_seconds=12.34",
+        ...     "Per-call timing: issue_id=SA-2 context=phase2_deep elapsed_seconds=45.67",
+        ...     "Per-call timing: issue_id=SA-3 context=phase1_parent elapsed_seconds=15.21",
+        ... ]
+        >>> result = _parse_per_call_timing_lines(lines)
+        >>> result["phase1_parent"]
+        [12.34, 15.21]
+        >>> result["phase2_deep"]
+        [45.67]
+    """
+    result: dict[str, list[float]] = {}
+    for line in timing_lines:
+        match = _PER_CALL_TIMING_RE.search(line)
+        if match:
+            context = match.group(2)
+            elapsed = float(match.group(3))
+            result.setdefault(context, []).append(elapsed)
+    return result
+
+
+def _derive_budget_baseline(
+    timing_lines: list[str],
+    safety_margin: float = 1.5,
+) -> dict[str, dict]:
+    """Derive right-sized per-phase budgets from measured timing data.
+
+    Parses ``Per-call timing:`` debug-log lines, computes the p50 and p95
+    per audit phase (context), applies a safety margin to the p95, and
+    returns a budget model summary.
+
+    Args:
+        timing_lines: Lines from stderr/debug output matching the
+            ``Per-call timing:`` format.
+        safety_margin: Multiplier applied to p95 to derive the per-call
+            budget. Default 1.5 (p95 + 50 % headroom).
+
+    Returns:
+        A ``dict`` keyed by context with values::
+
+            {
+                "context": str,
+                "count": int,
+                "p50": float,
+                "p95": float,
+                "budget": float,  # p95 * safety_margin
+                "mean": float,
+                "min": float,
+                "max": float,
+            }
+
+    If there are fewer than two samples for a phase, p95 falls back to the
+    max value (single-sample case).
+
+    Budget derivation formula::
+
+        budget = p95_per_phase × safety_margin
+
+    The parent-process budget is derived as::
+
+        parent_budget = PARENT_TIMEOUT_DEFAULT + sum(derived budgets)
+
+    This replaces the previous inconsistent ad-hoc values (~120s, 900s,
+    1500s, 3110s) with a single right-sized derivation based on measured
+    per-call timing data.
+    """
+    parsed = _parse_per_call_timing_lines(timing_lines)
+    if not parsed:
+        return {}
+
+    result: dict[str, dict] = {}
+    for context, elapsed_list in sorted(parsed.items()):
+        n = len(elapsed_list)
+        p50 = statistics.median(elapsed_list)
+        if n >= 2:
+            # Nearest-rank method for p95
+            sorted_vals = sorted(elapsed_list)
+            rank = math.ceil(0.95 * n)
+            p95 = sorted_vals[min(rank - 1, n - 1)]
+        else:
+            p95 = elapsed_list[0]
+        budget = round(p95 * safety_margin, 2)
+        result[context] = {
+            "count": n,
+            "p50": round(p50, 2),
+            "p95": round(p95, 2),
+            "budget": budget,
+            "mean": round(statistics.mean(elapsed_list), 2),
+            "min": round(min(elapsed_list), 2),
+            "max": round(max(elapsed_list), 2),
+        }
+    return result
+
+
+BUDGET_SAFE_MARGIN_DEFAULT = 1.5
+"""Default safety margin multiplier applied to p95 per-phase latency to
+derive the per-call budget. A value of 1.5 means the budget covers 95 % of
+observed calls with a 50 % headroom (SA-0MU32T6O0001UALR)."""
 
 
 def _resolve_max_child_audits(cli_value: int | None = None) -> int:
@@ -1658,7 +1949,9 @@ def _auto_green_run_prompt_block(sha: str) -> str:
 
     The block tells the model that a full test-suite run at *sha* (the audited
     HEAD) was verified green from the per-repo test cache via a READ-ONLY
-    query (``query_cached`` never executes anything), so execution-dependent
+    query (``query_cached`` never executes anything), and that the cached
+    entries are full-**scope** runs (a ``changed``-scope partial run is
+    rejected as evidence — SA-0MT6CEO700058ZEN), so execution-dependent
     criteria (e.g. 'full test suite passes') MAY be marked met based on that
     verified cached result — while the read-only mandate otherwise remains in
     force and the suite must NOT be executed. Returns a string ending in a
@@ -1668,7 +1961,8 @@ def _auto_green_run_prompt_block(sha: str) -> str:
         f"{AUTO_GREEN_RUN_BLOCK_HEADER} — A cached full test-suite run at "
         f"commit {sha} (== current HEAD) was verified green from the per-repo "
         "test cache (read-only query; the audit never executes the suite on "
-        "this path). "
+        "this path), and the cached entry's scope is verified as full "
+        "(partial changed-scope runs are rejected as evidence). "
         "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
         "marked met based on this verified cached result. The audit runner "
         "manages test execution: Do NOT execute tests yourself — the runner "
@@ -1711,18 +2005,32 @@ def _classify_full_suite_cache(
     (SA-0MSJELL44009XYIL), so a repo without tests/node is never asked
     about a phantom tests/node command.
 
+    **Scope filtering**: a cached entry is accepted as full-suite evidence
+    only when its recorded ``scope`` is ``"full"`` (entries recorded by
+    scope-aware runs before this check, or by historical runs, default to
+    ``"full"`` — see ``test_cache`` module docs). A ``changed``-scope entry
+    (a partial run) is rejected and reported as a MISS so the F3
+    auto-execution path reruns the suite for full evidence — a partial run
+    must never satisfy a "full suite passes" criterion
+    (SA-0MT6CEO700058ZEN AC1). In practice changed-scope runs already use
+    distinct cache keys (different commands), so this is defense-in-depth
+    against command-set convergence.
+
     Returns ``(status, head_sha, problems)``:
 
     - ``"green"`` — EVERY command has a cached entry at the audited git
-      state within the cache TTL AND every entry's exit code is 0
-      (``head_sha`` set, ``problems`` empty).
-    - ``"miss"``  — at least one command has NO cached entry at HEAD
-      (``head_sha`` set; ``problems`` name the missing commands). F3
+      state within the cache TTL, AND every entry's exit code is 0, AND
+      every entry's scope is ``"full"`` (``head_sha`` set, ``problems``
+      empty).
+    - ``"miss"``  — at least one command has NO cached entry at HEAD, or
+      has only a ``changed``-scope (partial) entry (``head_sha`` set;
+      ``problems`` name the offending commands). F3
       (SA-0MSTN5KRF0097TVP) auto-executes the suite on this state; F4
       (SA-0MSTN8CWM003AAU9) guarantees it never hard-blocks.
-    - ``"red"``   — every command is cached but at least one entry exited
-      non-zero (``head_sha`` set; ``problems`` name the failing commands).
-      Keeps the historical partial + diagnostic behavior — never a block.
+    - ``"red"``   — every command is cached at full scope but at least one
+      entry exited non-zero (``head_sha`` set; ``problems`` name the failing
+      commands). Keeps the historical partial + diagnostic behavior — never
+      a block.
     - ``"error"`` — HEAD could not be resolved (``head_sha`` None). A cache
       query exception propagates to the caller, which decides fail-closed
       (``_resolve_auto_green_run``).
@@ -1754,6 +2062,14 @@ def _classify_full_suite_cache(
             problems.append(
                 f"no cached full-suite run for '{command}' at HEAD {head_sha}"
             )
+        elif entry.get("scope", "full") != "full":
+            # A partial (changed-scope) run is never full-suite evidence.
+            # Report as a MISS so the caller auto-executes for full evidence
+            # (F3) instead of accepting a partial run (SA-0MT6CEO700058ZEN).
+            problems.append(
+                f"cached run for '{command}' is changed-scope (partial); "
+                f"full-suite evidence required at HEAD {head_sha}"
+            )
         elif int(entry.get("exit_code", -1)) != 0:
             problems.append(
                 f"cached full-suite run for '{command}' exited non-zero "
@@ -1761,7 +2077,10 @@ def _classify_full_suite_cache(
             )
     if not problems:
         return _FULL_SUITE_CACHE_GREEN, head_sha, []
-    if any(p.startswith("no cached full-suite run") for p in problems):
+    if any(
+        p.startswith(("no cached full-suite run", "cached run for"))
+        for p in problems
+    ):
         return _FULL_SUITE_CACHE_MISS, head_sha, problems
     return _FULL_SUITE_CACHE_RED, head_sha, problems
 
@@ -1955,7 +2274,7 @@ def _run_tests_via_test_skill(
     # Triage failures per the test skill (AC4) — never silently ignored.
     if failures:
         try:
-            from skill.triage.scripts.check_or_create import check_or_create
+            from triage.scripts.check_or_create import check_or_create
         except ImportError:
             check_or_create = None
         for failure in failures:
@@ -2042,25 +2361,426 @@ def _audit_lock_timeout() -> float:
     return AUDIT_LOCK_TIMEOUT_DEFAULT
 
 
-def _acquire_audit_slot(max_concurrency: int | None = None) -> Semaphore:
-    """Acquire one audit concurrency slot (shared across processes).
+def _audit_queue_timeout() -> float:
+    """Resolve the bounded wait for queue admission + a free slot.
+
+    Precedence: ``AUDIT_QUEUE_TIMEOUT`` env var > default 90s (see
+    ``AUDIT_QUEUE_TIMEOUT_DEFAULT``). Unlike the old fail-fast slot wait,
+    an audit under saturation WAITS in the priority queue for this bound
+    before reporting the ``unmet`` "concurrency limit reached" verdict
+    (SA-0MTG5RYH8005RQNM AC1/AC3). An invalid value is ignored with a
+    warning.
+    """
+    env_value = os.environ.get(AUDIT_QUEUE_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_QUEUE_TIMEOUT_ENV} value "
+                f"{env_value!r}; using default queue timeout",
+                file=sys.stderr,
+            )
+    return AUDIT_QUEUE_TIMEOUT_DEFAULT
+
+
+_PRIORITY_VALUE = {
+    "critical": Priority.CRITICAL,
+    "high": Priority.HIGH,
+    "medium": Priority.MEDIUM,
+    "low": Priority.LOW,
+    "": Priority.MEDIUM,
+}
+
+
+def _resolve_audit_priority(work_item: dict | None) -> int:
+    """Map a work item's priority string to a numeric queue priority.
+
+    Unknown, empty, or missing priority resolves to ``Priority.MEDIUM``
+    (the worklog default). Every audit still gets admission; critical
+    items simply preempt lower-priority items in the queue
+    (SA-0MTG5RYH8005RQNM AC2).
+    """
+    raw = ((work_item or {}).get("priority") or "").strip().lower()
+    return _PRIORITY_VALUE.get(raw, Priority.MEDIUM)
+
+
+def _log_audit_slot(priority: int, position: int | None, ticket: str,
+                    queued_wall: float) -> None:
+    """Emit the queue-admission log line (SA-0MTG5RYH8005RQNM AC4).
+
+    Includes ``queued_at``, ``priority``, ``queue_position``,
+    ``dequeued_at`` and ``wait_seconds`` so queue behaviour is observable
+    from stderr without a debug log.
+    """
+    dequeued_wall = time.time()
+    print(
+        "Audit slot acquired: "
+        f"queued_at={time.strftime(_AUDIT_TS_FORMAT, time.localtime(queued_wall))} "
+        f"priority={Priority.to_str(priority).lower()} "
+        f"queue_position={position} "
+        f"dequeued_at={time.strftime(_AUDIT_TS_FORMAT, time.localtime(dequeued_wall))} "
+        f"wait_seconds={max(0.0, dequeued_wall - queued_wall):.2f} "
+        f"ticket={ticket}",
+        file=sys.stderr,
+    )
+
+
+def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
+    """Remove audit queue tickets whose owning process is no longer alive.
+
+    Ticket ids have the shape ``audit:{issue_id}:{pid}:{counter}``. A
+    crashed or killed audit process (SIGKILL, OOM, host reboot) never
+    removes its own ticket, so the file lingers until the 24h TTL prune.
+    With enough such leftovers the queue saturates and every subsequent
+    audit times out with "audit concurrency queue saturated", even though
+    no audit is actually running (the observed failure mode).
+
+    Returns the number of tickets pruned. Never raises: a malformed id or
+    a transient ``remove`` race is ignored (the caller retries the poll).
+    """
+    try:
+        entries = queue._list_entries()
+    except OSError:
+        return 0
+    pruned = 0
+    for entry in entries:
+        parts = entry.item_id.split(":")
+        if len(parts) < 4 or parts[0] != "audit":
+            continue  # not an audit admission ticket — leave it alone
+        try:
+            pid = int(parts[2])
+        except (ValueError, IndexError):
+            continue
+        if pid == os.getpid():
+            continue  # never prune our own live process
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            # Owner is gone — safe to drop the stale ticket.
+            if queue.remove(entry.item_id) is not None:
+                pruned += 1
+        except PermissionError:
+            # Process exists but is not ours — not stale.
+            continue
+    return pruned
+
+
+def _acquire_audit_slot(issue_id: str = "",
+                        priority: int = Priority.MEDIUM,
+                        max_concurrency: int | None = None) -> Semaphore:
+    """Acquire one audit concurrency slot, waiting in a priority queue.
 
     Bounds concurrent pi/audit subprocesses host-wide via the shared
-    flock-based semaphore (skill/shared/process_semaphore.py). Returns a
-    held :class:`Semaphore` whose :meth:`release` must be called (or use
-    it as a context manager) to free the slot.
+    flock-based semaphore (skill/shared/process_semaphore.py). When the
+    ceiling is saturated the launch NO LONGER fails fast: it enqueues a
+    ticket at the work item's priority, waits for priority-ordered
+    admission (``AUDIT_QUEUE_TIMEOUT`` bound), then takes a host-wide
+    semaphore slot. Returns a held :class:`Semaphore` whose
+    :meth:`release` must be called (or use it as a context manager) to
+    free the slot.
+
+    Admission protocol (priority ordering under concurrency):
+      1. Enqueue a unique ticket at ``priority``; a full queue waits
+         (bounded, not fail-fast) for capacity.
+      2. Poll: when OUR ticket is at the head (``peek``), try a
+         semaphore slot; when a slot is free, remove OUR ticket
+         (``remove`` — never the head of a later arrival) and return.
+         Higher-priority tickets always beat lower-priority tickets at
+         the head check, so the next freed slot goes to the highest-
+         priority waiter, not whoever polls first.
+
+    Stale-ticket hygiene: before enqueueing, tickets whose owning PID is
+    no longer alive are pruned, and on timeout our own ticket is removed
+    before raising — a timed-out or crashed audit never leaves a stale
+    ticket behind (they would accumulate and saturate the queue for all
+    subsequent audits).
 
     Raises:
-        TimeoutError: When the ceiling stays saturated past the bounded
-            wait (``AUDIT_LOCK_TIMEOUT``; default 0s = fail fast).
+        TimeoutError: When admission + slot wait exceeds
+            ``AUDIT_QUEUE_TIMEOUT`` (enqueue-full or persistently
+            saturated). The existing call site converts this to the
+            ``unmet`` "Audit concurrency limit reached" verdict.
     """
     sem = Semaphore(
         AUDIT_SEMAPHORE_NAME,
         max_workers=_audit_semaphore_max_workers(max_concurrency),
         timeout=_audit_lock_timeout(),
     )
-    sem.acquire()
-    return sem
+    queue = PriorityQueue(AUDIT_QUEUE_NAME)
+    ticket = (
+        f"audit:{issue_id or 'anon'}:{os.getpid()}:"
+        f"{next(_AUDIT_TICKET_COUNTER)}"
+    )
+    # Stale-ticket hygiene: remove tickets whose owning PID is no longer
+    # alive (crashed/timed-out audits would otherwise leave them until the
+    # 24h TTL prune, accumulating and saturating the queue for all
+    # subsequent audits).
+    _prune_dead_audit_tickets(queue)
+    queue_timeout = _audit_queue_timeout()
+    queued_wall = time.time()
+    queued_mono = time.monotonic()
+    last_prune_mono = queued_mono
+    # Bounded enqueue: a full queue waits up to queue_timeout (AC3).
+    queue.enqueue(ticket, priority, timeout=queue_timeout)
+    position = queue.rank(ticket)
+    deadline = time.monotonic() + queue_timeout
+    while True:
+        head = queue.peek(timeout=0)
+        if head is not None and head.item_id == ticket:
+            try:
+                sem.acquire()
+            except TimeoutError:
+                pass  # all slots busy — hold position and retry
+            else:
+                if queue.remove(ticket) is not None:
+                    _log_audit_slot(priority, position, ticket, queued_wall)
+                    return sem
+                # Ticket vanished between peek and remove (unexpected):
+                # free the slot and re-enter the poll.
+                sem.release()
+        # Slow-path stale prune (~every 5s) so peers that crashed while we
+        # waited do not keep the queue saturated; keep it off the hot path
+        # to avoid per-poll lock churn.
+        now_mono = time.monotonic()
+        if now_mono - last_prune_mono >= 5.0:
+            _prune_dead_audit_tickets(queue)
+            last_prune_mono = now_mono
+        if now_mono >= deadline:
+            elapsed = time.monotonic() - queued_mono
+            queue_depth = len(queue)
+            retry_seconds = max(1, int(queue_timeout / 3))
+            # Remove OUR OWN ticket before raising so a timed-out audit does
+            # not leave a stale ticket behind (they accumulate and saturate).
+            queue.remove(ticket)
+            raise TimeoutError(
+                f"audit concurrency queue '{AUDIT_QUEUE_NAME}' saturated: "
+                f"no slot within {queue_timeout:.0f}s (waited {elapsed:.1f}s, "
+                f"{queue_depth} item(s) in queue); "
+                f"retry in {retry_seconds}s after fewer audits complete"
+            )
+        time.sleep(AUDIT_QUEUE_POLL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Batch drain (SA-0MTG5TP5Z008QBL5)
+# ---------------------------------------------------------------------------
+
+_ADMISSION_TICKET_PREFIX = "audit:"
+"""Prefix of admission tickets enqueued by ``_acquire_audit_slot``.
+
+Entries in the batch queue must be WORK-ITEM ids (e.g. ``SA-XXX``), never
+admission tickets; the cycle defensively skips ``audit:``-prefixed entries
+so a misconfigured producer cannot make the drain steal a live launch's
+admission slot.
+"""
+
+
+def _resolve_batch_max_items() -> int:
+    """Resolve the per-window batch-drain item ceiling.
+
+    Precedence: ``AUDIT_BATCH_MAX_ITEMS`` env var > default 5
+    (``AUDIT_BATCH_MAX_ITEMS_DEFAULT``). Values below 1 are clamped to 1;
+an invalid (non-integer) value is ignored with a warning so a
+misconfigured environment cannot break the drain (SA-0MTG5TP5Z008QBL5
+AC1).
+    """
+    env_value = os.environ.get(AUDIT_BATCH_MAX_ITEMS_ENV)
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_BATCH_MAX_ITEMS_ENV} value "
+                f"{env_value!r}; using default batch max items",
+                file=sys.stderr,
+            )
+    return AUDIT_BATCH_MAX_ITEMS_DEFAULT
+
+
+def _resolve_batch_timeout() -> float:
+    """Resolve the batch-drain wall-clock budget (seconds).
+
+    Precedence: ``AUDIT_BATCH_TIMEOUT`` env var > default 1800s (30 min,
+    ``AUDIT_BATCH_TIMEOUT_DEFAULT``). Invalid values are ignored with a
+    warning (SA-0MTG5TP5Z008QBL5 AC3).
+    """
+    env_value = os.environ.get(AUDIT_BATCH_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_BATCH_TIMEOUT_ENV} value "
+                f"{env_value!r}; using default batch timeout",
+                file=sys.stderr,
+            )
+    return AUDIT_BATCH_TIMEOUT_DEFAULT
+
+
+def _batch_drain_should_run(depth: int) -> bool:
+    """Decide whether batch drain activates for a given pending depth.
+
+    Batch mode activates when the batch queue holds at least
+    ``AUDIT_BATCH_MIN_QUEUE_DEPTH`` (2) pending work items; below that the
+    runner processes only its own single item (backward compatible).
+    (SA-0MTG5TP5Z008QBL5 AC1 trigger).
+    """
+    return depth >= AUDIT_BATCH_MIN_QUEUE_DEPTH
+
+
+def _batch_drain_enabled() -> bool:
+    """Opt-out check for the automatic post-audit batch drain.
+
+    Automatic drain is ON by default (trigger = queue depth)
+    (SA-0MTG5TP5Z008QBL5 AC1); ``AUDIT_BATCH_DRAIN=0`` disables it so
+    operators/CI can keep strict single-item behavior.
+    """
+    return os.environ.get(AUDIT_BATCH_DISABLE_ENV, "1") != "0"
+
+
+def _log_batch_metrics(metrics: dict) -> None:
+    """Emit the batch-drain metrics line to stderr (AC5).
+
+    Fields: ``batch_start``, ``batch_end``, ``items_processed``,
+    ``queue_remaining``, ``items_included``. Every batch run (even a
+    zero-item run) emits exactly one line so the dispatcher can observe
+    window utilization.
+    """
+    print(
+        "Audit batch drain: "
+        f"batch_start={metrics.get('batch_start')} "
+        f"batch_end={metrics.get('batch_end')} "
+        f"items_processed={metrics.get('items_processed', 0)} "
+        f"queue_remaining={metrics.get('queue_remaining', 0)} "
+        f"items_included={metrics.get('items_included', [])}",
+        file=sys.stderr,
+    )
+
+
+def _enqueue_pending_audit_items(max_items: int | None = None,
+                                 runner: Runner | None = None,
+                                 worklog_dir: str | None = None) -> list[str]:
+    """Prime the batch queue with the oldest, highest-priority in_review items.
+
+    Queries ``wl list --stage in_review --json`` (the canonical pending-audit
+    source per the audit skill), orders candidates by queue priority
+    (critical > high > medium > low) then by ``createdAt`` (oldest first =
+    FIFO within tier), and enqueues up to ``max_items`` work-item ids into
+    the batch queue. Enqueue is idempotent (the shared queue returns the
+    existing entry for a duplicate id), so re-priming never duplicates.
+
+    Returns the list of enqueued work-item ids (already-queued items are
+    included in the return value but not re-written).
+
+    Best-effort: a worklog query failure returns an empty list with the
+    failure printed to stderr — the caller degrades to draining whatever is
+    already queued (SA-0MTG5TP5Z008QBL5 AC1).
+    """
+    runner = runner if runner is not None else _default_runner
+    try:
+        data = _run_wl(runner, ["wl", "list", "--stage", "in_review", "--json"],
+                       worklog_dir=worklog_dir)
+    except Exception as exc:  # noqa: BLE001 — best-effort priming
+        print(f"Warning: could not discover pending in_review items: {exc}",
+              file=sys.stderr)
+        return []
+    items = data.get("workItems", data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    max_items = _resolve_batch_max_items() if max_items is None else max_items
+
+    def _sort_key(item: dict):
+        raw = ((item or {}).get("priority") or "").strip().lower()
+        prio = _PRIORITY_VALUE.get(raw, Priority.MEDIUM)
+        created = (item or {}).get("createdAt") or ""
+        return (prio, created)
+
+    candidates = sorted(items, key=_sort_key)[:max_items]
+    queue = PriorityQueue(AUDIT_BATCH_QUEUE_NAME)
+    enqueued: list[str] = []
+    for item in candidates:
+        item_id = (item or {}).get("id")
+        if not item_id:
+            continue
+        raw = ((item or {}).get("priority") or "").strip().lower()
+        prio = _PRIORITY_VALUE.get(raw, Priority.MEDIUM)
+        queue.enqueue(item_id, prio, timeout=_resolve_batch_timeout())
+        enqueued.append(item_id)
+    return enqueued
+
+
+def _batch_drain_cycle(audit_one: Callable[[str, int], int],
+                       max_items: int | None = None,
+                       timeout: float | None = None,
+                       worklog_dir: str | None = None,
+                       skip_ids: frozenset[str] = frozenset()) -> dict:
+    """Drain up to N queued work items in priority order within a budget.
+
+    The batch-drain loop (SA-0MTG5TP5Z008QBL5):
+
+      1. Dequeue the next entry from the batch queue — strict priority
+         order (critical > high > medium > low), FIFO within tier (AC2).
+      2. Skip ``audit:`` admission tickets, the caller's own primary item
+         (*skip_ids*), and duplicates (defensive; the queue holds work-item
+         ids).
+      3. Audit the item via ``audit_one(item_id, priority)``. The caller's
+         callback owns the concurrency slot discipline (each item's pi
+         calls acquire/release slots host-wide), so the slot is released
+         between items — another process can use it before the next item
+         is dequeued (AC4).
+      4. Continue until the queue is empty, ``max_items`` is reached, or
+         the wall-clock *timeout* (AC3) elapses — whichever comes first.
+         Remaining items stay queued for the next window.
+
+    Returns a metrics dict ``{batch_start, batch_end, items_processed,
+    queue_remaining, items_included}`` and emits the AC5 metrics line.
+    Errors from a single item's audit are caught per-item (logged, item
+    still counted as processed) so one bad item never aborts the window.
+    """
+    max_items = _resolve_batch_max_items() if max_items is None else max_items
+    timeout = _resolve_batch_timeout() if timeout is None else timeout
+    queue = PriorityQueue(AUDIT_BATCH_QUEUE_NAME)
+    batch_start = time.time()
+    batch_start_ts = time.strftime(_AUDIT_TS_FORMAT, time.localtime(batch_start))
+    items_processed = 0
+    items_included: list[str] = []
+    seen: set[str] = set()
+
+    while items_processed < max_items:
+        if time.time() - batch_start >= timeout:
+            break
+        entry = queue.dequeue(timeout=0)
+        if entry is None:
+            break  # queue empty — window done
+        item_id = entry.item_id
+        # Defensive: only drain work-item ids, never admission tickets,
+        # the caller's own primary item, or duplicates.
+        if (not item_id or item_id.startswith(_ADMISSION_TICKET_PREFIX)
+                or item_id in skip_ids or item_id in seen):
+            continue
+        seen.add(item_id)
+        items_included.append(item_id)
+        try:
+            audit_one(item_id, entry.priority)
+        except Exception as exc:  # noqa: BLE001 — per-item isolation
+            print(
+                f"Warning: batch item {item_id} audit failed: {exc}",
+                file=sys.stderr,
+            )
+        items_processed += 1
+
+    queue_remaining = len(queue)
+    batch_end = time.time()
+    metrics = {
+        "batch_start": batch_start_ts,
+        "batch_end": time.strftime(_AUDIT_TS_FORMAT, time.localtime(batch_end)),
+        "items_processed": items_processed,
+        "queue_remaining": queue_remaining,
+        "items_included": items_included,
+    }
+    _log_batch_metrics(metrics)
+    return metrics
 
 
 def _resolve_parallelism() -> int:
@@ -2260,6 +2980,76 @@ def _phase2_batch_enabled(cli_value: bool | None = None) -> bool:
     return env_value.strip().lower() in ("1", "true", "yes", "on")
 
 
+AUDIT_CHILD_IN_MAIN_SLOT_ENV = "AUDIT_CHILD_IN_MAIN_SLOT"
+"""Environment variable for the child-audit execution mode gate.
+
+When disabled (``false`` / ``0`` / ``no`` / ``off``), child Phase-1
+AC-review screens and Phase-2 child deep analysis run in a separate
+``pi`` subprocess session per child (the historical path, unchanged).
+When enabled (default — ``true``), child audits run in the main LLM slot:
+no new ``pi`` subprocess session is spawned per child; instead the runner
+emits structured in-main-slot work items for the invoking agent session
+and a ``/compact`` instruction after each child audit before continuing.
+See SA-0MT2XRGEU0009QRE.
+"""
+
+# Stable stderr markers emitted in in-main-slot mode. The invoking agent
+# session parses these to perform each child audit inline in the main
+# LLM slot, then issues the /compact instruction before the next child.
+IN_MAIN_SLOT_WORK_MARKER = "[AUDIT_IN_MAIN_SLOT_WORK]"
+IN_MAIN_SLOT_COMPACT_MARKER = "[AUDIT_IN_MAIN_SLOT_COMPACT]"
+
+
+def _resolve_child_in_main_slot(cli_value: bool | None = None) -> bool:
+    """Resolve whether child audits run in the main LLM slot.
+
+    Precedence:
+      1. ``--child-in-main-slot`` / ``--no-child-in-main-slot`` CLI flag
+         (explicit override; flag wins)
+      2. ``AUDIT_CHILD_IN_MAIN_SLOT`` environment variable
+      3. ``True`` (default — in-main-slot mode, SA-0MT2XRGEU0009QRE AC1)
+
+    The separate-process path (a new ``pi`` subprocess session per child)
+    is retained unchanged when the gate resolves to ``False``.
+    """
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(AUDIT_CHILD_IN_MAIN_SLOT_ENV, "")
+    if env_value:
+        return env_value.strip().lower() in ("1", "true", "yes", "on")
+    return True
+
+
+def _emit_in_main_slot_work(phase_label: str, child_id: str, payload: dict) -> None:
+    """Emit one in-main-slot child-audit work item to stderr.
+
+    In-main-slot mode does not spawn a new ``pi`` subprocess session per
+    child; instead the exact child Phase-1 AC screen (``phase1_child_screen``)
+    or Phase-2 child deep-analysis prompt (``phase2_child_deep``) that would
+    have been sent is surfaced as a structured, parseable work item so the
+    invoking agent session can run it inline in the main LLM slot.
+    """
+    print(
+        f"{IN_MAIN_SLOT_WORK_MARKER} {phase_label} {child_id} "
+        f"{json.dumps(payload, ensure_ascii=False)}",
+        file=sys.stderr,
+    )
+
+
+def _emit_in_main_slot_compact(child_id: str) -> None:
+    """Emit the /compact session instruction after a child audit.
+
+    ``/compact`` is an agent-session operation (the runner cannot execute
+    it itself); emitting the marker at the right point lets the invoking
+    agent session compact after each child audit before continuing with
+    the next (SA-0MT2XRGEU0009QRE AC2).
+    """
+    print(
+        f"{IN_MAIN_SLOT_COMPACT_MARKER} /compact after child audit {child_id}",
+        file=sys.stderr,
+    )
+
+
 def _normalize_model_source(source: str | None) -> str:
     """Normalize a model_source value to a valid value (remote|local)."""
     if not source:
@@ -2308,7 +3098,7 @@ def _extract_phase_model_config(config: dict) -> dict[str, object]:
     phase_config: dict[str, object] = {}
     model_root = config.get("model")
 
-    for phase in (AUDIT_PHASE,):
+    for phase in (AUDIT_PHASE, AUDIT_PHASE1):
         # Check dotted keys first (model.audit, model.remote.audit, etc.)
         dotted_key = config.get(f"model.{phase}")
         if dotted_key is not None:
@@ -2369,6 +3159,59 @@ def _resolve_model_for_phase(phase: str, config: dict,
         return resolved
 
     # 3. Hardcoded fallback
+    return DEFAULT_MODEL
+
+
+def _resolve_phase1_model(config: dict, model_source: str,
+                         cli_model: str | None = None,
+                         cli_phase1_model: str | None = None,
+                         full_model: str | None = None) -> str:
+    """Resolve the Phase 1 (fast/cheap screening) model.
+
+    Resolution chain:
+      1. ``--phase1-model`` CLI flag (explicit phase-1 override, highest)
+      2. ``--model`` CLI flag (explicit full-audit override)
+      3. Config-driven: ``model.audit_phase1`` from .ralph.json resolved via
+         model_source (falls back to ``model.audit`` — the full model — when
+         the phase-1 key is absent; SA-0MSKB697P000T3HG AC1)
+      4. Hardcoded fallback: DEFAULT_MODEL
+
+    Phase 1 (parent + child AC screening) runs on the fast/cheap model while
+    Phase 2 deep analysis keeps the full ``model.audit`` model.
+
+    The *full_model* argument is the already-resolved full audit model
+    (``_resolve_model_for_phase(AUDIT_PHASE, ...)``); when ``model.audit_phase1``
+    is absent the screening falls back to exactly that value, so a config with
+    only ``model.audit`` behaves byte-for-byte like today.
+    """
+    # 1. Explicit phase-1 CLI override
+    explicit = _coerce_model_str(cli_phase1_model)
+    if explicit:
+        return explicit
+
+    # 2. CLI override (applies to the whole audit)
+    explicit = _coerce_model_str(cli_model)
+    if explicit:
+        return explicit
+
+    # 3. Config-driven resolution: model.audit_phase1, falling back to
+    # the full model (model.audit) when the phase-1 key is absent.
+    phase_config = _extract_phase_model_config(config)
+    config_value = phase_config.get(AUDIT_PHASE1)
+    resolved = _resolve_phase_model_value(config_value, model_source)
+    if resolved:
+        return resolved
+
+    # AC1: no model.audit_phase1 → fall back to model.audit (full model).
+    # The caller usually passes the already-resolved full model; when absent
+    # (standalone resolution), resolve model.audit from the config directly.
+    if full_model is None:
+        full_value = phase_config.get(AUDIT_PHASE)
+        full_model = _resolve_phase_model_value(full_value, model_source)
+    if full_model:
+        return full_model
+
+    # 4. Hardcoded fallback
     return DEFAULT_MODEL
 
 
@@ -2472,13 +3315,38 @@ def _communicate_with_stall(process, cmd: list[str],
     return "".join(out_chunks), "".join(err_chunks)
 
 
+def _phase_label(context: str) -> str:
+    """Human-readable phase name from the pi-call context key.
+
+    Maps the raw call-context strings (``parent``, ``child:SA-XXX``,
+    ``phase2_deep``, ``phase2_child``, ``phase2_batch``) to the audit-phase
+    name so timeout/failure evidence in the report names which phase failed
+    instead of a bare "Manual audit required." (SA-0MT6EZUS9004FJ9T AC4).
+    Falls back to the raw context, or "unknown phase" when empty.
+    """
+    if context == "parent":
+        return "Phase 1 parent screening"
+    if context.startswith("child:"):
+        return f"Phase 1 child screening ({context.split(':', 1)[1]})"
+    if context == "phase2_deep":
+        return "Phase 2 deep analysis"
+    if context.startswith("phase2_child"):
+        return "Phase 2 child deep analysis"
+    if context == "phase2_batch":
+        return "Phase 2 batched deep analysis"
+    return context or "unknown phase"
+
+
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              pi_bin: str = "pi",
              enable_tools: bool = False,
              timeout: int | None = None,
              max_retries: int | None = None,
              ac_fallback_used: threading.Event | None = None,
-             child_screen: bool = False) -> dict:
+             child_screen: bool = False,
+             issue_id: str = "",
+             context: str = "",
+             priority: int = Priority.MEDIUM) -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
 
     Args:
@@ -2506,6 +3374,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 600 s, configurable via
             ``AUDIT_CHILD_SCREEN_TIMEOUT`` / ``--child-screen-timeout``)
             instead of the 1800 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
+
+        issue_id: Work-item ID used in the ``--session-id`` flag.
+        context: Phase/context string used in the ``--session-id`` flag
+                 (e.g. ``phase2_deep``, ``parent``, ``child:SA-XXX``).
+                 Colons are replaced with underscores in the output.
+        priority: Queue priority for slot admission (lower number =
+                 more urgent). Drives priority-ordered waiting under
+                 concurrency saturation (SA-0MTG5RYH8005RQNM AC2).
 
     Returns a dict with keys ``verdict`` and ``evidence``.
     On success, implementations may also include additional diagnostic keys
@@ -2536,6 +3412,10 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     # modes. Both flags are loader toggles compatible with --mode json and
     # --tools; prompts must never rely on AGENTS.md or skill descriptions.
     cmd.extend(["--no-context-files", "--no-skills"])
+    # Session-id: attach a descriptive session identifier so audit sessions
+    # can be traced back to the work item being audited (SA-0MSNYMKV7005P0H9).
+    if issue_id:
+        cmd.extend(["--session-id", _build_session_id(issue_id, context)])
 
     effective_timeout = _resolve_call_timeout(timeout, child_screen=child_screen)
     stall_timeout = _resolve_stall_timeout()
@@ -2546,16 +3426,21 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     stderr = ""
     # Wall-clock baseline for per-call timing instrumentation. Measures the
     # full call including any provider-error retries so operators can see the
-    # true per-call duration in the Phase 2 performance baseline.
-    _call_start = time.monotonic()
+    # true per-call duration in the Phase 2 performance baseline. Routed
+    # through the shared Timer so the per-call timing aligns with the unified
+    # timing utility (SA-0MT319YGQ002E801 AC2 — extends, does not remove).
+    _call_timer = SharedTimer("pi_call")
+    _call_timer.start()
     while True:
         attempt += 1
         try:
             # Concurrency cap: bound concurrent pi subprocesses host-wide
             # (fan-out investigation SA-0MSAEKOQE009TEB4). Each pi launch
-            # holds one audit slot; the wait is AUDIT_LOCK_TIMEOUT (default
-            # 0s = fail fast when the ceiling is saturated).
-            with _acquire_audit_slot():
+            # holds one audit slot; under saturation the launch waits on
+            # the priority queue (AUDIT_QUEUE_TIMEOUT bound) instead of
+            # failing fast, then acquires a slot when one is free
+            # (SA-0MTG5RYH8005RQNM).
+            with _acquire_audit_slot(issue_id=issue_id, priority=priority):
                 try:
                     process = subprocess.Popen(
                         cmd,
@@ -2581,11 +3466,13 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                         evidence = (
                             f"Pi model call stalled (no output for {stall_timeout}s); "
                             "aborted early. Manual audit required."
+                            f" Phase: {_phase_label(context)}."
                         )
                     else:
                         evidence = (
                             f"Pi model call timed out after {effective_timeout}s. "
                             "Manual audit required."
+                            f" Phase: {_phase_label(context)}."
                         )
                     return {
                         "verdict": "unmet",
@@ -2594,7 +3481,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                         "raw_stderr": stderr,
                         "extracted_text": "",
                         "_timeout": True,
-                        "elapsed_seconds": time.monotonic() - _call_start,
+                        "elapsed_seconds": _call_timer.elapsed,
                     }
         except TimeoutError as exc:
             # Ceiling saturated past the bounded wait: do not launch yet
@@ -2607,12 +3494,13 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 "evidence": (
                     f"Audit concurrency limit reached: {exc}. "
                     "Retry when fewer audits are running."
+                    f" Phase: {_phase_label(context)}."
                 ),
                 "raw_stdout": "",
                 "raw_stderr": "",
                 "extracted_text": "",
                 "_concurrency_timeout": True,
-                "elapsed_seconds": time.monotonic() - _call_start,
+                "elapsed_seconds": _call_timer.elapsed,
             }
 
         # Detect provider errors (e.g. "finish_reason: error" where the model
@@ -2622,14 +3510,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             break
         time.sleep(_PI_RETRY_BACKOFF_SECONDS * attempt)
 
-    elapsed_seconds = time.monotonic() - _call_start
+    elapsed_seconds = _call_timer.elapsed
 
     if provider_error:
         if ac_fallback_used is not None:
             ac_fallback_used.set()
         return {
             "verdict": "unmet",
-            "evidence": f"Pi provider error: {provider_error}",
+            "evidence": f"Pi provider error: {provider_error}. Phase: {_phase_label(context)}.",
             "raw_stdout": stdout,
             "raw_stderr": stderr,
             "extracted_text": "",
@@ -3042,8 +3930,15 @@ def _git_changed_files(runner: Runner) -> list[str]:
     """Return the list of changed/untracked files from git (bounded).
 
     Combines ``git diff --name-only HEAD`` and ``git status --porcelain=v1``
-    so both tracked modifications and untracked files are captured. Any git
-    failure returns an empty list so the audit never breaks on VCS errors.
+    so both tracked modifications and untracked files are captured.
+
+    Deleted and transient files are filtered out so that lint-scoped runs
+    never target ghost paths — without this filter, ``ruff check`` fails
+    with ``E902`` (IO error) and the remediation loop then writes junk
+    per-file-ignores for machine-absolute paths (SA-0MSXVXVUL0011JKX).
+
+    Any git failure returns an empty list so the audit never breaks on
+    VCS errors.
     """
     changed: list[str] = []
     try:
@@ -3065,18 +3960,40 @@ def _git_changed_files(runner: Runner) -> list[str]:
                         changed.append(path)
     except Exception:  # noqa: S110, BLE001 -- git is best-effort for the manifest
         pass
-    return changed[:_FILE_SCOPE_MAX_FILES]
+
+    # ------------------------------------------------------------------
+    # Drop ghost paths (deleted / transient files) that git reports but
+    # that no longer exist on disk.  Without this filter, ``ruff check``
+    # fails with E902 (IO error) and the remediation loop writes junk
+    # per-file-ignores for machine-absolute ghost paths (SA-0MSXVXVUL0011JKX).
+    # ------------------------------------------------------------------
+    root = Path(TARGET_PROJECT_ROOT).resolve()
+    existing: list[str] = []
+    for path in changed:
+        p = Path(path)
+        if p.is_absolute():
+            if p.exists():
+                existing.append(path)
+        elif (root / p).exists() or Path(path).exists():
+            existing.append(path)
+    return existing[:_FILE_SCOPE_MAX_FILES]
 
 
-def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX) -> list[str]:
+def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
+                max_root_files: int = _FILE_SCOPE_MAX_FILES) -> list[str]:
     """Return a lightweight repo index (top-level entries with file counts).
 
     Uses ``git ls-files`` to count files per top-level path and returns the
-    ``max_entries`` largest buckets as ``path/ (N files)`` strings. On git
-    failure, falls back to a best-effort directory listing of
-    ``TARGET_PROJECT_ROOT``.
+    ``max_entries`` largest buckets as ``path/ (N files)`` strings. Root-level
+    files are aggregated under ``(root)/`` but the first ``max_root_files``
+    root file names are listed inline (e.g. ``(root)/ (16 files): install.sh,
+    remote, ...``) so repos whose distinctive top-level markers are all
+    root-level files stay verifiable by the file-scope manifest check
+    (SA-0MSUBX8PP0087OEA). On git failure, falls back to a best-effort
+    listing of ``TARGET_PROJECT_ROOT``'s top-level entries.
     """
     buckets: dict[str, int] = {}
+    root_files: list[str] = []
     try:
         proc = runner(["git", "ls-files"])
         if proc.returncode == 0 and proc.stdout:
@@ -3086,21 +4003,37 @@ def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX) -> lis
                     continue
                 top = rel.split("/", 1)[0] if "/" in rel else "(root)"
                 buckets[top] = buckets.get(top, 0) + 1
+                if top == "(root)":
+                    root_files.append(rel)
     except Exception:  # noqa: S110, BLE001 -- git is best-effort for the manifest
         pass
 
     if not buckets:
-        # Best-effort fallback: list top-level dirs of TARGET_PROJECT_ROOT
+        # Best-effort fallback: list top-level entries of TARGET_PROJECT_ROOT
         try:
             root = TARGET_PROJECT_ROOT
             for entry in sorted(root.iterdir()):
-                if entry.is_dir() and not entry.name.startswith("."):
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
                     buckets[entry.name] = len(list(entry.iterdir()))
+                else:
+                    buckets["(root)"] = buckets.get("(root)", 0) + 1
+                    root_files.append(entry.name)
         except OSError:
             return []
 
     ordered = sorted(buckets.items(), key=lambda kv: -kv[1])[:max_entries]
-    return [f"{name}/ ({count} files)" for name, count in ordered]
+    lines: list[str] = []
+    for name, count in ordered:
+        line = f"{name}/ ({count} files)"
+        if name == "(root)" and root_files:
+            shown = sorted(root_files)[:max_root_files]
+            line += ": " + ", ".join(shown)
+            if len(root_files) > max_root_files:
+                line += ", ..."
+        lines.append(line)
+    return lines
 
 
 def _phase1_evidence_refs(ac_results: list[dict],
@@ -3188,7 +4121,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            green_run_sha: str | None = None,
                            auto_green_run_sha: str | None = None,
                            test_skill_run_sha: str | None = None,
-                           content_fingerprint: str | None = None) -> str:
+                           content_fingerprint: str | None = None,
+                           merge_gate_evidence: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -3246,6 +4180,9 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
+        ``warning`` criteria (e.g. zero-AC sentinel where ACs could not be extracted)
+        are **not** acceptable and will produce ``Ready to close: No``.
+        (SA-0MSRLLQ0V008EW3J)
       - All non-deleted children must be in ``in_review`` or ``done`` stage.
         Children with ``status: in_progress`` but ``stage: in_review`` are
         acceptable and do NOT block closure.
@@ -3367,12 +4304,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
         lines.extend(["", "## Summary", ""])
 
-    # Count verdicts across all criteria (parent + children)
-    all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
-    _met_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_MET)
-    adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
-    unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
-    partial_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_PARTIAL)
+    # Count verdicts across parent criteria only (children have their own
+    # section below).
+    _met_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_MET)
+    adjusted_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_ADJUSTED)
+    unmet_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_UNMET)
+    partial_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_PARTIAL)
 
     not_reviewed = [
         c for c in child_results
@@ -3445,6 +4382,16 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"| {i} | {r['text']} | {r['verdict']} | {evidence} |"
             )
+
+    # Merge gate evidence (SA-0MT456M27001LRTL): the Phase 1 gate's
+    # integration check command + result, recorded in the persisted report
+    # so the ancestor/merge verification is audit evidence (AC1/AC2/AC4).
+    # Placed after the AC table so the gate is visible but never distracts
+    # from the criterion verdicts.
+    if merge_gate_evidence:
+        lines.extend(["", "## Merge Gate Evidence (Phase 1)", ""])
+        lines.extend(merge_gate_evidence.splitlines())
+        lines.append("")
 
     # Variance Decisions section: appears when any parent or child criterion
     # has 'adjusted' verdict
@@ -3887,7 +4834,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            max_retries: int | None = None,
                            ac_fallback_used: threading.Event | None = None,
                            child_screen: bool = False,
-                           ac_count: int | None = None) -> dict:
+                           ac_count: int | None = None,
+                           priority: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -3910,8 +4858,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             supplied, the per-call timing line appends ``ac_count=N`` and
             ``avg_ac_elapsed_seconds`` (elapsed / N) so Phase-2 per-AC
             latency is visible and regressions surface (LP-0MSQ32WM5000NCB7
-            F4 AC1). A count of 0 is emitted without the avg field; a
-            missing count keeps the legacy timing format byte-for-byte.
+            F4 AC1). A count of 0 is emitted without the avg field. Every
+            timing line also appends ``model=<model>`` so the serving model
+            is observable per call (tiered Phase 1 fast vs Phase 2 full,
+            SA-0MSKB697P000T3HG).
 
         # Context reduction: every forwarded pi call runs with
         ``--no-context-files --no-skills`` (see _call_pi) so audit sessions
@@ -3923,7 +4873,13 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries, ac_fallback_used=ac_fallback_used, child_screen=child_screen)
+    result = _call_pi(
+        prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools,
+        timeout=timeout, max_retries=max_retries,
+        ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+        issue_id=issue_id, context=context,
+        priority=priority if priority is not None else Priority.MEDIUM,
+    )
 
     # Emit a per-call timing line to stderr (performance baseline). Includes
     # issue id, call context, and elapsed seconds so Phase 2 durations are
@@ -3948,6 +4904,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                 timing += (
                     f" avg_ac_elapsed_seconds={float(elapsed) / ac_count:.2f}"
                 )
+        # Surface the serving model so tiered Phase 1 (fast/cheap) vs Phase 2
+        # (full) usage is verifiable from the timing line alone
+        # (SA-0MSKB697P000T3HG AC2/AC3).
+        timing += f" model={model}"
         print(timing, file=sys.stderr)
 
     # Decide whether to write a debug line
@@ -4138,18 +5098,19 @@ def _parse_child_audit_verdict(raw_output: str,
     return False, "not_ready", audited_at
 
 
-def _fetch_child_audited_at(runner: Runner, child_id: str,
-                            worklog_dir: str | None = None) -> str | None:
-    """Return the child audit's ``auditedAt`` (None when unavailable).
+def _fetch_audited_at(runner: Runner, issue_id: str,
+                      worklog_dir: str | None = None) -> str | None:
+    """Return the audit's ``auditedAt`` for a work item (None when unavailable).
 
-    Used by the auto-trigger loop's content-freshness reuse branch to record
-    the ``reused from <auditedAt>`` marker (LP-0MSQ32MF200675AR). The branch
-    is a defense-in-depth fallback — the primary child reuse happens in the
-    Phase 1 pre-pass where ``_get_child_audit_verdict`` already returns the
-    auditedAt.
+    Used by the fresh-skip fast-path notice (AC2, SA-0MTFX6HMJ006QKR3) to
+    surface when the reused audit ran, and by the auto-trigger loop's
+    content-freshness reuse branch to record the ``reused from <auditedAt>``
+    marker (LP-0MSQ32MF200675AR). The branch is a defense-in-depth fallback
+    — the primary child reuse happens in the Phase 1 pre-pass where
+    ``_get_child_audit_verdict`` already returns the auditedAt.
     """
     try:
-        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
                        worklog_dir=worklog_dir)
     except RuntimeError:
         return None
@@ -4239,18 +5200,34 @@ def _child_acs_from_own_audit(child: dict, runner: Runner,
     return fallback if fallback is not None else fallback_met
 
 
-def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
-                             pi_bin: str, debug_log: str | None,
+def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
+                             full_model: str, pi_bin: str,
+                             debug_log: str | None,
                              timeout: int | None, runner: Runner,
                              script_failure_callback: Callable[[str, Exception], None],
-                             ac_fallback_used: threading.Event | None = None
+                             ac_fallback_used: threading.Event | None = None,
+                             child_in_main_slot: bool = False
                              ) -> tuple[int, list[dict]]:
     """Phase 1 child AC review worker (P7, parallel-safe).
 
-    Runs the batched Phase 1 acceptance-criteria screening for one child and
+    Runs the batched Phase 1 acceptance-criteria screening for one child on
+    the fast Phase 1 model (*phase1_model*, ``model.audit_phase1``) and
     returns ``(ci, child_ac_results)``. The prompt includes the file-scope
     manifest and SCANNING block, and the call runs with read-only tools
     (``enable_tools=True``) — mirroring the Phase 2 performance pattern.
+
+    AC4 safe fallback (SA-0MSKB697P000T3HG): when the fast model cannot
+    produce reliable batched verdict JSON and a distinct full model is
+    configured, the SAME screen is retried once with *full_model* before
+    falling back to diagnostic 'partial' verdicts.
+
+    *child_in_main_slot* (SA-0MT2XRGEU0009QRE): when True (in-main-slot
+    mode), NO ``pi`` subprocess is spawned per child. The screen prompt is
+    emitted as a structured in-main-slot work item for the invoking agent
+    session to run inline in the main LLM slot, followed by a ``/compact``
+    instruction; the child's ACs are marked pending main-session review.
+    A later parent run reuses the child's persisted audit (freshness/child
+    verdict reuse) with zero pi calls.
 
     Never raises: a Pi ``RuntimeError`` records a script failure and falls
     back to diagnostic ``partial`` verdicts (identical to the historical
@@ -4285,13 +5262,45 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
             f"Include justification in the evidence field.\n\n"
             f"Criteria: {child_ac_list}"
         )
+        if child_in_main_slot:
+            # In-main-slot mode: NO new pi subprocess session per child
+            # (SA-0MT2XRGEU0009QRE AC2). Surface the exact screen prompt
+            # for the invoking agent session and issue /compact after the
+            # child audit before continuing. The verdict is pending until
+            # the main session performs the screen and persists the child
+            # audit; a re-run reuses it at zero pi cost.
+            _emit_in_main_slot_work(
+                "phase1_child_screen", child.get("id", ""),
+                {
+                    "phase": "phase1_child_screen",
+                    "child_id": child.get("id", ""),
+                    "title": child.get("title", ""),
+                    "prompt": prompt,
+                },
+            )
+            _emit_in_main_slot_compact(child.get("id", ""))
+            child_ac_results = [
+                {
+                    "text": ac,
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": (
+                        "In-main-slot child Phase-1 AC screen emitted to the "
+                        "main LLM slot (no pi subprocess); verdict pending "
+                        "main-session review — perform the emitted screen, "
+                        "persist the child audit, and re-run the parent to "
+                        "collect the verdict (SA-0MT2XRGEU0009QRE)."
+                    ),
+                }
+                for ac in child_acs
+            ]
+            return ci, child_ac_results
         try:
-            result = _call_pi_and_maybe_log(
+            result, batch, raw_text = _call_phase1_screen(
                 child.get("id", ""), f"child:{child.get('id', '')}", prompt,
-                model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
-                enable_tools=True, timeout=timeout,
-                ac_fallback_used=ac_fallback_used,
-                child_screen=True,
+                phase1_model, pi_bin, debug_log, timeout, ac_fallback_used,
+                script_failure_callback, failure_label="child AC review",
+                child_screen=True, enable_tools=True,
+                priority=_resolve_audit_priority(child),
             )
         except RuntimeError as exc:
             script_failure_callback("pi (child AC review)", exc)
@@ -4300,14 +5309,22 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                 file=sys.stderr,
             )
             result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
-        # Use extracted_text (full response) instead of evidence (may be truncated)
-        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
-        batch = _extract_json_array(raw_text)
-        if batch is None:
-            try:
-                batch = json.loads(raw_text)
-            except json.JSONDecodeError:
-                batch = []
+        # AC4 safe fallback (SA-0MSKB697P000T3HG): a fast Phase 1 model that
+        # cannot produce reliable batched verdict JSON is retried once with
+        # the full audit model before falling back to 'partial'.
+        if not batch and phase1_model != full_model:
+            print(
+                "Warning: fast Phase 1 model produced unparseable output — "
+                "retrying child AC review with the full audit model",
+                file=sys.stderr,
+            )
+            result, batch, raw_text = _call_phase1_screen(
+                child.get("id", ""), f"child:{child.get('id', '')}", prompt,
+                full_model, pi_bin, debug_log, timeout, ac_fallback_used,
+                script_failure_callback, failure_label="child AC review",
+                child_screen=True, enable_tools=True,
+                priority=_resolve_audit_priority(child),
+            )
         if isinstance(batch, list) and batch and any(
             isinstance(item, dict) and "index" in item for item in batch
         ):
@@ -4699,6 +5716,7 @@ def _deep_analyze_child(
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
     max_citations_per_ac: int = _DEFAULT_MAX_CITATIONS_PER_AC,
+    child_in_main_slot: bool = False,
 ) -> tuple[int, dict, bool]:
     """Run Phase 2 deep analysis for a single child (worker for parallelism).
 
@@ -4714,6 +5732,14 @@ def _deep_analyze_child(
 
     *max_citations_per_ac* bounds the file:line evidence citations the model
     may emit per criterion (prompt-level only, LP-0MSQ32WM5000NCB7).
+
+    *child_in_main_slot* (SA-0MT2XRGEU0009QRE): when True (in-main-slot
+    mode), NO ``pi`` subprocess is spawned per child. The deep-analysis
+    prompt is emitted as a structured in-main-slot work item for the
+    invoking agent session to run inline in the main LLM slot, followed by
+    a ``/compact`` instruction; the child's Phase 1 ac_results are preserved
+    (pending main-session review). A later parent run reuses the child's
+    persisted audit with zero pi calls.
     """
     child_acs = child.get("ac_results", [])
     if not child_acs:
@@ -4743,6 +5769,25 @@ def _deep_analyze_child(
         f"Criteria: {child_ac_list}"
     )
 
+    if child_in_main_slot:
+        # In-main-slot mode: NO new pi subprocess session per child
+        # (SA-0MT2XRGEU0009QRE AC2). Surface the exact deep-analysis prompt
+        # for the invoking agent session and issue /compact after the child
+        # audit before continuing. Phase 1 ac_results stand (pending
+        # main-session review) until the main session performs the deep
+        # analysis, persists the child audit, and the parent is re-run.
+        _emit_in_main_slot_work(
+            "phase2_child_deep", child.get("id", ""),
+            {
+                "phase": "phase2_child_deep",
+                "child_id": child.get("id", ""),
+                "title": child.get("title", ""),
+                "prompt": child_prompt,
+            },
+        )
+        _emit_in_main_slot_compact(child.get("id", ""))
+        return ci, child, False
+
     try:
         child_result = _call_pi_and_maybe_log(
             child.get("id", ""), f"phase2_child:{ci}", child_prompt,
@@ -4751,6 +5796,7 @@ def _deep_analyze_child(
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
             ac_count=len(child_acs),
+            priority=_resolve_audit_priority(child),
         )
     except RuntimeError:
         return ci, child, False
@@ -4768,7 +5814,10 @@ def _deep_analyze_child(
             timeout_acs.append({
                 "text": ac.get("text", ""),
                 "verdict": VERDICT_PARTIAL,
-                "evidence": "Deep analysis timed out \u2014 manual review required.",
+                "evidence": (
+                    "Deep analysis timed out \u2014 manual review required."
+                    " Phase: Phase 2 child deep analysis."
+                ),
             })
         updated = dict(child)
         updated["ac_results"] = timeout_acs
@@ -4792,7 +5841,10 @@ def _deep_analyze_child(
             error_acs.append({
                 "text": ac.get("text", ""),
                 "verdict": VERDICT_PARTIAL,
-                "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                "evidence": (
+                    f"Pi provider error: {provider_error} \u2014 manual review required."
+                    " Phase: Phase 2 child deep analysis."
+                ),
             })
         updated = dict(child)
         updated["ac_results"] = error_acs
@@ -4805,43 +5857,64 @@ def _deep_analyze_child(
         or child_result.get("text", "")
     )
     child_batch = _extract_json_array(child_raw)
+    child_parse_failed = False
     if child_batch is None:
         try:
             child_batch = json.loads(child_raw)
         except json.JSONDecodeError:
             child_batch = []
+            child_parse_failed = True
 
     updated_child_acs = list(child_acs)
     if isinstance(child_batch, list):
-        reviewed = {
-            item["index"]: item
-            for item in child_batch
-            if isinstance(item, dict) and "index" in item
-        }
-        for i in range(len(updated_child_acs)):
-            item = reviewed.get(i, {})
-            deep_verdict = _normalize_verdict(item.get("verdict", ""))
-            deep_evidence = _evidence_text(item.get("evidence"))
-            if deep_verdict:
-                initial = updated_child_acs[i]["verdict"]
-                if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
-                    updated_child_acs[i] = {
-                        "text": updated_child_acs[i]["text"],
-                        "verdict": VERDICT_MET,
-                        "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
-                    }
-                elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
-                    updated_child_acs[i] = {
-                        "text": updated_child_acs[i]["text"],
-                        "verdict": deep_verdict,
-                        "evidence": f"Phase 1: {updated_child_acs[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
-                    }
-                else:
-                    updated_child_acs[i] = {
-                        "text": updated_child_acs[i]["text"],
-                        "verdict": deep_verdict,
-                        "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
-                    }
+        if not child_batch and child_parse_failed:
+            # Child Phase 2 output unparseable — disclose it explicitly
+            # rather than silently keeping stale Phase 1 verdicts.  A valid
+            # empty array is not a parse failure (existing contract).
+            if ac_fallback_used is not None:
+                ac_fallback_used.set()
+            for i in range(len(updated_child_acs)):
+                prev_evidence = _evidence_text(updated_child_acs[i].get("evidence"))
+                updated_child_acs[i] = {
+                    "text": updated_child_acs[i]["text"],
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": (
+                        (f"{prev_evidence} " if prev_evidence else "")
+                        + "Phase 2 child deep analysis did not return "
+                        "parseable results (model output could not be "
+                        "parsed). Phase: Phase 2 child deep analysis."
+                    ),
+                }
+        else:
+            reviewed = {
+                item["index"]: item
+                for item in child_batch
+                if isinstance(item, dict) and "index" in item
+            }
+            for i in range(len(updated_child_acs)):
+                item = reviewed.get(i, {})
+                deep_verdict = _normalize_verdict(item.get("verdict", ""))
+                deep_evidence = _evidence_text(item.get("evidence"))
+                if deep_verdict:
+                    initial = updated_child_acs[i]["verdict"]
+                    if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": VERDICT_MET,
+                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                        }
+                    elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": f"Phase 1: {updated_child_acs[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                        }
+                    else:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                        }
 
     updated = dict(child)
     updated["ac_results"] = updated_child_acs
@@ -4994,6 +6067,7 @@ def _run_batch_phase2(
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
             ac_count=len(ac_list),
+            priority=_resolve_audit_priority(issue),
         )
     except RuntimeError:
         return None
@@ -5063,6 +6137,7 @@ def _run_phase2_deep_analysis(
     skip_parent_deep: bool = False,
     owning_root: Path | None = None,
     max_citations_per_ac: int | None = None,
+    child_in_main_slot: bool = False,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -5108,6 +6183,14 @@ def _run_phase2_deep_analysis(
     resolved via ``_resolve_max_citations_per_ac``). Prompt-level only —
     verdict semantics and the canonical report format are unchanged
     (LP-0MSQ32WM5000NCB7).
+
+    *child_in_main_slot* (SA-0MT2XRGEU0009QRE): when True (in-main-slot
+    mode), child Phase-2 deep analysis runs in the main LLM slot — NO new
+    ``pi`` subprocess session is spawned per child: ``_deep_analyze_child``
+    emits structured in-main-slot work items + a ``/compact`` instruction
+    after each child audit. Batch mode (``--batch-phase2``) is skipped in
+    this mode (batch would still spawn one pi session); children are
+    processed sequentially (one main slot).
 
     Returns (updated_ac_results, updated_child_results, phase2_completed).
     The ``phase2_completed`` flag is ``False`` when the Pi call times out,
@@ -5174,7 +6257,11 @@ def _run_phase2_deep_analysis(
     # When *skip_parent_deep* is set the parent was already deep-verified
     # in a prior parent-only call (SA-0MSKB6VJA005N43F); the batch path
     # re-analyzes the parent ACs, so skip it and use the per-child path.
-    if batch_phase2 and pending and not skip_parent_deep:
+    # In-main-slot mode (SA-0MT2XRGEU0009QRE) also skips batch: batch would
+    # still spawn a fresh pi session, defeating the no-new-session-per-child
+    # contract; children are emitted as in-main-slot work instead.
+    if batch_phase2 and pending and not skip_parent_deep \
+            and not child_in_main_slot:
         batch_outcome = _run_batch_phase2(
             issue, ac_results, pending, updated_children,
             resolved_model, pi_bin, debug_log, timeout, runner,
@@ -5185,6 +6272,7 @@ def _run_phase2_deep_analysis(
         if batch_outcome is not None:
             return batch_outcome
 
+    parent_parse_failed = False
     if not skip_parent_deep:
         file_scope = _build_file_scope_manifest(issue, ac_results, runner=runner)
         # Validate the Phase 2 FILE SCOPE manifest covers the item repository
@@ -5241,6 +6329,7 @@ def _run_phase2_deep_analysis(
                 max_retries=_PHASE2_MAX_RETRIES,
                 ac_fallback_used=ac_fallback_used,
                 ac_count=len(ac_results),
+                priority=_resolve_audit_priority(issue),
             )
         except RuntimeError as exc:
             # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
@@ -5266,7 +6355,10 @@ def _run_phase2_deep_analysis(
                 timeout_acs.append({
                     "text": ac.get("text", ""),
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": "Deep analysis timed out \u2014 manual review required.",
+                    "evidence": (
+                        "Deep analysis timed out \u2014 manual review required."
+                        " Phase: Phase 2 deep analysis."
+                    ),
                 })
             # Also mark all child ACs as partial
             timeout_children = []
@@ -5277,7 +6369,10 @@ def _run_phase2_deep_analysis(
                     updated_child_acs.append({
                         "text": ac.get("text", ""),
                         "verdict": VERDICT_PARTIAL,
-                        "evidence": "Deep analysis timed out \u2014 manual review required.",
+                        "evidence": (
+                            "Deep analysis timed out \u2014 manual review required."
+                            " Phase: Phase 2 deep analysis."
+                        ),
                     })
                 timeout_children.append(dict(child))
                 timeout_children[-1]["ac_results"] = updated_child_acs
@@ -5304,7 +6399,10 @@ def _run_phase2_deep_analysis(
                 error_acs.append({
                     "text": ac.get("text", ""),
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                    "evidence": (
+                        f"Pi provider error: {provider_error} \u2014 manual review required."
+                        " Phase: Phase 2 deep analysis."
+                    ),
                 })
             error_children = []
             for child in child_results:
@@ -5314,7 +6412,10 @@ def _run_phase2_deep_analysis(
                     updated_child_acs.append({
                         "text": ac.get("text", ""),
                         "verdict": VERDICT_PARTIAL,
-                        "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                        "evidence": (
+                            f"Pi provider error: {provider_error} \u2014 manual review required."
+                            " Phase: Phase 2 deep analysis."
+                        ),
                     })
                 error_children.append(dict(child))
                 error_children[-1]["ac_results"] = updated_child_acs
@@ -5327,46 +6428,76 @@ def _run_phase2_deep_analysis(
             or result.get("text", "")
         )
         batch = _extract_json_array(raw_text)
+        batch_parse_failed = False
         if batch is None:
             try:
                 batch = json.loads(raw_text)
             except json.JSONDecodeError:
                 batch = []
+                batch_parse_failed = True
 
         updated_ac = list(ac_results)
         if isinstance(batch, list):
-            reviewed = {
-                item["index"]: item
-                for item in batch
-                if isinstance(item, dict) and "index" in item
-            }
-            for i in range(len(updated_ac)):
-                item = reviewed.get(i, {})
-                deep_verdict = _normalize_verdict(item.get("verdict", ""))
-                deep_evidence = _evidence_text(item.get("evidence"))
-                if deep_verdict:
-                    # Final verdict = Phase 1 passes AND Phase 2 confirms
-                    initial = updated_ac[i]["verdict"]
-                    if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
-                        updated_ac[i] = {
-                            "text": updated_ac[i]["text"],
-                            "verdict": VERDICT_MET,
-                            "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
-                        }
-                    elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
-                        # Phase 1 said met, Phase 2 disagrees → downgrade
-                        updated_ac[i] = {
-                            "text": updated_ac[i]["text"],
-                            "verdict": deep_verdict,
-                            "evidence": f"Phase 1: {updated_ac[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
-                        }
-                    else:
-                        # Use Phase 2 verdict (deep override for initial non-met)
-                        updated_ac[i] = {
-                            "text": updated_ac[i]["text"],
-                            "verdict": deep_verdict,
-                            "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
-                        }
+            if not batch and batch_parse_failed:
+                # Phase 2 output could not be parsed at all (e.g. an
+                # infrastructure error string).  Mark all ACs as partial
+                # with explicit evidence — never silently present stale
+                # Phase 1 verdicts as if Phase 2 had confirmed them.  A
+                # *valid* empty array ([]) is not a parse failure and keeps
+                # the existing Phase 1-verdict contract.
+                if ac_fallback_used is not None:
+                    ac_fallback_used.set()
+                parent_parse_failed = True
+                print(
+                    "Warning: Phase 2 deep analysis output could not be "
+                    f"parsed ({len(ac_results)} ACs marked partial).",
+                    file=sys.stderr,
+                )
+                for i in range(len(updated_ac)):
+                    prev_evidence = _evidence_text(updated_ac[i].get("evidence"))
+                    updated_ac[i] = {
+                        "text": updated_ac[i]["text"],
+                        "verdict": VERDICT_PARTIAL,
+                        "evidence": (
+                            (f"{prev_evidence} " if prev_evidence else "")
+                            + "Phase 2 deep analysis did not return parseable "
+                            "results (model output could not be parsed — raw "
+                            "output logged). Phase: Phase 2 deep analysis."
+                        ),
+                    }
+            else:
+                reviewed = {
+                    item["index"]: item
+                    for item in batch
+                    if isinstance(item, dict) and "index" in item
+                }
+                for i in range(len(updated_ac)):
+                    item = reviewed.get(i, {})
+                    deep_verdict = _normalize_verdict(item.get("verdict", ""))
+                    deep_evidence = _evidence_text(item.get("evidence"))
+                    if deep_verdict:
+                        # Final verdict = Phase 1 passes AND Phase 2 confirms
+                        initial = updated_ac[i]["verdict"]
+                        if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                            updated_ac[i] = {
+                                "text": updated_ac[i]["text"],
+                                "verdict": VERDICT_MET,
+                                "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                            }
+                        elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                            # Phase 1 said met, Phase 2 disagrees → downgrade
+                            updated_ac[i] = {
+                                "text": updated_ac[i]["text"],
+                                "verdict": deep_verdict,
+                                "evidence": f"Phase 1: {updated_ac[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                            }
+                        else:
+                            # Use Phase 2 verdict (deep override for initial non-met)
+                            updated_ac[i] = {
+                                "text": updated_ac[i]["text"],
+                                "verdict": deep_verdict,
+                                "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                            }
 
     else:
         # Parent Phase 2 already completed in a prior parent-only call
@@ -5375,7 +6506,10 @@ def _run_phase2_deep_analysis(
     # Also run deep analysis on active children
     child_timeout_occurred = False
 
-    parallelism = _resolve_child_concurrency()
+    # In-main-slot mode runs children sequentially on the single main slot
+    # (one /compact per child in order); the separate-process path retains
+    # the slot-aware parallel ceiling (SA-0MT2XRGEU0009QRE AC2).
+    parallelism = 1 if child_in_main_slot else _resolve_child_concurrency()
 
     def _merge_result(result: tuple[int, dict, bool]) -> None:
         nonlocal child_timeout_occurred
@@ -5398,6 +6532,7 @@ def _run_phase2_deep_analysis(
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
                     max_citations_per_ac=max_citations_per_ac,
+                    child_in_main_slot=child_in_main_slot,
                 )
                 for ci, child in pending
             ]
@@ -5418,9 +6553,12 @@ def _run_phase2_deep_analysis(
                 ac_fallback_used=ac_fallback_used,
                 green_run_block=green_run_block,
                 max_citations_per_ac=max_citations_per_ac,
+                child_in_main_slot=child_in_main_slot,
             ))
 
-    return updated_ac, updated_children, not child_timeout_occurred
+    return updated_ac, updated_children, not (
+        child_timeout_occurred or parent_parse_failed
+    )
 
 
 def _reask_verdict_array_once(
@@ -5472,6 +6610,7 @@ def _reask_verdict_array_once(
             issue.get("id", ""), "verdict_reask", prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             timeout=timeout,
+            priority=_resolve_audit_priority(issue),
         )
     except RuntimeError:
         return None
@@ -5564,10 +6703,26 @@ class _AuditContext:
     run_tests: bool
     no_execute: bool = False
     max_citations_per_ac: int | None = None
+    child_in_main_slot: bool = False
+    """Resolved from env var / CLI flag / default true by cmd_issue
+    (SA-0MT2XRGEU0009QRE). True → child Phase-1 AC screens and Phase-2
+    child deep analysis run in the main LLM slot (no pi subprocess per
+    child; /compact after each child audit). False → the unchanged
+    separate-process path.
+    """
+    phase1_model: str | None = None
+
+    # Phase checkpoint store (SA-0MT6EZUS9004FJ9T): bound by cmd_issue after
+    # the launch-context gate; read by _phase1_parent_screening and
+    # _phase_children to skip completed phases on a resumed run. None when
+    # checkpointing is disabled (--no-checkpoint, unresolvable HEAD, or a
+    # store failure) — behavior is then byte-identical to a pre-change run.
+    checkpoint: CheckpointStore | None = None
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
     resolved_model: str = DEFAULT_MODEL
+    resolved_phase1_model: str = DEFAULT_MODEL
     green_run_block: str | None = None
     green_run_sha: str | None = None
     auto_green_run_sha: str | None = None
@@ -5581,6 +6736,11 @@ class _AuditContext:
     work_item: dict = field(default_factory=dict)
     children: list = field(default_factory=list)
     description: str = ""
+    comments: list = field(default_factory=list)
+    """Top-level ``comments`` from the ``wl show --json`` payload. ``wl show``
+    returns comments beside ``workItem`` (not nested under it), so the fetch
+    phase binds them explicitly for the merge gate's evidence resolution
+    (SA-0MTQAF62U0085BEV)."""
     acs: list = field(default_factory=list)
     content_fingerprint: str | None = None
     cq_findings: list = field(default_factory=list)
@@ -5597,11 +6757,744 @@ class _AuditContext:
     audit_verdict: str | None = None
     audit_completed: bool = False
 
+    # Merge gate state (SA-0MT456M27001LRTL — Phase 1 merge gate)
+    merge_gate_merged: bool = False
+    """True when the merge gate confirmed (or integrated) the item into dev."""
+    merge_gate_evidence: str = ""
+    """Human-readable evidence of the merge gate result."""
+    merge_gate_blocker: str = ""
+    """Non-empty when the merge gate blocked (integration failed)."""
+    merge_gate_stale: bool = False
+    """True when the merge gate confirmed the item in origin/dev but the
+    local audit base (HEAD) does NOT contain the delivered work — auditing
+    would run against a stale tree and produce a misleading verdict
+    (SA-0MT9EK1UU000DT1R)."""
+    merge_gate_stale_reason: str = ""
+    """Human-readable reason for a stale audit base (missing delivered
+    commits, resolved HEAD, remediation)."""
+    merge_gate_pushed_sha: str = ""
+    """The exact commit sha the merge gate pushed to origin/dev during
+    integration. Cherry-pick integration creates NEW shas; captured so the
+    stale-audit-base guard can verify the delivered commit against local
+    HEAD."""
+
     def record_script_failure(self, script_name: str, exc: Exception) -> None:
         """Record a script execution failure (first failure wins)."""
         if self.script_failure is not None:
             return
         self.script_failure = _format_script_failure(script_name, exc)
+
+
+def _commit_object_exists(ctx: _AuditContext, sha: str) -> bool:
+    """True when *sha* resolves to a commit object in the owning repo.
+
+    Foreign hex cited in prose (upstream pins, URL fragments, decimal
+    fractions) is not an object in the owning repo. Treating it as a
+    cherry-pick candidate produced ``fatal: bad object`` and a spurious
+    merge-gate block (SA-0MTQAF62U0085BEV AC2). Git errors fail open (the
+    sha is kept) so a transient git failure never silently drops a real
+    candidate.
+    """
+    try:
+        proc = ctx.runner(
+            ["git", "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"]
+        )
+    except Exception:  # noqa: BLE001 -- fail open; never drop on error
+        return True
+    return getattr(proc, "returncode", 1) == 0
+
+
+def _bind_fetched_item(ctx: _AuditContext, data: dict) -> None:
+    """Bind a ``wl show --children --json`` payload onto *ctx*.
+
+    ``wl show --json`` returns ``comments`` at the TOP level of the payload
+    (beside ``workItem``), not nested under ``workItem``; binding it
+    explicitly keeps the merge gate's comment-referenced evidence reachable
+    (SA-0MTQAF62U0085BEV AC1/AC4). The binding lives in the audit runner
+    only — ``wl show`` clients are unaffected (AC4).
+    """
+    payload = data or {}
+    work_item = payload.get("workItem", {}) or {}
+    ctx.work_item = work_item
+    ctx.children = payload.get("children", []) or []
+    ctx.description = work_item.get("description", "") or ""
+    ctx.comments = payload.get("comments", []) or []
+
+
+def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], str]:
+    """Resolve the work item's integration evidence (generic; never hardcoded).
+
+    Returns ``(commits, branch)`` where *commits* is the list of candidate
+    commit shas referenced by the item (description / comments / a gate item
+    recorded one level up, plus any feature worktree HEADs) and *branch* is
+    the matching feature branch name (``wl-<id>-*``) or ``""`` when no
+    feature branch exists. Resolution derives from the item — never a
+    hardcoded commit or repo (SA-0MT456M27001LRTL AC1).
+
+    Evidence sources:
+    1. Feature worktree branches in the owning repo matching
+       ``wl-<id>-*`` / ``wl-<id>-<slug>`` (the implement-skill convention;
+       worktrees live under ``<owning>/.worklog/worktrees/`` but the branch
+       name is resolvable from the repo).
+    2. Commit shas referenced in the item's description and comments
+       (full 40-hex or short 7+ hex shas).
+    3. If the item references a gate item recorded one level up (a generic
+       gate work item whose description names ``<id>``), that gate's
+       description is scanned for commit shas too.
+    """
+    issue_id = ctx.issue_id
+    owning_root = Path(ctx.owning_root) if ctx.owning_root else None
+    commits: list[str] = []
+    seen: set[str] = set()
+    branch = ""
+
+    def _add_sha(candidate: str) -> None:
+        m = re.fullmatch(r"[0-9a-f]{7,40}", candidate.strip().lower())
+        if m and candidate.strip() not in seen:
+            seen.add(candidate.strip())
+            commits.append(candidate.strip().lower())
+
+    # 1. Feature branch via repo refs (wl-<id>-*) in the owning repo.
+    #    Parsing is defensive: only ref names that match the implement-skill
+    #    convention (``wl-<issue_id>-...``) and full hex-sha object names are
+    #    accepted — mocked/garbage git output (e.g. ``{"success": ...}``)
+    #    is never treated as a branch or commit. Commands are PLAIN git
+    #    invocations: the cwd-aware runner (already wrapped in
+    #    ``_phase_gate``) injects ``git -C <owning_root>`` only when the
+    #    launch cwd differs from the owning repo (SA-0MSLLGDW00098UCC) —
+    #    owning-root launches stay byte-identical.
+    if owning_root is not None:
+        try:
+            proc = ctx.runner([
+                "git", "for-each-ref",
+                "--format=%(refname:short) %(objectname)",
+                f"refs/heads/wl-{issue_id}-*",
+            ])
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    parts = line.strip().split(" ", 1)
+                    if len(parts) != 2:
+                        continue
+                    ref_name, obj_name = parts[0], parts[1].strip()
+                    if ref_name.startswith(f"wl-{issue_id}-") and re.fullmatch(
+                        r"[0-9a-f]{40}", obj_name.lower()
+                    ):
+                        branch = branch or ref_name
+                        _add_sha(obj_name)
+        except Exception:  # noqa: S110, BLE001 -- best-effort; never fail the gate on ref resolution
+            pass
+
+    # 2. Commits referenced in the item's description + comments. The
+    #    work item is already fetched (``_phase_fetch_and_cq`` runs the
+    #    merge gate after the fetch, before any Phase 1 screening), so no
+    #    extra ``wl show`` is issued here.
+    desc = ctx.description or ""
+    for m in re.finditer(r"\b[0-9a-f]{7,40}\b", desc, re.IGNORECASE):
+        _add_sha(m.group(0))
+    # ``wl show --json`` returns comments at the TOP level of the payload, not
+    # under ``workItem``; prefer the explicitly-bound ``ctx.comments``,
+    # falling back to a work-item-nested list for callers that pass one
+    # (SA-0MTQAF62U0085BEV AC1).
+    comment_list = ctx.comments or (ctx.work_item.get("comments", []) or [])
+    for comment in comment_list:
+        text = comment.get("comment", "") or ""
+        for m in re.finditer(r"\b[0-9a-f]{7,40}\b", text, re.IGNORECASE):
+            _add_sha(m.group(0))
+
+    # Drop hex tokens that are not commit objects in the owning repo
+    # (upstream pins, URL fragments, decimal fractions): cherry-picking them
+    # fails with ``fatal: bad object`` and blocks the gate spuriously
+    # (SA-0MTQAF62U0085BEV AC2). Fail-open when the owning repo is unknown —
+    # integration is not attempted in that case anyway.
+    if owning_root is not None and commits:
+        commits = [c for c in commits if _commit_object_exists(ctx, c)]
+
+    return commits, branch
+
+
+def _verify_merged_in_dev(ctx: _AuditContext,
+                          commits: list[str],
+                          branch: str) -> tuple[bool, str, bool]:
+    """Verify whether the item's work is merged into the owning repo's origin/dev.
+
+    Performs ``git merge-base --is-ancestor <commit> origin/dev`` for each
+    candidate commit (or confirms the feature branch is contained in dev).
+    Returns ``(merged, evidence, baseline_ok)`` where *baseline_ok* is False
+    when neither ``origin/dev`` nor a local ``dev`` branch exists in the
+    owning repo (no dev baseline to be missing from — the caller treats that
+    as non-blocking, never an integration trigger). Any commit verified as
+    an ancestor of origin/dev makes the item merged; the full command +
+    result are recorded as audit evidence (SA-0MT456M27001LRTL AC1).
+
+    Commands are PLAIN git invocations: the cwd-aware runner (wrapped in
+    ``_phase_gate``) injects ``git -C <owning_root>`` only when the launch
+    cwd differs from the owning repo (SA-0MSLLGDW00098UCC) — owning-root
+    launches stay byte-identical (no -C injection).
+
+    Never raises: git failures are recorded in the evidence string, never
+    propagated (the caller decides how to proceed — a failure to VERIFY is
+    not necessarily a failure to INTEGRATE, but push-back stays local).
+    """
+    owning_root = Path(ctx.owning_root) if ctx.owning_root else None
+    if owning_root is None:
+        return False, "Merge gate: owning repo undeterminable — cannot verify merged state.", False
+
+    evidence_lines: list[str] = []
+    candidates: list[tuple[str, str]] = [("branch", branch)] if branch else []
+    candidates += [("commit", c) for c in commits]
+    if not candidates:
+        return False, (
+            "Merge gate: no commits/branch resolved for the item — cannot "
+            "verify merged state; treating as not verified."
+        ), False
+
+    # Ensure origin/dev is available locally (fail-open: fetch may be
+    # unavailable in read-only contexts — the ancestor check then fails
+    # closed against the local ref).
+    try:
+        proc = ctx.runner(["git", "fetch", "origin", "dev"])
+        if proc.returncode != 0:
+            evidence_lines.append(
+                f"git fetch origin dev failed (rc={proc.returncode}) — "
+                "checking against local origin/dev ref."
+            )
+    except Exception as exc:  # noqa: BLE001
+        evidence_lines.append(f"git fetch origin dev error: {exc} — using local origin/dev.")
+
+    # Baseline check: a repo with NO dev ref at all (no origin/dev, no
+    # local dev) has no integration target — the gate records the fact and
+    # treats it as non-blocking rather than fabricating an integration
+    # trigger (the owning repo may never have been pushed to dev).
+    baseline_ok = False
+    for ref in ("origin/dev", "dev"):
+        try:
+            proc = ctx.runner(["git", "rev-parse", "--verify", "--quiet", ref])
+            if proc.returncode == 0:
+                baseline_ok = True
+                break
+        except Exception:  # noqa: S112, BLE001 -- best-effort; swallow to stay fail-open
+            continue
+    if not baseline_ok:
+        evidence_lines.append(
+            "No dev baseline: neither origin/dev nor a local dev branch "
+            "exists in the owning repo — cannot verify merge status; "
+            "treating as non-blocking (no dev target to be missing from)."
+        )
+        return False, "\n".join(evidence_lines), False
+
+    for kind, candidate in candidates:
+        check = ["git", "merge-base", "--is-ancestor",
+                 candidate, "origin/dev"]
+        label = (
+            f"feature branch {candidate} contained in origin/dev"
+            if kind == "branch"
+            else f"commit {candidate} ancestor of origin/dev"
+        )
+        try:
+            proc = ctx.runner(check)
+            result = "yes" if proc.returncode == 0 else "no"
+            evidence_lines.append(
+                f"git merge-base --is-ancestor {candidate} origin/dev -> {result} "
+                f"({label}; rc={proc.returncode})"
+            )
+            if result == "yes":
+                return True, "\n".join(evidence_lines), True
+        except Exception as exc:  # noqa: BLE001 -- record and continue
+            evidence_lines.append(
+                f"merge-base check for {candidate} failed: {exc}"
+            )
+    return False, "\n".join(evidence_lines), True
+
+
+def _integrate_into_dev(ctx: _AuditContext,
+                        commits: list[str],
+                        branch: str) -> tuple[bool, str]:
+    """Integrate the item's commits into the owning repo's dev (never main).
+
+    Strategy (deterministic, order matters):
+    1. Fresh worktree at ``origin/dev`` HEAD (isolation; never the main
+       checkout).
+    2. Integrate the commits: if a feature branch exists and is not empty,
+       replay it onto origin/dev (merge --no-ff of the branch). Otherwise
+       cherry-pick each candidate commit (or the amalgamated diff).
+    3. Build the project (matching the implement skill's build step), run
+       the project test suite (via the test skill's runner), then push
+       ``HEAD:refs/heads/dev``.
+
+    Returns ``(ok, evidence)``. On any failure the audit does NOT proceed
+    past Phase 1 (the caller emits "Ready to close: No").
+    """
+    owning_root = Path(ctx.owning_root) if ctx.owning_root else None
+    if owning_root is None:
+        return False, "Integration failed: owning repo undeterminable."
+
+    evidence: list[str] = []
+    worktree_path = owning_root / ".worklog" / "worktrees" / f"audit-merge-{ctx.issue_id}"
+    try:
+        # Fresh worktree from origin/dev (isolation; deterministic base).
+        # Repo-level commands are PLAIN git (the cwd-aware runner resolves
+        # them against the owning repo); worktree-scoped commands carry
+        # explicit ``-C <worktree_path>`` (absolute) so they operate on the
+        # integration worktree regardless of launch cwd.
+        proc = ctx.runner(["git", "fetch", "origin", "dev"])
+        evidence.append(f"git fetch origin dev -> rc={proc.returncode}")
+        if proc.returncode != 0:
+            return False, "\n".join(evidence) + "\nIntegration failed: could not fetch origin/dev."
+
+        proc = ctx.runner(["git", "rev-parse", "--verify", "origin/dev"])
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return False, "\n".join(evidence) + "\nIntegration failed: origin/dev unresolvable."
+        dev_sha = proc.stdout.strip()
+        evidence.append(f"origin/dev resolved to {dev_sha}")
+
+        if worktree_path.exists():
+            ctx.runner(["git", "worktree", "remove", "--force", str(worktree_path)])
+        try:
+            proc = ctx.runner(["git", "worktree", "add", "--detach", str(worktree_path), dev_sha])
+        except Exception as exc:  # noqa: BLE001
+            evidence.append(f"worktree add failed: {exc}")
+            return False, "\n".join(evidence) + "\nIntegration failed: could not create worktree."
+        if proc.returncode != 0:
+            evidence.append(f"worktree add rc={proc.returncode}: {proc.stderr.strip()}")
+            return False, "\n".join(evidence) + "\nIntegration failed: could not create worktree."
+        evidence.append(f"worktree created at {worktree_path} (detached at {dev_sha})")
+
+        # Integrate the item's commits onto dev.
+        sources: list[str] = []
+        if branch:
+            sources.append(branch)
+        sources += commits
+        if not sources:
+            return False, "\n".join(evidence) + "\nIntegration failed: no commits/branch to integrate."
+        if branch:
+            proc = ctx.runner(["git", "-C", str(worktree_path),
+                               "merge", "--no-ff", "--no-edit", branch])
+            evidence.append(f"git merge --no-ff {branch} -> rc={proc.returncode}")
+            if proc.returncode != 0:
+                evidence.append(proc.stderr.strip())
+                return False, "\n".join(evidence) + "\nIntegration failed: merge conflicts/unresolvable."
+        else:
+            # Cherry-pick only the candidates NOT already merged into dev: a
+            # description-referenced commit may already be an ancestor of
+            # origin/dev (e.g. another item's commit cited as context) —
+            # cherry-picking it would recreate/reject it. Skipping merged
+            # commits keeps the integration minimal and deterministic
+            # (SA-0MT456M27001LRTL AC1/AC2).
+            for commit in commits:
+                merged_proc = ctx.runner(["git", "-C", str(worktree_path),
+                                          "merge-base", "--is-ancestor",
+                                          commit, "origin/dev"])
+                if merged_proc.returncode == 0:
+                    evidence.append(f"commit {commit} already in origin/dev — skipped")
+                    continue
+                proc = ctx.runner(["git", "-C", str(worktree_path),
+                                   "cherry-pick", commit])
+                evidence.append(f"git cherry-pick {commit} -> rc={proc.returncode}")
+                if proc.returncode != 0:
+                    evidence.append(proc.stderr.strip())
+                    return False, "\n".join(evidence) + "\nIntegration failed: cherry-pick conflicts."
+
+        # Build + test (build → test → commit order per AGENTS.md).
+        # node_modules is shared via symlink (implement-skill convention,
+        # SA-0MSGS763C006SM1B): never npm-install inside a worktree.
+        if (owning_root / "node_modules").exists() and not (worktree_path / "node_modules").exists():
+            try:
+                (worktree_path / "node_modules").symlink_to(
+                    owning_root / "node_modules", target_is_directory=True
+                )
+                evidence.append("node_modules symlinked into integration worktree")
+            except OSError as exc:
+                evidence.append(f"node_modules symlink failed: {exc} (best-effort)")
+        build_cmd = ["npm", "run", "build"]
+        try:
+            proc = ctx.runner(["bash", "-lc", "cd " + str(worktree_path) + " && " + " ".join(build_cmd)])
+        except Exception as exc:  # noqa: BLE001
+            evidence.append(f"build error: {exc}")
+            return False, "\n".join(evidence) + "\nIntegration failed: build error."
+        if proc.returncode != 0:
+            evidence.append(f"npm run build -> rc={proc.returncode}")
+            evidence.append(proc.stderr[-2000:])
+            return False, "\n".join(evidence) + "\nIntegration failed: build failed."
+        evidence.append("npm run build -> rc=0")
+
+        try:
+            from test.scripts.run_tests import run_suite
+        except ImportError:
+            run_suite = None
+        if run_suite is not None:
+            suite_result = run_suite("all", cwd=worktree_path, use_cache=False)
+            test_rc = suite_result.get("returncode", 1)
+            evidence.append(f"project test suite ('all') -> rc={test_rc}")
+            if not suite_result.get("success", False):
+                return False, "\n".join(evidence) + "\nIntegration failed: test suite failed."
+        else:
+            # Fallback: run pytest/node suite commands if the test-skill
+            # runner is unavailable; best-effort.
+            proc = ctx.runner(["bash", "-lc", "cd " + str(worktree_path) + " && (pytest -q || true)"])
+            evidence.append(f"fallback pytest -> rc={proc.returncode}")
+
+        # Push the integrated HEAD to dev (never main).
+        proc = ctx.runner(["git", "-C", str(worktree_path),
+                           "push", "origin", "HEAD:refs/heads/dev"])
+        evidence.append(f"git push origin HEAD:refs/heads/dev -> rc={proc.returncode}")
+        if proc.returncode != 0:
+            evidence.append(proc.stderr[-2000:])
+            return False, "\n".join(evidence) + "\nIntegration failed: push to dev failed."
+
+        pushed_sha = ""
+        proc = ctx.runner(["git", "-C", str(worktree_path), "rev-parse", "HEAD"])
+        if proc.returncode == 0:
+            pushed_sha = proc.stdout.strip()
+            evidence.append(f"integrated commit {pushed_sha} pushed to origin/dev")
+        # Capture the pushed sha (cherry-pick integration creates NEW shas)
+        # so the stale-audit-base guard can verify it against local HEAD
+        # (SA-0MT9EK1UU000DT1R).
+        ctx.merge_gate_pushed_sha = pushed_sha
+
+        # Post-merge verification: the pushed commit must be an ancestor
+        # of origin/dev (AC2).
+        ok, verify_evidence, _baseline = _verify_merged_in_dev(ctx, [pushed_sha], "")
+        evidence.append("Post-merge verification:\n" + verify_evidence)
+        return ok, "\n".join(evidence)
+    finally:
+        try:
+            ctx.runner(["git", "worktree", "remove", "--force", str(worktree_path)])
+        except Exception:  # noqa: S110, BLE001 -- cleanup best-effort
+            pass
+
+
+def _audit_base_freshness(ctx: _AuditContext,
+                          commits: list[str],
+                          branch: str) -> tuple[bool, str, list[str], str | None]:
+    """Verify the local audit base (HEAD) contains the item's delivered work.
+
+    The merge gate confirms the item's commits ARE in origin/dev, but the
+    audit resolves ALL git-derived content (HEAD sha, file-scope manifest,
+    changed files, repo index, working-tree hash, green-run attestation)
+    against the local checkout at the launch cwd. When that checkout is
+    stale — HEAD behind origin/dev, lacking the delivered commits — Phase 1/2
+    silently run against a tree WITHOUT the fix and produce misleading
+    "unmet"/"partial" verdicts (stale-audit reports observed on
+    SA-0MSUZAJPC003BS66 and SA-0MSN2ULOF007JJ35, both audited from a local
+    dev at 030debfd while origin/dev was at ddc6f6f5).
+
+    Returns ``(fresh, evidence, missing_commits, head_sha)``:
+      - *fresh*: True when every delivered commit (an ancestor of
+        ``origin/dev``) is also an ancestor of the local ``HEAD`` — the
+        audit base contains the delivered state.
+      - *evidence*: per-commit command + result lines (mirrors
+        ``_verify_merged_in_dev``'s style) plus the resolved HEAD.
+      - *missing_commits*: the delivered commits absent from local HEAD.
+      - *head_sha*: ``git rev-parse HEAD`` (display only; None on failure).
+
+    Never raises: git failures are recorded as evidence, never propagated.
+    Fail-open semantics: a candidate that is NOT an ancestor of origin/dev
+    (e.g. an unrelated/context citation, or an unresolvable sha) is skipped;
+    candidates whose presence in HEAD cannot be verified due to a git error
+    are treated as present. The guard only flags the deterministic
+    stale-checkout case (delivered on origin/dev, absent from HEAD).
+    """
+    evidence: list[str] = []
+    missing: list[str] = []
+
+    head_sha = _resolve_audited_head(ctx.runner)
+    if head_sha:
+        evidence.append(f"local audit base HEAD resolved to {head_sha}")
+    else:
+        evidence.append("local audit base HEAD could not be resolved")
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in list(commits) + (
+        [ctx.merge_gate_pushed_sha] if ctx.merge_gate_pushed_sha else []
+    ):
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        # Delivered? (ancestor of origin/dev). Commands are PLAIN git
+        # invocations: the cwd-aware runner (already wrapped in
+        # ``_phase_gate``) injects ``git -C <owning_root>`` when the launch
+        # cwd differs from the owning repo (SA-0MSLLGDW00098UCC).
+        try:
+            delivered = ctx.runner(["git", "merge-base", "--is-ancestor",
+                                    candidate, "origin/dev"])
+        except Exception as exc:  # noqa: BLE001 -- fail-open, record only
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} origin/dev -> "
+                f"error ({exc}) — skipping (fail-open)"
+            )
+            continue
+        if delivered.returncode != 0:
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} origin/dev -> no "
+                "(not part of the delivered state; skipping staleness check)"
+            )
+            continue
+        evidence.append(
+            f"git merge-base --is-ancestor {candidate} origin/dev -> yes "
+            "(delivered)"
+        )
+        try:
+            present = ctx.runner(["git", "merge-base", "--is-ancestor",
+                                  candidate, "HEAD"])
+        except Exception as exc:  # noqa: BLE001 -- fail-open, record only
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} HEAD -> error "
+                f"({exc}) — treating as present (fail-open)"
+            )
+            continue
+        if present.returncode != 0:
+            missing.append(candidate)
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} HEAD -> no "
+                "(delivered commit NOT in the audit base: STALE)"
+            )
+        else:
+            evidence.append(
+                f"git merge-base --is-ancestor {candidate} HEAD -> yes "
+                "(audit base contains the delivered commit)"
+            )
+
+    if not candidates:
+        evidence.append(
+            "no delivered-commit candidates — nothing to verify (fail-open)"
+        )
+
+    return not missing, "\n".join(evidence), missing, head_sha
+
+
+def _audit_base_freshness_guard_passes(ctx: _AuditContext,
+                                       commits: list[str],
+                                       branch: str) -> bool:
+    """Run the stale-audit-base guard; returns True to proceed.
+
+    Appends the freshness evidence to the merge-gate evidence. When the
+    local audit base lacks the item's delivered work, marks the gate stale
+    (``ctx.merge_gate_stale`` + reason) so cmd_issue aborts loudly BEFORE
+    Phase 1/2 — the run never produces a misleading verdict against a stale
+    tree (SA-0MT9EK1UU000DT1R).
+    """
+    fresh, freshness_evidence, missing, head_sha = _audit_base_freshness(
+        ctx, commits, branch,
+    )
+    ctx.merge_gate_evidence += (
+        "\nAudit-base freshness check (stale-audit guard):\n"
+        + freshness_evidence
+    )
+    if fresh:
+        return True
+    ctx.merge_gate_stale = True
+    ctx.merge_gate_stale_reason = (
+        "The item's delivered work IS merged into the owning repo's "
+        "origin/dev, but the local checkout the audit resolves its git "
+        "scope against (HEAD "
+        f"{head_sha or '<unresolved>'}) does NOT contain the delivered "
+        "commit(s): "
+        + ", ".join(missing)
+        + ". The audit would run against a stale tree and report "
+        "misleading verdicts."
+    )
+    print(
+        f"Audit base STALE for {ctx.issue_id} — refusing to audit a stale "
+        "tree; run `git fetch origin && git pull origin dev` in the owning "
+        "project's main checkout (or launch the audit from a checkout "
+        "containing the delivered commit) and re-run.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _phase_merge_gate(ctx: _AuditContext) -> int | None:
+    """Phase 1 (very start) — merge gate (SA-0MT456M27001LRTL).
+
+    Guarantees the item being audited is integrated into its owning repo's
+    ``dev`` branch BEFORE any other Phase 1 screening (code-quality scan,
+    children-stage check, surface AC assessment). Verifies ancestor/merge
+    status of the item's commits / ``wl-<id>-*`` branch against
+    ``origin/dev``; integrates when missing; fails closed with
+    "Ready to close: No" when integration cannot complete.
+
+    Returns None when the gate passes (work merged or never resolvable —
+    see below) or when integration succeeded; returns 1 when integration
+    is REQUIRED but FAILED (the audit must fail with "Ready to close: No"
+    + needs-producer-review — AC3, never proceeds past Phase 1 with
+    unmerged work). A gate with no resolvable evidence is NOT a blocker:
+    the item may have no code changes at all (docs-only, no feature
+    branch, no commits referenced) — verification degrades to a recorded
+    "no evidence" note and the audit proceeds normally (fail-open for
+    evidence-less items, fail-closed for evidence that exists but is
+    unintegrated and unintegratable).
+    """
+    issue_id = ctx.issue_id
+    json_mode = ctx.json_mode
+    commits: list[str] = []
+    branch = ""
+    try:
+        commits, branch = _resolve_item_integration_evidence(ctx)
+        merged, evidence, baseline_ok = _verify_merged_in_dev(ctx, commits, branch)
+        ctx.merge_gate_evidence = evidence
+        if merged:
+            ctx.merge_gate_merged = True
+            ctx.merge_gate_evidence += "\nMerge gate: item work verified merged into origin/dev."
+            print(
+                f"Merge gate OK: {issue_id} work present in origin/dev "
+                f"(branch={branch or 'none'}, commits={commits})",
+                file=sys.stderr,
+            )
+            # Stale-audit-base guard (SA-0MT9EK1UU000DT1R): the work is on
+            # origin/dev, but ALL git-derived audit content resolves against
+            # the LOCAL checkout — if it lacks the delivered commits the
+            # audit would run against a stale tree. Abort before Phase 1.
+            if not _audit_base_freshness_guard_passes(ctx, commits, branch):
+                return 1
+            return None
+
+        # No positive verification. If NO evidence at all was resolvable,
+        # the item may be a docs/admin item with no code changes — proceed
+        # (recorded as a note, never a false blocker). Likewise a missing
+        # dev baseline (no origin/dev and no local dev in the owning repo)
+        # is NOT an integration trigger: there is no dev branch the work
+        # could be missing from. Integration is mandatory only when evidence
+        # EXISTS and a dev baseline EXISTS (fail-open for evidence-less or
+        # baseline-less items, fail-closed for evidence that is unintegrated
+        # and unintegratable).
+        if (not commits and not branch) or not baseline_ok:
+            if not commits and not branch:
+                reason = "no commits/branch resolvable for this item"
+            else:
+                reason = (
+                    "no dev baseline in owning repo "
+                    "(no origin/dev, no local dev)"
+                )
+            ctx.merge_gate_evidence += (
+                f"\nMerge gate: {reason} — no code changes to integrate; "
+                "proceeding with audit (not a merge-gate blocker)."
+            )
+            if json_mode:
+                print(json.dumps({
+                    "merge_gate": {"merged": False, "blocker": False,
+                                   "reason": reason}
+                }), file=sys.stderr)
+            return None
+
+        # Evidence exists but is NOT merged — integration is mandatory.
+        print(
+            f"Merge gate: {issue_id} work NOT present in origin/dev — "
+            f"integrating (branch={branch or 'none'}, commits={commits})",
+            file=sys.stderr,
+        )
+        ok, integ_evidence = _integrate_into_dev(ctx, commits, branch)
+        ctx.merge_gate_evidence += "\n" + integ_evidence
+        if ok:
+            ctx.merge_gate_merged = True
+            ctx.merge_gate_evidence += (
+                "\nMerge gate: integration completed; item work now present "
+                "in origin/dev (post-merge verification above)."
+            )
+            # Stale-audit-base guard (SA-0MT9EK1UU000DT1R): integration
+            # pushed to origin/dev, but the LOCAL audit base is unchanged —
+            # if it lacks the delivered work, abort before Phase 1/2.
+            if not _audit_base_freshness_guard_passes(ctx, commits, branch):
+                return 1
+            return None
+
+        # Integration failed — the audit must fail closed (AC3).
+        ctx.merge_gate_blocker = (
+            "Merge gate: work item changes are NOT merged into the owning "
+            f"repo's dev and integration FAILED. Evidence:\n{integ_evidence}"
+        )
+        if json_mode:
+            print(json.dumps({
+                "merge_gate": {"merged": False, "blocker": True,
+                               "reason": integ_evidence}
+            }), file=sys.stderr)
+        else:
+            print(
+                f"Merge gate FAILED: {issue_id} work could not be integrated "
+                f"into origin/dev — audit cannot proceed past Phase 1. "
+                f"Reason: {integ_evidence}",
+                file=sys.stderr,
+            )
+        return 1
+    except Exception as exc:  # noqa: BLE001 -- the gate must never crash the audit
+        # Any unexpected error. If evidence WAS resolved (commits/branch)
+        # but verification/integration crashed, the work is unmerged and
+        # unintegratable → fail closed (AC3). Fail-open only when no
+        # evidence could be resolved at all (docs/admin items with no code
+        # changes — a blocker cannot be fabricated from nothing).
+        ctx.record_script_failure("merge gate", exc)
+        ctx.merge_gate_evidence += f"\nMerge gate error: {exc}"
+        if commits or branch:
+            ctx.merge_gate_blocker = (
+                "Merge gate: work item changes are NOT merged into the "
+                f"owning repo's dev and integration FAILED (unexpected error: "
+                f"{exc}; branch={branch or 'none'}, commits={commits}). "
+                "The audit cannot proceed past Phase 1 with unmerged work."
+            )
+            print(
+                f"Merge gate FAILED: {issue_id} work could not be verified/"
+                f"integrated into origin/dev — audit cannot proceed past "
+                f"Phase 1. Error: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        return None
+
+
+def _build_merge_gate_failure_report(ctx: _AuditContext) -> str:
+    """Build a minimal audit report for a blocked merge gate (AC3).
+
+    Produces a report that parses as "Ready to close: No" with clear
+    merge gate evidence. The report is minimal — it does not attempt
+    code-quality scanning or AC screening when integration failed —
+    but it satisfies the persistence contract (``Ready to close:``
+    line, issue identity, parseable JSON verdict array).
+    """
+    issue_id = ctx.issue_id
+    work_item = ctx.work_item
+    title = work_item.get("title", issue_id)
+    blocker = ctx.merge_gate_blocker
+
+    verdict_json = json.dumps({
+        "verdict": "no",
+        "evidence": blocker,
+        "extracted_text": "",
+    }, indent=2)
+
+    lines = [
+        f"# Audit Report — {title} ({issue_id})",
+        "",
+        "Ready to close: No",
+        "",
+        "## Summary",
+        "",
+        "Phase 1 merge gate blocked: the work item's changes are not ",
+        "merged into the owning repository's ``dev`` branch, and ",
+        "integration failed. The audit cannot proceed past Phase 1 ",
+        "with unmerged work.",
+        "",
+        "## Merge Gate (Phase 1)",
+        "",
+        "**Status:** Blocked",
+        "",
+        "**Evidence:**",
+        "",
+        "```",
+        blocker,
+        "```",
+        "",
+        "## Acceptance Criteria Status",
+        "",
+        "| # | Criterion | Verdict | Evidence |",
+        "|---|-----------|---------|----------|",
+        "| 1 | Merge gate (Phase 1) | unmet | Merge gate blocked: ",
+        "integration failed — see evidence above. |",
+        "",
+        verdict_json,
+    ]
+    return "\n".join(lines)
 
 
 def _phase_gate(ctx: _AuditContext) -> int | None:
@@ -5660,6 +7553,14 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     config = _load_config()
     resolved_model = _resolve_model_for_phase(
         AUDIT_PHASE, config, model_source, cli_model=model,
+    )
+    # Tiered Phase 1 model (SA-0MSKB697P000T3HG): Phase 1 parent + child AC
+    # screening resolves model.audit_phase1 (fast/cheap), falling back to the
+    # full audit model when absent; Phase 2 deep analysis keeps model.audit.
+    phase1_model = _resolve_phase1_model(
+        config, model_source, cli_model=model,
+        cli_phase1_model=ctx.phase1_model,
+        full_model=resolved_model,
     )
 
     if runner is None:
@@ -5771,7 +7672,23 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
                                               worklog_dir=worklog_dir,
                                               work_item=wi)
         if fresh_report is not None:
-            print("Skipping: audit still fresh")
+            # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
+            # the fresh audit so a redundant re-audit is stopped before the
+            # model is invoked (re-audit coordination, SA-0MSQIA84B005NHWC).
+            # The full report still follows so the operator can inspect the
+            # evidence that produced the verdict.
+            audited_at = _fetch_audited_at(
+                runner, issue_id, worklog_dir=worklog_dir,
+            )
+            verdict = _parse_ready_to_close(fresh_report)
+            verdict_label = "Yes" if verdict == "yes" else "No"
+            notice = (
+                f"Skipping: audit still fresh — Ready to close: "
+                f"{verdict_label}"
+            )
+            if audited_at:
+                notice += f" (audited {audited_at})"
+            print(notice)
             print(fresh_report)
             return 0
 
@@ -5861,6 +7778,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
     ctx.resolved_model = resolved_model
+    ctx.resolved_phase1_model = phase1_model
     ctx.green_run_block = green_run_block
     ctx.green_run_sha = green_run_sha
     ctx.auto_green_run_sha = auto_green_run_sha
@@ -5966,17 +7884,45 @@ def _fp_classification_for(finding: dict, fp_screen_results: list[dict]) -> str 
     return None
 
 
+def _resolve_fp_screen_batch_size() -> int:
+    """Resolve the false-positive screen batch size from the env var.
+
+    Defaults to ``FP_SCREEN_BATCH_SIZE_DEFAULT`` (500); invalid values
+    (non-int, zero, negative) are ignored with a warning and the default
+    is used (SA-0MSYPAV1R000SMHK AC2).
+    """
+    try:
+        value = int(os.environ.get(FP_SCREEN_BATCH_SIZE_ENV, ""))
+    except (TypeError, ValueError):
+        return FP_SCREEN_BATCH_SIZE_DEFAULT
+    if value <= 0:
+        print(
+            f"Warning: {FP_SCREEN_BATCH_SIZE_ENV}={value!r} is not a "
+            f"positive integer; using default batch size "
+            f"{FP_SCREEN_BATCH_SIZE_DEFAULT}.",
+            file=sys.stderr,
+        )
+        return FP_SCREEN_BATCH_SIZE_DEFAULT
+    return value
+
+
 def _screen_ruff_findings(issue_id: str, findings: list[dict],
                           pi_bin: str, resolved_model: str,
                           debug_log: str | None, timeout: int | None,
-                          ac_fallback_used: threading.Event) -> list[dict]:
+                          ac_fallback_used: threading.Event,
+                          priority: int | None = None) -> list[dict]:
     """Model-judged false-positive screen over ruff findings (F1 scope).
 
-    Classifies each ruff finding via a SINGLE batched Pi call
+    Classifies each ruff finding via one or more batched Pi calls
     (``FP_SCREEN_CONTEXT``); non-ruff findings are never sent to the screen.
     Returns one entry per ruff finding (see ``_parse_fp_screen_response``
     for the schema) or ``[]`` when there are no ruff findings — the screen
     is skipped entirely, so zero Pi calls happen (T1 AC3).
+
+    When the ruff finding set exceeds ``FP_SCREEN_BATCH_SIZE_DEFAULT``
+    (configurable via ``AUDIT_FP_SCREEN_BATCH_SIZE``), findings are
+    chunked into bounded batches so no single Pi invocation exceeds the
+    OS ``ARG_MAX`` limit (SA-0MSYPAV1R000SMHK AC1/AC2).
 
     Caution-first degradation (T1 AC2): a provider error, timeout,
     concurrency-limit marker, unparseable output, or RuntimeError from the
@@ -5989,18 +7935,10 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
     if not ruff_findings:
         return []
 
-    finding_list_json = json.dumps([
-        {
-            "index": i,
-            "file": f.get("file", "?"),
-            "line": f.get("line", 0),
-            "severity": f.get("severity", "?"),
-            "code": f.get("code", "?"),
-            "message": f.get("message", ""),
-        }
-        for i, f in enumerate(ruff_findings)
-    ])
-    prompt = (
+    batch_size = _resolve_fp_screen_batch_size()
+
+    # Build the shared prompt preamble (constant across batches)
+    preamble = (
         "[READ-ONLY AUDIT] You are performing a read-only audit. "
         "Do NOT close, modify, or delete any work items; you MAY create "
         "a chore work item to track a false-positive finding (config-fix "
@@ -6016,53 +7954,147 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
         "(integer, matching the input), 'classification' (one of: "
         "genuine, confident-false-positive, uncertain) and 'justification' "
         "(a one-line written reason).\n\n"
-        f"Findings: {finding_list_json}"
     )
-    try:
-        result = _call_pi_and_maybe_log(
-            issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
-            pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
-            ac_fallback_used=ac_fallback_used, child_screen=True,
-        )
-    except RuntimeError as exc:
-        ac_fallback_used.set()
-        print(
-            f"Warning: Pi call failed for false-positive screen: {exc} — "
-            "all findings defaulted to uncertain (caution-first).",
-            file=sys.stderr,
-        )
-        entries, _ = _parse_fp_screen_response("", ruff_findings)
-        return entries
 
-    degraded = bool(
-        result.get("_provider_error")
-        or result.get("_timeout")
-        or result.get("_concurrency_timeout")
-    )
-    if degraded:
-        # Infra failure: _call_pi already set ac_fallback_used for
-        # timeout/concurrency/provider-error paths; belt-and-suspenders here.
-        ac_fallback_used.set()
-        print(
-            "Warning: false-positive screen degraded (provider error / timeout / "
-            "concurrency limit) — all findings defaulted to uncertain "
-            "(caution-first).",
-            file=sys.stderr,
-        )
-        entries, _ = _parse_fp_screen_response("", ruff_findings)
-        return entries
+    # Merge map: global_index -> parsed entry
+    merged: dict[int, dict] = {}
+    screen_failed = False
+    batch_count = 0
 
-    raw_text = result.get("extracted_text", "") or result.get("evidence", "") or ""
-    entries, failed = _parse_fp_screen_response(raw_text, ruff_findings)
-    if failed:
-        ac_fallback_used.set()
-        print(
-            "Warning: unparseable Pi output for false-positive screen — "
-            "all findings defaulted to uncertain (caution-first).",
-            file=sys.stderr,
+    for batch_start in range(0, len(ruff_findings), batch_size):
+        batch_end = min(batch_start + batch_size, len(ruff_findings))
+        batch = ruff_findings[batch_start:batch_end]
+
+        # Re-index within the batch (0 .. batch_size-1) for the model
+        finding_list_json = json.dumps([
+            {
+                "index": i,
+                "file": f.get("file", "?"),
+                "line": f.get("line", 0),
+                "severity": f.get("severity", "?"),
+                "code": f.get("code", "?"),
+                "message": f.get("message", ""),
+            }
+            for i, f in enumerate(batch)
+        ])
+        prompt = preamble + f"Findings: {finding_list_json}"
+
+        try:
+            result = _call_pi_and_maybe_log(
+                issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
+                pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
+                ac_fallback_used=ac_fallback_used, child_screen=True,
+                priority=priority,
+            )
+        except RuntimeError as exc:
+            screen_failed = True
+            ac_fallback_used.set()
+            print(
+                f"Warning: Pi call failed for false-positive screen batch "
+                f"{batch_start // batch_size + 1}: {exc} — all findings "
+                f"in this batch defaulted to uncertain (caution-first).",
+                file=sys.stderr,
+            )
+            # Degrade the entire batch
+            for i in range(batch_start, batch_end):
+                if i not in merged:
+                    merged[i] = {
+                        "index": i,
+                        "finding": ruff_findings[i],
+                        "classification": "uncertain",
+                        "justification": FP_SCREEN_FAILED_JUSTIFICATION,
+                        "remediable": False,
+                        "screen_failed": True,
+                    }
+            batch_count += 1
+            continue
+
+        degraded = bool(
+            result.get("_provider_error")
+            or result.get("_timeout")
+            or result.get("_concurrency_timeout")
         )
+        if degraded:
+            screen_failed = True
+            # Infra failure: _call_pi already set ac_fallback_used for
+            # timeout/concurrency/provider-error paths.
+            print(
+                f"Warning: false-positive screen batch {batch_start // batch_size + 1} "
+                f"degraded (provider error / timeout / concurrency limit) — "
+                f"all findings in this batch defaulted to uncertain "
+                f"(caution-first).",
+                file=sys.stderr,
+            )
+            for i in range(batch_start, batch_end):
+                if i not in merged:
+                    merged[i] = {
+                        "index": i,
+                        "finding": ruff_findings[i],
+                        "classification": "uncertain",
+                        "justification": FP_SCREEN_FAILED_JUSTIFICATION,
+                        "remediable": False,
+                        "screen_failed": True,
+                    }
+            batch_count += 1
+            continue
+
+        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or ""
+        batch_entries, batch_failed = _parse_fp_screen_response(raw_text, batch)
+        if batch_failed:
+            screen_failed = True
+            print(
+                "Warning: unparseable Pi output for false-positive screen "
+                f"batch {batch_start // batch_size + 1} — all findings in "
+                f"this batch defaulted to uncertain (caution-first).",
+                file=sys.stderr,
+            )
+            for i in range(batch_start, batch_end):
+                if i not in merged:
+                    merged[i] = {
+                        "index": i,
+                        "finding": ruff_findings[i],
+                        "classification": "uncertain",
+                        "justification": FP_SCREEN_FAILED_JUSTIFICATION,
+                        "remediable": False,
+                        "screen_failed": True,
+                    }
+        # Merge entries back using the global index
+        for entry in batch_entries:
+            global_idx = entry["index"] + batch_start
+            merged[global_idx] = {
+                "index": global_idx,
+                "finding": ruff_findings[global_idx],
+                "classification": entry["classification"],
+                "justification": entry["justification"],
+                "remediable": entry.get("remediable", False) and (
+                    ruff_findings[global_idx].get("severity") in ("critical", "high")
+                ),
+                "screen_failed": entry.get("screen_failed", False),
+            }
+        batch_count += 1
+
+    if screen_failed:
+        ac_fallback_used.set()
+
+    # Sort by global index and return
+    entries = [merged[i] for i in range(len(ruff_findings)) if i in merged]
+
+    if len(entries) != len(ruff_findings):
+        # Some findings are still missing (shouldn't happen, but safety net)
+        ac_fallback_used.set()
+        for i, f in enumerate(ruff_findings):
+            if i not in merged:
+                entries.append({
+                    "index": i,
+                    "finding": f,
+                    "classification": "uncertain",
+                    "justification": FP_SCREEN_MISSING_JUSTIFICATION,
+                    "remediable": False,
+                    "screen_failed": True,
+                })
+        entries.sort(key=lambda e: e["index"])
+
     return entries
-
 
 def _effective_blocking_findings(cq_findings: list[dict],
                                  fp_screen_results: list[dict]) -> list[dict]:
@@ -6243,8 +8275,8 @@ def _run_remediation_loop(
         "fp_screen_results": fp_screen_results,
     }
     try:
-        from skill.code_review.scripts.code_quality import run_code_quality
-        from skill.code_review.scripts.linter_runner import (
+        from code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.linter_runner import (
             apply_ruff_remediation,
             locate_ruff_config,
         )
@@ -6256,6 +8288,18 @@ def _run_remediation_loop(
     while iteration < max_iterations:
         targets = [
             e for e in results["fp_screen_results"] if e.get("remediable")
+        ]
+        if not targets:
+            break
+        # Skip E902 (IO error) and machine-absolute-path findings — they
+        # cannot be remediated via per-file-ignores and would produce
+        # junk config keys (SA-0MSXVXVUL0011JKX).  Filtering here prevents
+        # ``locate_ruff_config`` from creating a root ruff.toml when all
+        # remaining targets are un-remediable.
+        targets = [
+            t for t in targets
+            if not (t.get("finding", {}).get("code") == "E902"
+                    or os.path.isabs(t.get("finding", {}).get("file", "")))
         ]
         if not targets:
             break
@@ -6433,9 +8477,28 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
             print(fail_report)
         return 1
 
-    work_item = data.get("workItem", {})
-    children = data.get("children", [])
-    description = work_item.get("description", "")
+    # Populate ctx early so the merge gate (below) reuses the fetched item
+    # instead of issuing its own ``wl show``. ``_bind_fetched_item`` also
+    # binds the TOP-LEVEL ``comments`` (``wl show --json`` returns them
+    # beside ``workItem``, not nested under it) so comment-referenced
+    # integration evidence is reachable (SA-0MTQAF62U0085BEV AC1/AC4).
+    _bind_fetched_item(ctx, data)
+    work_item = ctx.work_item
+    children = ctx.children
+    description = ctx.description
+
+    # Merge gate (SA-0MT456M27001LRTL) — very start of Phase 1, BEFORE the
+    # code-quality scan, children-stage check, or surface AC assessment.
+    # The item's integration evidence (owning repo, commits, wl-<id>-*
+    # branch) is resolved from the item itself; if the work is not merged
+    # into origin/dev it is integrated (fetch, integrate, build, test, push
+    # dev). A blocked gate (integration failed) stores ctx.merge_gate_blocker
+    # and returns None here so cmd_issue emits the fail-closed report — the
+    # rest of Phase 1 screening and Phase 2 are never reached (AC3: never
+    # proceed past Phase 1 with unmerged work).
+    merge_gate_rc = _phase_merge_gate(ctx)
+    if merge_gate_rc is not None:
+        return None
 
     # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT):
     # git HEAD sha + work-item description hash + Key Files list. The
@@ -6454,7 +8517,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     cq_fixes_applied: int = 0
     cq_skipped_reason: str | None = None
     try:
-        from skill.code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.code_quality import run_code_quality
         # Scoped, read-only code-quality scan (SA-0MSKB6VWU000RT58): the
         # audit lints only the git changed-file list (already computed for
         # the Phase 1/2 file-scope manifest) instead of the whole repo, and
@@ -6496,6 +8559,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
             debug_log=ctx.debug_log,
             timeout=ctx.timeout,
             ac_fallback_used=ctx.ac_fallback_used,
+            priority=_resolve_audit_priority(ctx.work_item),
         )
     except Exception as exc:  # noqa: BLE001 -- the screen must never crash the audit
         ctx.record_script_failure("false-positive screen", exc)
@@ -6557,6 +8621,359 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     return None
 
 
+def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
+                        pi_bin: str, debug_log: str | None,
+                        timeout: int | None,
+                        ac_fallback_used: threading.Event | None,
+                        on_runtime_error: Callable[[str, Exception], None],
+                        failure_label: str,
+                        child_screen: bool = False,
+                        enable_tools: bool = True,
+                        priority: int | None = None) -> tuple[dict, list, str]:
+    """Call Pi for one Phase 1 batched AC screen and parse the verdict JSON.
+
+    Returns ``(result, batch, raw_text)`` where *batch* is the parsed list
+    of index-bearing verdict dicts, or ``[]`` when the response was not a
+    parseable verdict array (the caller falls back to 'partial'); *raw_text*
+    is the raw response text (used for debug logging on the fallback path).
+    Never raises: a ``RuntimeError`` is recorded via *on_runtime_error*
+    (script name ``pi (<failure_label>)``) and converts to a diagnostic
+    fallback result.
+
+    When *context* is ``"parent"``, the priority is forced to
+    ``Priority.CRITICAL`` (SA-0MU32T8SH001R8MZ) so that Phase 1 parent
+    screening is never starved by lower-priority concurrent audit calls.
+    """
+    # Force CRITICAL priority for parent-screening calls so they are never
+    # starved by lower-priority concurrent audits (SA-0MU32T8SH001R8MZ AC1).
+    effective_priority = priority
+    if context == "parent":
+        effective_priority = Priority.CRITICAL
+    try:
+        result = _call_pi_and_maybe_log(
+            issue_id, context, prompt, model=model, pi_bin=pi_bin,
+            debug_log=debug_log, enable_tools=enable_tools, timeout=timeout,
+            ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+            priority=effective_priority,
+        )
+    except RuntimeError as exc:
+        on_runtime_error(f"pi ({failure_label})", exc)
+        print(f"Warning: Pi call failed for {failure_label}: {exc}", file=sys.stderr)
+        return {"verdict": "unmet", "evidence": "", "extracted_text": ""}, [], ""
+    raw_text = (result.get("extracted_text", "") or result.get("evidence", "")
+                or result.get("text", ""))
+    batch = _extract_json_array(raw_text)
+    if batch is None:
+        try:
+            batch = json.loads(raw_text)
+        except json.JSONDecodeError:
+            batch = []
+    if isinstance(batch, list) and batch and any(
+        isinstance(item, dict) and "index" in item for item in batch
+    ):
+        return result, batch, raw_text
+    return result, [], raw_text
+
+
+def _resolve_git_head_sha(runner: Runner) -> str | None:
+    """Resolve the full lowercase git HEAD sha via the run's runner.
+
+    Returns ``None`` when git is unavailable / the runner fails / the output
+    is not a 40-hex sha (checkpointing is disabled in that case — the audit
+    itself is unaffected).
+    """
+    try:
+        proc = runner(["git", "rev-parse", "HEAD"])
+    except Exception:  # noqa: BLE001 -- git is best-effort for checkpoints
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = (proc.stdout or "").strip()
+    if re.fullmatch(r"[0-9a-f]{40}", sha.lower()):
+        return sha.lower()
+    return None
+
+
+def _open_checkpoint_store(ctx: _AuditContext,
+                           checkpoint_dir: str | None = None,
+                           no_checkpoint: bool = False) -> CheckpointStore | None:
+    """Open the phase checkpoint store for this run (best-effort).
+
+    Called right after the launch-context gate so the git root + owning root
+    are resolved. Returns ``None`` when checkpointing is disabled: explicit
+    ``--no-checkpoint``, an empty ``--checkpoint-dir``/``AUDIT_CHECKPOINT_DIR``
+    value, an unresolvable git HEAD, or any store failure — the audit then
+    behaves byte-identically to a pre-change run. ``--force`` starts a fresh
+    checkpoint: the existing file is cleared so a forced re-audit never
+    reuses partial results from an earlier run.
+
+    A resume prints the completed phases + the phase the previous run died
+    in, so operators can see exactly what was preserved (clear timeout
+    reporting — AC4 of SA-0MT6EZUS9004FJ9T).
+    """
+    if no_checkpoint:
+        return None
+    try:
+        cp_dir = resolve_checkpoint_dir(ctx.owning_root, checkpoint_dir)
+        if cp_dir is None:
+            return None
+        git_head = _resolve_git_head_sha(ctx.runner)
+        if git_head is None:
+            print(
+                "Warning: audit checkpointing disabled — could not resolve "
+                "the git HEAD sha",
+                file=sys.stderr,
+            )
+            return None
+        store = CheckpointStore(ctx.issue_id, git_head, cp_dir,
+                                force=ctx.force)
+        if ctx.force:
+            store.clear()
+            print(
+                f"[checkpoint] --force: starting a fresh checkpoint run "
+                f"({store.path()})",
+                file=sys.stderr,
+            )
+        elif store.is_resuming:
+            completed = [PHASE_LABELS[p] for p in store.completed_phases()]
+            line = (
+                f"[checkpoint] Resuming audit for {ctx.issue_id}: completed="
+                f"{completed}"
+            )
+            interrupted = store.interrupted_phase()
+            if interrupted is not None:
+                line += f"; previous run interrupted during " \
+                        f"{PHASE_LABELS[interrupted]}"
+            print(line, file=sys.stderr)
+        else:
+            # Stale/partial file (different HEAD/issue, or a run that never
+            # completed a phase) — start clean.
+            store.clear()
+            print(
+                f"[checkpoint] Phase checkpointing enabled: {store.path()} "
+                f"(git {git_head[:12]})",
+                file=sys.stderr,
+            )
+        return store
+    except Exception as exc:  # noqa: BLE001 -- best-effort checkpointing
+        print(
+            f"Warning: audit checkpointing disabled: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _checkpoint_phase_start(checkpoint: CheckpointStore | None,
+                            phase: str) -> None:
+    """Record that a phase started + emit the stderr trace marker."""
+    if checkpoint is None:
+        return
+    checkpoint.mark_started(phase)
+    print(f"[checkpoint] {PHASE_LABELS[phase]} started", file=sys.stderr)
+
+
+def _checkpoint_phase_done(checkpoint: CheckpointStore | None,
+                           phase: str, state: dict | None = None) -> None:
+    """Record that a phase completed + emit the stderr trace marker."""
+    if checkpoint is None:
+        return
+    checkpoint.mark_completed(phase, state)
+    elapsed = None
+    entry = checkpoint._data.get("phases", {}).get(phase, {})
+    elapsed = entry.get("elapsed_s")
+    if elapsed is not None:
+        print(
+            f"[checkpoint] {PHASE_LABELS[phase]} completed "
+            f"({elapsed:.0f}s)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[checkpoint] {PHASE_LABELS[phase]} completed",
+            file=sys.stderr,
+        )
+
+
+BUDGET_EXCEEDED_TEXT = "partial (budget exceeded)"
+"""Canonical AC text for a child skipped because the parent-process
+elapsed-time budget ran out (SA-0MU32T6O0001UALR). A budget-exceeded
+verdict is ``partial`` (fail-closed: an unverified AC never becomes
+``met``) and is distinct from a genuine ``partial`` code finding."""
+
+
+def _budget_exceeded_ac_result(elapsed_s: float, budget_s: float) -> dict:
+    """Build the AC result recorded when the parent-process budget is spent.
+
+    The verdict is ``partial`` (never ``met``) with the canonical
+    ``partial (budget exceeded)`` text and a diagnostic naming the elapsed
+    time, the budget, and the remediation (``--parent-timeout`` /
+    ``AUDIT_PARENT_TIMEOUT``) — replacing the old bare
+    "Skipped due to audit timeout" skip that hid the cause
+    (SA-0MU32T6O0001UALR AC2).
+    """
+    return {
+        "text": BUDGET_EXCEEDED_TEXT,
+        "verdict": "partial",
+        "evidence": (
+            f"Budget exceeded: child skipped after {elapsed_s:.0f}s total "
+            f"elapsed time (parent-process budget {budget_s:.0f}s). The "
+            f"child's ACs were NOT verified; raise the budget via "
+            f"--parent-timeout or AUDIT_PARENT_TIMEOUT and re-run. A resumed "
+            f"run re-audits budget-exceeded children."
+        ),
+    }
+
+
+def _record_child_budget_exceeded(
+    checkpoint: CheckpointStore | None,
+    child_id: str,
+    elapsed_s: float,
+    budget_s: float,
+) -> None:
+    """Persist a budget-exceeded child marker to the checkpoint immediately.
+
+    Best-effort: a ``None`` checkpoint (checkpointing disabled) is a no-op.
+    The write happens at the moment the budget trips (mid-phase), so a run
+    killed after the guard fires still leaves a resumable record
+    (SA-0MU32T6O0001UALR AC2/AC3).
+    """
+    if checkpoint is None:
+        return
+    checkpoint.mark_child_budget_exceeded(child_id, elapsed_s, budget_s)
+    print(
+        f"[checkpoint] recorded budget-exceeded child {child_id} "
+        f"({elapsed_s:.0f}s elapsed / {budget_s:.0f}s budget)",
+        file=sys.stderr,
+    )
+
+
+def _reaudit_budget_exceeded_children(
+    ctx: _AuditContext,
+    child_results: list[dict],
+    exceeded_ids: set[str],
+    child_persist_results: list[dict],
+) -> tuple[list[dict], int | None]:
+    """Re-audit the children a prior run skipped for budget reasons.
+
+    A resumed run skips the Phase 1 child screening entirely because the
+    phase completed in the checkpoint — but a child recorded as
+    budget-exceeded only carries ``partial (budget exceeded)`` placeholder
+    AC verdicts, never verified ones. This re-runs the Phase 1 child AC
+    screen for EXACTLY those children (the full child dict with description
+    is looked up from ``ctx.children``), replaces the placeholders with real
+    verdicts, clears the checkpoint markers, and (when ``persist``) persists
+    each re-audited child's report — without touching any other restored
+    child result, so completed phases/children are never re-run
+    (SA-0MU32T6O0001UALR / SA-0MU33XG8P004GX8K AC1-AC3).
+
+    Args:
+        ctx: The audit context (runner, models, persist flags).
+        child_results: Restored child results from the checkpoint; the
+            budget-exceeded placeholders are replaced in-place.
+        exceeded_ids: Ids of children marked budget-exceeded in the
+            checkpoint (``checkpoint.budget_exceeded_children()``).
+        child_persist_results: Reporting list accumulated from the prior
+            run; successful re-audit persists are appended.
+
+    Returns:
+        ``(child_results, None)`` on success, or ``(child_results, rc)``
+        with a non-zero exit code when a re-audited child's audit could not
+        be persisted (mirrors the fatal child-persist rule of the normal
+        path — a parent report whose child audits never landed is
+        misleading).
+    """
+    targets = [
+        (i, cr) for i, cr in enumerate(child_results)
+        if cr.get("id") in exceeded_ids
+    ]
+    if not targets:
+        return child_results, None
+    checkpoint = ctx.checkpoint
+    children_by_id = {
+        c.get("id"): c for c in ctx.children if c.get("id")
+    }
+    print(
+        f"[checkpoint] Re-auditing {len(targets)} budget-exceeded "
+        f"child(ren): {', '.join(cr.get('id', '') for _, cr in targets)}",
+        file=sys.stderr,
+    )
+    for ci, cr in targets:
+        child_id = cr.get("id", "")
+        source = children_by_id.get(child_id, cr)
+        _, acs = _phase1_review_child_acs(
+            ci, source,
+            ctx.resolved_phase1_model, ctx.resolved_model,
+            ctx.pi_bin, ctx.debug_log, ctx.timeout,
+            ctx.runner, ctx.record_script_failure,
+            ac_fallback_used=ctx.ac_fallback_used,
+            child_in_main_slot=ctx.child_in_main_slot,
+        )
+        cr["ac_results"] = acs
+        cr["child_audit_ready"] = False
+        cr["child_audit_not_ready"] = False
+        cr["reaudited_after_budget_exceeded"] = True
+        cr.pop("budget_exceeded", None)
+        if checkpoint is not None:
+            checkpoint.clear_budget_exceeded(child_id)
+        if ctx.persist:
+            fingerprint = _compute_content_fingerprint(
+                ctx.runner, child_id, worklog_dir=ctx.worklog_dir,
+            )
+            child_rc, _report = _persist_child_audit(
+                child_id=child_id,
+                child_title=cr.get("title", ""),
+                child_status=cr.get("status", ""),
+                child_stage=cr.get("stage", ""),
+                ac_results=acs,
+                pi_bin=ctx.pi_bin,
+                model=ctx.resolved_model,
+                model_source=ctx.model_source,
+                worklog_dir=ctx.worklog_dir,
+                content_fingerprint=fingerprint,
+            )
+            child_persist_results.append({
+                "id": child_id,
+                "title": cr.get("title", ""),
+                "success": child_rc == 0,
+            })
+            if child_rc != 0 and child_rc != PERSIST_CONTENT_INVALID:
+                print(
+                    f"Error: Failed to persist re-audited child {child_id}: "
+                    f"persist_audit returned exit code {child_rc}. Aborting "
+                    "the run — the parent report would be misleading without "
+                    "the child audit.",
+                    file=sys.stderr,
+                )
+                return child_results, 1
+        print(
+            f"[checkpoint] Re-audited budget-exceeded child {child_id} — "
+            f"{len(acs)} AC result(s) restored",
+            file=sys.stderr,
+        )
+    return child_results, None
+
+
+def _children_need_phase2(child_results: list[dict]) -> bool:
+    """Whether any restored child still needs Phase 2 deep analysis.
+
+    Mirrors the pending-child selection inside ``_run_phase2_deep_analysis``
+    (children with AC results that are not ready / not-not-ready / not done)
+    so a resumed run re-executes deep analysis for exactly the children that
+    need it and skips the call when none do — preserving the prior run's
+    phase2 completion state (SA-0MT6EZUS9004FJ9T).
+    """
+    for child in child_results:
+        if child.get("status") == "completed" and child.get("stage") == "done":
+            continue
+        if child.get("child_audit_ready") is True:
+            continue
+        if child.get("child_audit_not_ready") is True:
+            continue
+        if child.get("ac_results"):
+            return True
+    return False
+
+
 def _phase1_parent_screening(ctx: _AuditContext) -> None:
     """Phase 3 — batched parent AC review via Pi (single call).
 
@@ -6568,7 +8985,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     json_mode = ctx.json_mode
     runner = ctx.runner
     pi_bin = ctx.pi_bin
-    resolved_model = ctx.resolved_model
+    phase1_model = ctx.resolved_phase1_model
     debug_log = ctx.debug_log
     timeout = ctx.timeout
     green_run_block = ctx.green_run_block
@@ -6577,6 +8994,25 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     acs = ctx.acs
     work_item = ctx.work_item
     ac_results = ctx.ac_results
+
+    # Phase checkpointing (SA-0MT6EZUS9004FJ9T): a resumed run whose parent
+    # screening already completed skips the Pi call entirely and restores the
+    # stored AC verdicts — the most expensive Phase 1 segment is never
+    # re-run after an interruption.
+    checkpoint = ctx.checkpoint
+    if (checkpoint is not None and checkpoint.is_resuming
+            and checkpoint.phase_status(PHASE_PARENT) == STATUS_COMPLETED):
+        restored = checkpoint.accumulated_state().get("ac_results")
+        if restored is not None:
+            ctx.ac_results = restored
+            print(
+                f"[checkpoint] Skipping completed phase: "
+                f"{PHASE_LABELS[PHASE_PARENT]}",
+                file=sys.stderr,
+            )
+            return
+
+    _checkpoint_phase_start(checkpoint, PHASE_PARENT)
 
     # Review parent ACs via Pi (batched into a single call for performance)
     ac_results = []
@@ -6617,22 +9053,32 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"{green_run_block or ''}"
             f"Criteria: {ac_list_json}"
         )
-        try:
-            result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, enable_tools=True, timeout=timeout, ac_fallback_used=ac_fallback_used)
-        except RuntimeError as exc:
-            ctx.record_script_failure("pi (parent AC review)", exc)
-            print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
-            result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
-        # Parse the batched result - try to extract JSON array from text
-        # Use extracted_text (full response) instead of evidence (may be truncated)
-        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
-        batch = _extract_json_array(raw_text)
-        if batch is None:
-            # Fallback: try direct JSON parse
-            try:
-                batch = json.loads(raw_text)
-            except json.JSONDecodeError:
-                batch = []
+        result, batch, raw_text = _call_phase1_screen(
+            issue_id, "parent", prompt, phase1_model, pi_bin, debug_log,
+            timeout, ac_fallback_used, ctx.record_script_failure,
+            failure_label="parent AC review", enable_tools=True,
+            priority=_resolve_audit_priority(ctx.work_item),
+        )
+        # AC4 safe fallback (SA-0MSKB697P000T3HG): when a fast Phase 1 model
+        # is configured and it cannot produce reliable batched verdict JSON
+        # (unparseable output, provider error, or concurrency-limit timeout),
+        # retry the SAME Phase 1 screen with the full audit model before
+        # falling back to 'partial' diagnostics. The default (no
+        # model.audit_phase1 key) resolves phase1_model == resolved_model, so
+        # this retry is a no-op for legacy configs — zero behavior change.
+        if not batch and phase1_model != ctx.resolved_model:
+            print(
+                "Warning: fast Phase 1 model produced unparseable output — "
+                "retrying parent AC review with the full audit model",
+                file=sys.stderr,
+            )
+            result, batch, raw_text = _call_phase1_screen(
+                issue_id, "parent", prompt, ctx.resolved_model, pi_bin,
+                debug_log, timeout, ac_fallback_used,
+                ctx.record_script_failure, failure_label="parent AC review",
+                enable_tools=True,
+                priority=_resolve_audit_priority(ctx.work_item),
+            )
         if isinstance(batch, list) and batch and any(
             isinstance(item, dict) and "index" in item for item in batch
         ):
@@ -6709,11 +9155,26 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                     "evidence": evidence,
                 })
     else:
-        ac_results = [{"text": "No acceptance criteria defined.", "verdict": "met", "evidence": ""}]
+        # Zero-AC sentinel path: ACs could not be extracted (heading mismatch).
+        # Emit a warning verdict so the item is NOT auto-approved.
+        # The sentinel string itself is unchanged for backward compat with other
+        # callers; only the verdict changes (SA-0MSRLLQ0V008EW3J).
+        ac_results = [{
+            "text": "No acceptance criteria defined.",
+            "verdict": VERDICT_WARNING,
+            "evidence": (
+                "ACs could not be extracted — verify item description uses a "
+                "recognized heading format (e.g. 'Acceptance Criteria' or 'AC')."
+            ),
+        }]
 
 
     ctx.ac_results = ac_results
     ctx.ac_fallback_used = ac_fallback_used
+
+    _checkpoint_phase_done(checkpoint, PHASE_PARENT, {
+        "ac_results": ac_results,
+    })
 
 
 def _phase_children(ctx: _AuditContext) -> int | None:
@@ -6804,316 +9265,425 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             else _default_parent_timeout(len(active_children))
         )
 
-        if audit_children:
-            pending_children: list[tuple[int, dict]] = []
-            pre_verdicts: dict[str, tuple[bool | None, str]] = {}
-            for child in active_children:
-                cr = {
-                    "title": child.get("title", ""),
-                    "id": child.get("id", ""),
-                    "status": child.get("status", ""),
-                    "stage": child.get("stage", ""),
-                    "effort": child.get("effort"),
-                    "risk": child.get("risk"),
-                }
-                # Skip remaining children if we're too close to the parent
-                # timeout (elapsed_guard). This prevents a silent external kill
-                # and instead produces a clear diagnostic for skipped audits.
-                if _elapsed() >= elapsed_guard:
-                    print(
-                        f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
-                        f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
-                        "Manual audit required for this child. Raise the budget via "
-                        "--parent-timeout or AUDIT_PARENT_TIMEOUT.",
-                        file=sys.stderr,
-                    )
-                    cr["ac_results"] = [{
-                        "text": "Skipped due to audit timeout. Manual audit required.",
-                        "verdict": "unmet",
-                        "evidence": (
-                            f"Audit runner skipped this child after "
-                            f"{_elapsed():.0f}s total elapsed time to avoid "
-                            f"the parent process timeout ({elapsed_guard}s "
-                            f"budget; raise via --parent-timeout or "
-                            f"AUDIT_PARENT_TIMEOUT). Manual audit required."
-                        ),
-                    }]
-                    cr["child_audit_ready"] = False
-                    child_results.append(cr)
-                    continue
+        # ------------------------------------------------------------------
+        # Phase checkpointing (SA-0MT6EZUS9004FJ9T): resume support. When a
+        # prior run completed phase1_children or phase2 at the same git HEAD,
+        # restore the stored pipeline state and skip the corresponding work —
+        # never re-run Pi segments that already completed.
+        # ------------------------------------------------------------------
+        checkpoint = ctx.checkpoint
+        phase1_checkpointed = (
+            checkpoint is not None
+            and checkpoint.is_resuming
+            and checkpoint.phase_status(PHASE_CHILDREN) == STATUS_COMPLETED
+        )
+        phase2_checkpointed = (
+            checkpoint is not None
+            and checkpoint.is_resuming
+            and checkpoint.phase_status(PHASE_PHASE2) == STATUS_COMPLETED
+        )
+        # Budget-exceeded children are the ONE exception to "completed phase →
+        # skip": a prior run that recorded them `partial (budget exceeded)`
+        # never verified their ACs. The checkpoint markers identify exactly
+        # which children must be re-audited on resume (SA-0MU33XG8P004GX8K).
+        budget_exceeded_ids = (
+            set(checkpoint.budget_exceeded_children())
+            if checkpoint is not None else set()
+        )
+        budget_reaudit_needed = audit_children and bool(budget_exceeded_ids)
+        # When Phase 2 already completed but budget-exceeded children remain,
+        # the parent deep analysis MUST NOT be re-run — re-audit only the
+        # affected children and deep-analyse just those (AC3).
+        child_only_phase2 = phase2_checkpointed and budget_reaudit_needed
 
-                # Completed/done children are exempt (AC5): their audits are not
-                # re-checked and the Phase 1 child AC review is skipped; AC results
-                # are sourced from their own persisted audit (fallback to met).
-                if child.get("status") == "completed" and child.get("stage") == "done":
-                    cr["child_audit_ready"] = True
-                    cr["ac_results"] = _child_acs_from_own_audit(
-                        child, runner, worklog_dir=worklog_dir,
-                    )
-                    child_results.append(cr)
-                    continue
-
-                verdict, reason, audited_at = _get_child_audit_verdict(
-                    runner, child["id"], worklog_dir=worklog_dir,
-                    force=force, child=child,
+        if phase2_checkpointed and not budget_reaudit_needed:
+            # The children + Phase 2 segment completed in a prior run:
+            # restore the final pipeline state and skip this phase entirely.
+            st = checkpoint.accumulated_state()
+            ac_results = st.get("ac_results", ac_results)
+            child_results = st.get("child_results", child_results)
+            child_persist_results = st.get(
+                "child_persist_results", child_persist_results
+            )
+            phase2_completed = st.get("phase2_completed", phase2_completed)
+            phase2_skip_note = st.get("phase2_skip_note", phase2_skip_note)
+            print(
+                f"[checkpoint] Skipping completed phase: "
+                f"{PHASE_LABELS[PHASE_PHASE2]}",
+                file=sys.stderr,
+            )
+            return None
+        elif phase1_checkpointed:
+            # Child screenings completed; only the Phase 2 segment remains.
+            st = checkpoint.accumulated_state()
+            ac_results = st.get("ac_results", ac_results)
+            child_results = st.get("child_results", child_results)
+            child_persist_results = st.get(
+                "child_persist_results", child_persist_results
+            )
+            phase2_completed = st.get("phase2_completed", phase2_completed)
+            phase2_skip_note = st.get("phase2_skip_note", phase2_skip_note)
+            print(
+                f"[checkpoint] Skipping completed phase: "
+                f"{PHASE_LABELS[PHASE_CHILDREN]}",
+                file=sys.stderr,
+            )
+            if budget_reaudit_needed:
+                child_results, _reaudit_rc = _reaudit_budget_exceeded_children(
+                    ctx, child_results,
+                    budget_exceeded_ids,
+                    child_persist_results,
                 )
-                pre_verdicts[child["id"]] = (verdict, reason)
-                if verdict is not None:
-                    # Fresh valid audit (LP-0MSQ32MF200675AR child-verdict
-                    # reuse): the content-fingerprint gate (primary) or the
-                    # legacy time gate (fingerprint-less reports) judged the
-                    # child's own audit fresh, so the parent reuses its
-                    # persisted AC verdicts with ZERO pi calls — no child
-                    # Phase 1 screening, no child Phase 2 deep/batch entry.
-                    # Applies to ready AND not-ready verdicts (P12): the
-                    # child's own pipeline already deep-analyzed these ACs.
-                    cr["child_audit_ready"] = verdict is True
-                    cr["child_audit_not_ready"] = verdict is False
-                    cr["reused_from"] = audited_at
-                    cr["ac_results"] = _child_acs_from_own_audit(
-                        child, runner, worklog_dir=worklog_dir,
-                    )
-                else:
-                    cr["child_audit_ready"] = False
-                    # P12: record whether the child's own fresh audit produced an
-                    # explicit 'not ready to close' verdict. Such children have
-                    # already had their ACs deep-analyzed by their own audit
-                    # pipeline, so the parent's Phase 2 can skip the duplicated
-                    # phase2_child call (see _run_phase2_deep_analysis).
-                    cr["child_audit_not_ready"] = verdict is False
-                    cr["ac_results"] = []
-                    pending_children.append((len(child_results), child))
-                child_results.append(cr)
+                if _reaudit_rc is not None:
+                    return _reaudit_rc
+        else:
+            _checkpoint_phase_start(checkpoint, PHASE_CHILDREN)
 
-            # Review pending (no-audit / not-ready / not_ready) children with
-            # bounded parallelism; fall back to a sequential loop for a single
-            # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
-            if pending_children:
-                parallelism = _resolve_child_concurrency()
-                if parallelism > 1 and len(pending_children) > 1:
-                    with ThreadPoolExecutor(max_workers=parallelism) as executor:
-                        futures = [
-                            executor.submit(
-                                _phase1_review_child_acs,
+        if audit_children:
+            if not phase1_checkpointed:
+                pending_children: list[tuple[int, dict]] = []
+                pre_verdicts: dict[str, tuple[bool | None, str]] = {}
+                for child in active_children:
+                    cr = {
+                        "title": child.get("title", ""),
+                        "id": child.get("id", ""),
+                        "status": child.get("status", ""),
+                        "stage": child.get("stage", ""),
+                        "effort": child.get("effort"),
+                        "risk": child.get("risk"),
+                    }
+                    # Stop auditing remaining children once the parent-process
+                    # elapsed-time budget (elapsed_guard) is spent. The previous
+                    # run silently skips with a bare "Skipped due to audit
+                    # timeout"; instead record an explicit
+                    # ``partial (budget exceeded)`` verdict, persist a resumable
+                    # checkpoint marker immediately, and name the remediation
+                    # (SA-0MU32T6O0001UALR AC2/AC3).
+                    if _elapsed() >= elapsed_guard:
+                        elapsed_now = _elapsed()
+                        print(
+                            f"Warning: parent-process budget exceeded "
+                            f"({elapsed_now:.0f}s elapsed / {elapsed_guard}s "
+                            f"budget). Recording child {child.get('id', '')} "
+                            f"({child.get('title', '')}) as "
+                            f"{BUDGET_EXCEEDED_TEXT}. Raise the budget via "
+                            f"--parent-timeout or AUDIT_PARENT_TIMEOUT and "
+                            f"re-run to complete the audit.",
+                            file=sys.stderr,
+                        )
+                        cr["ac_results"] = [
+                            _budget_exceeded_ac_result(
+                                elapsed_now, float(elapsed_guard)
+                            )
+                        ]
+                        cr["child_audit_ready"] = False
+                        cr["budget_exceeded"] = True
+                        child_results.append(cr)
+                        _record_child_budget_exceeded(
+                            checkpoint, cr["id"], elapsed_now,
+                            float(elapsed_guard),
+                        )
+                        continue
+
+                    # Completed/done children are exempt (AC5): their audits are not
+                    # re-checked and the Phase 1 child AC review is skipped; AC results
+                    # are sourced from their own persisted audit (fallback to met).
+                    if child.get("status") == "completed" and child.get("stage") == "done":
+                        cr["child_audit_ready"] = True
+                        cr["ac_results"] = _child_acs_from_own_audit(
+                            child, runner, worklog_dir=worklog_dir,
+                        )
+                        child_results.append(cr)
+                        continue
+
+                    verdict, reason, audited_at = _get_child_audit_verdict(
+                        runner, child["id"], worklog_dir=worklog_dir,
+                        force=force, child=child,
+                    )
+                    pre_verdicts[child["id"]] = (verdict, reason)
+                    if verdict is not None:
+                        # Fresh valid audit (LP-0MSQ32MF200675AR child-verdict
+                        # reuse): the content-fingerprint gate (primary) or the
+                        # legacy time gate (fingerprint-less reports) judged the
+                        # child's own audit fresh, so the parent reuses its
+                        # persisted AC verdicts with ZERO pi calls — no child
+                        # Phase 1 screening, no child Phase 2 deep/batch entry.
+                        # Applies to ready AND not-ready verdicts (P12): the
+                        # child's own pipeline already deep-analyzed these ACs.
+                        cr["child_audit_ready"] = verdict is True
+                        cr["child_audit_not_ready"] = verdict is False
+                        cr["reused_from"] = audited_at
+                        cr["ac_results"] = _child_acs_from_own_audit(
+                            child, runner, worklog_dir=worklog_dir,
+                        )
+                    else:
+                        cr["child_audit_ready"] = False
+                        # P12: record whether the child's own fresh audit produced an
+                        # explicit 'not ready to close' verdict. Such children have
+                        # already had their ACs deep-analyzed by their own audit
+                        # pipeline, so the parent's Phase 2 can skip the duplicated
+                        # phase2_child call (see _run_phase2_deep_analysis).
+                        cr["child_audit_not_ready"] = verdict is False
+                        cr["ac_results"] = []
+                        pending_children.append((len(child_results), child))
+                    child_results.append(cr)
+
+                # Review pending (no-audit / not-ready / not_ready) children with
+                # bounded parallelism; fall back to a sequential loop for a single
+                # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
+                if pending_children:
+                    # In-main-slot mode (SA-0MT2XRGEU0009QRE) is inherently
+                    # sequential (one main slot): child Phase-1 screens run one at
+                    # a time with a /compact between them, so parallel dispatch is
+                    # forced to 1; the separate-process path keeps the slot-aware
+                    # parallel ceiling.
+                    parallelism = 1 if ctx.child_in_main_slot else _resolve_child_concurrency()
+                    if parallelism > 1 and len(pending_children) > 1:
+                        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+                            futures = [
+                                executor.submit(
+                                    _phase1_review_child_acs,
+                                    ci, child,
+                                    ctx.resolved_phase1_model, ctx.resolved_model,
+                                    pi_bin, debug_log, timeout,
+                                    runner, ctx.record_script_failure,
+                                    ac_fallback_used=ac_fallback_used,
+                                    child_in_main_slot=ctx.child_in_main_slot,
+                                )
+                                for ci, child in pending_children
+                            ]
+                            for future in futures:
+                                ci, acs = future.result()
+                                child_results[ci]["ac_results"] = acs
+                    else:
+                        for ci, child in pending_children:
+                            _ci, acs = _phase1_review_child_acs(
                                 ci, child,
-                                resolved_model, pi_bin, debug_log, timeout,
+                                ctx.resolved_phase1_model, ctx.resolved_model,
+                                pi_bin, debug_log, timeout,
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
+                                child_in_main_slot=ctx.child_in_main_slot,
                             )
-                            for ci, child in pending_children
-                        ]
-                        for future in futures:
-                            ci, acs = future.result()
                             child_results[ci]["ac_results"] = acs
-                else:
-                    for ci, child in pending_children:
-                        _ci, acs = _phase1_review_child_acs(
-                            ci, child,
-                            resolved_model, pi_bin, debug_log, timeout,
-                            runner, ctx.record_script_failure,
-                            ac_fallback_used=ac_fallback_used,
-                        )
-                        child_results[ci]["ac_results"] = acs
 
 
-            # ------------------------------------------------------------------
-            # Check each active child's persisted audit verdict.
-            # For children without audits or with stale audits, auto-trigger
-            # a fresh audit (if persist is True AND --audit-children is set) and
-            # re-evaluate. The recursive cascade is OPT-IN (SA-0MSKB6V5Q007YDHE):
-            # by default no child audits are auto-triggered, so a parent with many
-            # unaudited children no longer spawns an unbounded cascade. Children
-            # with unchanged content are skipped via the Feature 1 content-based
-            # freshness gate. Children with completed/done status+stage are
-            # exempt (AC5).
-            # ------------------------------------------------------------------
-            _audit_runner_path = Path(__file__).resolve()
-            max_child_audits = _resolve_max_child_audits(max_child_audits)
-            child_audits_triggered = 0
+                # ------------------------------------------------------------------
+                # Check each active child's persisted audit verdict.
+                # For children without audits or with stale audits, auto-trigger
+                # a fresh audit (if persist is True AND --audit-children is set) and
+                # re-evaluate. The recursive cascade is OPT-IN (SA-0MSKB6V5Q007YDHE):
+                # by default no child audits are auto-triggered, so a parent with many
+                # unaudited children no longer spawns an unbounded cascade. Children
+                # with unchanged content are skipped via the Feature 1 content-based
+                # freshness gate. Children with completed/done status+stage are
+                # exempt (AC5).
+                # ------------------------------------------------------------------
+                _audit_runner_path = Path(__file__).resolve()
+                max_child_audits = _resolve_max_child_audits(max_child_audits)
+                child_audits_triggered = 0
 
-            for child in child_results:
-                # Skip completed/done children (exempt per AC5)
-                if child.get("status") == "completed" and child.get("stage") == "done":
-                    child["child_audit_ready"] = True  # Exempt - treat as ready
-                    continue
-
-                # Reuse the pre-computed verdict from the Phase 1 pre-pass (P7) to
-                # avoid a second wl audit-show lookup per child.
-                verdict, reason = pre_verdicts.get(child["id"], (None, "unknown"))
-
-                if verdict is None and persist:
-                    if _elapsed() < elapsed_guard:
-                        # Content-based freshness skip (AC4): a child whose content
-                        # fingerprint is unchanged has a still-valid audit — do not
-                        # re-trigger it; re-evaluate the verdict from the stored
-                        # report instead. --force bypasses reuse entirely: every
-                        # child is re-audited (LP-0MSQ32MF200675AR AC4).
-                        fresh_report = None if force else _check_audit_freshness(
-                            runner, child["id"], worklog_dir=worklog_dir,
-                            work_item=child,
-                        )
-                        if fresh_report is not None:
-                            fresh_ready = _parse_ready_to_close(fresh_report)
-                            verdict = fresh_ready == "yes"
-                            reason = "ready" if fresh_ready == "yes" else "not_ready"
-                            child["reused_from"] = _fetch_child_audited_at(
-                                runner, child["id"], worklog_dir=worklog_dir,
-                            )
-                            print(
-                                f"Reusing fresh audit for child {child['id']} "
-                                f"({child['title']}) — content unchanged",
-                                file=sys.stderr,
-                            )
-                        elif not audit_children:
-                            # AC1: no cascade without explicit opt-in. The child
-                            # stays not-ready (a not-ready child still blocks the
-                            # parent — verdict semantics unchanged).
-                            print(
-                                f"Child {child['id']} ({child['title']}) has no "
-                                f"fresh audit; not auto-triggering a child audit. "
-                                f"Use --audit-children to enable the recursive "
-                                f"cascade (or audit the child directly).",
-                                file=sys.stderr,
-                            )
-                        elif child_audits_triggered >= max_child_audits:
-                            # AC3: per-run cap reached — stop the cascade.
-                            print(
-                                f"Warning: child audit cap ({max_child_audits}) "
-                                f"reached; not auto-auditing child {child['id']} "
-                                f"({child['title']}). Raise via --max-child-audits "
-                                f"or {AUDIT_MAX_CHILD_AUDITS_ENV}.",
-                                file=sys.stderr,
-                            )
-                        else:
-                            child_audits_triggered += 1
-                            print(
-                                f"Auto-triggering audit for child {child['id']} "
-                                f"({child['title']}) — reason: {reason}",
-                                file=sys.stderr,
-                            )
-                            try:
-                                audit_cmd = [
-                                    sys.executable or "python3",
-                                    str(_audit_runner_path),
-                                    "issue",
-                                    child["id"],
-                                    "--pi-bin", pi_bin,
-                                    "--model", resolved_model,
-                                    "--model-source", model_source,
-                                    "--force",  # Bypass freshness gate
-                                ]
-                                if timeout is not None:
-                                    audit_cmd.extend(["--timeout", str(timeout)])
-                                if parent_timeout is not None:
-                                    audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
-                                if run_tests:
-                                    # Thread the operator's --run-tests authorization
-                                    # into child audits so execution-dependent ACs
-                                    # auto-verify there too (SA-0MSJELSWS002UF60). In
-                                    # practice the parent's suite run already refreshed
-                                    # the cache, so children hit it read-only.
-                                    audit_cmd.append("--run-tests")
-                                # Thread the resolved worklog flags through to the child
-                                # runner process so it targets the same worklog store.
-                                child_flags = _resolve_worklog_flags(
-                                    ["wl", "show", child["id"], "--json"],
-                                    explicit_dir=worklog_dir,
-                                )
-                                if child_flags:
-                                    audit_cmd.extend(child_flags)
-                                effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
-                                subprocess.run(
-                                    audit_cmd,
-                                    check=False,
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=effective_timeout,
-                                )
-                                # Re-check verdict after triggered audit
-                                verdict, reason, _audited_at = _get_child_audit_verdict(
-                                    runner, child["id"], worklog_dir=worklog_dir,
-                                    child=child,
-                                )
-                            except subprocess.TimeoutExpired:
-                                print(
-                                    f"Warning: Auto-triggered audit for child {child['id']} "
-                                    f"timed out.", file=sys.stderr,
-                                )
-                            except Exception as exc:  # noqa: BLE001 -- audit failure warning
-                                print(
-                                    f"Warning: Auto-triggered audit for child {child['id']} "
-                                    f"failed: {exc}", file=sys.stderr,
-                                )
-                    else:
-                        print(
-                            f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
-                            f"Cannot auto-trigger audit for child {child['id']} "
-                            f"({child['title']}). Manual audit required. Raise the "
-                            f"budget via --parent-timeout or AUDIT_PARENT_TIMEOUT.",
-                            file=sys.stderr,
-                        )
-
-                # Set child_audit_ready: True/False if verdict is known, False otherwise
-                child["child_audit_ready"] = verdict if verdict is not None else False
-                # P12: record whether the child's own audit produced an explicit
-                # 'not ready to close' verdict (e.g. after the auto-triggered
-                # child audit above). The parent Phase 2 then skips the duplicated
-                # deep-analysis call and reuses the child's own persisted findings.
-                child["child_audit_not_ready"] = verdict is False
-
-            # Initialize child_persist_results for reporting
-            child_persist_results = []
-
-            # Persist child audits to individual child work items (if persist is True)
-            if persist:
                 for child in child_results:
-                    if child.get("reused_from"):
-                        # Persistence hygiene (LP-0MSQ32MF200675AR AC5): a
-                        # reused child keeps its own authoritative audit —
-                        # re-persisting it would overwrite the child's own
-                        # fingerprint-bearing report with a parent-style one
-                        # and break future content-gate reuse.
+                    # Skip completed/done children (exempt per AC5)
+                    if child.get("status") == "completed" and child.get("stage") == "done":
+                        child["child_audit_ready"] = True  # Exempt - treat as ready
                         continue
-                    child_fingerprint = _compute_content_fingerprint(
-                        runner, child["id"], worklog_dir=worklog_dir,
-                    )
-                    child_rc, _child_report = _persist_child_audit(
-                        child_id=child["id"],
-                        child_title=child["title"],
-                        child_status=child["status"],
-                        child_stage=child["stage"],
-                        ac_results=child["ac_results"],
-                        pi_bin=pi_bin,
-                        model=resolved_model,
-                        model_source=model_source,
-                        worklog_dir=worklog_dir,
-                        content_fingerprint=child_fingerprint,
-                    )
-                    child_persist_results.append({
-                        "id": child["id"],
-                        "title": child["title"],
-                        "success": child_rc == 0,
-                    })
-                    # Child persistence failure is FATAL (LP-0MSQ32HNR007AI6B): a
-                    # parent report whose child audits were never persisted is
-                    # misleading — abort with a non-zero exit instead of warning.
-                    if child_rc != 0 and child_rc != PERSIST_CONTENT_INVALID:
-                        print(
-                            f"Error: Failed to persist audit for child {child['id']} "
-                            f"({child['title']}): persist_audit returned exit code "
-                            f"{child_rc}. Aborting the run — the parent report "
-                            f"would be misleading without the child audit.",
-                            file=sys.stderr,
+
+                    # Reuse the pre-computed verdict from the Phase 1 pre-pass (P7) to
+                    # avoid a second wl audit-show lookup per child.
+                    verdict, reason = pre_verdicts.get(child["id"], (None, "unknown"))
+
+                    if verdict is None and persist:
+                        if _elapsed() < elapsed_guard:
+                            # Content-based freshness skip (AC4): a child whose content
+                            # fingerprint is unchanged has a still-valid audit — do not
+                            # re-trigger it; re-evaluate the verdict from the stored
+                            # report instead. --force bypasses reuse entirely: every
+                            # child is re-audited (LP-0MSQ32MF200675AR AC4).
+                            fresh_report = None if force else _check_audit_freshness(
+                                runner, child["id"], worklog_dir=worklog_dir,
+                                work_item=child,
+                            )
+                            if fresh_report is not None:
+                                fresh_ready = _parse_ready_to_close(fresh_report)
+                                verdict = fresh_ready == "yes"
+                                reason = "ready" if fresh_ready == "yes" else "not_ready"
+                                child["reused_from"] = _fetch_audited_at(
+                                    runner, child["id"], worklog_dir=worklog_dir,
+                                )
+                                print(
+                                    f"Reusing fresh audit for child {child['id']} "
+                                    f"({child['title']}) — content unchanged",
+                                    file=sys.stderr,
+                                )
+                            elif not audit_children:
+                                # AC1: no cascade without explicit opt-in. The child
+                                # stays not-ready (a not-ready child still blocks the
+                                # parent — verdict semantics unchanged).
+                                print(
+                                    f"Child {child['id']} ({child['title']}) has no "
+                                    f"fresh audit; not auto-triggering a child audit. "
+                                    f"Use --audit-children to enable the recursive "
+                                    f"cascade (or audit the child directly).",
+                                    file=sys.stderr,
+                                )
+                            elif child_audits_triggered >= max_child_audits:
+                                # AC3: per-run cap reached — stop the cascade.
+                                print(
+                                    f"Warning: child audit cap ({max_child_audits}) "
+                                    f"reached; not auto-auditing child {child['id']} "
+                                    f"({child['title']}). Raise via --max-child-audits "
+                                    f"or {AUDIT_MAX_CHILD_AUDITS_ENV}.",
+                                    file=sys.stderr,
+                                )
+                            else:
+                                child_audits_triggered += 1
+                                print(
+                                    f"Auto-triggering audit for child {child['id']} "
+                                    f"({child['title']}) — reason: {reason}",
+                                    file=sys.stderr,
+                                )
+                                try:
+                                    audit_cmd = [
+                                        sys.executable or "python3",
+                                        str(_audit_runner_path),
+                                        "issue",
+                                        child["id"],
+                                        "--pi-bin", pi_bin,
+                                        "--model", resolved_model,
+                                        "--model-source", model_source,
+                                        "--force",  # Bypass freshness gate
+                                    ]
+                                    # Thread the tiered Phase 1 model into the
+                                    # child audit so its Phase 1 screening uses the
+                                    # fast/cheap model too (SA-0MSKB697P000T3HG AC2)
+                                    # — only when tiering is actually configured.
+                                    if ctx.resolved_phase1_model != resolved_model:
+                                        audit_cmd.extend([
+                                            "--phase1-model", ctx.resolved_phase1_model,
+                                        ])
+                                    if timeout is not None:
+                                        audit_cmd.extend(["--timeout", str(timeout)])
+                                    if parent_timeout is not None:
+                                        audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
+                                    if run_tests:
+                                        # Thread the operator's --run-tests authorization
+                                        # into child audits so execution-dependent ACs
+                                        # auto-verify there too (SA-0MSJELSWS002UF60). In
+                                        # practice the parent's suite run already refreshed
+                                        # the cache, so children hit it read-only.
+                                        audit_cmd.append("--run-tests")
+                                    # Thread the resolved worklog flags through to the child
+                                    # runner process so it targets the same worklog store.
+                                    child_flags = _resolve_worklog_flags(
+                                        ["wl", "show", child["id"], "--json"],
+                                        explicit_dir=worklog_dir,
+                                    )
+                                    if child_flags:
+                                        audit_cmd.extend(child_flags)
+                                    effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
+                                    subprocess.run(
+                                        audit_cmd,
+                                        check=False,
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=effective_timeout,
+                                    )
+                                    # Re-check verdict after triggered audit
+                                    verdict, reason, _audited_at = _get_child_audit_verdict(
+                                        runner, child["id"], worklog_dir=worklog_dir,
+                                        child=child,
+                                    )
+                                except subprocess.TimeoutExpired:
+                                    print(
+                                        f"Warning: Auto-triggered audit for child {child['id']} "
+                                        f"timed out.", file=sys.stderr,
+                                    )
+                                except Exception as exc:  # noqa: BLE001 -- audit failure warning
+                                    print(
+                                        f"Warning: Auto-triggered audit for child {child['id']} "
+                                        f"failed: {exc}", file=sys.stderr,
+                                    )
+                        else:
+                            print(
+                                f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                                f"Cannot auto-trigger audit for child {child['id']} "
+                                f"({child['title']}). Manual audit required. Raise the "
+                                f"budget via --parent-timeout or AUDIT_PARENT_TIMEOUT.",
+                                file=sys.stderr,
+                            )
+
+                    # Set child_audit_ready: True/False if verdict is known, False otherwise
+                    child["child_audit_ready"] = verdict if verdict is not None else False
+                    # P12: record whether the child's own audit produced an explicit
+                    # 'not ready to close' verdict (e.g. after the auto-triggered
+                    # child audit above). The parent Phase 2 then skips the duplicated
+                    # deep-analysis call and reuses the child's own persisted findings.
+                    child["child_audit_not_ready"] = verdict is False
+
+                # Initialize child_persist_results for reporting
+                child_persist_results = []
+
+                # Persist child audits to individual child work items (if persist is True)
+                if persist:
+                    for child in child_results:
+                        if child.get("reused_from"):
+                            # Persistence hygiene (LP-0MSQ32MF200675AR AC5): a
+                            # reused child keeps its own authoritative audit —
+                            # re-persisting it would overwrite the child's own
+                            # fingerprint-bearing report with a parent-style one
+                            # and break future content-gate reuse.
+                            continue
+                        child_fingerprint = _compute_content_fingerprint(
+                            runner, child["id"], worklog_dir=worklog_dir,
                         )
-                        return 1
-                    if child_rc == PERSIST_CONTENT_INVALID:
-                        # Fallback notice WAS persisted (usable); keep the warning.
-                        print(
-                            f"Warning: audit for child {child['id']} "
-                            f"({child['title']}) persisted with fallback content "
-                            "(verdict JSON rejected); the child audit is usable.",
-                            file=sys.stderr,
+                        child_rc, _child_report = _persist_child_audit(
+                            child_id=child["id"],
+                            child_title=child["title"],
+                            child_status=child["status"],
+                            child_stage=child["stage"],
+                            ac_results=child["ac_results"],
+                            pi_bin=pi_bin,
+                            model=resolved_model,
+                            model_source=model_source,
+                            worklog_dir=worklog_dir,
+                            content_fingerprint=child_fingerprint,
                         )
+                        child_persist_results.append({
+                            "id": child["id"],
+                            "title": child["title"],
+                            "success": child_rc == 0,
+                        })
+                        # Child persistence failure is FATAL (LP-0MSQ32HNR007AI6B): a
+                        # parent report whose child audits were never persisted is
+                        # misleading — abort with a non-zero exit instead of warning.
+                        if child_rc != 0 and child_rc != PERSIST_CONTENT_INVALID:
+                            print(
+                                f"Error: Failed to persist audit for child {child['id']} "
+                                f"({child['title']}): persist_audit returned exit code "
+                                f"{child_rc}. Aborting the run — the parent report "
+                                f"would be misleading without the child audit.",
+                                file=sys.stderr,
+                            )
+                            return 1
+                        if child_rc == PERSIST_CONTENT_INVALID:
+                            # Fallback notice WAS persisted (usable); keep the warning.
+                            print(
+                                f"Warning: audit for child {child['id']} "
+                                f"({child['title']}) persisted with fallback content "
+                                "(verdict JSON rejected); the child audit is usable.",
+                                file=sys.stderr,
+                            )
+
+            if not phase1_checkpointed:
+                _checkpoint_phase_done(checkpoint, PHASE_CHILDREN, {
+                    "ac_results": ac_results,
+                    "child_results": child_results,
+                    "child_persist_results": child_persist_results,
+                    "phase2_completed": phase2_completed,
+                    "phase2_skip_note": phase2_skip_note,
+                })
+            _checkpoint_phase_start(checkpoint, PHASE_PHASE2)
 
             # ------------------------------------------------------------------
             # Phase 2 gate: check if Phase 1 automated screening has blocking issues
@@ -7182,6 +9752,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     skip_parent_deep=True,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
+                    child_in_main_slot=ctx.child_in_main_slot,
                 )
                 # The parent's deep analysis definitively did not run — never
                 # report it as completed regardless of child outcomes.
@@ -7201,8 +9772,13 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    # A phase2-completed resume that is only re-auditing
+                    # budget-exceeded children must NOT re-run the parent
+                    # deep analysis (AC3) — children only.
+                    skip_parent_deep=child_only_phase2,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
+                    child_in_main_slot=ctx.child_in_main_slot,
                 )
         else:
             # ── PARENT-FIRST flow (default, SA-0MSKB6VJA005N43F) ──
@@ -7214,175 +9790,211 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             #   - parent has gaps → only gap-mapped children are audited;
             #     unrelated children are not audited
             # --audit-children (Feature 2) forces the full per-child flow.
-            phase2_completed = False
-            phase2_skip_note = None
+            if not phase1_checkpointed:
+                phase2_completed = False
+                phase2_skip_note = None
             has_blocking_cq = bool(_effective_blocking_findings(
                 cq_findings, ctx.fp_screen_results
             ))
-            # 1. Parent Phase 2 deep analysis FIRST (parent-only).
-            if has_blocking_cq:
-                # Blocking CQ findings → demote met verdicts to partial and
-                # skip Phase 2 (mirrors the full-flow gate: the verdict is
-                # already "Ready to close: No" via the CQ findings, so the
-                # parent deep call would only burn model latency).
-                ac_results = _demote_met_to_partial(ac_results)
-            elif _is_low_risk_small(
-                work_item.get("effort"), work_item.get("risk")
-            ):
-                # Small effort + Low risk — skip Phase 2 per SA-0MSQ026T3009QY2L.
-                # Phase 1 verdicts stand unchanged; evidence notes the skip reason.
-                print(
-                    f"Skipping Phase 2 deep analysis (parent-first): "
-                    f"effort={work_item.get('effort')}, risk={work_item.get('risk')}. "
-                    f"Phase 1 verdicts stand unchanged.",
-                    file=sys.stderr,
-                )
-                ac_results = _annotate_skip_evidence(
-                    ac_results,
-                    f"Phase 2 deep analysis skipped (effort={work_item.get('effort')}, "
-                    f"risk={work_item.get('risk')}): small, low-risk item per "
-                    f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
-                )
-                phase2_skip_note = (
-                    f"small, low-risk item (effort={work_item.get('effort')}, "
-                    f"risk={work_item.get('risk')}) per SA-0MSQ026T3009QY2L"
-                )
-            elif acs and acs[0] != "No acceptance criteria defined.":
-                print(
-                    "Phase 1 passed: running Phase 2 deep code analysis "
-                    "(parent-first)...",
-                    file=sys.stderr,
-                )
-                ac_results, _, phase2_completed = _run_phase2_deep_analysis(
-                    work_item, ac_results, [],  # parent-only
-                    resolved_model=resolved_model,
-                    pi_bin=pi_bin,
-                    debug_log=debug_log,
-                    script_failure_callback=ctx.record_script_failure,
-                    timeout=timeout,
-                    runner=runner,
-                    batch_phase2=batch_phase2,
-                    worklog_dir=worklog_dir,
-                    ac_fallback_used=ac_fallback_used,
-                    green_run_block=green_run_block,
-                    owning_root=owning_root,
-                    max_citations_per_ac=max_citations_per_ac,
-                )
-
-            # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
-            parent_gaps = _parent_has_gaps(ac_results) or has_blocking_cq
-            gap_child_ids = set(
-                _map_gaps_to_children(ac_results, active_children)
-            ) if parent_gaps else set()
-
-            # 3. Child pass-through decision.
+            _checkpoint_phase_start(checkpoint, PHASE_PHASE2)
             pending_children: list[tuple[int, dict]] = []
-            for child in active_children:
-                cr = {
-                    "title": child.get("title", ""),
-                    "id": child.get("id", ""),
-                    "status": child.get("status", ""),
-                    "stage": child.get("stage", ""),
-                    "effort": child.get("effort"),
-                    "risk": child.get("risk"),
-                }
-                if _elapsed() >= elapsed_guard:
-                    cr["ac_results"] = [{
-                        "text": "Skipped due to audit timeout. Manual audit required.",
-                        "verdict": "unmet",
-                        "evidence": (
-                            f"Audit runner skipped this child after "
-                            f"{_elapsed():.0f}s total elapsed time to avoid "
-                            f"the parent process timeout ({elapsed_guard}s "
-                            f"budget; raise via --parent-timeout or "
-                            f"AUDIT_PARENT_TIMEOUT). Manual audit required."
-                        ),
-                    }]
-                    cr["child_audit_ready"] = False
-                    child_results.append(cr)
-                    continue
-
-                if child.get("status") == "completed" and child.get("stage") == "done":
-                    cr["child_audit_ready"] = True
-                    cr["ac_results"] = _child_acs_from_own_audit(
-                        child, runner, worklog_dir=worklog_dir,
+            if not phase1_checkpointed:
+                # 1. Parent Phase 2 deep analysis FIRST (parent-only).
+                if has_blocking_cq:
+                    # Blocking CQ findings → demote met verdicts to partial and
+                    # skip Phase 2 (mirrors the full-flow gate: the verdict is
+                    # already "Ready to close: No" via the CQ findings, so the
+                    # parent deep call would only burn model latency).
+                    ac_results = _demote_met_to_partial(ac_results)
+                elif _is_low_risk_small(
+                    work_item.get("effort"), work_item.get("risk")
+                ):
+                    # Small effort + Low risk — skip Phase 2 per SA-0MSQ026T3009QY2L.
+                    # Phase 1 verdicts stand unchanged; evidence notes the skip reason.
+                    print(
+                        f"Skipping Phase 2 deep analysis (parent-first): "
+                        f"effort={work_item.get('effort')}, risk={work_item.get('risk')}. "
+                        f"Phase 1 verdicts stand unchanged.",
+                        file=sys.stderr,
                     )
-                    child_results.append(cr)
-                    continue
+                    ac_results = _annotate_skip_evidence(
+                        ac_results,
+                        f"Phase 2 deep analysis skipped (effort={work_item.get('effort')}, "
+                        f"risk={work_item.get('risk')}): small, low-risk item per "
+                        f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
+                    )
+                    phase2_skip_note = (
+                        f"small, low-risk item (effort={work_item.get('effort')}, "
+                        f"risk={work_item.get('risk')}) per SA-0MSQ026T3009QY2L"
+                    )
+                elif acs and acs[0] != "No acceptance criteria defined.":
+                    print(
+                        "Phase 1 passed: running Phase 2 deep code analysis "
+                        "(parent-first)...",
+                        file=sys.stderr,
+                    )
+                    ac_results, _, phase2_completed = _run_phase2_deep_analysis(
+                        work_item, ac_results, [],  # parent-only
+                        resolved_model=resolved_model,
+                        pi_bin=pi_bin,
+                        debug_log=debug_log,
+                        script_failure_callback=ctx.record_script_failure,
+                        timeout=timeout,
+                        runner=runner,
+                        batch_phase2=batch_phase2,
+                        worklog_dir=worklog_dir,
+                        ac_fallback_used=ac_fallback_used,
+                        green_run_block=green_run_block,
+                        owning_root=owning_root,
+                        max_citations_per_ac=max_citations_per_ac,
+                        child_in_main_slot=ctx.child_in_main_slot,
+                    )
 
-                if not parent_gaps:
-                    # Parent passed with no gaps → child inherits passed
-                    # (AC2), unless the child's own content changed (AC6 —
-                    # changed children are never silently inherited-passed).
-                    if _child_content_changed(
-                        runner, child["id"], worklog_dir=worklog_dir,
-                        work_item=child,
-                    ):
+                # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
+                parent_gaps = _parent_has_gaps(ac_results) or has_blocking_cq
+                gap_child_ids = set(
+                    _map_gaps_to_children(ac_results, active_children)
+                ) if parent_gaps else set()
+
+                # 3. Child pass-through decision.
+                pending_children: list[tuple[int, dict]] = []
+                for child in active_children:
+                    cr = {
+                        "title": child.get("title", ""),
+                        "id": child.get("id", ""),
+                        "status": child.get("status", ""),
+                        "stage": child.get("stage", ""),
+                        "effort": child.get("effort"),
+                        "risk": child.get("risk"),
+                    }
+                    if _elapsed() >= elapsed_guard:
+                        elapsed_now = _elapsed()
+                        print(
+                            f"Warning: parent-process budget exceeded "
+                            f"({elapsed_now:.0f}s elapsed / {elapsed_guard}s "
+                            f"budget). Recording child {child.get('id', '')} "
+                            f"({child.get('title', '')}) as "
+                            f"{BUDGET_EXCEEDED_TEXT}. Raise the budget via "
+                            f"--parent-timeout or AUDIT_PARENT_TIMEOUT and "
+                            f"re-run to complete the audit.",
+                            file=sys.stderr,
+                        )
+                        cr["ac_results"] = [
+                            _budget_exceeded_ac_result(
+                                elapsed_now, float(elapsed_guard)
+                            )
+                        ]
+                        cr["child_audit_ready"] = False
+                        cr["budget_exceeded"] = True
+                        child_results.append(cr)
+                        _record_child_budget_exceeded(
+                            checkpoint, cr["id"], elapsed_now,
+                            float(elapsed_guard),
+                        )
+                        continue
+
+                    if child.get("status") == "completed" and child.get("stage") == "done":
+                        cr["child_audit_ready"] = True
+                        cr["ac_results"] = _child_acs_from_own_audit(
+                            child, runner, worklog_dir=worklog_dir,
+                        )
+                        child_results.append(cr)
+                        continue
+
+                    if not parent_gaps:
+                        # Parent passed with no gaps → child inherits passed
+                        # (AC2), unless the child's own content changed (AC6 —
+                        # changed children are never silently inherited-passed).
+                        if _child_content_changed(
+                            runner, child["id"], worklog_dir=worklog_dir,
+                            work_item=child,
+                        ):
+                            cr["child_audit_ready"] = False
+                            pending_children.append((len(child_results), child))
+                        else:
+                            cr["inherited_pass"] = True
+                            cr["child_audit_ready"] = True
+                            cr["ac_results"] = [{
+                                "text": "Inherited from parent pass",
+                                "verdict": "met",
+                                "evidence": (
+                                    "Parent audit passed with no gaps; child "
+                                    "inherits passed (SA-0MSKB6VJA005N43F)."
+                                ),
+                            }]
+                    elif child["id"] in gap_child_ids:
+                        # Parent has gaps and this child owns the affected files
+                        # → full audit (AC3).
                         cr["child_audit_ready"] = False
                         pending_children.append((len(child_results), child))
                     else:
-                        cr["inherited_pass"] = True
+                        # Unrelated child → not audited (AC3), does not block.
+                        cr["pass_through"] = "unrelated_to_gaps"
                         cr["child_audit_ready"] = True
                         cr["ac_results"] = [{
-                            "text": "Inherited from parent pass",
-                            "verdict": "met",
+                            "text": "Not audited (unrelated to parent gaps)",
+                            "verdict": "partial",
                             "evidence": (
-                                "Parent audit passed with no gaps; child "
-                                "inherits passed (SA-0MSKB6VJA005N43F)."
+                                "Parent audit has gaps; this child is unrelated to "
+                                "the gap files and was not audited "
+                                "(SA-0MSKB6VJA005N43F)."
                             ),
                         }]
-                elif child["id"] in gap_child_ids:
-                    # Parent has gaps and this child owns the affected files
-                    # → full audit (AC3).
-                    cr["child_audit_ready"] = False
-                    pending_children.append((len(child_results), child))
-                else:
-                    # Unrelated child → not audited (AC3), does not block.
-                    cr["pass_through"] = "unrelated_to_gaps"
-                    cr["child_audit_ready"] = True
-                    cr["ac_results"] = [{
-                        "text": "Not audited (unrelated to parent gaps)",
-                        "verdict": "partial",
-                        "evidence": (
-                            "Parent audit has gaps; this child is unrelated to "
-                            "the gap files and was not audited "
-                            "(SA-0MSKB6VJA005N43F)."
-                        ),
-                    }]
-                child_results.append(cr)
+                    child_results.append(cr)
 
-            # 4. Phase 1 child AC review for pending (gap-mapped / changed)
-            # children only — the parent's critical path is unaffected.
-            if pending_children:
-                parallelism = _resolve_child_concurrency()
-                if parallelism > 1 and len(pending_children) > 1:
-                    with ThreadPoolExecutor(max_workers=parallelism) as executor:
-                        futures = [
-                            executor.submit(
-                                _phase1_review_child_acs,
+                # 4. Phase 1 child AC review for pending (gap-mapped / changed)
+                # children only — the parent's critical path is unaffected.
+                if pending_children:
+                    # In-main-slot mode (SA-0MT2XRGEU0009QRE) is inherently
+                    # sequential (one main slot): child Phase-1 screens run one at
+                    # a time with a /compact between them, so parallel dispatch is
+                    # forced to 1; the separate-process path keeps the slot-aware
+                    # parallel ceiling.
+                    parallelism = 1 if ctx.child_in_main_slot else _resolve_child_concurrency()
+                    if parallelism > 1 and len(pending_children) > 1:
+                        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+                            futures = [
+                                executor.submit(
+                                    _phase1_review_child_acs,
+                                    ci, child,
+                                    ctx.resolved_phase1_model, ctx.resolved_model,
+                                    pi_bin, debug_log, timeout,
+                                    runner, ctx.record_script_failure,
+                                    ac_fallback_used=ac_fallback_used,
+                                    child_in_main_slot=ctx.child_in_main_slot,
+                                )
+                                for ci, child in pending_children
+                            ]
+                            for future in futures:
+                                ci, acs = future.result()
+                                child_results[ci]["ac_results"] = acs
+                    else:
+                        for ci, child in pending_children:
+                            _ci, acs = _phase1_review_child_acs(
                                 ci, child,
-                                resolved_model, pi_bin, debug_log, timeout,
+                                ctx.resolved_phase1_model, ctx.resolved_model,
+                                pi_bin, debug_log, timeout,
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
+                                child_in_main_slot=ctx.child_in_main_slot,
                             )
-                            for ci, child in pending_children
-                        ]
-                        for future in futures:
-                            ci, acs = future.result()
                             child_results[ci]["ac_results"] = acs
-                else:
-                    for ci, child in pending_children:
-                        _ci, acs = _phase1_review_child_acs(
-                            ci, child,
-                            resolved_model, pi_bin, debug_log, timeout,
-                            runner, ctx.record_script_failure,
-                            ac_fallback_used=ac_fallback_used,
-                        )
-                        child_results[ci]["ac_results"] = acs
+
+            if not phase1_checkpointed:
+                _checkpoint_phase_done(checkpoint, PHASE_CHILDREN, {
+                    "ac_results": ac_results,
+                    "child_results": child_results,
+                    "child_persist_results": child_persist_results,
+                    "phase2_completed": phase2_completed,
+                    "phase2_skip_note": phase2_skip_note,
+                })
 
             # 5. Child Phase 2 deep analysis for pending children only
             # (parent already deep-verified — skip_parent_deep=True).
-            if pending_children and not has_blocking_cq:
+            if (pending_children
+                    or (phase1_checkpointed
+                        and _children_need_phase2(child_results))
+            ) and not has_blocking_cq:
                 ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
                     work_item, ac_results, child_results,
                     resolved_model=resolved_model,
@@ -7398,6 +10010,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     skip_parent_deep=True,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
+                    child_in_main_slot=ctx.child_in_main_slot,
                 )
 
             # 6. Persist child audits (inherited children are explicit in the
@@ -7456,6 +10069,14 @@ def _phase_children(ctx: _AuditContext) -> int | None:
 
 
         # ------------------------------------------------------------------
+        _checkpoint_phase_done(checkpoint, PHASE_PHASE2, {
+            "ac_results": ac_results,
+            "child_results": child_results,
+            "child_persist_results": child_persist_results,
+            "phase2_completed": phase2_completed,
+            "phase2_skip_note": phase2_skip_note,
+        })
+
     finally:
         ctx.ac_results = ac_results
         ctx.child_results = child_results
@@ -7504,7 +10125,7 @@ def _phase_report(ctx: _AuditContext) -> int:
         # ------------------------------------------------------------------
         if cq_findings:
             try:
-                from skill.code_review.scripts.create_quality_epics import (
+                from code_review.scripts.create_quality_epics import (
                     create_epics_for_findings,
                 )
                 _epic_result = create_epics_for_findings(cq_findings, runner=runner)
@@ -7532,6 +10153,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 auto_green_run_sha=auto_green_run_sha,
                 test_skill_run_sha=test_skill_run_sha,
                 content_fingerprint=content_fingerprint,
+                merge_gate_evidence=ctx.merge_gate_evidence,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if ctx.script_failure:
@@ -7678,12 +10300,114 @@ def _phase_report(ctx: _AuditContext) -> int:
         ctx.audit_completed = audit_completed
 
 
-def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
+def _read_item_lifecycle_state(
+    runner: Runner,
+    issue_id: str,
+    worklog_dir: str | None,
+) -> tuple[str, str] | None:
+    """Read back an item's current status/stage via ``wl show <id> --json``.
+
+    Used by the post-update lifecycle verification (WL-0MSVVFBJ2003RRYK):
+    the terminal ``wl update`` may exit 0 while the item's state silently
+    stays unchanged, so the runner must verify the transition independently
+    through a fresh readback rather than trust the update's exit code.
+
+    Returns ``(status, stage)`` (stage normalized to a string, empty when
+    absent), or ``None`` when the readback fails (wl error, invalid JSON,
+    missing workItem/status) so the caller treats it as unverified.
+    """
+    try:
+        data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    wi = data.get("workItem")
+    if not isinstance(wi, dict):
+        wi = data
+    status = wi.get("status")
+    if not status:
+        return None
+    return status, str(wi.get("stage") or "")
+
+
+def _lifecycle_state_matches(
+    expected_status: str | None,
+    expected_stage: str | None,
+    actual: tuple[str, str] | None,
+) -> bool:
+    """Whether the readback state matches the expected terminal state.
+
+    A ``None`` readback (unverifiable) never matches — the transition is
+    treated as not applied so the caller retries then fails loudly.
+    """
+    if actual is None:
+        return False
+    actual_status, actual_stage = actual
+    return actual_status == expected_status and actual_stage == expected_stage
+
+
+def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
+    """Best-effort restore of the captured pre-audit state after a failed
+    terminal transition (WL-0MSWFRM800073Y81).
+
+    After a verification failure the item's state is uncertain (partial
+    application, silently-swallowed update, or a wl error). Restoring the
+    captured pre-audit status/stage — itself verified by a readback — keeps
+    the item observable and consistent; any residual failure is logged
+    loudly rather than silently ignored. Falls back to ``open``/``plan_complete``
+    only when the pre-audit state could not be captured.
+    """
+    safe_status = ctx.original_status or "open"
+    safe_stage = ctx.original_stage
+    if not safe_stage:
+        safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+    cmd = [
+        "wl", "update", ctx.issue_id,
+        "--status", safe_status,
+        "--stage", safe_stage,
+        "--assignee", "",
+        "--json",
+    ]
+    try:
+        _run_wl(ctx.runner, cmd, worklog_dir=ctx.worklog_dir)
+    except RuntimeError as exc:
+        print(
+            f"Error: failed to restore pre-audit state for {ctx.issue_id}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    actual = _read_item_lifecycle_state(ctx.runner, ctx.issue_id, ctx.worklog_dir)
+    if _lifecycle_state_matches(safe_status, safe_stage, actual):
+        print(
+            f"Restored {ctx.issue_id} to pre-audit state "
+            f"({safe_status}/{safe_stage}).",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Error: restore of {ctx.issue_id} to pre-audit state "
+            f"({safe_status}/{safe_stage}) could not be verified "
+            f"(readback: {actual!r}). Recover manually with "
+            f"`wl update {ctx.issue_id} --status {safe_status} "
+            f"--stage {safe_stage}`.",
+            file=sys.stderr,
+        )
+
+
+def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     """Phase 6 — verdict-driven terminal status transition + debug-log cleanup.
 
     Always runs (cmd_issue's finally): the item is never left in_progress.
     Restores the pre-audit state on failure/fallback-tainted runs; advances
     to completed/in_review only on a genuine 'Ready to close: Yes' verdict.
+
+    Returns 0 when the terminal transition was applied AND verified via a
+    ``wl show`` readback, or non-zero when the transition could not be
+    verified after retries (a silently-swallowed ``wl update`` must never
+    pass silently — WL-0MSVVFBJ2003RRYK). The caller (cmd_issue) folds a
+    non-zero result into its exit code so the failure is operator-visible.
     """
     # ------------------------------------------------------------------
     # Status lifecycle: verdict-driven terminal transition on exit.
@@ -7716,14 +10440,21 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
     #       printed — never a silent divergence.
     #
     # The transition is retried on transient wl failures so a single
-    # hiccup never leaves the item stuck in_progress; if it still fails a
-    # visible warning is printed (SA-0MSAL2NQV0008HY5) instead of being
-    # silently swallowed — a stuck in_progress child breaks the release
-    # close step.
+    # hiccup never leaves the item stuck in_progress; after every attempt
+    # the item state is VERIFIED via a ``wl show`` readback
+    # (WL-0MSVVFBJ2003RRYK) — a wl update that exits 0 without applying
+    # (silently swallowed) is never accepted. If retries are exhausted a
+    # loud diagnostic is printed, the pre-audit state is best-effort
+    # restored, and the run exits non-zero (never a silent success).
     # ------------------------------------------------------------------
     # Compute the intended terminal state first (no wl calls), so the
     # failure warning can tell the operator exactly what to apply.
     restore_cmd: list[str] | None = None
+    # Expected terminal state after the transition, used by the post-update
+    # readback verification (WL-0MSVVFBJ2003RRYK). Computed alongside
+    # restore_cmd so a verification failure can report the exact expectation.
+    expected_status: str | None = None
+    expected_stage: str | None = None
     # Conservative default: on any computation failure below, treat the
     # run as fallback-tainted so the debug log is retained for forensics.
     fallback_tainted = True
@@ -7784,20 +10515,50 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
                 "--assignee", "",
                 "--json",
             ]
+            expected_status, expected_stage = safe_status, safe_stage
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
+            # Top-level items (no parent) get --needs-producer-review yes so
+            # the producer-review gate (closeWorkItemsAfterRelease) blocks
+            # release until the producer explicitly reviews the item.  Child
+            # items are covered by their parent's review and must NOT be
+            # flagged — the flag would flood the producer queue with
+            # redundant approvals (SA-0MSSVKYEW008PJ9H). The flag is
+            # inserted before the trailing --json (file convention:
+            # --json is always the last flag).
+            cmd = ["wl", "update", ctx.issue_id]
             if ctx.original_stage == "done":
-                restore_cmd = ["wl", "update", ctx.issue_id, "--status", "completed", "--json"]
+                cmd += ["--status", "completed"]
             else:
-                restore_cmd = ["wl", "update", ctx.issue_id, "--status", "completed", "--stage", "in_review", "--json"]
+                cmd += ["--status", "completed", "--stage", "in_review"]
+            if not ctx.wi or not ctx.wi.get("parentId"):
+                cmd += ["--needs-producer-review", "yes"]
+            cmd.append("--json")
+            restore_cmd = cmd
+            # Stage is kept as the pre-existing 'done' when the item already
+            # sits in a terminal done stage; otherwise the review queue.
+            expected_status, expected_stage = "completed", (
+                "done" if ctx.original_stage == "done" else "in_review"
+            )
         else:  # ctx.audit_verdict == "no"
             # Return to the actionable queue at a fixed pre-review stage.
             restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
+            expected_status, expected_stage = "open", "plan_complete"
+            # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
+            # integration fails the audit closed and flags the item for
+            # producer review so the producer investigates and integrates
+            # manually — never proceed past Phase 1 with unmerged work.
+            if ctx.merge_gate_blocker:
+                restore_cmd = ["wl", "update", ctx.issue_id,
+                               "--status", "open", "--stage", "plan_complete",
+                               "--needs-producer-review", "yes", "--json"]
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(
-            f"Warning: could not compute terminal status for {ctx.issue_id}: {exc}",
+            f"Error: could not compute terminal status for {ctx.issue_id}: {exc}; "
+            "the item's lifecycle is unresolved and was NOT applied.",
             file=sys.stderr,
         )
+        return 1
 
     # ------------------------------------------------------------------
     # Debug-log lifecycle: a successful audit run removes its debug file
@@ -7810,46 +10571,66 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
     if ctx.audit_completed and ctx.script_failure is None and not fallback_tainted:
         _remove_debug_log(ctx.debug_log, ctx.issue_id)
 
-    if restore_cmd is not None:
-        # Apply the terminal transition, retrying transient failures. The
-        # update is idempotent, so retrying after a partially-applied
-        # update is harmless.
-        last_error: Exception | None = None
-        for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
-            try:
-                _run_wl(ctx.runner, restore_cmd, worklog_dir=ctx.worklog_dir)
+    if restore_cmd is None:
+        # Defensive: every branch above assigns restore_cmd; a future edit
+        # that adds a branch without one must never silently skip the
+        # lifecycle.
+        print(
+            f"Error: no terminal transition was computed for {ctx.issue_id}; "
+            "the item's lifecycle is unresolved and was NOT applied.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Apply the terminal transition and VERIFY it actually applied via a
+    # ``wl show`` readback (WL-0MSVVFBJ2003RRYK). A ``wl update`` that exits
+    # 0 without changing the item (silently swallowed) must never pass
+    # silently: transient wl failures AND verification mismatches are
+    # retried, then surfaced loudly with a non-zero exit. The update is
+    # idempotent, so retrying after a partially-applied update is harmless.
+    last_error: Exception | None = None
+    for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
+        try:
+            _run_wl(ctx.runner, restore_cmd, worklog_dir=ctx.worklog_dir)
+            actual = _read_item_lifecycle_state(
+                ctx.runner, ctx.issue_id, ctx.worklog_dir
+            )
+            if _lifecycle_state_matches(expected_status, expected_stage, actual):
                 last_error = None
                 break
-            except RuntimeError as exc:
-                last_error = exc
-                if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
-                    time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
-
-        if last_error is not None:
-            # Best-effort readback so the operator knows the item's actual
-            # state (the update may have applied but the response was lost).
-            actual_status = "unknown"
-            try:
-                rb = _run_wl(ctx.runner, ["wl", "show", ctx.issue_id, "--json"],
-                             worklog_dir=ctx.worklog_dir)
-                wi = rb.get("workItem") if isinstance(rb, dict) else None
-                if isinstance(wi, dict):
-                    actual_status = wi.get("status", "unknown")
-            except RuntimeError:
-                pass
-            print(
-                f"Warning: Failed to restore work item {ctx.issue_id} status after "
-                f"audit ({last_error}); item status is '{actual_status}'. "
-                f"If it was left in_progress, recover it manually, e.g. "
-                f"`wl update {ctx.issue_id} --status <terminal-status> --stage <stage>`.",
-                file=sys.stderr,
+            last_error = RuntimeError(
+                f"terminal transition not applied: expected "
+                f"status={expected_status!r} stage={expected_stage!r}, "
+                f"readback status={actual[0] if actual else None!r} "
+                f"stage={actual[1] if actual else None!r}"
             )
+        except RuntimeError as exc:
+            last_error = exc
+        if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
+            time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
+
+    if last_error is not None:
+        # Never a silent success: surface the failure loudly, restore the
+        # captured pre-audit state (best-effort, itself verified), and exit
+        # non-zero so the caller knows the item's lifecycle is unresolved.
+        print(
+            f"Error: Failed to apply terminal status transition for "
+            f"{ctx.issue_id} after {_STATUS_RESTORE_MAX_ATTEMPTS} attempt(s): "
+            f"{last_error}. The item's lifecycle is unresolved — check its "
+            f"state with `wl show {ctx.issue_id}` and recover manually if "
+            f"needed.",
+            file=sys.stderr,
+        )
+        _restore_pre_audit_state_on_failure(ctx)
+        return 1
+    return 0
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
               timeout: int | None = None,
               parent_timeout: int | None = None,
               pi_bin: str = "pi", model: str | None = None,
+              phase1_model: str | None = None,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
               debug_log: str | None = None,
@@ -7861,8 +10642,29 @@ def cmd_issue(issue_id: str, persist: bool = True,
               max_child_audits: int | None = None,
               run_tests: bool = False,
               no_execute: bool = False,
-              max_citations_per_ac: int | None = None) -> int:
+              max_citations_per_ac: int | None = None,
+              checkpoint_dir: str | None = None,
+              no_checkpoint: bool = False,
+              child_in_main_slot: bool | None = None,
+              batch_drain: bool | None = None) -> int:
     """Audit a single work item.
+
+    *batch_drain* (SA-0MTG5TP5Z008QBL5) controls the post-audit batch
+    drain: ``None`` (default) resolves to ON unless ``AUDIT_BATCH_DRAIN=0``
+    — when the batch queue holds >= 2 pending work items, the runner
+    continues draining additional queued items (priority order, wall-clock
+    budget) within the same dispatch window instead of stopping after this
+    item; ``False`` disables the drain for this run (nested drained audits
+    pass ``False`` so the drain never recurses).
+
+    *child_in_main_slot* (SA-0MT2XRGEU0009QRE) is the config gate between
+    the two child-audit execution modes: ``True`` (default → in-main-slot
+    mode) runs child Phase-1 AC-review screens and Phase-2 child deep
+    analysis in the main LLM slot — no new ``pi`` subprocess session per
+    child, with a ``/compact`` instruction after each child audit;
+    ``False`` uses the unchanged separate-process path (a ``pi`` subprocess
+    per child). Resolution precedence: explicit value (CLI flag, flag wins)
+    > ``AUDIT_CHILD_IN_MAIN_SLOT`` env var > ``True`` (default).
 
     The resolved model name and source are included as a metadata line
     in the audit report output (issue-level and child reports).
@@ -7872,8 +10674,26 @@ def cmd_issue(issue_id: str, persist: bool = True,
       2. Config-driven: model.audit from .ralph.json resolved via model_source
       3. Hardcoded fallback: DEFAULT_MODEL
 
+    Phase 1 model resolution (tiered, SA-0MSKB697P000T3HG):
+      1. --phase1-model CLI flag (explicit phase-1 override)
+      2. --model CLI flag
+      3. Config-driven: model.audit_phase1 from .ralph.json resolved via
+         model_source, falling back to model.audit (full model)
+      4. Hardcoded fallback: DEFAULT_MODEL
+
+    Phase 1 (parent + child AC screening) runs on the resolved phase-1
+    model; Phase 2 deep analysis keeps the full model.
+
     When *force* is ``True``, the freshness gate is bypassed and a full
     audit pipeline is always run, even if a recent audit already exists.
+    Any existing phase checkpoint is cleared so the forced run starts fresh
+    (SA-0MT6EZUS9004FJ9T).
+
+    *checkpoint_dir* (``--checkpoint-dir`` / ``AUDIT_CHECKPOINT_DIR``)
+    selects the directory for phase checkpoints, and *no_checkpoint*
+    (``--no-checkpoint``) disables checkpointing entirely. Checkpointing is
+    best-effort and OFF for ``audit project`` runs; see
+    ``_open_checkpoint_store``.
 
     *audit_children* enables the recursive child-audit cascade: when a child
     has no fresh audit, the runner auto-triggers a full child audit instead
@@ -7947,9 +10767,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
     ctx = _AuditContext(
         issue_id=issue_id, persist=persist, timeout=timeout,
         parent_timeout=parent_timeout, pi_bin=pi_bin, model=model,
+        phase1_model=phase1_model,
         model_source=model_source, runner=runner or _default_runner,
         json_mode=json_mode, debug_log=debug_log, force=force,
         worklog_dir=worklog_dir, batch_phase2=batch_phase2,
+        child_in_main_slot=_resolve_child_in_main_slot(child_in_main_slot),
         green_run=green_run, audit_children=audit_children,
         max_child_audits=max_child_audits, run_tests=run_tests,
         no_execute=no_execute,
@@ -7959,15 +10781,82 @@ def cmd_issue(issue_id: str, persist: bool = True,
     if rc is not None:
         return rc
 
+    ctx.checkpoint = _open_checkpoint_store(ctx, checkpoint_dir, no_checkpoint)
+
     try:
+        # The fetch phase (SA-0MT456M27001LRTL) runs the Phase 1 merge gate
+        # at its very start (before the code-quality scan, children-stage
+        # check, or surface AC assessment): the item's work must be merged
+        # into the owning repo's dev, and is integrated when missing. A
+        # blocked gate (integration failed) emits a fail-closed report here
+        # ("Ready to close: No" + needs-producer-review) — the pipeline
+        # never proceeds past Phase 1 with unmerged work (AC3).
         rc = _phase_fetch_and_cq(ctx)
         if rc is not None:
-            return rc
-        _phase1_parent_screening(ctx)
-        rc = _phase_children(ctx)
-        if rc is not None:
-            return rc
-        return _phase_report(ctx)
+            pass
+        elif ctx.merge_gate_stale:
+            # Stale audit base (SA-0MT9EK1UU000DT1R): the item's work is on
+            # origin/dev but the local checkout the audit resolves its git
+            # scope against does NOT contain the delivered commits. Phase 1/2
+            # would run against a tree MISSING the fix and produce misleading
+            # 'unmet'/'partial' verdicts. Abort loudly with remediation; the
+            # finally block restores the pre-audit lifecycle — no demotion,
+            # because the ITEM is fine; the checkout is stale.
+            if ctx.json_mode:
+                print(json.dumps({
+                    "stale_audit_base": {
+                        "merged": True,
+                        "reason": ctx.merge_gate_stale_reason,
+                        "remediation": (
+                            "run `git fetch origin && git pull origin dev` "
+                            "in the owning project's main checkout, or "
+                            "launch the audit from a checkout containing "
+                            "the delivered commit(s), then re-run"
+                        ),
+                    }
+                }, indent=2))
+            else:
+                print(
+                    f"Error: audit base is STALE for {ctx.issue_id}.",
+                    file=sys.stderr,
+                )
+                print(ctx.merge_gate_stale_reason, file=sys.stderr)
+                print(
+                    "Remediation: run `git fetch origin && git pull origin "
+                    "dev` in the owning project's main checkout, or launch "
+                    "the audit from a checkout containing the delivered "
+                    "commit(s), then re-run.",
+                    file=sys.stderr,
+                )
+            rc = 1
+        elif ctx.merge_gate_blocker:
+            # Integration failed: fail the audit closed (AC3). No further
+            # Phase 1 screening and no Phase 2 — any assessment would be
+            # misleading with the work unmerged.
+            ctx.audit_verdict = "no"
+            ctx.audit_completed = True
+            fail_report = _build_merge_gate_failure_report(ctx)
+            if ctx.json_mode:
+                print(json.dumps({
+                    "merge_gate": {
+                        "merged": False,
+                        "blocker": True,
+                        "reason": ctx.merge_gate_blocker,
+                    }
+                }, indent=2))
+            else:
+                print(fail_report)
+            if ctx.persist:
+                persist_audit(ctx.issue_id, fail_report,
+                              worklog_dir=ctx.worklog_dir)
+            rc = 1
+        else:
+            _phase1_parent_screening(ctx)
+            rc = _phase_children(ctx)
+            if rc is not None:
+                pass
+            else:
+                rc = _phase_report(ctx)
     except AuditScopeError as exc:
         # Scope error (LP-0MSQ32HNR007AI6B): the Phase 2 FILE SCOPE
         # manifest does not cover the item repository. Fail loudly with a
@@ -7976,10 +10865,111 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print(json.dumps({"error": str(exc)}, indent=2))
         else:
             print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        rc = 1
 
     finally:
-        _apply_terminal_lifecycle(ctx)
+        # The terminal lifecycle transition always runs; a verification
+        # failure (e.g. a silently-swallowed ``wl update``) overrides the
+        # run's exit code with a non-zero value so it is never a silent
+        # success (WL-0MSVVFBJ2003RRYK).
+        lifecycle_rc = _apply_terminal_lifecycle(ctx)
+        if lifecycle_rc != 0:
+            rc = lifecycle_rc
+    if rc == 0 and ctx.checkpoint is not None:
+        if ctx.checkpoint.budget_exceeded_children():
+            # Budget-exceeded children remain unverified: KEEP the checkpoint
+            # so a resumed run can re-audit exactly those children without
+            # re-running completed phases (SA-0MU32T6O0001UALR AC3). Clearing
+            # here would silently lose which children were skipped.
+            print(
+                "[checkpoint] budget-exceeded children remain; checkpoint "
+                "kept for resume",
+                file=sys.stderr,
+            )
+        else:
+            try:
+                ctx.checkpoint.clear()
+            except Exception as exc:  # noqa: BLE001 -- best-effort cleanup
+                print(
+                    f"Warning: could not clear audit checkpoint after success: {exc}",
+                    file=sys.stderr,
+                )
+    # Batch drain (SA-0MTG5TP5Z008QBL5): after a successful primary audit,
+    # drain additional queued work items within the same dispatch window.
+    # Never changes the primary's exit code — drained items persist and
+    # lifecycle-transition independently via their own cmd_issue calls.
+    if rc == 0 and batch_drain is not False:
+        try:
+            if _batch_drain_enabled():
+                _maybe_run_batch_drain(ctx)
+        except Exception as exc:  # noqa: BLE001 -- best-effort drain
+            print(f"Warning: batch drain failed: {exc}", file=sys.stderr)
+    return rc
+
+
+def _maybe_run_batch_drain(ctx: _AuditContext) -> None:
+    """Post-audit batch drain: drain queued work items if backlogged.
+
+    Called at the tail of a successful ``cmd_issue`` run. When the batch
+    queue holds at least ``AUDIT_BATCH_MIN_QUEUE_DEPTH`` (2) pending work
+    items, the drain processes up to ``AUDIT_BATCH_MAX_ITEMS`` (5) in
+    priority order within ``AUDIT_BATCH_TIMEOUT`` (30 min), releasing the
+    concurrency slot between items and logging batch metrics. Nested
+    drained audits run with ``batch_drain=False`` so the drain never
+    recurses. The drain is best-effort: any failure is logged, never
+    propagated (the primary audit's verdict and exit code stand).
+    """
+    queue = PriorityQueue(AUDIT_BATCH_QUEUE_NAME)
+    if not _batch_drain_should_run(len(queue)):
+        return
+    _batch_drain_cycle(
+        audit_one=_batch_audit_one(ctx),
+        max_items=_resolve_batch_max_items(),
+        timeout=_resolve_batch_timeout(),
+        worklog_dir=ctx.worklog_dir,
+        skip_ids=frozenset({ctx.issue_id}),
+    )
+
+
+def _batch_audit_one(origin: _AuditContext) -> Callable[[str, int], int]:
+    """Build the per-item audit callback for a batch drain.
+
+    Returns a closure that audits a drained work item via the full
+    ``cmd_issue`` pipeline (claim, freshness, phase gates, persist,
+    verified lifecycle). Every drained item shares the origin run's
+    configuration (model, worklog dir, persistence, etc.) but runs with
+    ``batch_drain=False`` so the drain cannot recurse. The callback owns
+    slot discipline: each item's pi calls acquire/release host-wide slots,
+    so the concurrency slot is free between items (AC4).
+    """
+    def _audit_one(item_id: str, priority: int) -> int:
+        return cmd_issue(
+            item_id,
+            persist=origin.persist,
+            timeout=origin.timeout,
+            parent_timeout=origin.parent_timeout,
+            pi_bin=origin.pi_bin,
+            model=origin.model,
+            phase1_model=origin.phase1_model,
+            model_source=origin.model_source,
+            runner=origin.runner,
+            json_mode=origin.json_mode,
+            debug_log=origin.debug_log,
+            force=origin.force,
+            worklog_dir=origin.worklog_dir,
+            batch_phase2=origin.batch_phase2,
+            green_run=origin.green_run,
+            audit_children=origin.audit_children,
+            max_child_audits=origin.max_child_audits,
+            run_tests=origin.run_tests,
+            no_execute=origin.no_execute,
+            max_citations_per_ac=origin.max_citations_per_ac,
+            checkpoint_dir=None,
+            no_checkpoint=True,
+            child_in_main_slot=origin.child_in_main_slot,
+            batch_drain=False,
+        )
+    return _audit_one
 
 
 def _build_project_json(summary: str, recommendation: str) -> dict:
@@ -8176,6 +11166,117 @@ def cmd_project(timeout: int | None = None,
     return 0
 
 
+def cmd_batch(max_items: int | None = None,
+              timeout: float | None = None,
+              persist: bool = True,
+              pi_bin: str = "pi", model: str | None = None,
+              phase1_model: str | None = None,
+              model_source: str = DEFAULT_MODEL_SOURCE,
+              runner: Runner | None = None,
+              json_mode: bool = False,
+              debug_log: str | None = None,
+              force: bool = False,
+              worklog_dir: str | None = None,
+              max_citations_per_ac: int | None = None,
+              green_run: str | None = None) -> int:
+    """Batch drain: audit up to N queued in_review items per window.
+
+    The standalone batch entry point (SA-0MTG5TP5Z008QBL5): primes the
+    batch queue from the pending ``in_review`` backlog when it is empty
+    (oldest-first, critical-before-high, ..., ``AUDIT_BATCH_MAX_ITEMS``
+    cap), then drains it — each item audited via the full ``cmd_issue``
+    pipeline in priority + FIFO order, the concurrency slot released
+    between items, within the ``AUDIT_BATCH_TIMEOUT`` wall-clock budget.
+    Emits the AC5 batch-metrics line and (in ``json_mode``) a JSON
+    summary of the window.
+
+    Returns 0 when the window drained (even if individual items reported
+    unmet verdicts — those are per-item audit outcomes, not batch
+    failures), 1 when the drain itself failed to start.
+    """
+    runner = runner if runner is not None else _default_runner
+    max_items = _resolve_batch_max_items() if max_items is None else max_items
+    timeout = _resolve_batch_timeout() if timeout is None else timeout
+
+    # Prime the batch queue when empty/under threshold so a bare
+    # ``audit_runner.py batch`` invocation drains the backlog instead of
+    # relying on an external producer having enqueued items.
+    queue = PriorityQueue(AUDIT_BATCH_QUEUE_NAME)
+    if not _batch_drain_should_run(len(queue)):
+        _enqueue_pending_audit_items(max_items, runner=runner,
+                                     worklog_dir=worklog_dir)
+        if not _batch_drain_should_run(len(queue)):
+            # Zero-item window: still emit the AC5 metrics line so stderr
+            # parsers see a uniform per-window record.
+            now = time.time()
+            zero_metrics = {
+                "batch_start": time.strftime(
+                    _AUDIT_TS_FORMAT, time.localtime(now)),
+                "batch_end": time.strftime(
+                    _AUDIT_TS_FORMAT, time.localtime(now)),
+                "items_processed": 0,
+                "queue_remaining": 0,
+                "items_included": [],
+            }
+            _log_batch_metrics(zero_metrics)
+            if json_mode:
+                print(json.dumps({
+                    "batch": {
+                        "items_processed": 0,
+                        "queue_remaining": 0,
+                        "items_included": [],
+                        "note": "no pending in_review items to audit",
+                    }
+                }, indent=2))
+            else:
+                print("No pending in_review items to audit.")
+            return 0
+
+    def _audit_one(item_id: str, priority: int) -> int:
+        return cmd_issue(
+            item_id,
+            persist=persist,
+            pi_bin=pi_bin,
+            model=model,
+            phase1_model=phase1_model,
+            model_source=model_source,
+            runner=runner,
+            json_mode=json_mode,
+            debug_log=debug_log,
+            force=force,
+            worklog_dir=worklog_dir,
+            max_citations_per_ac=max_citations_per_ac,
+            green_run=green_run,
+            checkpoint_dir=None,
+            no_checkpoint=True,
+            batch_drain=False,
+        )
+
+    try:
+        metrics = _batch_drain_cycle(
+            audit_one=_audit_one,
+            max_items=max_items,
+            timeout=timeout,
+            worklog_dir=worklog_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 -- drain must fail gracefully
+        if json_mode:
+            print(json.dumps({"error": str(exc)}, indent=2))
+        else:
+            print(f"Error: batch drain failed: {exc}", file=sys.stderr)
+        return 1
+
+    if json_mode:
+        print(json.dumps({"batch": metrics}, indent=2))
+    else:
+        print(
+            f"Batch drain complete: processed={metrics['items_processed']} "
+            f"remaining={metrics['queue_remaining']} "
+            f"items={metrics['items_included']}"
+        )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -8210,11 +11311,35 @@ def build_parser() -> argparse.ArgumentParser:
                              "pending child ACs into ONE indexed pi call (env: "
                              "AUDIT_PHASE2_BATCH; default off)"
                          ))
+    p_issue.add_argument("--child-in-main-slot", action="store_true",
+                         default=None,
+                         help=(
+                             "Run child Phase-1 AC-review screens and Phase-2 child "
+                             "deep analysis in the main LLM slot (no new pi "
+                             "subprocess session per child; the audit flow issues "
+                             "a /compact after each child audit). Default: "
+                             "AUDIT_CHILD_IN_MAIN_SLOT env or true. Use "
+                             "--no-child-in-main-slot to force the unchanged "
+                             "separate-process path (SA-0MT2XRGEU0009QRE)"
+                         ))
+    p_issue.add_argument("--no-child-in-main-slot", dest="child_in_main_slot",
+                         action="store_false",
+                         help=(
+                             "Force the separate-process path for child audits: "
+                             "a pi subprocess session per child (in-main-slot "
+                             "mode off — SA-0MT2XRGEU0009QRE)"
+                         ))
     p_issue.add_argument("--do-not-persist", action="store_true",
                          help="Do not persist the audit report via wl update")
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_issue.add_argument("--model", default=None,
                          help="Pi model to use for review (default: resolved from .ralph.json)")
+    p_issue.add_argument("--phase1-model", default=None,
+                         help=(
+                             "Pi model for Phase 1 parent + child AC screening "
+                             "(fast/cheap tier; default: resolved from "
+                             "model.audit_phase1, falling back to model.audit)"
+                         ))
     p_issue.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
                          choices=sorted(MODEL_SOURCES),
                          help="Model source: remote or local (default: local)")
@@ -8283,6 +11408,82 @@ def build_parser() -> argparse.ArgumentParser:
                              "runner auto-executes the repo's actual suite on a miss "
                              "via the test skill."
                          ))
+    p_issue.add_argument("--checkpoint-dir", default=None,
+                         help=(
+                             "Directory for audit phase checkpoints (default: "
+                             "<owning-repo>/.worklog/audit-checkpoints; env: "
+                             "AUDIT_CHECKPOINT_DIR). Partial results are persisted "
+                             "per phase so an interrupted audit resumes where it "
+                             "left off instead of re-running the whole pipeline."
+                         ))
+    p_issue.add_argument("--no-checkpoint", action="store_true",
+                         help=(
+                             "Disable phase checkpointing entirely — the audit runs "
+                             "as before, persisting no partial progress."
+                         ))
+    p_issue.add_argument("--batch-drain", dest="batch_drain",
+                         action="store_true",
+                         default=None,
+                         help=(
+                             "Force batch drain on after a successful audit: "
+                             "when the batch queue holds >= 2 pending work items, "
+                             "the runner continues draining additional queued items "
+                             "(priority order, wall-clock budget) within the same "
+                             "dispatch window instead of stopping after this item. "
+                             "Default: automatic when batch queue is backlogged, "
+                             "opt-out via AUDIT_BATCH_DRAIN=0. "
+                             "(SA-0MTG5TP5Z008QBL5)"
+                         ))
+    p_issue.add_argument("--no-batch-drain", dest="batch_drain",
+                         action="store_false",
+                         help=(
+                             "Disable automatic batch drain for this run. "
+                             "(SA-0MTG5TP5Z008QBL5)"
+                         ))
+
+    p_batch = sub.add_parser("batch", help="Batch-drain queued in_review audits")
+    p_batch.add_argument("--max-items", type=int, default=None,
+                         help=(
+                             "Max work items audited per dispatch window "
+                             f"(default: {AUDIT_BATCH_MAX_ITEMS_ENV} env or "
+                             f"{AUDIT_BATCH_MAX_ITEMS_DEFAULT})"
+                         ))
+    p_batch.add_argument("--timeout", type=float, default=None,
+                         help=(
+                             "Wall-clock budget in seconds for one batch window "
+                             f"(default: {AUDIT_BATCH_TIMEOUT_ENV} env or "
+                             f"{AUDIT_BATCH_TIMEOUT_DEFAULT}s)"
+                         ))
+    p_batch.add_argument("--do-not-persist", action="store_true",
+                         help="Do not persist drained audits via wl update")
+    p_batch.add_argument("--pi-bin", default="pi", help="Path to the pi binary")
+    p_batch.add_argument("--model", default=None,
+                         help="Pi model to use for review")
+    p_batch.add_argument("--phase1-model", default=None,
+                         help="Pi model for Phase 1 AC screening")
+    p_batch.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
+                         choices=sorted(MODEL_SOURCES),
+                         help="Model source: remote or local (default: local)")
+    p_batch.add_argument("--json", action="store_true",
+                         help="Emit a machine-readable JSON summary of the window")
+    p_batch.add_argument("--debug-log", default=None,
+                         help="Append Pi debug output to this file (JSONL)")
+    p_batch.add_argument("--force", action="store_true",
+                         help="Bypass the freshness gate for drained items")
+    p_batch.add_argument("--worklog-dir", default=None,
+                         help="Explicit .worklog directory to target")
+    p_batch.add_argument("--max-citations-per-ac", type=int, default=None,
+                         help=(
+                             "Max file:line evidence citations per criterion in "
+                             "Phase 2 deep analysis "
+                             f"(default: audit.max_citations_per_ac config key or "
+                             f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
+                         ))
+    p_batch.add_argument("--green-run", default=None, metavar="SHA|HEAD",
+                         help=(
+                             "Operator-attested green test run for execution-dependent "
+                             "ACs (same semantics as the issue subcommand)"
+                         ))
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--timeout", type=int, default=None,
@@ -8340,34 +11541,64 @@ def main(argv: list[str] | None = None) -> int:
     _apply_proxy_mode_serialization()
 
     if args.command == "issue":
-        return cmd_issue(args.issue_id, persist=not args.do_not_persist,
-                         timeout=_resolve_effective_timeout(args.timeout),
-                         parent_timeout=_resolve_parent_timeout(args.parent_timeout),
-                         pi_bin=args.pi_bin, model=args.model,
-                         model_source=args.model_source, json_mode=args.json,
-                         debug_log=args.debug_log,
-                         force=args.force,
-                         worklog_dir=args.worklog_dir,
-                         batch_phase2=_phase2_batch_enabled(args.batch_phase2),
-                         green_run=args.green_run,
-                         audit_children=args.audit_children,
-                         max_child_audits=_resolve_max_child_audits(
-                             args.max_child_audits
-                         ),
-                         max_citations_per_ac=_resolve_max_citations_per_ac(
-                             args.max_citations_per_ac
-                         ),
-                         run_tests=args.run_tests,
-                         no_execute=getattr(args, "no_execute", False))
+        with SharedTimer("audit_runner_issue") as _root_timer:
+            _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
+                            timeout=_resolve_effective_timeout(args.timeout),
+                            parent_timeout=_resolve_parent_timeout(args.parent_timeout),
+                            pi_bin=args.pi_bin, model=args.model,
+                            phase1_model=getattr(args, "phase1_model", None),
+                            model_source=args.model_source, json_mode=args.json,
+                            debug_log=args.debug_log,
+                            force=args.force,
+                            worklog_dir=args.worklog_dir,
+                            batch_phase2=_phase2_batch_enabled(args.batch_phase2),
+                            green_run=args.green_run,
+                            audit_children=args.audit_children,
+                            max_child_audits=_resolve_max_child_audits(
+                                args.max_child_audits
+                            ),
+                            max_citations_per_ac=_resolve_max_citations_per_ac(
+                                args.max_citations_per_ac
+                            ),
+                            run_tests=args.run_tests,
+                            no_execute=getattr(args, "no_execute", False),
+                            checkpoint_dir=getattr(args, "checkpoint_dir", None),
+                            no_checkpoint=getattr(args, "no_checkpoint", False),
+                            child_in_main_slot=getattr(
+                                args, "child_in_main_slot", None
+                            ),
+                            batch_drain=getattr(args, "batch_drain", None))
+            print(_root_timer.render(), file=sys.stderr)
+        return _rc
+    elif args.command == "batch":
+        with SharedTimer("audit_runner_batch") as _root_timer:
+            _rc = cmd_batch(max_items=args.max_items,
+                            timeout=args.timeout,
+                            persist=not args.do_not_persist,
+                            pi_bin=args.pi_bin, model=args.model,
+                            phase1_model=args.phase1_model,
+                            model_source=args.model_source, json_mode=args.json,
+                            debug_log=args.debug_log,
+                            force=args.force,
+                            worklog_dir=args.worklog_dir,
+                            max_citations_per_ac=_resolve_max_citations_per_ac(
+                                args.max_citations_per_ac
+                            ),
+                            green_run=args.green_run)
+            print(_root_timer.render(), file=sys.stderr)
+        return _rc
     elif args.command == "project":
-        return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
-                           pi_bin=args.pi_bin, model=args.model,
-                           model_source=args.model_source, json_mode=args.json,
-                           debug_log=args.debug_log,
-                           worklog_dir=args.worklog_dir,
-                           max_citations_per_ac=_resolve_max_citations_per_ac(
-                               args.max_citations_per_ac
-                           ))
+        with SharedTimer("audit_runner_project") as _root_timer:
+            _rc = cmd_project(timeout=_resolve_effective_timeout(args.timeout),
+                              pi_bin=args.pi_bin, model=args.model,
+                              model_source=args.model_source, json_mode=args.json,
+                              debug_log=args.debug_log,
+                              worklog_dir=args.worklog_dir,
+                              max_citations_per_ac=_resolve_max_citations_per_ac(
+                                  args.max_citations_per_ac
+                              ))
+            print(_root_timer.render(), file=sys.stderr)
+        return _rc
 
     return 2
 

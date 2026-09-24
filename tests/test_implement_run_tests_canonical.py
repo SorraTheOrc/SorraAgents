@@ -22,8 +22,7 @@ import sys
 from pathlib import Path
 
 import pytest
-
-from skill.test_runner import normalize_test_command
+from test_runner import normalize_test_command
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
@@ -129,7 +128,7 @@ def test_run_tests_cache_keys_match_test_skill_canonical_commands(
 
     # The test skill's run_tests.py builds PYTEST_CMD the same way:
     # canonicalize_quiet_test_command("pytest").
-    from skill.test_runner import canonicalize_quiet_test_command
+    from test_runner import canonicalize_quiet_test_command
 
     assert mod.PYTEST_CMD == canonicalize_quiet_test_command("pytest")
     assert mod.NPM_TEST_CMD == canonicalize_quiet_test_command("npm test")

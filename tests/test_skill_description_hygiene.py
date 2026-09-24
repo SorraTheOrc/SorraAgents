@@ -23,7 +23,9 @@ import measure_context as mc
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MAX_DESC_BYTES = 140
-MAX_TOTAL_PROSE_BYTES = 1800
+# 1800 B covered the original 17 skills; the 18th (report helper,
+# SA-0MSRFTP2Y008BH6L) adds at most one more ≤140 B description.
+MAX_TOTAL_PROSE_BYTES = 1940
 
 
 def _prose() -> dict[str, str]:
@@ -35,8 +37,12 @@ def _prose() -> dict[str, str]:
 class TestDescriptionTemplate:
     """Every skill description follows the compact template."""
 
-    def test_all_17_skills_have_descriptions(self):
+    def test_all_skills_have_descriptions(self):
         prose = _prose()
+        # 18 skills at F2 (SA-0MSLK78W7009HIXC + report helper
+        # SA-0MSRFTP2Y008BH6L); 16 after retiring two helper skills
+        # (SA-0MSN81W9G006K0K8); 17 after adding standup
+        # (SA-0MTOMCML900254CI).
         assert len(prose) == 17, f"expected 17 skills, got {len(prose)}"
 
     def test_each_description_within_140_chars(self):
@@ -67,10 +73,17 @@ class TestDescriptionTemplate:
 
     def test_measured_reduction_is_at_least_48_percent(self):
         baseline = 3492  # intake baseline (SA-0MSJI53RX006E2PS)
-        total = sum(len(d) for d in _prose().values())
-        reduction = 1 - total / baseline
+        prose = _prose()
+        # The ≥48% cut was measured on the original 17 skills
+        # (SA-0MSLK78W7009HIXC). The 18th skill (report) is new prose that
+        # never existed at intake, so it cannot participate in the compaction
+        # cut; its compactness is enforced by the ≤140 B per-description test
+        # and the total-prose budget. Exclude it to keep the AC anchored to
+        # the skills that were actually compacted.
+        compacted_total = sum(len(d) for k, d in prose.items() if k != "report")
+        reduction = 1 - compacted_total / baseline
         assert reduction >= 0.48, (
-            f"reduction {reduction:.1%} < 48% (total {total} B vs {baseline} B)"
+            f"reduction {reduction:.1%} < 48% (total {compacted_total} B vs {baseline} B)"
         )
 
 

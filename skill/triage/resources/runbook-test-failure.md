@@ -5,13 +5,12 @@ Purpose
 
 Guidance for triaging critical `test-failure` work items created by agents.
 
-Owner inference
----------------
+Owner assignment
+----------------
 
-1. Check `.worklog/triage/owner-map.yaml` for overrides.
-2. If not present, prefer CODEOWNERS if available.
-3. Otherwise run `git blame <file>` and use recent commit authorship.
-4. If confidence is low, assign to `Build` and request human triage.
+New test-failure issues are deterministically assigned to `Build` (the previous owner
+heuristics were retired). Route to humans via the normal PM/triage check when the
+issue needs an owner decision.
 
 Triage steps
 ------------
@@ -65,7 +64,7 @@ Blocks scheduler test suite; does not affect other test modules.
 ## Suggested Triage Steps
 
 1. Verify flakiness: rerun CI/test locally once.
-2. If reproducible, add owner from owner-inference heuristics and assign for triage.
+2. If reproducible, assign to `Build` and route for triage.
 3. If flaky, tag flaky and route to flaky-test queue.
 
 ## Links

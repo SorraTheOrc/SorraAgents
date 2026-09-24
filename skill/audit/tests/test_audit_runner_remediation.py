@@ -39,9 +39,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
-from skill.code_review.scripts import linter_runner
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
+from code_review.scripts import linter_runner
 
 
 @pytest.fixture(autouse=True)
@@ -88,7 +88,7 @@ def _git_runner():
             return SimpleNamespace(returncode=0, stdout="abc1234\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    runner.side_effect = _side
+    runner.side_effect = stateful_wl_side_effect(_side)
     return runner
 
 
@@ -107,7 +107,7 @@ def _run_loop(tmp_path, cq_findings, fp_screen_results, runner=None,
             audit_runner, "_git_changed_files", return_value=["src/bad.py"]
         ),
         mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             return_value=cq_returns,
         ),
         mock.patch.object(
@@ -242,6 +242,146 @@ class TestApplyRuffRemediation:
 
 
 # ===========================================================================
+# AC4 — per-file-ignores must not contain E902 or machine-absolute paths
+# ===========================================================================
+
+
+class TestRemediationFilter:
+    """AC4: apply_ruff_remediation and the remediation loop must never
+    produce junk per-file-ignores referencing E902 codes or
+    machine-specific absolute paths (SA-0MSXVXVUL0011JKX).
+
+    Pre-fix: E902 / absolute paths reach the remediation loop and get
+    written to config → junk.
+    Post-fix: they are skipped.
+    """
+
+    def test_apply_ruff_remediation_skips_e902_code(self, tmp_path):
+        """E902 findings are ignored — per-file-ignores cannot fix IO errors."""
+        cfg = tmp_path / "ruff.toml"
+        cfg.write_text("")
+        entry = _screen_entry(_finding(file="src/bad.py", code="E902"))
+        # E902 → skipped → no config change.
+        assert not linter_runner.apply_ruff_remediation(cfg, [entry])
+        assert cfg.read_text() == ""
+
+    def test_apply_ruff_remediation_skips_absolute_path(self, tmp_path):
+        """Machine-absolute paths are skipped — they'd pollute config."""
+        cfg = tmp_path / "ruff.toml"
+        cfg.write_text("")
+        entry = _screen_entry(_finding(
+            file="/home/ghost/project/file.py", code="F841",
+        ))
+        assert not linter_runner.apply_ruff_remediation(cfg, [entry])
+        assert cfg.read_text() == ""
+
+    def test_apply_ruff_remediation_accepts_relative_non_e902(self, tmp_path):
+        """Normal (relative, non-E902) findings still get entries."""
+        cfg = tmp_path / "ruff.toml"
+        cfg.write_text("")
+        entry = _screen_entry(_finding(file="src/bad.py", code="F841"))
+        assert linter_runner.apply_ruff_remediation(cfg, [entry])
+        assert '"src/bad.py" = ["F841"]' in cfg.read_text()
+
+    def test_loop_skips_e902_targets_before_config(self, tmp_path):
+        """The remediation loop must not call locate_ruff_config / apply
+        when all targets are E902 or absolute — avoids creating a junk
+        root ruff.toml.
+
+        Pre-fix: locate_ruff_config is called → empty ruff.toml created.
+        Post-fix: targets filtered → loop breaks without config."""
+        runner = mock.MagicMock()
+
+        def _side(cmd, **kwargs):
+            if " ".join(cmd).startswith("git rev-parse"):
+                return SimpleNamespace(returncode=0, stdout="abc1234\n",
+                                       stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        runner.side_effect = stateful_wl_side_effect(_side)
+
+        # Only E902 findings — should be filtered out.
+        e902_targets = [_screen_entry(_finding(
+            file="/home/ghost/ruff.toml", code="E902",
+        ))]
+
+        with (
+            mock.patch.object(audit_runner, "_git_changed_files",
+                              return_value=["/home/ghost/ruff.toml"]),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+            mock.patch.object(audit_runner, "_screen_ruff_findings",
+                              return_value=e902_targets),
+            mock.patch.object(audit_runner, "_commit_config_remediation",
+                              return_value="abc123"),
+            mock.patch.object(audit_runner, "_compute_content_fingerprint",
+                              return_value="fp-after"),
+        ):
+            results = audit_runner._run_remediation_loop(
+                issue_id="TEST-1",
+                cq_findings=[{"file": "/home/ghost/ruff.toml", "code": "E902"}],
+                fp_screen_results=e902_targets,
+                runner=runner, pi_bin="pi", resolved_model="m",
+                debug_log=None, timeout=None,
+                ac_fallback_used=mock.Mock(),
+                project_root=tmp_path, worklog_dir=None,
+                work_item={"id": "TEST-1"},
+                content_fingerprint="fp-before",
+            )
+
+        assert results["iterations"] == 0, (
+            "loop must not run when all targets are E902"
+        )
+        assert results["exhausted"] is False, (
+            "loop must not be exhausted when targets are filtered out"
+        )
+        assert results["commits"] == []
+        # No ruff.toml should have been created.
+        assert not (tmp_path / "ruff.toml").exists()
+
+
+    def test_no_tracked_ruff_config_has_machine_absolute_keys(self):
+        """AC4 repo-hygiene regression (SA-0MSXVXW9C0032S7G): no tracked
+        ruff config (ruff.toml or pyproject.toml [tool.ruff]) may contain
+        per-file-ignores keys that are machine-specific absolute paths.
+
+        Pre-fix: ruff.toml shipped legacy keys like
+        "/home/rgardler/projects/SorraAgents/skill/....py" (written by the
+        remediation loop before the absolute-path skip existed).
+        Post-fix: the junk config was deleted; a config re-introduced with
+        absolute-path keys fails this guard — the config is portable.
+        """
+        candidates = [
+            (REPO_ROOT / "ruff.toml", "per-file-ignores"),
+            (REPO_ROOT / "pyproject.toml", "tool.ruff.per-file-ignores"),
+        ]
+        cfg_texts = [
+            (cfg.read_text(encoding="utf-8"), section)
+            for cfg, section in candidates
+            if cfg.exists()
+        ]
+        if not cfg_texts:
+            pytest.skip("repo has no tracked ruff config to guard")
+        for text, section in cfg_texts:
+            in_section = False
+            for raw in text.splitlines():
+                line = raw.strip()
+                if line == f"[{section}]":
+                    in_section = True
+                    continue
+                if in_section and line.startswith("["):
+                    break
+                if in_section and line and not line.startswith("#"):
+                    key = line.partition("=")[0].strip().strip('"').strip("'")
+                    assert not Path(key).is_absolute(), (
+                        f"junk machine-absolute per-file-ignores key: {key}"
+                    )
+
+
+# ===========================================================================
 # AC3/AC4/AC5/AC6 — the remediation loop
 # ===========================================================================
 
@@ -268,7 +408,7 @@ class TestRemediationLoop:
             mock.patch.object(audit_runner, "_git_changed_files",
                               return_value=["src/bad.py"]),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
@@ -331,7 +471,7 @@ class TestRemediationLoop:
             mock.patch.object(audit_runner, "_git_changed_files",
                               return_value=["src/bad.py"]) as git_changed,
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality"
+                "code_review.scripts.code_quality.run_code_quality"
             ) as cq,
             mock.patch.object(audit_runner, "_screen_ruff_findings",
                               return_value=[]),
@@ -362,7 +502,7 @@ class TestRemediationLoop:
             mock.patch.object(audit_runner, "_git_changed_files",
                               return_value=["src/bad.py"]),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [finding],
                               "fixes_applied": 0},
             ),
@@ -405,7 +545,7 @@ class TestRemediationLoop:
             mock.patch.object(audit_runner, "_git_changed_files",
                               return_value=["src/bad.py"]),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [finding],
                               "fixes_applied": 0},
             ),
@@ -519,7 +659,7 @@ class TestRemediationLoop:
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        runner.side_effect = _side
+        runner.side_effect = stateful_wl_side_effect(_side)
 
         def _fake_pi(issue_id, context, prompt, **kwargs):
             if context == audit_runner.FP_SCREEN_CONTEXT:
@@ -535,14 +675,14 @@ class TestRemediationLoop:
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [finding],
                               "fixes_applied": 0},
             ),
             mock.patch.object(audit_runner, "_run_remediation_loop",
                               side_effect=_neutral_loop),
             mock.patch(
-                "skill.code_review.scripts.create_quality_epics."
+                "code_review.scripts.create_quality_epics."
                 "create_epics_for_findings",
                 return_value={"epic_id": None},
             ),

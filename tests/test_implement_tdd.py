@@ -95,9 +95,9 @@ class TestImplementSkillTDD:
     """Verify implement SKILL.md enforces tests-first in Step 5."""
 
     def test_implement_step_4_requires_tests_first(self, implement_content: str) -> None:
-        """Step 5 must include explicit instruction to write tests first
+        """Step 6 must include explicit instruction to write tests first
         before implementation code."""
-        step4 = _find_step(implement_content, "5. Implement")
+        step4 = _find_step(implement_content, "6. Implement")
         assert step4 is not None, "Could not find 'Implement' step"
 
         # Must contain "write tests first" or equivalent
@@ -120,9 +120,9 @@ class TestImplementSkillTDD:
 
 
     def test_implement_step_4_harness_mock_guidance(self, implement_content: str) -> None:
-        """Step 5 must include guidance for creating harnesses or mocks
+        """Step 6 must include guidance for creating harnesses or mocks
         when external constraints prevent writing complete tests."""
-        step4 = _find_step(implement_content, "5. Implement")
+        step4 = _find_step(implement_content, "6. Implement")
         assert step4 is not None, "Could not find 'Implement' step"
 
         harness_patterns = [

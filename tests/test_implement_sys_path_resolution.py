@@ -90,12 +90,20 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
     # imports is_code_freeze_active from it at module load.
     real_cf = (_REPO_ROOT / "skill" / "shared" / "code_freeze.py").read_text()
     (skill_pkg / "shared" / "code_freeze.py").write_text(real_cf)
+    # Provide the timing module (SA-0MT319YGQ002E801) — implement.py imports
+    # ``Timer`` from it at module load for timing instrumentation.
+    real_timing = (_REPO_ROOT / "skill" / "shared" / "timing.py").read_text()
+    (skill_pkg / "shared" / "timing.py").write_text(real_timing)
     # Provide the test cache + runner modules (SA-0MSGN5OJ4002OZKY) —
     # implement.py's run_tests() routes through the cache at import time.
     real_tc = (_REPO_ROOT / "skill" / "test_cache.py").read_text()
     (skill_pkg / "test_cache.py").write_text(real_tc)
     real_tr = (_REPO_ROOT / "skill" / "test_runner.py").read_text()
     (skill_pkg / "test_runner.py").write_text(real_tr)
+    # Provide the graceful-failure guard (F3, SA-0MSWJ9ZEU001HDVT) —
+    # implement.py imports guard_shared_import at module load.
+    real_ig = (_REPO_ROOT / "skill" / "import_guard.py").read_text()
+    (skill_pkg / "import_guard.py").write_text(real_ig)
     (skill_pkg / "__init__.py").touch()
     (skill_pkg / "shared" / "__init__.py").touch()
 

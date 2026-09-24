@@ -18,6 +18,7 @@ Optional flags:
   --commit-msg <msg>        Commit message override
   --parent-branch <branch>  Override parent branch (default: dev)
   --worktree-path <path>    Override worktree path
+  --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
   -v, --verbose             Verbose logging
 
 Environment:
@@ -36,6 +37,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -47,14 +49,32 @@ from pathlib import Path
 from typing import Any
 
 # Ensure the repository root is on sys.path so skill package imports work
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.shared.code_freeze import is_code_freeze_active
-from skill.shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
-from skill.test_cache import run_cached
-from skill.test_runner import canonicalize_quiet_test_command
+from import_guard import guard_shared_import
+
+try:
+    from shared.code_freeze import is_code_freeze_active
+    from shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
+    from shared.timing import Timer
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
+try:
+    # The shared changed-file → test selector (SA-0MT6CENPW004V2JN). Kept
+    # optional: partial skill installs (staged layouts without the test
+    # skill's scripts) must still start implement.py — changed-scope then
+    # degrades to full scope with a warning.
+    from test.scripts.run_tests import (
+        changed_scope_commands as _changed_scope_commands,
+    )
+except ModuleNotFoundError:
+    _changed_scope_commands = None  # type: ignore[assignment]
+from test_cache import run_cached
+from test_runner import canonicalize_quiet_test_command
 
 # Canonical quiet full-suite commands — identical cache keys to the test
 # skill's run_tests.py (SA-0MSN6FBFS006Z5QP) so cached runs are shared
@@ -63,6 +83,15 @@ PYTEST_CMD = canonicalize_quiet_test_command("pytest")  # pytest -q -r a --disab
 NPM_TEST_CMD = canonicalize_quiet_test_command("npm test")  # npm --silent test
 
 LOG = logging.getLogger("implement.scripts.implement")
+
+
+def _emit_timing(timer: Timer) -> None:
+    """Emit the timing report for a completed implement run to stderr.
+
+    Timing always goes to stderr so stdout stays clean for JSON-mode output
+    (SA-0MT319YGQ002E801 AC5 — additive, non-breaking).
+    """
+    print(timer.render(), file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -74,6 +103,38 @@ DEFAULT_WORKTREE_DIR = ".worklog/worktrees"
 DEFAULT_MAX_RETRY = 3
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
+
+# ---------------------------------------------------------------------------
+# Per-repo test-timeout configuration (SA-0MTXKIIRV009MJWG)
+# ---------------------------------------------------------------------------
+_TEST_CONFIG_FILE = ".pi/test-config.json"
+_DEFAULT_TIMEOUT_PER_COMMAND = 600
+
+
+def _resolve_test_timeout(cwd: str) -> int:
+    """Return the per-command timeout (seconds) for the project at *cwd*.
+
+    Reads ``.pi/test-config.json`` from the project root, extracts the
+    ``timeoutPerCommand`` value, and falls back to 600 when the file is
+    absent, the field is missing, or the value is invalid.
+
+    This allows per-repo overrides (e.g. TCE sets 1500 to cover its
+    ~19‑minute full suite) while keeping repos without the config file
+    on the original 600‑second default.
+    """
+    root = Path(cwd).resolve()
+    config_path = root / _TEST_CONFIG_FILE
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return _DEFAULT_TIMEOUT_PER_COMMAND
+    if not isinstance(data, dict):
+        return _DEFAULT_TIMEOUT_PER_COMMAND
+    timeout = data.get("timeoutPerCommand")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return _DEFAULT_TIMEOUT_PER_COMMAND
+    timeout = int(timeout)
+    return timeout if timeout > 0 else _DEFAULT_TIMEOUT_PER_COMMAND
 
 # State file name stored inside the worktree
 STATE_FILE_NAME = ".implement_state.json"
@@ -849,6 +910,67 @@ def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> b
     return True
 
 
+def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool:
+    """Initialize git submodules inside a newly-created worktree.
+
+    ``git worktree add`` does not automatically initialize submodules.  This
+    helper runs ``git submodule update --init --recursive`` inside the
+    worktree so that downstream builds and tests see the expected submodule
+    content.
+
+    Best-effort only — submodule initialisation failure is **never fatal**.
+    On failure a warning is logged and the worktree is left usable.
+
+    When the main checkout has no ``.gitmodules`` the command is a no-op and
+    returns ``False``.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout (unused but kept for
+            API symmetry with ``_ensure_node_modules_symlink``).
+
+    Returns:
+        ``True`` if submodules were initialised (or there were none),
+        ``False`` if the command failed or there was nothing to do.
+    """
+    # Quick check: does the repo even have submodules?
+    gitmodules = Path(repo_root) / ".gitmodules" if repo_root else None
+    if gitmodules and not gitmodules.is_file():
+        LOG.info("No .gitmodules found at %s; skipping submodule init.", gitmodules)
+        return False
+
+    try:
+        result = subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 min — generous for large submodule trees.
+            check=False,
+        )
+        if result.returncode != 0:
+            LOG.warning(
+                "Submodule initialisation failed in worktree %s (rc=%d): %s",
+                worktree_path,
+                result.returncode,
+                result.stderr.strip() or result.stdout.strip(),
+            )
+            return False
+        LOG.info(
+            "Submodules initialised in worktree %s.", worktree_path
+        )
+        return True
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError) as exc:
+        LOG.warning(
+            "Submodule initialisation errored in worktree %s: %s",
+            worktree_path,
+            exc,
+        )
+        return False
+
+
 def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
     """Remove a worktree directory gracefully.
 
@@ -1337,12 +1459,14 @@ def _detect_test_tooling(cwd: str) -> str | None:
     return None
 
 
-def _skip_test_result(message: str, tooling: str | None) -> dict[str, Any]:
+def _skip_test_result(message: str, tooling: str | None,
+                      scope: str = "full") -> dict[str, Any]:
     """Build a skipped/no-op test result.
 
     Args:
         message: Informative no-op message (also logged).
         tooling: The detected tooling, if any (e.g. ``unity``).
+        scope: The scope this run represented (``full``/``changed``).
 
     Returns:
         A result dict with ``success: True`` so finish proceeds.
@@ -1356,19 +1480,22 @@ def _skip_test_result(message: str, tooling: str | None) -> dict[str, Any]:
         "failures": [],
         "skipped": True,
         "tooling": tooling,
+        "scope": scope,
     }
 
 
-def _finalize_test_result(result: dict[str, Any], tooling: str | None) -> dict[str, Any]:
+def _finalize_test_result(result: dict[str, Any], tooling: str | None,
+                          scope: str = "full") -> dict[str, Any]:
     """Add metadata keys and parse failures from a raw run result.
 
     Args:
         result: Raw run dict (stdout/stderr/exit_code).
         tooling: The runner that produced the result.
+        scope: The scope this run represented (``full``/``changed``).
 
     Returns:
-        The result dict with ``success``, ``failures``, ``skipped: False``
-        and ``tooling`` keys.
+        The result dict with ``success``, ``failures``, ``skipped: False``,
+        ``tooling`` and ``scope`` keys.
     """
     failures: list[str] = []
     combined = f"{result['stdout']}\n{result['stderr']}"
@@ -1383,6 +1510,7 @@ def _finalize_test_result(result: dict[str, Any], tooling: str | None) -> dict[s
         "failures": failures,
         "skipped": False,
         "tooling": tooling,
+        "scope": scope,
     }
 
 
@@ -1399,8 +1527,64 @@ def _shell_command_runner(
     )
 
 
-def run_tests(cwd: str) -> dict[str, Any]:
-    """Run the full test suite, routed through the per-repo run cache.
+def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
+    """Run only the tests affected by the worktree's changes vs *base_ref*.
+
+    Reuses the shared changed-file → test selector from the test skill
+    (``skill/test/scripts/run_tests.py``) so implement's scoped validation
+    selects the exact same subset as ``run_tests.py --scope changed`` and
+    caches it under a distinct key with ``scope: "changed"`` metadata (a
+    partial run is never mistaken for full-suite evidence).
+
+    Returns ``None`` when no subset is possible so the caller falls back to
+    the full suite: no dev baseline/changed files, only non-test changes,
+    custom ``suiteCommands`` in ``.pi/test-config.json``, a selection
+    that resolves to node-only commands (implement's pytest channel cannot
+    run them), or a partial skill install without the test skill's
+    selector. npm / repo-script / override / unity toolings are not
+    subsettable — the caller warns and runs full scope.
+    """
+    if _changed_scope_commands is None:
+        LOG.warning(
+            "Implement run_tests: changed-scope selector unavailable "
+            "(test/scripts.run_tests not importable) — running full scope "
+            "on %s.",
+            cwd,
+        )
+        return None
+    commands = _changed_scope_commands(Path(cwd), base_ref=base_ref or "origin/dev")
+    if not commands:
+        return None
+    pytest_cmds = [c for c in commands if c.startswith("pytest")]
+    if not pytest_cmds:
+        return None
+    run = run_cached(
+        pytest_cmds[0],
+        cwd=cwd,
+        timeout=_resolve_test_timeout(cwd),
+        runner=lambda command, cwd_, timeout_: run_cmd(
+            shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+        ),
+        scope="changed",
+    )
+    return _finalize_test_result(run, tooling="pytest", scope="changed")
+
+
+def run_tests(cwd: str, scope: str = "changed",
+              base_ref: str | None = None) -> dict[str, Any]:
+    """Run the project test suite, routed through the per-repo run cache.
+
+    *scope* selects the execution scope (SA-0MT6CENPW004V2JN):
+
+    - ``changed`` (default): run only the tests affected by the worktree's
+      changes vs *base_ref* (``origin/dev`` default). Used by the finish
+      build/test/commit loop for fast iteration. When no subset can be
+      selected (no dev baseline, no changed files, only non-test changes,
+      custom ``suiteCommands``, or a non-pytest tooling), falls back to the
+      full suite with a logged warning — a scoped run must never silently
+      skip testing.
+    - ``full``: the complete suite (populates/consumes the full-suite cache
+      entry that audit and the pre-push hook rely on).
 
     The test step is tolerant of repos with no test tooling: when neither
     pytest, an npm ``test`` script, nor a repo-local runner is detected, the
@@ -1429,37 +1613,60 @@ def run_tests(cwd: str) -> dict[str, Any]:
 
     Args:
         cwd: Working directory (worktree root).
+        scope: Execution scope (``changed`` — default — or ``full``).
+        base_ref: Base ref for changed-file detection when *scope* is
+            ``changed`` (default ``origin/dev``).
 
     Returns:
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
-        ``exit_code`` (int), ``failures`` (list[str]), plus ``skipped``
-        (bool — True when no tooling was found) and ``tooling`` (str | None —
-        the detected runner: pytest/npm/repo-script/override/unity).
+        ``exit_code`` (int), ``failures`` (list[str]), ``scope`` (str), plus
+        ``skipped`` (bool — True when no tooling was found) and ``tooling``
+        (str | None — the detected runner: pytest/npm/repo-script/override/
+        unity).
     """
     # 1. Per-repo override (env var) — highest precedence
     override = os.environ.get("IMPLEMENT_TEST_COMMAND", "").strip()
     if override:
+        if scope == "changed":
+            LOG.warning(
+                "Implement run_tests: IMPLEMENT_TEST_COMMAND override is not "
+                "subsettable — running full scope on %s.",
+                cwd,
+            )
         return _finalize_test_result(
             run_cached(
                 override,
                 cwd=cwd,
-                timeout=600,
+                timeout=_resolve_test_timeout(cwd),
                 runner=_shell_command_runner,
+                scope="full",
             ),
             tooling="override",
+            scope="full",
         )
 
     tooling = _detect_test_tooling(cwd)
 
     # 2. pytest (with npm test fallback when the repo also has a test script)
     if tooling == "pytest":
+        if scope == "changed":
+            scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
+            if scoped is not None:
+                return scoped
+            LOG.warning(
+                "Implement run_tests: changed-scope selection unavailable in "
+                "%s (no dev baseline, no changed tests, or custom "
+                "suiteCommands) — falling back to full scope.",
+                cwd,
+            )
         pytest_run = run_cached(
             PYTEST_CMD,
             cwd=cwd,
-            timeout=600,
+            timeout=_resolve_test_timeout(cwd),
             runner=lambda command, cwd_, timeout_: run_cmd(
-                command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
             ),
+            scope="full",
         )
         result = pytest_run
         final_tooling = "pytest"
@@ -1468,30 +1675,41 @@ def run_tests(cwd: str) -> dict[str, Any]:
             npm_run = run_cached(
                 NPM_TEST_CMD,
                 cwd=cwd,
-                timeout=600,
+                timeout=_resolve_test_timeout(cwd),
                 runner=lambda command, cwd_, timeout_: run_cmd(
-                    command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
                 ),
+                scope="full",
             )
             if npm_run["exit_code"] == 0:
-                return _finalize_test_result(npm_run, tooling="npm")
+                return _finalize_test_result(
+                    npm_run, tooling="npm", scope="full"
+                )
             # Use the npm result if pytest also failed
             result = npm_run
             final_tooling = "npm"
-        return _finalize_test_result(result, tooling=final_tooling)
+        return _finalize_test_result(result, tooling=final_tooling, scope="full")
 
     # 3. npm test script (no pytest suite)
     if tooling == "npm":
+        if scope == "changed":
+            LOG.warning(
+                "Implement run_tests: npm tooling is not subsettable — "
+                "running full scope on %s.",
+                cwd,
+            )
         return _finalize_test_result(
             run_cached(
                 NPM_TEST_CMD,
                 cwd=cwd,
-                timeout=600,
+                timeout=_resolve_test_timeout(cwd),
                 runner=lambda command, cwd_, timeout_: run_cmd(
-                    command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
                 ),
+                scope="full",
             ),
             tooling="npm",
+            scope="full",
         )
 
     # 4. Repo-local runner script
@@ -1514,9 +1732,22 @@ def run_tests(cwd: str) -> dict[str, Any]:
             command = f"cmd.exe /c {runner_script}"
         else:
             command = f"bash {runner_script}"
+        if scope == "changed":
+            LOG.warning(
+                "Implement run_tests: repo-local runner is not subsettable — "
+                "running full scope on %s.",
+                cwd,
+            )
         return _finalize_test_result(
-            run_cached(command, cwd=cwd, timeout=600, runner=_shell_command_runner),
+            run_cached(
+                command,
+                cwd=cwd,
+                timeout=_resolve_test_timeout(cwd),
+                runner=_shell_command_runner,
+                scope="full",
+            ),
             tooling="repo-script",
+            scope="full",
         )
 
     # 5. Unity project without a configured runner → Unity-specific skip
@@ -1629,6 +1860,193 @@ def remove_state(worktree_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stash hygiene helpers
+# ---------------------------------------------------------------------------
+
+
+def git_stash_list(cwd: str | None = None) -> str:
+    """Run ``git stash list`` and return output.
+
+    Args:
+        cwd: Working directory (defaults to current directory).
+
+    Returns:
+        Stash list output, or empty string on error.
+    """
+    result = run_cmd(
+        ["git", "stash", "list"],
+        cwd=cwd,
+        capture=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _extract_work_item_ids_from_stash(stash_entry: str) -> list[str]:
+    """Extract work-item IDs from a single stash line.
+
+    Stash lines have the format:
+    ``stash@{N}: On <branch>: <message>``
+
+    Work-item IDs in the message follow the pattern ``SA-XXXXXXXXXXX`` or
+    any prefix followed by ``-`` and alphanumeric characters.
+
+    Args:
+        stash_entry: A single line from ``git stash list``.
+
+    Returns:
+        List of work-item ID strings found in the stash message.
+    """
+    # Pattern: SA-<word characters>, or any-prefix-<word characters>
+    # The stash message portion comes after "On <branch>: "
+    match = re.search(r"On\s+\S+:\s*(.*)", stash_entry)
+    if not match:
+        return []
+    message = match.group(1)
+    # Match work-item IDs: prefix (like SA, WL, etc.) followed by - and word chars
+    return re.findall(r"\b([A-Z]+-[A-Za-z0-9]+)\b", message)
+
+
+def _is_work_item_open(work_item_id: str) -> bool:
+    """Check whether a work item is currently open (not terminal).
+
+    Uses ``wl show`` to fetch the item and checks if its status is
+    ``in-progress``, ``in_progress``, ``open``, or ``blocked``.
+
+    Args:
+        work_item_id: The work item ID to check.
+
+    Returns:
+        True if the work item is open (not in_review/completed/done/deleted).
+    """
+    try:
+        cmd = ["wl", "show", work_item_id, "--json"]
+        cmd[1:1] = worklog_dir_flag()
+        result = run_cmd(cmd, check=False, timeout=30)
+        if result.returncode != 0:
+            return False
+        data = json.loads(result.stdout.strip())
+        if isinstance(data, dict) and "workItem" in data:
+            status = data["workItem"].get("status", "")
+            return status in ("open", "in-progress", "in_progress", "blocked")
+    except (json.JSONDecodeError, ValueError, RuntimeError):
+        pass
+    return False
+
+
+@dataclass
+class OrphanedStash:
+    """Represents a stash entry that is orphaned (no matching open work item)."""
+
+    stash_name: str  # e.g. "stash@{0}"
+    stash_entry: str  # Full git stash list line
+    matched_ids: list[str]  # Work item IDs found in the stash message
+    is_orphaned: bool  # True if no matched ID is open
+
+
+def check_orphaned_stashes(
+    cwd: str | None = None,
+) -> dict[str, Any]:
+    """Inspect ``git stash list`` and identify orphaned stashes.
+
+    An orphaned stash is one whose stash message does not reference any
+    work item that is currently in an open state (open, in_progress, blocked).
+    Stashes that reference an open work item are considered "matched" and
+    are NOT orphaned.
+
+    This function is called from ``phase_start`` to issue a WARNING when
+    orphaned stashes are found, but does NOT block (fail-open). Use
+    ``implement.py start --allow-orphaned-stashes`` to acknowledge the
+    warning and proceed.
+
+    Args:
+        cwd: Working directory to check (defaults to current directory).
+
+    Returns:
+        A dict with:
+        - ``total_stashes``: int — total number of stashes
+        - ``orphaned_stashes``: list[dict] — orphaned stash entries
+        - ``matched_stashes``: list[dict] — stashes matched to open work items
+        - ``has_orphaned``: bool — True if any orphaned stashes were found
+        - ``warning``: str | None — warning message if orphaned stashes exist
+    """
+    stash_output = git_stash_list(cwd)
+    if not stash_output:
+        return {
+            "total_stashes": 0,
+            "orphaned_stashes": [],
+            "matched_stashes": [],
+            "has_orphaned": False,
+            "warning": None,
+        }
+
+    all_stashes: list[OrphanedStash] = []
+    for line in stash_output.splitlines():
+        # Parse stash name from "stash@{N}: On <branch>: <message>"
+        stash_match = re.match(r"^(stash@\{\d+\}):", line)
+        if not stash_match:
+            continue
+        stash_name = stash_match.group(1)
+        matched_ids = _extract_work_item_ids_from_stash(line)
+
+        if matched_ids:
+            # Check if any matched ID is open
+            any_open = any(
+                _is_work_item_open(wid) for wid in matched_ids
+            )
+            is_orphaned = not any_open
+        else:
+            # No work item IDs found — this is orphaned
+            is_orphaned = True
+
+        all_stashes.append(OrphanedStash(
+            stash_name=stash_name,
+            stash_entry=line,
+            matched_ids=matched_ids,
+            is_orphaned=is_orphaned,
+        ))
+
+    orphaned = [s for s in all_stashes if s.is_orphaned]
+    matched = [s for s in all_stashes if not s.is_orphaned]
+
+    result: dict[str, Any] = {
+        "total_stashes": len(all_stashes),
+        "orphaned_stashes": [
+            {
+                "stash_name": s.stash_name,
+                "stash_entry": s.stash_entry,
+                "matched_ids": s.matched_ids,
+            }
+            for s in orphaned
+        ],
+        "matched_stashes": [
+            {
+                "stash_name": s.stash_name,
+                "stash_entry": s.stash_entry,
+                "matched_ids": s.matched_ids,
+            }
+            for s in matched
+        ],
+        "has_orphaned": len(orphaned) > 0,
+        "warning": None,
+    }
+
+    if orphaned:
+        orphaned_lines = "\n".join(
+            f"  - {s.stash_name}: {s.stash_entry}" for s in orphaned
+        )
+        result["warning"] = (
+            f"WARNING: {len(orphaned)} orphaned stash(es) detected on the main checkout. "
+            f"These stashes do not reference any open work item and may be lost.\n\n"
+            f"Orphaned stashes:\n{orphaned_lines}\n\n"
+            f"Triage these stashes (restore-and-commit via a proper work item, or delete if stale).\n"
+            f"Proceed anyway with --allow-orphaned-stashes."
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Phase implementations
 # ---------------------------------------------------------------------------
 
@@ -1641,6 +2059,7 @@ def phase_start(
     worktree_path_override: str | None = None,
     max_retry: int = DEFAULT_MAX_RETRY,
     verbose: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Phase 1: Setup the implementation environment.
 
@@ -1649,10 +2068,11 @@ def phase_start(
     2. Code Freeze gate: refuse when a release is in progress
     3. Claim the work item (status → in_progress)
     4. Safety gate: check for dirty working tree
-    5. Fetch work item details (audit)
-    6. Create a worktree from the parent branch
-    7. Register signal handlers
-    8. Write persistent state
+    5. Stash hygiene gate: warn on orphaned stashes (fail-open, --allow-orphaned-stashes to skip)
+    6. Fetch work item details (audit)
+    7. Create a worktree from the parent branch
+    8. Register signal handlers
+    9. Write persistent state
 
     Args:
         work_item_id: The work item ID.
@@ -1662,6 +2082,7 @@ def phase_start(
         worktree_path_override: Override worktree path.
         max_retry: Max test-fix retries.
         verbose: Enable verbose logging.
+        force: Acknowledge orphaned-stash warnings (--allow-orphaned-stashes) and proceed.
 
     Returns:
         Dict with result information.
@@ -1750,7 +2171,37 @@ def phase_start(
             print(format_json_output(report))
         return report
 
-    # ── Step 5: Fetch work item details ────────────────────────────
+    # ── Step 5: Stash hygiene gate (warn on orphaned stashes) ─────
+    LOG.info("Checking for orphaned stashes...")
+    stash_result = check_orphaned_stashes()
+    if stash_result["has_orphaned"]:
+        if not force:
+            orphaned_msg = (
+                f"WARNING: {len(stash_result['orphaned_stashes'])} orphaned stash(es) detected on the main checkout. "
+                f"These stashes do not reference any open work item and may be lost.\n"
+            )
+            if stash_result["warning"]:
+                orphaned_msg += stash_result["warning"]
+            LOG.warning("Orphaned stashes found:\n%s", orphaned_msg)
+            if not json_output:
+                print("\n⚠  Orphaned stash(es) detected")
+                print("=" * 60)
+                print(orphaned_msg)
+                print("=" * 60)
+                print("Run with --allow-orphaned-stashes to acknowledge and proceed.\n")
+            # Record the warning in the work-item comment for audit trail
+            wl_add_comment(work_item_id, f"Start phase: {len(stash_result['orphaned_stashes'])} orphaned stash(es) detected (see above). Run with --allow-orphaned-stashes to acknowledge.")
+            # Don't block — just warn. Proceed regardless.
+        else:
+            LOG.info("--allow-orphaned-stashes: acknowledged orphaned stash warning.")
+            if not json_output:
+                print(f"\n⚠  {len(stash_result['orphaned_stashes'])} orphaned stash(es) detected (--allow-orphaned-stashes: proceeding)\n")
+    elif stash_result["total_stashes"] > 0:
+        LOG.info("All %d stash(es) matched to open work items — no orphaned stashes.", stash_result["total_stashes"])
+    else:
+        LOG.info("No stashes found.")
+
+    # ── Step 6: Fetch work item details ────────────────────────────
     LOG.info("Fetching work item %s...", work_item_id)
     work_item = wl_show(work_item_id)
     if not work_item:
@@ -1770,7 +2221,7 @@ def phase_start(
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
 
-    # ── Step 6: Create worktree ────────────────────────────────────
+    # ── Step 7: Create worktree ────────────────────────────────────
     wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
     branch = branch_name_for(work_item_id, slug)
 
@@ -1795,6 +2246,10 @@ def phase_start(
     # fatal: skip when either side lacks node_modules (SA-0MSGS763C006SM1B).
     _ensure_node_modules_symlink(abs_wt_path, _get_repo_root())
 
+    # Initialise git submodules in the worktree (git worktree add does not
+    # do this automatically). Best-effort: a warning on failure, never fatal.
+    _ensure_submodules(abs_wt_path, _get_repo_root())
+
     # Update status with stage via shared helper
     try:
         StatusLifecycle.update_status(work_item_id, "in_progress", stage="in_progress")
@@ -1805,12 +2260,12 @@ def phase_start(
         f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}",
     )
 
-    # ── Step 7: Register signal handlers ───────────────────────────
+    # ── Step 8: Register signal handlers ───────────────────────────
     repo_root = str(Path.cwd().resolve())
     _store_signal_globals(abs_wt_path, work_item_id, repo_root)
     _register_signal_handlers()
 
-    # ── Step 8: Write state ────────────────────────────────────────
+    # ── Step 9: Write state ────────────────────────────────────────
     state = ImplementState(
         work_item_id=work_item_id,
         worktree_path=abs_wt_path,
@@ -1992,9 +2447,9 @@ def phase_finish(
         return report
 
     # ── Step 3: Test with fix-and-re-run loop ──────────────────────
-    LOG.info("Running test suite...")
+    LOG.info("Running test suite (changed scope)...")
     test_attempts = 0
-    test_result = run_tests(worktree_path)
+    test_result = run_tests(worktree_path, scope="changed")
     report["steps"]["tests"] = []
     report["steps"]["tests"].append({
         "attempt": test_attempts + 1,
@@ -2002,6 +2457,7 @@ def phase_finish(
         "failures": test_result.get("failures", []),
         "skipped": test_result.get("skipped", False),
         "tooling": test_result.get("tooling"),
+        "scope": test_result.get("scope", "changed"),
     })
 
     while not test_result["success"] and test_attempts < max_retry:
@@ -2067,14 +2523,16 @@ def phase_finish(
             break
 
         # Re-run tests
-        LOG.info("Re-running test suite (attempt %d/%d)...", test_attempts + 1, max_retry)
-        test_result = run_tests(worktree_path)
+        LOG.info("Re-running test suite (attempt %d/%d, changed scope)...",
+                 test_attempts + 1, max_retry)
+        test_result = run_tests(worktree_path, scope="changed")
         report["steps"]["tests"].append({
             "attempt": test_attempts + 1,
             "success": test_result["success"],
             "failures": test_result.get("failures", []),
             "skipped": test_result.get("skipped", False),
             "tooling": test_result.get("tooling"),
+            "scope": test_result.get("scope", "changed"),
         })
 
     if not test_result["success"]:
@@ -2091,6 +2549,46 @@ def phase_finish(
         else:
             LOG.error(msg)
         return report
+
+    # ── Step 3b: Final full-suite gate (SA-0MT6CENPW004V2JN) ───────
+    # Changed-scope validation passed. Before committing and pushing to dev
+    # (the release gate), run the FULL suite so (a) a red full tree can never
+    # be pushed, and (b) the full-suite cache is populated at the pushed
+    # commit, making the pre-push hook's full check a cheap cache hit. The
+    # result records scope=full so consumers never mistake it for the
+    # partial changed-scope validation.
+    if test_result["success"] and not test_result.get("skipped"):
+        LOG.info("Running final full-suite gate (scope=full) before commit...")
+        full_result = run_tests(worktree_path, scope="full")
+        report["steps"]["tests"].append({
+            "attempt": "final-full",
+            "success": full_result["success"],
+            "failures": full_result.get("failures", []),
+            "skipped": full_result.get("skipped", False),
+            "tooling": full_result.get("tooling"),
+            "scope": "full",
+        })
+        if not full_result["success"]:
+            failures = full_result.get("failures", [])
+            failure_summary = "\n".join(failures[:20]) if failures else full_result["stderr"][:1000]
+            msg = (
+                "Full-suite gate failed after changed-scope validation passed "
+                f"(scope=full). Failures:\n{failure_summary}\n\n"
+                "Fix the failures and re-run implement.py finish; the pre-push "
+                "hook also enforces the full suite at push."
+            )
+            report["success"] = False
+            report["message"] = msg
+            wl_add_comment(work_item_id, msg)
+            try:
+                StatusLifecycle.update_status(work_item_id, "open")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", work_item_id)
+            if json_output:
+                print(format_json_output(report))
+            else:
+                print(f"\n{msg}")
+            return report
 
     LOG.info("All tests passed")
 
@@ -2753,6 +3251,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--allow-orphaned-stashes",
+        action="store_true",
+        help="Acknowledge the orphaned-stash warning and proceed (fail-open gate)",
+    )
     return parser.parse_args(argv)
 
 
@@ -2798,38 +3301,47 @@ def _main(argv: list[str] | None = None) -> int:
     )
 
     if args.action == "start":
-        result = phase_start(
-            work_item_id=args.work_item_id,
-            json_output=args.json,
-            no_refactor=args.no_refactor,
-            parent_branch=args.parent_branch,
-            worktree_path_override=args.worktree_path,
-            max_retry=args.max_retry,
-            verbose=args.verbose,
-        )
+        with Timer("implement") as _root_timer, Timer("phase_start"):
+            result = phase_start(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                no_refactor=args.no_refactor,
+                parent_branch=args.parent_branch,
+                worktree_path_override=args.worktree_path,
+                max_retry=args.max_retry,
+                verbose=args.verbose,
+                force=args.allow_orphaned_stashes,
+            )
+            _emit_timing(_root_timer)
     elif args.action == "finish":
-        result = phase_finish(
-            work_item_id=args.work_item_id,
-            json_output=args.json,
-            no_refactor=args.no_refactor,
-            commit_msg_override=args.commit_msg,
-            max_retry=args.max_retry,
-            verbose=args.verbose,
-        )
+        with Timer("implement") as _root_timer, Timer("phase_finish"):
+            result = phase_finish(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                no_refactor=args.no_refactor,
+                commit_msg_override=args.commit_msg,
+                max_retry=args.max_retry,
+                verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
     elif args.action == "abort":
-        result = phase_abort(
-            work_item_id=args.work_item_id,
-            json_output=args.json,
-            verbose=args.verbose,
-        )
+        with Timer("implement") as _root_timer, Timer("phase_abort"):
+            result = phase_abort(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
     elif args.action == "parent":
-        result = phase_parent(
-            work_item_id=args.work_item_id,
-            json_output=args.json,
-            no_refactor=args.no_refactor,
-            parent_branch=args.parent_branch,
-            verbose=args.verbose,
-        )
+        with Timer("implement") as _root_timer, Timer("phase_parent"):
+            result = phase_parent(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                no_refactor=args.no_refactor,
+                parent_branch=args.parent_branch,
+                verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
     else:
         LOG.error("Unknown action: %s", args.action)
         return 1

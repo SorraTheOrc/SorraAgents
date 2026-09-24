@@ -31,11 +31,14 @@ import threading
 import time
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]  # .../skill/shared -> repo root
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[1]  # .../skill/shared -> <repo>/skill
+if str(_SKILLS_ROOT) in sys.path:
+    sys.path.remove(str(_SKILLS_ROOT))
+sys.path.insert(0, str(_SKILLS_ROOT))
 
-from skill.shared.measure_fanout import collect
+REPO_ROOT = _SKILLS_ROOT.parent
+
+from shared.measure_fanout import collect
 
 AUDIT_RUNNER = REPO_ROOT / "skill" / "audit" / "scripts" / "audit_runner.py"
 

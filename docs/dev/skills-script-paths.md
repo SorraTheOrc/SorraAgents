@@ -18,12 +18,15 @@
   - [Referencing Scripts](#referencing-scripts)
   - [Referencing Assets and Documentation](#referencing-assets-and-documentation)
   - [Cross-Skill References](#cross-skill-references)
+  - [Agent Invocation (cross-CWD resolution)](#agent-invocation-cross-cwd-resolution)
 - [Defensive Existence Checks](#defensive-existence-checks)
 - [Fallback Behaviour for Missing Scripts](#fallback-behaviour-for-missing-scripts)
 - [Examples from This Repository](#examples-from-this-repository)
   - [Recommended (Skill-Relative)](#recommended-skill-relative)
   - [Discouraged (Repo-Root-Relative)](#discouraged-repo-root-relative)
   - [Cross-Skill References (Use with Caution)](#cross-skill-references-use-with-caution)
+- [Initializing a New Project (Global Install)](#initializing-a-new-project-global-install)
+- [Graceful Failure for Missing Shared Modules](#graceful-failure-for-missing-shared-modules)
 - [Summary Decision Table](#summary-decision-table)
 - [Related Work](#related-work)
 
@@ -109,6 +112,38 @@ sparingly. When they are necessary, the consuming skill's SKILL.md should:
 1. Document the external dependency in a clear "Dependencies" section.
 2. Include a defensive existence check (see next section).
 3. Provide a fallback for when the external skill is not installed.
+
+### Agent Invocation (cross-CWD resolution)
+
+When a SKILL.md includes bash code blocks that the agent will paste into its
+bash tool (e.g., skill runners, test commands, report renderers), the agent
+runs bash from the **project CWD**, not the skill directory. In this context
+the `$(skill_path <name>)/scripts/...` convention is used to resolve the
+skill directory at runtime:
+
+```bash
+# ✅ Agent invocation — skill_path shim resolves at runtime
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <name> \
+  --headline "..." \
+  --ac "AC description|metric|met"
+```
+
+**How it works:** The `skill_path` shell shim is installed at
+`~/.pi/agent/bin/skill_path` (first on PATH). When bash expands
+`$(skill_path report)` it searches for the `report` skill in:
+
+1. `~/.pi/agent/skills/report/` (global agent skills)
+2. `~/.agents/skills/report/` (alternate global location)
+3. `<cwd>/.pi/skills/report/` (upward directory scan)
+
+This mirrors the pi `skill_path` tool's search order. The shim is available
+in this repo at `scripts/skill_path`.
+
+**Critical:** The `skill_path` tool is a Pi **chat tool**, not a shell
+executable. The shim provides shell-level resolution so that `$(skill_path ...)`
+in bash code blocks works without the agent needing to resolve the path
+separately. The convention was introduced in commit `0d23a44`.
 
 ---
 
@@ -262,15 +297,6 @@ to use skill-relative paths is completed under the parent epic
 
 ### Cross-Skill References (Use with Caution)
 
-The `git-management` skill references scripts from the `ship` and `cleanup`
-skills. These are cross-skill dependencies that should be clearly documented.
-
-| Consuming Skill | Reference | External Provider |
-|----------------|-----------|-------------------|
-| `git-management` | `skill/ship/scripts/git-helpers.js` | `ship` skill |
-| `git-management` | `skill/ship/scripts/ship.js` | `ship` skill |
-| `git-management` | `skill/cleanup/scripts/` | `cleanup` skill |
-
 The `audit` skill also references a script from the `code-review` skill:
 
 | Consuming Skill | Reference | External Provider |
@@ -282,11 +308,66 @@ and document the external dependency in the consuming skill's SKILL.md.
 
 ---
 
+## Initializing a New Project (Global Install)
+
+When a new project repo is set up, the skills are installed **globally**, not
+copied into the project:
+
+1. Run `scripts/install_pi.sh` from this repository (the canonical source).
+   It symlinks the global skills install (`~/.pi/agent/skills`) to this
+   repo's `skill/` tree and installs the global agent config
+   (`.pi-config/agent/`).
+2. **Project repos never need a `skill/` directory.** A project that
+   contains a `skill/` tree should treat it as the canonical source (this
+   repo), not as something to synthesize or copy from.
+3. **Never copy skill scripts between repositories.** Scripts resolve their
+   shared libraries (`shared/`, `scripts/`, `import_guard.py`, ...) from the
+   skills root; a real-copy install that drops `shared/` fails import
+   resolution (see
+   [#graceful-failure-for-missing-shared-modules](#graceful-failure-for-missing-shared-modules)).
+4. Invoke skill scripts canonically:
+   ```bash
+   python3 $(skill_path <skill-name>)/scripts/<script>.py ...  # from anywhere
+   cd ~/.pi/agent/skills/<skill-name> && python3 ./scripts/<script>.py ...
+   ```
+
+Where `wl` stores live: worklog state is kept per repository at
+`<project-root>/.worklog/worklog-data.jsonl` (plus `sessions/`,
+`worktrees/`); worktree derives resolve the store from the worklog-dir
+detection in `skill/shared/status_lifecycle.py` (`--worklog-dir` flags for
+`wl` subprocesses). The global skills install does **not** hold worklog data.
+
+## Project-Local Skill Extensions
+
+Projects may augment a global skill without editing it by placing optional
+prose hooks and machine-readable data under
+`<project_root>/.pi/skills_extensions/<skill-name>/` (resolved from the
+invoking git root, cwd fallback). The convention, schema guidance,
+precedence, and trust notes are documented in
+[skill-extensions.md](skill-extensions.md); the loader lives at
+`skill/shared/skill_extensions.py`. When no extension directory exists,
+global skill behaviour is unchanged.
+
+## Graceful Failure for Missing Shared Modules
+
+If a script cannot resolve a required shared module (partial or copied
+install missing `shared/` at the skills root), it fails gracefully via
+`skill/import_guard.py` (`guard_shared_import`, used by every script whose
+top-level imports touch shared): the exit is non-zero and the message names
+the missing module, gives the canonical invocation
+(`~/.pi/agent/skills` / `$(skill_path <skill-name>)`), states the
+no-cross-repo-copy rule, and never suggests copying files between
+repositories. Reinstall via `scripts/install_pi.sh` or invoke the skill from
+its canonical location.
+
+---
+
 ## Summary Decision Table
 
 | Scenario | Recommended Path Style | Existence Check Required? |
 |----------|----------------------|--------------------------|
-| Script bundled with the same skill | `./scripts/foo.py` | Optional (recommended) |
+| Script bundled with the same skill (invoked from skill dir) | `./scripts/foo.py` | Optional (recommended) |
+| Script bundled with the same skill (agent invocation from project CWD) | `$(skill_path skillname)/scripts/foo.py` | No (shim resolves) |
 | Asset bundled with the same skill | `./assets/template.json` | No |
 | Documentation bundled with the same skill | `./references/REFERENCE.md` | No |
 | Script from another skill in the same repo | `./scripts/foo.py` (via symlink or shared location) | **Yes** |
@@ -308,4 +389,8 @@ and document the external dependency in the consuming skill's SKILL.md.
   [GitHub](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/skills.md)).
 - **Agent Skills specification:** [https://agentskills.io/specification](https://agentskills.io/specification)
 - **Skills in this repository:** `skill/ship/`, `skill/cleanup/`,
-  `skill/triage/`, `skill/audit/`, `skill/git-management/`
+  `skill/triage/`, `skill/audit/`
+- **Project-local skill extensions:**
+  [skill-extensions.md](skill-extensions.md) — the
+  `.pi/skills_extensions/<skill-name>/` convention consumed by skill scripts
+  (loader: `skill/shared/skill_extensions.py`).

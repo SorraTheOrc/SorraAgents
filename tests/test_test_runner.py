@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shlex
 
-from skill.test_runner import (
+from test_runner import (
     canonicalize_quiet_pytest_command,
     canonicalize_quiet_test_command,
 )

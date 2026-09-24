@@ -23,7 +23,7 @@ Inspect repository branches, identify merged or stale work, remove safely deleta
 
 Scripts (implementation)
 
-- The skill ships a set of deterministic scripts under `./scripts/` that implement the non-interactive behaviour described below. Each script supports `--dry-run`, `--yes`, `--report <path>`, `--quiet`, and `--verbose`.
+- The skill ships a set of deterministic scripts under `$(skill_path cleanup)/scripts/` that implement the non-interactive behaviour described below. Each script supports `--dry-run`, `--yes`, `--report <path>`, `--quiet`, and `--verbose`.
 
 ## Policy
 
@@ -43,12 +43,12 @@ Scripts (implementation)
 
 Before any branch operations, determine whether the current branch is associated with a work item and, if so, verify its acceptance criteria are met via the audit skill. This gate applies to interactive skill invocations; scheduled non-interactive runs of the cleanup scripts are unaffected.
 
-1. **Inspect the current branch.** Run `./scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json` (the same script used in Step 1) and read the `work_item_id` field from the JSON report.
+1. **Inspect the current branch.** Run `$(skill_path cleanup)/scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json` (the same script used in Step 1) and read the `work_item_id` field from the JSON report.
 
    - **No `work_item_id`** (e.g. on `main` or a branch without a work-item token) → skip this step and proceed to Step 1.
    - **`work_item_id` present** → continue below.
 
-2. **Invoke the audit skill.** Audit the work item using the existing audit skill — e.g. `/skill:audit <work-item-id>` or the canonical runner `python3 ./scripts/audit_runner.py issue <work-item-id>` (see `../audit/SKILL.md`). Do not implement audit logic here; reuse the audit skill as-is. For long-running audits, follow the audit skill's Monitored Run Execution contract.
+2. **Invoke the audit skill.** Audit the work item using the existing audit skill — e.g. `/skill:audit <work-item-id>` or the canonical runner `python3 $(skill_path audit)/scripts/audit_runner.py issue <work-item-id>` (see `../audit/SKILL.md`). Do not implement audit logic here; reuse the audit skill as-is. For long-running audits, follow the audit skill's Monitored Run Execution contract.
 
 3. **Apply the decision rule.** Read the audit report's `Ready to close:` verdict and its `## Acceptance Criteria Status` table (or `No acceptance criteria defined.` when none exist):
 
@@ -62,7 +62,7 @@ Before any branch operations, determine whether the current branch is associated
 
 ### 1. Inspect current branch
 
-Run `./scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json` to detect the default branch, merge status, uncommitted changes, and unpushed commits.
+Run `$(skill_path cleanup)/scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json` to detect the default branch, merge status, uncommitted changes, and unpushed commits.
 
 Display the report to the user before any prompts. Include: branch name, default branch, merge status, uncommitted changes, unpushed commits count+summary, and report file path. If no uncommitted/unpushed changes, skip to step 3.
 
@@ -72,19 +72,19 @@ Present the inspection report and offer options (push, stash, skip, or audit-bra
 
 ### 3. Switch to default and update
 
-Run `./scripts/switch_to_default_and_update.py --report /tmp/cleanup/switch_default.json` to fetch and fast-forward the default branch. If pull fails (conflicts), ask the user how to proceed — do not auto-resolve.
+Run `$(skill_path cleanup)/scripts/switch_to_default_and_update.py --report /tmp/cleanup/switch_default.json` to fetch and fast-forward the default branch. If pull fails (conflicts), ask the user how to proceed — do not auto-resolve.
 
 ### 4. Summarize branches
 
-Run `./scripts/summarize_branches.py --report /tmp/cleanup/branches.json` to list local branches and open PRs targeting default. Present the report for deletion decisions. Branches merged with no open PRs are deletion candidates; branches with unmerged commits or open PRs need explicit authorization.
+Run `$(skill_path cleanup)/scripts/summarize_branches.py --report /tmp/cleanup/branches.json` to list local branches and open PRs targeting default. Present the report for deletion decisions. Branches merged with no open PRs are deletion candidates; branches with unmerged commits or open PRs need explicit authorization.
 
 ### 5. Delete local merged branches
 
-Run `./scripts/prune_local_branches.py --branches-file <file> --report /tmp/cleanup/prune_local.json` with an explicit branch list from the summarize report and user input. Never delete outside that list. Use `--dry-run` for preview.
+Run `$(skill_path cleanup)/scripts/prune_local_branches.py --branches-file <file> --report /tmp/cleanup/prune_local.json` with an explicit branch list from the summarize report and user input. Never delete outside that list. Use `--dry-run` for preview.
 
 ### 6. Delete remote merged branches
 
-Run `./scripts/delete_remote_branches.py --days 14 --report /tmp/cleanup/delete_remote.json` to delete remote branches merged into default and older than the threshold. Use `--dry-run` for preview.
+Run `$(skill_path cleanup)/scripts/delete_remote_branches.py --days 14 --report /tmp/cleanup/delete_remote.json` to delete remote branches merged into default and older than the threshold. Use `--dry-run` for preview.
 
 ### 7. Handle remaining branches
 
@@ -103,3 +103,24 @@ Remove temporary files. Produce a concise report: branches deleted (local + remo
 Fetch relevant work item context before cleanup decisions: `wl show <id> --json`. Include clear comments referencing branches and actions in any work item updates.
 
 End.
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

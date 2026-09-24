@@ -31,8 +31,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 _DESCRIPTION = (
     "## Acceptance Criteria\n"
@@ -326,7 +326,7 @@ class TestCmdIssuePhase2GateSkip:
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _run_issue(self, updates, effort, risk, mock_phase2, capsys):
@@ -354,7 +354,7 @@ class TestCmdIssuePhase2GateSkip:
                 audit_runner, "_run_phase2_deep_analysis", side_effect=mock_phase2,
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
         ):

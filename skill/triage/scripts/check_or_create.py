@@ -23,12 +23,14 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.scripts.failure_notice import FailureNotice
-from skill.test_runner import canonicalize_quiet_pytest_command
+from scripts.failure_notice import FailureNotice
+from test_runner import canonicalize_quiet_pytest_command
 
 # ---------------------------------------------------------------------------
 # WL CLI helpers
@@ -147,31 +149,6 @@ def emit_event(event_name: str, data: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Owner inference integration
-# ---------------------------------------------------------------------------
-
-
-def infer_owner(repo_path: str, file_path: str | None) -> dict[str, Any]:
-    """Try to infer the owner using the owner-inference skill."""
-    if not file_path:
-        return {
-            "assignee": "Build",
-            "confidence": 0.0,
-            "reason": "no file path provided",
-        }
-    try:
-        from skill.owner_inference.scripts.infer_owner import infer_owner as _infer
-
-        return _infer(repo_path, file_path)
-    except Exception:  # noqa: BLE001
-        return {
-            "assignee": "Build",
-            "confidence": 0.0,
-            "reason": "owner inference unavailable",
-        }
-
-
-# ---------------------------------------------------------------------------
 # Template rendering
 # ---------------------------------------------------------------------------
 
@@ -232,7 +209,7 @@ Failing test detected by agent during automated run. May block PR creation for t
 ## Suggested Triage Steps
 
 1. Verify flakiness: rerun CI/test locally once.
-2. If reproducible, add owner from owner-inference heuristics and assign for triage.
+2. If reproducible, assign to `Build` and route for triage.
 3. If flaky, tag `flaky` and route to flaky-test queue.
 
 ## Suspected Owner
@@ -394,8 +371,6 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
     stack_trace = payload.get("stack_trace") or sig.get("stack_trace", "")
     commit_hash = payload.get("commit_hash") or sig.get("commit_hash")
     ci_url = payload.get("ci_url") or sig.get("ci_url")
-    repo_path = payload.get("repo_path", ".")
-    file_path = payload.get("file_path") or sig.get("file_path")
     parent_work_item_id = payload.get("parent_work_item_id")
 
     if not test_name:
@@ -460,7 +435,7 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     # No match — create a new issue using the template
-    owner_info = infer_owner(repo_path, file_path)
+    owner_info = {"assignee": "Build", "confidence": 0.0, "reason": "no owner inference available"}
 
     title = f"[test-failure] {test_name} — failing test"
     body = render_template(

@@ -1,4 +1,7 @@
 {
+  "compaction": {
+    "enabled": false
+  },
   "llm-wiki": {
     "notices": false
   },

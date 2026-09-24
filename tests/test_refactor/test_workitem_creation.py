@@ -173,31 +173,31 @@ class TestPriorityMapping:
 
     def test_critical_severity_maps_to_high_priority(self):
         """Critical severity maps to 'high' priority."""
-        from skill.refactor.workitem_creation import severity_to_priority
+        from refactor.workitem_creation import severity_to_priority
 
         assert severity_to_priority("critical") == "high"
 
     def test_high_severity_maps_to_high_priority(self):
         """High severity maps to 'high' priority."""
-        from skill.refactor.workitem_creation import severity_to_priority
+        from refactor.workitem_creation import severity_to_priority
 
         assert severity_to_priority("high") == "high"
 
     def test_medium_severity_maps_to_medium_priority(self):
         """Medium severity maps to 'medium' priority."""
-        from skill.refactor.workitem_creation import severity_to_priority
+        from refactor.workitem_creation import severity_to_priority
 
         assert severity_to_priority("medium") == "medium"
 
     def test_low_severity_maps_to_low_priority(self):
         """Low severity maps to 'low' priority."""
-        from skill.refactor.workitem_creation import severity_to_priority
+        from refactor.workitem_creation import severity_to_priority
 
         assert severity_to_priority("low") == "low"
 
     def test_unknown_severity_defaults_to_medium_priority(self):
         """Unknown severity defaults to 'medium' priority."""
-        from skill.refactor.workitem_creation import severity_to_priority
+        from refactor.workitem_creation import severity_to_priority
 
         assert severity_to_priority("unknown") == "medium"
         assert severity_to_priority("") == "medium"
@@ -214,28 +214,28 @@ class TestWorkItemTitleGeneration:
 
     def test_title_includes_smell_type(self, sample_smell_critical):
         """Title contains the smell type label."""
-        from skill.refactor.workitem_creation import build_smell_title
+        from refactor.workitem_creation import build_smell_title
 
         title = build_smell_title(sample_smell_critical)
         assert "security" in title.lower()
 
     def test_title_includes_file_path(self, sample_smell_high):
         """Title contains the file path."""
-        from skill.refactor.workitem_creation import build_smell_title
+        from refactor.workitem_creation import build_smell_title
 
         title = build_smell_title(sample_smell_high)
         assert "src/main.py" in title
 
     def test_title_starts_with_refactor_prefix(self, sample_smell_medium):
         """Title starts with 'Refactor:' prefix."""
-        from skill.refactor.workitem_creation import build_smell_title
+        from refactor.workitem_creation import build_smell_title
 
         title = build_smell_title(sample_smell_medium)
         assert title.startswith("Refactor:")
 
     def test_title_is_reasonable_length(self, sample_smell_low):
         """Title is not excessively long."""
-        from skill.refactor.workitem_creation import build_smell_title
+        from refactor.workitem_creation import build_smell_title
 
         title = build_smell_title(sample_smell_low)
         assert len(title) < 200
@@ -251,7 +251,7 @@ class TestWorkItemDescriptionGeneration:
 
     def test_description_includes_file_and_line(self, sample_smell_critical):
         """Description contains the file path and line number."""
-        from skill.refactor.workitem_creation import build_smell_description
+        from refactor.workitem_creation import build_smell_description
 
         desc = build_smell_description(sample_smell_critical)
         assert "src/main.py" in desc
@@ -261,7 +261,7 @@ class TestWorkItemDescriptionGeneration:
         self, sample_smell_high
     ):
         """Description contains the smell type and severity."""
-        from skill.refactor.workitem_creation import build_smell_description
+        from refactor.workitem_creation import build_smell_description
 
         desc = build_smell_description(sample_smell_high)
         assert "complex_function" in desc
@@ -269,7 +269,7 @@ class TestWorkItemDescriptionGeneration:
 
     def test_description_includes_message(self, sample_smell_medium):
         """Description contains the original detection message."""
-        from skill.refactor.workitem_creation import build_smell_description
+        from refactor.workitem_creation import build_smell_description
 
         desc = build_smell_description(sample_smell_medium)
         assert "os" in desc
@@ -277,7 +277,7 @@ class TestWorkItemDescriptionGeneration:
 
     def test_description_is_markdown_formatted(self, sample_smell_low):
         """Description uses markdown formatting for readability."""
-        from skill.refactor.workitem_creation import build_smell_description
+        from refactor.workitem_creation import build_smell_description
 
         desc = build_smell_description(sample_smell_low)
         assert "**" in desc or "## " in desc or "- " in desc or "`" in desc
@@ -328,7 +328,7 @@ class TestWorklogCLIIntegration:
         mock_wl_create_json,
     ):
         """Calls ``wl create`` with correct arguments and returns the ID."""
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_item,
@@ -357,7 +357,7 @@ class TestWorklogCLIIntegration:
         self, monkeypatch, referent_medium, mock_wl_create_json
     ):
         """Work item is created with the priority mapped from severity."""
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_item,
@@ -387,7 +387,7 @@ class TestWorklogCLIIntegration:
         self, monkeypatch, referent_high, mock_wl_create_json
     ):
         """Work item is created with 'Refactor' tag."""
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_item,
@@ -416,7 +416,7 @@ class TestWorklogCLIIntegration:
         self, monkeypatch, sample_smell_low
     ):
         """When ``wl create`` fails, returns None rather than crashing."""
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_item,
@@ -441,7 +441,7 @@ class TestWorklogCLIIntegration:
         self, monkeypatch, sample_smell_critical
     ):
         """When ``wl create`` returns unparseable output, returns None."""
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_item,
@@ -465,7 +465,7 @@ class TestWorklogCLIIntegration:
         self, monkeypatch, sample_smell_medium
     ):
         """When ``wl`` is not installed, returns None rather than crashing."""
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_item,
@@ -490,7 +490,7 @@ class TestWorklogCLIIntegration:
         monkeypatch,
     ):
         """Creating work items from an empty list returns an empty list."""
-        from skill.refactor.workitem_creation import create_smell_work_items
+        from refactor.workitem_creation import create_smell_work_items
 
         results = create_smell_work_items([])
         assert results == []
@@ -504,7 +504,7 @@ class TestWorklogCLIIntegration:
         mock_wl_create_json,
     ):
         """Creating work items for multiple smells returns all IDs."""
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_item,
@@ -566,7 +566,7 @@ class TestDuplicatePrevention:
             'API_KEY = "sk-12345"\n'
         )
 
-        from skill.refactor.workitem_creation import has_existing_smell_comment
+        from refactor.workitem_creation import has_existing_smell_comment
 
         assert (
             has_existing_smell_comment(str(file_path), "security") is True
@@ -582,7 +582,7 @@ class TestDuplicatePrevention:
             'API_KEY = "sk-12345"\n'
         )
 
-        from skill.refactor.workitem_creation import has_existing_smell_comment
+        from refactor.workitem_creation import has_existing_smell_comment
 
         assert (
             has_existing_smell_comment(str(file_path), "security") is False
@@ -600,7 +600,7 @@ class TestDuplicatePrevention:
             "import os\n"
         )
 
-        from skill.refactor.workitem_creation import has_existing_smell_comment
+        from refactor.workitem_creation import has_existing_smell_comment
 
         # Different smell type should not be blocked
         assert (
@@ -625,7 +625,7 @@ class TestDuplicatePrevention:
             'API_KEY = "sk-12345"\n'
         )
 
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             create_smell_work_item,
         )
 
@@ -649,7 +649,7 @@ class TestDuplicatePrevention:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text("import os\n")
 
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_item,
@@ -678,7 +678,7 @@ class TestDuplicatePrevention:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text("")
 
-        from skill.refactor.workitem_creation import has_existing_smell_comment
+        from refactor.workitem_creation import has_existing_smell_comment
 
         assert (
             has_existing_smell_comment(str(file_path), "security") is False
@@ -688,7 +688,7 @@ class TestDuplicatePrevention:
         """A nonexistent file returns False (no duplicate)."""
         file_path = temp_dir / "nonexistent.py"
 
-        from skill.refactor.workitem_creation import has_existing_smell_comment
+        from refactor.workitem_creation import has_existing_smell_comment
 
         assert (
             has_existing_smell_comment(str(file_path), "security") is False
@@ -713,7 +713,7 @@ class TestNonExistentFileHandling:
         sample_smell_critical,
     ):
         """create_smell_work_item returns None when the file does not exist."""
-        from skill.refactor.workitem_creation import create_smell_work_item
+        from refactor.workitem_creation import create_smell_work_item
 
         smell = dict(sample_smell_critical)
         smell["file"] = "/nonexistent/path/file.py"
@@ -729,7 +729,7 @@ class TestNonExistentFileHandling:
         sample_smell_medium,
     ):
         """Batch creation skips smells whose files do not exist."""
-        from skill.refactor.workitem_creation import create_smell_work_items
+        from refactor.workitem_creation import create_smell_work_items
 
         smell1 = dict(sample_smell_critical)
         smell1["file"] = "/nonexistent/main.py"
@@ -747,7 +747,7 @@ class TestNonExistentFileHandling:
         sample_smell_critical,
     ):
         """A warning is logged when skipping creation for a non-existent file."""
-        from skill.refactor.workitem_creation import create_smell_work_item
+        from refactor.workitem_creation import create_smell_work_item
 
         smell = dict(sample_smell_critical)
         smell["file"] = "/nonexistent/path/file.py"
@@ -798,7 +798,7 @@ class TestWorklogDuplicatePrevention:
     ):
         """Work item creation is skipped when worklog has an existing Refactor item
         for the same (file, line, code) combination."""
-        from skill.refactor.workitem_creation import create_smell_work_item
+        from refactor.workitem_creation import create_smell_work_item
 
         # Create the actual file on disk so the file existence check passes
         file_path = temp_dir / "src" / "main.py"
@@ -873,7 +873,7 @@ class TestWorklogDuplicatePrevention:
         expected_list_cmd = "wl list --tags Refactor --json"
 
         # Build expected wl create command
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             severity_to_priority,
@@ -900,7 +900,7 @@ class TestWorklogDuplicatePrevention:
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
 
-        from skill.refactor.workitem_creation import create_smell_work_item
+        from refactor.workitem_creation import create_smell_work_item
 
         result = create_smell_work_item(smell)
         assert result == "SA-0MOCK1234X000WORK"
@@ -921,7 +921,7 @@ class TestBatchWorkItemCreation:
         mock_wl_create_json,
     ):
         """Batch creation returns work item IDs for each smell."""
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_items,
@@ -988,7 +988,7 @@ class TestBatchWorkItemCreation:
 
     def test_batch_with_empty_list_returns_empty(self):
         """Batch creation with an empty list returns an empty list."""
-        from skill.refactor.workitem_creation import create_smell_work_items
+        from refactor.workitem_creation import create_smell_work_items
 
         assert create_smell_work_items([]) == []
 
@@ -1014,7 +1014,7 @@ class TestBatchWorkItemCreation:
         clean_file.parent.mkdir(parents=True, exist_ok=True)
         clean_file.write_text("import sys\n")
 
-        from skill.refactor.workitem_creation import (
+        from refactor.workitem_creation import (
             build_smell_description,
             build_smell_title,
             create_smell_work_items,
@@ -1067,13 +1067,13 @@ class TestErrorHandling:
 
     def test_handles_missing_severity_key(self):
         """Missing severity key defaults to medium priority."""
-        from skill.refactor.workitem_creation import severity_to_priority
+        from refactor.workitem_creation import severity_to_priority
 
         assert severity_to_priority(None) == "medium"
 
     def test_handles_missing_file_key(self, monkeypatch):
         """Missing file key in smell still generates a work item."""
-        from skill.refactor.workitem_creation import build_smell_title
+        from refactor.workitem_creation import build_smell_title
 
         smell: dict[str, Any] = {
             "line": 1,
@@ -1090,7 +1090,7 @@ class TestErrorHandling:
 
     def test_handles_missing_message_key(self):
         """Missing message key produces a generic description."""
-        from skill.refactor.workitem_creation import build_smell_description
+        from refactor.workitem_creation import build_smell_description
 
         smell: dict[str, Any] = {
             "file": "src/test.py",
@@ -1106,7 +1106,7 @@ class TestErrorHandling:
 
     def test_handles_invalid_severity_values(self):
         """Invalid severity values are mapped to medium priority."""
-        from skill.refactor.workitem_creation import severity_to_priority
+        from refactor.workitem_creation import severity_to_priority
 
         for invalid in [None, "", "invalid", 1, [], {}]:
             result = severity_to_priority(invalid)

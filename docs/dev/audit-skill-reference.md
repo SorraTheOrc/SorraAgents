@@ -125,6 +125,53 @@ run:
 or contradict a runner verdict that already completed its lifecycle: if the
 runner finished, its verdict and status transitions stand untouched.
 
+### Phase checkpoints (SA-0MT6EZUS9004FJ9T) — resume after a kill
+
+Because a run can be killed at any point (stall abort, budget exhaustion,
+bash-tool timeout, `kill`), the runner persists **partial progress per phase**
+so the next `audit_runner.py issue <id>` run resumes instead of redoing the
+whole audit:
+
+- **Phases:** `phase1_parent` (parent AC screening) → `phase1_children`
+  (child screenings + child audit persistence) → `phase2` (deep analysis +
+  final state). Each completed phase saves its accumulated results
+  (`ac_results`, `child_results`, `child_persist_results`, `phase2_completed`,
+  `phase2_skip_note`) atomically to a JSON checkpoint file.
+- **Resume (AC2):** on the next run (same issue id **and** same git HEAD sha)
+  completed phases are skipped — e.g. a completed parent screening SKIPS the
+  Phase 1 Pi call entirely and restores the stored AC verdicts; a completed
+  `phase1_children` restores the child verdicts and re-runs only the Phase 2
+  segment for children that still need deep analysis. An in-progress
+  (interrupted) phase is always re-run from its start.
+- **Budget-exceeded children resume (SA-0MU32T6O0001UALR /
+  SA-0MU33XG8P004GX8K):** the ONE exception to "completed phase → skip". When
+  the parent-process elapsed-time guard trips, each remaining child is
+  recorded with a single `partial (budget exceeded)` AC result and a
+  per-child marker `phases[phase1_children].budget_exceeded[<child-id>]` is
+  written to the checkpoint **immediately** (mid-phase — never deferred to
+  phase completion) so an interrupted/killed run still leaves a resumable
+  record. On a resumed run (same issue id + HEAD) exactly the marked children
+  are re-audited in Phase 1 and their markers cleared; every other
+  (completed) child result is restored untouched. If Phase 2 had already
+  completed, only the affected children are deep-analysed (`skip_parent_deep`)
+  — the completed parent deep analysis is never re-run. The checkpoint is KEPT
+  while any marker remains and cleared only once all budget-exceeded children
+  have been re-audited.
+- **Timeout reporting (AC4):** the resume banner on stderr prints which
+  phases completed and which phase the previous run died in, e.g.
+  `[checkpoint] Resuming audit for SA-123: completed=['Phase 1 parent
+  screening']; previous run interrupted during Phase 1 child screenings`.
+- **Config (AC3):** `--checkpoint-dir DIR` / `AUDIT_CHECKPOINT_DIR`
+  (default `<owning-repo>/.worklog/audit-checkpoints`); `--no-checkpoint`
+  disables checkpointing (byte-identical pre-change behavior).
+- **Safety:** stale checkpoints from a different git HEAD are never reused;
+  `--force` always starts fresh (clears any checkpoint); the file is removed
+  after a successful run so a finished audit never resumes.
+- **Best-effort:** any checkpoint read/write/validation failure prints a
+  warning and disables checkpointing for that run — it never affects the
+  audit verdict or the exit code. Checkpointing applies to `issue` audits
+  only; `audit project` runs are out of scope.
+
 ## Pre-flight affirmation guard
 
 Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the same work item from racing. The SKILL.md long documented a "pre-flight affirmation" with no code behind it; this guard makes docs and code agree.
@@ -141,6 +188,39 @@ Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the sa
 The concurrency semaphore (`skill/shared/process_semaphore.py`) caps pi subprocesses host-wide but cannot see per-item claims: two audits of the same item would both set `in_progress`, both run the pipeline, and the last writer would win on persist + status transition. `in_progress` at entry is the reliable signal that another audit (or an implementation claim) owns the item.
 
 > Implementation self-review audits (implement skill Step 6) audit in-progress items and therefore pass `--force`.
+
+## Phase 1 merge gate (SA-0MT456M27001LRTL)
+
+At the very start of Phase 1 (after the item fetch, BEFORE the code-quality scan, children-stage check, or surface AC assessment) the runner guarantees the item under audit is integrated into its owning repository's `dev` branch.
+
+### Resolution (generic, never hardcoded)
+
+The item's integration evidence is derived from the item itself:
+
+1. **Owning repo** — the worklog prefix-to-sibling scan already resolves the owning project root (`_resolve_owning_project_root`); git commands run PLAIN and the cwd-aware runner pins them to the owning repo when the launch cwd differs (SA-0MSLLGDW00098UCC).
+2. **Feature branch** — `git for-each-ref refs/heads/wl-<id>-*`; only refs matching `wl-<id>-` with a 40-hex object name are accepted (mocked/garbage output is never treated as evidence).
+3. **Commits** — 7–40 hex shas referenced in the item's description and comments.
+
+### Verify → integrate → fail closed (AC1–AC3)
+
+- **Verify:** `git fetch origin dev` (best-effort), then `git merge-base --is-ancestor <candidate> origin/dev` for each candidate (branch first). Command + result are recorded; ANY positive ancestor check makes the item merged.
+- **No baseline:** an owning repo with neither `origin/dev` nor a local `dev` has no integration target — recorded as non-blocking (never an integration trigger).
+- **Integrate (when evidence exists, not merged, baseline present):** fetch `dev`; fresh detached worktree at `origin/dev`; merge `--no-ff` the feature branch (or cherry-pick each candidate NOT already in `dev`); symlink the owning repo's `node_modules` (implement-skill convention — never npm-install inside a worktree); build (`npm run build`); run the project test suite (test-skill runner, `run_suite("all")`); then push `HEAD:refs/heads/dev` — NEVER `main`. Post-merge the pushed sha is re-verified as an ancestor of `origin/dev`.
+- **Fail closed (AC3):** when integration cannot complete (fetch/ref failure, conflicts, build/test failure, push failure, or any unexpected error after evidence resolution) the gate emits "Ready to close: No" (+ `--needs-producer-review yes` via the lifecycle's no-verdict branch) — the pipeline never proceeds past Phase 1 with unmerged work. No rest of Phase 1 screening and no Phase 2 run (assessment would be misleading against unmerged code).
+- **Fail open (never blockers):** items with NO resolvable evidence (docs/admin items — no feature branch, no referenced commits) and repos with NO dev baseline proceed with the gate recorded as a note.
+
+### Stale-audit-base guard (SA-0MT9EK1UU000DT1R)
+
+The gate verifies integration against `origin/dev` (`git fetch origin dev` + `merge-base --is-ancestor`), but EVERY other git-derived audit ingredient — the audited HEAD sha, the file-scope manifest, the changed-files list (`git diff --name-only HEAD`), the repo index (`git ls-files`), the working-tree hash, and the green-run attestation — resolves against the **local checkout at the launch cwd** (cwd-aware runner, SA-0MSLLGDW00098UCC). When that checkout is stale (local `dev` behind `origin/dev`), the merge gate passes yet Phase 1/2 run against a tree MISSING the delivered commits — producing false `unmet`/`partial` verdicts that agents report as "audit run against a stale HEAD" (incidents: SA-0MSUZAJPC003BS66, SA-0MSN2ULOF007JJ35 — audits from local `030debfd` while `origin/dev` was `ddc6f6f5`).
+
+**Guard behaviour** (`_audit_base_freshness` / `_audit_base_freshness_guard_passes` in `audit_runner.py`):
+
+- After the gate concludes the item's work is on `origin/dev` (verified merged OR just integrated), the guard runs `git merge-base --is-ancestor <candidate> origin/dev` → `… HEAD` for each candidate (the item's commits + branch object + the integration's pushed sha — important when cherry-pick created new shas). A candidate that is an ancestor of `origin/dev` but NOT of local `HEAD` marks the audit base **stale**.
+- **Stale → abort before Phase 1 screening:** non-zero exit, loud stderr (or `{"stale_audit_base": …}` JSON in `--json` mode), per-commit evidence appended to `## Merge Gate Evidence (Phase 1)`. No verdict and NO persisted report — a misleading report is never produced. Remediation tells the caller to run `git fetch origin && git pull origin dev` in the owning project's main checkout (or launch the audit from a checkout containing the delivered commit) and re-run.
+- **Lifecycle:** the abort is independent of `--force` and the item is NOT demoted (`--needs-producer-review` is never set by this guard) — the finally block restores the pre-audit status/stage; the item is fine, the checkout is stale.
+- **Fail-open:** a candidate that is NOT an ancestor of `origin/dev` (unrelated/context citation, unresolvable sha) is skipped; a git error while verifying presence in `HEAD` treats the commit as present; items with no resolvable evidence never reach the guard.
+
+Evidence surfaces in the report under `## Merge Gate Evidence (Phase 1)` (before the Code Quality section) and in JSON payloads as `{merge_gate: {merged, blocker, reason}}`.
 
 ## Freshness Gate
 
@@ -165,9 +245,100 @@ No status lifecycle transitions occur, and no persistence is performed. An expli
 
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). A child whose stored audit carries an unchanged fingerprint AND a parseable verdict is reused: its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
 
+## Re-audit coordination check
+
+Cross-session coordination for anyone about to launch a full audit
+(SA-0MSQIA84B005NHWC): **always** run the two read-only checks before
+starting (or re-starting) a full audit so a session never repeats an audit
+another session already completed at the same HEAD:
+
+```bash
+wl audit-show <id> --json   # existing audit: auditedAt + rawOutput verdict
+wl comment list <id> --json # recent session activity on this item
+```
+
+Decision rules:
+
+- **Do NOT re-audit** an item that is `completed`/`in_review` **with a fresh
+  audit** (content fingerprint unchanged) **unless the code actually
+  changed** — a new commit, an edited description/ACs, or changed
+  working-tree state invalidates the fingerprint and makes the stored audit
+  stale (see the content-based gate above).
+- When the stored audit is fresh with `Ready to close: Yes` at the current
+  HEAD, the item is already audited: launch nothing, treat the verdict as
+  authoritative.
+- `--force` is the only way to bypass the freshness gate and must be
+  justified (stale fingerprint / changed code / explicit operator request).
+
+This is the agent-facing brief; the agent-facing summary lives in
+[`skill/audit/SKILL.md`](../../skill/audit/SKILL.md).
+
+## Batch drain (SA-0MTG5TP5Z008QBL5)
+
+The runner can process MULTIPLE queued work items per dispatch window
+instead of one item at a time, resolving the livelock/starvation pattern
+when concurrent multi-agent dispatch lets each window audit only a single
+item while the backlog grows.
+
+### Activation trigger
+
+Batch mode activates when the `audit-batch` priority queue holds at least
+2 pending work items (`AUDIT_BATCH_MIN_QUEUE_DEPTH`); below that the
+runner is backward compatible — it processes only its own single item.
+The automatic post-audit drain (a successful `issue` run drains the
+backlog) is opt-outable with `AUDIT_BATCH_DRAIN=0` or the `--no-batch-drain`
+flag (`--batch-drain` forces it on); drained items always run with
+`batch_drain=False` so the drain cannot recurse.
+
+### Queueing model
+
+- The **batch queue** (`audit-batch`) holds WORK-ITEM ids (e.g.
+  `SA-XXX`) with their priorities — never `audit:` admission tickets. It
+  is separate from the per-launch admission queue (`audit`), so draining
+  never steals a live launch's admission ticket and never perturbs queue
+  positions of contending audits (SA-0MTG5RYH8005RQNM).
+- A producer (operator/herdr dispatch) enqueues items, or the `batch`
+  subcommand **primes** the queue from `wl list --stage in_review --json`
+  when it is below the depth threshold: candidates are ordered by queue
+  priority (critical > high > medium > low) then by `createdAt`
+  (oldest first = FIFO within tier), capped at N. Re-priming is
+  idempotent (duplicate ids are not re-written).
+
+### Drain loop
+
+`_batch_drain_cycle` dequeues in strict priority + FIFO order and per
+item: skips `audit:` tickets, the caller's own primary item, and
+duplicates; audits via the FULL single-item pipeline (`cmd_issue`:
+claim, freshness gate, phase gates, persist, verified lifecycle); every
+item's pi calls acquire/release host-wide slots, so the **concurrency
+slot is released between items** — another process can use the slot
+before the next item is dequeued. The loop stops when the queue is
+empty, `--max-items N` is reached, or the wall-clock budget elapses —
+whichever comes first; remaining items stay queued for the next window.
+A single item's audit failure is logged and does not abort the window.
+
+### Configuration
+
+| Setting | Env var | Default |
+|---|---|---|
+| Items per window | `AUDIT_BATCH_MAX_ITEMS` | 5 |
+| Wall-clock budget | `AUDIT_BATCH_TIMEOUT` (seconds) | 1800 (30 min) |
+| Activation depth | `AUDIT_BATCH_MIN_QUEUE_DEPTH` | 2 |
+| Auto-drain opt-out | `AUDIT_BATCH_DRAIN=0` | enabled |
+
+CLI: `audit_runner.py batch [--max-items N] [--timeout S]` (standalone
+window; `--json` emits a machine-readable summary), and
+`audit_runner.py issue <id> [--batch-drain | --no-batch-drain]`.
+
+### Observability (AC5)
+
+Every window emits exactly one stderr line with
+`batch_start`, `batch_end`, `items_processed`, `queue_remaining`,
+`items_included` (ISO timestamps; including zero-item windows).
+
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--phase1-model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
@@ -250,9 +421,17 @@ python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NV
 Failure diagnostics surface the real `wl` error (stdout JSON error field first,
 then stdout text, then stderr) instead of empty stderr.
 
-**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `600s` per child — e.g. ~710s for a single child, ~6,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, the skip diagnostic names the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override. On timeout, returns `unmet` with evidence "Pi model call timed out."
+**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `600s` per child — e.g. ~710s for a single child, ~6,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, each remaining child is recorded as `partial (budget exceeded)` — never a bare skip — with a diagnostic naming the elapsed time, the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override, and a resumable checkpoint marker is written immediately (see the budget-exceeded contract below). On timeout, returns `unmet` with evidence "Pi model call timed out."
 
 **Child Phase-1 screen budget (LP-0MSQ32S2M001EA74):** lightweight child Phase-1 AC-review screens use a short per-call budget — default 600s, configurable via `--child-screen-timeout SECONDS` (flag wins) or the `AUDIT_CHILD_SCREEN_TIMEOUT` env var. A screen that exceeds its budget returns a clean timeout verdict (`_timeout` marker + timeout evidence) and never burns the full 1800s. Parent Phase-1 screens and all Phase 2 calls (parent + child deep analysis) keep the 1800s budget.
+
+**Budget baseline derivation (SA-0MU32T6O0001UALR):** the cumulative elapsed-time guard (`elapsed_guard`) previously used inconsistent ad-hoc values (~120s, 900s, 1500s, 3110s) across different runs. SA-0MU32T6O0001UALR introduced the `Per-call timing:` debug-log line (emitted by `_maybe_log_debug_info` for every Pi call) and the `_derive_budget_baseline()` helper that parses these lines to compute p50/p95 per phase context (e.g. `phase1_parent`, `phase2_deep`). The derived budget per phase is `p95 × BUDGET_SAFE_MARGIN_DEFAULT` (default safety margin 1.5 = p95 + 50 % headroom). The parent-process budget defaults to `PARENT_TIMEOUT_DEFAULT + N × PARENT_TIMEOUT_PER_CHILD` (110s base + 600s per child), which is itself derived from the same timing data for consistency. The derived baseline can be used to right-size `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` for future runs. Example timing line: ``Per-call timing: issue_id=SA-XXX context=phase2_deep elapsed_seconds=30.5 input_tokens=5000 ac_count=3 model=gpt-4``. The helper functions `_parse_per_call_timing_lines()` and `_derive_budget_baseline()` are available in `audit_runner.py` for one-time analysis.
+
+**Budget-exceeded contract (SA-0MU32T6O0001UALR):** when the cumulative guard trips, each remaining child's ACs are represented by a single AC result with `text` `partial (budget exceeded)` and `verdict` `partial`. This is **fail-closed** — an unverified AC can never become `met` — and it replaces the old `unmet` "Skipped due to audit timeout. Manual audit required." placeholder that hid the cause. It is **distinct from a genuine `partial` code finding**: `partial (budget exceeded)` means "not evaluated", not "partially satisfied". The `evidence` names the elapsed time, the budget and the remediation, and the child dict carries `budget_exceeded: true`. Example diagnostic:
+
+> Budget exceeded: child skipped after 837s total elapsed time (parent-process budget 710s). The child's ACs were NOT verified; raise the budget via `--parent-timeout` or `AUDIT_PARENT_TIMEOUT` and re-run. A resumed run re-audits budget-exceeded children.
+
+The check operates at two points in Phase 1 child orchestration (the pre-pass and the auto-trigger pass); at each trip the per-child checkpoint marker is persisted immediately so a killed run remains resumable.
 
 **In-process stall abort (LP-0MSQ32S2M001EA74):** any single Pi call (Phase 1 or Phase 2) that produces no output/progress for ≥ `AUDIT_STALL_TIMEOUT` seconds (default 600 = 10 min) is aborted in-process inside `_call_pi` — the process is killed, a `_timeout` verdict with stall evidence is returned, and the existing `partial — manual review required` path is followed (no fabricated verdicts). This complements the external monitored-run stale-log abort (≥10 min), which remains as a backstop.
 
@@ -320,7 +499,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 - **Fail-closed:** a non-green executed run (failures, non-zero exit, timeout, missing binary) yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict).
 - A green cache hit at the audited state short-circuits the invocation entirely (the suite is only executed when the cache cannot satisfy the evidence).
 
-**Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide (default: `AUDIT_MAX_CONCURRENCY` env var or 2). Each pi launch holds one audit slot; when the ceiling is saturated the call **fails fast by default** (no wait) and returns `unmet` with evidence "Audit concurrency limit reached" immediately, so the audit completes gracefully and the operator can retry later. To opt into a bounded wait instead, set the `AUDIT_LOCK_TIMEOUT` env var (seconds), e.g. `AUDIT_LOCK_TIMEOUT=30` waits up to 30s for a free slot before returning the `unmet` verdict. Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > 2 default.
+**Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide (default: `AUDIT_MAX_CONCURRENCY` env var or 2). Each pi launch holds one audit slot; when the ceiling is saturated the launch **waits on a shared bounded priority queue** (SA-0MTG5RYH8005RQNM) instead of failing fast: it enqueues a ticket at its work item's priority (critical > high > medium > low; missing/unknown priority defaults to medium), and is admitted in priority order (FIFO within a tier) as slots free up. The total wait for admission + slot is bounded by `AUDIT_QUEUE_TIMEOUT` (default 90s); `AUDIT_LOCK_TIMEOUT` now bounds only each individual semaphore attempt inside the admission poll (default 0s = immediate retry). Log lines (`Audit slot acquired: queued_at=<ts> priority=<level> queue_position=<N> dequeued_at=<ts> wait_seconds=<N> ticket=<id>`) make queue behaviour observable from stderr (AC4). If the bound is exhausted the audit still completes gracefully with the `unmet` evidence "Audit concurrency limit reached" (bounded, never fail-fast). Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > 2 default.
 
 **Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
 
@@ -364,6 +543,11 @@ Invalid values (0, negative, non-int) fail closed to the default with a warning 
 **Child verdict reuse (Phase 2):** When a child's own fresh audit already produced a ready verdict (`child_audit_ready=True`), the parent Phase 2 **skips** the duplicated child deep-analysis call (`phase2_child:<i>`) and reuses the child's existing `ac_results`. The same skip applies to children whose own fresh audit returned an explicit **'not ready to close'** verdict (`child_audit_not_ready=True`, P12): their own pipeline already ran deep analysis on the same ACs, so the parent Phase 2 reuses the child's own persisted audit findings (parsed from the child's audit report AC table, falling back to the Phase 1 screening results when the table cannot be parsed). Children with no fresh audit verdict (stale / no audit) still get parent deep analysis. Freshness is decided by `_get_child_audit_verdict`: the content-fingerprint gate is the PRIMARY test (stored fingerprint vs the child's current state; unchanged + verdict present = fresh), with the legacy time gate as the floor for fingerprint-less reports (LP-0MSQ32MF200675AR); `--force` bypasses both. Because the reuse decision is made in the Phase 1 pre-pass (see below), a reused child costs ZERO pi calls across the whole run — no Phase 1 screening and no Phase 2 deep/batch entry — while a 'not ready' child still blocks the parent's Ready-to-close evaluation.
 
 **Parallel child deep analysis (Phase 2):** Independent child deep-analysis calls (`phase2_child:<i>`) run concurrently with a slot-aware dynamic ceiling (LP-0MSQ32S2M001EA74): the runner queries the local proxy status endpoint (`/llama/local/status` → `available_slots`/`total_slots`; `AUDIT_SLOT_STATUS_URL`, default `http://localhost:8000/llama/local/status`, short 1s timeout, fail-open) once per child-call batch dispatch and caps the ceiling at `min(free-slots, configured_max)` with a floor of 1. When the slot query fails, the runner degrades gracefully to the configured static ceiling — `AUDIT_MAX_CHILD_CONCURRENCY` env var (integer ≥1) or the `AUDIT_PARALLELISM` env var (default 2, set to `1` for strictly-sequential historical behavior); the static knob remains the floor/fallback. The parent deep-analysis call always runs first and is never parallelized. Child workers are exception-isolated: a failure or timeout in one child degrades that child to `partial` (or falls back to its existing ACs) without affecting the others; on persistent executor failure the runner falls back to sequential execution. This collapses Phase 2 wall-clock from N sequential calls to ~N/cap while preserving per-child verdict isolation and avoiding slot contention with sibling sessions.
+
+**Child audits in the main LLM slot (SA-0MT2XRGEU0009QRE):** a config gate selects between two child-audit execution modes: env var `AUDIT_CHILD_IN_MAIN_SLOT` and CLI flag `--child-in-main-slot` (flag wins), **default `true` (in-main-slot mode)**; `--no-child-in-main-slot` / env `false` selects the separate-process path below, which remains fully retained.
+
+- **In-main-slot mode (default):** child Phase-1 AC-review screens (`_phase1_review_child_acs`) and Phase-2 child deep analysis (`_deep_analyze_child`) run in the main LLM slot — **no new `pi` subprocess session is spawned per child**. The runner emits a structured `[AUDIT_IN_MAIN_SLOT_WORK]` work item (the exact screen/deep prompt the invoking agent session should run inline, with the phase label and child id) followed by a `[AUDIT_IN_MAIN_SLOT_COMPACT] /compact` instruction **after each child audit before continuing** — the session compacts so context stays within budget while auditing many children. Child verdicts are left pending (`partial`, evidence "main-session review") until the main session performs the child audit and persists it; re-running the parent audit then reuses the fresh child audit with zero pi calls (child-verdict reuse, Feature 1/LP-0MSQ32MF200675AR). Children are processed sequentially (one main slot) and Phase-2 batch mode (`--batch-phase2`) is not applicable in this mode (batch would still spawn one pi session).
+- **Separate-process mode (gate `false`):** the unchanged historical path — a `pi` subprocess session per child for Phase-1 screens and Phase-2 deep analysis with the slot-aware concurrency ceiling and parallel child deep analysis described here. Restore it with `AUDIT_CHILD_IN_MAIN_SLOT=false` or `--no-child-in-main-slot` (documented fallback when the main-slot mode misbehaves).
 
 **Proxy cheap-mode serialization (startup):** At runner start (`main()`, before any pi call) the runner queries the llm-manager proxy mode endpoint — `GET <base>/admin/mode` (`AUDIT_PROXY_BASE_URL`, default `http://192.168.0.199:8000`; ~3 s timeout, fail-open) — and parses the JSON `mode` field. When the mode is exactly `cheap` (the proxy's reduced 1-slot local pool, e.g. during the default 01:00–10:00 local cheap window), the runner serializes this run's pi calls by setting **both** `AUDIT_PARALLELISM=1` **and** `AUDIT_MAX_CONCURRENCY=1` in its own process environment, and prints a detection line to stderr. The change is per-process (`os.environ`) — it affects only this run's spawned pi subprocesses, never other processes or audits; `AUDIT_MAX_CONCURRENCY=1` is defensive against sibling dispatchers sharing the same host-wide flock ceiling. Any other mode (including `fast`) or a failed query (unreachable / timeout / non-200 / unparseable) leaves all parallelism settings unchanged (fail-open) and logs a warning to stderr only on query failure; verdict semantics and the two-phase pipeline are unaffected. Mode *switching* (`POST /admin/set-mode`) is out of scope — the runner is read-only (SA-0MSN04X2S006ONH0).
 

@@ -84,7 +84,7 @@ class TestDetectLanguages:
     def _import_detection(self):
         """Import detection module; skip test if not yet implemented."""
         try:
-            from skill.code_review.scripts import detection
+            from code_review.scripts import detection
             return detection
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"Detection module not yet available: {exc}")
@@ -170,7 +170,7 @@ class TestProbeLinter:
     def _import_detection(self):
         """Import detection module; skip test if not yet implemented."""
         try:
-            from skill.code_review.scripts import detection
+            from code_review.scripts import detection
             return detection
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"Detection module not yet available: {exc}")
@@ -249,7 +249,7 @@ class TestDetectionIntegration:
 
     def _import_detection(self):
         try:
-            from skill.code_review.scripts import detection
+            from code_review.scripts import detection
             return detection
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"Detection module not yet available: {exc}")
@@ -327,7 +327,7 @@ class TestPhase2LanguageDetection:
     def _import_detection(self):
         """Import detection module; skip test if not yet implemented."""
         try:
-            from skill.code_review.scripts import detection
+            from code_review.scripts import detection
             return detection
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"Detection module not yet available: {exc}")
@@ -380,7 +380,7 @@ class TestPhase2LinterProbing:
     def _import_detection(self):
         """Import detection module; skip test if not yet implemented."""
         try:
-            from skill.code_review.scripts import detection
+            from code_review.scripts import detection
             return detection
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"Detection module not yet available: {exc}")

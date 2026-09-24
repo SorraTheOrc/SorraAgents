@@ -193,4 +193,66 @@ if [ ! -e "$DEST_PI/auth.json" ]; then
   echo "This will open a browser and create ~/.pi/agent/auth.json for your account."
 fi
 
+# ── Context-budget pre-push hook wiring ───────────────────────────────────
+# Install the v2 pre-push hook (worklog sync + context-budget gate + branch
+# policy) into the *current project* and configure git to use .githooks/.
+# The gate's measure_context.py resolves via the installed global skill
+# symlink (~/.pi/agent/skills/context-audit/scripts/measure_context.py); each
+# project ships its own per-project thresholds file
+# (docs/dev/context-budget.thresholds.json) generated via
+# `measure_context.py --generate-thresholds`.
+#
+# Set PI_SKIP_HOOK_INSTALL=1 to skip hook wiring entirely.
+if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
+  CURRENT_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$CURRENT_REPO_ROOT" ]; then
+    GITHOOKS_DIR="$CURRENT_REPO_ROOT/.githooks"
+    HOOK_SRC="$SRC_DIR/.githooks/pre-push"
+    HOOK_DST="$GITHOOKS_DIR/pre-push"
+
+    # 1. Ensure the v2 hook is present in .githooks/pre-push (idempotent).
+    if [ -f "$HOOK_SRC" ]; then
+      if [ ! -f "$HOOK_DST" ]; then
+        mkdir -p "$GITHOOKS_DIR"
+        cp "$HOOK_SRC" "$HOOK_DST"
+        chmod +x "$HOOK_DST"
+        echo "Installed v2 pre-push hook: $HOOK_DST (context-budget gate + worklog sync)"
+      else
+        echo "OK: pre-push hook already present: $HOOK_DST"
+      fi
+    else
+      echo "WARNING: source v2 pre-push hook not found at $HOOK_SRC; skipping hook install" >&2
+    fi
+
+    # 2. Configure git to use .githooks/ (idempotent).
+    current_hooks_path="$(git config --get core.hooksPath 2>/dev/null || true)"
+    if [ "$current_hooks_path" != ".githooks" ]; then
+      git config core.hooksPath .githooks
+      echo "Set core.hooksPath = .githooks in $(git rev-parse --show-toplevel)"
+    else
+      echo "OK: core.hooksPath already set to .githooks"
+    fi
+
+    # 3. Verify the global context-audit skill path is available for the gate.
+    GLOBAL_MEASURE="$HOME/.pi/agent/skills/context-audit/scripts/measure_context.py"
+    if [ -f "$GLOBAL_MEASURE" ]; then
+      echo "OK: global context-audit measure_context.py found: $GLOBAL_MEASURE"
+    else
+      echo "WARNING: global context-audit measure_context.py not found at $GLOBAL_MEASURE" >&2
+      echo "  The pre-push gate is fail-open (skips) until the skill is installed." >&2
+    fi
+
+    # 4. Inform about per-project thresholds.
+    THRESHOLDS_FILE="$CURRENT_REPO_ROOT/docs/dev/context-budget.thresholds.json"
+    if [ -f "$THRESHOLDS_FILE" ]; then
+      echo "OK: context-budget thresholds found: $THRESHOLDS_FILE"
+    else
+      echo "NOTE: no per-project context-budget thresholds found. Generate one with:" >&2
+      echo "  python3 $HOME/.pi/agent/skills/context-audit/scripts/measure_context.py --write-thresholds docs/dev/context-budget.thresholds.json" >&2
+    fi
+  else
+    echo "WARNING: not inside a git repo; skipping pre-push hook wiring" >&2
+  fi
+fi
+
 echo "Done."

@@ -38,7 +38,7 @@ Evaluate changes against:
 
 ## Automated Linting (Code Quality)
 
-Provides **automated linting** via canonical Python scripts in `../code-review/scripts/`. Runs as part of an audit or standalone.
+Provides **automated linting** via canonical Python scripts in `$(skill_path code-review)/scripts/`. Runs as part of an audit or standalone.
 
 ### Pipeline
 
@@ -60,8 +60,8 @@ Provides **automated linting** via canonical Python scripts in `../code-review/s
 ### Usage
 
 ```bash
-python3 ../code-review/scripts/code_quality.py --path . --json
-python3 ../code-review/scripts/create_quality_epics.py --findings '<json>' --dry-run
+python3 $(skill_path code-review)/scripts/code_quality.py --path . --json
+python3 $(skill_path code-review)/scripts/create_quality_epics.py --findings '<json>' --dry-run
 ```
 
 ### Linter Prerequisites
@@ -88,7 +88,7 @@ If a linter is unavailable, the corresponding language is skipped gracefully.
 
 ### Audit Integration
 
-Via `../audit/scripts/audit_runner.py`: Critical/high findings block closure ("Ready to close: No"); medium/low are warnings only. Findings auto-create/reuse a quality epic. If module unavailable, audit continues with warning.
+Via `$(skill_path audit)/scripts/audit_runner.py`: Critical/high findings block closure ("Ready to close: No"); medium/low are warnings only. Findings auto-create/reuse a quality epic. If module unavailable, audit continues with warning.
 
 ## Policy
 
@@ -99,7 +99,28 @@ Via `../audit/scripts/audit_runner.py`: Critical/high findings block closure ("R
 
 ```bash
 wl show SA-0MPYMFZXO0004ZU4 --json
-python3 ../code-review/scripts/code_quality.py --path . --json
+python3 $(skill_path code-review)/scripts/code_quality.py --path . --json
 ```
 
 End.
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

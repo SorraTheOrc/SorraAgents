@@ -33,7 +33,7 @@ Describe the user or CI impact (e.g., "blocks all PR merges", "affects scheduler
 ## Suggested Triage Steps
 
 1. Verify flakiness: rerun CI/test locally once.
-2. If reproducible, add owner from owner-inference heuristics and assign for triage.
+2. If reproducible, assign to `Build` and route for triage.
 3. If flaky, tag `flaky` and route to flaky-test queue.
 
 ## Links

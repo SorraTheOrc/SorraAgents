@@ -6,6 +6,23 @@ agent: build
 
 # Intake Skill
 
+## Invocation (canonical)
+
+Resolve the skill directory via the **`skill_path` tool** (never the project
+repo, which does not and must not contain copies of skill scripts):
+
+```bash
+python3 $(skill_path intake)/scripts/intake.py <work-item-id>
+```
+
+`$(skill_path <name>)` is the canonical runtime resolution for skill
+locations (the `<name>/` folder under the global install at
+`~/.pi/agent/skills`, or under this repo's `skill/` tree) — resolve it first
+with the `skill_path` tool, then invoke the script with the **absolute**
+path; never run `./scripts/...` relative to the project repo.
+
+---
+
 You are authoring a new Worklog work item for a feature or bug fix, following an interview-driven approach to gather requirements, constraints, Acceptance Criteria (synonym: Success Criteria), and related work — ensuring sufficient detail for a developer to complete the work.
 
 ## Inputs
@@ -20,6 +37,17 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
 
 ## Hard requirements
 
+- **Never copy skill scripts between repositories.** The intake scripts
+  (and all skills) resolve their shared libraries from the canonical global
+  skills location (`~/.pi/agent/skills`, per-skill via `$(skill_path <name>)`)
+  or this repo's `skill/` tree. If a script reports a missing shared module
+  (see the graceful-failure guard in
+  [docs/dev/skills-script-paths.md](../../docs/dev/skills-script-paths.md#graceful-failure-for-missing-shared-modules)
+  and `import_guard.py` at the skills root), reinstall via `scripts/install_pi.sh` or
+  invoke the skill from its canonical location — do **not** copy/paste script
+  files into another project, as real-copy installs without `shared/` break
+  import resolution.
+
 - Do not create a work item for this intake process itself.
 - Interview style: concise, high-signal questions, max three per round.
 - Do not invent requirements — ask the user; don't ask leading or unnecessary questions when an obvious answer exists.
@@ -31,12 +59,14 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
 
 ## Status Lifecycle
 
-All status transitions are managed by the shared `StatusLifecycle` context manager (from `../shared/status_lifecycle.py`) — never ad-hoc `wl update --status` commands. The lifecycle script at `./scripts/intake.py` is the canonical CLI:
+All status transitions are managed by the shared `StatusLifecycle` context manager (from `../shared/status_lifecycle.py`) — never ad-hoc `wl update --status` commands. The lifecycle script at `$(skill_path intake)/scripts/intake.py` is the canonical CLI:
 
-- **Claim** (before any other step): `python3 ./scripts/intake.py start <work-item-id> --assignee "<AGENT>"` — sets `status=in_progress`, prevents concurrent claims.
-- **Auto-complete** (skip full intake for sufficiently defined items): `python3 ./scripts/intake.py auto-complete <work-item-id>`.
-- **Finish**: `python3 ./scripts/intake.py finish <work-item-id> [--description-file <path>]`.
-- **Abort** (release on failure): `python3 ./scripts/intake.py abort <work-item-id>`.
+- **Claim** (before any other step): `python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee "<AGENT>"` — sets `status=in_progress`, prevents concurrent claims.
+- **Auto-complete** (skip full intake for sufficiently defined items): `python3 $(skill_path intake)/scripts/intake.py auto-complete <work-item-id>`.
+- **Finish**: `python3 $(skill_path intake)/scripts/intake.py finish <work-item-id> [--description-file <path>]`.
+- **Abort** (release on failure): `python3 $(skill_path intake)/scripts/intake.py abort <work-item-id>`.
+
+**Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No `wl` mutation (description/comment/child creation) while `status: open`. Guard with `StatusLifecycle.require_claimed(<id>)` before any mutation; on in-session resume after producer approval, re-claim first via `StatusLifecycle.ensure_claimed(<id>)` (idempotent). Release to `open` only at true handoff (open-ended wait with no in-session resume), completion, or error/abort.
 
 ## Worklog resolution
 
@@ -48,9 +78,28 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 
 - **Before any other step**, claim the work item:
   ```bash
-  python3 ./scripts/intake.py start <work-item-id> --assignee Map
+  python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee Map
   ```
   This must happen before any evaluation, context gathering, or preflight checks.
+
+### 0b. Per-child intake pass (when children exist)
+
+If the work item already has children, run intake on each child before proceeding:
+
+- Run `wl show <work-item-id> --children --json` to fetch existing children.
+- Order children by dependency edges using `wl dep list <id> --json` (topological order, ties broken by listed order).
+- For each child, run the intake process on it (steps 1–11, recursing if the child has its own children).
+- Use the shared tree-coverage helper to verify AC coverage across existing children:
+  ```python
+  from skill.shared.tree_coverage import run_coverage_review
+  review = run_coverage_review(<work-item-id>)
+  ```
+- If the coverage review returns `recommendation: "stop"` with unresolvable conflicts,
+  record the conflicts as a comment and stop — leave the item `open`.
+- If the coverage review returns `recommendation: "auto_close"`, apply the auto-closed gaps
+  and note them in a comment.
+- If the coverage review returns `recommendation: "proceed"`, continue to Step 1.
+- Idempotence: re-running must not create duplicate children or duplicate comments.
 
 ### 1. Evaluate whether intake is required (agent responsibility)
 
@@ -59,7 +108,7 @@ Run a lightweight evaluation to decide whether the item is well-defined enough t
 If intake is not needed:
 
 ```bash
-python3 ./scripts/intake.py auto-complete <work-item-id>
+python3 $(skill_path intake)/scripts/intake.py auto-complete <work-item-id>
 wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (ACs present / small task)." --actor Map --json   # optional
 ```
 
@@ -111,6 +160,14 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 
 Skip if the seed context suffices to draft a clear brief. Otherwise: soft limit of 3 questions per round (1+ rounds); do NOT ask questions answerable by repo search — use gathered context; goal is enough understanding to draft a problem definition with user stories, ACs, and related work (not a complete spec); if ambiguous, ask for clarification rather than guessing; do not proceed until sufficient information is gathered.
 
+**Producer review:** When the agent cannot proceed without producer input (clarifying questions unanswered, critical information missing), mark the work item as needing producer review:
+
+```bash
+wl reviewed <work-item-id> true
+```
+
+This flags the item so the producer knows attention is required. The agent should STOP and wait for the producer's response. Once answers are received, continue the interview or proceed.
+
 ### 5. Draft intake brief (agent responsibility)
 
 - Write a brief to `.worklog/tmp/intake-draft-<title>-<work-item-id>.md` with: **Problem statement** (1–2 sentences), **Users** (with example user stories), **Acceptance Criteria** (3–5 measurable bullets), **Constraints**, **Existing state**, **Desired change**, **Key Files (predicted)** (published as a `**Key Files:**` section; e.g. ``- `path/to/file.py` — Needs new function for X feature``), **Related work**.
@@ -135,13 +192,25 @@ Collect related work via `/skill:find-related <work-item-id>`; add a report to t
 - Adding dependencies: `wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json` / `wl comment add <work-item-id> --comment "Blocked-by:<blocking-id>" --json`
 - Adjusting priority: `wl update <work-item-id> --priority <level> --json`
 
-### 9. Update the work item
+### 9. Update the work item and verify coverage
 
-Write the final draft to the work item description and advance the stage:
+Write the final draft to the work item description:
 
 ```bash
-python3 ./scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
+python3 $(skill_path intake)/scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
 ```
+
+**AC coverage verification:** After updating the description, run the AC coverage review:
+
+```python
+from skill.shared.tree_coverage import run_coverage_review
+review = run_coverage_review(<work-item-id>)
+```
+
+- If ``recommendation == "proceed"`` or ``"auto_close"`` → mark `intake_complete`.
+- If ``recommendation == "stop"`` → **do NOT advance the stage**. Leave the item `open` with a comment describing the conflicts.
+
+Then advance the stage:
 
 This transitions `status=open`, `stage=intake_complete`.
 
@@ -149,7 +218,7 @@ This transitions `status=open`, `stage=intake_complete`.
 
 - Call the effort_and_risk skill on the new or updated work item:
   ```bash
-  python3 ../effort-and-risk/scripts/orchestrate_estimate.py <work-item-id>
+  python3 $(skill_path effort-and-risk)/scripts/orchestrate_estimate.py <work-item-id>
   ```
   (Refer to `../effort-and-risk/SKILL.md` for details.)
 
@@ -165,7 +234,7 @@ This transitions `status=open`, `stage=intake_complete`.
 If the intake process fails or is interrupted before completion:
 
 ```bash
-python3 ./scripts/intake.py abort <work-item-id>
+python3 $(skill_path intake)/scripts/intake.py abort <work-item-id>
 ```
 
 This resets `status=open`, releasing the item for other agents.
@@ -192,3 +261,24 @@ Example:
 - Q: "Can we reuse service X?" — Answer (engineer@acme): "Partially; need a small wrapper. Research: inspected services/x, no adapter — created follow-up wl-789".
 
 Behavior: append before final approval; **idempotent** (update existing records, never duplicate); mark open questions "OPEN QUESTION" with context; respect `.gitignore`. Privacy: record only user/authorized-stakeholder info; redact secrets with a note ("[REDACTED sensitive snippet]"). Traceability: each entry linkable; include `related-to:<work-item-id>` or file-path references when practical.
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

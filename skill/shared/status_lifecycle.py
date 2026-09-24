@@ -6,7 +6,7 @@ transitions consistently across all skills (audit, implement, plan, etc.).
 
 Usage::
 
-    from skill.shared.status_lifecycle import StatusLifecycle
+    from shared.status_lifecycle import StatusLifecycle
 
     with StatusLifecycle(
         work_item_id,
@@ -64,6 +64,15 @@ from pathlib import Path
 
 LOG = logging.getLogger("skill.shared.status_lifecycle")
 
+
+class ClaimError(RuntimeError):
+    """Raised when a work-item mutation is attempted without holding the claim.
+
+    Subclasses :class:`RuntimeError` for backward compatibility — existing
+    ``except RuntimeError`` handlers continue to catch it (SA-0MTFTFUIH000UWM9).
+    """
+
+
 # Type alias for an injectable command runner.
 # Takes a command list, returns a CompletedProcess (like subprocess.run).
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
@@ -74,23 +83,48 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess]
 def _resolve_repo_root() -> Path:
     """Resolve the framework repository root from this module's location.
 
-    The module may be imported from inside a git worktree — a full checkout
-    under ``<main>/.worklog/worktrees/<name>/`` whose ``skill/`` tree is a
-    complete copy. The sibling-projects scan base must be derived from the
-    MAIN checkout: a worktree has a ``.git`` FILE (gitdir pointer) at its
-    root, while the main checkout has a ``.git`` DIRECTORY. Walking up from
-    the module file, the first ancestor that owns ``skill/shared`` and is
-    NOT a worktree is the framework main checkout.
+    Delegates to :func:`_resolve_owning_checkout_root` with this module's
+    own file (symlinks resolved) — the single seam tests exercise.
     """
-    current = Path(__file__).resolve().parent  # skill/shared
+    return _resolve_owning_checkout_root(Path(__file__).resolve())
+
+
+def _resolve_owning_checkout_root(module_file: Path) -> Path:
+    """Resolve the checkout root that owns a skill/shared module file.
+
+    The module may live inside a git worktree — a full checkout under
+    ``<main>/.worklog/worktrees/<name>/`` whose ``skill/`` tree is a complete
+    copy. The sibling-projects scan base must be derived from the MAIN
+    checkout: a worktree has a ``.git`` FILE (gitdir pointer) at its root,
+    while the main checkout has a ``.git`` DIRECTORY. Walking up from the
+    module file, the first ancestor that owns ``skill/shared`` and is
+    NOT a worktree is the framework main checkout.
+
+    A tracked nested copy ``skill/skill/shared/status_lifecycle.py`` (see
+    commit aea4c741) makes a naive existence check match the *parent* of the
+    real checkout (``<repo>/skill``) one level too deep, because that parent
+    also "owns" the nested copy. Such a parent never has a ``.git`` member
+    of its own, so the walk requires the owning candidate to be a git
+    checkout root (``.git`` directory; worktrees with a ``.git`` FILE are
+    skipped, which restores the pre-nested-copy resolution to the main
+    checkout for worktree launches). The walk therefore falls through any
+    nested-copy-only candidate to the real owner.
+    """
+    current = module_file.parent  # skill/shared
     for candidate in current.parents:
-        if not (candidate / "skill" / "shared" / "status_lifecycle.py").is_file():
+        module_copy = candidate / "skill" / "shared" / "status_lifecycle.py"
+        if not module_copy.is_file():
             continue
         if (candidate / ".git").is_file():
             continue  # worktree copy (gitdir pointer), not the main checkout
-        return candidate
-    # Fallback: conventional layout (repo root = two levels above skill/shared).
-    return Path(__file__).resolve().parents[2]
+        if (candidate / ".git").is_dir():
+            return candidate  # owns skill/shared AND is a checkout root
+        # Matched only via the nested skill/skill copy (candidate is
+        # <real-checkout>/skill) or a foreign checkout's copy — keep walking
+        # to the first ancestor that is a real checkout root.
+    # Fallback: conventional layout (repo root = two levels above
+    # skill/shared).
+    return module_file.parents[2]
 
 
 REPO_ROOT = _resolve_repo_root()
@@ -531,6 +565,101 @@ class StatusLifecycle:
         r = runner or _default_runner
         return _run_wl_with_runner(r, cmd)
 
+    @staticmethod
+    def require_claimed(
+        work_item_id: str,
+        runner: Runner | None = None,
+    ) -> dict:
+        """Assert the work item is currently ``in_progress`` (claim held).
+
+        Fails closed when work is attempted without a claim — the invariant
+        ``actively worked => in_progress``. Call before any ``wl`` mutation
+        (create children, update description, wire deps, add comments) and
+        immediately after an in-session producer-approval resume (SA-0MTFTFUIH000UWM9).
+
+        Args:
+            work_item_id: The work item ID to check.
+            runner: Optional injectable runner for testing.
+
+        Returns:
+            The ``wl show`` response dict when the item is ``in_progress``.
+
+        Raises:
+            ClaimError: If the item's status is not ``in_progress`` (subclasses
+                :class:`RuntimeError` for backward compatibility; the ``open``
+                window caused duplicate dispatch of AH-0MTFPDKDU006QUDC on
+                2026-08-30).
+            RuntimeError: If ``wl show`` itself fails.
+        """
+        data = StatusLifecycle.show(work_item_id, runner=runner)
+        wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+        status = wi.get("status", "") if isinstance(wi, dict) else ""
+        if status != "in-progress":
+            raise ClaimError(
+                f"Work item {work_item_id} must be in-progress before mutation "
+                f"(current status: {status or 'unknown'}). "
+                f"Re-claim with StatusLifecycle.update_status({work_item_id!r}, 'in-progress') "
+                f"or StatusLifecycle.ensure_claimed({work_item_id!r}) before mutating."
+            )
+        return data
+
+    @staticmethod
+    def ensure_claimed(
+        work_item_id: str,
+        *,
+        assignee: str | None = None,
+        runner: Runner | None = None,
+    ) -> dict:
+        """Ensure the work item is ``in_progress``, reclaiming if needed.
+
+        Idempotent re-claim helper for in-session resume paths (e.g. plan
+        approval gate — SA-0MTFTFUIH000UWM9). If the item is already
+        ``in_progress`` this is a no-op (verified via ``wl show``); otherwise
+        it transitions to ``in_progress`` (optionally setting assignee) before
+        any further mutation. Prefer :meth:`require_claimed` when the caller
+        must *not* silently reclaim.
+
+        Args:
+            work_item_id: The work item ID to ensure is claimed.
+            assignee: Optional assignee to set when reclaiming. Ignored
+                when already ``in_progress``.
+            runner: Optional injectable runner for testing.
+
+        Returns:
+            The ``wl show`` response when already claimed, otherwise the
+            ``wl update`` response from the reclaim.
+
+        Raises:
+            RuntimeError: If ``wl show`` or the reclaim ``wl update`` fails.
+        """
+        data = StatusLifecycle.show(work_item_id, runner=runner)
+        wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+        status = wi.get("status", "") if isinstance(wi, dict) else ""
+        if status == "in-progress":
+            LOG.debug("ensure_claimed: %s already in-progress — no-op", work_item_id)
+            return data
+        kwargs: dict = {"status": "in-progress", "runner": runner}
+        if assignee is not None:
+            kwargs["assignee"] = assignee
+        LOG.info(
+            "ensure_claimed: reclaiming %s to in-progress (was %s)",
+            work_item_id,
+            status or "unknown",
+        )
+        return StatusLifecycle.update_status(work_item_id, **kwargs)
+
+    @staticmethod
+    def reclaim(
+        work_item_id: str,
+        *,
+        assignee: str | None = None,
+        runner: Runner | None = None,
+    ) -> dict:
+        """Alias for :meth:`ensure_claimed` — idempotent re-claim (SA-0MTFTFUIH000UWM9)."""
+        return StatusLifecycle.ensure_claimed(
+            work_item_id, assignee=assignee, runner=runner
+        )
+
     # ------------------------------------------------------------------
     # Context manager protocol
     # ------------------------------------------------------------------
@@ -556,7 +685,7 @@ class StatusLifecycle:
 
         # Set in_progress
         try:
-            kwargs: dict = {"status": "in_progress", "runner": self._runner}
+            kwargs: dict = {"status": "in-progress", "runner": self._runner}
             if self._assignee is not None:
                 kwargs["assignee"] = self._assignee
             self.update_status(self._work_item_id, **kwargs)
