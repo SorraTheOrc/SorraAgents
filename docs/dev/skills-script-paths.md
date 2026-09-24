@@ -315,8 +315,9 @@ copied into the project:
 
 1. Run `scripts/install_pi.sh` from this repository (the canonical source).
    It symlinks the global skills install (`~/.pi/agent/skills`) to this
-   repo's `skill/` tree and installs the global agent config
-   (`.pi-config/agent/`).
+   repo's `skill/` tree, installs the global agent config
+   (`.pi-config/agent/`), and installs the `skill_path` shell shim to
+   `$HOME/.pi/agent/bin/skill_path`.
 2. **Project repos never need a `skill/` directory.** A project that
    contains a `skill/` tree should treat it as the canonical source (this
    repo), not as something to synthesize or copy from.
@@ -325,7 +326,16 @@ copied into the project:
    skills root; a real-copy install that drops `shared/` fails import
    resolution (see
    [#graceful-failure-for-missing-shared-modules](#graceful-failure-for-missing-shared-modules)).
-4. Invoke skill scripts canonically:
+4. The `skill_path` shell shim (installed to `~/.pi/agent/bin/skill_path`)
+   must be on `PATH` for `$(skill_path <name>)` to resolve in bash command
+   substitution. If `~/.pi/agent/bin` is not on `PATH`, the installer
+   prints a warning. Add it to your shell profile if needed:
+
+   ```bash
+   export PATH="$HOME/.pi/agent/bin:$PATH"
+   ```
+
+5. Invoke skill scripts canonically:
    ```bash
    python3 $(skill_path <skill-name>)/scripts/<script>.py ...  # from anywhere
    cd ~/.pi/agent/skills/<skill-name> && python3 ./scripts/<script>.py ...
