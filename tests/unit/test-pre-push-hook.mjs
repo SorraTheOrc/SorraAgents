@@ -188,8 +188,15 @@ describe('pre-push hook: branch policy', () => {
         ...process.env,
         WORKLOG_SKIP_PRE_PUSH: '1',
         BRANCH_POLICY_SKIP: '1',
+        // The temp repo has no skill/test/scripts/run_tests.py, and its
+        // default branch is 'main' on machines with init.defaultBranch=main
+        // — the hook's full-suite gate would then fail with "runner not
+        // found". Skip the test/context gates so this test isolates the
+        // branch-policy bypass it actually exercises.
+        TEST_SCOPE_SKIP: '1',
+        CONTEXT_BUDGET_SKIP: '1',
       };
-      // With both skips enabled, push should succeed
+      // With all skips enabled, push should succeed
       execSync('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
       assert.ok(true, 'Push with BRANCH_POLICY_SKIP=1 should succeed');
     } finally {
