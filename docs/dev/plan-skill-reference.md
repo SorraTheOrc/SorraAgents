@@ -5,6 +5,15 @@ Deep implementation-reference detail relocated from `skill/plan/SKILL.md`
 operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged.
 
+## Interview conduct
+
+The agent-facing rule lives in `skill/plan/SKILL.md` (§ Hard requirements and
+§ 3. Interview): every interview round must include an explicit preferred
+option, marked `**Recommended:** <option> — <one-line rationale>`. The
+recommendation is **advisory** — the operator's choice always wins and the
+agent never selects unilaterally. The rule applies to every round and to
+questions handed off for producer review via `wl reviewed`.
+
 ## plan_helpers.py — full import list
 
 ```python

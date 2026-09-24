@@ -5,6 +5,15 @@ Deep implementation-reference detail relocated from `skill/intake/SKILL.md`
 operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged.
 
+## Interview conduct
+
+The agent-facing rule lives in `skill/intake/SKILL.md` (§ Hard requirements and
+§ 4. Interview): every interview round must include an explicit preferred
+option, marked `**Recommended:** <option> — <one-line rationale>`. The
+recommendation is **advisory** — the operator's choice always wins and the
+agent never selects unilaterally. The rule applies to every round and to
+questions handed off for producer review via `wl reviewed`.
+
 ## Worklog resolution
 
 `intake.py` routes every `wl` call through the shared `run_wl` helper

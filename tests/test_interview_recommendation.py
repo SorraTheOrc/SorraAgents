@@ -10,6 +10,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _INTAKE_SKILL_MD = _REPO_ROOT / "skill" / "intake" / "SKILL.md"
 _PLAN_SKILL_MD = _REPO_ROOT / "skill" / "plan" / "SKILL.md"
+_INTAKE_REF_MD = _REPO_ROOT / "docs" / "dev" / "intake-skill-reference.md"
+_PLAN_REF_MD = _REPO_ROOT / "docs" / "dev" / "plan-skill-reference.md"
 
 _MARKER = "**Recommended:**"
 _REQUIRED_PHRASES = [
@@ -57,6 +59,17 @@ class TestIntakeRecommendation:
             "the operator's choice"
         )
 
+    def test_intake_applies_to_every_round_and_producer_handoff(self) -> None:
+        content = _skill_content(_INTAKE_SKILL_MD)
+        assert "every interview round" in content, (
+            "skill/intake/SKILL.md must state the requirement applies to "
+            "every interview round"
+        )
+        assert "routed to the producer" in content, (
+            "skill/intake/SKILL.md must state the requirement also applies "
+            "to producer-review handoff questions"
+        )
+
 
 # ── Plan skill ──────────────────────────────────────────────────────────────
 
@@ -89,6 +102,17 @@ class TestPlanRecommendation:
         assert "operator's choice" in content, (
             "skill/plan/SKILL.md must state that the agent proceeds with "
             "the operator's choice"
+        )
+
+    def test_plan_applies_to_every_round_and_producer_handoff(self) -> None:
+        content = _skill_content(_PLAN_SKILL_MD)
+        assert "every interview round" in content, (
+            "skill/plan/SKILL.md must state the requirement applies to "
+            "every interview round"
+        )
+        assert "routed to the producer" in content, (
+            "skill/plan/SKILL.md must state the requirement also applies "
+            "to producer-review handoff questions"
         )
 
 
@@ -127,3 +151,38 @@ class TestBothSkillsConsistent:
             assert "operator's choice" in content, (
                 f"{name} skill must allow the operator's choice to prevail"
             )
+
+    def test_both_skills_cover_producer_handoff(self) -> None:
+        intake = _skill_content(_INTAKE_SKILL_MD)
+        plan = _skill_content(_PLAN_SKILL_MD)
+        for name, content in [("intake", intake), ("plan", plan)]:
+            assert "routed to the producer" in content, (
+                f"{name} skill must cover producer-review handoff questions"
+            )
+
+
+# ── Maintainer reference docs ───────────────────────────────────────────────
+
+
+class TestReferenceDocs:
+    """The maintainer reference docs must point to the interview-conduct rule."""
+
+    def test_intake_reference_documents_recommendation(self) -> None:
+        content = _skill_content(_INTAKE_REF_MD)
+        assert "Interview conduct" in content, (
+            "docs/dev/intake-skill-reference.md must document the "
+            "interview-conduct rule"
+        )
+        assert _MARKER in content, (
+            "intake reference doc must reference the `**Recommended:**` marker"
+        )
+
+    def test_plan_reference_documents_recommendation(self) -> None:
+        content = _skill_content(_PLAN_REF_MD)
+        assert "Interview conduct" in content, (
+            "docs/dev/plan-skill-reference.md must document the "
+            "interview-conduct rule"
+        )
+        assert _MARKER in content, (
+            "plan reference doc must reference the `**Recommended:**` marker"
+        )

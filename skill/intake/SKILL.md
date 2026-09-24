@@ -160,7 +160,7 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 
 Skip if the seed context suffices to draft a clear brief. Otherwise: soft limit of 3 questions per round (1+ rounds); do NOT ask questions answerable by repo search — use gathered context; goal is enough understanding to draft a problem definition with user stories, ACs, and related work (not a complete spec); if ambiguous, ask for clarification rather than guessing; do not proceed until sufficient information is gathered.
 
-**Explicit recommendation per round:** for every interview question or round, the agent **must** state its preferred option explicitly, using the marker `**Recommended:** <option> — <one-line rationale>`. This recommendation is **advisory only** — the operator may choose any option, and the agent **proceeds with the operator's choice**. The agent never unilaterally selects or auto-selects the recommendation without confirmation.
+**Explicit recommendation per round:** for every interview question or round, the agent **must** state its preferred option explicitly, using the marker `**Recommended:** <option> — <one-line rationale>`. This recommendation is **advisory only** — the operator may choose any option, and the agent **proceeds with the operator's choice**. The agent never unilaterally selects or auto-selects the recommendation without confirmation. The requirement applies to **every interview round** and to questions routed to the producer via `wl reviewed` — not only the first round.
 
 **Producer review:** When the agent cannot proceed without producer input (clarifying questions unanswered, critical information missing), mark the work item as needing producer review:
 
