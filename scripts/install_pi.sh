@@ -128,7 +128,7 @@ DEST_PI="$HOME/.pi/agent"
 copy_if_missing_or_prompt() {
   local src="$1" dst="$2"
   if [ -e "$dst" ]; then
-    read -r -e -p "File exists: $dst. Overwrite? [y/N]: " resp
+    read -r -e -p "File exists: $dst. Overwrite? [y/N]: " resp || true
     case "$resp" in
       [yY]|[yY][eE][sS]) cp -f "$src" "$dst" && echo "Overwrote $dst" ;; 
       *) echo "Skipped $dst" ;;
@@ -162,7 +162,7 @@ else
       [ -e "$DEST_PI/$f" ] && found=1 || true
     done
     if [ $found -eq 1 ]; then
-      read -r -e -p "Found existing ~/.pi/agent config. Would you like to copy non-secret config files into $REPO_ROOT/.pi-config/agent for tracking in git? [y/N]: " resp
+      read -r -e -p "Found existing ~/.pi/agent config. Would you like to copy non-secret config files into $REPO_ROOT/.pi-config/agent for tracking in git? [y/N]: " resp || true
       case "$resp" in
         [yY]|[yY][eE][sS])
           mkdir -p "$REPO_PI_CONFIG"
@@ -193,6 +193,40 @@ if [ ! -e "$DEST_PI/auth.json" ]; then
   echo "This will open a browser and create ~/.pi/agent/auth.json for your account."
 fi
 
+# ── skill_path shim installation ──────────────────────────────────────────
+# The install_pi.sh script must install the skill_path shim (source: this
+# repo's scripts/skill_path) into $HOME/.pi/agent/bin/skill_path so that
+# $(skill_path <name>) works in bash from any project CWD.  This block is
+# fail-open: if $HOME/.pi/agent/bin is not on PATH the shim is still created
+# but a warning is emitted.
+
+SHIM_SRC="$SRC_DIR/scripts/skill_path"
+SHIM_DST="$HOME/.pi/agent/bin/skill_path"
+
+if [ -f "$SHIM_SRC" ]; then
+  mkdir -p "$(dirname "$SHIM_DST")"
+
+  if [ -f "$SHIM_DST" ] && [ -x "$SHIM_DST" ]; then
+    echo "OK: skill_path shim already installed: $SHIM_DST"
+  else
+    cp "$SHIM_SRC" "$SHIM_DST"
+    chmod +x "$SHIM_DST"
+    echo "Installed skill_path shim: $SHIM_DST"
+  fi
+else
+  echo "WARNING: source skill_path shim not found at $SHIM_SRC; skipping shim install" >&2
+fi
+
+# Warn (non-fatal) if ~/.pi/agent/bin is not on PATH.  The shim must be
+# invocable as a bare command — $(skill_path report) — so it needs to be
+# first on PATH (as documented).
+pif_bin="$HOME/.pi/agent/bin"
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$pif_bin"; then
+  echo "WARNING: $pif_bin is not on PATH. The skill_path shim must be" >&2
+  echo "invocable as a bare command (e.g. \$(skill_path report))." >&2
+  echo "Add this to your shell profile:" >&2
+  echo "  export PATH=\"$pif_bin:\$PATH\"" >&2
+fi
 # ── Context-budget pre-push hook wiring ───────────────────────────────────
 # Install the v2 pre-push hook (worklog sync + context-budget gate + branch
 # policy) into the *current project* and configure git to use .githooks/.
