@@ -27,7 +27,7 @@ by the autoplan decision logic).
 - Do not create a work item for the planning process itself.
 - Each feature must be deliverable as a minimal end-to-end slice (code, tests, docs, infra, observability).
 - Identify existing implementations or features that can be reused.
-- Use concise interview style: ≤3 high-signal questions per iteration; prefer multiple-choice but allow freeform.
+- Use concise interview style: ≤3 high-signal questions per iteration; prefer multiple-choice but allow freeform. For each question/round, state the **preferred option explicitly** with a one-line rationale using the marker `**Recommended:** <option> — <rationale>`.
 - Do not invent requirements, dates, or owners — propose options and ask for confirmation.
 - Respect `.gitignore` and agent ignore rules.
 - If the user is uncertain, add clarifying questions rather than guessing.
@@ -236,6 +236,8 @@ Then output a summary of what each stage checked/found.
 3. Interview
 
    In iterations (≤3 questions each), gather the minimum information for an actionable plan. Per feature capture: **Target outcome**, **Definition of done** (pass/fail checks + automated tests), **Constraints** (performance, compatibility, rollout, timeline), **Risky assumptions** (where a prototype is needed and what "success" means). Iterate until the breakdown is clear. Review existing Appendix entries first — don't re-ask answered questions.
+
+   **Explicit recommendation per round:** for every interview question or round, the agent **must** state its preferred option explicitly, using the marker `**Recommended:** <option> — <one-line rationale>`. This recommendation is **advisory only** — the operator may choose any option, and the agent **proceeds with the operator's choice**. The agent never unilaterally selects or auto-selects the recommendation without confirmation.
 
    **Producer review:** When the agent cannot proceed without producer input (clarifying questions unanswered, critical information missing), mark the work item as needing producer review. **Handoff-only:** only release to `open` when the session genuinely ends and waits for an open-ended producer reply; if the run will resume in-session (e.g. approval pane), **hold `in_progress`** or re-claim via `StatusLifecycle.ensure_claimed` immediately on resume before any mutation (see Status lifecycle). A downtime run with no interactive approver must hold or abort — never release to `open` mid-run:
 
