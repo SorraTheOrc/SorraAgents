@@ -241,11 +241,25 @@ Selected test files are passed explicitly (`pytest tests/test_foo.py ...`),
 so a scoped run is deterministic and cache-keyed distinctly from the full
 suite.
 
+**Deleted / non-existent paths (LP-0MTZYRTNF0092JKW).** A deleted or
+renamed-away test file still appears in `git diff` even though it is absent
+from the worktree. `map_changed_to_tests()` adds a changed test path only
+when `(root / path).exists()`, and applies a final existence filter over the
+whole selection (covering convention-mapped and import-graph entries too).
+`changed_scope_commands()` repeats the filter defensively; if nothing
+selectable remains (a deletion-only change) it returns `None`, forcing the
+full-scope fallback. This prevents emitting `pytest <deleted-file>`, which
+exits 4 ("file or directory not found") and would otherwise be reported as
+a phantom test failure. The implement skill's changed-scope gate mirrors
+this: a scoped pytest exit 4 is treated as "selection unavailable" →
+full-scope fallback, while a genuine failure (exit 1) still blocks.
+
 **Fallback to full scope** (with a logged warning) happens when no subset
 can be selected: no diff base / no changed files, all changed files are
-non-test/unmapped, the repo declares custom `suiteCommands` in
-`.pi/test-config.json` (not introspectable), or the repo has no subsettable
-tooling. A scoped run never silently skips testing.
+non-test/unmapped, the selection references only deleted/non-existent paths,
+the repo declares custom `suiteCommands` in `.pi/test-config.json` (not
+introspectable), or the repo has no subsettable tooling. A scoped run never
+silently skips testing.
 
 **Result JSON** carries `scope` (`full`/`changed`) at the run level
 (`run_all` outputs `scope` + per-suite `resolved_scopes`); `run_suite`

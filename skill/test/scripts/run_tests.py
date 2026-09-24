@@ -323,7 +323,12 @@ def map_changed_to_tests(
     for changed_file in changed:
         rel = Path(changed_file)
         if _is_test_file(rel):
-            selected.add(changed_file)
+            # Only select the test when it still exists on disk: a test file
+            # that was deleted/renamed away still appears in `git diff` but
+            # must not reach the pytest command line (exit 4 → phantom
+            # failure). See LP-0MTZYRTNF0092JKW.
+            if (root / changed_file).exists():
+                selected.add(changed_file)
             continue
         if rel.suffix not in TRACKED_SOURCE_EXTENSIONS:
             continue  # non-source change → no test selection
@@ -351,7 +356,11 @@ def map_changed_to_tests(
     if selected or _has_python_changes(changed):
         selected |= _expand_by_imports(root, all_tests, changed)
 
-    return selected
+    # Final existence filter: convention mapping scans the filesystem so its
+    # entries exist, but a changed test file added directly above (or an
+    # import-graph entry pointing at a removed path) may not. Guard the
+    # contract that every returned path exists on disk (LP-0MTZYRTNF0092JKW).
+    return {f for f in selected if (root / f).exists()}
 
 
 def _is_test_file(rel: Path) -> bool:
@@ -534,6 +543,14 @@ def changed_scope_commands(
     selected = map_changed_to_tests(root, changed)
     # Anything changed that is itself a test file is already in `selected`;
     # leaf-only changes (e.g. a lone docs edit) → full scope.
+    if not selected:
+        return None
+
+    # Defensive existence filter: never emit a command referencing a path that
+    # is absent from the worktree (deleted/renamed away). If filtering leaves
+    # nothing selectable, fall back to full scope rather than emitting a
+    # degenerate command that would exit 4 (LP-0MTZYRTNF0092JKW).
+    selected = {f for f in selected if (root / f).exists()}
     if not selected:
         return None
 

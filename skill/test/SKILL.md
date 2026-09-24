@@ -131,6 +131,16 @@ the audit's read-only full-suite query rejects `changed` entries, so a
 partial run can never satisfy a "full test suite passes" AC. When no subset
 can be selected (no diff base, only non-test changes, custom
 `suiteCommands`), changed scope falls back to the full suite with a warning.
+**Deleted/non-existent paths are never selected (LP-0MTZYRTNF0092JKW):**
+`map_changed_to_tests()` excludes any changed path absent from the worktree
+(a deleted or renamed-away test file still appears in `git diff`), and
+`changed_scope_commands()` filters the selection to on-disk paths and returns
+`None` when nothing selectable remains — so a deletion-only change falls back
+to the full suite instead of emitting a pytest command that exits 4 ("file or
+directory not found") and is mistaken for a test failure. The implement skill
+applies the same rule defensively: a changed-scope pytest exit 4 is treated
+as "selection unavailable" (full-scope fallback), while a genuine failure
+(exit 1) still blocks.
 Result JSON and `--summary` output carry `scope` per suite. Pre-push
 enforcement (`.githooks/pre-push`): pushes to `refs/heads/dev`/`main` run the
 full suite (`--scope full`), feature-branch pushes skip tests
