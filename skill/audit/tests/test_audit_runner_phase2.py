@@ -1102,14 +1102,19 @@ class TestPhase2ParallelChildCalls:
         assert 1 <= cap <= 4
 
     def test_legacy_alias_fallback(self):
-        """Legacy AUDIT_PHASE2_PARALLELISM is honored when AUDIT_PARALLELISM is unset."""
+        """Legacy AUDIT_PHASE2_PARALLELISM is honored when AUDIT_PARALLELISM is unset.
+
+        The ambient environment is cleared so an audit-internal
+        ``AUDIT_PARALLELISM`` export cannot leak in and mask the legacy alias
+        (SA-0MUERWHED002FNQ4).
+        """
         with mock.patch.dict(
             audit_runner.os.environ,
             {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV_LEGACY: "3"},
-            clear=False,
+            clear=True,
         ):
             # Ensure the new name is not set
-            assert audit_runner.AUDIT_PARALLELISM_ENV not in audit_runner.os.environ or audit_runner.os.environ.get(audit_runner.AUDIT_PARALLELISM_ENV) is None
+            assert audit_runner.AUDIT_PARALLELISM_ENV not in audit_runner.os.environ
             cap = audit_runner._resolve_parallelism()
         assert cap == 3
 

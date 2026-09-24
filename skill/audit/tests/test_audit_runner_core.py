@@ -2852,21 +2852,29 @@ class TestSlotAwareConcurrency:
         )
 
     def test_dynamic_ceiling_caps_by_available_slots(self):
-        """available=2 → ceiling min(2, max); available=1 → 1; available=0 → 1 floor."""
-        with self._mock_slot_status(2, 4):
-            assert audit_runner._resolve_child_concurrency() == 2
-        with self._mock_slot_status(1, 4):
-            assert audit_runner._resolve_child_concurrency() == 1
-        with self._mock_slot_status(0, 4):
-            assert audit_runner._resolve_child_concurrency() == 1  # floor, never 0
-        with self._mock_slot_status(8, 8):
-            assert audit_runner._resolve_child_concurrency() == 2  # capped by configured max
+        """available=2 → ceiling min(2, max); available=1 → 1; available=0 → 1 floor.
+
+        The ambient environment is cleared so audit-internal parallelism
+        variables exported by the audit runner (e.g. ``AUDIT_PARALLELISM=1``
+        when the proxy is in ``cheap`` mode) cannot leak in and change the
+        configured maximum (SA-0MUERWHED002FNQ4).
+        """
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            with self._mock_slot_status(2, 4):
+                assert audit_runner._resolve_child_concurrency() == 2
+            with self._mock_slot_status(1, 4):
+                assert audit_runner._resolve_child_concurrency() == 1
+            with self._mock_slot_status(0, 4):
+                assert audit_runner._resolve_child_concurrency() == 1  # floor, never 0
+            with self._mock_slot_status(8, 8):
+                assert audit_runner._resolve_child_concurrency() == 2  # capped by configured max
 
     def test_fallback_to_static_on_query_failure(self):
         """Query failure (None, None) degrades to the static ceiling (fail-open)."""
-        with self._mock_slot_status(None, None):
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True), \
+             self._mock_slot_status(None, None):
             assert audit_runner._resolve_child_concurrency() == 2  # AUDIT_PARALLELISM default
-        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_PARALLELISM_ENV: "3"}, clear=False), \
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_PARALLELISM_ENV: "3"}, clear=True), \
              self._mock_slot_status(None, None):
             assert audit_runner._resolve_child_concurrency() == 3
 
