@@ -538,3 +538,144 @@ class TestCLIFlags:
         parser = build_parser()
         args = parser.parse_args([])
         assert args.target_branch is None
+
+
+# ---------------------------------------------------------------------------
+# Deleted/non-existent path regression tests (F1 — red baseline)
+# These tests reproduce the bug where `map_changed_to_tests()` adds changed
+# test-file paths without verifying they still exist on disk. They FAIL
+# against the unfixed code and should PASS after the fix in F2.
+# ---------------------------------------------------------------------------
+
+
+class TestDeletedPathSelection:
+    """AC1/AC3: deleted test files must be excluded from changed-scope selection."""
+
+    def test_deleted_test_file_excluded_from_map(self, tmp_path: Path) -> None:
+        """A test file that is tracked-in-git as changed but deleted from the
+        worktree must NOT appear in map_changed_to_tests() results.
+
+        This reproduces the original bug where a git-diff entry for a deleted
+        test file was unconditionally added to the selection set.
+        """
+        repo = _make_repo(tmp_path)
+
+        # Add and commit a test file, then delete it
+        (repo / "tests" / "test_extra.py").write_text("import src.extra\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test_extra"], cwd=repo, check=True, capture_output=True)
+
+        # Now delete the file (it will appear in git diff as a deletion)
+        (repo / "tests" / "test_extra.py").unlink()
+
+        # Simulate changed files: the deleted file appears in git diff
+        changed = {"tests/test_extra.py"}
+        tests = map_changed_to_tests(repo, changed)
+
+        # BUG: currently this assertion FAILS because the deleted file is
+        # still included in the selection.
+        assert "tests/test_extra.py" not in tests, (
+            "deleted test file tests/test_extra.py was included in "
+            "map_changed_to_tests() selection even though the file no longer "
+            "exists on disk"
+        )
+
+    def test_deleted_test_file_excluded_from_changed_scope_commands(
+        self, tmp_path: Path
+    ) -> None:
+        """A deletion-only change must cause changed_scope_commands() to return
+        None (full-scope fallback), not emit a command referencing the
+        non-existent file.
+
+        This is AC2: changed_scope_commands() must never emit a command that
+        references a non-existent path.
+        """
+        repo = _make_repo(tmp_path)
+        (repo / "pytest.ini").write_text("[pytest]\n")
+
+        # Add and commit a test file, then delete it
+        (repo / "tests" / "test_extra.py").write_text("import src.extra\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test_extra"], cwd=repo, check=True, capture_output=True)
+
+        # Now delete the file
+        (repo / "tests" / "test_extra.py").unlink()
+
+        # The changed file is the deleted test
+        changed = {"tests/test_extra.py"}
+        cmds = changed_scope_commands(repo, base_ref="dev", changed_files=changed)
+
+        # BUG: currently this assertion FAILS because the command still
+        # references the non-existent file.
+        assert cmds is None, (
+            f"changed_scope_commands() returned a command for a deleted test file: {cmds}. "
+            "Expected None (full-scope fallback) when the only changed test is deleted."
+        )
+
+    def test_mixed_deleted_and_modified_selection_excludes_deleted(
+        self, tmp_path: Path
+    ) -> None:
+        """A mixed change (one deleted test file + one modified source file)
+        must select only the test corresponding to the modified source, not
+        the deleted test.
+
+        Regression for AC1/AC3: deleted paths must not appear in the emitted command.
+        """
+        repo = _make_repo(tmp_path)
+        (repo / "pytest.ini").write_text("[pytest]\n")
+
+        # Add and commit a test file, then delete it
+        (repo / "tests" / "test_extra.py").write_text("import src.extra\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test_extra"], cwd=repo, check=True, capture_output=True)
+
+        # Modify src/utils.py AND delete test_extra.py
+        (repo / "src" / "utils.py").write_text("# utils — modified\n")
+        (repo / "tests" / "test_extra.py").unlink()
+
+        changed = {"src/utils.py", "tests/test_extra.py"}
+        tests = map_changed_to_tests(repo, changed)
+
+        # test_utils.py should be selected (from modified src/utils.py)
+        assert "tests/test_utils.py" in tests
+        # test_extra.py should NOT be selected (it was deleted)
+        assert "tests/test_extra.py" not in tests, (
+            "deleted test file tests/test_extra.py was included in selection "
+            "alongside an existing change"
+        )
+
+    def test_deleted_test_file_in_changed_scope_commands_mixed(
+        self, tmp_path: Path
+    ) -> None:
+        """For a mixed change (modified source + deleted test), the emitted
+        command must contain only existing paths.
+
+        Regression for AC3: the pytest command should not reference the
+        deleted file.
+        """
+        repo = _make_repo(tmp_path)
+        (repo / "pytest.ini").write_text("[pytest]\n")
+
+        # Add and commit a test file, then delete it
+        (repo / "tests" / "test_extra.py").write_text("import src.extra\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test_extra"], cwd=repo, check=True, capture_output=True)
+
+        # Modify src/utils.py AND delete test_extra.py
+        (repo / "src" / "utils.py").write_text("# utils — modified\n")
+        (repo / "tests" / "test_extra.py").unlink()
+
+        changed = {"src/utils.py", "tests/test_extra.py"}
+        cmds = changed_scope_commands(repo, base_ref="dev", changed_files=changed)
+
+        # BUG: currently this assertion FAILS because the command still
+        # references the non-existent file.
+        assert cmds is not None
+        assert len(cmds) == 1
+        cmd = cmds[0]
+        assert "pytest" in cmd.lower()
+        assert "tests/test_utils.py" in cmd
+        assert "tests/test_extra.py" not in cmd, (
+            f"deleted test file tests/test_extra.py appears in changed-scope "
+            f"command: {cmd}"
+        )
