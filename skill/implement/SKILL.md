@@ -22,11 +22,19 @@ through code, tests, and docs.
 
 - Intake/interview helpers: `intake`, `plan`.
 
-Security note: Do not push or create PRs automatically unless the invoking
-agent has explicit permission to push and open pull requests; require explicit
-confirmation before remote actions (push/PR) without an operator-approved
-credential. When in doubt, produce the exact `git`/`gh`/`wl` commands for a
-human to run.
+Security note — scope: this restriction applies to **protected branches**
+(`main`/`master`/`HEAD`) and to **creating PRs**: do not push to them or open
+PRs automatically without explicit operator permission (no operator-approved
+credential exists for those actions). Pushing the feature branch into `dev`
+(Step 9) is **pre-authorized by this workflow** — the repo's pre-push hook
+enforces the same policy, blocking `main`/`master`/`HEAD` only — and requires
+no additional approval, provided the build passes and the test gate is green:
+`implement.py finish` validates the worktree with **changed scope** (tests
+affected by the change — fast iteration), then runs a **final `--scope full`
+gate** before commit, and the **pre-push hook re-runs the full suite**
+(`--scope full`) on the actual push to `dev`/`main` (SA-0MT6BYQHB008DOGC).
+When in doubt, produce the exact
+`git`/`gh`/`wl` commands for a human to run.
 
 Privacy note: Avoid secrets/tokens/PII in comments or PR bodies — reference by
 work-item id or document path; mask/redact sensitive values before writing to
@@ -42,6 +50,12 @@ wraps build/test/commit/push in `with StatusLifecycle(..., target_stage="in_revi
 `phase_abort()` resets to `open` (also `implement.py abort <WIP-id>`). Manual
 use: `StatusLifecycle.update_status()` or the context-manager pattern in
 `../shared/status_lifecycle.py`.
+
+**Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No
+`wl` mutation (description/comment/child creation) while `status: open`. Guard
+with `StatusLifecycle.require_claimed(<id>)` before any mutation; on any
+in-session resume, re-claim first via `StatusLifecycle.ensure_claimed(<id>)`
+(idempotent).
 
 ## Test Anti-Patterns
 
@@ -74,6 +88,24 @@ anything. Every test must assert observable behaviour via the public API.
 - Not well-defined → intake interview; implement blockers/dependencies first.
 - Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev ([AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
 - Use `StatusLifecycle` for all status transitions — never ad-hoc `wl update --status` commands.
+
+## Test Timeout Configuration
+
+The finish step runs the project test suite through `implement.py finish` with a
+per-command timeout (default **600 seconds**). Repos with slow test suites can
+override this via `.pi/test-config.json`:
+
+```json
+{"timeoutPerCommand": 1500}
+```
+
+The `timeoutPerCommand` field is read from `.pi/test-config.json` in the project
+root. When the file is absent, the field is missing, or the value is invalid,
+the default of 600 seconds is used. This keeps other repos unaffected — only
+projects that explicitly create the file get the override.
+
+Set the value high enough to cover the full suite with headroom (e.g. TCE uses
+1500 to cover its ~19-minute suite).
 
 ## Status Safety & Abort Handling
 
@@ -157,16 +189,44 @@ abort); act only after the operator explicitly chooses.
 
 On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 
-3. Understand the work item
+3. Stash hygiene gate (warn on orphaned stashes)
 
-The item is already claimed from Step 1. Check the most recent worklog action,
-comment, or audit entry (reuse a recent audit, else `/skill:audit
-<work-item-id>`). Fetch `wl show <work-item-id> --json`; pay attention to
-`description`, `acceptance criteria`, `comments`. Restate ACs/status; surface
-blockers/dependencies/missing requirements; inspect linked PRDs/plans/docs;
-confirm expected tests/validation.
+After the dirty-tree check passes, `implement.py start` inspects
+`git stash list` on the main checkout. Stashes that reference an open work
+item (e.g. `stash@{0}: On dev: WIP: partial SA-0XXXXXXX`) are matched and
+not flagged. Stashes with no work-item reference, or where the referenced
+work item is not in an open state, are reported as **orphaned**.
 
-3.1. Definition gate (must pass before implementation)
+- Orphaned stashes trigger a **WARNING** (not a hard error) — the gate is
+  fail-open. Run with `--allow-orphaned-stashes` to acknowledge and proceed.
+- Each orphaned stash should be triaged: restore-and-commit via a proper work
+  item if valuable, or delete if stale. See the recovery playbook below.
+- The hygiene check is also available as a periodic script:
+  `scripts/hygiene_check.sh` (run via cron, CI, or manually).
+
+**Example warning:**
+
+```
+⚠  Orphaned stash(es) detected
+============================================================
+WARNING: 1 orphaned stash(es) detected on the main checkout.
+
+Orphaned stashes:
+  - stash@{1}: On dev: WIP: forgotten experiment
+
+Triage these stashes (restore-and-commit via a proper work item, or delete if stale).
+Proceed anyway with --allow-orphaned-stashes.
+============================================================
+```
+
+4. Understand the work item
+
+The item is already claimed from Step 1. Fetch `wl show <work-item-id> --json`;
+pay attention to `description`, `acceptance criteria`, `comments`. Restate
+ACs/status; surface blockers/dependencies/missing requirements; inspect linked
+PRDs/plans/docs; confirm expected tests/validation.
+
+4.1. Definition gate (must pass before implementation)
 
 Verify: clear scope (in/out-of-scope); concrete, testable ACs; constraints and
 compatibility expectations; unknowns captured as explicit questions.
@@ -175,7 +235,49 @@ If the gate fails: (1) `StatusLifecycle.update_status(<work-item-id>, "open")`;
 (2) not well-defined → intake interview (`../intake/SKILL.md`); too large →
 plan interview (`/skill:plan`); (3) inform the user and ask whether to restart.
 
-4. Create a worktree from dev and branch inside it
+**Producer review:** When the agent cannot proceed because the work item is
+ill-defined (unclear scope, untestable ACs, missing constraints) and needs
+producer input to resolve, mark the work item as needing producer review:
+
+```bash
+wl reviewed <work-item-id> true
+```
+
+This flags the item so the producer knows the work item needs clarification
+before implementation can proceed. The agent should STOP and wait for the
+producer's response.
+
+4.2. Detect "already implemented" and close gaps (if applicable)
+
+Before creating a worktree, check whether the work item has **already been
+implemented** but is stuck in a wrong state/stage. Detection signals include:
+
+- The implement skill has previously reported the work as completed with a
+  commit hash (the skill's own output — not inferred from status alone).
+- The item's status/stage is inconsistent (e.g. `in_progress` with a commit
+  already on `dev`, or `completed` without `in_review`).
+- A recent audit report indicates prior completion but unmet ACs or gaps.
+
+If **any** detection signal applies:
+
+1. Run the audit to get a current picture:
+   `/skill:audit <work-item-id>` (reuse a recent audit if one exists from
+   the same session; the most recent audit report may predate later fixes).
+2. Review the audit report (`audit_report_<id>.md`) for gaps: unmet ACs,
+   failing tests, missed requirements.
+3. **If gaps exist:** fix them inline as part of the current item's
+   implementation — write tests, code, or docs as needed. Do **NOT** create
+   new work items for gaps (they are closed inline per the intake decision).
+   Large gaps that exceed the scope of minimal remediation → record as a
+   `discovered-from:<work-item-id>` work item instead.
+4. **If the audit is clean** (no gaps): report the summary and skip further
+   implementation — the item is done, just needs a status/stage update.
+   Proceed directly to Step 9 (Commit, Push to dev and mark in_review).
+
+If **no** detection signal applies (the item genuinely needs implementation):
+proceed to Step 5.
+
+5. Create a worktree from dev and branch inside it
 
 > **MANDATORY — worktree requirement:** All implementation work MUST be done
 > in a git worktree created from `dev` — never edit, commit, or push from the
@@ -192,18 +294,23 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > `<worktree>/node_modules -> <repo-root>/node_modules` when the main checkout
 > has one (SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** — writes pass through the symlink, corrupting the shared tree.
 
+> **Git submodules are auto-initialised:** `implement.py start` runs
+> ``git submodule update --init --recursive`` inside the new worktree (SA-0MSN52GGN002B0AZ).
+> Failures produce a ``WARNING`` log message but **do not abort** — the worktree
+> remains usable (best-effort). Repos without ``.gitmodules`` are unaffected.
+
 See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 
-5. Implement
+6. Implement
 
 - Open/in_progress blockers or dependencies → implement them first (recursively via this procedure).
 
-5.1. Parent recursion (epic/parent items only)
+6.1. Parent recursion (epic/parent items only)
 
 A parent invocation recurses into its children automatically. Run:
 
 ```bash
-python3 scripts/implement.py parent <parent-id>
+python3 $(skill_path implement)/scripts/implement.py parent <parent-id>
 ```
 
 (`implement.py parent` — orchestrated by `phase_parent()`):
@@ -211,7 +318,7 @@ python3 scripts/implement.py parent <parent-id>
 - **No children** → behaves like a leaf: use the standard `start`/`finish`
   workflow unchanged.
 - **All children terminal** (`in_review`/`completed`/`done`) → the parent is
-  advanced to `completed`/`in_review` (existing Step 5.1 advancement
+  advanced to `completed`/`in_review` (existing Step 6.1 advancement
   retained) and a per-child summary (ids, statuses) is commented.
 - **Children remain** → the next child is claimed (`in_progress`), its own
   worktree is created from `dev`, and the worktree path is reported.
@@ -249,29 +356,38 @@ parent itself gets no worktree.
   - External constraints prevent complete tests → harnesses/mocks/placeholders,
     documented; follow project style; comment on significant decisions.
   - Discovered additional work → `wl create "<title>" --deps discovered-from:<work-item-id> --json`
-- Once all ACs are met: **build** (no errors); **run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`)** — run → triage → evaluate → loop until green; report; fix failures. **This MUST be `/skill:test` (`./scripts/run_tests.py`), never an ad-hoc equivalent** (`npx vitest run`, `pytest`, …): only the test-skill runner records the run in the per-repo test cache (keyed by git state, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run at the same commit is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
+- Once all ACs are met: **build** (no errors); **validate via the [test skill](../test/SKILL.md) — the loop is scope-aware (SA-0MT6BYQHB008DOGC)**: `implement.py finish` first runs a **changed-scope** validation (only the tests affected by this change — fast iteration), then a **final full-suite gate** (`--scope full`) before commit, and the **pre-push hook enforces the full suite again on the push to `dev`**. `run_tests.py` execution must go through the test-skill runner (`/skill:test`, `run_tests.py --scope full`): only the test-skill runner records runs in the per-repo test cache (keyed by git state + scope, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run (`npx vitest run`, `pytest`, …) is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
 
-6. Automated self-review
+7. Automated self-review
 
 - Build and lint; fix any issues.
-- Audit: `/skill:audit <work-item-id>` — if ACs unmet, inform the user and return to step 5. The item is `in_progress` during implementation, so pass `--force` (the audit's pre-flight affirmation guard refuses to audit an in-progress item without it — see [../audit/SKILL.md](../audit/SKILL.md)).
-- Sequential passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff. Small, goal-aligned edits; intent changes → Open Question and stop.
+- Sequential passes: completeness, dependencies & safety, scope & regression,
+  tests & acceptance, polish & handoff. Small, goal-aligned edits; intent
+  changes → Open Question and stop.
 
-7. Optional refactor step
+8. Optional refactor step
 
 Before final commit, an automated refactor step may detect/remediate code smells (files modified this session; linters for mechanical issues + LLM for design smells). **Session-introduced smells fixed immediately; pre-existing smells create Worklog items with REFACTOR comments.** Skip with ``--no-refactor``:
 
 ```bash
-python3 ../refactor/scripts/refactor.py <work-item-id>
+python3 $(skill_path refactor)/scripts/refactor.py <work-item-id>
 ```
 
 See ``../refactor/SKILL.md``.
 
-8. Commit, Push to dev and mark in_review
+9. Commit, Push to dev and mark in_review
 
 - Follow the mandatory build → test → commit order before committing.
 - **Do NOT create a Pull Request to `main`** — work is integrated into `dev`; the `dev`→`main` promotion is handled by the release process.
-- Push the feature branch into `dev` via the ship skill (`pushToDev()` from `../ship/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
+- Push the feature branch into `dev` via the ship skill (`pushToDev()` from `$(skill_path ship)/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
+
+  > **Pushing from a worktree:** the repo's pre-push hook runs `wl sync`, which
+  > refuses to run from a worktree (worktrees have no local `.worklog`; the
+  > data lives in the main checkout). First run `wl sync` from the main
+  > checkout, then push from the worktree with the hook's documented bypass:
+  > `WORKLOG_SKIP_PRE_PUSH=1 git push origin HEAD:refs/heads/dev`. Nothing is
+  > lost by skipping the sync at push time — the main checkout syncs the data
+  > on its own pushes.
 - After pushing, clean up the worktree:
 
   ```bash
@@ -283,22 +399,49 @@ See ``../refactor/SKILL.md``.
 
   > **Why rebuild?** `dist/` is gitignored; `git pull` does not update it. See [[concepts/git-worktree-best-practices-for-agent-workflows]].
 - Add a work-item comment with the commit hash: `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
+
+  > **Ordering vs. audit persistence (SA-0MTHC710X003ORZM):** when closing an audited work item, do NOT add a post-audit comment *after* the audit has been persisted (`wl audit-set` / `persist_audit.py`). A `wl comment add` bumps `workItem.updatedAt` (via `touchWorkItemUpdatedAt()`); if that bump falls after `auditedAt` it can invalidate the runner's 60 s freshness gate and the TUI shows a stale icon (⏳) on a passed audit. Record any audit-result commentary **before** calling `persist_audit.py`, or rely on the persisted audit report itself as the record — the runner's `_apply_terminal_lifecycle` plus the audit skill's Persistence Procedure ordering contract already cover this (see the audit skill docs and `$(skill_path audit)/scripts/audit_runner.py:_check_audit_freshness` / `persist_audit.py:_run_audit_text_update`).
 - Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 
-  > **Parent/epic items already advanced at Step 5.1:** skip the status update.
+  > **Parent/epic items already advanced at Step 6.1:** skip the status update.
   > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
 
   > The item stays `in_review` until release promotes `dev` to `main` (see `../ship/SKILL.md`).
 
+- **Final validation — belt-and-suspenders (post-push, post-`in_review`):** run
+  the full test suite against the committed state and ensure all tests pass.
+  If any tests fail: create critical `test-failure` work items with the triage
+  helper, fix the failures, and re-run until green before closing the response.
+
+  ```bash
+  /skill:test
+  ```
+
+  - This runs the full suite (not just changed-scope) against the exact pushed
+    commit, catching any regression the pre-push gate missed.
+  - Failures → triage helper:
+    `python3 $(skill_path triage)/scripts/check_or_create.py
+    '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...",
+    "parent_work_item_id":"<this-work-item-id>"}'` → fix → re-run.
+  - All tests green → close your response.
+  - **Parent/epic runs:** parent/epic items are validated per child at each
+    child's Step 9; the parent itself is covered by the per-child test runs
+    at Step 6.1.
+
 Pre-push blocking check
 -----------------------
 
-Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`) and fix failures before pushing; outside scope → triage helper.
+Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`).
+If any tests fail: (1) create a critical `test-failure` work item with
+`python3 $(skill_path triage)/scripts/check_or_create.py
+'{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...",
+"parent_work_item_id":"<this-work-item-id>"}'`; (2) fix the failures; (3)
+re-run until green. Only then proceed to commit/push.
 
 Final cleanup (belt-and-suspenders)
 ---------------------------------------
 
-Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_progress` and work is incomplete (not at Step 8), reset via `StatusLifecycle.update_status(work_item_id, "open")` to prevent orphaned `in_progress` items blocking other agents.
+Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_progress` and work is incomplete (not at Step 9), reset via `StatusLifecycle.update_status(work_item_id, "open")` to prevent orphaned `in_progress` items blocking other agents.
 
 ## Status Transition Matrix
 
@@ -306,7 +449,7 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 |-------|-----------|--------|-------|
 | Claim (Step 1) | `update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` / `phase_start()` | in_progress | in_progress |
 | Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review")` | completed | in_review |
-| Final (Step 8) | `with StatusLifecycle(id, target_stage="in_review"):` / `phase_finish()` | completed | in_review |
+| Final (Step 9) | `with StatusLifecycle(id, target_stage="in_review"):` / `phase_finish()` | completed | in_review |
 | Abort (dirty/gate/user/error/termination) | `update_status(id, "open")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
 
 > **All abort/failure transitions reset to `open`.** Never leave a work item in `in_progress` unless actively implementing.
@@ -329,4 +472,101 @@ git push origin HEAD:refs/heads/dev   # ship.js pushToDev preferred
 python3 -c "from skill.shared.status_lifecycle import StatusLifecycle; StatusLifecycle.update_status('SA-0MPYMFZXO0004ZU4', 'completed', stage='in_review')"
 ```
 
-End.
+## Dirty main-checkout recovery playbook
+
+When `implement.py start` detects a dirty main checkout or orphaned stashes,
+follow this decision tree to resolve the issue **without touching the operator's**
+uncommitted changes without explicit permission.
+
+### Decision tree: dirty working tree
+
+```
+Dirty main checkout detected?
+│
+├─ Only .worklog/ changes?
+│  └─ YES → Safe to proceed. Carry forward.
+│
+└─ Other uncommitted changes?
+   │
+   ├─ Are they your own WIP from this session?
+   │  ├─ YES → Commit them to a temporary branch or stash (with permission),
+   │  │          then create a worktree. Never stash without asking.
+   │  └─ NO (someone else's) → STOP. Ask the operator.
+   │
+   └─ Do you know whose changes these are?
+      ├─ YES → Coordinate with the author: commit, revert, or reset.
+      └─ NO (stale/unidentified) → Report to operator; DO NOT delete or
+                                        stash without explicit permission.
+```
+
+### Decision tree: orphaned stashes
+
+```
+Orphaned stash detected (no matching open work item)?
+│
+├─ Stash message contains a work-item ID (SA-XXXXXXX)?
+│  ├─ YES → Check if that work item is in_review/completed:
+│  │         └─ YES (stale) → Delete: git stash drop stash@{N}
+│  │         └─ NO (in-progress elsewhere) → Leave it (another agent owns it)
+│  │
+│  └─ NO → Stash has no work-item reference:
+│         ├─ Can you reconstruct what's in it? (check reflog)
+│         │  ├─ YES → Restore: git stash apply stash@{N}, then create a
+│         │  │           work item and commit via a worktree.
+│         │  └─ NO → Flag for operator review; delete only with permission.
+│         └─ Is it clearly a forgotten experiment or test?
+│            └─ YES → Safe to delete after documenting in comments.
+│
+└─ Multiple orphaned stashes?
+   └─ Run: scripts/hygiene_check.sh --json for a structured report.
+```
+
+### Recovery examples
+
+**Restore an orphaned stash:**
+```bash
+git stash apply stash@{0}
+git stash drop stash@{0}
+```
+
+**Delete a confirmed-stale stash:**
+```bash
+git stash drop stash@{0}
+```
+
+**Periodic hygiene check:**
+```bash
+scripts/hygiene_check.sh
+cron: 0 */4 * * * cd /path/to/repo && scripts/hygiene_check.sh >> /var/log/hygiene.log 2>&1
+```
+
+### Key rules (always apply)
+
+1. **Never stash, commit, or revert** another user's changes without explicit
+   permission — this is the foundational invariant that caused the original
+   incident (SA-0MSALRZ3B006FPI5).
+2. **Never delete stashes** that reference an open work item — they may be
+   needed by another agent.
+3. **Always document** stash dispositions in work-item comments for audit trail.
+4. **Run `scripts/hygiene_check.sh`** periodically to catch issues early.
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

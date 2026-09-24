@@ -533,3 +533,59 @@ class TestHappyPath:
         assert "PW_PLAY" in log_content, (
             f"pw-play should be invoked for playback, got: {log_content}"
         )
+
+
+# ===================================================================
+# Timing wrapper (SA-0MTACU3CQ0085KVO)
+# ===================================================================
+
+
+class TestTimingWrapper:
+    """The Python wrapper (speak.py) wraps speak.sh in timing."""
+
+    WRAPPER_PATH = REPO_ROOT / "skill" / "speak" / "scripts" / "speak.py"
+
+    def test_wrapper_exists(self):
+        """AC2: The wrapper file exists next to speak.sh."""
+        assert self.WRAPPER_PATH.exists(), (
+            f"speak.py wrapper not found at {self.WRAPPER_PATH}"
+        )
+
+    def test_wrapper_emits_timing_report(self, mock_env):
+        """AC3: Wrapper emits a timing report on stderr after a run."""
+        result = subprocess.run(  # noqa: PLW1510
+            ["python3", str(self.WRAPPER_PATH), "Test via wrapper"],
+            capture_output=True, text=True, env=mock_env,
+        )
+        assert result.returncode == 0, (
+            f"Wrapper should pass through exit code 0, got {result.returncode}: "
+            f"stderr={result.stderr}"
+        )
+        timing = result.stderr
+        assert "Timing Report" in timing, (
+            f"Wrapper should emit a timing report on stderr, got: {timing[:300]}"
+        )
+
+    def test_wrapper_forwards_stream_clean_stdout(self, mock_env):
+        """--stream keeps stdout clean and stderr gets the report."""
+        result = subprocess.run(  # noqa: PLW1510
+            ["python3", str(self.WRAPPER_PATH), "--stream", "Hi"],
+            capture_output=True, text=True, env=mock_env,
+        )
+        assert result.returncode == 0
+        assert "Timing Report" in result.stderr
+
+    def test_wrapper_help_delegates(self, mock_env):
+        """--help delegates to speak.sh usage text."""
+        result = subprocess.run(  # noqa: PLW1510
+            ["python3", str(self.WRAPPER_PATH), "--help"],
+            capture_output=True, text=True, env=mock_env,
+        )
+        assert result.returncode == 0
+        assert "Usage" in (result.stdout + result.stderr)
+
+    def test_script_itself_not_modified(self):
+        """AC2: speak.sh itself is NOT modified — it contains no Timer refs."""
+        content = SCRIPT_PATH.read_text()
+        assert "timing" not in content.lower()
+        assert "hrtime" not in content.lower()

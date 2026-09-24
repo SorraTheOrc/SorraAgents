@@ -11,8 +11,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
-
-from skill.audit.scripts.audit_runner import (
+from audit.scripts.audit_runner import (
     _CHILDREN_CAP,
     _PI_MAX_RETRIES,
     _assemble_issue_report,
@@ -25,7 +24,7 @@ from skill.audit.scripts.audit_runner import (
     cmd_issue,
     cmd_project,
 )
-from skill.scripts.pi_utils import extract_pi_text
+from scripts.pi_utils import extract_pi_text
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,7 +119,7 @@ def _no_audit_slot(monkeypatch):
     tests/test_validate_fanout.py.
     """
     monkeypatch.setattr(
-        "skill.audit.scripts.audit_runner._acquire_audit_slot",
+        "audit.scripts.audit_runner._acquire_audit_slot",
         lambda *args, **kwargs: contextlib.nullcontext(),
     )
 
@@ -314,7 +313,7 @@ class TestCallPi:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         # Avoid real sleeping during tests
-        monkeypatch.setattr("skill.audit.scripts.audit_runner.time.sleep", lambda s: None)
+        monkeypatch.setattr("audit.scripts.audit_runner.time.sleep", lambda s: None)
 
         result = _call_pi("criterion", model="test/model")
         assert result["verdict"] == "met"
@@ -336,7 +335,7 @@ class TestCallPi:
             )
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
-        monkeypatch.setattr("skill.audit.scripts.audit_runner.time.sleep", lambda s: None)
+        monkeypatch.setattr("audit.scripts.audit_runner.time.sleep", lambda s: None)
 
         result = _call_pi("criterion", model="test/model")
         assert result["_provider_error"] is True
@@ -737,7 +736,7 @@ class TestCmdIssueWithPi:
             return {"verdict": "met", "evidence": "test.py:1 — covered"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -764,7 +763,7 @@ class TestCmdIssueWithPi:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -794,7 +793,7 @@ class TestCmdIssueWithPi:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -820,7 +819,7 @@ class TestCmdIssueWithPi:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -850,7 +849,7 @@ class TestCmdProjectWithPi:
             return {"verdict": "met", "evidence": "summary:0 — ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -897,7 +896,7 @@ class TestChildrenReview:
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -932,7 +931,7 @@ class TestChildrenReview:
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -959,7 +958,7 @@ class TestChildrenReview:
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1044,7 +1043,7 @@ class TestCmdIssueJsonMode:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1074,7 +1073,7 @@ class TestCmdIssueJsonMode:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1098,7 +1097,7 @@ class TestCmdIssueJsonMode:
             }
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1119,7 +1118,7 @@ class TestCmdIssueJsonMode:
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             fake_call_pi,
         )
 
@@ -1138,7 +1137,7 @@ class TestCmdProjectJsonMode:
 
     def test_json_output_has_expected_keys(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
@@ -1157,7 +1156,7 @@ class TestCmdProjectJsonMode:
 
     def test_default_mode_still_emits_markdown(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._call_pi",
+            "audit.scripts.audit_runner._call_pi",
             lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 

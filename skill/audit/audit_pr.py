@@ -20,10 +20,17 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from skill.scripts.pi_utils import extract_pi_text
+# Bootstrap: add skills root to sys.path for top-level package imports
+_SKILLS_ROOT = Path(__file__).resolve().parents[1]
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
+
+from scripts.pi_utils import extract_pi_text
 
 WL_ID_RE = re.compile(r"\b([A-Z]+-[0-9A-Z]+)\b")
 PR_URL_RE = re.compile(r"https?://github.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)")
@@ -185,7 +192,10 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
             f.write(f'DRY-RUN: would run `pi -p --mode json "/audit {wl_id}"` in {path}\n')
         return 0, log_path
 
-    cmd = ['pi', '-p', '--mode', 'json', f"/audit {wl_id}"]
+    # Add descriptive session-id for traceability (SA-0MSNYMKV7005P0H9).
+    short_uuid = uuid.uuid4().hex[:8]
+    session_id = f"audit-{wl_id}-entrypoint-{short_uuid}"
+    cmd = ['pi', '-p', '--mode', 'json', '--session-id', session_id, f"/audit {wl_id}"]
     try:
         proc = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=timeout)  # noqa: PLW1510
         # Parse JSON-stream output to extract plain text before writing to log

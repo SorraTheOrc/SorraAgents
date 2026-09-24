@@ -110,17 +110,26 @@ Startup static-context budget (bytes / tokens):
 
 ## Thresholds / regression gate
 
-`docs/dev/context-budget.thresholds.json` ships an example gate that fails a
-PR/CI run when the startup budget regresses above the pre-change baseline:
+`docs/dev/context-budget.thresholds.json` ships the committed regression gate
+(the approved startup budget, including the hygiene guidance added in
+SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 8192,
-  "project_agents": 1334,
-  "skills_prose": 3523,
-  "total": 13049
+  "global_agents": 8335,
+  "project_agents": 1723,
+  "skills_prose": 1694,
+  "total": 11752
 }
 ```
+
+> **Scope — what counts:** thresholds are measured with
+> `measure_context.py --include-hidden` (all 16 skills, including the 5 hidden
+> helpers that the pre-push gate audits). The visible-skills surface is
+> smaller (1,168 B prose, 11,226 B total excluding hidden helpers).
+> **Historical baseline (F1):** the pre-change table above (`24,375 B` total)
+> is preserved for reference; the committed gate has always tracked the
+> accepted budget, not that baseline — see F2/F4/F6 updates.
 
 Use it in CI as:
 
@@ -147,6 +156,22 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > This is a **~54% reduction** in startup static context (~13.1 KB saved per
 > session, well above the epic's ≥15% target). On-demand SKILL.md content also
 > dropped ~48% (F5: 135,798 → 70,919 B across the six largest skills).
+>
+> **Post-F6 hygiene bump (2026-08-24, SA-0MT4DFE8Y004J8SP / SA-0MT7VTFIA000EFG6):**
+> the stash-hygiene guidance added ~143 B to `AGENTS_GLOBAL.md` and ~389 B to
+> `AGENTS.md`. Thresholds were bumped to the new measured surface
+> (`global_agents 8335`, `project_agents 1723`, `skills_prose 1694` with
+> `--include-hidden` / `1168` visible, `total 11752` / `11226` visible) so
+> the gate remains green for the approved content. The measurement tool's
+> default repo-root was also corrected (`parents[2]` → `parents[3]`) so the
+> gate measures the repo root rather than the `skill/` directory.
+>
+> **Game/Gym scene parity section bump (2026-09-19, SA-0MU8HLU640065P42 /
+> SA-0MU8QC3PI0047OWE):** the "Game Scenes and Gym Scenes Parity" section
+> added ~816 B to `AGENTS.md` (`project_agents 2469` → `3285`; `total 13201` →
+> `14017`; `global_agents` and `skills_prose` unchanged). Thresholds were
+> regenerated to the new measured surface so the gate remains green for the
+> approved content.
 >
 > ### Enforcement (committed gate)
 >
@@ -175,3 +200,85 @@ the tool, update the table above, and update `context-budget.thresholds.json`
 to the new values. The regression gate should always reflect the **accepted**
 budget, so accidental regressions fail CI while approved reductions are
 pinned in place.
+
+## Rollout to all framework projects
+
+The context-budget pre-push gate (F6, SA-0MSLK7XNZ00366YY) is enforced in
+SorraAgents and all framework projects: ContextHub, dev-scripts, llm-manager,
+open_source_llm, and Tableau-Card-Engine. (ampa was retired 2026-08-20 and is
+out of scope.) Each project ships the v2 pre-push hook
+(`.githooks/pre-push`) with **worklog sync + context-budget gate + branch
+policy**, wired via `core.hooksPath=.githooks` (or equivalent), plus its own
+committed per-project thresholds file
+(`docs/dev/context-budget.thresholds.json`).
+
+### How the v2 gate works in a multi-project framework
+
+The gate is identical across projects; what differs per project is the
+**thresholds file** (each repo has its own `AGENTS.md`, `AGENTS_GLOBAL.md`, and
+skill set, so the measured startup surface differs). The hook:
+
+1. resolves `measure_context.py` from the **local** path
+   (`skill/context-audit/scripts/measure_context.py`) when present
+   (SorraAgents only), otherwise from the **global symlink**
+   (`~/.pi/agent/skills/context-audit/scripts/measure_context.py`) installed
+   by `install_pi.sh`;
+2. reads the project's **committed** thresholds file
+   (`docs/dev/context-budget.thresholds.json`);
+3. runs `measure_context.py --include-hidden --thresholds <file>` and fails
+   the push when any threshold is exceeded.
+
+### Global fallback path for measure_context.py
+
+Only SorraAgents ships `skill/context-audit/` in-repo. All other framework
+projects get the skill via `install_pi.sh`, which symlinks the whole skills
+tree to `~/.pi/agent/skills/`; the hook therefore falls back to
+`~/.pi/agent/skills/context-audit/scripts/measure_context.py` when the local
+path is absent. This keeps the gate working in any project whose machine has
+run `scripts/install_pi.sh`, and stays **fail-open** when the framework is
+entirely absent (old repos, fresh worktrees, machines without pi installed).
+
+### Per-project threshold generation workflow
+
+Each project's thresholds are generated from its own measurement (AC2,
+SA-0MT1WO815009KXUC):
+
+```bash
+# from the project root, using the installed global skill:
+python3 ~/.pi/agent/skills/context-audit/scripts/measure_context.py \
+    --include-hidden --generate-thresholds
+
+# or write the file directly (match the project docs layout):
+python3 ~/.pi/agent/skills/context-audit/scripts/measure_context.py \
+    --include-hidden --write-thresholds docs/dev/context-budget.thresholds.json
+```
+
+Commit the generated `docs/dev/context-budget.thresholds.json` with the hook
+installation. Re-generate (and update the file) only when the project's
+context surface changes intentionally.
+
+### New projects via install_pi.sh
+
+`scripts/install_pi.sh` (v2 hook wiring, SA-0MT1WUEIT006U1HC) automates the
+gate for **future** projects. When run inside a git project, it:
+
+1. copies the v2 `pre-push` hook from the source SorraAgents checkout into
+   the project's `.githooks/pre-push` (idempotent);
+2. sets `core.hooksPath=.githooks` if not already configured;
+3. verifies the global context-audit skill symlink path
+   (`~/.pi/agent/skills/context-audit/scripts/measure_context.py`);
+4. reminds the operator to generate and commit a per-project thresholds
+   file if one is missing.
+
+Bypass hook installation with `PI_SKIP_HOOK_INSTALL=1`.
+
+### Troubleshooting
+
+| Symptom | Cause / resolution |
+|---|---|
+| Gate never runs | `measure_context.py` unavailable locally and globally → hook is fail-open by design (old repos/worktrees/machines without pi). Run `scripts/install_pi.sh` to install the global skill. |
+| Push blocked by context budget | Startup surface exceeded committed thresholds. Re-run `measure_context.py --include-hidden --thresholds docs/dev/context-budget.thresholds.json` to see which component regressed; fix the regression, or (only for intentional, reviewed changes) regenerate thresholds per the workflow above. |
+| Need to bypass the gate | `CONTEXT_BUDGET_SKIP=1` bypasses the context-budget gate universally (not recommended; never use to ship a regression). |
+| Worklog sync not running | `WORKLOG_SKIP_PRE_PUSH=1` disables worklog sync (must not be set globally); `wl`/`worklog` binary missing also skips sync (pushing continues). |
+| Branch policy wrongly blocking | `BRANCH_POLICY_SKIP=1` bypasses the protected-branch check (not recommended). |
+| Hook not executing | Verify `git config core.hooksPath` returns `.githooks` in the project; ensure `.githooks/pre-push` is executable (`chmod +x`). |

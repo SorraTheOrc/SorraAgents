@@ -9,7 +9,7 @@ Provides:
 
 Usage:
 
-    from skill.refactor.smell_detection import detect_smells, load_rules
+    from refactor.smell_detection import detect_smells, load_rules
 
     rules = load_rules(".refactor.json")
     findings = detect_smells(
@@ -28,10 +28,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-from skill.code_review.scripts.linter_runner import (
+from code_review.scripts.linter_runner import (
     classify_finding as _classify_linter_finding,
 )
-from skill.code_review.scripts.linter_runner import (
+from code_review.scripts.linter_runner import (
     probe_linter,
     run_eslint,
     run_ruff,
@@ -246,6 +246,10 @@ def _run_single_linter(
     Checks whether the linter is available and whether any of the
     existing files match the linter's language, then runs the linter
     and returns normalized findings filtered to the session file set.
+
+    For ruff, explicitly excludes non-Python extensions to prevent
+    false-positive lint findings — ruff mis-parses TypeScript/JavaScript
+    as Python (see CG-0MSXL2L0T009CA3I: 627 false positives on .ts).
 
     Args:
         linter_name: The linter name (e.g. ``"ruff"``, ``"eslint"``).

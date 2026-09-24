@@ -133,7 +133,7 @@ def yaml_source() -> str:
 def _import_comment_injection():
     """Import the comment injection module; skip tests if not yet implemented."""
     try:
-        from skill.refactor import comment_injection
+        from refactor import comment_injection
         return comment_injection
     except (ImportError, ModuleNotFoundError) as exc:
         pytest.skip(f"Comment injection module not yet available: {exc}")

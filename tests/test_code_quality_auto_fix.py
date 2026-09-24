@@ -72,7 +72,7 @@ class TestRunRuffAutoFix:
 
     def test_ruff_fix_returns_dict(self):
         """run_ruff with fix=True should return a dict, not a list."""
-        from skill.code_review.scripts.linter_runner import run_ruff
+        from code_review.scripts.linter_runner import run_ruff
 
         runner = self._make_runner([])
         result = run_ruff(str(REPO_ROOT), runner=runner, fix=True)
@@ -83,18 +83,18 @@ class TestRunRuffAutoFix:
 
     def test_ruff_fix_detects_fixes_applied(self):
         """run_ruff with fix=True should report fixes_applied=True when issues found."""
-        from skill.code_review.scripts.linter_runner import run_ruff
+        from code_review.scripts.linter_runner import run_ruff
 
         runner = self._make_runner([])
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
-            with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
+        with patch("code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
+            with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
                 result = run_ruff(str(REPO_ROOT), runner=runner, fix=True)
 
         assert result["fixes_applied"] is True
 
     def test_ruff_fix_returns_empty_findings_after_fix(self):
         """run_ruff with fix=True should return remaining findings after re-scan."""
-        from skill.code_review.scripts.linter_runner import run_ruff
+        from code_review.scripts.linter_runner import run_ruff
 
         runner = self._make_runner([])
         result = run_ruff(str(REPO_ROOT), runner=runner, fix=True)
@@ -104,7 +104,7 @@ class TestRunRuffAutoFix:
 
     def test_ruff_no_fix_returns_dict(self):
         """run_ruff with fix=False should still return a dict."""
-        from skill.code_review.scripts.linter_runner import run_ruff
+        from code_review.scripts.linter_runner import run_ruff
 
         runner = self._make_runner([])
         result = run_ruff(str(REPO_ROOT), runner=runner, fix=False)
@@ -116,9 +116,9 @@ class TestRunRuffAutoFix:
 
     def test_ruff_fix_no_linter_available(self):
         """run_ruff should return empty when ruff is not available."""
-        from skill.code_review.scripts.linter_runner import run_ruff
+        from code_review.scripts.linter_runner import run_ruff
 
-        with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": False}):
+        with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": False}):
             result = run_ruff(str(REPO_ROOT), fix=True)
 
         assert result == {"findings": [], "fixes_applied": False}
@@ -160,11 +160,11 @@ class TestRunEslintAutoFix:
 
     def test_eslint_fix_returns_dict(self):
         """run_eslint with fix=True should return a dict."""
-        from skill.code_review.scripts.linter_runner import run_eslint
+        from code_review.scripts.linter_runner import run_eslint
 
         runner = self._make_runner()
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["typescript"]):  # noqa: SIM117
-            with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "eslint", "available": True}):
+        with patch("code_review.scripts.linter_runner.detect_languages", return_value=["typescript"]):  # noqa: SIM117
+            with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "eslint", "available": True}):
                 result = run_eslint(str(REPO_ROOT), runner=runner, fix=True)
 
         assert isinstance(result, dict)
@@ -173,20 +173,20 @@ class TestRunEslintAutoFix:
 
     def test_eslint_fix_detects_fixes_applied(self):
         """run_eslint with fix=True should report fixes_applied=True."""
-        from skill.code_review.scripts.linter_runner import run_eslint
+        from code_review.scripts.linter_runner import run_eslint
 
         runner = self._make_runner()
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["typescript"]):  # noqa: SIM117
-            with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "eslint", "available": True}):
+        with patch("code_review.scripts.linter_runner.detect_languages", return_value=["typescript"]):  # noqa: SIM117
+            with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "eslint", "available": True}):
                 result = run_eslint(str(REPO_ROOT), runner=runner, fix=True)
 
         assert result["fixes_applied"] is True
 
     def test_eslint_no_linter_available(self):
         """run_eslint should return empty when eslint is not available."""
-        from skill.code_review.scripts.linter_runner import run_eslint
+        from code_review.scripts.linter_runner import run_eslint
 
-        with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "eslint", "available": False}):
+        with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "eslint", "available": False}):
             result = run_eslint(str(REPO_ROOT), fix=True)
 
         assert result == {"findings": [], "fixes_applied": False}
@@ -216,11 +216,11 @@ class TestRunMarkdownlintAutoFix:
 
     def test_markdownlint_fix_returns_dict(self):
         """run_markdownlint with fix=True should return a dict."""
-        from skill.code_review.scripts.linter_runner import run_markdownlint
+        from code_review.scripts.linter_runner import run_markdownlint
 
         runner = self._make_runner()
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["markdown"]):  # noqa: SIM117
-            with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "markdownlint", "available": True}):
+        with patch("code_review.scripts.linter_runner.detect_languages", return_value=["markdown"]):  # noqa: SIM117
+            with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "markdownlint", "available": True}):
                 result = run_markdownlint(str(REPO_ROOT), runner=runner, fix=True)
 
         assert isinstance(result, dict)
@@ -229,9 +229,9 @@ class TestRunMarkdownlintAutoFix:
 
     def test_markdownlint_no_linter_available(self):
         """run_markdownlint should return empty when not available."""
-        from skill.code_review.scripts.linter_runner import run_markdownlint
+        from code_review.scripts.linter_runner import run_markdownlint
 
-        with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "markdownlint", "available": False}):
+        with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "markdownlint", "available": False}):
             result = run_markdownlint(str(REPO_ROOT), fix=True)
 
         assert result == {"findings": [], "fixes_applied": False}
@@ -263,11 +263,11 @@ class TestRunDotnetFormatAutoFix:
 
     def test_dotnet_format_fix_returns_dict(self):
         """run_dotnet_format with fix=True should return a dict."""
-        from skill.code_review.scripts.linter_runner import run_dotnet_format
+        from code_review.scripts.linter_runner import run_dotnet_format
 
         runner = self._make_runner()
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["csharp"]):  # noqa: SIM117
-            with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "dotnet-format", "available": True}):
+        with patch("code_review.scripts.linter_runner.detect_languages", return_value=["csharp"]):  # noqa: SIM117
+            with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "dotnet-format", "available": True}):
                 result = run_dotnet_format(str(REPO_ROOT), runner=runner, fix=True)
 
         assert isinstance(result, dict)
@@ -276,9 +276,9 @@ class TestRunDotnetFormatAutoFix:
 
     def test_dotnet_format_no_linter_available(self):
         """run_dotnet_format should return empty when not available."""
-        from skill.code_review.scripts.linter_runner import run_dotnet_format
+        from code_review.scripts.linter_runner import run_dotnet_format
 
-        with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "dotnet-format", "available": False}):
+        with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "dotnet-format", "available": False}):
             result = run_dotnet_format(str(REPO_ROOT), fix=True)
 
         assert result == {"findings": [], "fixes_applied": False}
@@ -294,17 +294,17 @@ class TestRunLintersForProjectAutoFix:
 
     def test_linters_for_project_with_fix_returns_fixes_applied(self):
         """run_linters_for_project with fix=True should aggregate fixes_applied."""
-        from skill.code_review.scripts.linter_runner import run_linters_for_project
+        from code_review.scripts.linter_runner import run_linters_for_project
 
         # Create a mock runner that always returns fix results
         def mock_runner(cmd):
             return _mock_result(returncode=0, stdout="")
 
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
-            with patch("skill.code_review.scripts.linter_runner.get_linters_for_language", return_value=["ruff"]):
-                with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
+        with patch("code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
+            with patch("code_review.scripts.linter_runner.get_linters_for_language", return_value=["ruff"]):
+                with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
                     # Patch run_ruff to return fix=True result
-                    with patch("skill.code_review.scripts.linter_runner.run_ruff", return_value={"findings": [], "fixes_applied": True}):
+                    with patch("code_review.scripts.linter_runner.run_ruff", return_value={"findings": [], "fixes_applied": True}):
                         result = run_linters_for_project(str(REPO_ROOT), runner=mock_runner, fix=True)
 
         assert "fixes_applied" in result
@@ -312,15 +312,15 @@ class TestRunLintersForProjectAutoFix:
 
     def test_linters_for_project_without_fix(self):
         """run_linters_for_project with fix=False should have fixes_applied=0."""
-        from skill.code_review.scripts.linter_runner import run_linters_for_project
+        from code_review.scripts.linter_runner import run_linters_for_project
 
         def mock_runner(cmd):
             return _mock_result(returncode=0, stdout="")
 
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
-            with patch("skill.code_review.scripts.linter_runner.get_linters_for_language", return_value=["ruff"]):
-                with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
-                    with patch("skill.code_review.scripts.linter_runner.run_ruff", return_value={"findings": [], "fixes_applied": False}):
+        with patch("code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
+            with patch("code_review.scripts.linter_runner.get_linters_for_language", return_value=["ruff"]):
+                with patch("code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
+                    with patch("code_review.scripts.linter_runner.run_ruff", return_value={"findings": [], "fixes_applied": False}):
                         result = run_linters_for_project(str(REPO_ROOT), runner=mock_runner, fix=False)
 
         assert result["fixes_applied"] == 0
@@ -336,7 +336,7 @@ class TestCodeQualityCLIFix:
 
     def test_cli_accepts_fix_flag(self):
         """The CLI parser should accept --fix flag."""
-        from skill.code_review.scripts.code_quality import build_parser
+        from code_review.scripts.code_quality import build_parser
 
         parser = build_parser()
         args = parser.parse_args(["--fix", "--path", str(REPO_ROOT)])
@@ -344,7 +344,7 @@ class TestCodeQualityCLIFix:
 
     def test_cli_without_fix_flag(self):
         """The CLI should default fix=False."""
-        from skill.code_review.scripts.code_quality import build_parser
+        from code_review.scripts.code_quality import build_parser
 
         parser = build_parser()
         args = parser.parse_args(["--path", str(REPO_ROOT)])
@@ -352,12 +352,12 @@ class TestCodeQualityCLIFix:
 
     def test_run_code_quality_returns_fixes_applied(self):
         """run_code_quality should include fixes_applied in result."""
-        from skill.code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.code_quality import run_code_quality
 
         def mock_runner(cmd):
             return _mock_result(returncode=0, stdout="")
 
-        with patch("skill.code_review.scripts.code_quality.run_linters_for_project", return_value={"languages": [], "linters": [], "total_findings": 0, "findings_by_severity": {}, "findings": [], "fixes_applied": 2}):
+        with patch("code_review.scripts.code_quality.run_linters_for_project", return_value={"languages": [], "linters": [], "total_findings": 0, "findings_by_severity": {}, "findings": [], "fixes_applied": 2}):
             result = run_code_quality(str(REPO_ROOT), fix=True, runner=mock_runner)
 
         assert "fixes_applied" in result
@@ -374,7 +374,7 @@ class TestCommitChanges:
 
     def test_commit_changes_no_changes(self):
         """_commit_changes should return False when no git changes exist."""
-        from skill.code_review.scripts.linter_runner import _commit_changes
+        from code_review.scripts.linter_runner import _commit_changes
 
         def mock_runner(cmd, cwd=None):
             return _mock_result(returncode=0, stdout="")  # No changes
@@ -384,7 +384,7 @@ class TestCommitChanges:
 
     def test_commit_changes_with_changes(self):
         """_commit_changes should return True and stage+commit when changes exist."""
-        from skill.code_review.scripts.linter_runner import _commit_changes
+        from code_review.scripts.linter_runner import _commit_changes
 
         call_count = [0]
 
@@ -410,7 +410,7 @@ class TestRunRuffCheck:
 
     def test_run_ruff_check_returns_findings_list(self):
         """_run_ruff_check should return a list of finding dicts."""
-        from skill.code_review.scripts.linter_runner import _run_ruff_check
+        from code_review.scripts.linter_runner import _run_ruff_check
 
         sample_findings = [
             {
@@ -432,7 +432,7 @@ class TestRunRuffCheck:
 
     def test_run_ruff_check_empty_on_no_issues(self):
         """_run_ruff_check should return empty list when no issues found."""
-        from skill.code_review.scripts.linter_runner import _run_ruff_check
+        from code_review.scripts.linter_runner import _run_ruff_check
 
         def mock_runner(cmd):
             return _mock_result(returncode=0, stdout="")

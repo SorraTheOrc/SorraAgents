@@ -166,15 +166,42 @@ class TestImplementPySafetyGateMessage:
 
     def test_script_never_executes_git_stash(self):
         """implement.py must never run `git stash` (no subprocess git call with
-        a stash subcommand)."""
+        a stash subcommand).
+
+        Exception: READ-ONLY inspection via ``git stash list`` is allowed —
+        it is the mechanism for the orphaned-stash warning gate
+        (SA-0MT4DFE8Y004J8SP, AC3) and cannot modify state. State-changing
+        stash commands (``git stash`` without subcommand, ``push``/``pop``/
+        ``apply``/``drop``/``clear``) remain forbidden.
+        """
         source = _implement_py_source()
+        dangerous = (("stash", "push"), ("stash", "pop"), ("stash", "apply"),
+                     ("stash", "drop"), ("stash", "clear"), ("stash", "save"))
         for line in source.splitlines():
-            if "stash" not in line.lower():
+            lower = line.lower()
+            if "stash" not in lower:
                 continue
-            # Only the guidance message text may mention stash — never a command.
-            assert "git" not in line or "Do NOT stash" in line or "never stash" in line, (
-                f"implement.py must never execute git stash; suspicious line: {line.strip()!r}"
-            )
+            # Guidance messages are not commands.
+            if "do not stash" in lower or "never stash" in lower:
+                continue
+            # Read-only inspection (git stash list) is allowed and required
+            # by the stash-hygiene gate.
+            if '"stash", "list"' in line or "'stash', 'list'" in line:
+                continue
+            # State-changing stash subcommands in a subprocess call are
+            # forbidden (push/pop/apply/drop/clear/save).
+            for cmd_word, sub in dangerous:
+                if f'"{cmd_word}", "{sub}"' in line or f"'{cmd_word}', '{sub}'" in line:
+                    raise AssertionError(
+                        f"implement.py must never execute a state-changing git stash; "
+                        f"suspicious line: {line.strip()!r}"
+                    )
+            # Reject bare "git stash" invocations (defaults to push).
+            if re.search(r"\bgit\s+stash(?:\s|$)", lower) and "list" not in lower:
+                raise AssertionError(
+                    f"implement.py must never execute git stash; "
+                    f"suspicious line: {line.strip()!r}"
+                )
 
 
 # ===========================================================================

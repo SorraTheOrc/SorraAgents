@@ -17,10 +17,15 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
   - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
+  - [skill/report/SKILL.md](skill/report/SKILL.md): the **report helper** — canonical end-of-session report format (Acceptance Criteria table, Meta-Data with ContextHub icons, Producer Actions, Notes, Conclusion) that every work-item skill renders as its final step.
 - plugins/: local agent framework plugins used by this repository.
-- docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
+- docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)). For setting up a new project: [skills-script-paths.md](docs/dev/skills-script-paths.md#initializing-a-new-project-global-install) (global skills install via `scripts/install_pi.sh` — project repos need no `skill/` and must not receive copies of skill scripts).
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
+
+## Agent Status Lifecycle (SA-0MTFTFUIH000UWM9)
+
+Agents must hold `status: in_progress` for the entire duration they are actively working on a work item (`actively worked => in_progress`). Releasing to `open` is only valid at a true handoff — completion, error/abort, or an open-ended session end with no in-session resume. Before any work-item mutation (create children, update description, wire deps, add comments) agents must hold the claim; after any in-session producer-approval resume they must re-claim first. The shared helper `skill/shared/status_lifecycle.py` enforces this via `StatusLifecycle.require_claimed(id)` (fail-closed `ClaimError` guard) and `StatusLifecycle.ensure_claimed`/`reclaim` (idempotent re-claim); `skill/plan/plan_helpers.py:plan_approval_gate --reclaim-if-open` adapts it for the plan approval gate. `StatusLifecycle` also manages worklog-dir resolution (`--worklog-dir` precedence: explicit > prefix-to-sibling scan > cwd chain) so lifecycle calls resolve the correct store regardless of caller cwd. See the StatusLifecycle sections in `skill/plan/SKILL.md`, `skill/implement/SKILL.md`, `skill/intake/SKILL.md`, `skill/audit/SKILL.md`, and `skill/effort-and-risk/SKILL.md`, and `docs/dev/worklog-sync.md`.
 
 ## Prerequisites
 
@@ -48,8 +53,13 @@ Test verification during releases (and repeated audits/implement loops) is
 routed through a per-repo cache so identical full-suite runs at the same git
 state are not re-executed: use
 `python3 skill/test/scripts/run_tests.py --json` (cached) and
-`--summary` (read-only query). See [`skill/test_cache.py`](skill/test_cache.py)
-and [`docs/dev/release-tests.md`](docs/dev/release-tests.md).
+`--summary` (read-only query). Typed profiles give fast feedback without losing
+the full-suite evidence contract: `--type unit|smoke` (or a project-defined
+type in `.pi/skills_extensions/test/extension.json`) runs a lighter profile,
+while only `--type full` (the default) populates the audit-accepted full-suite
+cache entry. See [`skill/test/SKILL.md`](skill/test/SKILL.md),
+[`skill/test_cache.py`](skill/test_cache.py) and
+[`docs/dev/release-tests.md`](docs/dev/release-tests.md).
 
 ### For Release Managers
 

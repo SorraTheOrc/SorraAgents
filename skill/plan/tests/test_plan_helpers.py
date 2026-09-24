@@ -2,7 +2,8 @@
 
 The plan skill's step 4 asks the user to approve a proposed feature plan.
 Approval is requested only when the work item's effort t-shirt size is
-Medium/Large/Extra Large ("scale") OR its risk level is Medium/High.
+Medium/Large/Extra Large ("scale") OR its risk level is High (Medium risk
+no longer triggers the gate on its own — dev commit a9d8b8b9).
 When effort is Extra Small/Small AND risk is Low, the plan proceeds
 directly to the automated review stages without an approval pause.
 
@@ -14,6 +15,17 @@ Related work item: SA-0MSHID94D009P0TL
 """
 
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+# The repo root must stay ahead of the skills root so top-level `plan`
+# resolves to the ROOT plan/ package (see tests/test_plan_package_resolution.py).
+# plan_helpers.py applies its own skills-root bootstrap internally, so only the
+# repo root is needed here.
+if str(REPO_ROOT) in sys.path:
+    sys.path.remove(str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
 import json
 from unittest.mock import patch
 
@@ -57,17 +69,24 @@ class TestShouldRequestPlanApproval:
         assert request is True
         assert effort in reason
 
-    @pytest.mark.parametrize(
-        "risk",
-        ["Medium", "High"],
-    )
-    def test_medium_or_high_risk_requests_approval(self, risk):
-        """Medium/High risk requests approval even with Extra Small effort."""
+    @pytest.mark.parametrize("risk", ["High"])
+    def test_high_risk_requests_approval(self, risk):
+        """High risk requests approval even with Extra Small effort."""
         request, reason = should_request_plan_approval(
             {"effort": "Extra Small", "risk": risk}
         )
         assert request is True
         assert risk in reason
+
+    def test_medium_risk_alone_no_longer_triggers_approval(self):
+        """Medium risk no longer triggers the gate by itself
+        (PLAN_APPROVAL_RISK is High-only since dev commit a9d8b8b9); a
+        small, Medium-risk item proceeds without an approval pause."""
+        request, reason = should_request_plan_approval(
+            {"effort": "Small", "risk": "Medium"}
+        )
+        assert request is False
+        assert reason == ""
 
     def test_high_effort_and_high_risk_lists_both_reasons(self):
         """The reason names both the scale and the risk that triggered the gate."""
@@ -295,3 +314,121 @@ class TestWlSubprocessWorklogFlags:
             result = plan_if_needed("SA-TEST")
         assert result["decision"] == "error"
         assert "could not fetch" in result["error"]
+
+
+# =========================================================================
+# 4. Claim invariant — approval gate reclaim (SA-0MTFTFUIH000UWM9)
+#
+# The AH-0MTFPDKDU006QUDC incident released to `open` at 12:08:51Z to pause
+# for producer approval and never re-claimed after 12:09:42Z approval,
+# leaving `open` while 3 children were created until 12:18:40Z — allowing
+# herdr downtime to dispatch a duplicate plan at 12:13:02Z. With
+# --reclaim-if-open the gate re-claims in_progress before any mutation.
+# =========================================================================
+
+
+class _SequenceRunner:
+    """Runner that returns a pre-defined sequence of _FakeResult payloads."""
+
+    def __init__(self, results: list):
+        self._results = list(results)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd):
+        self.calls.append(list(cmd))
+        assert self._results, "SequenceRunner exhausted"
+        return self._results.pop(0)
+
+
+def _show_payload(work_item: dict) -> str:
+    return json.dumps({"success": True, "workItem": work_item})
+
+
+def _update_payload() -> str:
+    return json.dumps({"success": True})
+
+
+class TestPlanApprovalReclaimInvariant:
+    """The approval gate re-claims in_progress before evaluation when requested."""
+
+    def test_reclaim_if_open_reclaims_open_before_gate(self):
+        """With reclaim_if_open=True and status open, gate re-claims before evaluating."""
+        runner = _SequenceRunner([
+            _FakeResult(_show_payload({"id": "X", "status": "open", "effort": "Extra Small", "risk": "Low"})),
+            _FakeResult(_update_payload()),
+            _FakeResult(_show_payload({"id": "X", "effort": "Extra Small", "risk": "Low"})),
+        ])
+        result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
+        assert result["request_approval"] is False
+        # Calls: 1) show for reclaim check, 2) update in-progress, 3) show for gate
+        assert len(runner.calls) == 3
+        assert "show" in runner.calls[0]
+        assert "update" in runner.calls[1]
+        assert "in-progress" in runner.calls[1]
+        assert "show" in runner.calls[2]
+
+    def test_reclaim_if_open_noop_when_already_in_progress(self):
+        """With reclaim_if_open=True and already in_progress, no update is issued."""
+        runner = _SequenceRunner([
+            _FakeResult(_show_payload({"id": "X", "status": "in-progress", "effort": "Extra Small", "risk": "Low"})),
+            _FakeResult(_show_payload({"id": "X", "effort": "Extra Small", "risk": "Low"})),
+        ])
+        result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
+        assert result["request_approval"] is False
+        assert len(runner.calls) == 2
+        assert all("update" not in c for c in runner.calls)
+
+    def test_without_reclaim_flag_does_not_reclaim(self):
+        """Without reclaim_if_open the gate never touches status — only shows."""
+        runner = _SequenceRunner([
+            _FakeResult(_show_payload({"id": "X", "effort": "Extra Small", "risk": "Low"})),
+        ])
+        result = plan_approval_gate("X", runner=runner)
+        assert result["request_approval"] is False
+        assert len(runner.calls) == 1
+        assert "update" not in runner.calls[0]
+
+    def test_reclaim_failure_is_best_effort_gate_still_evaluates(self):
+        """A failing reclaim (show error) does not abort the gate — it proceeds."""
+        runner = _SequenceRunner([
+            _FakeResult("{}", returncode=1, stderr="wl show failed"),
+            _FakeResult(_show_payload({"id": "X", "effort": "Large", "risk": "Low"})),
+        ])
+        result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
+        assert result["request_approval"] is True
+        assert "Large" in result["reason"]
+
+    def test_continuous_in_progress_from_approval_through_gate(self):
+        """End-to-end: open at approval → reclaim → gate + subsequent require_claimed."""
+        # Step 1: approval resume re-claims
+        gate_runner = _SequenceRunner([
+            _FakeResult(_show_payload({"id": "X", "status": "open", "effort": "Small", "risk": "Low"})),
+            _FakeResult(_update_payload()),
+            _FakeResult(_show_payload({"id": "X", "effort": "Small", "risk": "Low"})),
+        ])
+        gate = plan_approval_gate("X", runner=gate_runner, reclaim_if_open=True)
+        assert gate["request_approval"] is False
+        # Step 2: mutation guard would pass (verified via StatusLifecycle with shim)
+        from skill.plan.plan_helpers import _wl_reclaim
+
+        # After gate reclaim, a subsequent require_claimed == in_progress
+        verify_runner = _FakeResult(_show_payload({"id": "X", "status": "in-progress", "effort": "Small", "risk": "Low"}))
+
+        class _VerifyRunner:
+            def __call__(self, cmd):
+                return verify_runner
+
+        # _wl_reclaim is a no-op when already in_progress
+        assert _wl_reclaim("X", runner=_VerifyRunner()) is not None
+
+    def test_does_not_regress_existing_gate_behavior(self):
+        """Without the flag, gate semantics are byte-identical to before."""
+        for effort, risk, expected in [
+            ("Extra Small", "Low", False),
+            ("Large", "Low", True),
+            ("Extra Small", "High", True),
+        ]:
+            runner = _FakeWlShow({"id": "X", "effort": effort, "risk": risk})
+            result = plan_approval_gate("X", runner=runner)
+            assert result["request_approval"] is expected
+

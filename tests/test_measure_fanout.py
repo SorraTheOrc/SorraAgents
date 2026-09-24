@@ -139,7 +139,7 @@ def _run_classify(processes, monkeypatch):
     # installed the module falls back to psutil = None (see measure_fanout.py)
     # and monkeypatching it would crash. Skip instead of failing.
     pytest.importorskip("psutil")
-    import skill.shared.measure_fanout as mf
+    import shared.measure_fanout as mf
 
     monkeypatch.setattr(
         mf.psutil,
@@ -220,7 +220,7 @@ def test_classify_unknown_processes_ignored(monkeypatch):
 
 def test_classify_fallback_without_psutil(monkeypatch):
     """Without psutil, classification degrades to all-zero counts (no crash)."""
-    import skill.shared.measure_fanout as mf
+    import shared.measure_fanout as mf
 
     # Force the module's psutil-unavailable state regardless of the current
     # environment; the fallback branch must return empty counts, not raise.
@@ -238,7 +238,7 @@ def test_non_intrusive_no_side_effects(monkeypatch, tmp_path):
     """Running the script must not create files (except explicit --out)."""
     # Same psutil dependency as the classification tests above.
     pytest.importorskip("psutil")
-    import skill.shared.measure_fanout as mf
+    import shared.measure_fanout as mf
 
     monkeypatch.setattr(
         mf.psutil,

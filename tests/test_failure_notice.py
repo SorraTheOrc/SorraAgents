@@ -1,7 +1,7 @@
 """Unit tests for skill/scripts/failure_notice.py."""
 
 
-from skill.scripts.failure_notice import FailureNotice
+from scripts.failure_notice import FailureNotice
 
 
 class TestFailureNoticeConstruction:

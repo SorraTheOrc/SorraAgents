@@ -15,14 +15,28 @@ of 5 files, and attempt playback.
 Invoke the underlying bash script directly:
 
 ```bash
-./scripts/speak.sh "Text to convert to speech"
+$(skill_path speak)/scripts/speak.sh "Text to convert to speech"
 ```
 
 Or set the `TTS_API_URL` environment variable to use a different endpoint:
 
 ```bash
-TTS_API_URL="http://localhost:8000/v1/audio/speech" ./scripts/speak.sh "Hello"
+TTS_API_URL="http://localhost:8000/v1/audio/speech" $(skill_path speak)/scripts/speak.sh "Hello"
 ```
+
+### Timing wrapper (recommended)
+
+For a per-invocation timing report, call the Python wrapper instead of
+`speak.sh` directly (per SA-0MT319YGQ002E801 AC4 — shell scripts are not
+instrumented internally; callers wrap the call in timing):
+
+```bash
+python3 $(skill_path speak)/scripts/speak.py "Text to convert to speech"
+```
+
+The wrapper passes all arguments through unchanged and emits a timing report
+(step name, elapsed seconds, percentage, total) on **stderr**, keeping stdout
+clean for `--stream` mode.
 
 ## Arguments
 
@@ -98,23 +112,27 @@ A 60-second timeout is applied to the API call.
 ## Examples
 
 ```bash
-# Basic usage
-./scripts/speak.sh "Hello, world!"
+# Basic usage (with timing wrapper)
+python3 $(skill_path speak)/scripts/speak.py "Hello, world!"
+
+# Basic usage (direct — no timing report)
+$(skill_path speak)/scripts/speak.sh "Hello, world!"
 
 # Multi-word phrase
-./scripts/speak.sh 'The TTS system is now working.'
+$(skill_path speak)/scripts/speak.py 'The TTS system is now working.'
 
 # Stream raw audio to stdout (pipe over SSH to local player)
-./scripts/speak.sh --stream "Hello" | aplay
-ssh user@host "cd ~/.pi/agent/skills/speak && ./scripts/speak.sh --stream 'hi'" | aplay
+$(skill_path speak)/scripts/speak.py --stream "Hello" | aplay
+ssh user@host "$(skill_path speak)/scripts/speak.py --stream 'hi'" | aplay
 
 # Custom API endpoint
-TTS_API_URL="http://localhost:8000/v1/audio/speech" ./scripts/speak.sh "Test"
+TTS_API_URL="http://localhost:8000/v1/audio/speech" $(skill_path speak)/scripts/speak.py "Test"
 
 # Custom output directory
-SPEAK_DIR="/tmp/my-speech" ./scripts/speak.sh "Custom output"
+SPEAK_DIR="/tmp/my-speech" $(skill_path speak)/scripts/speak.py "Custom output"
 ```
 
 ## See Also
 
-- `./scripts/speak.sh` -- the underlying implementation script
+- `$(skill_path speak)/scripts/speak.sh` -- the underlying implementation script (not modified by the timing wrapper)
+- `$(skill_path speak)/scripts/speak.py` -- caller-side timing wrapper (SA-0MTACU3CQ0085KVO)

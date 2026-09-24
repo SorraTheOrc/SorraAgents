@@ -34,10 +34,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.audit.scripts.persist_audit import (
+from audit.scripts.persist_audit import (
     PERSIST_CONTENT_INVALID,
     persist_audit,
 )
+from audit.tests.wl_helpers import make_stateful_runner
 
 # The 43-char stub observed in the Phase 2 failure: the summary string passed
 # to ``wl audit-set`` when the ``wl update --audit-text`` replacement failed.
@@ -214,7 +215,10 @@ class TestFallbackNotice:
         audit_text_calls = [c for c in runner.calls if "--audit-text" in c]  # type: ignore[attr-defined]
         for call in audit_text_calls:
             assert call[1:3] == ["--worklog-dir", "/explicit/.worklog"]
-            assert "--stage" in call and "plan_complete" in call
+            # SA-0MTHC710X003ORZM: --stage must NOT be present on audit-text
+            # updates; the status/stage transition is handled by the runner's
+            # _apply_terminal_lifecycle (not persist_audit).
+            assert "--stage" not in call
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +256,7 @@ class TestBoundedReask:
 
     def _baseline_pi_calls(self, monkeypatch, capsys) -> int:
         """Run cmd_issue with a healthy persist; return the pi call count."""
-        from skill.audit.scripts import audit_runner as ar_module
+        from audit.scripts import audit_runner as ar_module
 
         calls: list[str] = []
 
@@ -286,13 +290,13 @@ class TestBoundedReask:
                     },
                 }))
             return _proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def test_reask_uses_at_most_one_additional_model_call(self, monkeypatch, capsys):
         """When the first persist attempt returns PERSIST_CONTENT_INVALID, the
         runner re-asks the model exactly once (bounded ≤1) and then persists
         successfully. The full audit pipeline is NOT re-run."""
-        from skill.audit.scripts import audit_runner as ar_module
+        from audit.scripts import audit_runner as ar_module
 
         baseline = self._baseline_pi_calls(monkeypatch, capsys)
         assert baseline >= 1
@@ -326,7 +330,7 @@ class TestBoundedReask:
 
     def test_no_reask_when_persist_succeeds(self, monkeypatch, capsys):
         """A healthy persist (rc 0) never triggers the re-ask."""
-        from skill.audit.scripts import audit_runner as ar_module
+        from audit.scripts import audit_runner as ar_module
 
         calls: list[str] = []
 
@@ -349,7 +353,7 @@ class TestBoundedReask:
     def test_run_succeeds_when_reask_cannot_recover(self, monkeypatch, capsys):
         """When the single re-ask also fails, the run still succeeds because
         persist_audit already persisted the fallback notice (usable content)."""
-        from skill.audit.scripts import audit_runner as ar_module
+        from audit.scripts import audit_runner as ar_module
 
         def unparseable_call_pi(prompt, model="x", pi_bin="x", **kwargs):
             # The re-ask gets a response that cannot be parsed as a verdict
@@ -385,7 +389,7 @@ class TestBoundedReask:
         evidence slice ((dict)[:200]) and no report was persisted; post-fix
         the evidence is normalized to a string everywhere.
         """
-        from skill.audit.scripts import audit_runner as ar_module
+        from audit.scripts import audit_runner as ar_module
 
         def fake_pi_and_maybe_log(issue_id, context, prompt, **kwargs):
             if context == "phase2_deep":

@@ -1,9 +1,20 @@
 ---
 name: refactor
-description: "Detect and fix code smells (linters + LLM); file work items for pre-existing smells. Use when asked to refactor."
+description: "Detect and fix code smells. EXECUTE immediately when no ID (full scan); /skill:refactor <id> for session only. Use when refactor."
 ---
 
 # Refactor
+
+## ⚠️ Agent instruction: run immediately, never ask
+
+**When invoked without a work-item ID** (`/skill:refactor` with no ID):
+→ Run `python3 $(skill_path refactor)/scripts/refactor.py` **immediately**.
+→ It performs a full project scan, auto-fixes, detects smells, and files work items.
+→ **Do NOT ask the user what to refactor, which files to target, or how to proceed.**
+→ Report results when done.
+
+**When invoked with a work-item ID** (`/skill:refactor <id>`):
+→ Run `python3 $(skill_path refactor)/scripts/refactor.py <id>` — session-only analysis.
 
 ## Overview
 
@@ -13,10 +24,16 @@ before the final commit) to identify and address code quality issues.
 
 ### Key Concepts
 
-- **Session boundary**: Only files modified in the current session are analyzed (git diff against parent branch)
-- **Hybrid detection**: Combines linter-based mechanical checks with LLM-based design/architectural analysis
-- **Auto-fix**: Auto-fixable linters (ruff, eslint) resolve mechanical issues in-place before detection
-- **Pre-existing smells**: Non-auto-fixable issues become Worklog work items with REFACTOR comments to prevent duplicates
+- **Full-project scan** (default, no work-item ID): All source files in the
+  project are analysed for lint errors and code smells.
+- **Session boundary** (with work-item ID): Only files modified in the
+  current session are analyzed (git diff against parent branch).
+- **Hybrid detection**: Combines linter-based mechanical checks with LLM-based
+  design/architectural analysis
+- **Auto-fix**: Auto-fixable linters (ruff, eslint) resolve mechanical issues
+  in-place before detection
+- **Pre-existing smells**: Non-auto-fixable issues become Worklog work items
+  with REFACTOR comments to prevent duplicates
 
 ### Architecture
 
@@ -35,10 +52,11 @@ refactor/
 
 ## When To Use
 
-- As a post-implementation quality check in the implement
-  workflow.
+- As a post-implementation quality check in the implement workflow.
 - Manually via `/refactor <work-item-id>` to run code smell analysis on
-  session changes.
+  session changes only.
+- Run **without** a work-item ID to do a complete scan of the entire project
+  looking for lint errors and refactor opportunities.
 - Integrated into CI/CD pipelines for automated code quality gates.
 
 ## Verification
@@ -73,8 +91,14 @@ never left in `in_progress` when the script exits.
 python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-linter] [--dry-run] [--json] [--parent-branch <branch>] [--config <path>]
 ```
 
+| Invocation | Scan scope | Status management |
+|---|---|---|
+| `refactor.py` (no args) | **Entire project** — every source file | None |
+| `refactor.py <work-item-id>` | Session changes only (git diff) | `StatusLifecycle` |
+| `refactor.py --dry-run` | **Entire project** (same as no args) | None |
+
 - If a `<work-item-id>` is provided and `--dry-run` is not set, the script will manage the work item's status using `StatusLifecycle`.
-- If no `<work-item-id>` is provided or `--dry-run` is set, the script runs without any work item status interaction.
+- If no `<work-item-id>` is provided or `--dry-run` is set, the script runs a full-project scan without any work item status interaction.
 
 ## Usage
 
@@ -84,7 +108,13 @@ python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-lint
 python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-linter] [--dry-run] [--json] [--parent-branch <branch>] [--config <path>]
 ```
 
-Agent invocation: `/refactor <work-item-id>`
+Agent invocation: `/refactor <work-item-id>` (session-only mode)
+or `/skill:refactor` with no ID for a full-project scan.
+
+| Invocation | Scan scope | Status management |
+|---|---|---|
+| `/skill:refactor` (no ID) | **Entire project** — every source file | None |
+| `/skill:refactor <work-item-id>` | Session changes only (git diff) | `StatusLifecycle` |
 
 ### Output
 
@@ -130,6 +160,7 @@ Example config (project root):
 | god_class | Class with too many responsibilities | LLM | High |
 | feature_envy | Method overly interested in another class | LLM | Medium |
 | shotgun_surgery | Single change requires many file modifications | LLM | Medium |
+| scene-gym divergence | Game scenes and Gym Scenes implementing different functionality — they must remain functionally equivalent; divergence indicates a bug in one or both implementations. Cross-references the [test-writing-guidelines.md](../shared/test-writing-guidelines.md) anti-patterns "Self-Referential Simulations" and "Duplicates of Existing Core Coverage" | Compare functionality between gym scene tests and their corresponding game scene tests (LLM review) | High |
 | inappropriate_intimacy | Classes that know too much about each other | LLM | Medium |
 
 ## REFACTOR Comments
@@ -158,3 +189,24 @@ Comment delimiters vary by file type — `#` for Python, `//` for JS/TS, `<!-- -
 
 - [Implement](../implement/SKILL.md) — Integrated refactor step
 - [Code Review](../code-review/SKILL.md) — Complementary code quality skill
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

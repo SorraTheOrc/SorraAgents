@@ -1,10 +1,9 @@
 import json
 
 import pytest
-
-from scripts.cleanup import cleanup_stale_remote_branches, lib, prune_local_branches
-from skill.cleanup.scripts import lib as skill_lib
-from skill.cleanup.scripts.inspect_current_branch import inspect_current_branch
+from cleanup.scripts import delete_remote_branches, lib, prune_local_branches
+from cleanup.scripts import lib as skill_lib
+from cleanup.scripts.inspect_current_branch import inspect_current_branch
 
 
 class DummyRunner:
@@ -47,7 +46,7 @@ def test_prune_local_branches_dry_run(tmp_path, monkeypatch):
     assert payload["dry_run"] is True
 
 
-def test_cleanup_stale_remote_branches_dry_run(tmp_path, monkeypatch):
+def test_delete_remote_branches_dry_run(tmp_path, monkeypatch):
     runner = DummyRunner(
         {
             "git remote show origin": lib.CommandResult([], 0, "HEAD branch: main", ""),
@@ -60,22 +59,23 @@ def test_cleanup_stale_remote_branches_dry_run(tmp_path, monkeypatch):
                 "origin/old\t2023-01-01 00:00:00 +0000\n",
                 "",
             ),
+            "git fetch origin --prune": lib.CommandResult([], 0, "", ""),
             "git merge-base --is-ancestor origin/old origin/main": lib.CommandResult(
                 [], 0, "", ""
             ),
         }
     )
-    monkeypatch.setattr(cleanup_stale_remote_branches, "lib", lib)
+    monkeypatch.setattr(delete_remote_branches, "lib", lib)
     monkeypatch.setattr(lib, "CommandRunner", lambda: runner)
     monkeypatch.setattr(lib, "ensure_tool_available", lambda tool: True)
 
     report_path = tmp_path / "remote.json"
-    exit_code = cleanup_stale_remote_branches.main(
+    exit_code = delete_remote_branches.main(
         ["--dry-run", "--days", "1", "--report", str(report_path)]
     )
     assert exit_code == 0
     payload = json.loads(report_path.read_text())
-    assert payload["operation"] == "cleanup_stale_remote_branches"
+    assert payload["operation"] == "delete_remote_branches"
     assert payload["dry_run"] is True
 
 
@@ -161,7 +161,7 @@ class TestSummarizeWorkItemParser:
 
     @staticmethod
     def _parse(branch: str) -> tuple[str, str]:
-        from skill.cleanup.scripts.summarize_branches import parse_work_item
+        from cleanup.scripts.summarize_branches import parse_work_item
 
         return parse_work_item(branch)
 

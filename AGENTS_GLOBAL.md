@@ -38,10 +38,13 @@ If you already have a current work-item id, continue using it; otherwise ask the
 
 **MANDATORY — worktree requirement:** all implementation MUST happen in the worktree created by `implement.py start <WIP-id>`; `cd` into `.worklog/worktrees/wl-<WIP-id>-<slug>` and make ALL changes there — never edit, commit, or push from the main checkout; `implement.py finish` refuses if it detects changes outside the worktree. See the [implement skill](/home/rgardler/.pi/agent/skills/implement/SKILL.md).
 
+> **Worktree hygiene:** run `scripts/hygiene_check.sh` periodically to detect orphaned stashes and dirty main checkouts; when `implement.py start` warns about orphaned stashes, triage them using the [recovery playbook](skill/implement/SKILL.md#dirty-main-checkout-recovery-playbook) — never stash or delete stashes without explicit operator permission.
+
 <!-- WORKFLOW: end -->
 
 ## CRITICAL RULES
 
+- **Write in UK English.** All written output must use UK English spelling (e.g. "colour" not "color", "organise" not "organize").
 - Use wl for ALL task tracking — never markdown TODOs or task lists.
 - Never write directly to `.worklog/worklog-data.jsonl`; use `wl` commands only.
 - A child may be closed independently; a parent only once all children closed, blockers resolved, ACs met, and a Producer approved.
@@ -57,6 +60,15 @@ If you already have a current work-item id, continue using it; otherwise ask the
 ## Important Rules
 
 - wl is the primary source of truth; only source code is more authoritative. Always use `--json` for programmatic use. New work items discovered during work → `wl create`: child if blocking (`--parent <current-id>`), else `discovered-from:<current-id>` in the description. Check `wl next` before asking what to work on.
+
+## Local skill extensions
+
+A project may augment a global skill from its repo via
+`.pi/skills_extensions/<skill>/`: optional `SKILL_PREFIX.md` /
+`SKILL_POSTFIX.md` (prose before the first / after the final step) and
+`extension.json` (machine-readable script data). Absence is a no-op;
+extensions are additive and cannot weaken safety/gating steps — see
+[docs/dev/skill-extensions.md](docs/dev/skill-extensions.md).
 
 ## Stage vs Status distinction
 
@@ -99,9 +111,7 @@ Skills with `disable-model-invocation: true` (internal helpers / always invoked 
 
 | Skill | How it is invoked | Purpose |
 |---|---|---|
-| `owner-inference` | triage's `check_or_create.py` | Infer owner for a failing test file |
 | `triage` | test skill's scripts (`check_or_create.py`) | Search/create critical `test-failure` work items |
 | `find-related` | `/skill:find-related <id>` | Discover related work for a work item |
 | `effort-and-risk` | `/skill:effort-and-risk <id>` (plan/implement) | Produce effort/risk estimates |
 | `speak` | `/skill:speak <text>` or `./scripts/speak.sh` | Generate audible speech from text |
-| `git-management` | `/skill:git-management` | Unified git feature-branch lifecycle management |

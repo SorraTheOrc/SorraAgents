@@ -39,13 +39,27 @@ by the autoplan decision logic).
 
 See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#workflow-for-ai-agents) for the claim-first pattern.
 
+**Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`; release to `open` only at true handoff.** No agent process may perform work-item mutations (create children, update description, wire deps, add completion comments) while `status: open`. Use `StatusLifecycle.require_claimed(<id>)` as a guard before any mutation, and `StatusLifecycle.ensure_claimed(<id>)` to re-claim on in-session resume.
+
 Claim with `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
 before starting, and always leave the item in a **valid terminal status**
 (`open`, `blocked`, or `completed`) when the skill ends — including on error:
 
 - **On completion:** `StatusLifecycle.update_status(<work-item-id>, "open", stage="plan_complete")`
-- **Pausing for producer input:** `StatusLifecycle.update_status(<work-item-id>, "open", needs_producer_review=True)` — released to `open`, flagged for producer triage.
+- **Pausing for producer input (handoff-only):** Release to `open` AND mark needs-producer-review **only when the session genuinely hands control back** for an open-ended wait with no in-session resume. Do **not** release when an in-session resume is expected (e.g. interactive approval pane — see Resume re-claim below). A downtime-dispatched run with no interactive approver that hits the approval gate must **hold `in_progress` or abort cleanly — never release to `open` mid-run** (the `open` window caused duplicate dispatch of AH-0MTFPDKDU006QUDC on 2026-08-30):
+  ```bash
+  wl reviewed <work-item-id> true
+  ```
+  (Alternatively: `StatusLifecycle.update_status(<work-item-id>, "open", needs_producer_review=True)`)
 - **On error/abort:** `StatusLifecycle.update_status(<work-item-id>, "open")` + a comment describing the failure.
+
+**Resume re-claim (in-session approval):** When a paused plan run resumes after producer approval **in the same session** (interactive pane), immediately re-claim before any work-bearing step (child creation, dep wiring, description/comment updates):
+  ```python
+  from shared.status_lifecycle import StatusLifecycle
+  StatusLifecycle.ensure_claimed(work_item_id)   # idempotent re-claim
+  StatusLifecycle.require_claimed(work_item_id)  # guard — fails closed if still open
+  ```
+  The item must be `in_progress` continuously from approval through completion — never `open` in that window.
 
 Never leave an item in `in_progress` when control returns to the operator — an orphaned `in_progress` item is invisible to `wl next` and blocks downstream work.
 
@@ -161,10 +175,42 @@ Review stages:
    vague criteria where intent is clear.
 6. **Polish & handoff review** — description clear, well formatted, actionable.
 
-After all six stages, output a summary of what each stage checked/found, then
-mark `plan_complete` (see skip path instructions above).
+After all six stages, run the AC coverage review:
+
+```python
+from skill.shared.tree_coverage import run_coverage_review
+review = run_coverage_review(<work-item-id>)
+```
+
+- If ``recommendation == "proceed"`` → mark `plan_complete`.
+- If ``recommendation == "auto_close"`` → close gaps, record comment, mark `plan_complete`.
+- If ``recommendation == "stop"`` → **do NOT mark `plan_complete`**; leave the item `open` with a comment describing conflicts.
+
+Then output a summary of what each stage checked/found.
 
 ## Process (must follow)
+
+0. Tree iteration (when children exist)
+
+   If the work item already has children, iterate the entire subtree **before** any other processing:
+
+   - Run `wl show <work-item-id> --children --json` to fetch existing children.
+   - Order children by dependency edges using `wl dep list <id> --json` (topological order, ties broken by listed order).
+   - For each child (in dependency order), recurse: if that child has its own children, process them first.
+   - Use the shared tree-coverage helper from `../shared/tree_coverage.py`:
+     ```bash
+     python3 ./tree_coverage.py run-coverage-review <work-item-id>
+     ```
+     Or import and call `run_coverage_review(<work-item-id>)` directly.
+   - If the coverage review returns `recommendation: "stop"` with unresolvable conflicts,
+     record the conflicts as a comment and **do not advance the stage** — leave the item `open`.
+   - If the coverage review returns `recommendation: "auto_close"`, apply the auto-closed gaps
+     and note them in a comment.
+   - If the coverage review returns `recommendation: "proceed"`, continue to Step 1.
+   - Idempotence: re-running must not create duplicate children or duplicate comments.
+
+   This step ensures every node in the tree has been planned/processed and that parent ACs
+   are collectively covered by their children.
 
 1. Evaluate whether planning is required (agent responsibility)
 
@@ -191,12 +237,20 @@ mark `plan_complete` (see skip path instructions above).
 
    In iterations (≤3 questions each), gather the minimum information for an actionable plan. Per feature capture: **Target outcome**, **Definition of done** (pass/fail checks + automated tests), **Constraints** (performance, compatibility, rollout, timeline), **Risky assumptions** (where a prototype is needed and what "success" means). Iterate until the breakdown is clear. Review existing Appendix entries first — don't re-ask answered questions.
 
+   **Producer review:** When the agent cannot proceed without producer input (clarifying questions unanswered, critical information missing), mark the work item as needing producer review. **Handoff-only:** only release to `open` when the session genuinely ends and waits for an open-ended producer reply; if the run will resume in-session (e.g. approval pane), **hold `in_progress`** or re-claim via `StatusLifecycle.ensure_claimed` immediately on resume before any mutation (see Status lifecycle). A downtime run with no interactive approver must hold or abort — never release to `open` mid-run:
+
+   ```bash
+   wl reviewed <work-item-id> true
+   ```
+
+   This flags the item so the producer knows attention is required. The agent should STOP and wait for the producer's response. Once answers are received, re-claim (`StatusLifecycle.ensure_claimed`) then continue the interview or proceed.
+
 4. Propose feature plan (agent responsibility + user confirmation)
 
    Produce a draft plan (guide: 3-12 features) where each feature includes: **Short Title** (≤7 words) | **Summary** (one sentence) | **Acceptance Criteria** (2-6 measurable bullets) | **Minimal Implementation** (2-6 bullets, smallest end-to-end slice) | **Prototype/Experiment** (optional; success thresholds) | **Dependencies** | **Deliverables**.
 
    - **Test-first ordering**: test/verification features before implementation features.
-   - **Approval gate**: run the approval-gate check first (see **Plan-approval gate**). When approval IS requested, state the reason explicitly and iterate until approved. When NOT warranted (effort Extra Small/Small AND risk Low), proceed directly to steps 5-6 without an approval pause.
+   - **Approval gate**: run the approval-gate check first (see **Plan-approval gate**). When approval IS requested, state the reason explicitly and iterate until approved. When NOT warranted (effort Extra Small/Small AND risk Low), proceed directly to steps 5-6 without an approval pause. **On any approval resume, re-claim first:** `StatusLifecycle.ensure_claimed(<id>)` + `StatusLifecycle.require_claimed(<id>)` before steps 5-7; downtime dispatch with no approver holds `in_progress` or aborts — never releases to `open`.
 
 5. Verify vertical slice phasing (agent responsibility)
 
@@ -215,8 +269,22 @@ mark `plan_complete` (see skip path instructions above).
    5. **Acceptance & testability review** — ACs pass/fail and testable.
    6. **Polish & handoff review** — plan copy-pasteable and easy to execute.
 
+   **AC coverage review (final step):**
+
+   After the six review stages, run the AC coverage review using the shared helper:
+
+   ```python
+   from skill.shared.tree_coverage import run_coverage_review
+   review = run_coverage_review(<work-item-id>)
+   ```
+
+   - If ``recommendation == "proceed"`` → all parent ACs are covered; continue to Step 7.
+   - If ``recommendation == "auto_close"`` → unambiguous gaps are identified; close them by adding the missing child ACs (where intent is clear), record a comment noting what was auto-closed.
+   - If ``recommendation == "stop"`` → unresolvable conflicts exist; **do NOT advance the stage**. Leave the item `open` with a comment describing the conflicts and which parent ACs are uncovered.
+
 7. Update work items (agent)
 
+   - **Guard (SA-0MTFTFUIH000UWM9):** before any mutation in this step, assert `StatusLifecycle.require_claimed(<work-item-id>)` — fails closed if the item is `open` (the 2026-08-30 gap left AH-0MTFPDKDU006QUDC `open` while creating 3 children). On in-session approval resume, `StatusLifecycle.ensure_claimed(<work-item-id>)` first.
    - **Test-first creation**: create test/verification items before implementation items.
    - Create child work items: `wl create --title "<Short Title>" --description "<Full description>" --parent <work-item-id> --priority P2 --stage intake_complete --json`
    - Add dependency edges: `wl dep add <DependentId> <PrereqId>`
@@ -277,3 +345,24 @@ Behavior:
 
 - Q: "Should feature X be behind a feature flag?" Answer (product): "Yes, gradual rollout". Final: yes.
 - Q: "Can we reuse library Y?" Answer (eng): "Partially; requires adapter." Research: reviewed `libs/y` and PR #88.
+
+
+## Final step: standardized end-of-session report
+
+Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../report/SKILL.md)) as the **last step**, replacing any ad-hoc end-of-session summary:
+
+```bash
+python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
+  --skill-name <skill_name> \
+  --headline "<1-3 sentence headline summary>" \
+  --ac "<AC# description>|<verification metric>|met" \
+  --ac "<...>|<...>|unmet" \
+  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--notes "<freeform context/caveats/assumptions>"] \
+  [--next-action <review|plan|implement|...>]
+```
+
+The script prints the rendered report to stdout — **paste it verbatim into
+your final response**, so the operator sees the report itself (not just the
+tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
+re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.

@@ -30,11 +30,18 @@ from pathlib import Path
 
 # Ensure the repo root is on sys.path so the shared status_lifecycle module
 # is importable when this script is executed directly from any cwd.
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.shared.status_lifecycle import resolve_worklog_flags
+from import_guard import guard_shared_import
+
+try:
+    from shared.status_lifecycle import resolve_worklog_flags
+except ModuleNotFoundError as _missing_shared:
+    guard_shared_import(_missing_shared.name)
 
 
 def _build_fallback_text(issue_id: str, ready: str) -> str:
@@ -479,29 +486,19 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     # own auditResult field (visible via wl show) must be set via wl update --audit-text
     # so that the Pi extension's audit column shows the green tick / verdict.
     #
-    # SAFETY: Fetch the current work item stage and pass it explicitly so that
-    # the `wl update` call never accidentally advances the stage. The
-    # verdict-driven status transition (completed/in_review on 'Ready to
-    # close: Yes', open/plan_complete on 'No') is applied by the audit
-    # runner's finally block after persistence completes — see
-    # skill/audit/SKILL.md "Status Lifecycle".
-    current_stage = ""
-    try:
-        fetch_cmd = [wl_bin, "show", issue_id, "--json"]
-        fetch_cmd[1:1] = _worklog_flags(fetch_cmd, worklog_dir)
-        fetch_proc = runner(fetch_cmd, check=False, text=True, capture_output=True)
-        if fetch_proc.returncode == 0:
-            fetch_data = json.loads(fetch_proc.stdout)
-            wi = fetch_data.get("workItem", {}) if isinstance(fetch_data, dict) else {}
-            current_stage = wi.get("stage", "") or ""
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass  # Best-effort; audit text persistence must not fail on fetch errors
+    # CRITICAL: Do NOT pass --stage on this update call.  The verdict-driven
+    # status transition (completed/in_review on 'Ready to close: Yes',
+    # open/plan_complete on 'No') is applied by the audit runner's
+    # _apply_terminal_lifecycle after persistence completes — see
+    # skill/audit/SKILL.md "Status Lifecycle".  Passing --stage causes wl
+    # update() to bump updatedAt on the work-item row.  If that bump pushes
+    # updatedAt past auditedAt + AUDIT_FRESHNESS_BUFFER (60 s), freshness
+    # checks (_audit_time_is_fresh / isAuditFresh) return false, causing
+    # passed audits to show a stale icon (SA-0MTHC710X003ORZM).
 
     def _run_audit_text_update(text: str):
         cmd = [wl_bin, "update", issue_id, "--audit-text", text]
         cmd[1:1] = _worklog_flags(cmd, worklog_dir)
-        if current_stage:
-            cmd.extend(["--stage", current_stage])
         cmd.append("--json")
         return runner(cmd, check=False, text=True, capture_output=True)
 

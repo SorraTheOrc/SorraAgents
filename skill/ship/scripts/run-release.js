@@ -11,9 +11,12 @@ import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
-import { checkAuditReadyToClose, getCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
+import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
+import { checkFinalValidation } from './check-final-validation.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
+import { sendReleaseNotification } from './discord-notify.js';
+import { Timer } from './timing.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -239,6 +242,49 @@ export function verifyReleaseMerge(version, options = {}) {
   };
 }
 
+// ── getDescendants ───────────────────────────────────────────────────────────
+
+/**
+ * Recursively resolve all descendant ids of a work item.
+ *
+ * Uses `wl show <id> --children --json` per node, bounded by a visited set so
+ * cycles terminate, and returns descendant ids excluding the root. The close
+ * step uses this to refuse closing a candidate whose `wl close --force` would
+ * sweep in descendants that are not themselves release candidates
+ * (SA-0MU2OY1N9000XL2H AC9/AC10).
+ *
+ * @param {string} itemId - Root work item id.
+ * @returns {string[]} Descendant ids (excluding `itemId`).
+ */
+export function getDescendants(itemId) {
+  const found = [];
+  const visited = new Set([itemId]);
+  const stack = [itemId];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let parsed = null;
+    try {
+      const output = execSync(`wl show ${current} --children --json`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      parsed = JSON.parse(output);
+    } catch (_err) {
+      continue;
+    }
+    const children = (parsed && parsed.children) || [];
+    for (const child of children) {
+      if (!child || !child.id || visited.has(child.id)) {
+        continue;
+      }
+      visited.add(child.id);
+      found.push(child.id);
+      stack.push(child.id);
+    }
+  }
+  return found;
+}
+
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
@@ -271,7 +317,10 @@ export function verifyReleaseMerge(version, options = {}) {
  *   check-audit-gate.js (real `wl list`).
  * @param {(itemId: string, reason: string) => void} [options.runCloseCommand] -
  *   Close-command runner; defaults to `wl close <id> --force --reason <r>`.
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}> }}
+ * @param {(itemId: string) => string[]} [options.getDescendantsFn] -
+ *   Descendant resolver (for candidate-set scoping); defaults to
+ *   {@link getDescendants}.
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -280,6 +329,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       `wl close ${itemId} --force --reason "${reason}" --json`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
+    getDescendantsFn = getDescendants,
   } = options;
 
   if (!version) {
@@ -290,6 +340,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: 0,
       skippedItems: [],
+      refusedCount: 0,
+      refusedItems: [],
     };
   }
 
@@ -307,6 +359,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: 0,
       skippedItems: [],
+      refusedCount: 0,
+      refusedItems: [],
     };
   }
 
@@ -334,8 +388,35 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     console.log('');
   }
 
-  if (toClose.length === 0) {
-    const message = `No work items to close (${skippedItems.length} skipped, needs producer review).`;
+  // Scope the close (SA-0MU2OY1N9000XL2H AC9/AC10): `wl close --force`
+  // recursively closes ALL descendants, so a candidate whose subtree contains
+  // a descendant that is not itself a close candidate must not be force-closed
+  // — it would close out-of-scope work. Such candidates are refused and
+  // reported (an explicit, reversible exclusion decision) instead.
+  const candidateIds = new Set(toClose.map((item) => item.id));
+  const refusedItems = [];
+  const closable = [];
+  for (const item of toClose) {
+    let descendants = [];
+    try {
+      descendants = getDescendantsFn(item.id) || [];
+    } catch (err) {
+      console.warn(`  ⚠ Could not resolve descendants for ${item.id}: ${err.message}`);
+      descendants = [];
+    }
+    const collateral = descendants.filter((id) => !candidateIds.has(id));
+    if (collateral.length > 0) {
+      const reason = `Refused: --force close would sweep descendant(s) outside the candidate set: ${collateral.join(', ')}`;
+      console.log(`  ○ ${item.title || item.id} (${item.id}) — ${reason}`);
+      refusedItems.push({ id: item.id, title: item.title, reason, collateral });
+    } else {
+      closable.push(item);
+    }
+  }
+
+  if (closable.length === 0) {
+    const message = `No work items to close (${skippedItems.length} skipped, needs producer review; `
+      + `${refusedItems.length} refused, collateral descendants outside candidate set).`;
     console.log(message);
     return {
       success: true,
@@ -344,16 +425,18 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: skippedItems.length,
       skippedItems,
+      refusedCount: refusedItems.length,
+      refusedItems,
     };
   }
 
-  console.log(`Closing ${toClose.length} work item(s)...`);
+  console.log(`Closing ${closable.length} work item(s)...`);
 
   let closedCount = 0;
   let errorCount = 0;
   const errors = [];
 
-  for (const item of toClose) {
+  for (const item of closable) {
     try {
       const reason = `Shipped in v${version}`;
       // --force: the audit gate (Step 2) already verified audit readiness for
@@ -383,6 +466,9 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   if (skippedItems.length > 0) {
     summary += ` ${skippedItems.length} item(s) skipped (needs producer review).`;
   }
+  if (refusedItems.length > 0) {
+    summary += ` ${refusedItems.length} item(s) refused (collateral descendants outside candidate set).`;
+  }
 
   console.log(`\n${summary}`);
 
@@ -395,6 +481,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     errorCount,
     skippedCount: skippedItems.length,
     skippedItems,
+    refusedCount: refusedItems.length,
+    refusedItems,
   };
 }
 
@@ -553,11 +641,13 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * 3. Check critical-priority items (gating, exit code 7)
  * 3.5. Check worklog refs (gating, exit code 8)
  * 3.6. Check producer-review status (gating, exit code 9)
+ * 3.7. Final validation sweep — ALL in_review items (gating, exit code 12)
  * 4. Find and execute the release script
  * 5. Parse PR URL from release script output
  * 6. Wait for PR merge (if not already merged with --force)
  * 7. Sync dev with main
  * 8. Verify the release merge landed on main (gating, exit code 11)
+ * 8.5. Post-release Discord notification (non-blocking)
  * 9. Close work items shipped in this release (non-blocking)
  *
  * @param {string[]} [cliArgs=[]] - Command-line arguments.
@@ -567,7 +657,7 @@ export async function runRelease(cliArgs = []) {
   const projectRoot = resolveProjectRoot();
   setCodeFreezeMarker(projectRoot);
   try {
-    return await runReleaseImpl(cliArgs);
+    return await runReleaseImpl(cliArgs, projectRoot);
   } finally {
     // Cleared on EVERY exit path: success, failure, abort, dry-run, and
     // gating failures (trap/finally-equivalent, contract WL-0MSBU4KMA004PKSR).
@@ -575,13 +665,34 @@ export async function runRelease(cliArgs = []) {
   }
 }
 
-async function runReleaseImpl(cliArgs = []) {
+async function runReleaseImpl(cliArgs = [], projectRoot) {
   const args = [...cliArgs];
   const skipChecks = args.includes('--skip-checks');
   const isDryRun = args.includes('--dry-run');
   const isForce = args.includes('--force');
 
+  // Timing instrumentation (SA-0MT319YGQ002E801): every major step is
+  // wrapped in a named Timer and the report is emitted on every exit path.
+  const rootTimer = new Timer('runRelease');
+  rootTimer.start();
+  const stepTimers = {};
+  const emitTimingReport = () => {
+    if (rootTimer.stop && !rootTimer.elapsedNs) rootTimer.stop();
+    console.error('\n' + rootTimer.render());
+  };
+  const startStep = (name) => {
+    const t = new Timer(name, rootTimer);
+    t.start();
+    stepTimers[name] = t;
+    return t;
+  };
+  const finish = (exitCode) => {
+    emitTimingReport();
+    return exitCode;
+  };
+
   // ── Step 1: Check for unmerged branches (gating step) ──────────────────
+  startStep('Step 1: unmerged branch check');
   if (!skipChecks) {
     const report = checkUnmergedBranches();
     if (report.hasUnmergedBranches) {
@@ -590,11 +701,13 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(report.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 3;
+      return finish(3);
     }
   }
+  stepTimers['Step 1: unmerged branch check'].stop();
 
   // ── Step 2: Check audit readiness (gating step) ────────────────────────
+  startStep('Step 2: audit readiness check');
   if (!skipChecks) {
     const auditReport = await checkAuditReadyToClose();
     if (auditReport.hasBlockingItems) {
@@ -603,11 +716,13 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(auditReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 6;
+      return finish(6);
     }
   }
+  stepTimers['Step 2: audit readiness check'].stop();
 
   // ── Step 3: Check critical-priority items (gating step) ────────────────
+  startStep('Step 3: critical items check');
   if (!skipChecks) {
     const criticalReport = checkCriticalItems();
     if (criticalReport.hasBlockingItems) {
@@ -616,11 +731,13 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(criticalReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 7;
+      return finish(7);
     }
   }
+  stepTimers['Step 3: critical items check'].stop();
 
   // ── Step 3.5: Check worklog refs (gating step) ─────────────────────────
+  startStep('Step 3.5: worklog refs check');
   if (!skipChecks) {
     const worklogReport = checkWorklogRefs();
     if (worklogReport.hasWorklogRefs) {
@@ -629,13 +746,18 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(worklogReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 8;
+      return finish(8);
     }
   }
+  stepTimers['Step 3.5: worklog refs check'].stop();
 
   // ── Step 3.6: Check producer-review status (gating step) ───────────────
+  startStep('Step 3.6: producer review check');
   if (!skipChecks) {
-    const items = getCandidateItems();
+    // Top-level candidates only: a child's producer review is covered by its
+    // parent's review, so children must not block the release
+    // (SA-0MSUT8GQP004WSYN AC3).
+    const items = getTopLevelCandidateItems();
     const producerReviewReport = checkProducerReviewStatus(items);
     if (producerReviewReport.hasBlockingItems) {
       console.error(
@@ -643,11 +765,34 @@ async function runReleaseImpl(cliArgs = []) {
       );
       console.error(producerReviewReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
-      return 9;
+      return finish(9);
     }
   }
+  stepTimers['Step 3.6: producer review check'].stop();
+
+  // ── Step 3.7: Final validation sweep (gating step) ─────────────────────
+  // Comprehensive sweep of ALL in_review items (top-level and children) for
+  // missing/stale/failing audits and producer-review flags
+  // (SA-0MTMSPKEX003JGIX). Missing/stale/transient audits are auto-remediated
+  // conservatively (re-run `audit_runner.py issue <id>`, re-check); genuine
+  // "not ready to close" verdicts block immediately. Unlike Steps 2 and 3.6
+  // this gate is NOT scoped to top-level items — child audit gaps block too.
+  startStep('Step 3.7: final validation check');
+  if (!skipChecks) {
+    const finalValidationReport = await checkFinalValidation();
+    if (finalValidationReport.hasBlockingItems) {
+      console.error(
+        '⚠️  Final-validation gate check failed — some in_review items have unresolved audit or producer-review issues:\n',
+      );
+      console.error(finalValidationReport.message);
+      console.error('\nTo bypass this check, re-run with --skip-checks.');
+      return finish(12);
+    }
+  }
+  stepTimers['Step 3.7: final validation check'].stop();
 
   // ── Step 4: Find the release script ───────────────────────────────────
+  startStep('Step 4: locate release script');
   let selectedScript = null;
   if (existsSync(SKILL_RELEASE_SCRIPT)) {
     selectedScript = SKILL_RELEASE_SCRIPT;
@@ -675,10 +820,12 @@ async function runReleaseImpl(cliArgs = []) {
     ].join('\n');
 
     console.error(msg);
-    return 2;
+    return finish(2);
   }
+  stepTimers['Step 4: locate release script'].stop();
 
   // ── Step 5: Execute the release script ─────────────────────────────────
+  startStep('Step 5: execute release script');
   console.log('Executing release script...\n');
 
   // Wrapper-only flags (e.g. --skip-checks) must not reach the merge script,
@@ -700,7 +847,7 @@ async function runReleaseImpl(cliArgs = []) {
       'and was terminated. The Code Freeze marker has been cleared. ' +
       'Check for partially-created branches/PRs/refs, then re-run the release.'
     );
-    return 10;
+    return finish(10);
   }
 
   const exitCode = child.status || 0;
@@ -713,34 +860,40 @@ async function runReleaseImpl(cliArgs = []) {
 
   if (exitCode !== 0) {
     console.error(`Release script exited with code ${exitCode}.`);
-    return exitCode;
+    return finish(exitCode);
   }
 
   // If dry-run, don't do post-release steps
   if (isDryRun) {
     console.log('\nDry-run complete. No post-release actions taken.');
-    return 0;
+    stepTimers['Step 5: execute release script'].stop();
+    return finish(0);
   }
+  stepTimers['Step 5: execute release script'].stop();
 
   // ── Step 6: Post-release - wait for PR merge and sync dev ──────────────
+  startStep('Step 6: wait for PR merge');
   const prUrl = parsePRUrl(stdout);
 
   if (prUrl && !isForce) {
     const mergeResult = waitForPRMerge(prUrl);
     if (!mergeResult.success) {
       console.error(`\n⚠️  ${mergeResult.message}`);
-      return 4;
+      return finish(4);
     }
   } else if (!prUrl) {
     console.log('\nNo PR URL detected in release output. Skipping PR merge wait.');
   }
+  stepTimers['Step 6: wait for PR merge'].stop();
 
   // ── Step 7: Sync dev with main ─────────────────────────────────────────
+  startStep('Step 7: sync dev with main');
   const syncResult = syncDevWithMain();
   if (!syncResult.success) {
     console.error(`\n⚠️  ${syncResult.message}`);
-    return 5;
+    return finish(5);
   }
+  stepTimers['Step 7: sync dev with main'].stop();
 
   // ── Step 8: Verify the release merge landed on main (gating) ───────────
   // Merge-verification guard (SA-0MSJ2XMQL006CVQS): only close work items
@@ -750,6 +903,7 @@ async function runReleaseImpl(cliArgs = []) {
   // step runs without a real dev→main merge.
   //
   // Read the released version from the git tag created by the release script
+  startStep('Step 8: verify release merge');
   let version = null;
   try {
     version = execSync('git describe --tags --abbrev=0', {
@@ -776,17 +930,35 @@ async function runReleaseImpl(cliArgs = []) {
     if (!mergeVerification.success) {
       console.error(`\n⚠️  ${mergeVerification.message}`);
       console.error('Refusing to close work items (exit code 11).');
-      return 11;
+      return finish(11);
     }
+    stepTimers['Step 8: verify release merge'].stop();
+
+    // ── Step 8.5: Post-release Discord notification (non-blocking) ────────
+    // Send release details + changelog to the configured Discord channel
+    // (SA-0MSQ6K7Z1002H14Z). Runs only after the release merge is verified
+    // (never on --dry-run or failed releases). Notification failures are
+    // logged as warnings and never change the release exit code.
+    startStep('Step 8.5: discord notification');
+    try {
+      await sendReleaseNotification({ version, prUrl, projectRoot });
+    } catch (err) {
+      console.warn(`\n⚠ Discord notification step failed: ${err.message} (non-blocking).`);
+    }
+    stepTimers['Step 8.5: discord notification'].stop();
 
     // ── Step 9: Close work items shipped in this release (non-blocking) ──
+    startStep('Step 9: close work items');
     const closeResult = closeWorkItemsAfterRelease(version);
     if (!closeResult.success && closeResult.errorCount > 0) {
       console.warn(`\n⚠ Non-critical: ${closeResult.message}`);
     }
+    stepTimers['Step 9: close work items'].stop();
+  } else {
+    stepTimers['Step 8: verify release merge'].stop();
   }
 
-  return 0;
+  return finish(0);
 }
 
 // ── CLI Entry Point ──────────────────────────────────────────────────────────

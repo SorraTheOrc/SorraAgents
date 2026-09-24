@@ -16,9 +16,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.append(str(_SKILLS_ROOT))
 
-from skill.shared import status_lifecycle as status_lifecycle_module
-from skill.shared.status_lifecycle import StatusLifecycle
+from shared import status_lifecycle as status_lifecycle_module
+from shared.status_lifecycle import ClaimError, StatusLifecycle
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -38,13 +41,13 @@ def mock_run():
     ``skill/shared/tests/test_shared_worklog_resolution.py``.
     """
     with (
-        mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+        mock.patch("shared.status_lifecycle.subprocess.run") as m,
         mock.patch(
-            "skill.shared.status_lifecycle.worklog_dir_flag",
+            "shared.status_lifecycle.worklog_dir_flag",
             return_value=[],
         ),
         mock.patch(
-            "skill.shared.status_lifecycle._find_worklog_dir_by_prefix",
+            "shared.status_lifecycle._find_worklog_dir_by_prefix",
             return_value=None,
         ),
     ):
@@ -72,7 +75,7 @@ def _make_wl_show_proc(status: str = "open", stage: str = "idea"):
 def _make_wl_update_proc():
     """Build a mock CompletedProcess for a successful ``wl update``."""
     return subprocess.CompletedProcess(
-        args=["wl", "update", "TEST-123", "--status", "in_progress", "--json"],
+        args=["wl", "update", "TEST-123", "--status", "in-progress", "--json"],
         returncode=0,
         stdout=json.dumps({"success": True}),
         stderr="",
@@ -82,7 +85,7 @@ def _make_wl_update_proc():
 def _make_wl_failure_proc(returncode: int = 1, stderr: str = "error", stdout: str = ""):
     """Build a mock CompletedProcess for a failed ``wl`` command."""
     return subprocess.CompletedProcess(
-        args=["wl", "update", "TEST-123", "--status", "in_progress", "--json"],
+        args=["wl", "update", "TEST-123", "--status", "in-progress", "--json"],
         returncode=returncode,
         stdout=stdout,
         stderr=stderr,
@@ -113,7 +116,7 @@ class TestStatusLifecycleUnit:
         assert mock_run.call_count == 3
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[0] == ["wl", "show", "TEST-123", "--json"]
-        assert calls[1] == ["wl", "update", "TEST-123", "--status", "in_progress", "--json"]
+        assert calls[1] == ["wl", "update", "TEST-123", "--status", "in-progress", "--json"]
         assert calls[2] == ["wl", "update", "TEST-123", "--status", "completed", "--json"]
 
     def test_failure_lifecycle_restores_original(self, mock_run):
@@ -135,10 +138,10 @@ class TestStatusLifecycleUnit:
         assert "--assignee" not in calls[2]
 
     def test_idempotent_already_in_progress(self, mock_run):
-        """Idempotent: already in_progress → still works (no unnecessary update)."""
+        """Idempotent: already in-progress → still works (no unnecessary update)."""
         mock_run.side_effect = [
-            _make_wl_show_proc(status="in_progress"),  # already in_progress
-            _make_wl_update_proc(),                      # set in_progress (no-op)
+            _make_wl_show_proc(status="in-progress"),  # already in-progress
+            _make_wl_update_proc(),                      # set in-progress (no-op)
             _make_wl_update_proc(),                      # set completed
         ]
 
@@ -147,8 +150,8 @@ class TestStatusLifecycleUnit:
 
         assert mock_run.call_count == 3
         calls = [c.args[0] for c in mock_run.call_args_list]
-        # Still calls update in_progress (harmless) and then completed
-        assert "in_progress" in calls[1]
+        # Still calls update in-progress (harmless) and then completed
+        assert "in-progress" in calls[1]
         assert calls[2] == ["wl", "update", "TEST-123", "--status", "completed", "--json"]
 
     def test_stage_advancement_on_success(self, mock_run):
@@ -180,7 +183,7 @@ class TestStatusLifecycleUnit:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         # Entry sets assignee
-        assert calls[1][:5] == ["wl", "update", "TEST-123", "--status", "in_progress"]
+        assert calls[1][:5] == ["wl", "update", "TEST-123", "--status", "in-progress"]
         assert "--assignee" in calls[1]
         assert "bot" in calls[1]
         # Exit is completed without assignee
@@ -286,7 +289,7 @@ class TestStatusLifecycleUnit:
         assert mock_run.call_count == 3
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[0] == ["wl", "show", "TEST-123", "--json"]
-        assert calls[1] == ["wl", "update", "TEST-123", "--status", "in_progress", "--json"]
+        assert calls[1] == ["wl", "update", "TEST-123", "--status", "in-progress", "--json"]
         # Restored, NOT advanced to completed
         assert calls[2] == ["wl", "update", "TEST-123", "--status", "open", "--json"]
 
@@ -321,8 +324,8 @@ class TestStatusLifecycleUnit:
         assert "--stage" not in calls[2], (
             f"restore_on_exit must not touch stage: {calls[2]}"
         )
-        # Still sets in_progress on entry, restores original on exit
-        assert "in_progress" in calls[1]
+        # Still sets in-progress on entry, restores original on exit
+        assert "in-progress" in calls[1]
         assert calls[2] == ["wl", "update", "TEST-123", "--status", "open", "--json"]
 
     # ------------------------------------------------------------------
@@ -348,7 +351,7 @@ class TestStatusLifecycleUnit:
         ]
 
         with pytest.raises(RuntimeError, match="Worklog system is not initialized"):
-            StatusLifecycle.update_status("TEST-123", "in_progress")
+            StatusLifecycle.update_status("TEST-123", "in-progress")
 
     def test_error_detail_prefers_stdout_error_over_stderr(self, mock_run):
         """stdout JSON error detail takes precedence over stderr text."""
@@ -361,7 +364,7 @@ class TestStatusLifecycleUnit:
         ]
 
         with pytest.raises(RuntimeError, match="stdout error detail"):
-            StatusLifecycle.update_status("TEST-123", "in_progress")
+            StatusLifecycle.update_status("TEST-123", "in-progress")
 
     def test_error_detail_falls_back_to_stderr(self, mock_run):
         """When stdout is empty, stderr detail is used."""
@@ -370,7 +373,7 @@ class TestStatusLifecycleUnit:
         ]
 
         with pytest.raises(RuntimeError, match="stderr detail"):
-            StatusLifecycle.update_status("TEST-123", "in_progress")
+            StatusLifecycle.update_status("TEST-123", "in-progress")
 
     def test_error_detail_includes_plain_stdout(self, mock_run):
         """Non-JSON stdout is included verbatim as fallback detail."""
@@ -379,7 +382,7 @@ class TestStatusLifecycleUnit:
         ]
 
         with pytest.raises(RuntimeError, match="something went wrong"):
-            StatusLifecycle.update_status("TEST-123", "in_progress")
+            StatusLifecycle.update_status("TEST-123", "in-progress")
 
     # ------------------------------------------------------------------
     # worklog-dir injection (cwd-independent wl invocation)
@@ -388,12 +391,12 @@ class TestStatusLifecycleUnit:
     def test_worklog_dir_flag_injected_when_detected(self, mock_run):
         """When a worklog dir is resolved, --worklog-dir is injected after wl."""
         with mock.patch(
-            "skill.shared.status_lifecycle.worklog_dir_flag",
+            "shared.status_lifecycle.worklog_dir_flag",
             return_value=["--worklog-dir", "/fake/proj/.worklog"],
         ):
             mock_run.side_effect = [_make_wl_update_proc()]
 
-            StatusLifecycle.update_status("TEST-123", "in_progress")
+            StatusLifecycle.update_status("TEST-123", "in-progress")
 
             calls = [c.args[0] for c in mock_run.call_args_list]
             assert calls[0][:4] == [
@@ -404,15 +407,161 @@ class TestStatusLifecycleUnit:
     def test_no_flag_when_cwd_is_worklog_root(self, mock_run):
         """When cwd is already a worklog root, no flag is injected."""
         with mock.patch(
-            "skill.shared.status_lifecycle.worklog_dir_flag",
+            "shared.status_lifecycle.worklog_dir_flag",
             return_value=[],
         ):
             mock_run.side_effect = [_make_wl_update_proc()]
 
-            StatusLifecycle.update_status("TEST-123", "in_progress")
+            StatusLifecycle.update_status("TEST-123", "in-progress")
 
             calls = [c.args[0] for c in mock_run.call_args_list]
-            assert calls[0] == ["wl", "update", "TEST-123", "--status", "in_progress", "--json"]
+            assert calls[0] == ["wl", "update", "TEST-123", "--status", "in-progress", "--json"]
+
+    # ------------------------------------------------------------------
+    # Claim invariant (SA-0MTFTFUIH000UWM9): require_claimed / ensure_claimed
+    # ------------------------------------------------------------------
+
+    def test_require_claimed_passes_when_in_progress(self, mock_run):
+        """require_claimed returns the show payload when status is in-progress (hyphenated)."""
+        mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
+        data = StatusLifecycle.require_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in-progress"
+        assert mock_run.call_count == 1
+        assert mock_run.call_args_list[0].args[0] == ["wl", "show", "TEST-123", "--json"]
+
+    def test_require_claimed_raises_claim_error_when_open(self, mock_run):
+        """require_claimed raises ClaimError (subclass of RuntimeError) when open."""
+        mock_run.side_effect = [_make_wl_show_proc(status="open")]
+        with pytest.raises(ClaimError, match="must be in-progress"):
+            StatusLifecycle.require_claimed("TEST-123")
+        # Legacy handlers catching RuntimeError must still catch ClaimError
+        mock_run.side_effect = [_make_wl_show_proc(status="open")]
+        with pytest.raises(RuntimeError, match="must be in-progress"):
+            StatusLifecycle.require_claimed("TEST-123")
+
+    def test_require_claimed_uses_runner(self, mock_run):
+        """require_claimed honors an injected runner."""
+        seen: list[list[str]] = []
+
+        def runner(cmd: list[str]):
+            seen.append(cmd)
+            return _make_wl_show_proc(status="in-progress")
+
+        StatusLifecycle.require_claimed("TEST-123", runner=runner)
+        assert seen[0][0] == "wl"
+
+    def test_ensure_claimed_noop_when_in_progress(self, mock_run):
+        """ensure_claimed is a no-op (show only) when already in-progress (hyphenated)."""
+        mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
+        data = StatusLifecycle.ensure_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in-progress"
+        assert mock_run.call_count == 1
+
+    def test_ensure_claimed_reclaims_when_open(self, mock_run):
+        """ensure_claimed reclaims via wl update when status is open."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+        ]
+        StatusLifecycle.ensure_claimed("TEST-123")
+        assert mock_run.call_count == 2
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0] == ["wl", "show", "TEST-123", "--json"]
+        assert calls[1][:5] == ["wl", "update", "TEST-123", "--status", "in-progress"]
+
+    def test_ensure_claimed_propagates_assignee_on_reclaim(self, mock_run):
+        """ensure_claimed passes assignee through to wl update when reclaiming."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+        ]
+        StatusLifecycle.ensure_claimed("TEST-123", assignee="bot")
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert "--assignee" in calls[1]
+        assert "bot" in calls[1]
+
+    def test_reclaim_alias_is_idempotent(self, mock_run):
+        """reclaim() is an alias for ensure_claimed with identical behavior."""
+        mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
+        data = StatusLifecycle.reclaim("TEST-123")
+        assert data["workItem"]["status"] == "in-progress"
+        assert mock_run.call_count == 1
+
+    # ------------------------------------------------------------------
+    # Hyphen vs underscore distinction (SA-0MTYMFLZD004O2VV)
+    # ------------------------------------------------------------------
+
+    def test_require_claimed_passes_with_hyphenated_status(self, mock_run):
+        """require_claimed must pass when wl returns 'in-progress' (hyphen).
+
+        The wl CLI normalises underscore → hyphen on write and returns
+        'in-progress' in JSON. Before the fix, the guard compared against
+        'in_progress' (underscore) and always raised ClaimError.
+        """
+        mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
+        data = StatusLifecycle.require_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in-progress"
+        assert mock_run.call_count == 1
+
+    def test_require_claimed_fails_with_underscore_does_not_pass(self, mock_run):
+        """require_claimed raises when the stored status is the underscore variant.
+
+        The underscore variant never occurs in wl output (wl normalises to
+        hyphen), but if it ever did, it should fail the guard — proving the
+        guard is strict, not permissive.
+        """
+        mock_run.side_effect = [_make_wl_show_proc(status="in_progress")]
+        with pytest.raises(ClaimError, match="must be in-progress"):
+            StatusLifecycle.require_claimed("TEST-123")
+
+    def test_ensure_claimed_noop_with_hyphenated_status(self, mock_run):
+        """ensure_claimed must be a no-op when wl returns 'in-progress' (hyphen).
+
+        Before the fix, ensure_claimed never recognised an existing claim
+        because it compared against 'in_progress' (underscore), so it
+        performed a redundant write on every call.
+        """
+        mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
+        data = StatusLifecycle.ensure_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in-progress"
+        assert mock_run.call_count == 1  # show only, no update
+
+    def test_ensure_claimed_reclaims_with_hyphenated_status(self, mock_run):
+        """ensure_claimed reclaims via wl update when status differs from 'in-progress'."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+        ]
+        StatusLifecycle.ensure_claimed("TEST-123")
+        assert mock_run.call_count == 2
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[1][:5] == ["wl", "update", "TEST-123", "--status", "in-progress"]
+        assert "in_progress" not in calls[1], (
+            "ensure_claimed should not emit underscore variant"
+        )
+
+    def test_pause_approval_reclaim_lifecycle(self, mock_run):
+        """Pause→approval→reclaim window stays continuously in-progress (hyphenated).
+
+        Reproduces the AH-0MTFPDKDU006QUDC gap (12:08:51Z released to open, never
+        reclaimed after 12:09:42Z approval): a resumed run that forgot to
+        re-claim would fail the require_claimed guard; with the re-claim it
+        passes and stays in-progress through mutation.
+        """
+        # Pre-approval: item is open (paused for approval)
+        mock_run.side_effect = [_make_wl_show_proc(status="open")]
+        with pytest.raises(ClaimError):
+            StatusLifecycle.require_claimed("TEST-123")
+        # Post-approval re-claim: ensure_claimed restores in-progress
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+        ]
+        StatusLifecycle.ensure_claimed("TEST-123")
+        # Subsequent mutation guard now passes
+        mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
+        data = StatusLifecycle.require_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in-progress"
 
 
 # ===========================================================================
@@ -436,7 +585,7 @@ class TestWorklogDirDetection:
         monkeypatch.chdir(tmp_path)  # cwd has no .worklog
         wl_dir = tmp_path / "proj" / ".worklog"
         with mock.patch(
-            "skill.shared.status_lifecycle._detect_worklog_dir",
+            "shared.status_lifecycle._detect_worklog_dir",
             return_value=wl_dir,
         ):
             assert status_lifecycle_module.worklog_dir_flag() == [
@@ -447,7 +596,7 @@ class TestWorklogDirDetection:
         """Non-root cwd with no resolvable worklog dir -> no flag (graceful)."""
         monkeypatch.chdir(tmp_path)
         with mock.patch(
-            "skill.shared.status_lifecycle._detect_worklog_dir",
+            "shared.status_lifecycle._detect_worklog_dir",
             return_value=None,
         ):
             assert status_lifecycle_module.worklog_dir_flag() == []
@@ -471,7 +620,7 @@ class TestWorklogDirDetection:
             stdout=str(root),
             stderr="",
         )
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+        with mock.patch("shared.status_lifecycle.subprocess.run", return_value=fake):
             assert status_lifecycle_module._detect_worklog_dir() == root / ".worklog"
 
     def test_detect_walk_up(self, monkeypatch, tmp_path):
@@ -487,7 +636,7 @@ class TestWorklogDirDetection:
             stdout="",
             stderr="",
         )
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+        with mock.patch("shared.status_lifecycle.subprocess.run", return_value=fake):
             assert status_lifecycle_module._detect_worklog_dir() == proj / ".worklog"
 
     def test_detect_none(self, monkeypatch):
@@ -512,7 +661,7 @@ class TestWorklogDirDetection:
             stdout="",
             stderr="",
         )
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+        with mock.patch("shared.status_lifecycle.subprocess.run", return_value=fake):
             assert status_lifecycle_module._detect_worklog_dir() is None
 
 
@@ -575,7 +724,7 @@ class TestStatusLifecycleIntegration:
                 capture_output=True, text=True, check=True,
             )
             inside = json.loads(show.stdout)
-            assert inside["workItem"]["status"] == "in_progress"
+            assert inside["workItem"]["status"] == "in-progress"
 
         # After context: should be completed
         show = subprocess.run(

@@ -194,7 +194,7 @@ def custom_rules_file(temp_dir: Path) -> Path:
 def _import_smell_module():
     """Import the smell detection module; skip tests if not yet implemented."""
     try:
-        from skill.refactor import smell_detection
+        from refactor import smell_detection
         return smell_detection
     except (ImportError, ModuleNotFoundError) as exc:
         pytest.skip(f"Smell detection module not yet available: {exc}")

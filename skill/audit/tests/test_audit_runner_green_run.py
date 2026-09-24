@@ -13,9 +13,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
-from skill.test.scripts.run_tests import repo_has_pytest_suite
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
+from test.scripts.run_tests import repo_has_pytest_suite
 
 
 @pytest.fixture(autouse=True)
@@ -61,7 +61,7 @@ def _green_run_git_runner(head_sha: str | None = _GREEN_RUN_HEAD):
             return SimpleNamespace(returncode=0, stdout=head_sha + "\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
-    mock_runner.side_effect = _side_effect
+    mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
     return mock_runner
 
 class TestGreenRunResolution:
@@ -211,7 +211,7 @@ class TestGreenRunPromptInjection:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _mock_cq(self):
@@ -231,7 +231,7 @@ class TestGreenRunPromptInjection:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(
@@ -430,7 +430,7 @@ class TestGreenRunCmdIssue:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _mock_cq(self):
@@ -443,7 +443,7 @@ class TestGreenRunCmdIssue:
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             return audit_runner.cmd_issue(
@@ -507,7 +507,7 @@ class TestGreenRunCmdIssue:
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -556,7 +556,7 @@ class TestGreenRunCmdIssue:
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -687,6 +687,47 @@ class TestAutoGreenRunResolution:
         assert block is None
         assert sha is None
         mock_q.assert_not_called()
+
+    def test_changed_scope_cached_entry_no_evidence(self, tmp_path, capsys):
+        """AC1 (SA-0MT6CEO700058ZEN): a changed-scope partial run is never
+        full-suite evidence — classified as a miss, no green verdict."""
+        _make_suite_dirs(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "tests/unit" in command:
+                entry["scope"] = "changed"  # partial run, green exit
+            return entry
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            block, sha, _ = audit_runner._auto_green_run_outcome(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert "changed-scope" in err
+        assert "full-suite evidence required" in err
+        assert "run_tests.py --force" in err or "/skill:test" in err
+
+    def test_all_changed_scope_entries_classified_miss(self, tmp_path, capsys):
+        """AC1: every suite cached but at changed scope → classified MISS so the
+        F3 path re-executes for full evidence (never accepted as green)."""
+        _make_suite_dirs(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            entry["scope"] = "changed"
+            return entry
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, sha, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == audit_runner._FULL_SUITE_CACHE_MISS
+        assert sha == _GREEN_RUN_HEAD
+        assert any("changed-scope" in p for p in problems)
+        assert not any("exited non-zero" in p for p in problems)
 
     def test_query_cached_consumed_read_only(self, tmp_path, capsys):
         """AC1: resolution consumes the cache (never executes) at the project cwd."""
@@ -842,7 +883,7 @@ class TestAutoGreenRunPromptInjection:
                 stderr="",
             )
 
-        mock_runner.side_effect = _side_effect
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
     def _mock_cq(self):
@@ -864,7 +905,7 @@ class TestAutoGreenRunPromptInjection:
         ), mock.patch.object(
             audit_runner, "query_cached", return_value=cache_result
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(
@@ -935,7 +976,7 @@ class TestAutoGreenRunPromptInjection:
         ), mock.patch.object(
             audit_runner, "query_cached", side_effect=_side_effect
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -962,7 +1003,7 @@ class TestAutoGreenRunPromptInjection:
         ), mock.patch.object(
             audit_runner, "query_cached"
         ) as mock_q, mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(
@@ -1023,7 +1064,7 @@ class TestAutoGreenRunCmdIssue:
         ), mock.patch.object(
             audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -1054,7 +1095,7 @@ class TestAutoGreenRunCmdIssue:
             audit_runner, "query_cached",
             side_effect=RuntimeError("cache corrupt"),
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -1216,7 +1257,7 @@ class TestNeverBlocksOnExecutionImpossible:
                 "triaged": [], "notice": "",
             },
         ) as mock_run_tests, mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             mock.MagicMock(
                 return_value={"success": True, "findings": [], "fixes_applied": 0}
             ),
@@ -1253,7 +1294,7 @@ class TestPreflightGateCmdIssue:
                 audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 mock.MagicMock(
                     return_value={"success": True, "findings": [], "fixes_applied": 0}
                 ),
@@ -1392,7 +1433,7 @@ class TestRunTestsViaTestSkill:
         with mock.patch.object(
             audit_runner, "run_cached", side_effect=_side_effect
         ), mock.patch(
-            "skill.triage.scripts.check_or_create.check_or_create",
+            "triage.scripts.check_or_create.check_or_create",
             return_value={"issueId": "SA-TRIAGE-1", "created": True},
         ) as mock_triage:
             result = audit_runner._run_tests_via_test_skill(
@@ -1431,7 +1472,7 @@ class TestRunTestsViaTestSkill:
         with mock.patch.object(
             audit_runner, "run_cached", side_effect=_side_effect
         ), mock.patch(
-            "skill.triage.scripts.check_or_create.check_or_create",
+            "triage.scripts.check_or_create.check_or_create",
             return_value={"issueId": "SA-TRIAGE-1", "created": True},
         ) as mock_triage:
             result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
@@ -1439,6 +1480,60 @@ class TestRunTestsViaTestSkill:
         assert len(result["failures"]) == 1
         assert "<suite exited 1>" in result["failures"][0]["test_name"]
         assert mock_triage.call_count == 1
+
+    def test_error_only_run_attributes_named_test(self, tmp_path):
+        """An ERROR-only non-zero run names the erroring test for triage.
+
+        Regression guard for SA-0MSRN0Q64005YR5A: pytest exits non-zero with
+        no FAILED line for collection/setup/teardown errors, so the error
+        summary line is the only attribution available — the run must not
+        degrade to a bare ``<suite exited 1>`` entry that triage cannot act on.
+        """
+        _with_pytest_config(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": (
+                        "..E\n"
+                        "==================== ERRORS ====================\n"
+                        "________ ERROR at setup of test_needs_service ________\n\n"
+                        "@pytest.fixture\ndef service():\n"
+                        ">       raise RuntimeError(\"boom\")\n"
+                        "E       RuntimeError: boom\n\n"
+                        "test_infra.py:7: RuntimeError\n"
+                        "=========================== short test summary info "
+                        "============================\n"
+                        "ERROR tests/test_infra.py::test_needs_service - "
+                        "RuntimeError: boom\n"
+                        "1 error, 2 passed in 0.05s\n"
+                    ),
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "triage.scripts.check_or_create.check_or_create",
+            return_value={"issueId": "SA-TRIAGE-1", "created": True},
+        ) as mock_triage:
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert len(result["failures"]) == 1
+        failure = result["failures"][0]
+        assert failure["test_name"] == "tests/test_infra.py::test_needs_service"
+        assert "<suite exited" not in failure["test_name"]
+        assert "RuntimeError: boom" in failure["stack_trace"]
+        assert mock_triage.call_count == 1
+        assert mock_triage.call_args.args[0]["test_name"] == (
+            "tests/test_infra.py::test_needs_service"
+        )
 
     def test_timeout_notice_fail_closed(self, tmp_path):
         """A suite timeout yields a notice, no evidence, no crash."""
@@ -1493,7 +1588,7 @@ class TestRunTestsViaTestSkill:
         with mock.patch.object(
             audit_runner, "run_cached", side_effect=_side_effect
         ), mock.patch(
-            "skill.triage.scripts.check_or_create.check_or_create",
+            "triage.scripts.check_or_create.check_or_create",
             side_effect=RuntimeError("triage boom"),
         ):
             result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
@@ -1540,7 +1635,7 @@ class TestRunTestsPromptInjection:
             audit_runner, "_run_tests_via_test_skill",
             return_value=effective_test_run,
         ) as mock_run_tests, mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(
@@ -1588,7 +1683,7 @@ class TestRunTestsPromptInjection:
                 "triaged": [], "notice": "",
             },
         ) as mock_run_tests, mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
@@ -1651,7 +1746,7 @@ class TestRunTestsPromptInjection:
         ), mock.patch.object(
             audit_runner, "run_cached", side_effect=_green_run
         ), mock.patch(
-            "skill.code_review.scripts.code_quality.run_code_quality",
+            "code_review.scripts.code_quality.run_code_quality",
             self._mock_cq(),
         ):
             audit_runner.cmd_issue(

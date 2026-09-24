@@ -19,7 +19,16 @@ to run the canonical module's code in this module's namespace. This ensures:
 See ``skill/plan/plan_helpers.py`` for the canonical source.
 """
 
+# Bootstrap: add the skills root to sys.path so the canonical module's
+# top-level imports (shared, scripts) resolve when exec'd from any cwd.
+import sys
 from pathlib import Path
+
+_SKILLS_ROOT = Path(__file__).resolve().parent.parent / "skill"
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
 _canonical_path = str(
     Path(__file__).resolve().parent.parent / "skill" / "plan" / "plan_helpers.py"

@@ -26,7 +26,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner
+from audit.scripts import audit_runner
+from audit.tests.wl_helpers import make_stateful_runner
 
 # ===========================================================================
 # Helpers
@@ -91,7 +92,7 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, m
     # Patch the SHARED SIBLING_SCAN_ROOT so the sibling scan finds the target
     # project (the shared module owns the scan; audit_runner delegates).
     patcher = mock.patch(
-        "skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+        "shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
     )
     return target, patcher
 
@@ -228,7 +229,7 @@ class TestChildAuditWorklogDirThreading:
             mock.patch.object(
                 audit_runner, "TARGET_PROJECT_ROOT", target.parent
             ),
-            mock.patch("skill.code_review.scripts.code_quality.run_code_quality",
+            mock.patch("code_review.scripts.code_quality.run_code_quality",
                        return_value={"success": True, "findings": [],
                                     "fixes_applied": 0}),
             mock.patch.object(audit_runner.subprocess, "run", fake_subprocess_run),
@@ -237,7 +238,7 @@ class TestChildAuditWorklogDirThreading:
                 "OSL-1",
                 persist=True,
                 force=True,
-                runner=fake_runner,
+                runner=make_stateful_runner(fake_runner),
                 timeout=30,
                 audit_children=True,  # Cascade is opt-in (SA-0MSKB6V5Q007YDHE)
             )
@@ -269,7 +270,7 @@ class TestSiblingScanBaseCwdIndependence:
         parent — cwd-independent and worktree-safe (SA-0MSG57UNY009DE51) —
         not from the import-time cwd-derived TARGET_PROJECT_ROOT.
         """
-        from skill.shared.status_lifecycle import REPO_ROOT as SHARED_REPO_ROOT
+        from shared.status_lifecycle import REPO_ROOT as SHARED_REPO_ROOT
 
         assert audit_runner.SIBLING_SCAN_ROOT == SHARED_REPO_ROOT.parent
 
@@ -371,7 +372,7 @@ class TestStatusLifecycleFromOwningProjectRoot:
                 )
             return _make_wl_success_proc()
 
-        return fake_runner
+        return make_stateful_runner(fake_runner)
 
     def test_lifecycle_completes_and_commands_carry_worklog_dir(self, tmp_path):
         """AC2: capture -> in_progress -> terminal transition completes without
@@ -387,7 +388,7 @@ class TestStatusLifecycleFromOwningProjectRoot:
                 audit_runner, "TARGET_PROJECT_ROOT", target.parent
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
         ):

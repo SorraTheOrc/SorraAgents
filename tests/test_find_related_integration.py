@@ -62,11 +62,20 @@ if cmd == 'show':
     sys.exit(0)
 
 elif cmd == 'search':
-    # Skip --semantic flag if present to find the actual keyword
+    # Skip flags (--semantic/--json/--limit) to find the actual query term(s)
     filtered_args = [a for a in args[1:] if not a.startswith('--')]
-    keyword = filtered_args[0] if filtered_args else ''
-    results = state.get('search_results', {{}}).get(keyword, [])
-    # Ensure --json format matches real wl search output (bare list is also OK)
+    query = filtered_args[0] if filtered_args else ''
+    # v3 batching (SA-0MNCDAQ8W008KOG9): the script now issues a SINGLE
+    # `wl search --semantic <space-joined keywords>` call. Emulate the hybrid
+    # result by unioning per-word lexical results (dedup by id).
+    results = []
+    seen_ids = set()
+    for word in query.split():
+        for item in state.get('search_results', {{}}).get(word, []):
+            iid = item.get('id')
+            if iid and iid not in seen_ids:
+                seen_ids.add(iid)
+                results.append(item)
     print(json.dumps(results))
     sys.exit(0)
 
@@ -224,6 +233,18 @@ def test_find_related_integration(tmp_path, monkeypatch):
     # Should only have one automated report section
     assert desc_after_second.count("Related work (automated report)") == 1, (
         "Report section should not be duplicated"
+    )
+    # v3 boundary fix (SA-0MNCDAQ8W008KOG9): ### sub-blocks belong to the
+    # report section — re-runs must not stack or orphan duplicate sub-blocks.
+    assert desc_after_second.count("### Related work items") == 1, (
+        "Sub-block 'Related work items' should not be duplicated"
+    )
+    # Repo sub-block: at most one when repo files matched (none matched here)
+    assert desc_after_second.count("### Repository file matches") <= 1, (
+        "Sub-block 'Repository file matches' should not be duplicated"
+    )
+    assert desc_after_second.count("REL-001") == 1, (
+        "Stale sub-block content should be replaced, not accumulated"
     )
 
 

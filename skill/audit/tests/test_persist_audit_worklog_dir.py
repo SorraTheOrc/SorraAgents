@@ -32,9 +32,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner
-from skill.audit.scripts.persist_audit import main as persist_main
-from skill.audit.scripts.persist_audit import persist_audit
+from audit.scripts import audit_runner
+from audit.scripts.persist_audit import main as persist_main
+from audit.scripts.persist_audit import persist_audit
 
 # ===========================================================================
 # Helpers
@@ -70,7 +70,7 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, m
         f"projectName: Open Source LLM\nprefix: {prefix}\n", encoding="utf-8"
     )
     patcher = mock.patch(
-        "skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+        "shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
     )
     return target, patcher
 
@@ -204,10 +204,10 @@ class TestAutoResolutionFromNonProjectCwd:
         )
 
         with mock.patch(
-            "skill.shared.status_lifecycle.SIBLING_SCAN_ROOT",
+            "shared.status_lifecycle.SIBLING_SCAN_ROOT",
             tmp_path / "empty-projects",
         ), mock.patch(
-            "skill.shared.status_lifecycle.worklog_dir_flag", return_value=[]
+            "shared.status_lifecycle.worklog_dir_flag", return_value=[]
         ):
             rc = persist_audit(
                 "XX-UNKNOWN123", report,
@@ -248,7 +248,7 @@ class TestStandaloneCLI:
             return _proc(stdout='{"success": true}')
 
         with patcher, mock.patch(
-            "skill.audit.scripts.persist_audit.subprocess.run",
+            "audit.scripts.persist_audit.subprocess.run",
             fake_subprocess_run,
         ):
             rc = persist_main([
@@ -271,7 +271,7 @@ class TestStandaloneCLI:
             return _proc(stdout='{"success": true}')
 
         with patcher, mock.patch(
-            "skill.audit.scripts.persist_audit.subprocess.run",
+            "audit.scripts.persist_audit.subprocess.run",
             fake_subprocess_run,
         ):
             rc = persist_main([
@@ -314,7 +314,7 @@ class TestChildAuditPersistence:
             return _proc(stdout='{"success": true}')
 
         with patcher, mock.patch(
-            "skill.audit.scripts.persist_audit.subprocess.run",
+            "audit.scripts.persist_audit.subprocess.run",
             fake_subprocess_run,
         ):
             rc, report = audit_runner._persist_child_audit(
@@ -341,7 +341,7 @@ class TestChildAuditPersistence:
             return _proc(stdout='{"success": true}')
 
         with patcher, mock.patch(
-            "skill.audit.scripts.persist_audit.subprocess.run",
+            "audit.scripts.persist_audit.subprocess.run",
             fake_subprocess_run,
         ):
             rc, _report = audit_runner._persist_child_audit(

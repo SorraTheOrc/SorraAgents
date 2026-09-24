@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.test.scripts.run_tests import full_suite_commands
+from test.scripts.run_tests import full_suite_commands
 
 
 def _write_tce_like_repo(root: Path) -> None:

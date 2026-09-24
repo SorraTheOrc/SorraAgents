@@ -30,7 +30,7 @@ Usage
 -----
 .. code-block:: python
 
-    from skill.shared.process_semaphore import Semaphore
+    from shared.process_semaphore import Semaphore
 
     with Semaphore("audit", max_workers=2, timeout=30):
         run_heavy_work()

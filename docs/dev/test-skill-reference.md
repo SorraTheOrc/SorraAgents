@@ -40,6 +40,14 @@ hit the same entries because both resolve the same project root.
   `npm test 2>&1 | grep -E "Test Files|failed"`, `| tail -30`, `| head`,
   `| tee`) normalize to the underlying run and share one cache entry.
 - **Visibility**: non-JSON output marks cache hits with `[cached]`.
+- **PATH augmentation for user-installed executables (SA-0MSUZAJPC003BS66)**: the
+  default runner (`_default_runner` in `test_cache.py`) prepends
+  `~/.local/bin` to the subprocess `PATH` when it is not already present, so
+  user-installed executables (e.g. `pytest` installed via `pip --user`) are
+  found when a suite command is spawned in a restricted environment (e.g. an
+  audit runner whose PATH lacks the user-local bin directory). The path stays
+  clean for callers that already have the directory configured (no duplicate
+  entry).
 
 Query a cached run without executing anything:
 
@@ -71,6 +79,43 @@ Since F3 (SA-0MSTN5KRF0097TVP) a cache miss triggers auto-execution via this
 skill's machinery instead of blocking; since F4 (SA-0MSTN8CWM003AAU9) the
 audit never hard-blocks on execution-impossible repos.
 
+### 0.5. Concurrency bounding (SA-0MTG5U75A001F1RG)
+
+Concurrent test-suite executions are bounded host-wide via the shared flock
+semaphore in `skill/shared/process_semaphore.py`.
+
+**Separate namespace:** test runs use the **"test"** semaphore name, which is
+completely independent of the **"audit"** semaphore. Holding the audit slot
+never blocks a test run and vice-versa. Each workload has its own ceiling.
+
+**Configuration via environment variables:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TEST_MAX_CONCURRENCY` | `2` | Maximum concurrent test-suite executions |
+| `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot |
+
+Both env vars are validated at runtime: invalid values produce a stderr
+warning and fall back to the documented default (never breaking the test run).
+Values below 1 are clamped to 1.
+
+**Bounded wait semantics:** unlike the audit runner's fail-fast slot wait, a
+test run under saturation WAITS (bounded) for a free slot. If no slot frees
+within `TEST_LOCK_TIMEOUT`, the run reports a clear failure notice (e.g.
+`"test concurrency slot busy: no free slot within 600s"`) instead of failing
+immediately or crashing. This means multiple agents running tests concurrently
+will serialize gracefully — each waits its turn and succeeds once a slot
+becomes free.
+
+**Cache hits never block:** the semaphore is acquired ONLY when an actual
+execution is about to happen (cache miss path). A cached result is served
+without acquiring a slot, so read-only `--summary` queries and fast cached
+hits are completely unaffected by concurrency saturation.
+
+**Interaction with `--force`:** `--force` bypasses the cache lookup but still
+acquires the concurrency slot before executing. Under saturation, a forced run
+waits bounded rather than failing fast.
+
 ### 1. Suite-command resolution order (F2, SA-0MSTMYE79006NA61)
 
 The full suite is `full_suite_commands(project_root)`, resolved in this
@@ -97,4 +142,123 @@ An empty resolved set (no extension file, no npm test script, no pytest
 suite, no node dirs) is NOT an error: `run_tests.py` reports zero commands
 and the audit skill treats the repo as execution-impossible — fail-open
 partial, never blocks (F4 AC2).
+
+**Project-specific note (SorraAgents):** this repo declares
+`.pi/test-config.json` with `{"timeoutPerCommand": 1500}` (added under
+SA-0MTYMFLZD004O2VV / commit 715806bb). The default 600s cap kills the full
+suite (~412s measured wall-clock) before it can finish, so the timeout was
+raised to 1500s (~3.6x margin) to allow both the test skill and the audit
+runner's auto-execute path to complete. No `suiteCommands` override is set
+— command detection continues to use the convention-based resolution above.
+
+### 1a. Test types (`--type`) and the local extension contract (SA-0MTJQB2MA008HMO6)
+
+`--type <TYPE>` selects the **command profile** (default `full`). It is
+orthogonal to `--scope`: the type chooses *which* commands form the profile,
+the scope chooses *full vs changed* within it.
+
+**Minimum types** (accepted by every project):
+
+| Type | Without a local extension |
+|------|---------------------------|
+| `full` (default) | `full_suite_commands(project_root)` (section 1) — unchanged. |
+| `unit` | Convention subset: `pytest tests/unit` when the repo declares pytest and the dir holds `.py`; `node --test "tests/unit/**/*.mjs"` when it holds `.mjs`. |
+| `smoke` | Convention subset: `tests/smoke` (same pytest/node rules). |
+
+When no convention subset exists (e.g. `--type smoke` in a repo without
+`tests/smoke`), the runner exits non-zero with a clear diagnostic — it never
+silently runs the full suite.
+
+**Local extension (machine-readable).** A project declares its own type→command
+map at `<project_root>/.pi/skills_extensions/test/extension.json` (the
+SA-0MSQ7MQEJ0064ZB0 convention, loaded via
+`shared.skill_extensions.load_extension`):
+
+```json
+{ "types": { "unit": ["npx vitest run --project unit"], "e2e": ["npx playwright test"] } }
+```
+
+- Values are a command string or a **non-empty** list of command strings.
+- A locally-defined type wins over the convention/minimum rules, so projects may
+  add extra types (`dev`, `e2e`, `quick`, …).
+- If the extension exists but omits a requested **minimum** type
+  (`unit`/`smoke`), the runner fails with a diagnostic naming the type and the
+  extension file — never a silent full-suite substitution. `full` that the
+  extension omits still falls back to `full_suite_commands` so a bare invocation
+  is never broken.
+- A malformed `extension.json` (bad JSON, non-object top level, non-string
+  commands) raises a clear error naming the file.
+- Convention fallback applies only when no local `types` map exists (a
+  prose-only `SKILL_PREFIX.md`/`SKILL_POSTFIX.md` extension does not define
+  types).
+
+**Unknown types** exit non-zero listing the allowed values — the minimum set
+plus all locally-defined types.
+
+**Cache and evidence.** Only `--type full` populates the audit-accepted
+full-suite cache entry. The cache key namespaces non-`full` types
+(`test_cache.cache_key(..., test_type=...)`), each entry's metadata records
+`test_type`, and `query_cached`/`run_cached` match on it, so a typed run can
+never be served as (or mistaken for) full-suite evidence. `run_suite`/`run_all`
+results carry `type`; `--summary` reports the recorded type per suite
+(`types` in JSON, `type=<T>` in text). The audit skill queries with the
+default `test_type="full"` and is therefore unaffected.
+
+```bash
+python3 ./scripts/run_tests.py --type unit --json    # fast implementation feedback
+python3 ./scripts/run_tests.py --type full --json    # release/audit evidence
+```
+
+### 2. Scope-aware execution (SA-0MT6BYQHB008DOGC)
+
+`run_tests.py` supports execution **scope** so full-suite evidence is only
+generated at the gates that need it (push to `dev`/`main`, release, audit),
+while cheap changed-file-scoped runs back iterative validation.
+
+**`--scope full|changed`** (default `full`):
+
+- **`full`** — the complete suite (`full_suite_commands`, section 1). This is
+the ONLY scope that populates the *full-suite* cache entry and therefore the
+only scope the audit skill accepts as evidence of a green full suite.
+- **`changed`** — only the tests affected by changes since the diff base.
+Used for fast validation during feature-branch iteration (implement skill's
+worktree test loop, ad-hoc agent validation); NEVER used as full-suite
+evidence.
+
+**`--target-branch <ref>`** sets the diff base for changed-file detection
+(default `origin/dev`, falling back to `dev`). Changed files are computed as
+`git diff --name-only <base> HEAD` (merge-base resolved automatically).
+
+**Changed-file → test selection** combines:
+
+1. **Convention mapping** — a changed file maps to its own tests:
+   `src/foo.py` → `tests/test_foo.py`, a changed `tests/test_x.py` → itself,
+   etc.
+2. **AST import-graph expansion** — the mapping adds test files that import
+the changed module (deterministic, no heuristic coverage tools).
+
+Selected test files are passed explicitly (`pytest tests/test_foo.py ...`),
+so a scoped run is deterministic and cache-keyed distinctly from the full
+suite.
+
+**Fallback to full scope** (with a logged warning) happens when no subset
+can be selected: no diff base / no changed files, all changed files are
+non-test/unmapped, the repo declares custom `suiteCommands` in
+`.pi/test-config.json` (not introspectable), or the repo has no subsettable
+tooling. A scoped run never silently skips testing.
+
+**Result JSON** carries `scope` (`full`/`changed`) at the run level
+(`run_all` outputs `scope` + per-suite `resolved_scopes`); `run_suite`
+results carry `scope` on every path (normal, `FileNotFoundError`,
+timeout). `--summary` prints `{suite} summary ({scope} scope):` and the JSON
+summary carries per-suite `scopes` — a partial summary can never be
+mistaken for full-suite evidence.
+
+**Cache interaction:** scoped runs use independent cache keys
+distinct from the full suite (the command differs; the stored metadata
+also records `scope`). A `changed`-scope run NEVER populates the
+full-suite cache entry — the audit's read-only full-suite query
+(`query_cached`) filters by scope and rejects `changed` entries, so
+full-suite verification always requires a genuine `full` run at the same
+git state.
 

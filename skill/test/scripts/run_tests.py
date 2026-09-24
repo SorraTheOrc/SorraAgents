@@ -20,6 +20,13 @@ per-command timeout (F2 AC1).
 Results are cached per-repo (see skill/test_cache.py) by default so repeated
 verification at the same git state is served without re-executing the suite.
 
+Concurrent suite executions are bounded host-wide via the shared "test"
+semaphore (skill/shared/process_semaphore.py): TEST_MAX_CONCURRENCY (default
+2) ceilings concurrent runs, TEST_LOCK_TIMEOUT (default 600s) bounds the wait
+for a free slot. Only ACTUAL executions acquire a slot — cache hits are
+served without executing and never block on the semaphore
+(SA-0MTG5U75A001F1RG).
+
 Emits structured per-failure records (test_name, stdout_excerpt, stack_trace)
 compatible with the triage skill's check_or_create.py input.
 
@@ -43,29 +50,58 @@ import re
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.test_cache import (
+from shared.process_semaphore import Semaphore
+from shared.skill_extensions import (
+    DATA_FILENAME,
+    SkillExtensionError,
+    load_extension,
+)
+from shared.timing import Timer
+from test_cache import (
     DEFAULT_TTL_SECONDS,
     query_cached,
     run_cached,
     summary_lines,
 )
-from skill.test_runner import canonicalize_quiet_test_command
+from test_runner import (
+    canonicalize_quiet_test_command,
+    executable_test_command,
+)
 
-REPO_ROOT = _REPO_ROOT
+REPO_ROOT = _SKILLS_ROOT.parent
 
 # Cache TTL exposed as a module constant so CLI tests can backdate entries.
 CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
 
+# Canonical pytest command (stable form for cache keying and cross-consumer
+# reuse). The executable is resolved at run time via executable_test_command
+# so a shell without ~/.local/bin on PATH still runs the suite
+# (SA-0MSQ012QG005N22S).
 PYTEST_CMD = canonicalize_quiet_test_command("pytest")
 NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
+
+# Test-run concurrency bounding (SA-0MTG5U75A001F1RG): concurrent test
+# suite executions are bounded host-wide via the shared flock "test"
+# semaphore (skill/shared/process_semaphore.py) — a separate namespace
+# from the "audit" semaphore so the two workloads have independent
+# ceilings. Cache hits never execute and never consume a slot.
+TEST_SEMAPHORE_NAME = "test"
+TEST_MAX_CONCURRENCY_ENV = "TEST_MAX_CONCURRENCY"
+TEST_MAX_CONCURRENCY_DEFAULT = 2
+TEST_LOCK_TIMEOUT_ENV = "TEST_LOCK_TIMEOUT"
+TEST_LOCK_TIMEOUT_DEFAULT = 600.0
 
 # pytest config markers, mirroring implement.py's _has_pytest_markers so the
 # test/implement/audit skills agree on whether a repo has a pytest suite
@@ -81,6 +117,18 @@ _PYTEST_CONFIG_MARKERS = (
 # (the primary command list; convention detection is skipped when present) and
 # an optional ``timeoutPerCommand`` (per-command timeout in seconds).
 TEST_CONFIG_FILE = ".pi/test-config.json"
+
+# --- Test-type (profile) selection (SA-0MTJQB2MA008HMO6) ------------------
+# Minimum types every project accepts. ``full`` is the default and preserves
+# the existing full-suite contract; ``unit``/``smoke`` fall back to convention
+# detection (``tests/unit``, ``tests/smoke``) when no local extension defines
+# them. A project may define additional types via its local extension
+# (``.pi/skills_extensions/test/extension.json`` → ``types`` map).
+MINIMUM_TEST_TYPES = ("smoke", "unit", "full")
+#: Type used when ``--type`` is omitted (backwards compatibility, AC5).
+DEFAULT_TEST_TYPE = "full"
+#: The global skill name whose project extension supplies the type map.
+TEST_SKILL_NAME = "test"
 
 
 def detect_project_root() -> Path:
@@ -112,9 +160,405 @@ def detect_project_root() -> Path:
         pass
     return REPO_ROOT
 
-_FAILED_RE = re.compile(r"^FAILED\s+(.+?)\s+-\s+(.*)$", re.MULTILINE)
+# "Red" short-test-summary lines emitted by pytest ``-r a`` on a non-zero
+# run: ``FAILED <nodeid> - <message>`` for test failures and
+# ``ERROR <nodeid> - <message>`` for collection/setup/teardown errors (the
+# message is absent for some collection errors). Parsing only ``FAILED``
+# left error-only runs — which exit non-zero with no FAILED line — recorded
+# as a bare ``<suite exited N>: pytest ...`` entry with no named test, which
+# triage cannot act on (SA-0MSRN0Q64005YR5A).
+_RED_SUMMARY_RE = re.compile(
+    r"^(?P<kind>FAILED|ERROR)\s+(?P<name>.+?)(?:\s+-\s+(?P<message>.*))?$",
+    re.MULTILINE,
+)
 _SECTION_RE = re.compile(r"^_{5,}\s+(.+?)\s+_{5,}$", re.MULTILINE)
 _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
+
+
+# ---------------------------------------------------------------------------
+# Scope-aware test selection
+# ---------------------------------------------------------------------------
+
+TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts")
+
+
+def compute_changed_files(
+    project_root: Path | None = None,
+    base_ref: str = "origin/dev",
+) -> set[str]:
+    """Return the set of files changed between *base_ref* and HEAD.
+
+    Base resolution order (first match wins):
+
+    1. ``<base_ref>`` (default ``origin/dev``) — the remote-tracking dev ref
+    2. ``dev`` local branch — when the remote ref is absent
+    3. ``HEAD~1`` — when neither dev ref exists (fallback for repos without
+       a dev branch, so the diff is against the last commit)
+
+    Untracked files are not included (they have no diff and would be
+    reported only by ``git status``, not a diff). The merge-base is used so
+    only files changed on the current branch since it forked from the base
+    are returned — files changed on the base after the fork point are not
+    attributed to this branch.
+
+    Args:
+        project_root: Repo root (default: detected from calling repo).
+        base_ref: Preferred base ref for the diff (default ``origin/dev``).
+
+    Returns:
+        Set of repo-relative changed file paths (POSIX separators).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+
+    base = _resolve_merge_base(root, base_ref)
+    if base is None:
+        # No base ref at all — nothing to diff against.
+        return set()
+
+    proc = subprocess.run(
+        ["git", "diff", "--name-only", base],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return set()
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+def _resolve_merge_base(root: Path, base_ref: str) -> str | None:
+    """Find the merge-base commit for diffing, following the fallback chain.
+
+    Returns None only when no usable base exists (no commits yet, or git
+    unavailable). Logs a warning for each fallback so operators understand
+    which base produced the diff.
+    """
+    candidates = [base_ref]
+    if base_ref != "dev":
+        candidates.append("dev")
+    candidates.append("HEAD~1")
+
+    for candidate in candidates:
+        try:
+            proc = subprocess.run(
+                ["git", "merge-base", candidate, "HEAD"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # Missing cwd / git unavailable → no diff base → caller falls
+            # back to full scope rather than crashing the run.
+            return None
+        if proc.returncode == 0 and proc.stdout.strip():
+            if candidate != base_ref:
+                print(
+                    f"run_tests: base ref '{base_ref}' not found — using '{candidate}' "
+                    "for changed-file detection",
+                    file=sys.stderr,
+                )
+            return candidate
+    return None
+
+
+def map_changed_to_tests(
+    project_root: Path | None = None,
+    changed_files: set[str] | None = None,
+) -> set[str]:
+    """Map changed source files to affected test files.
+
+    Two mechanisms, unioned:
+
+    1. **Convention mapping**: ``src/foo.py`` → ``tests/test_foo.py``;
+       ``tests/test_foo.py`` itself; any ``test_*.py`` / ``*_test.py`` in the
+       same directory tree as a non-test change whose basename matches the
+       changed file's stem.
+    2. **Import-graph expansion**: AST-scan every test file once; for each
+       changed module (dotted name derived from its path relative to the
+       project root), find test files whose import statements reference the
+       changed module OR any module that (transitively) imports it. This
+       catches indirect breakage — e.g. ``utils.py`` changed →
+       ``test_report.py`` imported via a chain.
+
+    ``changed_files`` defaults to :func:`compute_changed_files` against the
+    calling repo. Non-Python changes (README, yaml, …) never map to tests
+    (they return an empty selection) unless they are themselves test files.
+
+    Args:
+        project_root: Repo root.
+        changed_files: Changed files (default: computed).
+
+    Returns:
+        Set of test-file paths (repo-relative, POSIX).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    changed = changed_files if changed_files is not None else compute_changed_files(root)
+
+    if not changed:
+        return set()
+
+    # All test files under tests/test dirs (matching run_tests conventions).
+    test_dirs = [d for d in ("tests", "test") if (root / d).is_dir()]
+    all_tests: set[str] = set()
+    for d in test_dirs:
+        all_tests.update(
+            str(p.relative_to(root))
+            for p in (root / d).rglob("*.py")
+        )
+    # Node suite dirs also carry test files (tests/node|cli|unit/**/*.mjs)
+    # — included so a changed source can select its node tests by convention.
+    for d in NODE_SUITE_DIRS:
+        node_dir = root / d
+        if not node_dir.is_dir():
+            continue
+        for p in node_dir.rglob("*.mjs"):
+            if _is_test_file(Path(str(p.relative_to(root)))):
+                all_tests.add(str(p.relative_to(root)))
+
+    # 1. Convention mapping
+    selected: set[str] = set()
+    for changed_file in changed:
+        rel = Path(changed_file)
+        if _is_test_file(rel):
+            selected.add(changed_file)
+            continue
+        if rel.suffix not in TRACKED_SOURCE_EXTENSIONS:
+            continue  # non-source change → no test selection
+
+        # Direct convention: changed_stem → test_<stem>.py in same tree
+        for test in all_tests:
+            test_rel = Path(test)
+            if test_rel.name in {
+                f"test_{rel.stem}.py",
+                f"{rel.stem}_test.py",
+                f"test_{rel.stem}.mjs",
+                f"{rel.stem}_test.mjs",
+                f"{rel.stem}.test.mjs",
+            }:
+                selected.add(test)
+            elif (
+                rel.name == "__init__.py"
+                and test_rel.name.startswith("test_")
+                and str(rel.parent) == str(test_rel.parent)
+            ):
+                # Package init changed → every test under that package tree.
+                selected.add(test)
+
+    # 2. Import-graph expansion
+    if selected or _has_python_changes(changed):
+        selected |= _expand_by_imports(root, all_tests, changed)
+
+    return selected
+
+
+def _is_test_file(rel: Path) -> bool:
+    """True for names matching test-file conventions (test_*.py / *_test.py)."""
+    name = rel.name
+    return (
+        name.startswith("test_")
+        or name.endswith(("_test.py", ".test.mjs", "_test.mjs"))
+    )
+
+
+def _has_python_changes(changed: set[str]) -> bool:
+    return any(p.endswith(".py") for p in changed)
+
+
+def _expand_by_imports(
+    root: Path,
+    all_tests: set[str],
+    changed: set[str],
+) -> set[str]:
+    """AST scan: find test files importing changed modules (transitively).
+
+    Builds a project-wide module import graph from every ``.py`` file (source
+    and test): module name → directly-imported dotted names (relative imports
+    resolved against the file's package). Node names are aliased by basename
+    (``src/foo.py`` → ``src.foo`` AND ``foo``) so repos that expose a source
+    root on the import path (e.g. ``src/`` on ``sys.path``, so tests import
+    ``foo`` while the file lives at ``src/foo.py``) still match. For each
+    changed module (also matched by basename), a test file is affected when
+    it directly imports the changed module, or imports any module that
+    (transitively) imports it — so a change to ``utils.py`` triggers
+    ``test_report.py`` that only imports ``report.py`` which imports
+    ``utils.py``.
+
+    The mapping is deliberately approximate: dynamic imports, ``__import__``,
+    importlib, and namespace-package aliasing are not resolved; same-named
+    modules in different packages are conflated (over-matching only — extra
+    tests run, never fewer). This is a fast-feedback heuristic, NOT a
+    correctness gate — the full suite is the push-time gate.
+    """
+    changed_targets: set[str] = set()
+    for p in changed:
+        if not p.endswith(".py"):
+            continue
+        full = _path_to_module(p)
+        if full:
+            changed_targets.add(full)
+        changed_targets.add(Path(p).stem)
+    if not changed_targets:
+        return set()
+
+    # module name → directly-imported dotted names, parsed once for every
+    # project .py file (no double-parsing: tests are also in the rglob).
+    # Each node is registered under BOTH its path-derived name and its
+    # basename so imports in either namespace resolve.
+    module_imports: dict[str, set[str]] = {}
+    for py_file in root.rglob("*.py"):
+        rel = str(py_file.relative_to(root))
+        mod = _path_to_module(rel)
+        if mod is None:
+            continue
+        imports = _ast_imports(root, rel)
+        module_imports[mod] = imports
+        module_imports[py_file.stem] = imports
+
+    # BFS: does module *m* (transitively) import module *target*?
+    def imports_module(m: str, target: str) -> bool:
+        seen: set[str] = set()
+        stack = [m]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur == target:
+                return True
+            stack.extend(module_imports.get(cur, ()))
+        return False
+
+    affected: set[str] = set()
+    for test in all_tests:
+        test_imports = module_imports.get(_path_to_module(test) or "", set())
+        for mod in test_imports:
+            if any(mod == cm or imports_module(mod, cm) for cm in changed_targets):
+                affected.add(test)
+                break
+    return affected
+
+
+def _path_to_module(path: str) -> str | None:
+    """Derive a dotted module name from a repo-relative .py path."""
+    p = Path(path)
+    if p.suffix != ".py":
+        return None
+    if p.name == "__init__.py":
+        return ".".join(p.parts[:-1]) if p.parts[:-1] else None
+    parts = list(p.parts)
+    if parts:
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts)
+
+
+def _ast_imports(root: Path, test_file: str) -> set[str]:
+    """Return dotted module names imported by *test_file* (AST, best-effort).
+
+    Relative imports are resolved against the importing file's package so
+    ``from .utils import x`` inside ``src/foo.py`` yields ``src.utils``.
+    """
+    import ast
+
+    path = root / test_file
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return set()
+
+    pkg_parts = Path(test_file).parent.parts
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            level = node.level or 0
+            name = node.module or ""
+            if level:
+                # level=1 → same package; level=2 → parent package, etc.
+                parts = list(pkg_parts)
+                if parts and level > 1:
+                    parts = parts[: -(level - 1)]
+                resolved = ".".join([*parts, name] if name else parts)
+                imports.add(resolved)
+            elif name:
+                imports.add(name)
+    return imports
+
+
+def changed_scope_commands(
+    project_root: Path | None = None,
+    base_ref: str = "origin/dev",
+    changed_files: set[str] | None = None,
+) -> list[str] | None:
+    """Return the test commands for changed-file scope, or None for full scope.
+
+    Returns None (meaning "fall back to the full suite") when:
+
+    - The repo declares custom ``suiteCommands`` in ``.pi/test-config.json``
+      (not introspectable → cannot select a subset).
+    - No changed files are found (nothing to select → full scope).
+    - The resolved changed-file selection is empty (e.g. only non-source
+      changes like README edits).
+    - The repo has no test tooling of a kind we can subset (no pytest, no
+      node suite dirs).
+
+    When a selection IS possible, returns a list with, per applicable suite:
+
+    - pytest: ``pytest <selected test files>`` (canonicalized quiet form).
+    - node: ``node --test <selected node test files>`` per node suite dir.
+
+    The selected test files are always passed explicitly so the partial run
+    is deterministic and cache-keyed distinctly from the full suite.
+
+    *changed_files* may be passed in to avoid a second ``git diff`` when the
+    caller already computed it (single source for the fallback warning).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+
+    # Custom suite commands are not introspectable — fall back to full scope.
+    if extension_suite_commands(root) is not None:
+        return None
+
+    changed = (
+        changed_files
+        if changed_files is not None
+        else compute_changed_files(root, base_ref=base_ref)
+    )
+    if not changed:
+        return None
+
+    selected = map_changed_to_tests(root, changed)
+    # Anything changed that is itself a test file is already in `selected`;
+    # leaf-only changes (e.g. a lone docs edit) → full scope.
+    if not selected:
+        return None
+
+    pytest_files = sorted(f for f in selected if f.endswith(".py") and not f.endswith(".mjs"))
+    node_files = sorted(f for f in selected if f.endswith(".mjs"))
+
+    commands: list[str] = []
+    if pytest_files and repo_has_pytest_suite(root):
+        file_args = " ".join(shlex.quote(f) for f in pytest_files)
+        commands.append(canonicalize_quiet_test_command(f"pytest {file_args}"))
+
+    if node_files:
+        # Group by node suite dir (tests/node, tests/cli, tests/unit) so we
+        # emit one node --test command per dir, mirroring full_suite_commands.
+        by_dir: dict[str, list[str]] = {}
+        for f in node_files:
+            top = f.split("/", 1)[0]
+            by_dir.setdefault(top, []).append(f)
+        for dirname, files in sorted(by_dir.items()):
+            if not (root / dirname).is_dir():
+                continue
+            file_args = " ".join(shlex.quote(f) for f in files)
+            commands.append(f"node --test {file_args}")
+
+    return commands or None
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +755,178 @@ def full_suite_commands(project_root: Path | None = None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Test-type (profile) resolution
+# ---------------------------------------------------------------------------
+
+
+class TypeResolutionError(RuntimeError):
+    """Raised when a requested test type cannot be resolved to commands.
+
+    Covers both unknown types and minimum types that a present local extension
+    omits. Callers surface the message and exit non-zero — never silently
+    substitute the full suite (SA-0MTJQB2MA008HMO6 AC2/AC4).
+    """
+
+
+class UnknownTestTypeError(TypeResolutionError):
+    """Raised when ``--type`` names no known or locally-defined type."""
+
+
+def local_test_types(project_root: Path | None = None) -> dict[str, list[str]] | None:
+    """Return the project's local type→commands map, or None when absent.
+
+    Reads ``<project_root>/.pi/skills_extensions/test/extension.json`` through
+    the shared loader (SA-0MSQ7MQEJ0064ZB0). Returns None when there is no
+    extension or it defines no ``types`` map (so convention fallback applies).
+    A present-but-malformed map raises :class:`SkillExtensionError` naming the
+    file — never a silent fallback.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    ext = load_extension(TEST_SKILL_NAME, root)
+    if not ext.present:
+        return None
+    data_path = ext.data_path or (ext.directory / DATA_FILENAME)
+    raw_types = ext.data.get("types")
+    if raw_types is None:
+        # Extension present but no type map (e.g. prose-only hooks): there are
+        # no local type definitions, so minimum types use conventions.
+        return None
+    if not isinstance(raw_types, dict):
+        raise SkillExtensionError(
+            f"Invalid test type map in {data_path}: 'types' must be a JSON object."
+        )
+    normalized: dict[str, list[str]] = {}
+    for key, value in raw_types.items():
+        if not isinstance(key, str) or not key:
+            raise SkillExtensionError(
+                f"Invalid test type name {key!r} in {data_path}: names must be "
+                "non-empty strings."
+            )
+        if isinstance(value, str):
+            commands = [value]
+        elif (
+            isinstance(value, list)
+            and value
+            and all(isinstance(item, str) and item.strip() for item in value)
+        ):
+            commands = list(value)
+        else:
+            raise SkillExtensionError(
+                f"Invalid commands for test type '{key}' in {data_path}: "
+                "expected a non-empty string or a non-empty list of strings."
+            )
+        normalized[key] = commands
+    return normalized
+
+
+def extension_file(project_root: Path | None = None) -> Path:
+    """Return the path of the test-skill extension data file."""
+    root = Path(project_root or REPO_ROOT).resolve()
+    return root / ".pi" / "skills_extensions" / TEST_SKILL_NAME / DATA_FILENAME
+
+
+def allowed_test_types(project_root: Path | None = None) -> list[str]:
+    """Return the sorted allowed type names (minimum set + local types)."""
+    local = local_test_types(project_root)
+    return sorted(set(MINIMUM_TEST_TYPES) | set(local or {}))
+
+
+def convention_type_commands(
+    project_root: Path | None = None,
+    test_type: str = "unit",
+) -> list[str]:
+    """Return convention-detected commands for *test_type*, if any.
+
+    The convention is a ``tests/<type>/`` directory: pytest when the repo
+    declares a pytest suite and the dir holds ``.py`` tests; node when it
+    holds ``.mjs`` tests. An empty list means no convention applies (the
+    caller then raises a clear diagnostic rather than running the full suite).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    type_dir = root / "tests" / test_type
+    if not type_dir.is_dir():
+        return []
+    commands: list[str] = []
+    if repo_has_pytest_suite(root) and any(type_dir.rglob("*.py")):
+        commands.append(canonicalize_quiet_test_command(f"pytest tests/{test_type}"))
+    if any(type_dir.rglob("*.mjs")):
+        commands.append(f'node --test "tests/{test_type}/**/*.mjs"')
+    return commands
+
+
+def resolve_type_commands(
+    project_root: Path | None = None,
+    test_type: str = DEFAULT_TEST_TYPE,
+) -> list[str]:
+    """Resolve a test type to its command list.
+
+    Resolution order (AC2/AC3/AC4/AC5):
+
+    1. A locally-defined type (``.pi/skills_extensions/test/extension.json``)
+       wins, including extra types beyond the minimum set.
+    2. ``full`` always falls back to :func:`full_suite_commands` when the
+       local map omits it, so a bare invocation (no ``--type``) preserves the
+       existing full-suite contract even when an extension exists (AC5).
+    3. A minimum type (``unit``/``smoke``) with a present local map that omits
+       it fails with a diagnostic naming the type and the extension file —
+       never a silent full-suite substitution (AC2).
+    4. A minimum type with no local map falls back to convention detection
+       (``tests/<type>``); when no convention applies it fails with a clear
+       diagnostic (AC4).
+    5. Anything else is an unknown type (AC3).
+
+    Raises:
+        UnknownTestTypeError: the type is neither minimum nor locally defined.
+        TypeResolutionError: the type cannot be resolved to commands.
+        SkillExtensionError: the local extension is malformed.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    local = local_test_types(root)
+    if local is not None and test_type in local:
+        return list(local[test_type])
+
+    if test_type == DEFAULT_TEST_TYPE:
+        return full_suite_commands(root)
+
+    if test_type in MINIMUM_TEST_TYPES:
+        if local is not None:
+            raise TypeResolutionError(
+                f"Local test extension {extension_file(root)} does not define "
+                f"the minimum test type '{test_type}' (defined: "
+                f"{', '.join(sorted(local))}). Add it to extension.json or "
+                "remove the extension to use convention detection."
+            )
+        commands = convention_type_commands(root, test_type)
+        if commands:
+            return commands
+        raise TypeResolutionError(
+            f"No commands resolved for test type '{test_type}': no local test "
+            f"extension defines it and no tests/{test_type} convention exists."
+        )
+
+    raise UnknownTestTypeError(
+        f"Unknown test type '{test_type}': it is not one of the minimum types "
+        f"({', '.join(MINIMUM_TEST_TYPES)}) and is not defined by the local "
+        f"test extension {extension_file(root)}."
+    )
+
+
+def filter_commands_for_suite(name: str, commands: list[str]) -> list[str]:
+    """Filter a type's commands to the named suite (pytest/node/all).
+
+    Raising for empty results is the caller's responsibility so it can add a
+    context-specific diagnostic.
+    """
+    if name == "all":
+        return list(commands)
+    if name == "pytest":
+        return [c for c in commands if "pytest" in c]
+    if name == "node":
+        return [c for c in commands if "node" in c]
+    raise ValueError(f"unknown suite: {name}")
+
+
+# ---------------------------------------------------------------------------
 # Failure parsing
 # ---------------------------------------------------------------------------
 
@@ -318,29 +934,41 @@ def full_suite_commands(project_root: Path | None = None) -> list[str]:
 def parse_pytest_failures(output: str) -> list[dict[str, str]]:
     """Parse pytest ``-r a`` output into per-failure structured records.
 
+    Both ``FAILED`` (test failures) and ``ERROR`` (collection / setup /
+    teardown errors) short-summary lines are parsed: an error-only run exits
+    non-zero without any ``FAILED`` line, and treating it as an unnamed
+    suite-level failure hid the responsible test from triage
+    (SA-0MSRN0Q64005YR5A).
+
     Each record contains ``test_name``, ``stdout_excerpt`` and ``stack_trace``
     in the shape expected by triage check_or_create.py.
     """
     records: list[dict[str, str]] = []
-    failed = list(_FAILED_RE.finditer(output))
-    for match in failed:
-        test_name = match.group(1).strip()
-        # Extract the traceback section for this test from the FAILURES block.
+    for match in _RED_SUMMARY_RE.finditer(output):
+        test_name = match.group("name").strip()
+        message = (match.group("message") or "").strip()
+        # Extract the traceback section for this test from the FAILURES or
+        # ERRORS block (both use the same ``____ <nodeid> ____`` header).
         stack_trace = _extract_pytest_section(output, test_name)
-        excerpt = stack_trace[:1000] if stack_trace else match.group(2).strip()
+        excerpt = stack_trace[:1000] if stack_trace else message
         records.append(
             {
                 "test_name": test_name,
-                "stdout_excerpt": excerpt,
-                "stack_trace": stack_trace or excerpt,
+                "stdout_excerpt": excerpt or test_name,
+                "stack_trace": stack_trace or excerpt or test_name,
             }
         )
     return records
 
 
 def _extract_pytest_section(output: str, test_name: str) -> str:
-    """Return the pytest FAILURES section body for a given test name."""
-    # The section header is the test node id's tail (function name or full id).
+    """Return the pytest FAILURES/ERRORS section body for a test name.
+
+    The section header is the test node id's tail (function name or full id),
+    optionally prefixed for errors — e.g. ``ERROR at setup of test_x`` — so
+    the tail is matched both exactly and as a header suffix
+    (SA-0MSRN0Q64005YR5A).
+    """
     tail = test_name.split("::")[-1]
     lines = output.splitlines()
     section_start = None
@@ -349,7 +977,9 @@ def _extract_pytest_section(output: str, test_name: str) -> str:
         if not m:
             continue
         header = m.group(1).strip()
-        if header == tail or header == test_name or header.endswith("::" + tail):
+        if header == test_name or re.search(
+            rf"(?:^|[\s:]){re.escape(tail)}$", header
+        ):
             section_start = i
             break
     if section_start is None:
@@ -421,6 +1051,95 @@ def _extract_yaml_block(block: str, key: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class TestConcurrencyTimeout(RuntimeError):
+    """Raised when a test run cannot acquire a concurrency slot in time.
+
+    Bounded-wait semantics (SA-0MTG5U75A001F1RG AC1): the shared "test"
+    semaphore is acquired with ``TEST_LOCK_TIMEOUT`` (default 600s); when
+    the ceiling stays saturated past the deadline the run reports a clear
+    failure notice instead of failing fast or hanging. Cache hits never
+    execute, so they never acquire a slot and never raise
+    (SA-0MTG5U75A001F1RG AC4).
+    """
+
+    __test__ = False  # suppress pytest collection warning
+
+
+def _test_semaphore_max_workers() -> int:
+    """Resolve the test-run concurrency ceiling.
+
+    Precedence: ``TEST_MAX_CONCURRENCY`` env var > default 2. Values below
+    1 are clamped to 1; an invalid (non-integer) value is ignored with a
+    warning so a misconfigured environment cannot break test runs. The
+    ceiling bounds concurrent suite executions host-wide via the shared
+    "test" semaphore — a separate namespace from the audit semaphore
+    (SA-0MTG5U75A001F1RG AC1/AC2/AC3).
+    """
+    env_value = os.environ.get(TEST_MAX_CONCURRENCY_ENV)
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {TEST_MAX_CONCURRENCY_ENV} value "
+                f"{env_value!r}; using default ceiling",
+                file=sys.stderr,
+            )
+    return TEST_MAX_CONCURRENCY_DEFAULT
+
+
+def _test_lock_timeout() -> float:
+    """Resolve the bounded wait for a free test-run slot.
+
+    Precedence: ``TEST_LOCK_TIMEOUT`` env var > default 600s. Unlike the
+    audit's fail-fast slot wait, a test run under saturation WAITS
+    (bounded) for a free slot instead of failing immediately — the same
+    no-fail-fast philosophy as the audit priority queue
+    (SA-0MTG5U75A001F1RG AC1).
+    """
+    env_value = os.environ.get(TEST_LOCK_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {TEST_LOCK_TIMEOUT_ENV} value "
+                f"{env_value!r}; using default lock timeout",
+                file=sys.stderr,
+            )
+    return TEST_LOCK_TIMEOUT_DEFAULT
+
+
+@contextmanager
+def _test_concurrency_slot() -> Iterator[None]:
+    """Hold a shared test-run slot for the duration of an actual execution.
+
+    Bounds concurrent test suite executions via the shared "test"
+    semaphore (ceiling ``TEST_MAX_CONCURRENCY``, bounded wait
+    ``TEST_LOCK_TIMEOUT``). Only ACTUAL executions acquire a slot — a
+    cached result is served without executing and never blocks on the
+    semaphore, so cache behavior is unchanged (SA-0MTG5U75A001F1RG AC4).
+
+    Raises:
+        TestConcurrencyTimeout: when no slot frees within the bound.
+    """
+    max_workers = _test_semaphore_max_workers()
+    lock_timeout = _test_lock_timeout()
+    sem = Semaphore(
+        TEST_SEMAPHORE_NAME,
+        max_workers=max_workers,
+        timeout=lock_timeout,
+    )
+    try:
+        with sem:
+            yield
+    except TimeoutError as exc:
+        raise TestConcurrencyTimeout(
+            f"test concurrency slot busy: no free slot within "
+            f"{lock_timeout:.0f}s (TEST_MAX_CONCURRENCY={max_workers})"
+        ) from exc
+
+
 def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
     """Run a suite command capturing stdout/stderr."""
     return subprocess.run(
@@ -440,8 +1159,14 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
     ``node --test "tests/node/**/*.mjs"`` pass the glob without literal
     quotes — otherwise node matches zero files and the suite trivially
     "passes" with 0 tests (pre-existing bug fixed with SA-0MSGN5OJ4002OZKY).
+
+    The pytest executable is resolved before spawning so a shell without
+    ``~/.local/bin`` on PATH still runs the suite (SA-0MSQ012QG005N22S);
+    the canonical command (cache key) is unchanged.
     """
-    return _run_cmd(shlex.split(command), cwd=Path(cwd), timeout=timeout)
+    executable = executable_test_command(command)
+    with _test_concurrency_slot():
+        return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
 
 
 def run_suite(
@@ -452,6 +1177,9 @@ def run_suite(
     force: bool = False,
     no_cache: bool = False,
     commands: list[str] | None = None,
+    scope: str = "full",
+    base_ref: str = "origin/dev",
+    test_type: str = DEFAULT_TEST_TYPE,
 ) -> dict[str, Any]:
     """Run a single named suite and return structured results.
 
@@ -468,19 +1196,78 @@ def run_suite(
     everything else → node parser), mirroring the audit's
     ``_run_tests_via_test_skill``.
 
+    *scope* ("full" or "changed") selects which tests run: ``full`` resolves
+    the repo's full suite (existing behavior); ``changed`` resolves only
+    tests touching files edited on this branch (via
+    :func:`changed_scope_commands`), filtering the selection to the named
+    suite (pytest commands for ``name="pytest"``, node commands for
+    ``name="node"``, everything for ``name="all"``). When ``changed``
+    cannot produce a subset for this suite (custom suite commands, no
+    selection, no applicable commands), it falls back to the full suite and
+    reports ``scope: "full"`` in the result so consumers never mistake a
+    partial run for a full one. The result always carries ``scope``
+    ("full"|"changed") and, for changed scope, ``changed_files`` (the file
+    set that drove selection). The scope is recorded in the per-repo test
+    cache metadata (``run_cached(scope=...)``) so read-only consumers can
+    reject partial runs as full-suite evidence.
+
+    *test_type* selects the command profile (``full`` default, ``unit``,
+    ``smoke``, or a locally-defined type). It is orthogonal to *scope*:
+    ``test_type`` chooses the profile, *scope* chooses full-vs-changed within
+    it. Only ``full`` populates the audit-accepted full-suite cache entry;
+    other types use independent cache keys and record ``type`` in the result.
+
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
-    ``cached`` and (on missing binary) ``notice``.
+    ``cached``, ``scope``, ``type`` and (on missing binary) ``notice``.
     """
     cwd = cwd or REPO_ROOT
+    resolvable_scope = "full"
+    changed_files: set[str] = set()
     if commands is None:
-        if name == "pytest":
-            commands = [pytest_command()]
-        elif name == "node":
-            commands = node_suite_commands()
-        elif name == "all":
-            commands = full_suite_commands(cwd)
-        else:
-            raise ValueError(f"unknown suite: {name}")
+        if scope == "changed" and test_type == DEFAULT_TEST_TYPE:
+            # Changed-file selection drives every suite name; the selection is
+            # narrowed to the named suite below. Any failure to produce a
+            # subset (custom suiteCommands, no selection) falls back to full.
+            changed_files = compute_changed_files(cwd, base_ref=base_ref)
+            changed_commands = changed_scope_commands(
+                cwd, base_ref=base_ref, changed_files=changed_files
+            )
+            if changed_commands is not None:
+                cmds = changed_commands
+                if name == "pytest":
+                    cmds = [c for c in cmds if "pytest" in c]
+                elif name == "node":
+                    cmds = [c for c in cmds if "node" in c]
+                if cmds:
+                    commands = cmds
+                    resolvable_scope = "changed"
+        if commands is None:
+            # Full scope (including changed-scope fallback — report "full" so
+            # consumers never treat a partial selection as complete).
+            if test_type == DEFAULT_TEST_TYPE:
+                # Legacy name-based resolution (AC5, unchanged for full runs).
+                if name == "pytest":
+                    commands = [pytest_command()]
+                elif name == "node":
+                    commands = node_suite_commands(cwd)
+                elif name == "all":
+                    commands = full_suite_commands(cwd)
+                else:
+                    raise ValueError(f"unknown suite: {name}")
+            else:
+                type_cmds = resolve_type_commands(cwd, test_type)
+                commands = filter_commands_for_suite(name, type_cmds)
+                if not commands:
+                    raise TypeResolutionError(
+                        f"Test type '{test_type}' defines no commands for the "
+                        f"'{name}' suite (resolved: {', '.join(type_cmds)})."
+                    )
+            resolvable_scope = "full"
+    else:
+        # Explicit command override (a resolved type profile, or a test): a
+        # changed subset cannot be derived from an opaque override, so the run
+        # is full-profile and honestly reports scope=full.
+        resolvable_scope = "full"
     command = " && ".join(commands)
 
     all_failures: list[dict[str, str]] = []
@@ -497,13 +1284,20 @@ def run_suite(
                     ttl=CACHE_TTL_SECONDS,
                     timeout=timeout,
                     runner=_cached_runner,
+                    scope=resolvable_scope,
+                    test_type=test_type,
                 )
                 proc = SimpleNamespace(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
                 )
                 cached_flags.append(run["cached"])
             else:
-                proc = _run_cmd(shlex.split(cmd), cwd=cwd, timeout=timeout)
+                with _test_concurrency_slot():
+                    proc = _run_cmd(
+                        shlex.split(executable_test_command(cmd)),
+                        cwd=cwd,
+                        timeout=timeout,
+                    )
                 cached_flags.append(False)
         except FileNotFoundError as exc:
             return {
@@ -512,6 +1306,9 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"command not found: {exc.filename}",
+                "scope": resolvable_scope,
+                "type": test_type,
+                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
         except subprocess.TimeoutExpired:
             return {
@@ -520,6 +1317,23 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"suite timed out after {timeout}s: {name}",
+                "scope": resolvable_scope,
+                "type": test_type,
+                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
+            }
+        except TestConcurrencyTimeout as exc:
+            # Concurrency ceiling stayed saturated past the bounded wait:
+            # report a clear failure notice (never a crash, never fail-fast
+            # before the bound) — SA-0MTG5U75A001F1RG AC1.
+            return {
+                "success": False,
+                "returncode": None,
+                "command": command,
+                "failures": [],
+                "notice": str(exc),
+                "scope": resolvable_scope,
+                "type": test_type,
+                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
 
         output = f"{proc.stdout}\n{proc.stderr}"
@@ -537,6 +1351,9 @@ def run_suite(
         "command": command,
         "failures": all_failures,
         "cached": use_cache and all(cached_flags) if cached_flags else False,
+        "scope": resolvable_scope,
+        "type": test_type,
+        "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
         "notice": "",
     }
 
@@ -548,6 +1365,10 @@ def run_all(
     use_cache: bool = True,
     force: bool = False,
     no_cache: bool = False,
+    scope: str = "full",
+    base_ref: str = "origin/dev",
+    commands: list[str] | None = None,
+    test_type: str = DEFAULT_TEST_TYPE,
 ) -> dict[str, Any]:
     """Run the selected suites and aggregate failures.
 
@@ -556,29 +1377,49 @@ def run_all(
     no-pytest repo never runs a phantom pytest command, and a vitest/npm repo
     runs its real ``npm --silent test``. Explicit ``("pytest",)``/``("node",)``
     selections keep the historical per-suite behavior.
+
+    *scope*: ``"changed"`` resolves changed-file-selected tests for the
+    ``"all"`` suite (falling back to full when a subset is impossible); the
+    result carries ``scope`` so consumers can distinguish partial from full.
+
+    *commands* / *test_type*: an explicit typed command profile (resolved by
+    :func:`resolve_type_commands`) and the type name it belongs to. The type
+    is recorded in each suite result and in the aggregate.
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
     notices: list[str] = []
-    for name in suites:
-        result = run_suite(
-            name,
-            cwd=cwd,
-            timeout=timeout,
-            use_cache=use_cache,
-            force=force,
-            no_cache=no_cache,
-        )
-        results[name] = result
-        for failure in result["failures"]:
-            all_failures.append({**failure, "suite": name})
-        if result.get("notice"):
-            notices.append(result["notice"])
+    resolved_scopes: list[str] = []
+    with Timer("run_all") as _all_timer:
+        for name in suites:
+            with Timer(f"suite:{name}"):
+                result = run_suite(
+                    name,
+                    cwd=cwd,
+                    timeout=timeout,
+                    use_cache=use_cache,
+                    force=force,
+                    no_cache=no_cache,
+                    commands=commands,
+                    scope=scope,
+                    base_ref=base_ref,
+                    test_type=test_type,
+                )
+            results[name] = result
+            resolved_scopes.append(result["scope"])
+            for failure in result["failures"]:
+                all_failures.append({**failure, "suite": name})
+            if result.get("notice"):
+                notices.append(result["notice"])
     return {
         "success": all(r["success"] for r in results.values()),
         "suites": results,
         "failures": all_failures,
         "notices": notices,
+        "scope": scope,
+        "type": test_type,
+        "resolved_scopes": resolved_scopes,
+        "timing": _all_timer.to_dict(),
     }
 
 
@@ -603,8 +1444,18 @@ def rerun_failures(
             stable.append(failure)
             continue
         try:
-            proc = _run_cmd(cmd.split(), cwd=cwd or REPO_ROOT, timeout=timeout)
+            with _test_concurrency_slot():
+                proc = _run_cmd(
+                    shlex.split(executable_test_command(cmd)),
+                    cwd=cwd or REPO_ROOT,
+                    timeout=timeout,
+                )
         except FileNotFoundError:
+            stable.append(failure)
+            continue
+        except TestConcurrencyTimeout as exc:
+            # Saturation prevented the rerun: keep as stable with a note.
+            failure["note"] = f"rerun skipped (concurrency saturated): {exc}"
             stable.append(failure)
             continue
         if proc.returncode == 0:
@@ -631,6 +1482,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which suite(s) to run (default: all).",
     )
     parser.add_argument(
+        "--type",
+        dest="test_type",
+        default=DEFAULT_TEST_TYPE,
+        metavar="TYPE",
+        help="Test type/profile to run: 'full' (default), 'unit', 'smoke', or "
+        "any type defined by the project's local test extension "
+        "(.pi/skills_extensions/test/extension.json). The type selects the "
+        "command profile; --scope selects full-vs-changed within it. Only "
+        "'full' populates the audit-accepted full-suite cache entry.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit JSON output.",
@@ -645,7 +1507,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-run failing tests once to verify flakiness before triage.",
     )
-    parser.add_argument("--timeout", type=int, default=600, help="Per-suite timeout in seconds.")
+    parser.add_argument("--timeout", type=int, default=None, help="Per-suite timeout in seconds.")
     parser.add_argument(
         "--no-cache",
         action="store_true",
@@ -673,6 +1535,22 @@ def build_parser() -> argparse.ArgumentParser:
         "cwd via git rev-parse --show-toplevel, falling back to the framework "
         "install location).",
     )
+    parser.add_argument(
+        "--scope",
+        choices=("full", "changed"),
+        default="full",
+        help="Which tests to run: 'full' (default, the entire suite) or "
+        "'changed' (only tests touching files edited on this branch, fast "
+        "feedback for feature-branch validation). 'changed' falls back to "
+        "full when a subset cannot be resolved (custom suite commands, no "
+        "changed files, no selectable tests).",
+    )
+    parser.add_argument(
+        "--target-branch",
+        default=None,
+        help="Base branch for changed-file detection (default: origin/dev, "
+        "falling back to local 'dev' then HEAD~1).",
+    )
     return parser
 
 
@@ -680,88 +1558,173 @@ def run_summary(
     suites: tuple[str, ...],
     cwd: Path | None = None,
     pattern: str | None = None,
+    test_type: str = DEFAULT_TEST_TYPE,
+    commands: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return summary lines for each suite from the cache, executing nothing.
 
     Suites with no cached entry report a clear miss. The result carries
     ``success`` (True only when every selected suite had a cached entry),
-    ``lines`` per suite, and ``missing`` (list of suite names). The ``"all"``
-    suite resolves commands via ``full_suite_commands(cwd)`` — the single
-    source of truth (F2 AC4).
+    ``lines`` per suite, ``scopes`` (the recorded scope of the cached entry
+    per suite — ``"full"``, ``"changed"``, or ``"mixed"`` when the suite's
+    commands resolve to entries with different scopes), ``types`` (the
+    recorded test type per suite, same ``"mixed"``/``"missing"`` rules) and
+    ``missing`` (list of suite names). A ``changed``-scope summary is NOT
+    full-suite verification — consumers must treat it as partial evidence
+    (the audit skill rejects changed-scope entries for full-suite ACs). The
+    ``"all"`` suite resolves commands via ``full_suite_commands(cwd)`` — the
+    single source of truth (F2 AC4) — unless an explicit typed *commands*
+    profile is supplied.
     """
     cwd = cwd or REPO_ROOT
-    result: dict[str, Any] = {"lines": {}, "missing": [], "success": True}
+    result: dict[str, Any] = {
+        "lines": {},
+        "scopes": {},
+        "types": {},
+        "missing": [],
+        "success": True,
+    }
     for name in suites:
-        if name == "pytest":
-            commands = [pytest_command()]
+        if commands is not None:
+            suite_commands = filter_commands_for_suite(name, commands)
+        elif name == "pytest":
+            suite_commands = [pytest_command()]
         elif name == "node":
-            commands = node_suite_commands()
+            suite_commands = node_suite_commands(cwd)
         else:
-            commands = full_suite_commands(cwd)
+            suite_commands = full_suite_commands(cwd)
         lines: list[str] = []
-        for cmd in commands:
-            entry = query_cached(cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS)
+        scopes: set[str] = set()
+        types: set[str] = set()
+        for cmd in suite_commands:
+            entry = query_cached(
+                cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS, test_type=test_type
+            )
             if entry is None:
                 result["missing"].append(name)
                 result["success"] = False
                 continue
             lines.extend(summary_lines(entry["stdout"], entry["stderr"], pattern=pattern))
+            scopes.add(entry.get("scope", "full"))
+            types.add(entry.get("test_type", "full"))
         result["lines"][name] = lines
+        result["scopes"][name] = "mixed" if len(scopes) > 1 else (next(iter(scopes)) if scopes else "missing")
+        result["types"][name] = "mixed" if len(types) > 1 else (next(iter(types)) if types else "missing")
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     suites = (args.suite,)
+    test_type = args.test_type
 
     # Resolve the project root: explicit flag wins, else detect from cwd at
     # CLI time so a non-framework invocation tests that project (SA-0MSNQV9J20010LE7).
     project_root = Path(args.project_root).resolve() if args.project_root else detect_project_root()
 
+    # Validate the requested type against the allowed set (minimum set plus any
+    # locally-defined types) and report the full list on error (AC1/AC3).
+    try:
+        allowed_types = allowed_test_types(project_root)
+    except SkillExtensionError as exc:
+        print(f"run_tests: {exc}", file=sys.stderr)
+        return 2
+    if test_type not in allowed_types:
+        print(
+            f"run_tests: unknown test type '{test_type}'. Allowed types: "
+            f"{', '.join(allowed_types)}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Resolve the type's command profile once, failing fast with a clear
+    # diagnostic — never silently substituting the full suite (AC2/AC4).
+    try:
+        type_commands = resolve_type_commands(project_root, test_type)
+    except (TypeResolutionError, SkillExtensionError) as exc:
+        print(f"run_tests: {exc}", file=sys.stderr)
+        return 2
+
+    # Legacy path (AC5): a full-type run with no local override lets run_suite
+    # resolve by suite name exactly as before. Otherwise the resolved profile
+    # is passed explicitly and narrowed to --suite.
+    if test_type == DEFAULT_TEST_TYPE and type_commands == full_suite_commands(project_root):
+        override_commands: list[str] | None = None
+    else:
+        override_commands = filter_commands_for_suite(args.suite, type_commands)
+        if not override_commands:
+            print(
+                f"run_tests: test type '{test_type}' defines no commands for "
+                f"the '{args.suite}' suite.",
+                file=sys.stderr,
+            )
+            return 2
+
     # Per-command timeout: explicit --timeout wins, else the extension file's
     # timeoutPerCommand (F2 AC1), else the default 600.
     timeout = args.timeout or suite_timeout_per_command(project_root) or 600
 
-    if args.summary:
-        summary = run_summary(suites, cwd=project_root, pattern=args.summary_grep)
+    with Timer("run_tests") as _root_timer:
+        if args.summary:
+            with Timer("run_summary"):
+                summary = run_summary(
+                    suites,
+                    cwd=project_root,
+                    pattern=args.summary_grep,
+                    test_type=test_type,
+                    commands=override_commands,
+                )
+            if args.json:
+                summary["timing"] = _root_timer.to_dict()
+                print(json.dumps(summary, indent=2))
+            else:
+                for name, lines in summary["lines"].items():
+                    if name in summary["missing"]:
+                        print(f"{name}: no cached result — run the suite first or use --force")
+                    else:
+                        scope = summary["scopes"].get(name, "full")
+                        recorded_type = summary["types"].get(name, test_type)
+                        print(f"{name} summary ({scope} scope, type={recorded_type}):")
+                        for line in lines:
+                            print(f"  {line}")
+                print(_root_timer.render(), file=sys.stderr)
+            return 0 if summary["success"] else 1
+
+        result = run_all(
+            suites=suites,
+            cwd=project_root,
+            timeout=timeout,
+            use_cache=not args.no_cache,
+            force=args.force,
+            no_cache=args.no_cache,
+            scope=args.scope,
+            base_ref=args.target_branch or "origin/dev",
+            commands=override_commands,
+            test_type=test_type,
+        )
+
+        if args.rerun_failures and result["failures"]:
+            with Timer("rerun_failures"):
+                result["failures"] = rerun_failures(result["failures"], timeout=timeout)
+            result["success"] = all(r["success"] for r in result["suites"].values()) and not result["failures"]
+
         if args.json:
-            print(json.dumps(summary, indent=2))
+            result["timing"] = _root_timer.to_dict()
+            print(json.dumps(result, indent=2))
         else:
-            for name, lines in summary["lines"].items():
-                if name in summary["missing"]:
-                    print(f"{name}: no cached result — run the suite first or use --force")
-                else:
-                    print(f"{name} summary:")
-                    for line in lines:
-                        print(f"  {line}")
-        return 0 if summary["success"] else 1
-
-    result = run_all(
-        suites=suites,
-        cwd=project_root,
-        timeout=timeout,
-        use_cache=not args.no_cache,
-        force=args.force,
-        no_cache=args.no_cache,
-    )
-
-    if args.rerun_failures and result["failures"]:
-        result["failures"] = rerun_failures(result["failures"], timeout=timeout)
-        result["success"] = all(r["success"] for r in result["suites"].values()) and not result["failures"]
-
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        for name, suite_result in result["suites"].items():
-            status = "PASS" if suite_result["success"] else "FAIL"
-            cached = " [cached]" if suite_result.get("cached") else ""
-            print(f"{name}: {status}{cached} ({suite_result['command']})")
-            if suite_result.get("notice"):
-                print(f"  notice: {suite_result['notice']}")
-            for failure in suite_result["failures"]:
-                print(f"  FAILED: {failure['test_name']}")
-        for notice in result["notices"]:
-            print(f"notice: {notice}")
+            for name, suite_result in result["suites"].items():
+                status = "PASS" if suite_result["success"] else "FAIL"
+                cached = " [cached]" if suite_result.get("cached") else ""
+                scope = f" [{suite_result.get('scope', 'full')} scope]"
+                type_info = f" [type {suite_result.get('type', test_type)}]"
+                print(f"{name}: {status}{cached}{scope}{type_info} ({suite_result['command']})")
+                if suite_result.get("notice"):
+                    print(f"  notice: {suite_result['notice']}")
+                for failure in suite_result["failures"]:
+                    print(f"  FAILED: {failure['test_name']}")
+            for notice in result["notices"]:
+                print(f"notice: {notice}")
+            print(_root_timer.render(), file=sys.stderr)
 
     return 0 if result["success"] else 1
 

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
+from pathlib import Path
 from typing import Any
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+_SKILLS_ROOT_STR = str(_SKILLS_ROOT)
+if _SKILLS_ROOT_STR in sys.path:
+    sys.path.remove(_SKILLS_ROOT_STR)
+sys.path.insert(0, _SKILLS_ROOT_STR)
 
-from skill.cleanup.scripts import lib
+from cleanup.scripts import lib
 
 
 def get_unpushed_count(runner: lib.CommandRunner, branch: str) -> int:

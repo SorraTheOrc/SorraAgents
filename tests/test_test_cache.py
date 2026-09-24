@@ -8,15 +8,16 @@ pipeline normalization sharing, and read-only query mode.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-from skill.test_cache import (
+from test_cache import (
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
+    _default_runner,
     cache_dir,
     compute_git_state,
     lookup,
@@ -414,7 +415,7 @@ def test_store_replaces_existing_entry(git_repo: Path) -> None:
 def _key_for(command: str, git_state: str) -> str:
     """Compute the cache key directory name (mirrors the module internals)."""
 
-    from skill.test_cache import cache_key
+    from test_cache import cache_key
 
     return cache_key(normalize_test_command(command), git_state)
 
@@ -485,3 +486,79 @@ def test_failed_run_ttl_constant_is_short() -> None:
     """The failed-run TTL must be strictly shorter than the default TTL."""
     assert FAILED_RUN_TTL_SECONDS > 0
     assert FAILED_RUN_TTL_SECONDS < DEFAULT_TTL_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# PATH augmentation for user-installed executables (SA-0MSUZAJPC003BS66)
+# ---------------------------------------------------------------------------
+
+
+def test_default_runner_prepends_local_bin_to_path(git_repo: Path) -> None:
+    """_default_runner must prepend ~/.local/bin to PATH for subprocess calls.
+
+    When the audit runner spawns suite commands in a restricted environment
+    (missing ~/.local/bin on PATH), user-installed executables like pytest
+    must still be found (SA-0MSUZAJPC003BS66).
+    """
+    captured_env: dict[str, str] = {}
+    original_path = os.environ.get("PATH", "")
+    local_bin = os.path.expanduser("~/.local/bin")
+    # Remove ~/.local/bin from PATH to simulate the restricted environment.
+    path_parts = [p for p in original_path.split(os.pathsep) if p != local_bin]
+    os.environ["PATH"] = os.pathsep.join(path_parts)
+
+    try:
+        import subprocess as sp
+        orig_run = sp.run
+
+        def fake_run(cmd, **kwargs):
+            captured_env["PATH"] = kwargs.get("env", {}).get("PATH", "")
+            return SimpleNamespace(stdout="ok\n", stderr="", returncode=0)
+
+        sp.run = fake_run  # type: ignore[assignment]
+        try:
+            _default_runner("pytest -q", str(git_repo), 60)
+            path_value = captured_env.get("PATH", "")
+            assert path_value is not None, "PATH not captured from subprocess.run call"
+            # ~/.local/bin must be first on PATH.
+            assert path_value.startswith(local_bin + os.pathsep), (
+                f"~/.local/bin not at front of PATH: {path_value}"
+            )
+        finally:
+            sp.run = orig_run  # type: ignore[assignment]
+    finally:
+        os.environ["PATH"] = original_path
+
+
+def test_default_runner_skips_dup_when_local_bin_already_on_path(git_repo: Path) -> None:
+    """When ~/.local/bin is already on PATH, _default_runner must not duplicate it.
+
+    The runner checks before prepending so the path stays clean for callers
+    that already have the directory configured.
+    """
+    captured_env: dict[str, str] = {}
+    original_path = os.environ.get("PATH", "")
+    # Prepend ~/.local/bin to our own PATH so it is already present.
+    local_bin = os.path.expanduser("~/.local/bin")
+    if local_bin not in original_path:
+        os.environ["PATH"] = local_bin + os.pathsep + original_path
+
+    try:
+        import subprocess as sp
+        orig_run = sp.run
+
+        def fake_run(cmd, **kwargs):
+            captured_env["PATH"] = kwargs.get("env", {}).get("PATH", "")
+            return SimpleNamespace(stdout="ok\n", stderr="", returncode=0)
+
+        sp.run = fake_run  # type: ignore[assignment]
+        try:
+            _default_runner("pytest -q", str(git_repo), 60)
+            # Count occurrences — should be exactly one.
+            parts = captured_env["PATH"].split(os.pathsep)
+            count = parts.count(local_bin)
+            assert count == 1, f"~/.local/bin appears {count} times in PATH: {captured_env['PATH']}"
+        finally:
+            sp.run = orig_run  # type: ignore[assignment]
+    finally:
+        os.environ["PATH"] = original_path

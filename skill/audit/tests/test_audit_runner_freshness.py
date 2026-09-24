@@ -14,8 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-
-from skill.audit.scripts import audit_runner
+from audit.scripts import audit_runner
 
 
 @pytest.fixture(autouse=True)
@@ -435,6 +434,44 @@ class TestContentFreshnessGate:
         )
         assert self._check(run_wl) is None
 
+    def test_legacy_audit_persistence_write_within_tolerance_is_fresh(self):
+        """SA-0MTHC710X003ORZM / SA-0MSI3XH34001LLU4: legacy (fingerprint-less)
+        audits whose updatedAt is the runner's own persistence write (wl
+        audit-set + wl update --audit-text, ≤ 30 s after auditedAt) are
+        treated as fresh even though auditedAt <= updatedAt + 60 s.
+
+        Without this tolerance a just-persisted legacy audit would be marked
+        stale by the time gate and the selection list would show \u23f3 instead
+        of \u2705. Mirrors the child gate at _get_child_audit_verdict:4849."""
+        legacy_report = "Ready to close: Yes\n\n## Summary\nlegacy audit"
+        # auditedAt 00:00:00, updatedAt 00:00:10 (own write, within 30 s) → fresh
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-01T00:00:10.000Z",
+        )
+        assert self._check(run_wl) == legacy_report
+
+        # Boundary: exactly 30 s is still fresh (inclusive, per timedelta check)
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-01T00:00:30.000Z",
+        )
+        assert self._check(run_wl) == legacy_report
+
+        # Just past tolerance (31 s) and still inside the 60 s freshness buffer
+        # — NOT fresh, because the gap is no longer the runner's own write.
+        # (The 60 s buffer measures auditedAt > updatedAt + 60; here auditedAt
+        # is BEFORE updatedAt so the time gate fails, and 31 s > 30 s so the
+        # tolerance also fails.)
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-01T00:00:31.000Z",
+        )
+        assert self._check(run_wl) is None
+
     def test_fingerprint_gate_not_blocked_by_recent_update(self):
         """AC1: the content gate skips even when updatedAt moved after the
         audit (e.g. a comment added) — the 60s floor only applies to legacy
@@ -564,7 +601,7 @@ class TestContentFreshnessGate:
                 return_value={"extracted_text": "[]"},
             ),
             mock.patch(
-                "skill.code_review.scripts.code_quality.run_code_quality",
+                "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},
             ),
             mock.patch.object(
@@ -575,4 +612,270 @@ class TestContentFreshnessGate:
                 "TEST-1", persist=False, force=True, runner=_make_runner(),
             )
         assert rc == 0
+
+    # ------------------------------------------------------------------
+    # Freshness skip notice (AC2, SA-0MTFX6HMJ006QKR3): surfaces verdict
+    # + auditedAt so a re-audit short-circuits without needing to read
+    # the full raw report (re-audit coordination, SA-0MSQIA84B005NHWC).
+    # ------------------------------------------------------------------
+
+    def test_fresh_skip_notice_surfaces_verdict_and_timestamp(self):
+        """AC2: the fast-path skip notice names the verdict and auditedAt
+        of the fresh audit instead of a bare 'still fresh' line."""
+        captured = []
+
+        def _make_runner(fp: str):
+            mock_runner = mock.MagicMock()
+
+            def _side_effect(cmd):
+                cmd_str = " ".join(cmd)
+                if "audit-show" in cmd_str:
+                    report = self._report_with_fingerprint(
+                        fp, verdict="Yes",
+                    )
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "auditedAt": "2026-08-01T00:00:00.000Z",
+                                "rawOutput": report,
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "update" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True}), stderr="",
+                    )
+                if "show" in cmd_str and "--children" not in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1",
+                                "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                        }),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            mock_runner.side_effect = _side_effect
+            return mock_runner
+
+        # The stored fingerprint must match the one the gate recomputes at
+        # runtime, so derive it through the same fake runner + mocked HEAD.
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                _make_runner("f" * 64), "TEST-1",
+                work_item={"description": self._DESC},
+            )
+        assert fp is not None
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                return_value={"extracted_text": "[]"},
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+            ),
+            mock.patch(
+                "builtins.print",
+                side_effect=lambda *a, **k: captured.append(
+                    " ".join(str(x) for x in a)
+                ),
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False, runner=_make_runner(fp),
+            )
+        assert rc == 0
+        joined = "\n".join(captured)
+        assert "Skipping: audit still fresh" in joined
+        assert "Ready to close: Yes" in joined
+        assert "2026-08-01T00:00:00.000Z" in joined
+
+    # ------------------------------------------------------------------
+    # AC4 (SA-0MTFX6VD70097OEO): second audit at the same HEAD
+    # short-circuits WITHOUT invoking the model — the re-audit-count
+    # reduction target (re-audit coordination, SA-0MSQIA84B005NHWC).
+    # ------------------------------------------------------------------
+
+    def test_second_audit_same_head_short_circuits_without_model(self):
+        """AC4: auditing twice at the same HEAD reuses the fresh audit; the
+        second run exits 0 and never invokes the model (zero pi calls)."""
+        pi_calls = []
+
+        def _pi(**kwargs):
+            pi_calls.append(kwargs)
+            raise AssertionError(
+                "model must not be invoked when a fresh audit exists "
+                f"(call #{len(pi_calls)}: {kwargs})"
+            )
+
+        def _make_runner(fp: str):
+            mock_runner = mock.MagicMock()
+
+            def _side_effect(cmd):
+                cmd_str = " ".join(cmd)
+                if "audit-show" in cmd_str:
+                    # Existing fresh audit: fingerprint matches the current
+                    # content state (HEAD + description + Key Files + tree).
+                    report = self._report_with_fingerprint(fp, verdict="Yes")
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "auditedAt": "2026-08-01T00:00:00.000Z",
+                                "rawOutput": report,
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "update" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True}), stderr="",
+                    )
+                if "show" in cmd_str and "--children" not in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1",
+                                "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                        }),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            mock_runner.side_effect = _side_effect
+            return mock_runner
+
+        # Deterministic fingerprint for the CURRENT state so the stored
+        # report matches exactly (no 60s time-gate dependence).
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                _make_runner("f" * 64), "TEST-1",
+                work_item={"description": self._DESC},
+            )
+        assert fp is not None
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_pi,
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False, runner=_make_runner(fp),
+            )
+        assert rc == 0
+        assert pi_calls == [], "the fresh audit short-circuit must skip the model"
+
+    def test_second_audit_force_still_invokes_model(self):
+        """AC4 (guard): --force bypasses the short-circuit — the model IS
+        invoked even with a matching fresh audit (re-audit target: only
+        stale/forced re-audits are allowed)."""
+        pi_calls = []
+
+        def _make_runner(fp: str):
+            mock_runner = mock.MagicMock()
+
+            def _side_effect(cmd):
+                cmd_str = " ".join(cmd)
+                if "audit-show" in cmd_str:
+                    report = self._report_with_fingerprint(fp, verdict="Yes")
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "auditedAt": "2026-08-01T00:00:00.000Z",
+                                "rawOutput": report,
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "update" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True}), stderr="",
+                    )
+                if "show" in cmd_str and "--children" not in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1",
+                                "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "--children" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1", "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                            "children": [],
+                        }),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            mock_runner.side_effect = _side_effect
+            return mock_runner
+
+        # The full pipeline needs code_quality + _call_pi to succeed; the
+        # model invocation IS recorded (proving --force re-audits).
+        def _pi(*args, **kwargs):
+            pi_calls.append(kwargs.get("prompt", "")[:50])
+            return {"extracted_text": "[]"}
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_pi,
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=_make_runner("f" * 64),
+            )
+        assert rc == 0
+        assert pi_calls, "--force must bypass the fresh-audit short-circuit"
 

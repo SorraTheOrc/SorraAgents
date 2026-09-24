@@ -19,6 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from audit.tests.wl_helpers import make_stateful_runner
+
 
 def _mock_result(returncode=0, stdout="", stderr=""):
     result = MagicMock(spec=subprocess.CompletedProcess)
@@ -33,7 +35,7 @@ class TestCodeQualityFileScoping:
 
     def test_run_code_quality_forwards_files_to_linters(self):
         """run_code_quality passes the files list through to the linter runner."""
-        from skill.code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.code_quality import run_code_quality
 
         captured = {}
 
@@ -47,7 +49,7 @@ class TestCodeQualityFileScoping:
             }
 
         with patch(
-            "skill.code_review.scripts.code_quality.run_linters_for_project",
+            "code_review.scripts.code_quality.run_linters_for_project",
             side_effect=fake_linters,
         ):
             result = run_code_quality(
@@ -60,7 +62,7 @@ class TestCodeQualityFileScoping:
 
     def test_run_code_quality_defaults_files_none(self):
         """Without files, the whole-project behavior is preserved (files=None)."""
-        from skill.code_review.scripts.code_quality import run_code_quality
+        from code_review.scripts.code_quality import run_code_quality
 
         captured = {}
 
@@ -73,7 +75,7 @@ class TestCodeQualityFileScoping:
             }
 
         with patch(
-            "skill.code_review.scripts.code_quality.run_linters_for_project",
+            "code_review.scripts.code_quality.run_linters_for_project",
             side_effect=fake_linters,
         ):
             run_code_quality(str(REPO_ROOT), runner=MagicMock())
@@ -83,7 +85,7 @@ class TestCodeQualityFileScoping:
     def test_run_linters_for_project_scopes_ruff_command(self):
         """run_linters_for_project passes files to run_ruff, which targets only
         the scoped files in the ruff command."""
-        from skill.code_review.scripts.linter_runner import run_linters_for_project
+        from code_review.scripts.linter_runner import run_linters_for_project
 
         commands: list[list[str]] = []
 
@@ -92,9 +94,9 @@ class TestCodeQualityFileScoping:
             return _mock_result(returncode=0, stdout="")
 
         with (
-            patch("skill.code_review.scripts.linter_runner.detect_languages",
+            patch("code_review.scripts.linter_runner.detect_languages",
                   return_value=["python"]),
-            patch("skill.code_review.scripts.linter_runner.probe_linter",
+            patch("code_review.scripts.linter_runner.probe_linter",
                   return_value={"name": "ruff", "available": True}),
         ):
             run_linters_for_project(
@@ -109,7 +111,7 @@ class TestCodeQualityFileScoping:
 
     def test_run_linters_for_project_full_scan_unchanged(self):
         """Without files, the full-project ruff command is unchanged."""
-        from skill.code_review.scripts.linter_runner import run_linters_for_project
+        from code_review.scripts.linter_runner import run_linters_for_project
 
         commands: list[list[str]] = []
 
@@ -118,9 +120,9 @@ class TestCodeQualityFileScoping:
             return _mock_result(returncode=0, stdout="")
 
         with (
-            patch("skill.code_review.scripts.linter_runner.detect_languages",
+            patch("code_review.scripts.linter_runner.detect_languages",
                   return_value=["python"]),
-            patch("skill.code_review.scripts.linter_runner.probe_linter",
+            patch("code_review.scripts.linter_runner.probe_linter",
                   return_value={"name": "ruff", "available": True}),
         ):
             run_linters_for_project(str(REPO_ROOT), runner=runner)
@@ -131,7 +133,7 @@ class TestCodeQualityFileScoping:
 
     def test_run_shellcheck_filters_by_scope(self):
         """run_shellcheck only checks shell files in the provided scope."""
-        from skill.code_review.scripts.linter_runner import run_shellcheck
+        from code_review.scripts.linter_runner import run_shellcheck
 
         checked: list[str] = []
 
@@ -146,15 +148,140 @@ class TestCodeQualityFileScoping:
             (root / "a.sh").write_text("#!/bin/bash\necho hi\n")
             (root / "b.sh").write_text("#!/bin/bash\necho hi\n")
             with (
-                patch("skill.code_review.scripts.linter_runner.detect_languages",
+                patch("code_review.scripts.linter_runner.detect_languages",
                       return_value=["shell"]),
-                patch("skill.code_review.scripts.linter_runner.probe_linter",
+                patch("code_review.scripts.linter_runner.probe_linter",
                       return_value={"name": "shellcheck", "available": True}),
             ):
                 run_shellcheck(str(root), runner=runner,
                                files=[str(root / "a.sh")])
 
         assert checked == [str(root / "a.sh")], f"got {checked}"
+
+
+# ===========================================================================
+# AC1: _git_changed_files drops non-existent (deleted) paths
+# ===========================================================================
+
+
+class TestGitChangedFilesDropsPhantomPath:
+    """AC1: a duplicated/concatenated phantom path (never existed on
+    disk, e.g. ``skill/audit/skill/skill``) is excluded from the lint
+    scope before any linter runs (SA-0MSXVXW9C0032S7G).
+
+    Pre-fix (no existence filter in ``_git_changed_files``): the phantom
+    path flows into ``ruff check`` → E902 IO error. Post-fix: dropped.
+    """
+
+    def test_concatenated_phantom_path_excluded(self):
+        import tempfile
+
+        from audit.scripts import audit_runner
+
+        # Real temp dir = project root; the phantom path does NOT exist.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # A real changed file that DOES exist, to prove the scope is
+            # not dropped wholesale.
+            real = root / "real.py"
+            real.write_text("x = 1\n")
+
+            phantom = "skill/audit/skill/skill"
+            assert not (root / phantom).exists()
+
+            def fake_runner(cmd):
+                """git reports the phantom + a real changed file."""
+                cmd_str = " ".join(cmd)
+                if "diff --name-only" in cmd_str:
+                    out = f"{phantom}\n{real.name}\n"
+                else:  # status --porcelain
+                    out = f"?? {phantom}\n M {real.name}\n"
+                return _mock_result(returncode=0, stdout=out)
+
+            with patch.object(audit_runner, "TARGET_PROJECT_ROOT",
+                              str(root)):
+                changed = audit_runner._git_changed_files(fake_runner)
+
+            # Phantom dropped; real file kept.
+            assert phantom not in changed, (
+                f"phantom path must be excluded: {changed}"
+            )
+            assert "real.py" in changed
+
+
+class TestGitChangedFilesDropsDeleted:
+    """AC1: _git_changed_files drops non-existent (deleted) paths.
+
+    A tracked file that has been deleted appears in ``git diff
+    --name-only HEAD`` as a ghost path.  Linting such a path makes ruff
+    fail with ``E902`` (IO error) and the remediation loop then writes
+    junk per-file-ignores for machine-absolute paths (SA-0MSXVXVUL0011JKX).
+
+    Post-fix: deleted paths are filtered so they never reach the linter.
+    Pre-fix (without the filter) this test fails.
+    """
+    def test_deleted_tracked_file_not_in_changed_list(self):
+        import tempfile
+
+        # Create a real git repo with a tracked Python file.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            marker = repo / "_marker.py"
+            marker.write_text("x = 1  # unused var\n")  # F841 trigger
+
+            def _git(*args, cwd):
+                return subprocess.run(
+                    ["git", *args], cwd=str(cwd), check=True,
+                    capture_output=True, text=True,
+                )
+
+            _git("init", cwd=repo)
+            _git("config", "user.email", "test@test.com", cwd=repo)
+            _git("config", "user.name", "Test", cwd=repo)
+            _git("add", "-A", cwd=repo)
+            _git("commit", "-m", "init", cwd=repo)
+
+            # Delete the tracked file — now a ghost path.
+            marker.unlink()
+
+            # Verify git diff lists it (the ghost path exists).
+            diff = _git("diff", "--name-only", "HEAD", cwd=repo)
+            assert "_marker.py" in diff.stdout, (
+                "git should list _marker.py as deleted"
+            )
+
+            # Call _git_changed_files with a runner that executes git
+            # from inside the test repo so paths are repo-relative.
+            from audit.scripts import audit_runner
+
+            def git_runner(cmd):
+                return subprocess.run(
+                    list(cmd), cwd=str(repo),
+                    capture_output=True, text=True, check=False,
+                )
+
+            with patch.object(audit_runner, "TARGET_PROJECT_ROOT",
+                              str(repo)):
+                changed = audit_runner._git_changed_files(git_runner)
+
+            # The deleted file must NOT appear — lint scope excludes it.
+            assert "_marker.py" not in changed, (
+                f"deleted file must be dropped from lint scope: {changed}"
+            )
+
+            # Also verify _git_changed_files includes only existing files.
+            for path in changed:
+                candidate = Path(path)
+                if not candidate.is_absolute():
+                    assert (Path(repo) / candidate).exists(), (
+                        f"{path!r} should exist on disk"
+                    )
+
+
+# ===========================================================================
+# The audit path invokes code quality scoped + read-only (fix=False).
+# ===========================================================================
 
 
 class TestAuditReadOnlyCodeQuality:
@@ -164,7 +291,7 @@ class TestAuditReadOnlyCodeQuality:
         """cmd_issue scopes the code-quality scan to git changed files and
         never passes fix=True (read-only mandate)."""
         sys.path.insert(0, str(REPO_ROOT))
-        from skill.audit.scripts import audit_runner
+        from audit.scripts import audit_runner
 
         captured = {}
 
@@ -209,15 +336,17 @@ class TestAuditReadOnlyCodeQuality:
                          return_value={"extracted_text": json.dumps([
                              {"index": 0, "verdict": "met", "evidence": "f.py:1"},
                          ])}),
-            patch("skill.code_review.scripts.code_quality.run_code_quality",
+            patch("code_review.scripts.code_quality.run_code_quality",
                   side_effect=fake_run_code_quality),
             patch.object(audit_runner, "_git_changed_files",
                          return_value=["src/a.py", "src/b.py"]),
             patch.object(audit_runner, "_run_phase2_deep_analysis",
                          side_effect=lambda issue, ac, ch, **kw: (ac, ch, True)),
         ):
-            rc = audit_runner.cmd_issue("TEST-1", persist=False, force=True,
-                                        runner=fake_runner)
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True,
+                runner=make_stateful_runner(fake_runner),
+            )
 
         assert rc == 0
         assert captured["fix"] is False, "audits must be read-only (fix=False)"
