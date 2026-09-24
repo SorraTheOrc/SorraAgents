@@ -135,8 +135,8 @@ Work item: <id> | Related: 3 | Repo matches: 2 | Added IDs: REL-001, REL-002
 
 ### Runtime expectations
 
-Clean runs finish in **~2–4s** (v3): worklog search is bounded to
-`MAX_SEARCH_KEYWORDS` (8) per-keyword subprocesses (~0.5s each) instead of one
+Typical runs finish in **~3–6s** (v3): worklog search is bounded to
+`MAX_SEARCH_KEYWORDS` (8) per-keyword subprocesses (~0.4–0.5s each) instead of one
 per extracted keyword (96% of v2 runtime was subprocess waits; the polluted
 review item hit 523 spawns / unbounded wall-clock). Keyword extraction never
 reads the skill's own report and is frequency-ranked, so re-runs do not grow
@@ -144,6 +144,11 @@ slower over time (pre-fix feedback loop: 14 → 82 → 523 keywords). Repo
 scanning excludes `.worklog` (~83% of scanned files) so stale worktrees and
 the sidecar full report are neither read nor matched. See
 `docs/dev/find-related-v3-analysis.md` for the measured before/after.
+
+> **Note:** Actual timing varies by machine. Measured ~5–6s on a typical
+> development machine (8 searches at ~0.43s each + semantic probe + repo scan).
+> The v3 analysis measured ~3s on a faster machine; the bottleneck is per-subprocess
+> latency, not algorithmic complexity.
 
 ### Idempotency
 
