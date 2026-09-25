@@ -32,7 +32,6 @@ if str(_RUNNER_DIR) not in _sys.path:
     _sys.path.insert(0, str(_RUNNER_DIR))
 
 import run_tests
-
 from run_tests import (
     build_parser,
     changed_scope_commands,
@@ -41,6 +40,7 @@ from run_tests import (
     run_all,
     run_suite,
 )
+from shared.git_sandbox import commit_all, init_repo, run_git
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -49,8 +49,7 @@ from run_tests import (
 
 def _make_repo(tmp_path: Path) -> Path:
     """Create a minimal git repo with test and source files."""
-    repo = tmp_path / "test_repo"
-    repo.mkdir()
+    repo = init_repo(tmp_path / "test_repo")
     (repo / "src").mkdir()
     (repo / "tests").mkdir()
 
@@ -64,22 +63,15 @@ def _make_repo(tmp_path: Path) -> Path:
     (repo / "tests" / "test_foo.py").write_text("import src.foo\n")
     (repo / "tests" / "test_bar.py").write_text("import src.bar\n")
 
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
-
-    # Initial commit
-    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+    # Initial commit (identity + hermetic environment come from the sandbox)
+    commit_all(repo, "initial")
 
     # Second commit on dev so HEAD~1 always exists for fallback tests
     (repo / "README.md").write_text("# test repo\n")
-    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "docs: add readme"], cwd=repo, check=True, capture_output=True)
+    commit_all(repo, "docs: add readme")
 
     # Create a remote-like branch for merge-base resolution
-    subprocess.run(["git", "branch", "origin/dev"], cwd=repo, check=True, capture_output=True)
+    run_git(repo, ["branch", "origin/dev"], check=True)
 
     return repo
 

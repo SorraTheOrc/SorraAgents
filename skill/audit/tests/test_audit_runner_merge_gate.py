@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from audit.scripts import audit_runner
 from audit.tests.wl_helpers import make_stateful_runner
+from shared.git_sandbox import commit_all, init_bare_remote, init_repo, run_git
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -87,8 +88,7 @@ def _make_real_repo(tmp_path: Path, prefix: str = "WL",
     """
     projects = tmp_path / "projects"
     owning = projects / "ctxhub"
-    owning.mkdir(parents=True)
-    (owning / "src").mkdir()
+    (owning / "src").mkdir(parents=True)
     (owning / "src" / "main.py").write_text("print('hi')\n", encoding="utf-8")
     (owning / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
     wl_dir = owning / ".worklog"
@@ -100,41 +100,36 @@ def _make_real_repo(tmp_path: Path, prefix: str = "WL",
     origin.mkdir()
 
     def _git(*args: str, cwd: Path) -> str:
-        proc = subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                              capture_output=True, text=True)
+        proc = run_git(cwd, list(args), check=True)
         return proc.stdout.strip()
 
     shas: dict[str, str] = {}
-    _git("init", "--bare", cwd=origin)
-    _git("init", cwd=owning)
-    _git("config", "user.email", "t@t.com", cwd=owning)
-    _git("config", "user.name", "T", cwd=owning)
-    _git("remote", "add", "origin", str(origin), cwd=owning)
+    init_bare_remote(origin, sandbox_root=tmp_path)
+    init_repo(owning, sandbox_root=tmp_path)
+    run_git(owning, ["config", "user.email", "t@t.com"], check=True)
+    run_git(owning, ["config", "user.name", "T"], check=True)
+    run_git(owning, ["remote", "add", "origin", str(origin)], check=True)
     (owning / "src" / "main.py").write_text("print('dev1')\n", encoding="utf-8")
-    _git("add", "-A", cwd=owning)
-    _git("commit", "-m", "dev first", cwd=owning)
+    commit_all(owning, "dev first")
     shas["dev_default"] = _git("rev-parse", "HEAD", cwd=owning)
-    _git("branch", "-M", "dev", cwd=owning)
     if second_dev_commit:
         (owning / "src" / "main.py").write_text(
             "print('dev2')\n", encoding="utf-8"
         )
-        _git("add", "-A", cwd=owning)
-        _git("commit", "-m", "dev second: rename tab", cwd=owning)
+        commit_all(owning, "dev second: rename tab")
     shas["dev_head"] = _git("rev-parse", "HEAD", cwd=owning)
-    _git("push", "origin", "dev", cwd=owning)
+    run_git(owning, ["push", "origin", "dev"], check=True)
 
     if feature_branch:
-        _git("checkout", "-b", f"wl-{issue_id}-rename-tab", shas["dev_head"],
-             cwd=owning)
+        run_git(owning, ["checkout", "-b", f"wl-{issue_id}-rename-tab",
+                         shas["dev_head"]], check=True)
         shas["feature_parent"] = _git("rev-parse", "HEAD", cwd=owning)
         (owning / "src" / "tab.py").write_text(
             "tab = 'Worklog'\n", encoding="utf-8"
         )
-        _git("add", "-A", cwd=owning)
-        _git("commit", "-m", "rename podcast tab to Worklog", cwd=owning)
+        commit_all(owning, "rename podcast tab to Worklog")
         shas["feature_head"] = _git("rev-parse", "HEAD", cwd=owning)
-        _git("checkout", "dev", cwd=owning)
+        run_git(owning, ["checkout", "dev"], check=True)
     return wl_dir, owning, shas
 
 
