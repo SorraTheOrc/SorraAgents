@@ -267,3 +267,86 @@ are legitimate transient worktree placeholders, not incident artefacts.
 **Cleanup safety:** the removal touched only the named fixture branches and the
 stale detached worktree directories; it did not disturb other agents' worktrees
 or unrelated branches, and the `backup-*` tags were retained.
+
+## 7. Verification (F7, SA-0MUG30KZX000TW0S)
+
+Verification of the parent's AC4/AC6 after the F5 guard fix
+(SA-0MUH5KFDV002ORSS) and the companion cleanup (SA-0MUG216UP008821M, commit
+`e36dd153`) had both landed on `dev`.
+
+### 7.1 AC1 — full suite green
+
+```bash
+# from the F7 implement worktree (dev @ e36dd153)
+python3 skill/test/scripts/run_tests.py --scope full --json --no-cache
+```
+
+Result: `success: true`, `failures: []`, `cached: false`, `returncode: 0`
+(930 s, pytest + node suites). No test was skipped, xfailed, or retried to
+reach green.
+
+### 7.2 AC2 — prevention proof (guarded-worktree stand-in)
+
+The plan's fresh-clone stand-in (D8) is **unsound** and was replaced:
+
+- a clone is not owned by the SorraAgents prefix-based project resolution, so
+  the audit launch-context tests resolve `TEST`-prefixed items to unrelated
+  leftovers and the clone lacks the untracked `.worklog` runtime state — a clone
+  run produced 56 spurious failures;
+- an implement worktree is a **real** checkout that shares the live checkout's
+  `.git` (same refs, same local config). A ref/config mutation therefore *would*
+  be visible in the live checkout, making the worktree a **stronger** stand-in
+  than a clone, not a weaker one.
+
+The controlled run (§7.1) snapshotted the **live checkout** with read-only
+plumbing before and after; nothing changed:
+
+```
+refs   sha256  f6f5fb6b...f937a5   (identical before/after; 249 refs)
+config sha256  aefac331...d637cc   (identical)
+status sha256  e3b0c442...b855   (identical; empty — clean tree)
+```
+
+A separate full `git for-each-ref` diff before/after the run is empty. The
+`run_tests.py` F4 guard also reported no mutation (`success: true`).
+
+> **Producer decision (assumption recorded):** AC2's literal "fresh clone" is
+> replaced by the guarded implement-worktree run, per the OPEN QUESTION raised
+> in this item's comment (2026-09-25T13:18Z). Rationale above. Residual risk:
+> pointer to the decision remains for the producer's review at audit time.
+
+### 7.3 AC3 — supervised live-checkout run: not performed
+
+No full-suite run was executed *in* the live checkout. The live checkout was
+only ever snapshotted read-only. Residual risk: the exact live environment was
+not exercised directly; mitigated by the two independent guarded worktree runs
+(F5 commit `1dbfafb9`; F7 controlled run above) and the F4/F5 guards.
+
+### 7.4 AC4 — serialisation with the companion cleanup
+
+Ordering was serialised: the companion cleanup `SA-0MUG216UP008821M` completed
+and was pushed (`e36dd153`) **before** this verification run, so no concurrent
+ref deletion could be mistaken for a mutation. The initial pre-cleanup run that
+saw a ref-count change (250 → 249) was a one-time concurrent event; two
+controlled re-runs (cached and `--no-cache`) showed zero ref change.
+
+### 7.5 AC5 — post-cleanup checkout
+
+```
+git branch --list 'origin/dev' 'feature-x' 'wl-OSL-1-test' 'wl-SA-001-test-feature'   # empty
+git for-each-ref | grep -E 'feature-x|wl-OSL-1-test|wl-SA-001-test-feature|heads/origin/dev'  # none
+ls -d root-file-repo   # absent
+git tag --list 'backup-*'   # backup-corrupt-dev-1790283975, backup-real-dev-6d7b4b4f (retained)
+```
+
+### 7.6 AC6 — parent AC coverage
+
+| Parent AC | Child verification | Status |
+|-----------|--------------------|--------|
+| AC1 hermetic git usage | F2 `tests/test_live_repo_mutation_guard.py`; F3 `skill/shared/tests/test_git_sandbox.py` | met |
+| AC2 reproduction / guard proof | F1 `docs/dev/repro_live_repo_leak.py` (3/3 runs); F2 guard-fires proof | met |
+| AC3 regression guard | F2 guard tests; F4 `run_tests.py` snapshot; F5 root conftest guard (+ SA-0MUH5KFDV002ORSS ordering fix) | met |
+| AC4 live checkout clean | companion SA-0MUG216UP008821M (`e36dd153`); §7.5 above | met |
+| AC5 documentation | F6 `skill/shared/test-writing-guidelines.md` + `skill/test/SKILL.md` | met |
+| AC6 full suite passes | §7.1 (`success: true`, 0 failures) | met |
+
