@@ -69,6 +69,12 @@ class LiveRepoMutationGuard:
     def pytest_runtest_logstart(self, nodeid: str, location: Any) -> None:
         self.last_test = nodeid
 
+    # ``pytest_runtest_teardown`` is the hook pytest uses to finalise fixtures
+    # (including ``monkeypatch``). ``trylast=True`` makes this implementation run
+    # *after* those finalisers, so a test that patch-replaces ``subprocess``
+    # (e.g. the audit queue tests) cannot make the guard's own ``subprocess``
+    # call observe the replacement and crash the session (SA-0MUH5KFDV002ORSS).
+    @pytest.hookimpl(trylast=True)
     def pytest_runtest_teardown(self, item: Any, nextitem: Any) -> None:
         if not self.active:
             return

@@ -249,3 +249,46 @@ class TestNoFalsePositives:
         proc = _run_nested_pytest(root)
 
         assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Teardown ordering — guard must run AFTER fixture finalisation
+# ---------------------------------------------------------------------------
+
+
+class TestTeardownRunsAfterFixtureFinalisation:
+    """Regression: the guard's own ``subprocess`` call must not observe a
+    still-active ``monkeypatch`` of ``subprocess``.
+
+    ``pytest_runtest_teardown`` is the hook pytest uses to finalise fixtures,
+    including ``monkeypatch``. If the guard's implementation of that hook runs
+    first, a test that replaces ``subprocess.Popen`` (as the audit queue tests
+    do) leaves the replacement active while the guard snapshots the repo — the
+    guard then calls ``subprocess.run`` and raises
+    ``TypeError: ... does not support the context manager protocol``, the
+    monkeypatch finaliser never runs, and every later test errors.
+    """
+
+    def test_monkeypatched_subprocess_popen_does_not_break_guard(self, tmp_path):
+        repo = _init_guard_repo(tmp_path)
+        _write_guard_conftest(repo)
+        (repo / "test_patches_subprocess.py").write_text(
+            "import subprocess\n\n"
+            "class _NoContextPopen:\n"
+            "    returncode = 0\n"
+            "    def communicate(self, timeout=None):\n"
+            "        return '', ''\n"
+            "    def kill(self):\n"
+            "        pass\n\n"
+            "def test_patches_popen(monkeypatch):\n"
+            "    monkeypatch.setattr(subprocess, 'Popen', _NoContextPopen)\n"
+            "    assert subprocess.Popen is _NoContextPopen\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(repo)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "TypeError" not in combined, combined
+        assert "live-repo mutation" not in combined, combined
