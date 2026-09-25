@@ -229,7 +229,41 @@ and [`skill/test/SKILL.md`](../../skill/test/SKILL.md) (updated by F6).
 The reproduction leaves the live checkout byte-identical (verified in AC5 of
 this slice): `git for-each-ref` and `git status --porcelain=v1 -uall` hashes
 were identical before and after the three evidence runs (251 refs, clean
-working tree). Removal of the **pre-existing** fixture artefacts left in the
-live checkout (stale branches, stale temp worktrees, backup tags) is delegated
-to the companion item **SA-0MUG216UP008821M**, which is blocked by the
-prevention layer (F3).
+working tree).
+
+### 6.1 Cleanup of pre-existing fixture artefacts
+
+The **pre-existing** artefacts left in the live checkout by the incident were
+removed by the companion item **SA-0MUG216UP008821M** (blocked by the
+prevention layer, F3) once the dirty-tree safety gate cleared:
+
+| Artefact | Disposition |
+|----------|-------------|
+| Fixture branch `feature-x` (`4afe475f`) | Deleted (`git branch -D`) |
+| Fixture branch `wl-OSL-1-test` (`ab56ec6c`) | Deleted (`git branch -D`) |
+| Fixture branch `wl-SA-001-test-feature` (`fe099f2c`) | Deleted (`git branch -D`) |
+| Local branch `origin/dev` (`ea135719`) | Deleted (`git branch -D`); tooling had temporarily renamed it `_stale_origin_dev_backup_SA_test`, so the earlier name-based check missed it |
+| Untracked `root-file-repo/` | Already absent at cleanup time |
+| 13 stale `.worklog/tmp-worktree-*` directories | Removed; `git worktree prune` run |
+| Tags `backup-corrupt-dev-1790283975`, `backup-real-dev-6d7b4b4f` | **Retained** for rollback |
+
+Verified after cleanup:
+
+```bash
+git branch --list 'origin/dev' 'feature-x' 'wl-OSL-1-test' 'wl-SA-001-test-feature'  # empty
+git rev-parse HEAD                # 0fb18eeb11201e776d297a5f89aacb08569c2aae
+git rev-parse origin/dev          # 0fb18eeb11201e776d297a5f89aacb08569c2aae  (remote-tracking)
+git status --short                # empty
+git tag --list 'backup-*'         # backup-corrupt-dev-1790283975, backup-real-dev-6d7b4b4f
+```
+
+**Ignore-rule review (`root-file-repo/`):** deliberately **not** added to
+`.gitignore`. The live-repo mutation guard detects stray artefacts via
+`git status --porcelain=v1 --untracked-files=all`; ignoring `root-file-repo/`
+would hide a recurrence from the very guard meant to catch it. The existing
+`.worklog/tmp-worktree-*` ignore entry is appropriate because those directories
+are legitimate transient worktree placeholders, not incident artefacts.
+
+**Cleanup safety:** the removal touched only the named fixture branches and the
+stale detached worktree directories; it did not disturb other agents' worktrees
+or unrelated branches, and the `backup-*` tags were retained.
