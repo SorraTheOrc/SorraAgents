@@ -148,6 +148,58 @@ full suite (`--scope full`), feature-branch pushes skip tests
 with changed scope and runs a final `--scope full` gate before commit.
 Details: [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
 
+### 1b. Live-repo mutation guard (detect-only)
+
+`run_tests.py` snapshots the resolved checkout **before and after** every run
+and fails the run (non-zero exit + an actionable diff) when the suite changed
+it. This stops a test that mutates the live checkout from being reported as green
+— and, because the `.githooks/pre-push` gate relies only on the exit code, from
+being pushed to `dev`/`main` (SA-0MUG0WFP8008WN63). The guard is **detect-only**:
+it does not prevent the mutation, it makes the run fail. It is armed on
+cache-served runs too (nothing executes, but the delta is still verified) and for
+every scope/type.
+
+**What it snapshots** (read-only plumbing only — `for-each-ref`,
+`config --local --list`, `worktree list --porcelain`, `status --porcelain=v1 -uall`):
+refs, local `.git/config` keys and the working tree (tracked diff + untracked
+non-ignored paths). Non-git project roots are a no-op.
+
+**Exclusions** (avoiding false positives):
+
+- refs checked out in registered agent worktrees under
+  `.worklog/worktrees/` (derived from `git worktree list --porcelain`, never a
+  `wl-*` name pattern) — a fixture branch with **no** registered worktree still
+  fails the run;
+- the `refs/worklog/` data namespace (churned by `wl` during a run).
+
+**Reading a failure:** the diff lists every added/deleted/moved ref, added/
+removed/changed config key and added/removed/changed path, e.g.
+
+```text
+live-repo mutation detected: the test suite changed the checkout at <root>.
+  added ref      refs/heads/feature-x -> abc123
+  changed config user.email: real@example.com -> t@t.com
+  added path     [??] root-file-repo/
+```
+
+JSON runs carry the same text under `live_repo_mutation` and set
+`success: false`.
+
+**Direct `pytest` runs** are covered by a second, reusable guard:
+[`live_repo_guard.py`](../shared/live_repo_guard.py), armed by the
+repo-root [`conftest.py`](../../conftest.py). It compares a cheap refs+config
+fingerprint at each test's teardown and **names the offending test**
+(`pytest.fail`), then compares the full surface at session end. It is a no-op
+under `--collect-only`, under xdist workers and for non-git roots. A
+**recursion marker** (`LIVE_REPO_GUARD_ACTIVE`) is exported when a guard arms:
+subprocesses inherit it, so a nested `pytest`/`run_tests.py` invocation stands
+down instead of double-reporting — the outermost guard owns the checkout. Tests
+that deliberately arm the guard in a `tmp_path` repo clear the marker first.
+
+Details: [docs/dev/test-isolation.md](../../docs/dev/test-isolation.md),
+[`git_sandbox.py`](../shared/git_sandbox.py) and
+[`tests/test_live_repo_mutation_guard.py`](../../tests/test_live_repo_mutation_guard.py).
+
 ### 2. Triage every failure
 
 For each failure record, invoke the triage helper to create or link a critical
