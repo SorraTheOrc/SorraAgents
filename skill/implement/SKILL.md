@@ -393,6 +393,20 @@ See ``../refactor/SKILL.md``.
   > `WORKLOG_SKIP_PRE_PUSH=1 git push origin HEAD:refs/heads/dev`. Nothing is
   > lost by skipping the sync at push time — the main checkout syncs the data
   > on its own pushes.
+
+- **Post-push local parent sync (SA-0MUGX1DIT000M7S1).** `implement.py finish`
+  fast-forwards the main checkout's **local parent branch** (`dev`) to the
+  pushed tip *after* a successful push, so the next `implement.py parent` /
+  `start` forks the following child worktree from an up-to-date base instead
+  of a stale one. The sync is **safe-skip**: it performs a `git fetch origin
+  dev` followed by a `--ff-only` merge (when `dev` is checked out) or a
+  non-checked-out ref fetch (`git fetch origin dev:dev`) — it never
+  force-updates and never loses local commits. It is skipped (with a logged
+  warning, and without failing the already-successful finish) when the main
+  checkout is dirty, the remote is unreachable, or the local parent branch has
+  diverged. `implement.py start` also refreshes the parent branch before
+  `git worktree add`, so children never start from a stale base even when
+  another actor pushed concurrently.
 - After pushing, clean up the worktree:
 
   ```bash

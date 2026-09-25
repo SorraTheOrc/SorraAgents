@@ -1075,6 +1075,161 @@ def _restore_repo_state(repo_root: str) -> None:
     run_cmd(["git", "pull", "origin", DEFAULT_PARENT_BRANCH], cwd=repo_root, check=False)
 
 
+def _sync_parent_branch(
+    repo_root: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> dict[str, Any]:
+    """Sync the main checkout's local parent branch to origin/<parent_branch>.
+
+    After ``implement.py finish`` pushes a child branch to ``origin/<parent>",
+    the local parent branch can be left behind.  This helper fast-forwards
+    the local parent branch so that the next ``phase_start`` / child
+    worktree starts from an up-to-date base (AC1 / AC3).
+
+    Safety (AC2):
+        When the update is not safe — dirty working tree, checkout is on
+        another branch or detached, or the local branch has diverged — the
+        helper returns a *skipped* result without failing.  Local commits
+        are never lost.
+
+    Args:
+        repo_root: Path to the repo root.
+        parent_branch: The parent branch to sync (default: ``dev``).
+
+    Returns:
+        Dict with ``method`` ("synced" | "skipped"), ``success`` (bool),
+        and optional ``reason`` / ``warning``.
+    """
+    result: dict[str, Any] = {
+        "method": "none",
+        "success": True,
+    }
+
+    # ── Pre-condition checks (safe-skip semantics) ─────────────────
+
+    # 1. Dirty working tree → skip (check the main checkout, not the
+    #    worktree we may currently be invoked from)
+    status_output = git_status(repo_root)
+    if git_has_dirty_files(status_output):
+        result["method"] = "skipped"
+        result["success"] = True
+        result["reason"] = "dirty_working_tree"
+        result["warning"] = (
+            f"Skipped syncing parent branch {parent_branch}: "
+            "dirty working tree detected."
+        )
+        LOG.info("%s", result["warning"])
+        return result
+
+    # 2. Fetch the latest parent ref. Remote unreachable → degrade
+    #    gracefully (report, never fail a finish that already pushed).
+    fetch_result = run_cmd(
+        ["git", "fetch", "origin", parent_branch],
+        cwd=repo_root,
+        check=False,
+        timeout=120,
+    )
+    if fetch_result.returncode != 0:
+        result["method"] = "skipped"
+        result["success"] = True
+        result["reason"] = "fetch_failed"
+        result["warning"] = (
+            f"Skipped syncing parent branch {parent_branch}: "
+            f"git fetch origin {parent_branch} failed. "
+            f"The finish push may have succeeded but local {parent_branch} "
+            f"was not updated."
+        )
+        LOG.info("%s", result["warning"])
+        return result
+
+    # 3. Determine the current branch of the main checkout
+    branch_result = run_cmd(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo_root,
+        check=False,
+    )
+    if branch_result.returncode != 0:
+        result["method"] = "skipped"
+        result["success"] = True
+        result["reason"] = "cannot_determine_branch"
+        result["warning"] = "Could not determine current branch."
+        LOG.info("%s", result["warning"])
+        return result
+
+    current_branch = branch_result.stdout.strip()
+    # Use the fully-qualified remote-tracking ref so a stale local branch
+    # literally named ``origin/<parent>`` cannot shadow it (git would
+    # otherwise warn and resolve to the local branch).
+    remote_parent_ref = f"refs/remotes/origin/{parent_branch}"
+
+    if current_branch == parent_branch:
+        # 4a. Checked out on the parent branch: fast-forward with
+        #     ``merge --ff-only`` (refuses on divergence; never rewrites
+        #     the working tree or loses local commits).
+        ff_result = run_cmd(
+            ["git", "merge-base", "--is-ancestor",
+             "HEAD", remote_parent_ref],
+            cwd=repo_root,
+            check=False,
+        )
+        if ff_result.returncode != 0:
+            result["method"] = "skipped"
+            result["success"] = True
+            result["reason"] = "diverged"
+            result["warning"] = (
+                f"Skipped syncing parent branch {parent_branch}: "
+                f"local {parent_branch} has diverged from "
+                f"origin/{parent_branch}; --ff-only is not possible "
+                f"without risking local commits."
+            )
+            LOG.info("%s", result["warning"])
+            return result
+
+        merge_result = run_cmd(
+            ["git", "merge", "--ff-only", remote_parent_ref],
+            cwd=repo_root,
+            check=False,
+        )
+        if merge_result.returncode != 0:
+            result["method"] = "skipped"
+            result["success"] = True
+            result["reason"] = "merge_failed"
+            result["warning"] = (
+                f"Skipped syncing parent branch {parent_branch}: "
+                f"--ff-only merge failed (unexpected)."
+            )
+            LOG.info("%s", result["warning"])
+            return result
+    else:
+        # 4b. Not checked out on the parent branch (another branch or
+        #     detached HEAD): update the local ref directly via
+        #     ``git fetch origin <parent>:<parent>``. Git refuses a
+        #     non-fast-forward update, so local commits are never lost,
+        #     and no branch switch is performed.
+        ref_fetch_result = run_cmd(
+            ["git", "fetch", "origin",
+             f"{parent_branch}:{parent_branch}"],
+            cwd=repo_root,
+            check=False,
+            timeout=120,
+        )
+        if ref_fetch_result.returncode != 0:
+            result["method"] = "skipped"
+            result["success"] = True
+            result["reason"] = "diverged_or_checked_out"
+            result["warning"] = (
+                f"Skipped syncing parent branch {parent_branch}: "
+                f"current branch is '{current_branch}'; the local "
+                f"{parent_branch} ref was not updated (diverged or "
+                f"cannot be fetched non-checked-out)."
+            )
+            LOG.info("%s", result["warning"])
+            return result
+
+    result["method"] = "synced"
+    LOG.info("Synced parent branch %s to origin/%s", parent_branch, parent_branch)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Process cleanup helpers
 # ---------------------------------------------------------------------------
@@ -2085,6 +2240,7 @@ def phase_start(
     4. Safety gate: check for dirty working tree
     5. Stash hygiene gate: warn on orphaned stashes (fail-open, --allow-orphaned-stashes to skip)
     6. Fetch work item details (audit)
+    6.5. Refresh parent branch from origin (AC3)
     7. Create a worktree from the parent branch
     8. Register signal handlers
     9. Write persistent state
@@ -2236,6 +2392,20 @@ def phase_start(
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
 
+    # ── Step 6.5: Refresh parent branch before creating worktree (AC3) ─
+    # Ensure the parent branch is up-to-date before forking a child
+    # worktree. This prevents children from starting from a stale base
+    # when another actor pushed to origin/<parent> between the last
+    # finish and this start. Degrades gracefully (dirty/offline/diverged
+    # → fall back to the local branch; never fails the start phase).
+    repo_root = _get_repo_root() or str(Path.cwd().resolve())
+    LOG.info("Refreshing parent branch %s from origin...", parent_branch)
+    refresh_result = _sync_parent_branch(repo_root, parent_branch)
+    report["steps"] = report.get("steps", {})
+    report["steps"]["sync_parent_branch"] = refresh_result
+    if refresh_result.get("warning"):
+        LOG.info("Parent-branch refresh: %s", refresh_result["warning"])
+
     # ── Step 7: Create worktree ────────────────────────────────────
     wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
     branch = branch_name_for(work_item_id, slug)
@@ -2338,7 +2508,7 @@ def phase_finish(
     6. Clean up worktree processes
     7. Remove worktree
     8. Push to dev
-    9. Restore repo state
+    9. Sync local parent branch (post-push, AC1/AC2)
     10. Mark in_review
 
     All implementation work MUST be done inside the worktree created by
@@ -2640,13 +2810,12 @@ def phase_finish(
                 LOG.warning(msg)
                 report["steps"]["worktree_removed"] = False
 
-            # ── Step 7: Restore repo state ─────────────────────────────────
+            # ── Step 7: Resolve repo_root for push & sync ──────────────────
             repo_root = (
                 state.repo_root
                 if state
                 else (_get_repo_root() or str(Path.cwd().resolve()))
             )
-            _restore_repo_state(repo_root)
 
             # ── Step 8: Push to dev ────────────────────────────────────────
             LOG.info("Pushing to dev...")
@@ -2655,6 +2824,16 @@ def phase_finish(
 
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
+
+            # ── Step 9: Sync local parent branch (AC1 / AC2) ───────────────
+            # After a successful push, bring the main checkout's local
+            # parent branch (dev) up to date so the next child worktree
+            # does not start from a stale base.
+            LOG.info("Syncing local parent branch %s...", parent_branch)
+            sync_result = _sync_parent_branch(repo_root, parent_branch)
+            report["steps"]["sync_parent_branch"] = sync_result
+            if sync_result.get("warning"):
+                LOG.info("Parent-branch sync: %s", sync_result["warning"])
 
             # StatusLifecycle.__exit__ sets status=completed, stage=in_review
 
