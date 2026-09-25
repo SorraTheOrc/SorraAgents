@@ -382,6 +382,107 @@ def test_phase_start_refreshes_parent_before_worktree_add(implement_mod, tmp_pat
     assert report["steps"]["sync_parent_branch"]["method"] == "synced"
 
 
+def test_phase_finish_syncs_parent_branch_after_push(implement_mod, tmp_path):
+    """AC1: phase_finish calls _sync_parent_branch *after* a successful push,
+    passing the state's parent branch (regression: a missing local variable
+    here previously raised NameError after the push, leaving the item open).
+    """
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    calls: list[str] = []
+    sync_args: list[tuple] = []
+
+    state = implement_mod.ImplementState(
+        work_item_id="SA-0000000001",
+        worktree_path=str(worktree),
+        repo_root=str(repo_root),
+        parent_branch="dev",
+        started_at="2026-01-01T00:00:00Z",
+    )
+
+    class _FakeLifecycle:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        @staticmethod
+        def update_status(*a, **k):
+            return None
+
+    def _record_push(*a, **k):
+        calls.append("push")
+        return True
+
+    def _record_sync(*a, **k):
+        calls.append("sync")
+        sync_args.append(a)
+        return {"method": "synced", "success": True}
+
+    with (
+        mock.patch.object(
+            implement_mod, "_discover_worktree", return_value=str(worktree)
+        ),
+        mock.patch.object(implement_mod, "read_state", return_value=state),
+        mock.patch.object(
+            implement_mod, "_worktree_placement_violation", return_value=None
+        ),
+        mock.patch.object(
+            implement_mod,
+            "run_build",
+            return_value={"success": True, "exit_code": 0, "stderr": ""},
+        ),
+        mock.patch.object(
+            implement_mod,
+            "run_tests",
+            return_value={
+                "success": True,
+                "failures": [],
+                "skipped": False,
+                "tooling": "pytest",
+                "scope": "full",
+            },
+        ),
+        mock.patch.object(implement_mod, "git_commit", return_value=True),
+        mock.patch.object(
+            implement_mod, "git_get_commit_hash", return_value="abc1234"
+        ),
+        mock.patch.object(
+            implement_mod, "cleanup_worktree_processes", return_value={}
+        ),
+        mock.patch.object(implement_mod, "remove_state"),
+        mock.patch.object(implement_mod, "_remove_worktree", return_value=True),
+        mock.patch.object(
+            implement_mod, "git_push_to_dev", side_effect=_record_push
+        ),
+        mock.patch.object(
+            implement_mod, "_sync_parent_branch", side_effect=_record_sync
+        ),
+        mock.patch.object(implement_mod, "wl_add_comment", return_value=True),
+        mock.patch.object(implement_mod, "StatusLifecycle", _FakeLifecycle),
+    ):
+        report = implement_mod.phase_finish(
+            "SA-0000000001", json_output=True, no_refactor=True
+        )
+
+    assert report["success"] is True, report
+    assert calls == ["push", "sync"], (
+        f"phase_finish must push then sync the parent branch; got {calls}"
+    )
+    assert sync_args == [(str(repo_root), "dev")], (
+        f"_sync_parent_branch must receive (repo_root, state.parent_branch); "
+        f"got {sync_args}"
+    )
+    assert report["steps"]["sync_parent_branch"]["method"] == "synced"
+
+
 # ---------------------------------------------------------------------------
 # Structural / documentation guards
 # ---------------------------------------------------------------------------
@@ -398,7 +499,7 @@ class TestFinishOrdering:
         finish_end = self.SOURCE.index("def phase_abort(", finish_start)
         body = self.SOURCE[finish_start:finish_end]
         push_idx = body.index("git_push_to_dev(repo_root, branch)")
-        sync_idx = body.index("_sync_parent_branch(repo_root, parent_branch)")
+        sync_idx = body.index("_sync_parent_branch(repo_root,")
         assert sync_idx > push_idx, (
             "local parent sync must run AFTER the push to dev"
         )

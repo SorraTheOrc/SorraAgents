@@ -2829,8 +2829,11 @@ def phase_finish(
             # After a successful push, bring the main checkout's local
             # parent branch (dev) up to date so the next child worktree
             # does not start from a stale base.
-            LOG.info("Syncing local parent branch %s...", parent_branch)
-            sync_result = _sync_parent_branch(repo_root, parent_branch)
+            sync_parent_branch = (
+                state.parent_branch if state else DEFAULT_PARENT_BRANCH
+            )
+            LOG.info("Syncing local parent branch %s...", sync_parent_branch)
+            sync_result = _sync_parent_branch(repo_root, sync_parent_branch)
             report["steps"]["sync_parent_branch"] = sync_result
             if sync_result.get("warning"):
                 LOG.info("Parent-branch sync: %s", sync_result["warning"])
