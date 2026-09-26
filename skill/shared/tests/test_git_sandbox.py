@@ -17,6 +17,7 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -251,6 +252,74 @@ class TestMainCheckoutAnchoring:
 # ---------------------------------------------------------------------------
 # AC1 — leaked environment is neutralised
 # ---------------------------------------------------------------------------
+
+
+class TestScrubRepositoryOverrides:
+    """F2 (SA-0MUIULHQC005MUM0): the shared repository-override scrub helper."""
+
+    def test_removes_every_override_when_all_present(self):
+        env = {name: "poison" for name in gs.REPOSITORY_OVERRIDE_ENV_VARS}
+        env["PATH"] = "/usr/bin"
+        cleaned = gs.scrub_repository_overrides(env)
+        for name in gs.REPOSITORY_OVERRIDE_ENV_VARS:
+            assert name not in cleaned
+        assert cleaned["PATH"] == "/usr/bin"
+
+    def test_removes_only_present_overrides_and_preserves_unrelated(self):
+        env = {"GIT_DIR": "/tmp/x", "HOME": "/home/u", "PATH": "/bin"}
+        cleaned = gs.scrub_repository_overrides(env)
+        assert cleaned == {"HOME": "/home/u", "PATH": "/bin"}
+
+    def test_empty_environments_are_safe(self):
+        assert gs.scrub_repository_overrides({}) == {}
+
+    def test_empty_string_value_is_still_removed(self):
+        cleaned = gs.scrub_repository_overrides({"GIT_DIR": "", "A": "b"})
+        assert cleaned == {"A": "b"}
+
+    def test_input_mapping_is_never_mutated(self):
+        env = {"GIT_DIR": "/tmp/x", "PATH": "/bin"}
+        gs.scrub_repository_overrides(env)
+        assert env == {"GIT_DIR": "/tmp/x", "PATH": "/bin"}
+
+    def test_os_environ_is_never_mutated(self, monkeypatch):
+        monkeypatch.setenv("GIT_DIR", "/tmp/leaked")
+        gs.scrub_repository_overrides()
+        assert os.environ["GIT_DIR"] == "/tmp/leaked"
+
+    def test_sanitized_git_env_uses_the_scrub(self, monkeypatch):
+        monkeypatch.setenv("GIT_DIR", "/tmp/leaked")
+        assert "GIT_DIR" not in gs.sanitized_git_env()
+
+
+class TestRepositoryOverrideVarsPresent:
+    """F2: the detection helper used by diagnostics and the release gate."""
+
+    def test_reports_present_names_in_canonical_order(self):
+        env = {"GIT_DIR": "x", "GIT_CONFIG": "y", "PATH": "z"}
+        assert gs.repository_override_vars_present(env) == ("GIT_DIR", "GIT_CONFIG")
+
+    def test_empty_when_none_present(self):
+        assert gs.repository_override_vars_present({"PATH": "z"}) == ()
+
+
+class TestImportSurface:
+    """F2 AC3: the helper is importable from every production caller."""
+
+    def test_importable_from_test_runner_and_production_modules(self):
+        from test_runner import scrub_repository_overrides
+
+        assert scrub_repository_overrides is gs.scrub_repository_overrides
+        # Import the production callers to prove no import cycle.
+        import test_cache  # noqa: F401
+        from audit.scripts import audit_runner  # noqa: F401
+        # ``run_tests`` lives under skill/test/scripts; the skill root must
+        # precede the stdlib ``test`` package for the import to resolve.
+        skill_root = str(REPO_ROOT / "skill")
+        while skill_root in sys.path:
+            sys.path.remove(skill_root)
+        sys.path.insert(0, skill_root)
+        import test.scripts.run_tests  # noqa: F401
 
 
 class TestEnvironmentIsolation:

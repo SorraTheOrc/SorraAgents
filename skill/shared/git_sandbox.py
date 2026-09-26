@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -85,12 +85,49 @@ class GitSandboxError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def scrub_repository_overrides(
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a copy of *env* with every repository-override variable removed.
+
+    This is the single shared choke point every production path that spawns a
+    subprocess which may invoke ``git`` must route its environment through
+    (SA-0MUIA3OE40001QJX). Git honours ``GIT_DIR`` and friends over ``cwd``,
+    so a leaked value makes an otherwise-isolated fixture operate on the
+    leaked repository — the mechanism behind the 2026-09-24 and 2026-09-26
+    live-checkout incidents.
+
+    Args:
+        env: Mapping to scrub (defaults to ``os.environ``). Neither the input
+            mapping nor ``os.environ`` is mutated.
+
+    Returns:
+        A new ``dict`` containing every entry of *env* except the names in
+        :data:`REPOSITORY_OVERRIDE_ENV_VARS`.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    cleaned = dict(source)
+    for name in REPOSITORY_OVERRIDE_ENV_VARS:
+        cleaned.pop(name, None)
+    return cleaned
+
+
+def repository_override_vars_present(
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Return the repository-override variable names present in *env*.
+
+    Used by the runner diagnostics (log which variables were stripped, never
+    their values) and by the release-gate fail-fast check. Defaults to
+    ``os.environ``.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    return tuple(name for name in REPOSITORY_OVERRIDE_ENV_VARS if name in source)
+
+
 def sanitized_git_env() -> dict[str, str]:
     """A copy of the process environment with repository overrides removed."""
-    env = dict(os.environ)
-    for name in REPOSITORY_OVERRIDE_ENV_VARS:
-        env.pop(name, None)
-    return env
+    return scrub_repository_overrides(os.environ)
 
 
 def run_git(

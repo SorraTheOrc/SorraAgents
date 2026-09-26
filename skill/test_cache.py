@@ -63,7 +63,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from test_runner import normalize_test_command
+from test_runner import (
+    log_repository_override_scrub,
+    normalize_test_command,
+    subprocess_env_with_scrubbed_overrides,
+)
 
 DEFAULT_TTL_SECONDS = 2 * 60 * 60  # 2 hours (operator decision)
 # Non-zero-exit runs get a much shorter TTL (SA-0MSJELL44009XYIL): a failed
@@ -312,16 +316,17 @@ def store(
 def _default_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
     """Execute a normalized command string, capturing stdout/stderr.
 
-    Prepend ``~/.local/bin`` to PATH if not already present so that
-    user-installed executables (e.g. pytest at ``~/.local/bin/pytest``)
-    are found when the audit runner spawns suite commands in a restricted
-    environment (SA-0MSUZAJPC003BS66).
+    The environment is the shared repository-override scrub (F2,
+    SA-0MUIA3OE40001QJX): a leaked ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_CONFIG*``
+    would otherwise override ``cwd`` in every ``git`` subprocess a test spawns
+    and redirect fixture git operations at the live checkout. ``~/.local/bin``
+    is prepended to PATH if not already present so that user-installed
+    executables (e.g. pytest at ``~/.local/bin/pytest``) are found when the
+    audit runner spawns suite commands in a restricted environment
+    (SA-0MSUZAJPC003BS66).
     """
-    env = os.environ.copy()
-    local_bin = os.path.expanduser("~/.local/bin")
-    path_value = env.get("PATH", "")
-    if local_bin not in path_value.split(os.pathsep):
-        env["PATH"] = local_bin + os.pathsep + path_value
+    log_repository_override_scrub()
+    env = subprocess_env_with_scrubbed_overrides()
     return subprocess.run(
         shlex.split(command),
         cwd=cwd,

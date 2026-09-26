@@ -814,3 +814,166 @@ def test_parent_screen_priority_beats_child_under_saturation(monkeypatch, capsys
     assert len(lines) == 2, f"expected 2 admission logs, got {len(lines)}"
     seq = [re.search(r"priority=(\w+)", l).group(1) for l in lines]
     assert seq[0] == "critical", f"parent (CRITICAL) must admit first: {seq}"
+
+
+# ---------------------------------------------------------------------------
+# F5 (SA-0MUIUMO7T00639FL): host-wide audit ingress cap + orphan detection
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_max_host_audits_reads_env(monkeypatch):
+    """The host-wide cap is env-configurable, with clamping and fail-safe."""
+    monkeypatch.setenv(audit_runner.AUDIT_MAX_HOST_AUDITS_ENV, "7")
+    assert audit_runner._resolve_max_host_audits() == 7
+    monkeypatch.setenv(audit_runner.AUDIT_MAX_HOST_AUDITS_ENV, "0")
+    assert audit_runner._resolve_max_host_audits() == 1  # clamped to >= 1
+    monkeypatch.setenv(audit_runner.AUDIT_MAX_HOST_AUDITS_ENV, "not-a-number")
+    assert audit_runner._resolve_max_host_audits() == (
+        audit_runner.AUDIT_MAX_HOST_AUDITS_DEFAULT
+    )
+    monkeypatch.delenv(audit_runner.AUDIT_MAX_HOST_AUDITS_ENV, raising=False)
+    assert audit_runner._resolve_max_host_audits() == (
+        audit_runner.AUDIT_MAX_HOST_AUDITS_DEFAULT
+    )
+
+
+def test_acquire_host_audit_slot_is_reentrant(monkeypatch, tmp_path):
+    """Nested cmd_issue calls reuse the process-wide host slot (no deadlock)."""
+    monkeypatch.setenv(ENV_LOCK_DIR, str(tmp_path / "locks"))
+    try:
+        first = audit_runner._acquire_host_audit_slot()
+        second = audit_runner._acquire_host_audit_slot()
+        assert first is second
+    finally:
+        audit_runner._release_host_audit_slot()
+    assert audit_runner._HOST_AUDIT_SLOT is None
+
+
+def test_host_slot_saturated_raises_timeout(monkeypatch, tmp_path):
+    """A saturated host-wide cap fails fast rather than running concurrently."""
+    from shared.process_semaphore import Semaphore
+
+    monkeypatch.setenv(ENV_LOCK_DIR, str(tmp_path / "locks"))
+    monkeypatch.setenv(audit_runner.AUDIT_MAX_HOST_AUDITS_ENV, "1")
+    monkeypatch.setenv(audit_runner.AUDIT_HOST_LOCK_TIMEOUT_ENV, "0")
+    audit_runner._release_host_audit_slot()  # ensure clean global
+    other = Semaphore(
+        audit_runner.AUDIT_HOST_SEMAPHORE_NAME, max_workers=1, timeout=0
+    )
+    other.acquire()
+    try:
+        with pytest.raises(TimeoutError):
+            audit_runner._acquire_host_audit_slot()
+    finally:
+        other.release()
+
+
+def test_host_cap_bounds_independent_processes(tmp_path):
+    """N+1 independent processes observe at most N concurrent hosts (AC2)."""
+    import os
+    import subprocess
+
+    lock_dir = str(tmp_path / "locks")
+    marker = tmp_path / "marker.txt"
+    skill_root = str(REPO_ROOT / "skill")
+    script = tmp_path / "hold_host_slot.py"
+    script.write_text(
+        "import os, sys, time\n"
+        "sys.path.insert(0, os.environ['SKILL_ROOT'])\n"
+        "from audit.scripts import audit_runner\n"
+        "audit_runner._acquire_host_audit_slot()\n"
+        "try:\n"
+        "    with open(os.environ['MARKER'], 'a') as f:\n"
+        "        f.write('start %d\\n' % time.monotonic_ns())\n"
+        "    time.sleep(0.7)\n"
+        "    with open(os.environ['MARKER'], 'a') as f:\n"
+        "        f.write('end %d\\n' % time.monotonic_ns())\n"
+        "finally:\n"
+        "    audit_runner._release_host_audit_slot()\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.update({
+        "SKILL_ROOT": skill_root,
+        "MARKER": str(marker),
+        "PI_SEMAPHORE_DIR": lock_dir,
+        "AUDIT_MAX_HOST_AUDITS": "2",
+        "AUDIT_HOST_LOCK_TIMEOUT": "10",
+    })
+    procs = [
+        subprocess.Popen([sys.executable, str(script)], env=env)
+        for _ in range(3)
+    ]
+    for p in procs:
+        assert p.wait(timeout=30) == 0
+
+    events: list[tuple[int, int]] = []
+    for line in marker.read_text().splitlines():
+        kind, ts = line.split()
+        events.append((0 if kind == "start" else 1, int(ts)))
+    events.sort(key=lambda event: event[1])
+    concurrent = 0
+    peak = 0
+    for kind, _ in events:
+        concurrent += 1 if kind == 0 else -1
+        peak = max(peak, concurrent)
+    assert peak <= 2, f"host cap not honoured: peak={peak}"
+
+
+def test_main_issue_exits_cleanly_when_host_capped(monkeypatch, tmp_path, capsys):
+    """The CLI issue ingress exits non-zero without running when capped (AC1)."""
+    from shared.process_semaphore import Semaphore
+
+    monkeypatch.setenv(ENV_LOCK_DIR, str(tmp_path / "locks"))
+    monkeypatch.setenv(audit_runner.AUDIT_MAX_HOST_AUDITS_ENV, "1")
+    monkeypatch.setenv(audit_runner.AUDIT_HOST_LOCK_TIMEOUT_ENV, "0")
+    audit_runner._release_host_audit_slot()  # ensure clean global
+    other = Semaphore(
+        audit_runner.AUDIT_HOST_SEMAPHORE_NAME, max_workers=1, timeout=0
+    )
+    other.acquire()
+    called: list[int] = []
+    monkeypatch.setattr(
+        audit_runner, "cmd_issue", lambda *a, **k: called.append(1) or 0
+    )
+    try:
+        rc = audit_runner.main(["issue", "TEST-1", "--json"])
+    finally:
+        other.release()
+    assert rc == 1
+    assert called == []  # the pipeline never ran
+    assert "host-wide audit concurrency limit reached" in capsys.readouterr().err
+
+
+def test_find_orphaned_audit_processes_detects_ppid_one(tmp_path):
+    """Orphan (PPID 1) audit_runner.py issue processes are detected (AC3)."""
+    orphan = tmp_path / "4242"
+    orphan.mkdir()
+    (orphan / "stat").write_text("4242 (python3) S 1 0 0 0 0 0")
+    (orphan / "cmdline").write_bytes(
+        b"python3\x00skill/audit/scripts/audit_runner.py\x00issue\x00SA-1\x00"
+    )
+
+    owned = tmp_path / "4243"
+    owned.mkdir()
+    (owned / "stat").write_text("4243 (python3) S 999 0 0 0 0 0")
+    (owned / "cmdline").write_bytes(
+        b"python3\x00skill/audit/scripts/audit_runner.py\x00issue\x00SA-2\x00"
+    )
+
+    unrelated = tmp_path / "4244"
+    unrelated.mkdir()
+    (unrelated / "stat").write_text("4244 (bash) S 1 0 0 0 0 0")
+    (unrelated / "cmdline").write_bytes(b"bash\x00-c\x00echo hi\x00")
+
+    orphans = audit_runner._find_orphaned_audit_processes(str(tmp_path))
+    assert [o["pid"] for o in orphans] == [4242]
+    assert orphans[0]["ppid"] == 1
+    assert "audit_runner.py" in orphans[0]["cmdline"]
+
+
+def test_find_orphaned_audit_processes_missing_proc_root(tmp_path):
+    """A non-existent proc root degrades to an empty list (never raises)."""
+    assert audit_runner._find_orphaned_audit_processes(
+        str(tmp_path / "does-not-exist")
+    ) == []

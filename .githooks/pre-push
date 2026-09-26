@@ -86,8 +86,8 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   runner="$repo_root/skill/test/scripts/run_tests.py"
   if [ -n "$repo_root" ] && [ -f "$runner" ]; then
-    echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full" >&2
-    if python3 "$runner" --scope full --json >/dev/null 2>&1; then
+    echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env" >&2
+    if python3 "$runner" --scope full --strict-git-env --json >/dev/null 2>&1; then
       echo "pre-push: full suite green (cached runs make repeat pushes cheap)" >&2
     else
       echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2

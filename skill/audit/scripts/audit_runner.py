@@ -107,6 +107,7 @@ from scripts.failure_notice import FailureNotice
 from scripts.pi_utils import extract_pi_text
 
 try:
+    from shared.git_sandbox import scrub_repository_overrides
     from shared.process_semaphore import (
         DEFAULT_MAX_WORKERS,
         ENV_MAX_WORKERS,
@@ -143,6 +144,32 @@ from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
 # ---------------------------------------------------------------------------
 AUDIT_SEMAPHORE_NAME = "audit"
+
+# Host-wide ingress cap (F5, SA-0MUIUMO7T00639FL). The per-call ``audit``
+# semaphore bounds concurrent *pi* subprocesses, and the test skill's ``test``
+# semaphore bounds suite *commands* it spawns — but independently launched
+# ``audit_runner.py issue`` processes (the 2026-09-26 incident spawned 30+)
+# are bounded by neither. This ingress cap gates the whole issue pipeline in
+# its own semaphore namespace so N+1 concurrent issues wait or exit cleanly.
+AUDIT_HOST_SEMAPHORE_NAME = "audit-host"
+AUDIT_MAX_HOST_AUDITS_ENV = "AUDIT_MAX_HOST_AUDITS"
+AUDIT_MAX_HOST_AUDITS_DEFAULT = 3
+AUDIT_HOST_LOCK_TIMEOUT_ENV = "AUDIT_HOST_LOCK_TIMEOUT"
+AUDIT_HOST_LOCK_TIMEOUT_DEFAULT = 90.0
+"""Bounded wait (seconds) for a host-wide audit ingress slot.
+
+Default 90s matches ``AUDIT_QUEUE_TIMEOUT`` and stays inside the parent
+bash-tool execution timeout (~120s): a saturated host makes the N+1th
+``audit_runner.py issue`` WAIT for a slot (so a legitimate batch of audits
+still completes) and exit cleanly with a clear message if none frees in time,
+rather than adding another concurrent suite runner. Set ``AUDIT_HOST_LOCK_TIMEOUT=0``
+to fail fast, or a larger value for longer batches.
+"""
+
+#: Process-wide host slot held for the duration of a ``cmd_issue`` call.
+#: Nested/recursive ``cmd_issue`` calls (batch drain, child audits) are
+#: re-entrant: the outer call already holds the slot for the process.
+_HOST_AUDIT_SLOT: "Semaphore | None" = None
 AUDIT_LOCK_TIMEOUT_ENV = "AUDIT_LOCK_TIMEOUT"
 AUDIT_LOCK_TIMEOUT_DEFAULT = 0.0
 """Fail-fast wait (seconds) for a free audit concurrency slot.
@@ -3681,6 +3708,9 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     # timing utility (SA-0MT319YGQ002E801 AC2 — extends, does not remove).
     _call_timer = SharedTimer("pi_call")
     _call_timer.start()
+    # The pi subprocess (and any test suite it later runs) must not inherit a
+    # leaked repository-override variable (F3, SA-0MUIA3OE40001QJX).
+    pi_env = scrub_repository_overrides(os.environ)
     while True:
         attempt += 1
         try:
@@ -3698,6 +3728,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                         stderr=subprocess.PIPE,
                         text=True,
                         bufsize=1,
+                        env=pi_env,
                     )
                 except FileNotFoundError:
                     raise RuntimeError(f"pi binary not found: {pi_bin}")
@@ -11097,6 +11128,121 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     return 0
 
 
+def _resolve_max_host_audits() -> int:
+    """Resolve the host-wide concurrent ``issue`` ceiling (F5).
+
+    Precedence: ``AUDIT_MAX_HOST_AUDITS`` env var > default 3. Values below 1
+    are clamped to 1; an invalid value is ignored with a warning so a
+    misconfigured environment cannot break the audit.
+    """
+    env_value = os.environ.get(AUDIT_MAX_HOST_AUDITS_ENV)
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_MAX_HOST_AUDITS_ENV} value "
+                f"{env_value!r}; using default {AUDIT_MAX_HOST_AUDITS_DEFAULT}",
+                file=sys.stderr,
+            )
+    return AUDIT_MAX_HOST_AUDITS_DEFAULT
+
+
+def _resolve_host_lock_timeout() -> float:
+    """Resolve the bounded wait for a host-wide audit ingress slot (F5)."""
+    env_value = os.environ.get(AUDIT_HOST_LOCK_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return max(0.0, float(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_HOST_LOCK_TIMEOUT_ENV} value "
+                f"{env_value!r}; using default {AUDIT_HOST_LOCK_TIMEOUT_DEFAULT}",
+                file=sys.stderr,
+            )
+    return AUDIT_HOST_LOCK_TIMEOUT_DEFAULT
+
+
+def _acquire_host_audit_slot() -> "Semaphore":
+    """Acquire the process-wide host-wide audit ingress slot (F5).
+
+    Re-entrant within the process: a nested ``cmd_issue`` (batch drain, child
+    audit) returns the already-held slot instead of deadlocking on it. Raises
+    ``TimeoutError`` when the host ceiling is saturated and the bounded wait
+    elapses.
+    """
+    global _HOST_AUDIT_SLOT
+    if _HOST_AUDIT_SLOT is not None:
+        return _HOST_AUDIT_SLOT
+    sem = Semaphore(
+        AUDIT_HOST_SEMAPHORE_NAME,
+        max_workers=_resolve_max_host_audits(),
+        timeout=_resolve_host_lock_timeout(),
+    )
+    sem.acquire()
+    _HOST_AUDIT_SLOT = sem
+    return sem
+
+
+def _release_host_audit_slot() -> None:
+    """Release the process-wide host-wide audit ingress slot (idempotent)."""
+    global _HOST_AUDIT_SLOT
+    if _HOST_AUDIT_SLOT is None:
+        return
+    try:
+        _HOST_AUDIT_SLOT.release()
+    finally:
+        _HOST_AUDIT_SLOT = None
+
+
+def _find_orphaned_audit_processes(proc_root: str = "/proc") -> list[dict]:
+    """Return ``audit_runner.py issue`` processes orphaned to PID 1 (F5).
+
+    An orphan (``PPID 1``) audit is one whose launcher has exited and which
+    can no longer be reaped/attributed — the failure mode behind the
+    2026-09-26 fan-out. Read-only: scans ``proc_root`` for ``cmdline`` files
+    containing ``audit_runner.py`` and ``issue`` and reports those whose
+    ``stat`` PPID is 1. Returns a list of ``{pid, ppid, cmdline}`` dicts;
+    never raises (a missing/short-lived entry is skipped).
+    """
+    orphans: list[dict] = []
+    root = Path(proc_root)
+    if not root.is_dir():
+        return orphans
+    for entry in root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            # Format: pid (comm) state ppid ...  — comm may contain spaces.
+            rparen = stat.rfind(")")
+            ppid = int(stat[rparen + 2:].split()[1])
+            if ppid != 1:
+                continue
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(
+                "utf-8", errors="replace"
+            )
+        except (OSError, ValueError, IndexError):
+            continue
+        if "audit_runner.py" in cmdline and "issue" in cmdline:
+            orphans.append({"pid": int(entry.name), "ppid": ppid, "cmdline": cmdline.strip()})
+    return orphans
+
+
+def _warn_on_orphaned_audits() -> list[dict]:
+    """Log a warning when orphaned audit processes are detected (F5)."""
+    orphans = _find_orphaned_audit_processes()
+    if orphans:
+        pids = ", ".join(str(o["pid"]) for o in orphans)
+        print(
+            f"Warning: detected {len(orphans)} orphaned audit process(es) "
+            f"(PPID 1): {pids}. These may each be running the test suite; "
+            "investigate and reap them.",
+            file=sys.stderr,
+        )
+    return orphans
+
+
 def cmd_issue(issue_id: str, persist: bool = True,
               timeout: int | None = None,
               parent_timeout: int | None = None,
@@ -12028,35 +12174,27 @@ def main(argv: list[str] | None = None) -> int:
     _apply_proxy_mode_serialization()
 
     if args.command == "issue":
-        with SharedTimer("audit_runner_issue") as _root_timer:
-            _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
-                            timeout=_resolve_effective_timeout(args.timeout),
-                            parent_timeout=_resolve_parent_timeout(args.parent_timeout),
-                            pi_bin=args.pi_bin, model=args.model,
-                            phase1_model=getattr(args, "phase1_model", None),
-                            model_source=args.model_source, json_mode=args.json,
-                            debug_log=args.debug_log,
-                            force=args.force,
-                            worklog_dir=args.worklog_dir,
-                            batch_phase2=_phase2_batch_enabled(args.batch_phase2),
-                            green_run=args.green_run,
-                            audit_children=args.audit_children,
-                            max_child_audits=_resolve_max_child_audits(
-                                args.max_child_audits
-                            ),
-                            max_citations_per_ac=_resolve_max_citations_per_ac(
-                                args.max_citations_per_ac
-                            ),
-                            run_tests=args.run_tests,
-                            no_execute=getattr(args, "no_execute", False),
-                            checkpoint_dir=getattr(args, "checkpoint_dir", None),
-                            no_checkpoint=getattr(args, "no_checkpoint", False),
-                            child_in_main_slot=getattr(
-                                args, "child_in_main_slot", None
-                            ),
-                            batch_drain=getattr(args, "batch_drain", None))
-            print(_root_timer.render(), file=sys.stderr)
-        return _rc
+        # Host-wide ingress gate (F5, SA-0MUIUMO7T00639FL): bound independently
+        # launched ``audit_runner.py issue`` processes so a fan-out cannot
+        # orphan 30+ concurrent test-running processes. The gate lives at the
+        # CLI entry point (not inside ``cmd_issue``) so in-process recursive
+        # calls (batch drain, child audits) stay re-entrant and timing-sensitive
+        # unit tests that call ``cmd_issue`` directly are unaffected.
+        try:
+            _acquire_host_audit_slot()
+        except TimeoutError as exc:
+            print(
+                "audit_runner: host-wide audit concurrency limit reached "
+                f"({exc}); retry after fewer audits complete or raise "
+                f"{AUDIT_MAX_HOST_AUDITS_ENV}.",
+                file=sys.stderr,
+            )
+            return 1
+        _warn_on_orphaned_audits()
+        try:
+            return _run_issue_command(args)
+        finally:
+            _release_host_audit_slot()
     elif args.command == "batch":
         with SharedTimer("audit_runner_batch") as _root_timer:
             _rc = cmd_batch(max_items=args.max_items,
@@ -12088,6 +12226,39 @@ def main(argv: list[str] | None = None) -> int:
         return _rc
 
     return 2
+
+
+def _run_issue_command(args) -> int:
+    """Run the ``issue`` subcommand body (extracted for the F5 host gate)."""
+    with SharedTimer("audit_runner_issue") as _root_timer:
+        _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
+                        timeout=_resolve_effective_timeout(args.timeout),
+                        parent_timeout=_resolve_parent_timeout(args.parent_timeout),
+                        pi_bin=args.pi_bin, model=args.model,
+                        phase1_model=getattr(args, "phase1_model", None),
+                        model_source=args.model_source, json_mode=args.json,
+                        debug_log=args.debug_log,
+                        force=args.force,
+                        worklog_dir=args.worklog_dir,
+                        batch_phase2=_phase2_batch_enabled(args.batch_phase2),
+                        green_run=args.green_run,
+                        audit_children=args.audit_children,
+                        max_child_audits=_resolve_max_child_audits(
+                            args.max_child_audits
+                        ),
+                        max_citations_per_ac=_resolve_max_citations_per_ac(
+                            args.max_citations_per_ac
+                        ),
+                        run_tests=args.run_tests,
+                        no_execute=getattr(args, "no_execute", False),
+                        checkpoint_dir=getattr(args, "checkpoint_dir", None),
+                        no_checkpoint=getattr(args, "no_checkpoint", False),
+                        child_in_main_slot=getattr(
+                            args, "child_in_main_slot", None
+                        ),
+                        batch_drain=getattr(args, "batch_drain", None))
+        print(_root_timer.render(), file=sys.stderr)
+    return _rc
 
 
 if __name__ == "__main__":

@@ -83,6 +83,9 @@ from test_cache import (
 from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
+    log_repository_override_scrub,
+    repository_override_vars_present,
+    subprocess_env_with_scrubbed_overrides,
 )
 
 REPO_ROOT = _SKILLS_ROOT.parent
@@ -111,6 +114,11 @@ TEST_LOCK_TIMEOUT_DEFAULT = 600.0
 #: Recursion marker shared with the pytest conftest guard (F5). Set by
 #: whichever guard owns the checkout first; nested pytest/run_tests stand down.
 LIVE_REPO_GUARD_ACTIVE_ENV = "LIVE_REPO_GUARD_ACTIVE"
+
+#: Explicit operator opt-out from the strict release-gate refusal. Scrub is
+#: always applied; this only lets a rare legitimate override-vars run proceed
+#: (with a loud warning) when ``--strict-git-env`` was requested.
+STRICT_GIT_ENV_OPT_OUT_ENV = "RUN_TESTS_ALLOW_REPO_OVERRIDES"
 
 # pytest config markers, mirroring implement.py's _has_pytest_markers so the
 # test/implement/audit skills agree on whether a repo has a pytest suite
@@ -1167,7 +1175,14 @@ def _test_concurrency_slot() -> Iterator[None]:
 
 
 def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
-    """Run a suite command capturing stdout/stderr."""
+    """Run a suite command capturing stdout/stderr.
+
+    The environment is the shared repository-override scrub (F2,
+    SA-0MUIA3OE40001QJX): passing an explicit ``env=`` replaces the previous
+    bare inherit of the parent environment, so a leaked ``GIT_DIR`` cannot
+    redirect real-git test fixtures at the live checkout.
+    """
+    log_repository_override_scrub()
     return subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -1175,6 +1190,7 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
         text=True,
         timeout=timeout,
         check=False,
+        env=subprocess_env_with_scrubbed_overrides(),
     )
 
 
@@ -1572,6 +1588,17 @@ def build_parser() -> argparse.ArgumentParser:
         "changed files, no selectable tests).",
     )
     parser.add_argument(
+        "--strict-git-env",
+        action="store_true",
+        help="Release-gate mode: refuse to run (exit 2) when repository-"
+        "override environment variables (GIT_DIR / GIT_WORK_TREE / "
+        "GIT_CONFIG* / GIT_OBJECT_DIRECTORY / "
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES) are present, before any suite "
+        "command runs. Ad-hoc runs scrub and continue; only the release "
+        "gate opts in. Override with "
+        f"{STRICT_GIT_ENV_OPT_OUT_ENV}=1 (loud warning, not recommended).",
+    )
+    parser.add_argument(
         "--target-branch",
         default=None,
         help="Base branch for changed-file detection (default: origin/dev, "
@@ -1673,6 +1700,30 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve the project root: explicit flag wins, else detect from cwd at
     # CLI time so a non-framework invocation tests that project (SA-0MSNQV9J20010LE7).
     project_root = Path(args.project_root).resolve() if args.project_root else detect_project_root()
+
+    # Release-gate fail-fast (F4, SA-0MUIULX49001BWGG): the release path opts
+    # into ``--strict-git-env`` and refuses to run when repository-override
+    # vars are present. Scrubbing still happens everywhere (F3); this only
+    # guards the release gate where a scrub bug would be catastrophic.
+    if args.strict_git_env:
+        present = repository_override_vars_present()
+        if present and os.environ.get(STRICT_GIT_ENV_OPT_OUT_ENV) != "1":
+            print(
+                "run_tests: refusing to run the release gate with "
+                "repository-override env var(s) present: "
+                + ", ".join(present)
+                + ". Unset them (they would be scrubbed anyway) or set "
+                f"{STRICT_GIT_ENV_OPT_OUT_ENV}=1 to override (not recommended).",
+                file=sys.stderr,
+            )
+            return 2
+        if present:
+            print(
+                "run_tests: WARNING: repository-override env var(s) present "
+                f"({', '.join(present)}); proceeding because "
+                f"{STRICT_GIT_ENV_OPT_OUT_ENV}=1 (scrub still applied)",
+                file=sys.stderr,
+            )
 
     # Validate the requested type against the allowed set (minimum set plus any
     # locally-defined types) and report the full list on error (AC1/AC3).

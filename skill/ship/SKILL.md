@@ -174,8 +174,16 @@ Verifying the full suite is green before promoting `dev` to `main` is an **optio
 ```bash
 python3 $(skill_path test)/scripts/run_tests.py --scope full --json                    # fresh full-suite run (populates cache)
 python3 $(skill_path test)/scripts/run_tests.py --summary --suite all                   # read-only summary (shows cached scope), never executes
-python3 $(skill_path test)/scripts/run_tests.py --scope full --force --json            # fresh full-suite run for the final gate
+python3 $(skill_path test)/scripts/run_tests.py --scope full --strict-git-env --force --json   # final release gate
 ```
+
+The release gate runs with ``--strict-git-env`` (SA-0MUIULX49001BWGG): it
+refuses to start (exit 2) when a repository-override variable such as
+``GIT_DIR`` is present in the environment, because a leaked value can redirect
+real-git test fixtures at the live checkout. The pre-push hook applies the same
+``--strict-git-env`` flag for ``dev``/``main`` pushes. An operator can override
+with ``RUN_TESTS_ALLOW_REPO_OVERRIDES=1`` (loud warning; not recommended) — the
+scrub is still applied either way.
 
 The run and final-gate commands use ``--scope full`` explicitly: the release
 gate must be backed by **full-suite** evidence. A ``changed``-scope (partial)

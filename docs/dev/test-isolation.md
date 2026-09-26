@@ -414,3 +414,89 @@ Regression coverage:
   linked-worktree sibling churn, plus the config-rewrite fires proof, in
   `tests/test_live_repo_mutation_guard.py`.
 
+
+## 9. Production test-execution scrub (2026-09-26 recurrence, SA-0MUIA3OE40001QJX)
+
+### 9.1 What happened
+
+The 2026-09-24 fix (§5) neutralised repository-override variables for **test
+fixtures** (`skill/shared/git_sandbox.py`), but the **production
+test-execution paths** still inherited the full process environment. On
+2026-09-26 an orphaned audit fan-out (30+ concurrent `audit_runner.py issue`
+processes) exported `GIT_DIR=<live worktree git dir>` into the suite
+subprocesses, so real-git fixtures operated on the live checkout: 24 junk
+commits were created on `dev` and pushed to `origin/dev`. The remote was
+force-restored, but the production path remained unguarded.
+
+Root cause: `test_cache._default_runner` copied `os.environ` wholesale, and
+`run_tests._run_cmd` inherited the parent env (no `env=`). Both are the choke
+points every cached/audited suite run passes through.
+
+### 9.2 Prevention layers (defence in depth)
+
+| Layer | Entry point | Behaviour |
+|-------|-------------|-----------|
+| Shared scrub | `shared.git_sandbox.scrub_repository_overrides` (re-exported by `test_runner`) | Returns a copy of an env mapping with every `REPOSITORY_OVERRIDE_ENV_VARS` name removed; never mutates its input. |
+| Cache runner scrub | `test_cache._default_runner` | Builds the subprocess env via the shared scrub + `~/.local/bin` PATH injection. |
+| Test-skill runner scrub | `run_tests._run_cmd` | Passes an explicit scrubbed `env=` (previously inherited the parent env). |
+| Audit pi-launch scrub | `audit_runner._call_pi` | Passes a scrubbed `env=` to the `pi` subprocess so a later test run cannot inherit a leaked override. |
+| Startup diagnostic | `test_runner.log_repository_override_scrub` | Emits **once** per process, naming (never the values of) the stripped variables; silent when none are present. |
+| Release-gate fail-fast | `run_tests.py --strict-git-env` (invoked by `.githooks/pre-push` for `dev`/`main` and documented in [`skill/ship/SKILL.md`](../../skill/ship/SKILL.md)) | Refuses to start (exit 2) when an override var is present, before any suite command runs. Operator opt-out: `RUN_TESTS_ALLOW_REPO_OVERRIDES=1` (loud warning; scrub still applied). |
+| Host-wide audit cap | `audit_runner.main` `issue` ingress | Bounds independently launched `audit_runner.py issue` processes via the shared `audit-host` flock semaphore (`AUDIT_MAX_HOST_AUDITS`, default 3; `AUDIT_HOST_LOCK_TIMEOUT`, default 90s bounded wait). The N+1th process waits for a slot and exits cleanly with a clear message if none frees in time, instead of adding another concurrent suite runner. |
+| Orphan detection | `audit_runner._find_orphaned_audit_processes` / `_warn_on_orphaned_audits` | Scans `/proc` for `audit_runner.py issue` processes with `PPID 1` and warns, so an orphaned fan-out is visible. |
+| Detect-only live-repo guard | `run_tests.py` `_detect_live_repo_mutation` (+ the repo-root `conftest.py` plugin) | Unchanged inner net: fails a run that mutated its own checkout, but only *after* the mutation. |
+
+Regression coverage: `tests/test_repository_override_isolation.py` (victim-repo
+proof for every production path, plus an assertion that `refs/heads/dev` and
+`refs/remotes/origin/dev` cannot be moved by a fixture),
+`skill/shared/tests/test_git_sandbox.py` (scrub helper contract),
+`skill/audit/tests/test_audit_runner_concurrency.py` (host cap + orphan
+detection), and `tests/test_run_tests_cache.py` (strict release gate).
+
+### 9.3 Residual risk — the external launcher
+
+The variable that exported `GIT_DIR` originated **outside** the `skill/` tree
+(no setter exists in the repository) and could not be recovered from the
+overwritten evidence. The layers above neutralise the *effect* at every
+in-repo execution path, but a launcher can still export an override variable
+into the **pre-scrub** environment of a process that spawns `git` directly
+(bypassing `git_sandbox`). Tracking item:
+**SA-0MUIZSXEY008NGR8** (investigate the external launcher).
+
+### 9.4 Recovery playbook for a recurrence
+
+1. **Stop the bleeding.** Kill the offending run(s); do not let the process
+   finish and push.
+2. **Identify the victim refs.** Snapshot the checkout read-only (never
+   `gc`/`fetch` on the live repo):
+   ```bash
+   git for-each-ref --format='%(refname) %(objectname)'
+   git status --porcelain=v1 -uall
+   git config --local --list
+   ```
+   The incident signature is `refs/heads/dev` moved onto `Test <test@test.com>`
+   / `T <t@t>` / `Cache Test` / `RT Test` commits, fixture branches
+   (`feature-x`, `wl-*-test*`), and a rewritten `.git/config`.
+3. **Restore local `dev`** only after confirming the intended tip (the last
+   legitimate push). Use `--force-with-lease`, never `--force`:
+   ```bash
+   git update-ref refs/heads/dev <legitimate-sha>
+   git push --force-with-lease origin dev:refs/heads/dev
+   ```
+4. **Verify `core.bare` and identity.** A leaked `git init --bare` flips
+   `core.bare`; repair the shared config:
+   ```bash
+   git config --local --get core.bare      # expect: false
+   git config --local --get user.name
+   ```
+5. **Reap orphaned audits.** `ps -eo pid,ppid,cmd | awk '$2==1'` and look for
+   `audit_runner.py issue`; the F5 cap prevents a new fan-out from forming.
+6. **Record the incident** on the tracking work item and re-run the suite via
+   `/skill:test` before any further push.
+
+### 9.5 Verification evidence
+
+- Full suite (pytest + node) green on the implementation worktree — see the
+  work-item comment on SA-0MUIA3OE40001QJX for the exact command and result.
+- `origin/dev`/`refs/heads/dev` fixture-immutability asserted by
+  `tests/test_repository_override_isolation.py::test_poisoned_env_cannot_move_dev_or_origin_dev`.
