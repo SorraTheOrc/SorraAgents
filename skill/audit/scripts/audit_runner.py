@@ -5094,6 +5094,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            ac_fallback_used: threading.Event | None = None,
                            child_screen: bool = False,
                            ac_count: int | None = None,
+                           json_expected: bool = False,
                            priority: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
@@ -5121,6 +5122,13 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             timing line also appends ``model=<model>`` so the serving model
             is observable per call (tiered Phase 1 fast vs Phase 2 full,
             SA-0MSKB697P000T3HG).
+        json_expected: When True, the caller expects a JSON array from this
+            call; the debug entry's ``parse_ok`` field records whether the
+            production extractor found one, and ``reason`` is
+            ``parse_failure`` only when it did not. When False (default) the
+            reason is the neutral ``call_trace`` and ``parse_ok`` is None,
+            because presence of ``raw_stdout`` alone says nothing about the
+            parse outcome (SA-0MU32TAMB007HI99).
 
         # Context reduction: every forwarded pi call runs with
         ``--no-context-files --no-skills`` (see _call_pi) so audit sessions
@@ -5129,8 +5137,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     If *debug_log* is provided the entry reason will be "debug_log" and the
     provided path will be used. If *debug_log* is not provided but the pi
     result contains diagnostic fields (``raw_stdout``/``raw_stderr``), a
-    default path from ``_default_debug_log_path`` will be used and the reason
-    will be "parse_failure".
+    default path from ``_default_debug_log_path`` will be used. The reason is
+    a neutral ``call_trace`` for calls that returned, ``provider_error`` for
+    provider failures, and ``parse_failure`` only when ``json_expected`` was
+    set and the output could not be parsed (SA-0MU32TAMB007HI99).
     """
     result = _call_pi(
         prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools,
@@ -5169,14 +5179,36 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         timing += f" model={model}"
         print(timing, file=sys.stderr)
 
-    # Decide whether to write a debug line
+    # Decide whether to write a debug line.
+    #
+    # Taxonomy (SA-0MU32TAMB007HI99): this layer cannot know whether the
+    # call-site parse succeeded merely from the presence of ``raw_stdout``
+    # (which is set on *every* returned call). The default reason is therefore
+    # the neutral "call_trace"; "parse_failure" is recorded only when the
+    # caller declared that a JSON array was expected (``json_expected``) and
+    # the production extractor could not find one. ``parse_ok`` carries the
+    # explicit outcome (True/False) when a parse was attempted, else None.
+    parse_ok = None
+    if (json_expected and isinstance(result, dict)
+            and not result.get("_provider_error")):
+        text = (
+            result.get("extracted_text")
+            or extract_pi_text(result.get("raw_stdout") or "")
+        )
+        parse_ok = _extract_json_array(text) is not None
+
     reason = None
     target = None
     if debug_log:
         reason = "debug_log"
         target = Path(debug_log)
     elif isinstance(result, dict) and (result.get("raw_stdout") or result.get("raw_stderr")):
-        reason = "provider_error" if result.get("_provider_error") else "parse_failure"
+        if result.get("_provider_error"):
+            reason = "provider_error"
+        elif json_expected:
+            reason = "call_trace" if parse_ok else "parse_failure"
+        else:
+            reason = "call_trace"
         target = _default_debug_log_path(issue_id, context)
 
     if reason and target:
@@ -5184,6 +5216,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             "issue_id": issue_id,
             "context": context,
             "reason": reason,
+            "parse_ok": parse_ok,
             "raw_stdout": result.get("raw_stdout"),
             "raw_stderr": result.get("raw_stderr"),
             "extracted_text": result.get("extracted_text"),
@@ -5627,6 +5660,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                         "child_id": child.get("id"),
                         "context": "child_ac_fallback",
                         "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
+                        "parse_ok": False if not result.get("_provider_error") else None,
                         "raw_text": raw_text,
                         "result_verdict": result.get("verdict"),
                         "result_evidence": result.get("evidence", "")[:500],
@@ -6056,6 +6090,7 @@ def _deep_analyze_child(
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
             ac_count=len(child_acs),
+            json_expected=True,
             priority=_resolve_audit_priority(child),
         )
     except RuntimeError:
@@ -6327,6 +6362,7 @@ def _run_batch_phase2(
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
             ac_count=len(ac_list),
+            json_expected=True,
             priority=_resolve_audit_priority(issue),
         )
     except RuntimeError:
@@ -6589,6 +6625,7 @@ def _run_phase2_deep_analysis(
                 max_retries=_PHASE2_MAX_RETRIES,
                 ac_fallback_used=ac_fallback_used,
                 ac_count=len(ac_results),
+                json_expected=True,
                 priority=_resolve_audit_priority(issue),
             )
         except RuntimeError as exc:
@@ -6870,6 +6907,7 @@ def _reask_verdict_array_once(
             issue.get("id", ""), "verdict_reask", prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             timeout=timeout,
+            json_expected=True,
             priority=_resolve_audit_priority(issue),
         )
     except RuntimeError:
@@ -8250,6 +8288,7 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
                 issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
                 pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
                 ac_fallback_used=ac_fallback_used, child_screen=True,
+                json_expected=True,
                 priority=priority,
             )
         except RuntimeError as exc:
@@ -8927,6 +8966,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
             issue_id, context, prompt, model=model, pi_bin=pi_bin,
             debug_log=debug_log, enable_tools=enable_tools, timeout=timeout,
             ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+            json_expected=True,
             priority=effective_priority,
         )
     except RuntimeError as exc:
@@ -9392,6 +9432,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                         "issue_id": issue_id,
                         "context": "parent_ac_fallback",
                         "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
+                        "parse_ok": False if not result.get("_provider_error") else None,
                         "raw_text": raw_text,
                         "result_verdict": result.get("verdict"),
                         "result_evidence": result.get("evidence", "")[:500],

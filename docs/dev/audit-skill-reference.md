@@ -529,7 +529,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 Per-call timing: issue_id=<id> context=<context> elapsed_seconds=<seconds>
 ```
 
-where `<context>` is the call type (e.g. `parent`, `phase2_deep`, `phase2_child:<i>`, `child:<id>`, `project`). This establishes a performance baseline for Phase 2 deep analysis (N+1 sequential agent-mode calls: one parent + one per active child) and makes regressions visible. The same `elapsed_seconds` value is written into `--debug-log` JSONL entries alongside `issue_id`, `context`, and `provider_error`.
+where `<context>` is the call type (e.g. `parent`, `phase2_deep`, `phase2_child:<i>`, `child:<id>`, `project`). This establishes a performance baseline for Phase 2 deep analysis (N+1 sequential agent-mode calls: one parent + one per active child) and makes regressions visible. The same `elapsed_seconds` value is written into `--debug-log` JSONL entries alongside `issue_id`, `context`, `provider_error`, and the parse-outcome fields `reason` / `parse_ok` (see the reason taxonomy below).
 
 **Per-AC latency (Phase 2, LP-0MSQ32WM5000NCB7):** Phase-2 call sites pass the AC count to `_call_pi_and_maybe_log`, so the timing line additionally surfaces per-AC latency for the deep-analysis contexts (`phase2_deep`, `phase2_child:<i>`, `phase2_batch`):
 
@@ -600,13 +600,33 @@ See `docs/dev/audit-grep-scan-patterns.md` (SA-0MSBR06GX0051T1Q) for the
 pattern catalogue and benchmark.
 
 **Debug logs are transient (Phase 2):** Debug files (`audit_debug_*.jsonl`)
-are written only on parse_failure/provider_error or explicit `--debug-log`, live
+are written for every call that returns plus explicit `--debug-log`, live
 under `~/.audit_debug/<project>/` (outside `.worklog/` and the repo tree, so
 scans never walk them), and are swept by
 `./scripts/cleanup_debug_logs.py` (dry-run default, `--apply`,
 `--older-than N` days, default 14). Successful audit runs delete their own
 debug file; failed runs keep full-content forensics. Never read them back
 programmatically — use `scan.py find-workitem` / `wl search` instead.
+
+**Reason taxonomy (SA-0MU32TAMB007HI99):** each debug entry carries a `reason`
+and an explicit `parse_ok` field, so a returned call can never be mistaken for
+a parse failure:
+
+- `reason: call_trace` — the call returned; `parse_ok` is `true` when a JSON
+  array was expected and found, `false` when it was expected and not found,
+  and `null` when the caller did not declare a JSON expectation.
+- `reason: parse_failure` — a genuine parse failure: the caller passed
+  `json_expected=True` and the production extractor found no JSON array
+  (`parse_ok: false`).
+- `reason: provider_error` — a provider/transport failure
+  (`parse_ok: null`); never conflated with a parse failure.
+- `reason: debug_log` — an explicit `--debug-log` path was supplied.
+
+Only call sites that pass `json_expected=True` (the Phase 1 parent/child AC
+screens, Phase 2 parent/child deep analysis, the batch path, the
+false-positive screen, and the verdict re-ask) can ever record
+`parse_failure`. Consumers MUST key off `parse_ok`/`reason`, not the mere
+presence of a debug entry.
 
 **Phase 1 performance treatment (P7):** Phase 1 (automated screening) now
 mirrors the Phase 2 performance pattern, which removed the dominant Phase 1
