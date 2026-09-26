@@ -536,23 +536,16 @@ def _check_and_evaluate_risk_effort(
         work_item_id, risk, effort,
     )
 
-    # Fetch children for a better estimate
+    # Fetch children for a better estimate (reuses the shared helper so the
+    # cross-repo worklog resolution stays consistent — OSL-0MUI78ROQ005B37N).
     children = []
-    try:
-        cmd = ["wl", "show", work_item_id, "--children", "--json"]
-        cmd[1:1] = worklog_dir_flag()
-        res = run_cmd(cmd, check=False)
-        if res.returncode == 0:
-            data = json.loads(res.stdout.strip())
-            for child in data.get("children", []):
-                children.append({
-                    "id": child.get("id", ""),
-                    "title": child.get("title", ""),
-                    "probability": 2,
-                    "impact": 1,
-                })
-    except Exception as exc:  # noqa: BLE001
-        LOG.warning("Failed to fetch children for estimate: %s", exc)
+    for child in wl_show_children(work_item_id):
+        children.append({
+            "id": child.get("id", ""),
+            "title": child.get("title", ""),
+            "probability": 2,
+            "impact": 1,
+        })
 
     # Build the payload for the orchestrator
     payload = {
