@@ -301,11 +301,15 @@ class TestCmdIssueInMainSlotEndToEnd:
         assert child_contexts == [], (
             f"in-main-slot mode must not spawn child pi sessions: {child_contexts}"
         )
-        err = capsys.readouterr().err
-        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER in err
-        assert "phase1_child_screen" in err
-        assert "CHILD-1" in err
-        assert audit_runner.IN_MAIN_SLOT_COMPACT_MARKER in err
+        captured = capsys.readouterr()
+        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER in captured.err
+        assert "phase1_child_screen" in captured.err
+        assert "CHILD-1" in captured.err
+        assert audit_runner.IN_MAIN_SLOT_COMPACT_MARKER in captured.err
+        # The report must surface the explicit gate, never a silent partial
+        # (SA-0MU32TE120012T49 AC2).
+        assert "Ready to close: No" in captured.out
+        assert "Child screens pending: 1 (main-slot) — CHILD-1" in captured.out
 
     def test_separate_process_child_pi_subprocess(self, capsys):
         """Gate=false: cmd_issue keeps the separate-process path (child pi
@@ -345,5 +349,67 @@ class TestCmdIssueInMainSlotEndToEnd:
         assert any(
             c.startswith("child:") for c in context_log
         ), f"separate-process path must spawn child screens: {context_log}"
-        err = capsys.readouterr().err
-        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER not in err
+        captured = capsys.readouterr()
+        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER not in captured.err
+        assert "Child screens pending" not in captured.out
+
+
+class TestChildScreensPendingGate:
+    """AC2/AC3: in-main-slot pending screens are explicit and block closure."""
+
+    def _pending_child(self):
+        return {
+            "id": "CHILD-1",
+            "title": "Child CHILD-1",
+            "status": "in_progress",
+            "stage": "in_review",
+            "ac_results": [
+                {"text": "CAC1", "verdict": "partial",
+                 "evidence": "In-main-slot child Phase-1 AC screen emitted to "
+                             "the main LLM slot; verdict pending main-session "
+                             "review."},
+            ],
+        }
+
+    def _parent_acs(self):
+        return [{"text": "AC one", "verdict": "met", "evidence": "x.py:1"}]
+
+    def test_report_surfaces_pending_gate_and_blocks_yes(self):
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, self._parent_acs(), [self._pending_child()],
+        )
+        assert "Ready to close: No" in report
+        assert "Child screens pending: 1 (main-slot) — CHILD-1" in report
+        assert "Child-audit execution gate:" in report
+
+    def test_json_payload_includes_pending_screens(self):
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, self._parent_acs(), [self._pending_child()],
+        )
+        assert payload["ready_to_close"] is False
+        assert payload["pending_child_screens"] == ["CHILD-1"]
+
+    def test_pending_signal_written_and_cleared(self, tmp_path):
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1", "CHILD-2"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        signal = tmp_path / "TEST-1.pending-screens.json"
+        assert signal.exists()
+        data = json.loads(signal.read_text(encoding="utf-8"))
+        assert data["pending_child_screens"] == ["CHILD-1", "CHILD-2"]
+
+        audit_runner._write_pending_screens_signal(
+            [], "TEST-1", tmp_path, str(tmp_path),
+        )
+        assert not signal.exists()
+
+    def test_no_pending_child_produces_no_gate(self):
+        child = self._pending_child()
+        child["ac_results"][0] = {
+            "text": "CAC1", "verdict": "met", "evidence": "x.py:1 — ok",
+        }
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, self._parent_acs(), [child],
+        )
+        assert "Child screens pending" not in report
+        assert "Ready to close: Yes" in report

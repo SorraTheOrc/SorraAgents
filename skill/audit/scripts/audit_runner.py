@@ -4366,6 +4366,76 @@ def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
 _MISSING = object()
 
 
+#: Evidence substring marking an AC whose in-main-slot child screen has not
+#: yet been executed by the invoking session (SA-0MT2XRGEU0009QRE).
+MAIN_SLOT_PENDING_EVIDENCE = "main-session review"
+#: Suffix of the resumable pending-screens signal file (SA-0MU32TE120012T49).
+PENDING_SCREENS_SIGNAL_SUFFIX = ".pending-screens.json"
+
+
+def _pending_main_slot_child_ids(child_results: list[dict]) -> list[str]:
+    """Return ids of children whose ACs are pending in-main-slot review.
+
+    In-main-slot mode marks each unexecuted child AC ``partial`` with
+    evidence containing :data:`MAIN_SLOT_PENDING_EVIDENCE`. This is the
+    single detection point used to surface the explicit child-audit gate
+    and to write the resumable pending-screens signal
+    (SA-0MU32TE120012T49).
+    """
+    pending: list[str] = []
+    for child in child_results or []:
+        cid = str(child.get("id", "") or "")
+        acs = child.get("ac_results") or []
+        if not cid or not acs:
+            continue
+        if any(
+            a.get("verdict") == VERDICT_PARTIAL
+            and MAIN_SLOT_PENDING_EVIDENCE in str(a.get("evidence", ""))
+            for a in acs
+        ):
+            pending.append(cid)
+    return pending
+
+
+def _write_pending_screens_signal(
+    pending_ids: list[str],
+    issue_id: str,
+    owning_root: str | Path | None,
+    explicit_dir: str | None = None,
+) -> None:
+    """Persist or clear the resumable in-main-slot pending-screens signal.
+
+    Writes ``<issue_id>.pending-screens.json`` listing the child ids whose
+    main-slot screens remain and removes it when none remain, so a
+    subsequent run can complete exactly those children without a full
+    re-audit (SA-0MU32TE120012T49 AC3). Best-effort: a failure never breaks
+    the audit.
+    """
+    directory = resolve_checkpoint_dir(owning_root, explicit_dir)
+    if directory is None:
+        return
+    signal = Path(directory) / f"{issue_id}{PENDING_SCREENS_SIGNAL_SUFFIX}"
+    try:
+        if not pending_ids:
+            signal.unlink(missing_ok=True)
+            return
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        payload = {
+            "issue_id": issue_id,
+            "pending_child_screens": list(pending_ids),
+            "instructions": (
+                "Perform each emitted [AUDIT_IN_MAIN_SLOT_WORK] child screen, "
+                "persist the child audit, then re-run the parent audit; the "
+                "signal is cleared automatically when no screens remain."
+            ),
+        }
+        tmp = signal.with_name(signal.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(signal)
+    except OSError:
+        pass
+
+
 def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            child_results: list[dict],
                            code_quality_findings: list[dict] | None = None,
@@ -4502,6 +4572,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         ready = ready_before_cq
 
+    # Explicit child-audit execution gate (SA-0MU32TE120012T49): in-main-slot
+    # pending child screens are never presented as a normal result. The gate
+    # names the child ids and how to complete them, and forces Ready=No.
+    pending_child_screens = _pending_main_slot_child_ids(child_results)
+    gate_lines: list[str] = []
+    if pending_child_screens:
+        ready = "No"
+        gate_lines = [
+            "",
+            f"Child screens pending: {len(pending_child_screens)} (main-slot) — "
+            + ", ".join(pending_child_screens)
+            + ". Perform each emitted [AUDIT_IN_MAIN_SLOT_WORK] screen, persist "
+            "the child audit, then re-run the parent to collect the verdicts.",
+        ]
+
     # Build model line (only when model/model_source was explicitly provided)
     issue_id_label = issue.get("id", "") or "unknown"
     if model is not _MISSING:
@@ -4513,6 +4598,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             model_line = f"Model: {effective_model} (no provider)"
         lines = [
             f"Ready to close: {ready}",
+            *gate_lines,
             "",
             f"Audit report for work item {issue_id_label}",
             "",
@@ -4540,6 +4626,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         lines = [
             f"Ready to close: {ready}",
+            *gate_lines,
             "",
             f"Audit report for work item {issue_id_label}",
         ]
@@ -4596,7 +4683,17 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 parts.append(" Deep code analysis (Phase 2) completed and confirmed all verdicts.")
             lines.append(" ".join(parts))
     else:
-        if not phase2_completed and any(
+        if pending_child_screens:
+            lines.append(
+                f"Child-audit execution gate: {len(pending_child_screens)} child "
+                "screen(s) pending main-slot review ("
+                + ", ".join(pending_child_screens)
+                + "). Ready to close is blocked until each emitted "
+                "[AUDIT_IN_MAIN_SLOT_WORK] screen is performed and its child "
+                "audit persisted, then the parent is re-run. See the child-audit "
+                "execution contract in the audit reference."
+            )
+        elif not phase2_completed and any(
             r["verdict"] == VERDICT_PARTIAL
             and "pending deep code review" in _evidence_text(r.get("evidence"))
             for r in ac_results
@@ -5942,7 +6039,14 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         cq_findings, fp_screen_results or []
     ))
 
-    ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq and not any_child_audit_not_ready
+    pending_child_screens = _pending_main_slot_child_ids(child_results)
+    ready = (
+        all_ac_acceptable
+        and all_children_reviewed
+        and not has_blocking_cq
+        and not any_child_audit_not_ready
+        and not pending_child_screens
+    )
 
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
@@ -5968,6 +6072,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
 
     return {
         "ready_to_close": ready,
+        "pending_child_screens": pending_child_screens,
         "summary": summary,
         "acceptance_criteria": ac_results,
         "children": child_results,
@@ -7016,6 +7121,10 @@ class _AuditContext:
     # checkpointing is disabled (--no-checkpoint, unresolvable HEAD, or a
     # store failure) — behavior is then byte-identical to a pre-change run.
     checkpoint: CheckpointStore | None = None
+    # Resolved checkpoint directory (set by _open_checkpoint_store); used to
+    # persist the resumable in-main-slot pending-screens signal
+    # (SA-0MU32TE120012T49). None when checkpointing is disabled.
+    checkpoint_dir: str | None = None
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
@@ -9030,6 +9139,7 @@ def _open_checkpoint_store(ctx: _AuditContext,
         cp_dir = resolve_checkpoint_dir(ctx.owning_root, checkpoint_dir)
         if cp_dir is None:
             return None
+        ctx.checkpoint_dir = str(cp_dir)
         git_head = _resolve_git_head_sha(ctx.runner)
         if git_head is None:
             print(
@@ -10480,6 +10590,16 @@ def _phase_report(ctx: _AuditContext) -> int:
             return assembled
 
         report = _assemble_report()
+
+        # Persist the resumable in-main-slot pending-screens signal so a
+        # later run completes exactly the outstanding child screens without a
+        # full re-audit (SA-0MU32TE120012T49 AC3). Skipped when checkpointing
+        # is disabled (--no-checkpoint / no resolvable HEAD).
+        if ctx.checkpoint is not None and ctx.checkpoint_dir:
+            _write_pending_screens_signal(
+                _pending_main_slot_child_ids(child_results),
+                issue_id, ctx.owning_root, ctx.checkpoint_dir,
+            )
 
         # Capture the audit verdict for the status lifecycle transition.
         # The finally block only trusts this verdict when the audit pipeline
