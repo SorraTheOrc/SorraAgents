@@ -117,6 +117,23 @@ create_symlink "$PROMPTS_LINK" "$PROMPTS_SRC"
 create_symlink "$SKILLS_LINK" "$SKILLS_SRC"
 create_symlink "$AGENTS_LINK" "$AGENTS_SRC"
 
+# --- Pi extension symlinks --------------------------------------------------
+# Wire this repository's `pi-client/*` extensions into the global extension
+# discovery directory so they load in every pi session. Extensions are
+# directories containing an `index.ts`/`index.js` entry point (jiti-loaded, no
+# build step) — see pi-client/voice-input and pi-client/proxy-sse-signals.
+EXTENSIONS_LINK="$HOME/.pi/agent/extensions"
+PI_CLIENT_SRC="$SRC_DIR/pi-client"
+if [ -d "$PI_CLIENT_SRC" ]; then
+  for ext_path in "$PI_CLIENT_SRC"/*/; do
+    [ -d "$ext_path" ] || continue
+    ext_name="$(basename "$ext_path")"
+    if [ -f "$ext_path/index.ts" ] || [ -f "$ext_path/index.js" ]; then
+      create_symlink "$EXTENSIONS_LINK/$ext_name" "${ext_path%/}"
+    fi
+  done
+fi
+
 # --- Pi global config installation / export --------------------------------
 # Repo-side pi config directory (relative to repo root)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
