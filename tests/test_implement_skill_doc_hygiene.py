@@ -15,7 +15,7 @@ def _skill_content() -> str:
 def test_implement_skill_uses_pi_command_names_instead_of_opencode_paths() -> None:
     content = _skill_content()
     assert ".command/" not in content
-    assert "Intake/interview helpers: `intake`, `plan`." in content
+    assert "Intake/interview helpers: `intake`, `plan`, `interview`." in content
 
 
 def test_implement_skill_has_no_dangling_any_asset_line() -> None:

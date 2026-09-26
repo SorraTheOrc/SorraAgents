@@ -1,15 +1,24 @@
-"""Doc-hygiene test: both interview skills must require an explicit preferred option.
+"""Doc-hygiene test: the interview skills must require an explicit preferred option.
 
 SA-0MUBVLFP70064SPJ — Interview skills must state the agent's preferred option
 explicitly.
+
+SA-0MUBVM6FR000NDI1 relocated the shared interview-conduct rules (including the
+explicit preferred-option requirement) into the canonical
+``skill/interview/SKILL.md``. The requirement is still enforced — now through
+the shared component — while ``intake`` and ``plan`` delegate to it. These
+assertions therefore target the shared skill and verify the consuming skills
+reference it (instead of restating the rule).
 """
 
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
+_INTERVIEW_SKILL_MD = _REPO_ROOT / "skill" / "interview" / "SKILL.md"
 _INTAKE_SKILL_MD = _REPO_ROOT / "skill" / "intake" / "SKILL.md"
 _PLAN_SKILL_MD = _REPO_ROOT / "skill" / "plan" / "SKILL.md"
+_INTERVIEW_REF_MD = _REPO_ROOT / "docs" / "dev" / "interview-skill-reference.md"
 _INTAKE_REF_MD = _REPO_ROOT / "docs" / "dev" / "intake-skill-reference.md"
 _PLAN_REF_MD = _REPO_ROOT / "docs" / "dev" / "plan-skill-reference.md"
 
@@ -17,8 +26,9 @@ _MARKER = "**Recommended:**"
 _REQUIRED_PHRASES = [
     "preferred option explicitly",
     "advisory",
-    "operator's choice",
+    "operator may choose",
 ]
+_SHARED_REFERENCE = "interview/SKILL.md"
 
 
 def _skill_content(path: Path) -> str:
@@ -26,138 +36,71 @@ def _skill_content(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-# ── Intake skill ────────────────────────────────────────────────────────────
+# ── Shared interview skill carries the requirement ──────────────────────────
 
 
-class TestIntakeRecommendation:
-    """The intake skill must contain the recommendation requirement."""
+class TestSharedInterviewRecommendation:
+    """The shared interview skill must contain the recommendation requirement."""
 
-    def test_intake_has_recommendation_marker(self) -> None:
-        content = _skill_content(_INTAKE_SKILL_MD)
+    def test_recommendation_marker_present(self) -> None:
+        content = _skill_content(_INTERVIEW_SKILL_MD)
         assert _MARKER in content, (
-            "skill/intake/SKILL.md must contain the "
-            f"'{_MARKER}' recommendation marker"
+            f"skill/interview/SKILL.md must contain the '{_MARKER}' marker"
         )
 
-    def test_intake_requires_preferred_option_explicitly(self) -> None:
-        content = _skill_content(_INTAKE_SKILL_MD)
-        assert "preferred option explicitly" in content, (
-            "skill/intake/SKILL.md must require the agent to state its "
-            "preferred option explicitly"
+    def test_requires_preferred_option_explicitly(self) -> None:
+        content = _skill_content(_INTERVIEW_SKILL_MD)
+        assert "preferred option" in content and "explicitly" in content, (
+            "shared skill must require the agent to state its preferred option "
+            "explicitly"
         )
 
-    def test_intake_mark_advisory(self) -> None:
-        content = _skill_content(_INTAKE_SKILL_MD)
+    def test_mark_advisory(self) -> None:
+        content = _skill_content(_INTERVIEW_SKILL_MD)
         assert "advisory" in content, (
-            "skill/intake/SKILL.md must state the recommendation is advisory"
+            "shared skill must state the recommendation is advisory"
         )
 
-    def test_intake_operator_choice_wins(self) -> None:
-        content = _skill_content(_INTAKE_SKILL_MD)
-        assert "operator's choice" in content, (
-            "skill/intake/SKILL.md must state that the agent proceeds with "
-            "the operator's choice"
+    def test_operator_choice_wins(self) -> None:
+        content = _skill_content(_INTERVIEW_SKILL_MD)
+        assert "operator may choose" in content, (
+            "shared skill must state the operator may choose any option"
         )
 
-    def test_intake_applies_to_every_round_and_producer_handoff(self) -> None:
-        content = _skill_content(_INTAKE_SKILL_MD)
+    def test_applies_to_every_round_and_producer_handoff(self) -> None:
+        content = _skill_content(_INTERVIEW_SKILL_MD)
         assert "every interview round" in content, (
-            "skill/intake/SKILL.md must state the requirement applies to "
-            "every interview round"
+            "shared skill must state the requirement applies to every round"
         )
-        assert "routed to the producer" in content, (
-            "skill/intake/SKILL.md must state the requirement also applies "
-            "to producer-review handoff questions"
+        assert "producer" in content, (
+            "shared skill must cover producer-review handoff questions"
         )
 
 
-# ── Plan skill ──────────────────────────────────────────────────────────────
+# ── Consuming skills delegate to the shared component ───────────────────────
 
 
-class TestPlanRecommendation:
-    """The plan skill must contain the recommendation requirement."""
+class TestConsumingSkillsDelegate:
+    """intake and plan must reference the shared component, not restate it."""
 
-    def test_plan_has_recommendation_marker(self) -> None:
+    def test_intake_references_shared_skill(self) -> None:
+        content = _skill_content(_INTAKE_SKILL_MD)
+        assert _SHARED_REFERENCE in content, (
+            "skill/intake/SKILL.md must reference the shared interview skill"
+        )
+
+    def test_plan_references_shared_skill(self) -> None:
         content = _skill_content(_PLAN_SKILL_MD)
-        assert _MARKER in content, (
-            "skill/plan/SKILL.md must contain the "
-            f"'{_MARKER}' recommendation marker"
+        assert _SHARED_REFERENCE in content, (
+            "skill/plan/SKILL.md must reference the shared interview skill"
         )
 
-    def test_plan_requires_preferred_option_explicitly(self) -> None:
-        content = _skill_content(_PLAN_SKILL_MD)
-        assert "preferred option explicitly" in content, (
-            "skill/plan/SKILL.md must require the agent to state its "
-            "preferred option explicitly"
-        )
-
-    def test_plan_mark_advisory(self) -> None:
-        content = _skill_content(_PLAN_SKILL_MD)
-        assert "advisory" in content, (
-            "skill/plan/SKILL.md must state the recommendation is advisory"
-        )
-
-    def test_plan_operator_choice_wins(self) -> None:
-        content = _skill_content(_PLAN_SKILL_MD)
-        assert "operator's choice" in content, (
-            "skill/plan/SKILL.md must state that the agent proceeds with "
-            "the operator's choice"
-        )
-
-    def test_plan_applies_to_every_round_and_producer_handoff(self) -> None:
-        content = _skill_content(_PLAN_SKILL_MD)
-        assert "every interview round" in content, (
-            "skill/plan/SKILL.md must state the requirement applies to "
-            "every interview round"
-        )
-        assert "routed to the producer" in content, (
-            "skill/plan/SKILL.md must state the requirement also applies "
-            "to producer-review handoff questions"
-        )
-
-
-# ── Both skills must be consistent ──────────────────────────────────────────
-
-
-class TestBothSkillsConsistent:
-    """Both interview skills must carry the same requirement language."""
-
-    def _required_text(self, content: str) -> str:
-        """Return the portion of content between the two known anchors."""
-        start = content.index("preferred option explicitly")
-        end = content.index("This recommendation is", start)
-        return content[start:end]
-
-    def test_both_skills_require_recommendation(self) -> None:
-        intake = _skill_content(_INTAKE_SKILL_MD)
-        plan = _skill_content(_PLAN_SKILL_MD)
-        for name, content in [("intake", intake), ("plan", plan)]:
-            assert "preferred option explicitly" in content, (
-                f"{name} skill must require explicit recommendation"
-            )
-
-    def test_both_skills_mark_advisory(self) -> None:
-        intake = _skill_content(_INTAKE_SKILL_MD)
-        plan = _skill_content(_PLAN_SKILL_MD)
-        for name, content in [("intake", intake), ("plan", plan)]:
-            assert "advisory" in content, (
-                f"{name} skill must mark recommendation as advisory"
-            )
-
-    def test_both_skills_allow_operator_override(self) -> None:
-        intake = _skill_content(_INTAKE_SKILL_MD)
-        plan = _skill_content(_PLAN_SKILL_MD)
-        for name, content in [("intake", intake), ("plan", plan)]:
-            assert "operator's choice" in content, (
-                f"{name} skill must allow the operator's choice to prevail"
-            )
-
-    def test_both_skills_cover_producer_handoff(self) -> None:
-        intake = _skill_content(_INTAKE_SKILL_MD)
-        plan = _skill_content(_PLAN_SKILL_MD)
-        for name, content in [("intake", intake), ("plan", plan)]:
-            assert "routed to the producer" in content, (
-                f"{name} skill must cover producer-review handoff questions"
+    def test_consuming_skills_do_not_restate_the_rule(self) -> None:
+        for name, path in [("intake", _INTAKE_SKILL_MD), ("plan", _PLAN_SKILL_MD)]:
+            content = _skill_content(path)
+            assert _MARKER not in content, (
+                f"{name} skill must not duplicate the shared "
+                "preferred-option rule"
             )
 
 
@@ -167,22 +110,32 @@ class TestBothSkillsConsistent:
 class TestReferenceDocs:
     """The maintainer reference docs must point to the interview-conduct rule."""
 
-    def test_intake_reference_documents_recommendation(self) -> None:
+    def test_shared_interview_reference_documents_recommendation(self) -> None:
+        content = _skill_content(_INTERVIEW_REF_MD)
+        assert "Interview" in content, (
+            "docs/dev/interview-skill-reference.md must document the "
+            "interview-conduct rule"
+        )
+        assert _MARKER in content, (
+            "interview reference doc must reference the `**Recommended:**` marker"
+        )
+
+    def test_intake_reference_points_to_shared_skill(self) -> None:
         content = _skill_content(_INTAKE_REF_MD)
         assert "Interview conduct" in content, (
             "docs/dev/intake-skill-reference.md must document the "
             "interview-conduct rule"
         )
-        assert _MARKER in content, (
-            "intake reference doc must reference the `**Recommended:**` marker"
+        assert "interview" in content.lower(), (
+            "intake reference doc must point to the shared interview skill"
         )
 
-    def test_plan_reference_documents_recommendation(self) -> None:
+    def test_plan_reference_points_to_shared_skill(self) -> None:
         content = _skill_content(_PLAN_REF_MD)
         assert "Interview conduct" in content, (
             "docs/dev/plan-skill-reference.md must document the "
             "interview-conduct rule"
         )
-        assert _MARKER in content, (
-            "plan reference doc must reference the `**Recommended:**` marker"
+        assert "interview" in content.lower(), (
+            "plan reference doc must point to the shared interview skill"
         )

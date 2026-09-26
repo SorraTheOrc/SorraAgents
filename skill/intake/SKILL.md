@@ -49,10 +49,9 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
   import resolution.
 
 - Do not create a work item for this intake process itself.
-- Interview style: concise, high-signal questions, max three per round. For each question/round, state the **preferred option explicitly** with a one-line rationale using the marker `**Recommended:** <option> — <rationale>`.
-- Do not invent requirements — ask the user; don't ask leading or unnecessary questions when an obvious answer exists.
-- If a response is unclear or ambiguous, ask for clarification rather than guessing.
-- Respect `.gitignore` and agent framework ignore rules; prefer short multiple-choice suggestions but allow freeform.
+- Follow the shared [interview conduct contract](../interview/SKILL.md) for
+  all interview behaviour (question volume, multiple-choice preference,
+  explicit preferred option, producer-review handoff, Appendix recording).
 - All work-item descriptions and comments **must be written in Markdown**.
 - The goal is sufficient detail for a clear work item — not an exhaustive spec.
 - Do not include procedural next steps (e.g., "Proceed to planning") in the brief; progression is handled by stage transitions.
@@ -158,17 +157,18 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 
 ### 4. Interview
 
-Skip if the seed context suffices to draft a clear brief. Otherwise: soft limit of 3 questions per round (1+ rounds); do NOT ask questions answerable by repo search — use gathered context; goal is enough understanding to draft a problem definition with user stories, ACs, and related work (not a complete spec); if ambiguous, ask for clarification rather than guessing; do not proceed until sufficient information is gathered.
+Follow the shared [interview conduct contract](../interview/SKILL.md) for all
+interview behaviour — question volume (≤ 3 high-signal questions per round),
+multiple-choice preferred with freeform allowed, the explicit preferred-option
+recommendation rule, the producer-review handoff via `wl reviewed`, and
+idempotent Appendix recording of questions/answers.
 
-**Explicit recommendation per round:** for every interview question or round, the agent **must** state its preferred option explicitly, using the marker `**Recommended:** <option> — <one-line rationale>`. This recommendation is **advisory only** — the operator may choose any option, and the agent **proceeds with the operator's choice**. The agent never unilaterally selects or auto-selects the recommendation without confirmation. The requirement applies to **every interview round** and to questions routed to the producer via `wl reviewed` — not only the first round.
-
-**Producer review:** When the agent cannot proceed without producer input (clarifying questions unanswered, critical information missing), mark the work item as needing producer review:
-
-```bash
-wl reviewed <work-item-id> true
-```
-
-This flags the item so the producer knows attention is required. The agent should STOP and wait for the producer's response. Once answers are received, continue the interview or proceed.
+**Intake-specific interview inputs:** Skip the interview when the seed context
+suffices to draft a clear brief. Otherwise use the interview to gather enough
+understanding to draft a problem definition with user stories, acceptance
+criteria, and related work (not a complete spec) — do not ask questions
+answerable by repo search; use the gathered context. Capture, per feature: the
+user/stakeholder, the problem being solved, and the measurable outcome.
 
 ### 5. Draft intake brief (agent responsibility)
 

@@ -20,7 +20,7 @@ through code, tests, and docs.
 
 ## References to Bundled Resources
 
-- Intake/interview helpers: `intake`, `plan`.
+- Intake/interview helpers: `intake`, `plan`, `interview`.
 
 Security note — scope: this restriction applies to **protected branches**
 (`main`/`master`/`HEAD`) and to **creating PRs**: do not push to them or open

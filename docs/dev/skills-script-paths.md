@@ -399,7 +399,7 @@ its canonical location.
   [GitHub](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/skills.md)).
 - **Agent Skills specification:** [https://agentskills.io/specification](https://agentskills.io/specification)
 - **Skills in this repository:** `skill/ship/`, `skill/cleanup/`,
-  `skill/triage/`, `skill/audit/`
+  `skill/triage/`, `skill/audit/`, `skill/interview/`
 - **Project-local skill extensions:**
   [skill-extensions.md](skill-extensions.md) — the
   `.pi/skills_extensions/<skill-name>/` convention consumed by skill scripts

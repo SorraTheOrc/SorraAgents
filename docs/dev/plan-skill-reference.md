@@ -7,12 +7,12 @@ for maintainers. Workflow semantics are unchanged.
 
 ## Interview conduct
 
-The agent-facing rule lives in `skill/plan/SKILL.md` (§ Hard requirements and
-§ 3. Interview): every interview round must include an explicit preferred
-option, marked `**Recommended:** <option> — <one-line rationale>`. The
-recommendation is **advisory** — the operator's choice always wins and the
-agent never selects unilaterally. The rule applies to every round and to
-questions handed off for producer review via `wl reviewed`.
+Interview conduct is defined once in the canonical shared interview skill
+(`$(skill_path interview)/SKILL.md`); see
+[interview-skill-reference.md](interview-skill-reference.md) for the
+maintainer summary. `skill/plan/SKILL.md` § Interview delegates to it and
+retains only plan-specific interview inputs (target outcome, definition of
+done, constraints, risky assumptions). The shared rules are not restated here.
 
 ## plan_helpers.py — full import list
 
