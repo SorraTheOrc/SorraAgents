@@ -59,6 +59,8 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
 
+**Missing-script fail-fast (SA-0MUIVIJFT0009ZNV):** `run-release.js` resolves the canonical release script **before** the gating checks. When no script exists it exits 2 immediately and runs no git or live-`wl` gate commands — keeping the missing-script safety path cheap, deterministic, and free of worklog side effects.
+
 ## Audit & Producer-Review Gates
 
 `check-audit-gate.js` provides the two readiness gates evaluated during a
@@ -147,6 +149,7 @@ node ./skill/ship/scripts/run-release.js
 
 Steps:
 
+0. **Locate the release script (fail-fast, SA-0MUIVIJFT0009ZNV)** — resolves the canonical release script (skill-level or repository-level) **before** the gating checks and exits 2 immediately if absent; no git or live-`wl` gate commands run.
 1. **Unmerged branches check** — aborts with report if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verifies `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — aborts with exit 7 if non-terminal critical items exist.

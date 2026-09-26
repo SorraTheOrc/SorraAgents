@@ -691,6 +691,45 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     return exitCode;
   };
 
+  // ── Step 0: Locate the release script (fail fast) ──────────────────────
+  // Resolved BEFORE the gating checks below: a missing canonical release
+  // script makes every subsequent check pointless, and the gates issue
+  // expensive live `wl` queries that must not run when the release cannot
+  // proceed (SA-0MUIVIJFT0009ZNV). This also upholds the documented safety
+  // contract — with no script, exit non-zero without running git/worklog
+  // commands (tests/unit/test-run-release.mjs).
+  startStep('Step 0: locate release script');
+  let selectedScript = null;
+  if (existsSync(SKILL_RELEASE_SCRIPT)) {
+    selectedScript = SKILL_RELEASE_SCRIPT;
+  } else if (existsSync(REPO_RELEASE_SCRIPT)) {
+    selectedScript = REPO_RELEASE_SCRIPT;
+  }
+
+  if (!selectedScript) {
+    const msg = [
+      `Ship automated release unavailable: missing canonical release script.`,
+      '',
+      'Attempted locations: ',
+      ` - skill: ${SKILL_RELEASE_SCRIPT}`,
+      ` - repository: ${resolve(REPO_RELEASE_SCRIPT)}`,
+      '',
+      'Human fallback: perform the dev → main promotion manually using the Release Manager checklist:',
+      '- See docs/dev/release-process.md for the manual merge workflow and checklist.',
+      '- Example manual commands (from repo root):',
+      '    git fetch origin',
+      '    git checkout main',
+      '    git merge origin/dev --no-ff',
+      '    git push origin main',
+      '',
+      "If you want the agent to run an automated release, place the canonical script at '<skill-dir>/scripts/release/merge-dev-to-main.sh' or add it to the repository at 'scripts/release/merge-dev-to-main.sh'.",
+    ].join('\n');
+
+    console.error(msg);
+    return finish(2);
+  }
+  stepTimers['Step 0: locate release script'].stop();
+
   // ── Step 1: Check for unmerged branches (gating step) ──────────────────
   startStep('Step 1: unmerged branch check');
   if (!skipChecks) {
@@ -790,39 +829,6 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     }
   }
   stepTimers['Step 3.7: final validation check'].stop();
-
-  // ── Step 4: Find the release script ───────────────────────────────────
-  startStep('Step 4: locate release script');
-  let selectedScript = null;
-  if (existsSync(SKILL_RELEASE_SCRIPT)) {
-    selectedScript = SKILL_RELEASE_SCRIPT;
-  } else if (existsSync(REPO_RELEASE_SCRIPT)) {
-    selectedScript = REPO_RELEASE_SCRIPT;
-  }
-
-  if (!selectedScript) {
-    const msg = [
-      `Ship automated release unavailable: missing canonical release script.`,
-      '',
-      'Attempted locations: ',
-      ` - skill: ${SKILL_RELEASE_SCRIPT}`,
-      ` - repository: ${resolve(REPO_RELEASE_SCRIPT)}`,
-      '',
-      'Human fallback: perform the dev → main promotion manually using the Release Manager checklist:',
-      '- See docs/dev/release-process.md for the manual merge workflow and checklist.',
-      '- Example manual commands (from repo root):',
-      '    git fetch origin',
-      '    git checkout main',
-      '    git merge origin/dev --no-ff',
-      '    git push origin main',
-      '',
-      "If you want the agent to run an automated release, place the canonical script at '<skill-dir>/scripts/release/merge-dev-to-main.sh' or add it to the repository at 'scripts/release/merge-dev-to-main.sh'.",
-    ].join('\n');
-
-    console.error(msg);
-    return finish(2);
-  }
-  stepTimers['Step 4: locate release script'].stop();
 
   // ── Step 5: Execute the release script ─────────────────────────────────
   startStep('Step 5: execute release script');
