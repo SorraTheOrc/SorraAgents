@@ -483,6 +483,200 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
 
 
+def _check_and_evaluate_risk_effort(
+    work_item_id: str, work_item: dict[str, Any],
+) -> dict[str, Any]:
+    """Check risk/effort estimates; run effort-and-risk if missing (SA-0MTTSWHQE0072N9J).
+
+    When a plan_complete item lacks ``risk`` and/or ``effort`` fields, this
+    function runs the effort-and-risk skill to produce and persist estimates
+    via ``wl update``.  Items that already have both fields are passed
+    through unchanged — no gate error, no behaviour change.
+
+    Args:
+        work_item_id: The work-item identifier.
+        work_item: The work-item dict from ``wl show``.
+
+    Returns:
+        A dict with keys ``success`` (bool), ``estimates_provided`` (bool),
+        ``effort`` (str|None), ``risk`` (str|None) and optional ``error``.
+    """
+    risk = work_item.get("risk") or ""
+    effort = work_item.get("effort") or ""
+    stage = work_item.get("stage", "")
+
+    # Only evaluate items that are plan_complete (the gate only applies here)
+    if stage != "plan_complete":
+        LOG.info(
+            "Risk/effort evaluation skipped: stage is %r (not plan_complete)",
+            stage,
+        )
+        return {
+            "success": True,
+            "estimates_provided": False,
+            "reason": f"stage={stage}",
+        }
+
+    # Both fields present — no evaluation needed (no behaviour change)
+    if risk and effort:
+        LOG.info(
+            "Risk/effort already set: risk=%r effort=%r",
+            risk, effort,
+        )
+        return {
+            "success": True,
+            "estimates_provided": False,
+            "reason": "estimates already present",
+        }
+
+    # ── Missing estimates: run the effort-and-risk evaluation ────────────
+    LOG.warning(
+        "Missing risk/effort on plan_complete item %s "
+        "(risk=%r effort=%r) — running evaluation.",
+        work_item_id, risk, effort,
+    )
+
+    # Fetch children for a better estimate
+    children = []
+    try:
+        cmd = ["wl", "show", work_item_id, "--children", "--json"]
+        cmd[1:1] = worklog_dir_flag()
+        res = run_cmd(cmd, check=False)
+        if res.returncode == 0:
+            data = json.loads(res.stdout.strip())
+            for child in data.get("children", []):
+                children.append({
+                    "id": child.get("id", ""),
+                    "title": child.get("title", ""),
+                    "probability": 2,
+                    "impact": 1,
+                })
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Failed to fetch children for estimate: %s", exc)
+
+    # Build the payload for the orchestrator
+    payload = {
+        "o": 2.0,
+        "m": 4.0,
+        "p": 8.0,
+        "overheads": {
+            "coordination": 1.0,
+            "review": 1.0,
+            "testing": 1.0,
+            "risk_buffer": 1.0,
+        },
+        "parent": {"probability": 2.1, "impact": 2.1},
+        "children": children,
+        "certainty": 85.0,
+        "assumptions": [
+            "Default O/M/P used because no prior estimates exist",
+            "Standard overheads applied",
+        ],
+        "unknowns": [
+            "Exact scope may differ from initial understanding",
+        ],
+        "issue_id": work_item_id,
+    }
+
+    # Locate the orchestrator script
+    skill_root = str(Path(__file__).resolve().parents[2])
+    orchestrator = os.path.join(
+        skill_root, "effort-and-risk", "scripts", "orchestrate_estimate.py",
+    )
+
+    if not os.path.isfile(orchestrator):
+        LOG.error(
+            "effort-and-risk orchestrator not found at %s — "
+            "item will be blocked.",
+            orchestrator,
+        )
+        return {
+            "success": False,
+            "estimates_provided": False,
+            "error": "orchestrator not found",
+        }
+
+    # Run the orchestrator
+    try:
+        proc = subprocess.run(
+            ["python3", orchestrator],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+        if proc.returncode != 0:
+            LOG.error(
+                "effort-and-risk evaluation failed (rc=%d): %s",
+                proc.returncode, proc.stderr.strip(),
+            )
+            return {
+                "success": False,
+                "estimates_provided": False,
+                "error": f"orchestrator failed: {proc.stderr.strip()}",
+            }
+
+        # The orchestrator updates the work item via wl update internally.
+        # Parse the output to report what was produced.
+        try:
+            result = json.loads(proc.stdout.strip())
+        except json.JSONDecodeError:
+            result = {}
+
+        # Check whether the update succeeded
+        update_ok = result.get("update_result", {}).get("success", False)
+        if not update_ok:
+            LOG.error(
+                "Failed to persist estimates for %s: %s",
+                work_item_id,
+                result.get("update_result", {}),
+            )
+            return {
+                "success": False,
+                "estimates_provided": False,
+                "error": "failed to persist estimates via wl update",
+            }
+
+        wl_effort = result.get("effort", {}).get("tshirt", "")
+        wl_risk = result.get("risk", {}).get("level", "")
+        # Map risk level to wl label
+        risk_map = {"Low": "Low", "Medium": "Medium", "High": "High", "Critical": "Severe", "Severe": "Severe"}
+        wl_risk_label = risk_map.get(wl_risk, "Medium")
+
+        LOG.info(
+            "Risk/effort evaluated and persisted: risk=%s effort=%s",
+            wl_risk_label, wl_effort,
+        )
+        return {
+            "success": True,
+            "estimates_provided": True,
+            "risk": wl_risk_label,
+            "effort": wl_effort,
+        }
+
+    except subprocess.TimeoutExpired:
+        LOG.error(
+            "effort-and-risk evaluation timed out for %s",
+            work_item_id,
+        )
+        return {
+            "success": False,
+            "estimates_provided": False,
+            "error": "evaluation timed out (5 min)",
+        }
+    except Exception as exc:  # noqa: BLE001
+        LOG.error(
+            "Unexpected error running effort-and-risk for %s: %s",
+            work_item_id, exc,
+        )
+        return {
+            "success": False,
+            "estimates_provided": False,
+            "error": str(exc),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Parent-recursion helpers
 # ---------------------------------------------------------------------------
@@ -2514,6 +2708,30 @@ def phase_start(
 
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
+
+    # ── Step 6.1: Check risk/effort estimates — evaluate if missing ────
+    # (SA-0MTTSWHQE0072N9J) plan_complete items without risk/effort now
+    # trigger an automatic evaluation instead of failing the gate.
+    LOG.info("Checking risk/effort estimates for %s...", work_item_id)
+    re_result = _check_and_evaluate_risk_effort(work_item_id, work_item)
+    report.setdefault("steps", {})["risk_effort"] = re_result
+    if re_result.get("estimates_provided"):
+        LOG.info(
+            "Risk/effort evaluated: risk=%s effort=%s",
+            re_result.get("risk"), re_result.get("effort"),
+        )
+        if not json_output:
+            print(
+                f"\nℹ  Risk/effort estimated: risk={re_result.get('risk')} "
+                f"effort={re_result.get('effort')}\n",
+            )
+    elif not re_result.get("success", True):
+        # Evaluation failed — log but do NOT block; the item can still be
+        # implemented (the estimates will be missing but the gate is pass).
+        LOG.warning(
+            "Risk/effort evaluation failed for %s: %s — proceeding without estimates.",
+            work_item_id, re_result.get("error", "unknown"),
+        )
 
     # ── Step 6.5: Refresh parent branch before creating worktree (AC3) ─
     # Ensure the parent branch is up-to-date before forking a child

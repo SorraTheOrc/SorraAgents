@@ -233,12 +233,18 @@ PRDs/plans/docs; confirm expected tests/validation.
 
 4.1. Definition gate (must pass before implementation)
 
-Verify: clear scope (in/out-of-scope); concrete, testable ACs; constraints and
-compatibility expectations; unknowns captured as explicit questions.
+- Verify: clear scope (in/out-of-scope); concrete, testable ACs; constraints and
+  compatibility expectations; unknowns captured as explicit questions.
+- **Risk/effort gate:** for `plan_complete` items missing `risk` or `effort`, the
+  skill automatically runs the effort-and-risk evaluation and persists estimates
+  via `wl update` — it does NOT fail the gate (SA-0MTTSWHQE0072N9J).  Items with
+  both fields set proceed normally.  If evaluation fails, a warning is logged but
+  the run proceeds.
 
-If the gate fails: (1) `StatusLifecycle.update_status(<work-item-id>, "open")`;
-(2) not well-defined → intake interview (`../intake/SKILL.md`); too large →
-plan interview (`/skill:plan`); (3) inform the user and ask whether to restart.
+If the gate fails (definition issues only, not missing estimates): (1)
+`StatusLifecycle.update_status(<work-item-id>, "open")`; (2) not well-defined →
+intake interview (`../intake/SKILL.md`); too large → plan interview
+(`/skill:plan`); (3) inform the user and ask whether to restart.
 
 **Producer review:** When the agent cannot proceed because the work item is
 ill-defined (unclear scope, untestable ACs, missing constraints) and needs
@@ -251,6 +257,17 @@ wl reviewed <work-item-id> true
 This flags the item so the producer knows the work item needs clarification
 before implementation can proceed. The agent should STOP and wait for the
 producer's response.
+
+**Missing risk/effort estimates.** When a `plan_complete` item is missing
+`risk` and/or `effort` fields, the implement skill runs the
+[effort-and-risk skill](../effort-and-risk/SKILL.md) automatically to produce
+and persist estimates via `wl update --risk/--effort`.  Items with both fields
+already set proceed normally — no gate error, no behaviour change for items
+that are already sized.  The evaluation runs before the worktree is created
+(Step 6.1) so the dispatcher can re-classify the item as implement-dispatchable
+after estimates are persisted.  If the evaluation fails (orchestrator not
+found, subprocess error, timeout), the skill logs a warning and proceeds
+without estimates — it does **not** block the run (SA-0MTTSWHQE0072N9J).
 
 4.2. Detect "already implemented" and close gaps (if applicable)
 
