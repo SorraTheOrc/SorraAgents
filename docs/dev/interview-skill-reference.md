@@ -1,12 +1,13 @@
 # Interview skill — implementation reference
 
 Deep implementation-reference detail for the shared interview-conduct skill
-(`skill/interview/SKILL.md`). This document preserves the full reference for
-maintainers; agents consume the SKILL.md directly.
+(`$(skill_path interview)/SKILL.md`). This document preserves the full
+reference for maintainers; agents consume the SKILL.md directly.
 
 ## Consuming skills
 
-Both `skill/intake/SKILL.md` (§ Interview) and `skill/plan/SKILL.md` (§ Interview)
+Both `$(skill_path intake)/SKILL.md` (§ Interview) and
+`$(skill_path plan)/SKILL.md` (§ Interview)
 reference this shared skill. Each consuming skill retains its own skill-specific
 capture fields:
 

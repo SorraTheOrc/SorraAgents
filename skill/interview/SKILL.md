@@ -1,6 +1,6 @@
 ---
 name: interview
-description: "Canonical interview-conduct rules shared by intake and plan skills. Not directly invocable by the model."
+description: "Define the canonical interview-conduct rules shared by intake and plan. Use when conducting an intake or plan interview."
 agent: build
 disable-model-invocation: true
 ---
@@ -12,8 +12,8 @@ This skill defines the shared interview-conduct rules used by **intake** and
 by running a script. Both consuming skills reference it from their § Interview
 sections instead of restating the rules inline.
 
-> **Consuming skills:** `skill/intake/SKILL.md` (§ Interview),
-> `skill/plan/SKILL.md` (§ Interview).
+> **Consuming skills:** `$(skill_path intake)/SKILL.md` (§ Interview),
+> `$(skill_path plan)/SKILL.md` (§ Interview).
 > Each consuming skill retains its own skill-specific capture fields
 > (seed context, target outcome, DoD, etc.) alongside the shared-conduct
 > reference.
