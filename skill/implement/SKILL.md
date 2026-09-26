@@ -297,7 +297,18 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 
 > **`node_modules` is auto-symlinked:** `implement.py start` creates
 > `<worktree>/node_modules -> <repo-root>/node_modules` when the main checkout
-> has one (SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** — writes pass through the symlink, corrupting the shared tree.
+> has one (SA-0MSGS763C006SM1B). It also symlinks **nested** `node_modules`
+> directories: every `<pkg>/node_modules` found in the main checkout whose
+> parent package directory already exists in the worktree gets a matching
+> symlink (`<worktree>/<pkg>/node_modules -> <main-checkout>/<pkg>/node_modules`),
+> so workspace/monorepo packages and pi packages resolve their dependencies in
+> the worktree (OSL-0MUFG3PJA00379CT). Discovery is bounded — it prunes `.git`
+> and `.worklog` and never descends into a `node_modules` tree. Existing
+> entries are never overwritten and a missing parent package directory is never
+> fabricated. **Do NOT run `npm install` inside a worktree** — writes pass
+> through the symlink, corrupting the shared tree. A branch that changes
+> `package.json` still resolves the main checkout's dependencies; reinstall in
+> the main checkout if that matters.
 
 > **Git submodules are auto-initialised:** `implement.py start` runs
 > ``git submodule update --init --recursive`` inside the new worktree (SA-0MSN52GGN002B0AZ).

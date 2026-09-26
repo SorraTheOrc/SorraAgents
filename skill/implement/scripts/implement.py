@@ -44,6 +44,7 @@ import subprocess
 import sys
 import time
 import traceback
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -59,7 +60,7 @@ from import_guard import guard_shared_import
 
 try:
     from shared.code_freeze import is_code_freeze_active
-    from shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
+    from shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
     from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
@@ -354,7 +355,7 @@ def wl_show(work_item_id: str) -> dict[str, Any]:
         Parsed JSON dict from ``wl show``.
     """
     cmd = ["wl", "show", work_item_id, "--json"]
-    cmd[1:1] = worklog_dir_flag()
+    cmd[1:1] = resolve_worklog_flags(cmd)
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.error("Failed to fetch work item %s: %s", work_item_id, result.stderr.strip())
@@ -382,7 +383,7 @@ def wl_show_children(work_item_id: str) -> list[dict[str, Any]]:
         List of child work-item dicts (may be empty).
     """
     cmd = ["wl", "show", work_item_id, "--children", "--json"]
-    cmd[1:1] = worklog_dir_flag()
+    cmd[1:1] = resolve_worklog_flags(cmd)
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.error(
@@ -416,7 +417,7 @@ def wl_dep_blockers(work_item_id: str) -> list[dict[str, Any]]:
         List of outbound dependency-edge dicts (may be empty).
     """
     cmd = ["wl", "dep", "list", work_item_id, "--json"]
-    cmd[1:1] = worklog_dir_flag()
+    cmd[1:1] = resolve_worklog_flags(cmd)
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.error(
@@ -450,7 +451,7 @@ def wl_add_comment(work_item_id: str, comment: str) -> bool:
         "wl", "comment", "add", work_item_id,
         "--comment", comment, "--author", "implement",
     ]
-    cmd[1:1] = worklog_dir_flag()
+    cmd[1:1] = resolve_worklog_flags(cmd)
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.warning("Failed to add comment to %s: %s", work_item_id, result.stderr.strip())
@@ -908,6 +909,128 @@ def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> b
         return False
     LOG.info("Symlinked %s -> %s", wt_nm, root_nm)
     return True
+
+
+# Directories pruned by the nested node_modules discovery walk. ``.git`` and
+# ``.worklog`` are large/irrelevant trees; ``node_modules`` is pruned so the
+# walk never descends into (and therefore never mirrors) a dependency tree's
+# own nested dependencies (OSL-0MUFG3PJA00379CT).
+_NESTED_NODE_MODULES_PRUNE_DIRS = frozenset({".git", ".worklog", "node_modules"})
+
+
+def _iter_nested_node_modules(repo_root: str) -> Iterator[tuple[str, str]]:
+    """Yield nested ``node_modules`` directories under the main checkout.
+
+    Walks *repo_root* top-down, pruning :data:`_NESTED_NODE_MODULES_PRUNE_DIRS`
+    (so ``.git``/``.worklog`` trees are ignored and a ``node_modules``
+    directory is never descended into) and never following symlinked
+    directories. The repository-root ``node_modules`` is excluded — it is
+    owned by :func:`_ensure_node_modules_symlink`.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+
+    Yields:
+        ``(rel_parent, rel_node_modules)`` POSIX-style paths relative to
+        *repo_root*, e.g. ``(".pi/packages/x", ".pi/packages/x/node_modules")``.
+    """
+    repo = Path(repo_root)
+    for dirpath, dirnames, _filenames in os.walk(repo, topdown=True):
+        current = Path(dirpath)
+        rel_parent = os.path.relpath(current, repo)
+        # A nested candidate is a child named node_modules, but not the
+        # repository-root one (handled separately).
+        is_nested_candidate = rel_parent != "." and "node_modules" in dirnames
+        # Prune heavy/irrelevant trees, dependency trees, and symlinked
+        # directories (never follow — avoids loops and branch shadowing).
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if name not in _NESTED_NODE_MODULES_PRUNE_DIRS
+            and not (current / name).is_symlink()
+        )
+        if not is_nested_candidate:
+            continue
+        if not (current / "node_modules").is_dir():  # pragma: no cover - defensive
+            continue
+        yield rel_parent, os.path.join(rel_parent, "node_modules")
+
+
+def _ensure_nested_node_modules_symlinks(
+    worktree_path: str, repo_root: str | None
+) -> int:
+    """Auto-symlink the main checkout's *nested* node_modules into a worktree.
+
+    Companion to :func:`_ensure_node_modules_symlink`, which only links the
+    repository-root ``node_modules``. On checkouts whose dependencies live in a
+    nested/workspace package (for example a pi package under
+    ``.pi/packages/<pkg>/node_modules``) the worktree would otherwise have no
+    dependencies at all, so tools run from the worktree (``pi``, ``tsx``) fail
+    with ``Cannot find module``.
+
+    For every nested ``node_modules`` directory discovered in the main checkout
+    (:func:`_iter_nested_node_modules`) this creates
+    ``<worktree>/<rel>/node_modules`` as a symlink to
+    ``<main-checkout>/<rel>/node_modules`` when BOTH conditions hold:
+
+    - the worktree has no entry at that path (dir or symlink) — never
+      overwrite; AND
+    - the parent directory ``<worktree>/<rel>`` already exists — never
+      fabricate a package directory the branch removed (avoids shadowing
+      branch state).
+
+    Best-effort only: a per-candidate failure is logged at ``WARNING`` and does
+    not abort; remaining candidates are still processed. Symlinks only — the
+    helper never copies, installs, or invokes a package manager.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+
+    Returns:
+        Number of nested node_modules symlinks created.
+    """
+    if not repo_root:
+        LOG.info("No repo root known; skipping nested node_modules symlinks.")
+        return 0
+
+    wt_root = Path(worktree_path)
+    repo = Path(repo_root)
+    created = 0
+
+    for rel_parent, rel_nm in _iter_nested_node_modules(repo_root):
+        wt_nm = wt_root / rel_nm
+        if os.path.lexists(wt_nm):
+            LOG.info(
+                "Worktree already has %s; skipping nested node_modules symlink.",
+                wt_nm,
+            )
+            continue
+        wt_parent = wt_root / rel_parent
+        if not wt_parent.is_dir():
+            LOG.info(
+                "Worktree has no %s; skipping nested node_modules symlink "
+                "(would fabricate a package directory).",
+                wt_parent,
+            )
+            continue
+        main_nm = repo / rel_nm
+        try:
+            os.symlink(str(main_nm), str(wt_nm), target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            LOG.warning(
+                "Failed to symlink nested node_modules %s -> %s: %s",
+                wt_nm,
+                main_nm,
+                exc,
+            )
+            continue
+        LOG.info("Symlinked %s -> %s", wt_nm, main_nm)
+        created += 1
+
+    if created:
+        LOG.info("Created %d nested node_modules symlink(s).", created)
+    return created
 
 
 def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool:
@@ -2091,7 +2214,7 @@ def _is_work_item_open(work_item_id: str) -> bool:
     """
     try:
         cmd = ["wl", "show", work_item_id, "--json"]
-        cmd[1:1] = worklog_dir_flag()
+        cmd[1:1] = resolve_worklog_flags(cmd)
         result = run_cmd(cmd, check=False, timeout=30)
         if result.returncode != 0:
             return False
@@ -2430,6 +2553,12 @@ def phase_start(
     # dist-spawning tests resolve dependencies without manual setup. Never
     # fatal: skip when either side lacks node_modules (SA-0MSGS763C006SM1B).
     _ensure_node_modules_symlink(abs_wt_path, _get_repo_root())
+
+    # Nested/workspace packages keep their own node_modules (e.g. a pi package
+    # under .pi/packages/<pkg>); symlink those too so tools run from the
+    # worktree resolve dependencies. Best-effort: never fatal
+    # (OSL-0MUFG3PJA00379CT).
+    _ensure_nested_node_modules_symlinks(abs_wt_path, _get_repo_root())
 
     # Initialise git submodules in the worktree (git worktree add does not
     # do this automatically). Best-effort: a warning on failure, never fatal.
