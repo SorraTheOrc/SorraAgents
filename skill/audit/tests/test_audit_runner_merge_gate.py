@@ -264,14 +264,10 @@ class TestVerifyMergedInDev:
         )
         # Remove dev everywhere: local branch (from a temp checkout), the
         # remote branch, and the remote-tracking ref.
-        subprocess.run(["git", "checkout", "-q", "-b", "tmp-no-dev"],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-D", "dev"], cwd=str(owning),
-                       check=True, capture_output=True)
-        subprocess.run(["git", "push", "-q", "origin", "--delete", "dev"],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "update-ref", "-d", "refs/remotes/origin/dev"],
-                       cwd=str(owning), check=False, capture_output=True)
+        run_git(owning, ["checkout", "-q", "-b", "tmp-no-dev"], check=True)
+        run_git(owning, ["branch", "-D", "dev"], check=True)
+        run_git(owning, ["push", "-q", "origin", "--delete", "dev"], check=True)
+        run_git(owning, ["update-ref", "-d", "refs/remotes/origin/dev"], check=False)
         ctx = _ctx_with_runner(owning, "WL-X")
         merged, evidence, baseline = audit_runner._verify_merged_in_dev(
             ctx, [shas["dev_default"]], ""
@@ -665,14 +661,10 @@ class TestAuditBaseFreshness:
         rewound to dev_default so local HEAD lacks the delivered work."""
         _wl, owning, shas = _make_real_repo(tmp_path)
         branch = "wl-WL-0MSI4TAT70058921-rename-tab"
-        subprocess.run(["git", "push", "-q", "origin", f"{branch}:dev"],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "checkout", "-q", "dev"],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "reset", "-q", "--hard", shas["dev_default"]],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "fetch", "-q", "origin", "dev"],
-                       cwd=str(owning), check=True, capture_output=True)
+        run_git(owning, ["push", "-q", "origin", f"{branch}:dev"], check=True)
+        run_git(owning, ["checkout", "-q", "dev"], check=True)
+        run_git(owning, ["reset", "-q", "--hard", shas["dev_default"]], check=True)
+        run_git(owning, ["fetch", "-q", "origin", "dev"], check=True)
         return owning, shas
 
     def test_fresh_when_local_base_contains_delivered_commits(self, tmp_path):
@@ -1010,3 +1002,44 @@ class TestCommentReferencedEvidence:
         commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
         assert "4f1f0452abc" in commits
         assert branch == ""
+
+
+# ---------------------------------------------------------------------------
+# Hermetic sandbox invariant (SA-0MUG0WFP8008WN63 — parent AC1)
+# ---------------------------------------------------------------------------
+
+
+class TestRealRepoHelpersAreHermetic:
+    """Every real-git fixture helper in this module must be sandbox-hermetic.
+
+    Regression guard for parent AC1: a leaked repository-overriding
+    environment variable (``GIT_DIR``) must not redirect the repo factory
+    away from its ``tmp_path`` sandbox, and the created repository must
+    resolve inside ``tmp_path``.
+    """
+
+    def test_leaked_git_dir_cannot_redirect_make_real_repo(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        victim = init_repo(tmp_path / "victim")
+        (victim / "real.txt").write_text("real", encoding="utf-8")
+        commit_all(victim, "victim base")
+        before = run_git(
+            victim, ["rev-list", "--all", "--count"], check=True
+        ).stdout.strip()
+
+        monkeypatch.setenv("GIT_DIR", str(victim / ".git"))
+        try:
+            _wl, owning, _shas = _make_real_repo(tmp_path / "made")
+        finally:
+            monkeypatch.delenv("GIT_DIR", raising=False)
+
+        # The leaked GIT_DIR must not have touched the victim repository.
+        assert run_git(
+            victim, ["rev-list", "--all", "--count"], check=True
+        ).stdout.strip() == before
+        # ...and the fixture repository must resolve inside the tmp_path sandbox.
+        toplevel = run_git(
+            owning, ["rev-parse", "--show-toplevel"], check=True
+        ).stdout.strip()
+        assert Path(toplevel).resolve() == owning.resolve()
