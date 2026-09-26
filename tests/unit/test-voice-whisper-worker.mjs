@@ -17,7 +17,7 @@
  * Run: node --test tests/unit/test-voice-whisper-worker.mjs
  */
 
-import { describe, test, before } from "node:test";
+import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -57,6 +57,21 @@ before(() => {
   stubDir = { stub: stubDir, empty };
 });
 
+/** Workers still running, killed on process teardown so a failed assertion
+ * cannot leave a python child holding the event loop open. */
+const liveWorkers = new Set();
+
+after(() => {
+  for (const worker of liveWorkers) {
+    try {
+      worker.child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  liveWorkers.clear();
+});
+
 /** Spawn the real worker and expose a message queue. */
 class WorkerHarness {
   constructor(args = [], { pythonPath } = {}) {
@@ -68,6 +83,7 @@ class WorkerHarness {
     });
     this.messages = [];
     this.stderr = "";
+    liveWorkers.add(this);
     this.readline = createInterface({ input: this.child.stdout });
     this.readline.on("line", (line) => {
       try {
@@ -80,7 +96,10 @@ class WorkerHarness {
       this.stderr += chunk.toString();
     });
     this.exit = new Promise((resolve) => {
-      this.child.on("exit", (code, signal) => resolve({ code, signal }));
+      this.child.on("exit", (code, signal) => {
+        liveWorkers.delete(this);
+        resolve({ code, signal });
+      });
     });
   }
 
@@ -88,17 +107,21 @@ class WorkerHarness {
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  async waitFor(type, timeoutMs = 20000) {
+  async waitForCount(type, count, timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const found = this.messages.find((m) => m.type === type);
-      if (found) return found;
+      const found = this.messages.filter((m) => m.type === type);
+      if (found.length >= count) return found[count - 1];
       if (this.child.exitCode !== null) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     throw new Error(
-      `timed out waiting for "${type}". messages=${JSON.stringify(this.messages)} stderr=${this.stderr}`,
+      `timed out waiting for ${count} "${type}" message(s). messages=${JSON.stringify(this.messages)} stderr=${this.stderr}`,
     );
+  }
+
+  async waitFor(type, timeoutMs = 20000) {
+    return this.waitForCount(type, 1, timeoutMs);
   }
 }
 
@@ -150,6 +173,25 @@ describe("whisper worker protocol", () => {
     worker.send({ type: "finalise" });
     const final = await worker.waitFor("final");
     assert.equal(final.text, "");
+
+    worker.send({ type: "stop" });
+    await worker.exit;
+  });
+
+  test("finalise clears the utterance buffer so the persistent worker can be reused", async () => {
+    const worker = new WorkerHarness(["--device", "cpu"], { pythonPath: stubDir.stub });
+    worker.send({ type: "start", device: "cpu" });
+    await worker.waitFor("ready");
+
+    worker.send({ type: "feed", audio: pcm(1600).toString("base64") });
+    worker.send({ type: "finalise" });
+    const first = await worker.waitFor("final");
+    assert.match(first.text, /1600 samples/);
+
+    // A second utterance starts from silence: no audio buffered -> empty.
+    worker.send({ type: "finalise" });
+    const second = await worker.waitForCount("final", 2);
+    assert.equal(second.text, "");
 
     worker.send({ type: "stop" });
     await worker.exit;

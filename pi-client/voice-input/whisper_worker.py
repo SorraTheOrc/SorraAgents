@@ -132,7 +132,15 @@ class TranscriptionSession:
         self.sequence += 1
         text = self._transcribe()
         emit(self._message("final", text=text))
+        # The persistent worker is reused across recordings: clear the
+        # utterance buffer so the next recording starts from silence.
+        self.reset()
         return text
+
+    def reset(self) -> None:
+        """Discard the accumulated utterance (called after finalise)."""
+        self.buffer = bytearray()
+        self.last_partial_bytes = 0
 
     def _message(self, kind: str, text: str | None = None) -> dict[str, Any]:
         return {
