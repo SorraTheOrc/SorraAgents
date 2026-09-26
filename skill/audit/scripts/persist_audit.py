@@ -559,6 +559,85 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     return 0
 
 
+def persist_audit_freshness(issue_id: str, wl_bin: str = "wl",
+                            runner: Callable = None,  # noqa: RUF013
+                            worklog_dir: str | None = None,
+                            fingerprint: str | None = None,
+                            summary: str | None = None) -> int:
+    """Refresh a work item's audit freshness without storing the full report.
+
+    Implements the ``--do-not-persist`` dry-run contract
+    (SA-0MTJ0KO6L004GIZK): a passing dry-run validation must still bump
+    ``auditedAt``/``auditResult`` so Herdr/downtime treat the item as freshly
+    audited, while the full ``rawOutput`` markdown is NOT persisted.
+
+    Uses the atomic ``wl audit-set`` path (WL-0MT8KTE3E001Q1D9): the same
+    transaction writes the ``audit_results`` row and sets
+    ``updatedAt = auditedAt`` on the work item. ``--raw-output`` /
+    ``--audit-file`` are deliberately omitted so ``rawOutput`` stays null.
+
+    The optional *fingerprint* is forwarded as ``--fingerprint`` so the
+    content-freshness gate keeps the audit fresh across later ``updatedAt``
+    churn (comments, lifecycle transitions). When absent, freshness falls
+    back to the legacy 60 s time gate.
+
+    Return codes:
+
+    - ``0`` — the freshness timestamp and verdict were refreshed.
+    - non-zero — ``wl audit-set`` failed or reported ``success: false``;
+      fail-closed (a caller must not claim freshness when the refresh did
+      not apply).
+    """
+    if summary is None:
+        summary = (
+            "Dry-run audit (--do-not-persist): Ready to close: Yes — "
+            "full report not stored."
+        )
+
+    cmd = [
+        wl_bin, "audit-set", issue_id,
+        "--ready-to-close", "yes",
+        "--summary", summary,
+    ]
+    if fingerprint:
+        cmd += ["--fingerprint", fingerprint]
+    cmd.append("--json")
+    cmd[1:1] = _worklog_flags(cmd, worklog_dir)
+
+    # The audit runner's injectable runner contract is ``runner(cmd)``
+    # (positional, args baked in — see ``_default_runner``); only the real
+    # subprocess fallback needs explicit kwargs. Keeping the positional call
+    # means a runner that models ``_run_wl`` needs no special-casing.
+    if runner is None:
+        proc = subprocess.run(cmd, check=False, text=True, capture_output=True)
+    else:
+        proc = runner(cmd)
+    if getattr(proc, "returncode", 1) != 0:
+        stderr = getattr(proc, "stderr", "") or ""
+        print(
+            f"wl audit-set (freshness refresh) failed "
+            f"(rc={getattr(proc, 'returncode', 'unknown')}): {stderr.strip()}",
+            file=sys.stderr,
+        )
+        return int(getattr(proc, "returncode", 1) or 1)
+
+    stdout = getattr(proc, "stdout", "") or ""
+    try:
+        data = json.loads(stdout)
+        if isinstance(data, dict) and data.get("success") is False:
+            err = data.get("error") or data.get("message") or "unknown"
+            print(
+                f"wl audit-set (freshness refresh) reported failure: {err}",
+                file=sys.stderr,
+            )
+            return 1
+    except json.JSONDecodeError:
+        # wl not emitting JSON is tolerated; the exit code is authoritative.
+        pass
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Persist an audit report to a Worklog work item using wl")
     p.add_argument("--issue-id", "-i", required=True, help="Worklog issue id to persist the audit to")

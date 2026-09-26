@@ -37,6 +37,7 @@ The runner manages the item's `status`/`stage` during execution to prevent concu
 - Failure/timeout/unparseable → restore captured pre-audit status/stage (fallback only if undeterminable) and **clear the assignee**. Only an explicit `No` moves to `open` — a transient timeout never demotes an `in_review` item. If a completed `Yes` run is ever restored (script failure during the run), a visible warning is printed — never a silent divergence.
 - **Verified transitions (WL-0MSVVFBJ2003RRYK):** after the terminal `wl update` the runner reads back the item via `wl show <id> --json` and confirms the status/stage actually changed to the expected values (`completed`/`in_review`, `open`/`plan_complete`, or the restored pre-audit state). A `wl update` that exits 0 without applying (silently swallowed) is retried up to 3 times with short delays; if still unverified the runner prints a loud diagnostic, best-effort restores the captured pre-audit state, and exits **non-zero** — a passing audit can never leave an item stranded in its pre-audit stage silently.
 - `--do-not-persist` doesn't affect the lifecycle; status-update failures are retried and verified, then surfaced loudly (never silently caught).
+- **Dry-run freshness (SA-0MTJ0KO6L004GIZK):** with `--do-not-persist`, a `Ready to close: Yes` verdict STILL persists the audit freshness signal — `auditedAt`/`auditResult` (not the full `rawOutput`) — via the atomic `wl audit-set --ready-to-close yes` path (`updatedAt = auditedAt`, `WL-0MT8KTE3E001Q1D9`) applied as the last write after the terminal transition. The content fingerprint is forwarded so `isAuditFresh` stays true across later `updatedAt` churn; the runner exits non-zero if the refresh fails. A `No`/`partial`/failure verdict never bumps `auditedAt` (fail-closed). Omit the flag to persist the full report.
 
 ### Manual Fallback
 
@@ -295,7 +296,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 
 1. **Print** the complete audit report to stdout.
 2. **Persist** via `python3 $(skill_path audit)/scripts/persist_audit.py --issue-id <id> --report "<report>"` (or echo-pipe; runner `audit_runner.py issue <id>` persists **and verifies** unless `--do-not-persist`). The persister targets the work-item's own worklog store from any cwd (auto-resolved via the shared prefix-to-sibling scan when `--worklog-dir` is omitted; an explicit `--worklog-dir` keeps highest precedence).
-   > **Readback verification is an invariant:** runner reads back via `wl audit-show <id> --json` (audit exists, `rawOutput` non-empty, content references the ID) or exits non-zero.
+   > **Readback verification is an invariant:** runner reads back via `wl audit-show <id> --json` (audit exists, `rawOutput` non-empty, content references the ID) or exits non-zero. With `--do-not-persist` the readback of the full report is intentionally skipped (no `rawOutput`); instead, on `Ready to close: Yes` the runner persists ONLY the freshness signal (`auditedAt`/`auditResult` via `wl audit-set` without `--raw-output`) so Herdr/DOWNTIME see the item as freshly audited, and exits non-zero if that refresh fails. `rawOutput` stays null. The dry-run refresh is applied after the terminal status/stage transition, so `auditedAt == updatedAt` holds for an item already in `in_review`.
 3. **Verify persistence** — exit 0 does NOT guarantee storage: `wl audit-show <id> --json` must show `success=true`, audit not null, `rawOutput` non-empty with `Ready to close:` marker.
 4. **On failure:** re-print, report the error, do NOT mark as recorded.
 5. **Closing sentence** (issue-level): `Yes` → "Audit passed. The item is ready for release."; otherwise → "Work item is not ready to close (see above), would you like me to address the gaps in the audit?"
@@ -309,7 +310,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 
 ```bash
 python3 $(skill_path audit)/scripts/audit_runner.py issue SA-123                  # audit + persist
-python3 $(skill_path audit)/scripts/audit_runner.py issue SA-123 --do-not-persist  # dry run
+python3 $(skill_path audit)/scripts/audit_runner.py issue SA-123 --do-not-persist  # dry run (full report not stored; a Yes verdict still refreshes auditedAt/auditResult)
 python3 $(skill_path audit)/scripts/audit_runner.py issue SA-123 --force           # in-progress item (bypasses pre-flight guard + freshness)
 ```
 

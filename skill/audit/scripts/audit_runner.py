@@ -43,6 +43,13 @@ Persist + verify invariant:
   is retrievable.  If either step fails the runner exits non-zero.
   This is not configurable — it is an invariant of the runner.
 
+  ``--do-not-persist`` is a dry run: the full report (``rawOutput``) is NOT
+  stored, but a 'Ready to close: Yes' verdict STILL persists the audit
+  freshness signal (``auditedAt`` / ``auditResult``) via the atomic
+  ``wl audit-set`` path (``updatedAt = auditedAt``) so Herdr/DOWNTIME treat
+  the item as freshly audited instead of re-queuing it as a stale-audit
+  candidate.  A non-Yes verdict never bumps ``auditedAt`` (fail-closed).
+
 Exit codes:
   0 – success (report printed to stdout)
   1 – Worklog / CLI / Pi failure, persistence failure, or readback
@@ -93,6 +100,7 @@ from audit.scripts.checkpoint_store import (
 from audit.scripts.persist_audit import (
     PERSIST_CONTENT_INVALID,
     persist_audit,
+    persist_audit_freshness,
 )
 from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
@@ -10720,6 +10728,11 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # restore_cmd so a verification failure can report the exact expectation.
     expected_status: str | None = None
     expected_stage: str | None = None
+    # Dry-run freshness refresh marker (SA-0MTJ0KO6L004GIZK): set only on a
+    # genuine 'Ready to close: Yes' advance when --do-not-persist was given.
+    # Applied after the transition is verified so the atomic
+    # ``updatedAt = auditedAt`` write is the item's last timestamp change.
+    dry_run_freshness_refresh = False
     # Conservative default: on any computation failure below, treat the
     # run as fallback-tainted so the debug log is retained for forensics.
     fallback_tainted = True
@@ -10805,6 +10818,10 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             expected_status, expected_stage = "completed", (
                 "done" if ctx.original_stage == "done" else "in_review"
             )
+            # Dry-run (--do-not-persist) does not store the full report, but
+            # a passing verdict must still refresh the audit freshness signal
+            # (SA-0MTJ0KO6L004GIZK). Apply it after the verified transition.
+            dry_run_freshness_refresh = not ctx.persist
         else:  # ctx.audit_verdict == "no"
             # Return to the actionable queue at a fixed pre-review stage.
             restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
@@ -10888,6 +10905,34 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         )
         _restore_pre_audit_state_on_failure(ctx)
         return 1
+
+    # Dry-run freshness refresh (SA-0MTJ0KO6L004GIZK): as the LAST write of a
+    # passing --do-not-persist run, refresh ``auditedAt``/``auditResult`` via
+    # the atomic ``wl audit-set`` path (``updatedAt = auditedAt``) WITHOUT
+    # storing the full ``rawOutput`` markdown. Placed after the terminal
+    # transition so ``auditedAt == updatedAt`` holds and Herdr/downtime stop
+    # re-queuing the item as a stale-audit candidate. A non-Yes verdict never
+    # reaches here (fail-closed: a failed dry-run must not clear staleness).
+    if dry_run_freshness_refresh:
+        fresh_rc = persist_audit_freshness(
+            ctx.issue_id,
+            runner=ctx.runner,
+            worklog_dir=ctx.worklog_dir,
+            fingerprint=ctx.content_fingerprint,
+        )
+        if fresh_rc != 0:
+            print(
+                f"Error: Failed to refresh audit freshness for {ctx.issue_id} "
+                f"after a passing dry-run (exit code {fresh_rc}); the full "
+                "report was not stored and the item may still appear stale.",
+                file=sys.stderr,
+            )
+            return fresh_rc
+        print(
+            f"Dry-run audit for {ctx.issue_id}: freshness timestamp "
+            "refreshed (full report not stored).",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -11595,7 +11640,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "mode off — SA-0MT2XRGEU0009QRE)"
                          ))
     p_issue.add_argument("--do-not-persist", action="store_true",
-                         help="Do not persist the audit report via wl update")
+                         help=(
+                             "Dry run: do NOT store the full audit report "
+                             "via wl update. On a 'Ready to close: Yes' verdict "
+                             "the audit freshness timestamp (auditedAt / "
+                             "auditResult) is still persisted so Herdr/DOWNTIME "
+                             "treat the item as freshly audited; a non-Yes "
+                             "verdict leaves auditedAt unchanged. Omit this "
+                             "flag to persist the full report"
+                         ))
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_issue.add_argument("--model", default=None,
                          help="Pi model to use for review (default: resolved from .ralph.json)")
@@ -11720,7 +11773,15 @@ def build_parser() -> argparse.ArgumentParser:
                              f"{AUDIT_BATCH_TIMEOUT_DEFAULT}s)"
                          ))
     p_batch.add_argument("--do-not-persist", action="store_true",
-                         help="Do not persist drained audits via wl update")
+                         help=(
+                             "Dry run: do NOT store each drained audit's full "
+                             "report via wl update. Each 'Ready to close: Yes' "
+                             "item still gets its audit freshness timestamp "
+                             "(auditedAt / auditResult) persisted so "
+                             "Herdr/DOWNTIME treat it as freshly audited; "
+                             "non-Yes items are unchanged. Omit this flag to "
+                             "persist the full reports"
+                         ))
     p_batch.add_argument("--pi-bin", default="pi", help="Path to the pi binary")
     p_batch.add_argument("--model", default=None,
                          help="Pi model to use for review")
