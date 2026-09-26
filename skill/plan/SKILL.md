@@ -134,14 +134,15 @@ python3 ./plan_helpers.py plan-approval-gate <work-item-id>
 
 Expected keys: `request_approval` (`true`/`false`) and `reason`. The gate
 requests approval when effort is Medium/Large/Extra Large **OR** risk is
-Medium/High; it skips when effort is Extra Small/Small **AND** risk is Low.
-Absent effort/risk → default conservatively to requesting approval (a human
-checkpoint is never silently skipped).
+High or higher (High/Severe, the top of the `wl` risk scale); it skips when
+effort is Extra Small/Small **AND** risk is Low/Medium. Absent effort/risk →
+default conservatively to requesting approval (a human checkpoint is never
+silently skipped).
 
 - **`request_approval == true`**: present the plan and ask the user to
   accept, edit, reorder, or split/merge — iterating until approved. State
   the reason explicitly (e.g. "This plan requires your confirmation because
-  its effort is Large scale and its risk is Medium.").
+  its effort is Large scale and its risk is High.").
 - **`request_approval == false`**: do NOT ask; proceed directly to step 5
   (vertical slice verification) and step 6 (automated review stages).
 
