@@ -428,6 +428,17 @@ python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NV
 Failure diagnostics surface the real `wl` error (stdout JSON error field first,
 then stdout text, then stderr) instead of empty stderr.
 
+**Test-suite sibling-scan isolation (SA-0MUIMLPLH006TKY1):** the audit flow
+tests audit synthetic ids (e.g. `TEST-1`) whose prefix can collide with a stale
+worklog left on the host. The shared autouse fixture
+`_default_resolvable_ownership` (`skill/audit/tests/conftest.py` and
+`tests/conftest.py`) therefore redirects `SIBLING_SCAN_ROOT` to an empty
+isolated directory for the duration of each flow test, so a leftover
+`TEST`-prefixed worklog (e.g. `/tmp/wlfields-test`) can never hijack the
+synthetic id and trip the launch-context guard. Tests that exercise ownership
+resolution (the launch-context suite) override the scan root and resolver with
+their own patches.
+
 **Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `600s` per child — e.g. ~710s for a single child, ~6,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, each remaining child is recorded as `partial (budget exceeded)` — never a bare skip — with a diagnostic naming the elapsed time, the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override, and a resumable checkpoint marker is written immediately (see the budget-exceeded contract below). On timeout, returns `unmet` with evidence "Pi model call timed out."
 
 **Child Phase-1 screen budget (LP-0MSQ32S2M001EA74):** lightweight child Phase-1 AC-review screens use a short per-call budget — default 600s, configurable via `--child-screen-timeout SECONDS` (flag wins) or the `AUDIT_CHILD_SCREEN_TIMEOUT` env var. A screen that exceeds its budget returns a clean timeout verdict (`_timeout` marker + timeout evidence) and never burns the full 1800s. Parent Phase-1 screens and all Phase 2 calls (parent + child deep analysis) keep the 1800s budget.

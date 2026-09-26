@@ -73,8 +73,11 @@ def _default_separate_process_child_audits():
 
 
 @pytest.fixture(autouse=True)
-def _default_resolvable_ownership():
-    """Resolve undeterminable ownership to the launch project root.
+def _default_resolvable_ownership(tmp_path_factory):
+    """Resolve undeterminable ownership to the launch project root, and
+    isolate the sibling prefix scan so stale sibling worklogs cannot hijack
+    synthetic test ids (SA-0MUIMLPLH006TKY1).
+
     The undeterminable-ownership abort (SA-0MSLLGDW00098UCC) makes
     ``cmd_issue`` exit non-zero when the owning project root cannot be
     determined (no --worklog-dir, unknown item prefix, no sibling match).
@@ -83,9 +86,18 @@ def _default_resolvable_ownership():
     would otherwise abort for reasons unrelated to what they test. This
     autouse fixture resolves unknown prefixes to ``TARGET_PROJECT_ROOT``
     — the launch cwd's project root — preserving the legacy fail-open
-    behavior for those flows; tests that DO exercise ownership resolution
-    (the launch-context suite) override it with their own
-    ``mock.patch.object(audit_runner, "_resolve_owning_project_root", ...)``
+    behavior for those flows.
+
+    It additionally redirects ``SIBLING_SCAN_ROOT`` to an empty isolated
+    directory. The default scan root is ``REPO_ROOT.parent``; a stale
+    ``TEST``-prefixed sibling worklog left behind on the host (e.g.
+    ``/tmp/wlfields-test``) therefore matched the synthetic ``TEST-1`` id
+    and made the launch-context guard reject the item — an
+    environment-dependent failure (incident: SA-0MUIMLPLH006TKY1). An empty
+    scan root guarantees flow tests never resolve host artifacts.
+
+    Tests that DO exercise ownership resolution (the launch-context suite)
+    override the scan root and/or resolver with their own ``mock.patch``
     — the inner patch wins while active.
     """
     real_resolve = audit_runner._resolve_owning_project_root
@@ -96,7 +108,13 @@ def _default_resolvable_ownership():
             return root
         return audit_runner.TARGET_PROJECT_ROOT
 
-    with mock.patch.object(
-        audit_runner, "_resolve_owning_project_root", side_effect=_resolvable
+    isolated_scan_root = tmp_path_factory.mktemp("isolated-sibling-scan")
+    with (
+        mock.patch(
+            "shared.status_lifecycle.SIBLING_SCAN_ROOT", isolated_scan_root
+        ),
+        mock.patch.object(
+            audit_runner, "_resolve_owning_project_root", side_effect=_resolvable
+        ),
     ):
         yield

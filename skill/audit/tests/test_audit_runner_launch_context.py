@@ -1070,3 +1070,42 @@ class TestWorktreeLaunchGitResolution:
         assert "wt_uncommitted.txt" in changed, (
             f"changed files must reflect the worktree working tree: {changed}"
         )
+
+
+# ===========================================================================
+# Stale-sibling isolation (SA-0MUIMLPLH006TKY1)
+# ===========================================================================
+
+
+class TestStaleSiblingIsolation:
+    """Flow tests must not resolve synthetic ids through the real scan root.
+
+    Regression for SA-0MUIMLPLH006TKY1:
+    ``TestLifecycleVerification.test_swallowed_no_update_fails_nonzero``
+    audits the synthetic id ``TEST-1``. The real prefix-to-sibling scan root
+    is ``REPO_ROOT.parent``; a stale ``TEST``-prefixed worklog left behind on
+    the host (e.g. ``/tmp/wlfields-test`` from an earlier suite) matched that
+    prefix and made the launch-context guard reject the item, so the lifecycle
+    test failed on otherwise-unrelated hosts. The autouse ownership fixture now
+    redirects the scan to an empty isolated directory, keeping flow tests
+    hermetic.
+    """
+
+    def test_scan_root_is_isolated_from_real_siblings(self):
+        """The active sibling scan root must not be the real repo parent, and
+        must expose no prefix-matching worklog to synthetic-id flow tests."""
+        from shared import status_lifecycle as shared
+
+        assert shared.SIBLING_SCAN_ROOT != shared.REPO_ROOT.parent, (
+            "flow tests must not scan the real sibling root where stale "
+            "prefix-matching worklogs can hijack synthetic ids"
+        )
+        assert shared._find_worklog_dir_by_prefix("TEST") is None
+
+    def test_synthetic_id_resolves_to_launch_root(self):
+        """With the scan isolated, ``TEST-1`` resolves to the launch project
+        root, so the launch-context guard does not abort the flow test."""
+        assert (
+            audit_runner._resolve_owning_project_root("TEST-1")
+            == audit_runner.TARGET_PROJECT_ROOT
+        )
