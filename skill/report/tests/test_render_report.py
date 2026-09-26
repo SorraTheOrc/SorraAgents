@@ -9,11 +9,14 @@ Tests are decoupled from live `wl` — they use fixture JSON and patch
 the renderer to accept explicit parameters.
 """
 
+import io
 import json
 import os
 import sys
 import textwrap
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 # Ensure the scripts directory is on the path so we can import the renderer.
 SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), '..', 'scripts')
@@ -31,8 +34,77 @@ FULL_WORK_ITEM_JSON = textwrap.dedent("""\
   "stage": "in_progress",
   "risk": "medium",
   "effort": "M",
-  "childCount": 3,
-  "auditResult": true
+  "childCount": 3
+}
+""")
+
+# Realistic ``wl show <id> --json --children`` envelope: the structured verdict
+# lives at the payload top level (``auditResult.readyToClose``) and is mirrored
+# into ``workItem.audit`` for backwards compatibility. ``workItem.auditResult``
+# is absent for the current ``wl`` version.
+PASSING_ENVELOPE_JSON = textwrap.dedent("""\
+{
+  "success": true,
+  "workItem": {
+    "id": "LP-0TEST0000000001",
+    "title": "Audited work item that is ready to close",
+    "status": "completed",
+    "priority": "high",
+    "issueType": "bug",
+    "stage": "in_review",
+    "risk": "medium",
+    "effort": "Medium",
+    "auditResult": null,
+    "audit": {
+      "time": "2026-09-20T16:17:56.161Z",
+      "author": "rgardler",
+      "text": "Approved by manual review",
+      "status": "Complete"
+    }
+  },
+  "auditResult": {
+    "workItemId": "LP-0TEST0000000001",
+    "readyToClose": true,
+    "auditedAt": "2026-09-20T16:17:56.161Z",
+    "summary": "Approved by manual review",
+    "rawOutput": null,
+    "author": "rgardler",
+    "fingerprint": null
+  },
+  "comments": []
+}
+""")
+
+FAILING_ENVELOPE_JSON = textwrap.dedent("""\
+{
+  "success": true,
+  "workItem": {
+    "id": "LP-0TEST0000000002",
+    "title": "Audited work item that is not ready to close",
+    "status": "completed",
+    "priority": "medium",
+    "issueType": "task",
+    "stage": "in_review",
+    "risk": "low",
+    "effort": "Small",
+    "auditResult": null,
+    "audit": {
+      "time": "2026-09-20T16:17:56.161Z",
+      "author": "audit",
+      "text": "Ready to close: No - AC2 unmet.",
+      "status": "Complete"
+    }
+  },
+  "auditResult": {
+    "workItemId": "LP-0TEST0000000002",
+    "readyToClose": false,
+    "auditedAt": "2026-09-20T16:17:56.161Z",
+    "summary": "AC2 unmet",
+    "rawOutput": null,
+    "author": "audit",
+    "fingerprint": null
+  },
+  "comments": []
 }
 """)
 
@@ -571,6 +643,130 @@ class TestRendererWithFixture(unittest.TestCase):
         )
         self.assertIn("# Completed test-skill", result)
         self.assertIn("## Conclusion", result)
+
+
+class TestAuditMetadata(unittest.TestCase):
+    """Audit verdict derivation from the structured payload and legacy fallbacks."""
+
+    def setUp(self):
+        from render_report import render_metadata
+        self.render_metadata = render_metadata
+
+    def _audit_line(self, work_item, audit_result=None):
+        metadata = self.render_metadata(work_item, audit_result=audit_result)
+        return metadata["Audit"]
+
+    def test_structured_ready_to_close_true_is_passed(self):
+        line = self._audit_line({}, {"readyToClose": True})
+        self.assertIn("\u2705", line)
+        self.assertIn("passed", line)
+
+    def test_structured_ready_to_close_false_is_failed(self):
+        line = self._audit_line({}, {"readyToClose": False})
+        self.assertIn("\u274c", line)
+        self.assertIn("failed", line)
+
+    def test_missing_audit_result_is_not_run(self):
+        line = self._audit_line({})
+        self.assertIn("\u2754", line)
+        self.assertIn("not run", line)
+
+    def test_null_audit_result_is_not_run(self):
+        line = self._audit_line({}, None)
+        self.assertIn("not run", line)
+
+    def test_legacy_boolean_true_is_passed(self):
+        line = self._audit_line({"auditResult": True})
+        self.assertIn("passed", line)
+
+    def test_legacy_boolean_false_is_failed(self):
+        line = self._audit_line({"auditResult": False})
+        self.assertIn("failed", line)
+
+    def test_legacy_audit_object_status_complete_is_passed(self):
+        line = self._audit_line(
+            {"audit": {"status": "Complete", "text": "Approved by manual review"}}
+        )
+        self.assertIn("passed", line)
+
+    def test_legacy_audit_object_ready_to_close_yes_is_passed(self):
+        line = self._audit_line(
+            {"audit": {"status": "Complete", "text": "Ready to close: Yes\n\nAll ACs met."}}
+        )
+        self.assertIn("passed", line)
+
+    def test_legacy_audit_object_ready_to_close_no_overrides_status(self):
+        line = self._audit_line(
+            {"audit": {"status": "Complete", "text": "Ready to close: No\n\nAC2 unmet."}}
+        )
+        self.assertIn("failed", line)
+
+    def test_structured_verdict_wins_over_legacy_boolean(self):
+        line = self._audit_line({"auditResult": True}, {"readyToClose": False})
+        self.assertIn("failed", line)
+
+    def test_regression_observed_payload_shape(self):
+        """Regression: top-level ``readyToClose: true`` with no ``workItem.auditResult``."""
+        envelope = json.loads(PASSING_ENVELOPE_JSON)
+        work_item = envelope["workItem"]
+        self.assertIsNone(work_item.get("auditResult"))
+        line = self._audit_line(work_item, envelope["auditResult"])
+        self.assertIn("\u2705", line)
+        self.assertIn("passed", line)
+
+
+class TestRenderFromWlEnvelope(unittest.TestCase):
+    """``render_from_wl`` must thread the envelope's top-level ``auditResult``."""
+
+    def _render(self, envelope_json):
+        import render_report as rr
+
+        fake = mock.Mock(returncode=0, stdout=envelope_json, stderr="")
+        with mock.patch.object(rr.subprocess, "run", return_value=fake), \
+                mock.patch.object(rr, "worklog_dir_flag", return_value=[]):
+            return rr.render_from_wl(
+                skill_name="implement",
+                work_item_id="LP-0TEST0000000001",
+                headline="Test headline",
+                acceptance_criteria=[],
+            )
+
+    def test_passing_envelope_renders_passed(self):
+        report = self._render(PASSING_ENVELOPE_JSON)
+        self.assertIn("- **Audit:** \u2705 passed", report)
+
+    def test_failing_envelope_renders_failed(self):
+        report = self._render(FAILING_ENVELOPE_JSON)
+        self.assertIn("- **Audit:** \u274c failed", report)
+
+
+class TestJsonStdinEnvelope(unittest.TestCase):
+    """The ``--json`` stdin path must accept the full ``{workItem, auditResult}`` envelope."""
+
+    def _run_main(self, payload):
+        import render_report as rr
+
+        argv = ["render_report.py", "--json", "--skill-name", "implement"]
+        with mock.patch.object(rr.sys, "argv", argv), \
+                mock.patch.object(rr.sys, "stdin", io.StringIO(payload)):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rr.main()
+        return buffer.getvalue()
+
+    def test_full_envelope_passed(self):
+        output = self._run_main(PASSING_ENVELOPE_JSON)
+        self.assertIn("\u2705 passed", output)
+
+    def test_full_envelope_failed(self):
+        output = self._run_main(FAILING_ENVELOPE_JSON)
+        self.assertIn("\u274c failed", output)
+
+    def test_bare_work_item_still_supported(self):
+        output = self._run_main(
+            json.dumps({"id": "SA-0X", "title": "T", "auditResult": True})
+        )
+        self.assertIn("\u2705 passed", output)
 
 
 if __name__ == "__main__":

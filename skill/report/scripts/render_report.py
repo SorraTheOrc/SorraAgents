@@ -51,8 +51,10 @@ Public API
 """
 
 import json
+import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 # Ensure ``skill/`` is on sys.path so shared modules are importable
@@ -189,8 +191,89 @@ def _fallback(lookup_table, key, default="[?]", label=""):
 
 # ─── Metadata rendering ────────────────────────────────────────────────
 
-def render_metadata(work_item: dict, children: list | None = None) -> dict:
+#: First line of a legacy ``workItem.audit.text`` that states the verdict.
+_READY_TO_CLOSE_RE = re.compile(
+    r"^\s*Ready to close:\s*(yes|no)\b", re.IGNORECASE,
+)
+#: Legacy ``workItem.audit.status`` values that imply a passing verdict.
+_LEGACY_PASS_STATUSES = {"complete", "completed", "passed", "pass"}
+#: Legacy ``workItem.audit.status`` values that imply a failing verdict.
+_LEGACY_FAIL_STATUSES = {"failed", "fail"}
+
+
+def _coerce_bool(value) -> bool:
+    """Coerce a ``readyToClose`` value to a bool (tolerates string forms)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
+
+
+def _legacy_audit_verdict(audit: Mapping) -> str | None:
+    """Derive a verdict from the legacy ``workItem.audit`` mirror.
+
+    The explicit ``Ready to close: Yes|No`` line in ``audit.text`` (when
+    present) is authoritative; otherwise a ``status`` of ``Complete``
+    (or similar) is treated as a pass. Returns ``None`` when undecidable.
+    """
+    text = audit.get("text")
+    if isinstance(text, str):
+        stripped = text.strip()
+        if stripped:
+            first_line = stripped.splitlines()[0]
+            match = _READY_TO_CLOSE_RE.match(first_line)
+            if match:
+                return "yes" if match.group(1).lower() == "yes" else "no"
+    status = audit.get("status")
+    if isinstance(status, str):
+        normalised = status.strip().lower()
+        if normalised in _LEGACY_PASS_STATUSES:
+            return "yes"
+        if normalised in _LEGACY_FAIL_STATUSES:
+            return "no"
+    return None
+
+
+def _audit_verdict(work_item: dict, audit_result: Mapping | None) -> str:
+    """Normalise the audit verdict to ``yes`` / ``no`` / ``unknown``.
+
+    Precedence:
+      1. the structured top-level ``auditResult.readyToClose`` (authoritative);
+      2. a legacy boolean ``workItem.auditResult`` (simple dict callers);
+      3. the legacy ``workItem.audit`` mirror (``status`` / ``Ready to close:``
+         line);
+      4. ``unknown`` (rendered as ``not run``).
+    """
+    if isinstance(audit_result, Mapping) and "readyToClose" in audit_result:
+        return "yes" if _coerce_bool(audit_result.get("readyToClose")) else "no"
+    legacy_boolean = work_item.get("auditResult")
+    if isinstance(legacy_boolean, bool):
+        return "yes" if legacy_boolean else "no"
+    audit = work_item.get("audit")
+    if isinstance(audit, Mapping):
+        verdict = _legacy_audit_verdict(audit)
+        if verdict is not None:
+            return verdict
+    return "unknown"
+
+
+def render_metadata(
+    work_item: dict,
+    children: list | None = None,
+    audit_result: Mapping | None = None,
+) -> dict:
     """Populate the Meta-Data block from a ``wl show --json`` dict.
+
+    Args:
+        work_item: The ``workItem`` object from the ``wl show --json`` payload.
+        children: The payload's ``children`` array (for the child count).
+        audit_result: The payload's **top-level** ``auditResult`` object
+            (``readyToClose``); ``None`` when absent or unaudited. Legacy
+            callers that pass only *work_item* keep working via the
+            ``workItem.auditResult`` / ``workItem.audit`` fallbacks.
 
     Returns a dict keyed by field name with ``<icon> <value>`` strings.
     """
@@ -232,10 +315,10 @@ def render_metadata(work_item: dict, children: list | None = None) -> dict:
     metadata["Children"] = f"{children_icon} {child_count}"
 
     # Audit
-    audit_result = work_item.get("auditResult")
-    a_key = "yes" if audit_result is True else ("no" if audit_result is False else "unknown")
+    a_key = _audit_verdict(work_item, audit_result)
     a_icon = AUDIT_ICONS.get(a_key, "")
-    metadata["Audit"] = f"{a_icon} {'passed' if a_key == 'yes' else ('failed' if a_key == 'no' else 'not run')}"
+    a_label = {"yes": "passed", "no": "failed", "unknown": "not run"}[a_key]
+    metadata["Audit"] = f"{a_icon} {a_label}"
 
     return metadata
 
@@ -355,9 +438,16 @@ def render_report_from_workitem(
     notes=None,
     next_action: str = "review",
     children: list | None = None,
+    audit_result: Mapping | None = None,
 ) -> str:
-    """Convenience wrapper: read metadata from a work-item dict and render."""
-    metadata = render_metadata(work_item, children=children)
+    """Convenience wrapper: read metadata from a work-item dict and render.
+
+    ``audit_result`` is the structured top-level ``auditResult`` from the
+    ``wl show --json`` envelope; it takes precedence over legacy fields.
+    """
+    metadata = render_metadata(
+        work_item, children=children, audit_result=audit_result,
+    )
     return render_report(
         skill_name=skill_name,
         work_item_id=work_item.get("id", "unknown"),
@@ -407,6 +497,7 @@ def render_from_wl(
         notes=notes,
         next_action=next_action,
         children=children,
+        audit_result=data.get("auditResult"),
     )
 
 
@@ -495,8 +586,17 @@ def main():
 
     if args.json:
         data = json.load(sys.stdin)
-        # ``data`` may be a ``{workItem: {...}}`` envelope or the item itself.
-        work_item = data.get("workItem", data) if isinstance(data, dict) else data
+        # ``data`` may be a ``{workItem: {...}, auditResult: {...}}`` envelope
+        # or the bare work item itself.
+        if isinstance(data, dict) and "workItem" in data:
+            work_item = data.get("workItem") or {}
+            audit_result = data.get("auditResult")
+        elif isinstance(data, dict):
+            work_item = data
+            audit_result = None
+        else:
+            work_item = {}
+            audit_result = None
         ac_rows = _parse_ac_args(args.ac)
         report = render_report_from_workitem(
             work_item=work_item if isinstance(work_item, dict) else {},
@@ -506,6 +606,7 @@ def main():
             producer_actions=args.producer_actions,
             notes=args.notes,
             next_action=args.next_action,
+            audit_result=audit_result,
         )
         print(report)
         return
