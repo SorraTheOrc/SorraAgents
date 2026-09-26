@@ -40,6 +40,29 @@ If you already have a current work-item id, continue using it; otherwise ask the
 
 > **Worktree hygiene:** run `scripts/hygiene_check.sh` periodically to detect orphaned stashes and dirty main checkouts; when `implement.py start` warns about orphaned stashes, triage them using the [recovery playbook](skill/implement/SKILL.md#dirty-main-checkout-recovery-playbook) — never stash or delete stashes without explicit operator permission.
 
+### Epic/parent items — one session per child
+
+When `/skill:implement <parent-id>` is invoked on a work item that has children
+(an epic), implement each child in its **own Pi session** with a clean context
+window — do not run every child in a single accumulating session. The session
+for a child loads only that child's work-item description, acceptance criteria,
+and relevant context.
+
+- **Serial, dependency order.** Children are still implemented serially with
+  blocking items first; session isolation does not relax the ordering.
+- **One worktree each.** Worktree isolation per child is preserved alongside
+  session isolation — see the worktree requirement above.
+- **Session logging.** Each new session comments on the child work item with
+  its session id (`<agent_action> - Session ID: <pi_session_id> - <path_to_sessions_log>`),
+  per the **Session logging** rule below.
+- **End, then continue.** End a child's session before starting the next
+  child's session: summarise the remaining tasks and clean up the worktree.
+- **Error isolation.** A failure in one child's session does not affect the
+  other children's sessions; the parent phase reports which children
+  succeeded and which failed.
+- **Parent last.** Only after **all** child sessions have reached a terminal
+  stage is the parent advanced to `in_review`.
+
 <!-- WORKFLOW: end -->
 
 ## CRITICAL RULES

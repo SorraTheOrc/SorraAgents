@@ -116,10 +116,10 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 8335,
-  "project_agents": 1723,
-  "skills_prose": 1694,
-  "total": 11752
+  "global_agents": 10220,
+  "project_agents": 3285,
+  "skills_prose": 1968,
+  "total": 15473
 }
 ```
 
@@ -172,6 +172,13 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > `14017`; `global_agents` and `skills_prose` unchanged). Thresholds were
 > regenerated to the new measured surface so the gate remains green for the
 > approved content.
+>
+> **Session-per-child guidance bump (2026-09-26, SA-0MTLCCIPU0050Q52 /
+> SA-0MUCMMYTV008QWI2):** the "Epic/parent items — one session per child"
+> procedural guidance added ~1,336 B to `AGENTS_GLOBAL.md` (`global_agents
+> 8884` → `10220`; `total 14137` → `15473`; `project_agents` and
+> `skills_prose` unchanged). Thresholds were regenerated to the new measured
+> surface so the gate remains green for the approved content.
 >
 > ### Enforcement (committed gate)
 >
