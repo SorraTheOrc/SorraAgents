@@ -363,6 +363,32 @@ parent reports all children terminal. Each child is implemented in its own
 worktree (never the main checkout); sequential children reuse/rotate the
 `.worklog/worktrees` machinery.
 
+**One session per child (session isolation).** Invoking `/skill:implement
+<parent-id>` on an epic starts a **new Pi session for each child** — do not
+implement every child in one accumulating session. Each child's session
+opens with a clean context window containing only that child's work-item
+description, acceptance criteria, and relevant context. Session isolation
+layers on top of the existing guarantees:
+
+- **Serial, dependency order.** Children are still implemented serially with
+  blocking items first; the dependency, cycle, and blocked-child guards
+  below are unchanged.
+- **Worktree isolation preserved.** Every child is still implemented in its
+  own worktree created by `phase_start`; session and worktree isolation are
+  independent and both apply.
+- **Session logging.** Each new session comments on the child work item with
+  its session id (`<agent_action> - Session ID: <pi_session_id> -
+  <path_to_sessions_log>`), per the AGENTS.md session-logging convention.
+- **Error isolation.** A failure in one child's session does not affect the
+  other children's sessions: the failed child is reset to `open`, the parent
+  phase reports which children succeeded and which failed, and
+  already-completed siblings are never regressed.
+- **Parent advanced last.** The parent is advanced to `completed`/`in_review`
+  only after **all** child sessions have reached a terminal stage.
+
+This mirrors the "Epic/parent items — one session per child" guidance in
+`AGENTS_GLOBAL.md`.
+
 Guards (deterministic, in `phase_parent`):
 
 - **Dependency order** — a child `blocked` by another item is implemented
