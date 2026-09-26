@@ -8,7 +8,9 @@ Covers:
 - AC4 — the ``run_tests.py`` snapshot guard (F4) exits non-zero when the
   configured suite command mutates a ref;
 - AC5 — no false positives: churn in an unrelated repository, a no-op run, and
-  registered agent-worktree churn do not trip the guard.
+  agent-worktree churn (branch advance, plus registration/removal mid-run
+  including the ``--track`` branch config) do not trip the guard
+  (SA-0MUINEW6X0034C65).
 
 No live checkout is mutated to obtain any proof; every mutation happens in a
 ``tmp_path`` repository created through ``shared.git_sandbox``.
@@ -117,6 +119,26 @@ class TestConftestGuardFires:
         assert "test_creates_a_branch" in combined
         # The guard is real: the branch really was created.
         assert gs.run_git(repo, ["rev-parse", "--verify", "refs/heads/intruder"]).returncode == 0
+
+    def test_config_rewrite_is_failed_and_named(self, tmp_path):
+        """Config rewrites are still genuine mutations after the exclusion fix."""
+        repo = _init_guard_repo(tmp_path)
+        _write_guard_conftest(repo)
+        (repo / "test_config_mutator.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            "def test_rewrites_config():\n"
+            "    subprocess.run(['git', '-C', str(Path(__file__).resolve().parent),\n"
+            "                    'config', '--local', 'user.name', 'intruder'], check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(repo)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, combined
+        assert "live-repo mutation" in combined
+        assert "user.name" in combined
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +271,114 @@ class TestNoFalsePositives:
         proc = _run_nested_pytest(root)
 
         assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_worktree_registration_churn_does_not_trip_the_guard(self, tmp_path):
+        """Registering an agent worktree mid-run is churn, not a mutation.
+
+        Regression for SA-0MUINEW6X0034C65: the excluded set grows while the
+        authoritative diff stays empty, which used to fail the running test
+        with ``(no differences)``.
+        """
+        root = _init_guard_repo(tmp_path, "root")
+        agent_wt = root / ".worklog" / "worktrees" / "wl-mid"
+        _write_guard_conftest(root)
+        (root / "test_registers_worktree.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            f"ROOT = Path({str(root)!r})\n"
+            f"WT = Path({str(agent_wt)!r})\n\n"
+            "def test_registers_worktree():\n"
+            "    subprocess.run(['git', '-C', str(ROOT), 'worktree', 'add',\n"
+            "                    '-b', 'wl-mid', str(WT)], check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(root)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined
+        assert agent_wt.exists()  # the worktree really was registered
+
+    def test_tracked_worktree_registration_churn_does_not_trip_the_guard(
+        self, tmp_path
+    ):
+        """``--track`` registration writes branch config: still not a mutation."""
+        root = _init_guard_repo(tmp_path, "root")
+        agent_wt = root / ".worklog" / "worktrees" / "wl-mid"
+        _write_guard_conftest(root)
+        (root / "test_registers_tracked_worktree.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            f"ROOT = Path({str(root)!r})\n"
+            f"WT = Path({str(agent_wt)!r})\n\n"
+            "def test_registers_tracked_worktree():\n"
+            "    subprocess.run(['git', '-C', str(ROOT), 'worktree', 'add',\n"
+            "                    '--track', '-b', 'wl-mid', str(WT), 'dev'],\n"
+            "                   check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(root)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined
+
+    def test_worktree_removal_churn_does_not_trip_the_guard(self, tmp_path):
+        """Removing an agent worktree mid-run (branch retained) is not a mutation."""
+        root = _init_guard_repo(tmp_path, "root")
+        agent_wt = root / ".worklog" / "worktrees" / "wl-agent"
+        gs.add_worktree(root, agent_wt, "wl-agent")
+        _write_guard_conftest(root)
+        (root / "test_removes_worktree.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            f"ROOT = Path({str(root)!r})\n"
+            f"WT = Path({str(agent_wt)!r})\n\n"
+            "def test_removes_worktree():\n"
+            "    subprocess.run(['git', '-C', str(ROOT), 'worktree', 'remove', str(WT)],\n"
+            "                   check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(root)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined
+
+    def test_linked_worktree_guard_ignores_sibling_worktree_churn(self, tmp_path):
+        """Guard armed at a linked-worktree root ignores sibling churn.
+
+        ``implement.py finish`` runs the suite from a linked worktree; the
+        exclusion anchor must therefore be the main checkout, or every sibling
+        commit looks like a mutation (SA-0MUINEW6X0034C65).
+        """
+        root = _init_guard_repo(tmp_path, "root")
+        guarded_wt = root / ".worklog" / "worktrees" / "wl-guarded"
+        sibling_wt = root / ".worklog" / "worktrees" / "wl-sibling"
+        gs.add_worktree(root, guarded_wt, "wl-guarded")
+        gs.add_worktree(root, sibling_wt, "wl-sibling")
+        _write_guard_conftest(guarded_wt)
+        (guarded_wt / "test_ok.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            f"SIBLING = Path({str(sibling_wt)!r})\n\n"
+            "def test_sibling_commits():"
+            "\n"
+            "    (SIBLING / 'sibling.txt').write_text('sibling')\n"
+            "    subprocess.run(['git', '-C', str(SIBLING), 'add', '-A'], check=True)\n"
+            "    subprocess.run(['git', '-C', str(SIBLING), 'commit', '-qm', 'sibling work'],\n"
+            "                   check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(guarded_wt)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,10 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
 - ``snapshot_repo_state`` / ``diff_snapshots`` report an added ref, a deleted
   ref, a moved ref, a changed local-config key, a deleted tracked file and a
   newly added untracked file — and report nothing for an unchanged repo
-  (F3 AC5; parent AC3).
+  (F3 AC5; parent AC3);
+- agent-worktree registration/removal churn (including the
+  ``branch.<name>.*`` config written by ``git worktree add --track``) moves
+  neither the fingerprint nor the diff (SA-0MUINEW6X0034C65).
 """
 from __future__ import annotations
 
@@ -94,6 +97,155 @@ class TestSandboxContainment:
         diff = gs.diff_snapshots(before, after)
         assert diff["changed"]
         assert "refs/heads/wl-incident-test" in diff["refs"]["added"]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MUINEW6X0034C65 — agent-worktree churn is invisible to the guard
+# ---------------------------------------------------------------------------
+
+
+class TestAgentWorktreeChurn:
+    """Registering/removing agent worktrees must not look like a mutation.
+
+    Regression for the per-test guard false positive
+    (SA-0MUINEW6X0034C65): the fingerprint moved when the *excluded set's
+    membership* changed, while the authoritative diff stayed empty, so the
+    guard failed a clean test with ``(no differences)``.
+    """
+
+    def _repo_with_agent_dir(self, tmp_path: Path) -> Path:
+        repo = gs.init_repo(tmp_path / "repo")
+        (repo / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+        (repo / "a.txt").write_text("a", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        return repo
+
+    def test_registering_worktree_moves_neither_fingerprint_nor_diff(
+        self, tmp_path
+    ):
+        """A new excluded ref (agent worktree) is churn, not a mutation."""
+        repo = self._repo_with_agent_dir(tmp_path)
+        before = gs.snapshot_repo_state(repo)
+        gs.add_worktree(repo, repo / ".worklog" / "worktrees" / "wl-new", "wl-new")
+        after = gs.snapshot_repo_state(repo)
+        assert after["excluded_refs"] > before["excluded_refs"]
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+        assert not gs.diff_snapshots(before, after)["changed"]
+
+    def test_tracked_worktree_branch_config_churn_is_excluded(self, tmp_path):
+        """``git worktree add --track`` config churn is excluded too.
+
+        ``implement.py`` registers worktrees with ``--track``, which writes
+        ``branch.<name>.remote`` / ``branch.<name>.merge``. Those keys belong
+        to the excluded agent branch and must not be reported.
+        """
+        repo = self._repo_with_agent_dir(tmp_path)
+        before = gs.snapshot_repo_state(repo)
+        gs.run_git(
+            repo,
+            [
+                "worktree",
+                "add",
+                "--track",
+                "-b",
+                "wl-tracked",
+                str(repo / ".worklog" / "worktrees" / "wl-tracked"),
+                "dev",
+            ],
+            check=True,
+        )
+        after = gs.snapshot_repo_state(repo)
+        assert after["excluded_refs"] > before["excluded_refs"]
+        assert "branch.wl-tracked.remote" in after["config"]  # git really wrote it
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+        assert not gs.diff_snapshots(before, after)["changed"]
+
+    def test_removing_worktree_with_retained_branch_reports_nothing(self, tmp_path):
+        """Removal shrinks the excluded set but keeps the branch: no diff."""
+        repo = self._repo_with_agent_dir(tmp_path)
+        agent_wt = repo / ".worklog" / "worktrees" / "wl-agent"
+        gs.add_worktree(repo, agent_wt, "wl-agent")
+        before = gs.snapshot_repo_state(repo)
+        gs.run_git(repo, ["worktree", "remove", str(agent_wt)], check=True)
+        after = gs.snapshot_repo_state(repo)
+        assert before["excluded_refs"] > after["excluded_refs"]
+        assert "refs/heads/wl-agent" in after["refs"]  # branch retained
+        assert not gs.diff_snapshots(before, after)["changed"]
+
+    def test_existing_branch_becomes_excluded_reports_nothing(self, tmp_path):
+        """A pre-existing branch gaining a worktree is churn, not a mutation.
+
+        This is the exact ``excluded_refs`` grows / empty-diff signature from
+        the SA-0MUINEW6X0034C65 report: the branch already existed, so the
+        cheap fingerprint moves even though the authoritative diff is empty.
+        """
+        repo = self._repo_with_agent_dir(tmp_path)
+        gs.run_git(repo, ["branch", "wl-existing"], check=True)
+        before = gs.snapshot_repo_state(repo)
+        assert "refs/heads/wl-existing" not in before["excluded_refs"]
+        gs.add_worktree(
+            repo,
+            repo / ".worklog" / "worktrees" / "wl-existing",
+            "wl-existing",
+            create_branch=False,
+        )
+        after = gs.snapshot_repo_state(repo)
+        assert "refs/heads/wl-existing" in after["excluded_refs"]
+        assert not gs.diff_snapshots(before, after)["changed"]
+
+    def test_non_excluded_branch_config_rewrite_is_still_reported(self, tmp_path):
+        """Exclusion is scoped to agent branches: other branch config fires."""
+        repo = self._repo_with_agent_dir(tmp_path)
+        before = gs.snapshot_repo_state(repo)
+        gs.run_git(
+            repo, ["config", "--local", "branch.dev.remote", "intruder"], check=True
+        )
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+        assert diff["changed"]
+        assert "branch.dev.remote" in diff["config"]["added"]
+
+
+class TestMainCheckoutAnchoring:
+    """Snapshots taken *from a linked worktree* must exclude agent worktrees.
+
+    ``implement.py finish`` runs the suite from a linked worktree; anchoring the
+    exclusion on the passed root left ``excluded_refs`` empty there and turned
+    concurrent sibling churn into a bogus mutation (SA-0MUINEW6X0034C65).
+    """
+
+    def _repo_with_two_worktrees(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+        repo = gs.init_repo(tmp_path / "repo")
+        (repo / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+        (repo / "a.txt").write_text("a", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        guarded = repo / ".worklog" / "worktrees" / "wl-a"
+        sibling = repo / ".worklog" / "worktrees" / "wl-b"
+        gs.add_worktree(repo, guarded, "wl-a")
+        gs.add_worktree(repo, sibling, "wl-b")
+        return repo, guarded, sibling
+
+    def test_main_checkout_root_resolves_from_linked_worktree(self, tmp_path):
+        repo, guarded, _sibling = self._repo_with_two_worktrees(tmp_path)
+        assert gs.main_checkout_root(guarded) == repo.resolve()
+        assert gs.main_checkout_root(repo) == repo.resolve()
+
+    def test_snapshot_from_linked_worktree_excludes_agent_branches(self, tmp_path):
+        _repo, guarded, sibling = self._repo_with_two_worktrees(tmp_path)
+        (sibling / "sibling.txt").write_text("sibling", encoding="utf-8")
+        gs.commit_all(sibling, "sibling work")
+        snapshot = gs.snapshot_repo_state(guarded)
+        assert snapshot["root"] == str(guarded.resolve())
+        assert "refs/heads/wl-a" in snapshot["excluded_refs"]
+        assert "refs/heads/wl-b" in snapshot["excluded_refs"]
+
+    def test_linked_worktree_sibling_commit_reports_nothing(self, tmp_path):
+        _repo, guarded, sibling = self._repo_with_two_worktrees(tmp_path)
+        before = gs.snapshot_repo_state(guarded)
+        (sibling / "sibling.txt").write_text("sibling", encoding="utf-8")
+        gs.commit_all(sibling, "sibling work")
+        after = gs.snapshot_repo_state(guarded)
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+        assert not gs.diff_snapshots(before, after)["changed"]
 
 
 # ---------------------------------------------------------------------------

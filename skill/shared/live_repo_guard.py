@@ -10,7 +10,8 @@ Behaviour:
 
 - ``pytest_configure`` → ``register(config, root=...)`` snapshots the checkout.
 - ``pytest_runtest_teardown`` → compares a cheap **refs + local-config**
-  fingerprint and fails the offending test immediately, naming its node id.
+  fingerprint and, when it moves, fails the offending test immediately only
+  if the authoritative full diff is non-empty, naming its node id.
 - ``pytest_sessionfinish`` → compares the **full** surface (refs, config,
   tracked/untracked working tree) and exits non-zero, naming the last test if
   only the file surface changed.
@@ -22,7 +23,12 @@ Safety / no-false-positive rules (F5 AC2/AC5/AC6/AC7):
 - a no-op under ``--collect-only`` and under xdist workers;
 - a no-op for non-git roots;
 - refs checked out in ``.worklog/worktrees/`` (agent worktrees) are excluded
-  (derived from ``git worktree list --porcelain``, never a ``wl-*`` pattern).
+  (derived from ``git worktree list --porcelain``, never a ``wl-*`` pattern),
+  together with the ``branch.<name>.*`` config those worktrees own;
+- the cheap fingerprint is only a **trigger**: a movement is confirmed against
+  the authoritative diff before a test is failed, so excluded-set churn
+  (worktree registered/removed mid-run) cannot fail a clean run with
+  ``(no differences)`` (SA-0MUINEW6X0034C65).
 """
 
 from __future__ import annotations
@@ -81,13 +87,22 @@ class LiveRepoMutationGuard:
         current = self._gs.snapshot_repo_state(self.root, include_status=False)
         if self._gs.fingerprint(current) == self._baseline:
             return
-        diff = self._gs.diff_snapshots(self.before, self._gs.snapshot_repo_state(self.root))
-        self.offender = item.nodeid
+        # The cheap fingerprint moved, but it is only a *trigger*: confirm the
+        # movement against the authoritative full diff before failing. An
+        # agent worktree registered or removed mid-run moves the fingerprint
+        # (its branch enters/leaves the excluded set) yet yields no reportable
+        # diff; failing on that produced the bogus
+        # ``(no differences)`` failure (SA-0MUINEW6X0034C65).
+        after = self._gs.snapshot_repo_state(self.root)
+        diff = self._gs.diff_snapshots(self.before, after)
         # Reset the baseline so a single mutation is reported once.
-        self.before = self._gs.snapshot_repo_state(self.root)
+        self.before = after
         self._baseline = self._gs.fingerprint(
             self._gs.snapshot_repo_state(self.root, include_status=False)
         )
+        if not diff["changed"]:
+            return
+        self.offender = item.nodeid
         pytest.fail(
             f"live-repo mutation detected during {item.nodeid}:\n"
             + self._gs.describe_diff(diff),

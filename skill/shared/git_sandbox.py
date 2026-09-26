@@ -30,7 +30,10 @@ Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
   ``git worktree list --porcelain`` — never a ``wl-*`` name pattern, which
   would also have excluded the incident's own fixture branches. A fixture
   branch that happens to be backed by a registered worktree is therefore
-  excluded; the incident is still caught via config rewrites, moved ``dev``,
+  excluded, and so is the ``branch.<name>.*`` local config that registering
+  that worktree writes (``remote``/``merge``) — both are mechanical agent
+  churn, not checkout mutations (SA-0MUINEW6X0034C65). The incident is still
+  caught via config rewrites of any non-excluded key, moved ``dev``,
   ``refs/heads/origin/dev`` and the working-tree surface.
 """
 
@@ -60,8 +63,11 @@ REPOSITORY_OVERRIDE_ENV_VARS: tuple[str, ...] = (
 FIXTURE_AUTHOR_NAME = "Git Sandbox"
 FIXTURE_AUTHOR_EMAIL = "git-sandbox@example.invalid"
 
-#: Worktree-registration directory whose refs are excluded from snapshot
-#: diffs (agent worktrees under ``<checkout>/.worklog/worktrees/``).
+#: Worktree-registration directory whose refs (and their ``branch.<name>.*``
+#: config) are excluded from snapshot diffs: agent worktrees under
+#: ``<main_checkout>/.worklog/worktrees/``. The anchor is always the **main
+#: checkout** (see :func:`main_checkout_root`), even when the snapshot is taken
+#: from a linked worktree.
 AGENT_WORKTREE_DIR = (".worklog", "worktrees")
 
 #: Worklog data namespace. These refs are managed by the ``wl`` tool (they can
@@ -297,18 +303,21 @@ def _parse_status(output: str) -> dict[str, str]:
     return entries
 
 
-def _parse_worktrees(output: str, root: Path) -> tuple[dict[str, str], set[str]]:
+def _parse_worktrees(output: str, anchor: Path) -> tuple[dict[str, str], set[str]]:
     """Parse ``git worktree list --porcelain``.
 
     Returns ``(branches_by_path, excluded_refs)`` where *excluded_refs* are the
     branch refs checked out in registered worktrees under
-    ``<root>/.worklog/worktrees/`` (agent worktrees whose churn is legitimate).
+    ``<anchor>/.worklog/worktrees/`` (agent worktrees whose churn is
+    legitimate). *anchor* must be the **main checkout** even when the snapshot
+    is taken from a linked worktree, so the exclusion is not silently empty
+    (SA-0MUINEW6X0034C65); resolve it with :func:`main_checkout_root`.
     """
     branches: dict[str, str] = {}
     path: str | None = None
     branch: str | None = None
     excluded: set[str] = set()
-    agent_root = root.joinpath(*AGENT_WORKTREE_DIR)
+    agent_root = anchor.joinpath(*AGENT_WORKTREE_DIR)
 
     def _flush() -> None:
         if path is None:
@@ -330,6 +339,44 @@ def _parse_worktrees(output: str, root: Path) -> tuple[dict[str, str], set[str]]
             branch = line[len("branch "):].strip()
     _flush()
     return branches, excluded
+
+
+def main_checkout_root(
+    path: str | os.PathLike[str], top: str | None = None
+) -> Path | None:
+    """Resolve the main checkout owning the linked worktree at *path*.
+
+    Agent worktrees live under ``<main_checkout>/.worklog/worktrees/``. When
+    the snapshot is taken from a linked worktree (as ``implement.py finish``
+    does), ``path``'s toplevel is the linked worktree, not the main checkout,
+    so the exclusion directory must be anchored on the main checkout. Anchored
+    on git plumbing — ``git rev-parse --git-common-dir`` (its parent when it is
+    named ``.git``) — with the first ``git worktree list --porcelain`` entry as
+    a validated fallback; **never** a ``wl-*`` name pattern. *top* may be
+    supplied to reuse a toplevel already resolved by the caller. Returns None
+    when *path* is not inside a git work tree.
+    """
+    resolved = Path(path)
+    if top is None:
+        top = git_toplevel(resolved)
+    if top is None:
+        return None
+
+    proc = run_git(resolved, ["rev-parse", "--git-common-dir"])
+    if proc.returncode == 0 and proc.stdout.strip():
+        common = Path(proc.stdout.strip())
+        if not common.is_absolute():
+            common = Path(top) / common
+        common = common.resolve()
+        return common.parent if common.name == ".git" else common
+
+    listing = run_git(resolved, ["worktree", "list", "--porcelain"])
+    for line in listing.stdout.splitlines():
+        if line.startswith("worktree "):
+            candidate = Path(line[len("worktree "):].strip()).resolve()
+            if candidate.is_dir():
+                return candidate
+    return None
 
 
 def snapshot_repo_state(
@@ -377,9 +424,14 @@ def snapshot_repo_state(
         if include_status
         else {}
     )
+    # Anchor on the main checkout, not the passed root: from a linked worktree
+    # the agent-worktree directory lives under the main checkout, and anchoring
+    # on the worktree would leave ``excluded_refs`` empty and turn concurrent
+    # sibling churn into a bogus mutation (SA-0MUINEW6X0034C65).
+    anchor = main_checkout_root(resolved, top=top) or Path(top)
     worktrees, excluded = _parse_worktrees(
         run_git(resolved, ["worktree", "list", "--porcelain"]).stdout,
-        Path(top),
+        anchor,
     )
     return {
         "root": str(resolved),
@@ -392,16 +444,47 @@ def snapshot_repo_state(
     }
 
 
+def _excluded_branch_config_prefixes(excluded_refs: set[str]) -> tuple[str, ...]:
+    """Local-config key prefixes owned by excluded agent-worktree branches.
+
+    ``git worktree add --track -b <branch>`` writes
+    ``branch.<branch>.remote`` and ``branch.<branch>.merge``; registering or
+    removing an agent worktree therefore churns exactly that config section.
+    Deriving the prefixes from ``excluded_refs`` anchors the config exclusion
+    to the same ``git worktree list`` evidence as the ref exclusion (never a
+    ``wl-*`` name pattern).
+    """
+    prefixes = [
+        f"branch.{ref[len('refs/heads/'):]}."
+        for ref in excluded_refs
+        if ref.startswith("refs/heads/")
+    ]
+    return tuple(sorted(prefixes))
+
+
+def _filter_excluded_config(
+    config: dict[str, str], prefixes: tuple[str, ...]
+) -> dict[str, str]:
+    """Drop local-config keys owned by excluded agent-worktree branches."""
+    if not prefixes:
+        return dict(config)
+    return {key: value for key, value in config.items() if not key.startswith(prefixes)}
+
+
 def fingerprint(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     """A cheap, hashable fingerprint of a snapshot's refs + local config.
 
-    Refs checked out in registered agent worktrees (``excluded_refs``) are
-    ignored, matching :func:`diff_snapshots`, so legitimate agent-worktree
-    churn does not trip the per-test guard (F5 AC4/AC7). Used by the per-test
-    guard to attribute a mutation without paying for a full ``status`` scan on
-    every test.
+    Refs checked out in registered agent worktrees (``excluded_refs``) and the
+    ``branch.<name>.*`` config those worktrees own are ignored entirely — the
+    excluded set's own membership and its churn are invisible — matching
+    :func:`diff_snapshots`. Agent-worktree registration/removal (frequent on
+    shared multi-agent hosts) therefore cannot move the fingerprint and trip
+    the per-test guard, even before the authoritative diff is consulted
+    (F5 AC4/AC7, SA-0MUINEW6X0034C65). Used by the per-test guard as a cheap
+    short-circuit; the full diff remains the sole authority for failure.
     """
     excluded = set(snapshot.get("excluded_refs", set()))
+    prefixes = _excluded_branch_config_prefixes(excluded)
     refs = tuple(
         sorted(
             (ref, sha)
@@ -409,11 +492,12 @@ def fingerprint(snapshot: dict[str, Any]) -> tuple[Any, ...]:
             if ref not in excluded
         )
     )
-    return (
-        refs,
-        tuple(sorted(snapshot.get("config", {}).items())),
-        tuple(sorted(excluded)),
+    config = tuple(
+        sorted(
+            _filter_excluded_config(snapshot.get("config", {}), prefixes).items()
+        )
     )
+    return (refs, config)
 
 
 def diff_snapshots(
@@ -422,9 +506,12 @@ def diff_snapshots(
 ) -> dict[str, Any]:
     """Report the differences between two snapshots.
 
-    Refs checked out in registered agent worktrees (``excluded_refs``) are
-    ignored. Returns ``{"changed": bool, "refs": ..., "config": ...,
-    "status": ...}`` where each category lists added/removed/changed entries.
+    Refs checked out in registered agent worktrees (``excluded_refs``) and the
+    ``branch.<name>.*`` config those worktrees own are ignored, using the
+    union of both snapshots' excluded sets so a worktree appearing or
+    disappearing mid-run is invisible on either side. Returns
+    ``{"changed": bool, "refs": ..., "config": ..., "status": ...}`` where
+    each category lists added/removed/changed entries.
     """
     if not before.get("git", True) or not after.get("git", True):
         return {"changed": False, "refs": {}, "config": {}, "status": {}}
@@ -432,8 +519,11 @@ def diff_snapshots(
     excluded = set(before.get("excluded_refs", set())) | set(
         after.get("excluded_refs", set())
     )
+    prefixes = _excluded_branch_config_prefixes(excluded)
     before_refs = {k: v for k, v in before["refs"].items() if k not in excluded}
     after_refs = {k: v for k, v in after["refs"].items() if k not in excluded}
+    before_config = _filter_excluded_config(before["config"], prefixes)
+    after_config = _filter_excluded_config(after["config"], prefixes)
 
     refs_added = {k: v for k, v in after_refs.items() if k not in before_refs}
     refs_removed = {k: v for k, v in before_refs.items() if k not in after_refs}
@@ -443,16 +533,14 @@ def diff_snapshots(
         if k in after_refs and before_refs[k] != after_refs[k]
     }
 
-    config_added = {
-        k: v for k, v in after["config"].items() if k not in before["config"]
-    }
+    config_added = {k: v for k, v in after_config.items() if k not in before_config}
     config_removed = {
-        k: v for k, v in before["config"].items() if k not in after["config"]
+        k: v for k, v in before_config.items() if k not in after_config
     }
     config_changed = {
-        k: (before["config"][k], after["config"][k])
-        for k in before["config"]
-        if k in after["config"] and before["config"][k] != after["config"][k]
+        k: (before_config[k], after_config[k])
+        for k in before_config
+        if k in after_config and before_config[k] != after_config[k]
     }
 
     status_added = {k: v for k, v in after["status"].items() if k not in before["status"]}

@@ -350,3 +350,67 @@ git tag --list 'backup-*'   # backup-corrupt-dev-1790283975, backup-real-dev-6d7
 | AC5 documentation | F6 `skill/shared/test-writing-guidelines.md` + `skill/test/SKILL.md` | met |
 | AC6 full suite passes | §7.1 (`success: true`, 0 failures) | met |
 
+## 8. Live-repo guard exclusion contract (SA-0MUINEW6X0034C65)
+
+Both guards (`run_tests.py` F4 outer snapshot and the repo-root
+`skill/shared/live_repo_guard.py` inner per-test plugin) share
+`skill/shared/git_sandbox.py` for their snapshot, fingerprint and diff
+surfaces, so a change to the exclusion contract cannot make the two consumers
+drift.
+
+### 8.1 Surfaces and exclusions
+
+The mutation surface is **refs + local `.git/config` + working tree**. Two
+namespaces are deliberately excluded because they are tooling churn, not
+checkout mutations:
+
+- `refs/worklog/*` — managed by the `wl` tool;
+- agent worktrees — every branch ref checked out in a worktree under
+  `<main_checkout>/.worklog/worktrees/`, **plus the `branch.<name>.remote` /
+  `branch.<name>.merge` config that `git worktree add --track -b` writes for
+  that branch**.
+
+Exclusion is derived from `git worktree list --porcelain`; it is **never** a
+`wl-*` name pattern (which would also have excluded the incident's own fixture
+branches). A legitimately-created fixture branch that happens to be backed by
+a registered agent worktree is therefore excluded.
+
+### 8.2 Main-checkout anchoring
+
+The exclusion directory is anchored on the **main checkout**, not on the root
+the snapshot was taken from. `main_checkout_root()` resolves it with git
+plumbing — `git rev-parse --git-common-dir` (its parent when it is named
+`.git`) — with the first `git worktree list --porcelain` entry as a validated
+fallback. This matters because `implement.py finish` runs the suite from a
+linked worktree: anchoring on the worktree root left `excluded_refs` empty
+there, so every concurrent sibling commit looked like a mutation.
+
+### 8.3 No false positives: fingerprint is a trigger, the diff is the authority
+
+The per-test guard uses a cheap `fingerprint()` (refs + config only, no status
+scan) as a **trigger**. When it moves, the guard confirms the movement against
+the authoritative `diff_snapshots()` before failing; an empty diff re-baselines
+and continues. `fingerprint()` also excludes the agent-worktree refs/config
+entirely, so registration/removal churn does not even move it in the common
+case. Consequently excluded-set churn alone can never fail a test with the
+bogus `(no differences)` signature.
+
+### 8.4 No false negatives: genuine mutations are still reported
+
+Exclusion is scoped to the agent-worktree namespace only. Genuine mutations
+still fail the guard and name the offending test:
+
+- an added/deleted/moved ref outside the excluded set (e.g. `refs/heads/intruder`);
+- a rewritten local-config key outside the excluded set (e.g. `user.name`,
+  `branch.dev.remote`);
+- a deleted tracked file or an added untracked file.
+
+Regression coverage:
+
+- helper-level `excluded_refs` churn (`TestAgentWorktreeChurn`) and
+  linked-worktree anchoring (`TestMainCheckoutAnchoring`) in
+  `skill/shared/tests/test_git_sandbox.py`;
+- guard-level registration, `--track` registration, removal and
+  linked-worktree sibling churn, plus the config-rewrite fires proof, in
+  `tests/test_live_repo_mutation_guard.py`.
+
