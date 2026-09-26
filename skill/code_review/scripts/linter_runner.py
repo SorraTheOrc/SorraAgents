@@ -83,6 +83,13 @@ _RUFF_SEVERITY_MAP: dict[str, str] = {
 
 _RUFF_DEFAULT_SEVERITY = "medium"
 
+#: File extensions eslint is able to parse. Scoped lint runs must only ever
+#: pass these targets to eslint: any other extension (``.py``, ``.md``, …) is
+#: parsed as JavaScript and emits a fatal "Parsing error" that surfaces as a
+#: blocking high-severity finding (SA-0MUA6W7P1007H2AU). Mirrors the ruff
+#: extension guard in ``_run_ruff_check``.
+ESLINT_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
 
 def _classify_ruff(code: str) -> str:
     """Classify a ruff rule code (e.g. ``F841``, ``E302``) to severity.
@@ -340,15 +347,31 @@ def _run_eslint_findings_check(
 ) -> list[dict[str, Any]]:
     """Run eslint check (without fix) and return structured findings.
 
+    When ``files`` is a non-empty scope it is filtered to JS/TS extensions;
+    if no JS/TS target remains, eslint is skipped and ``[]`` returned. This
+    prevents eslint from mis-parsing Python (and other) files as JavaScript
+    and emitting false blocking findings (SA-0MUA6W7P1007H2AU).
+
     Args:
         root: The project root path.
         runner: Subprocess runner callable.
+        files: Optional scoped file list. Empty/absent means whole project.
 
     Returns:
         A list of finding dicts.
     """
     if files:
-        cmd = ["eslint", *[str(f) for f in files], "-f", "json", "--quiet"]
+        # Only JS/TS files are valid eslint targets. A non-empty file scope
+        # that contains no JS/TS files means there is nothing for eslint to
+        # lint — skip the invocation entirely rather than mis-parsing other
+        # languages (SA-0MUA6W7P1007H2AU).
+        js_files = [
+            str(f) for f in files
+            if str(f).lower().endswith(ESLINT_EXTENSIONS)
+        ]
+        if not js_files:
+            return []
+        cmd = ["eslint", *js_files, "-f", "json", "--quiet"]
     else:
         cmd = ["eslint", str(root), "-f", "json", "--quiet"]
     result = runner(cmd)
@@ -716,15 +739,30 @@ def _run_eslint_fix_mode(
     runner: Callable,
     files: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Run eslint --fix and return remaining findings."""
+    """Run eslint --fix and return remaining findings.
+
+    Scoped runs filter ``files`` to JS/TS extensions before building the fix
+    and rescan commands; when no JS/TS target remains, eslint is skipped
+    entirely and ``([], False)`` is returned (SA-0MUA6W7P1007H2AU).
+    """
+    if files:
+        js_files = [
+            str(f) for f in files
+            if str(f).lower().endswith(ESLINT_EXTENSIONS)
+        ]
+        if not js_files:
+            return [], False
+    else:
+        js_files = []
+
     def fix_cmd(root: Path) -> list[str]:
-        if files:
-            return ["eslint", *[str(f) for f in files], "-f", "json", "--fix", "--quiet"]
+        if js_files:
+            return ["eslint", *js_files, "-f", "json", "--fix", "--quiet"]
         return ["eslint", str(root), "-f", "json", "--fix", "--quiet"]
 
     def rescan_cmd(root: Path) -> list[str]:
-        if files:
-            return ["eslint", *[str(f) for f in files], "-f", "json", "--quiet"]
+        if js_files:
+            return ["eslint", *js_files, "-f", "json", "--quiet"]
         return ["eslint", str(root), "-f", "json", "--quiet"]
 
     def fixes_detected(result: Any, output: str) -> bool:
@@ -842,7 +880,7 @@ def run_eslint(
         runner = _run_subprocess
 
     if fix:
-        findings, fixes_applied = _run_eslint_fix_mode(root, runner)
+        findings, fixes_applied = _run_eslint_fix_mode(root, runner, files)
     else:
         findings = _run_eslint_findings_check(root, runner, files)
         fixes_applied = False
