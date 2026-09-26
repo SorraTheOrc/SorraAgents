@@ -421,6 +421,20 @@ class TestStatusLifecycleUnit:
     # Claim invariant (SA-0MTFTFUIH000UWM9): require_claimed / ensure_claimed
     # ------------------------------------------------------------------
 
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("in_progress", "in-progress"),
+            ("in-progress", "in-progress"),
+            ("open", "open"),
+            ("completed", "completed"),
+            ("", ""),
+        ],
+    )
+    def test_normalise_status(self, raw, expected):
+        """_normalise_status canonicalises underscores to hyphens (AC3)."""
+        assert status_lifecycle_module._normalise_status(raw) == expected
+
     def test_require_claimed_passes_when_in_progress(self, mock_run):
         """require_claimed returns the show payload when status is in-progress (hyphenated)."""
         mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
@@ -503,16 +517,17 @@ class TestStatusLifecycleUnit:
         assert data["workItem"]["status"] == "in-progress"
         assert mock_run.call_count == 1
 
-    def test_require_claimed_fails_with_underscore_does_not_pass(self, mock_run):
-        """require_claimed raises when the stored status is the underscore variant.
+    def test_require_claimed_passes_with_underscore_status(self, mock_run):
+        """require_claimed accepts the underscore variant via normalisation (AC1).
 
-        The underscore variant never occurs in wl output (wl normalises to
-        hyphen), but if it ever did, it should fail the guard — proving the
-        guard is strict, not permissive.
+        Historically the guard compared against a single literal spelling.
+        LP-0MUESDZVW006YJ1N normalises ``_`` → ``-`` so either spelling
+        returned by ``wl`` satisfies the claim guard.
         """
         mock_run.side_effect = [_make_wl_show_proc(status="in_progress")]
-        with pytest.raises(ClaimError, match="must be in-progress"):
-            StatusLifecycle.require_claimed("TEST-123")
+        data = StatusLifecycle.require_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in_progress"
+        assert mock_run.call_count == 1
 
     def test_ensure_claimed_noop_with_hyphenated_status(self, mock_run):
         """ensure_claimed must be a no-op when wl returns 'in-progress' (hyphen).
@@ -524,6 +539,18 @@ class TestStatusLifecycleUnit:
         mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
         data = StatusLifecycle.ensure_claimed("TEST-123")
         assert data["workItem"]["status"] == "in-progress"
+        assert mock_run.call_count == 1  # show only, no update
+
+    def test_ensure_claimed_noop_with_underscore_status(self, mock_run):
+        """ensure_claimed recognises the underscore variant as already claimed (AC3).
+
+        The sibling comparison must normalise consistently with
+        require_claimed, otherwise an underscore status triggers a redundant
+        write on every call.
+        """
+        mock_run.side_effect = [_make_wl_show_proc(status="in_progress")]
+        data = StatusLifecycle.ensure_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in_progress"
         assert mock_run.call_count == 1  # show only, no update
 
     def test_ensure_claimed_reclaims_with_hyphenated_status(self, mock_run):

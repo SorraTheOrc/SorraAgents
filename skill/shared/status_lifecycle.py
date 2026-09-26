@@ -73,6 +73,33 @@ class ClaimError(RuntimeError):
     """
 
 
+def _normalise_status(status: object) -> str:
+    """Normalise a work-item status value to its canonical hyphenated form.
+
+    ``wl`` accepts and stores statuses in hyphenated form (``in-progress``),
+    but callers, older data, and other tooling occasionally use the
+    underscore variant (``in_progress``). Replacing ``_`` with ``-`` lets
+    every status comparison in this module accept either spelling instead
+    of matching a single literal (LP-0MUESDZVW006YJ1N; the claim guard must
+    not reject a genuinely claimed item — SA-0MTFTFUIH000UWM9).
+
+    Only status values are normalised; stage values (``intake_complete``,
+    ``plan_complete``, ``in_review``) legitimately use underscores and are
+    never passed through this helper.
+
+    Args:
+        status: Raw status value from ``wl`` (or a caller). Non-string
+            values are treated as an empty status.
+
+    Returns:
+        The status with underscores replaced by hyphens, or ``""`` for
+        non-string input.
+    """
+    if not isinstance(status, str):
+        return ""
+    return status.replace("_", "-")
+
+
 # Type alias for an injectable command runner.
 # Takes a command list, returns a CompletedProcess (like subprocess.run).
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
@@ -594,7 +621,7 @@ class StatusLifecycle:
         data = StatusLifecycle.show(work_item_id, runner=runner)
         wi = data.get("workItem", {}) if isinstance(data, dict) else {}
         status = wi.get("status", "") if isinstance(wi, dict) else ""
-        if status != "in-progress":
+        if _normalise_status(status) != "in-progress":
             raise ClaimError(
                 f"Work item {work_item_id} must be in-progress before mutation "
                 f"(current status: {status or 'unknown'}). "
@@ -635,7 +662,7 @@ class StatusLifecycle:
         data = StatusLifecycle.show(work_item_id, runner=runner)
         wi = data.get("workItem", {}) if isinstance(data, dict) else {}
         status = wi.get("status", "") if isinstance(wi, dict) else ""
-        if status == "in-progress":
+        if _normalise_status(status) == "in-progress":
             LOG.debug("ensure_claimed: %s already in-progress — no-op", work_item_id)
             return data
         kwargs: dict = {"status": "in-progress", "runner": runner}
