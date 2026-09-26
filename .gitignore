@@ -45,6 +45,12 @@ bun.lock
 __pycache__/
 *.pyc
 
+# Guard against reintroduction of the accidental nested skill/skill/ artefact:
+# an absolute symlink plus package marker that duplicated skill/shared pytest
+# collection and, inside a worktree, resolved to the main checkout's stale copy.
+# See LP-0MUHOHP82006NT3W and tests/test_nested_skill_skill_guard.py.
+skill/skill/
+
 # Local build artifacts
 build/
 tmp/

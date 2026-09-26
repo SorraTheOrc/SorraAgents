@@ -127,15 +127,18 @@ def _resolve_owning_checkout_root(module_file: Path) -> Path:
     module file, the first ancestor that owns ``skill/shared`` and is
     NOT a worktree is the framework main checkout.
 
-    A tracked nested copy ``skill/skill/shared/status_lifecycle.py`` (see
-    commit aea4c741) makes a naive existence check match the *parent* of the
-    real checkout (``<repo>/skill``) one level too deep, because that parent
-    also "owns" the nested copy. Such a parent never has a ``.git`` member
-    of its own, so the walk requires the owning candidate to be a git
-    checkout root (``.git`` directory; worktrees with a ``.git`` FILE are
-    skipped, which restores the pre-nested-copy resolution to the main
-    checkout for worktree launches). The walk therefore falls through any
-    nested-copy-only candidate to the real owner.
+    A nested ``skill/skill/shared/status_lifecycle.py`` copy makes a naive
+    existence check match the *parent* of the real checkout (``<repo>/skill``)
+    one level too deep, because that parent also "owns" the nested copy. Such
+    a parent never has a ``.git`` member of its own, so the walk requires the
+    owning candidate to be a git checkout root (``.git`` directory; worktrees
+    with a ``.git`` FILE are skipped, which restores the pre-nested-copy
+    resolution to the main checkout for worktree launches). The walk therefore
+    falls through any nested-copy-only candidate to the real owner.
+
+    The tracked copy that originally triggered this (commit aea4c741, an
+    absolute symlink) was removed in LP-0MUHOHP82006NT3W; the defensive walk
+    is retained so a stray nested copy can never shift the resolved root.
     """
     current = module_file.parent  # skill/shared
     for candidate in current.parents:

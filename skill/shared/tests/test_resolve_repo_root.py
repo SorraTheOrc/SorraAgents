@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Regression tests for ``_resolve_owning_checkout_root`` / ``_resolve_repo_root``.
 
-Covers SA-0MT6D0CFG004EA55: the tracked nested ``skill/skill/shared/`` copy
-(commit aea4c741) made ``_resolve_repo_root()`` resolve one level too deep
-when launched from the framework's main checkout (``<repo>/skill`` instead of
-``<repo>``). The audit runner's prefix-to-sibling scan
-(``SIBLING_SCAN_ROOT = REPO_ROOT.parent``) then could not find the owning
-project's ``.worklog`` without an explicit ``--worklog-dir``.
+Covers SA-0MT6D0CFG004EA55: the historically tracked nested
+``skill/skill/shared/`` copy (commit aea4c741, removed in LP-0MUHOHP82006NT3W)
+made ``_resolve_repo_root()`` resolve one level too deep when launched from the
+framework's main checkout (``<repo>/skill`` instead of ``<repo>``). The audit
+runner's prefix-to-sibling scan (``SIBLING_SCAN_ROOT = REPO_ROOT.parent``) then
+could not find the owning project's ``.worklog`` without an explicit
+``--worklog-dir``.
+
+The nested copy is now gone, but the defensive walk and these unit tests are
+retained so any future stray nested copy cannot shift the resolved root.
 """  # noqa: EXE001
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ RESOLVE = status_lifecycle._resolve_owning_checkout_root
 
 
 def _write_module_copies(checkout: Path, with_nested: bool = True) -> Path:
-    """Create ``skill/shared/status_lifecycle.py`` (and the tracked nested
+    """Create ``skill/shared/status_lifecycle.py`` (and, by default, a nested
     ``skill/skill/shared/`` copy) under *checkout*. Returns the module file.
     """
     real = checkout / "skill" / "shared" / "status_lifecycle.py"
@@ -95,9 +99,9 @@ class TestResolveOwningCheckoutRoot:
 
 class TestResolveRepoRootRealRepo:
     def test_framework_root_resolves_to_main_checkout_here(self):
-        """Integration: in this repo the nested copy is present, so a correct
-        resolution equals the framework MAIN checkout (not the nested-copy
-        parent and not the worktree root when tests run inside a worktree).
+        """Integration: a correct resolution equals the framework MAIN checkout
+        (not a worktree root when tests run inside a worktree, and not any
+        stray nested-copy parent).
         """
         import subprocess
 
