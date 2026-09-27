@@ -905,3 +905,69 @@ python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit
 python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit/evidence/static check-static
 python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit/evidence/reaudit-sample reaudit-sample
 ```
+
+## Session-id traceability & retention (SA-0MSNYWMJJ002CIJ7)
+
+Every pi subprocess the audit skill spawns carries a descriptive
+`--session-id`, so a session file can be traced back to the work item and
+phase that produced it and resumed with `pi --session <id>` / `/resume`.
+The convention follows the Ralph session-per-call precedent
+(SA-0MQ6E8NCG003STJB): unique per call, dash-separated, and conservatively
+prefix-scoped for cleanup.
+
+### Session-id format
+
+| Spawn point | Format |
+|-------------|--------|
+| `audit_runner.py::_call_pi` (all phases) | `audit-{issue_id}-{context}-{uuid8}` |
+| `audit_runner.py::_call_pi` (project audit) | `audit-project-{uuid8}` (the repeated `project` context is deduped) |
+| `audit_pr.py::run_audit_in_worktree` | `audit-pr-{wl_id}-{uuid8}` (non-dry-run only) |
+
+`uuid8` is `uuid.uuid4().hex[:8]` — a fresh value on every call, so no two
+calls ever share a session file. This preserves session-per-call isolation
+and avoids the shared-session "Cannot continue from message role:
+assistant" failure mode (SA-0MPFD4RWQ009AXJR). `_build_session_id()`
+sanitises colons in the `context` segment (e.g. `child:SA-XXX` →
+`child_SA-XXX`) so the value passes pi's `assertValidSessionId` pattern —
+it must start and end with an alphanumeric and contain only alphanumerics,
+`.`, `_`, and `-`.
+
+`_call_pi()` gained an optional `session_id`/`issue_id` + `context`; when no
+`issue_id` is supplied the command is byte-identical to the pre-change
+invocation, so direct callers and command-construction tests are unaffected.
+
+### Automatic retention cleanup
+
+Pi has no built-in session retention: session files accumulate in
+`~/.pi/agent/sessions/` forever. Pi nests them in per-working-directory
+subfolders as `<timestamp>_<session-id>.jsonl`. After every completed
+`issue` and `project` audit the runner prunes stale audit sessions:
+
+- **Scope:** only files whose session-id segment starts with `audit-`
+  (`_is_audit_session_filename`). Every other pi session — `herdr-*`,
+  `ralph-*`, ad-hoc sessions — is never touched.
+- **Age:** files modified more than the retention period ago are removed;
+  newer files are kept.
+- **Recursion:** the scan walks the session root recursively to reach the
+  per-cwd subfolders.
+- **Reporting:** the pruned count and reclaimed space are logged to stderr
+  (`audit_runner: pruned N audit session(s), reclaimed X (retention=Dd)`).
+
+### Configuration
+
+| Setting | CLI flag | Env var | Default |
+|---------|----------|---------|---------|
+| Retention period (days) | `--session-retention-days` | `AUDIT_SESSION_RETENTION_DAYS` | `112` |
+| Pi session directory | `--session-dir` | `PI_CODING_AGENT_SESSION_DIR` | `~/.pi/agent/sessions/` |
+
+The CLI flag wins over the env var, which wins over the default. Invalid or
+non-positive values fall through to the default. `--session-dir` is exported
+as `PI_CODING_AGENT_SESSION_DIR` so the spawned pi subprocesses save into the
+same directory the cleanup scans. `_prune_audit_sessions()` fails open: an
+inaccessible or missing session directory returns `(0, 0)` and never raises.
+
+Tests: `skill/audit/tests/test_audit_runner_core.py`
+(`TestCallPiSessionId`, `TestBuildSessionIdProjectDedup`,
+`TestGetPiSessionDir`, `TestPruneAuditSessions`,
+`TestResolveSessionRetentionDays`, `TestRunSessionCleanup`,
+`TestSessionCliFlags`).

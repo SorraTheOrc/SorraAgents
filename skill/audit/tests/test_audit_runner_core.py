@@ -611,6 +611,360 @@ class TestCallPiAndMaybeLogSessionId:
         assert kwargs.get("context") == "phase2_deep"
 
 
+class TestBuildSessionIdProjectDedup:
+    """Tests for project-level session-id deduplication (SA-0MSNYWMJJ002CIJ7)."""
+
+    def test_project_audit_dedupe_context(self):
+        """AC4: project-level audits use ``audit-project-{uuid8}`` not
+        ``audit-project-project-{uuid8}``."""
+        sid = audit_runner._build_session_id("project", "project")
+        assert sid.startswith("audit-project-")
+        # Must have exactly the pattern audit-project-{8-hex-uuid}
+        parts = sid.split("-")
+        assert parts[0] == "audit"
+        assert parts[1] == "project"
+        # Last part is the 8-char UUID
+        suffix = parts[2]
+        assert len(suffix) == 8
+        int(suffix, 16)
+
+    def test_non_project_audit_uses_full_format(self):
+        """Non-project audits keep the standard format."""
+        sid = audit_runner._build_session_id("SA-0XXX", "phase2_deep")
+        assert sid.startswith("audit-SA-0XXX-phase2_deep-")
+        suffix = sid.rsplit("-", 1)[1]
+        assert len(suffix) == 8
+        int(suffix, 16)
+
+
+class TestGetPiSessionDir:
+    """Tests for _get_pi_session_dir() (SA-0MSNYWMJJ002CIJ7)."""
+
+    def test_default_returns_user_home(self):
+        """Default path is ~/.pi/agent/sessions/."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = audit_runner._get_pi_session_dir()
+        assert result == os.path.join(
+            os.path.expanduser("~"), ".pi", "agent", "sessions"
+        )
+
+    def test_env_var_override(self):
+        """PI_CODING_AGENT_SESSION_DIR overrides the path."""
+        with mock.patch.dict(
+            os.environ,
+            {audit_runner.ENV_PI_SESSION_DIR: "/custom/sessions"},
+        ):
+            result = audit_runner._get_pi_session_dir()
+        assert result == "/custom/sessions"
+
+
+class TestPruneAuditSessions:
+    """Tests for _prune_audit_sessions() (SA-0MSNYWMJJ002CIJ7)."""
+
+    def _make_fake_dir(self, tmp_path):
+        """Create a fake session directory with test files."""
+        session_dir = tmp_path / "sessions"
+        session_dir.mkdir()
+        return session_dir
+
+    def test_prunes_stale_audit_files(self, tmp_path):
+        """Stale audit-* files are removed."""
+        session_dir = self._make_fake_dir(tmp_path)
+        # Create a file with old mtime (200 days ago)
+        old_file = session_dir / "audit-SA-XXX-phase2-abcdef12"
+        old_file.write_text("old session data")
+        old_time = time.time() - (200 * 86400)
+        os.utime(old_file, (old_time, old_time))
+
+        with mock.patch.object(audit_runner, "_get_pi_session_dir", return_value=str(session_dir)):
+            count, freed = audit_runner._prune_audit_sessions(112)
+
+        assert count == 1
+        assert freed > 0
+        assert not old_file.exists()
+
+    def test_prunes_stale_timestamped_audit_files_recursively(self, tmp_path):
+        """Pi stores ``<timestamp>_<session-id>.jsonl`` in per-cwd subfolders;
+        stale audit sessions there are pruned recursively (AC5)."""
+        session_dir = self._make_fake_dir(tmp_path)
+        cwd_subdir = session_dir / "--home-user-projects-repo--"
+        cwd_subdir.mkdir()
+        session_file = cwd_subdir / (
+            "2026-01-01T10-00-00-000Z_audit-SA-XXX-phase2-abcdef12.jsonl"
+        )
+        session_file.write_text("old session data")
+        old_time = time.time() - (200 * 86400)
+        os.utime(session_file, (old_time, old_time))
+
+        with mock.patch.object(audit_runner, "_get_pi_session_dir", return_value=str(session_dir)):
+            count, freed = audit_runner._prune_audit_sessions(112)
+
+        assert count == 1
+        assert freed > 0
+        assert not session_file.exists()
+
+    def test_preserves_recent_audit_files(self, tmp_path):
+        """Recent audit-* files are NOT removed."""
+        session_dir = self._make_fake_dir(tmp_path)
+        recent_file = session_dir / "audit-SA-XXX-phase2-fedcba98"
+        recent_file.write_text("recent session data")
+        # mtime is 30 days ago
+        recent_time = time.time() - (30 * 86400)
+        os.utime(recent_file, (recent_time, recent_time))
+
+        with mock.patch.object(audit_runner, "_get_pi_session_dir", return_value=str(session_dir)):
+            count, _ = audit_runner._prune_audit_sessions(112)
+
+        assert count == 0
+        assert recent_file.exists()
+
+    def test_does_not_touch_non_audit_files(self, tmp_path):
+        """Non-audit-* files are never removed."""
+        session_dir = self._make_fake_dir(tmp_path)
+        # Create a non-audit file with old mtime
+        other_file = session_dir / "ralph-SA-XXX-run-00112233"
+        other_file.write_text("ralph session")
+        old_time = time.time() - (200 * 86400)
+        os.utime(other_file, (old_time, old_time))
+
+        with mock.patch.object(audit_runner, "_get_pi_session_dir", return_value=str(session_dir)):
+            count, _ = audit_runner._prune_audit_sessions(112)
+
+        assert count == 0
+        assert other_file.exists()
+
+    def test_does_not_touch_non_audit_timestamped_files(self, tmp_path):
+        """Timestamped non-audit sessions (e.g. herdr/ralph) are preserved."""
+        session_dir = self._make_fake_dir(tmp_path)
+        cwd_subdir = session_dir / "--home-user-projects-repo--"
+        cwd_subdir.mkdir()
+        other_file = cwd_subdir / (
+            "2026-01-01T10-00-00-000Z_ralph-SA-XXX-run-00112233.jsonl"
+        )
+        other_file.write_text("ralph session")
+        old_time = time.time() - (200 * 86400)
+        os.utime(other_file, (old_time, old_time))
+
+        with mock.patch.object(audit_runner, "_get_pi_session_dir", return_value=str(session_dir)):
+            count, _ = audit_runner._prune_audit_sessions(112)
+
+        assert count == 0
+        assert other_file.exists()
+
+    def test_session_dir_override_on_non_audit_prefix(self, tmp_path):
+        """A timestamped herdr session is left alone (conservative scope)."""
+        session_dir = self._make_fake_dir(tmp_path)
+        other_file = session_dir / (
+            "2026-01-01T10-00-00-000Z_herdr-123-456.jsonl"
+        )
+        other_file.write_text("herdr session")
+        old_time = time.time() - (200 * 86400)
+        os.utime(other_file, (old_time, old_time))
+
+        with mock.patch.object(audit_runner, "_get_pi_session_dir", return_value=str(session_dir)):
+            count, _ = audit_runner._prune_audit_sessions(112)
+
+        assert count == 0
+        assert other_file.exists()
+
+    def test_explicit_session_dir_argument(self, tmp_path):
+        """The optional session_dir argument overrides _get_pi_session_dir."""
+        session_dir = self._make_fake_dir(tmp_path)
+        old_file = session_dir / (
+            "2026-01-01T10-00-00-000Z_audit-project-abcdef12.jsonl"
+        )
+        old_file.write_text("old")
+        old_time = time.time() - (200 * 86400)
+        os.utime(old_file, (old_time, old_time))
+
+        count, _ = audit_runner._prune_audit_sessions(112, session_dir=str(session_dir))
+        assert count == 1
+        assert not old_file.exists()
+
+    def test_empty_dir_returns_zeros(self, tmp_path):
+        """Empty directory returns (0, 0)."""
+        session_dir = self._make_fake_dir(tmp_path)
+        with mock.patch.object(audit_runner, "_get_pi_session_dir", return_value=str(session_dir)):
+            count, freed = audit_runner._prune_audit_sessions(112)
+        assert count == 0
+        assert freed == 0
+
+    def test_nonexistent_dir_returns_zeros(self):
+        """Non-existent directory returns (0, 0) without raising."""
+        with mock.patch.object(audit_runner, "_get_pi_session_dir", return_value="/nonexistent/path"):
+            count, freed = audit_runner._prune_audit_sessions(112)
+        assert count == 0
+        assert freed == 0
+
+    def test_name_matcher_accepts_only_audit_sessions(self):
+        """_is_audit_session_filename matches only audit session ids."""
+        assert audit_runner._is_audit_session_filename(
+            "2026-01-01T10-00-00-000Z_audit-SA-XXX-parent-abcdef12.jsonl"
+        )
+        assert audit_runner._is_audit_session_filename(
+            "audit-project-abcdef12.jsonl"
+        )
+        assert not audit_runner._is_audit_session_filename(
+            "2026-01-01T10-00-00-000Z_herdr-123-456.jsonl"
+        )
+        assert not audit_runner._is_audit_session_filename(
+            "2026-01-01T10-00-00-000Z_ralph-SA-XXX-run-abcdef12.jsonl"
+        )
+        assert not audit_runner._is_audit_session_filename("random.jsonl")
+
+
+class TestResolveSessionRetentionDays:
+    """Tests for _resolve_session_retention_days() (SA-0MSNYWMJJ002CIJ7)."""
+
+    def test_cli_flag_wins(self):
+        """CLI --session-retention-days overrides env var and default."""
+        args = mock.MagicMock()
+        args.session_retention_days = 30
+        with mock.patch.dict(os.environ, {audit_runner.ENV_SESSION_RETENTION_DAYS: "60"}):
+            result = audit_runner._resolve_session_retention_days(args)
+        assert result == 30
+
+    def test_env_var_used_when_no_flag(self):
+        """AUDIT_SESSION_RETENTION_DAYS env var is used when no CLI flag."""
+        args = mock.MagicMock()
+        args.session_retention_days = None
+        with mock.patch.dict(os.environ, {audit_runner.ENV_SESSION_RETENTION_DAYS: "90"}):
+            result = audit_runner._resolve_session_retention_days(args)
+        assert result == 90
+
+    def test_default_when_nothing_set(self):
+        """Default retention when no flag or env var."""
+        args = mock.MagicMock()
+        args.session_retention_days = None
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = audit_runner._resolve_session_retention_days(args)
+        assert result == audit_runner.DEFAULT_SESSION_RETENTION_DAYS
+
+    def test_invalid_env_var_uses_default(self):
+        """Invalid env var value falls through to default."""
+        args = mock.MagicMock()
+        args.session_retention_days = None
+        with mock.patch.dict(os.environ, {audit_runner.ENV_SESSION_RETENTION_DAYS: "not-a-number"}):
+            result = audit_runner._resolve_session_retention_days(args)
+        assert result == audit_runner.DEFAULT_SESSION_RETENTION_DAYS
+
+
+class TestFormatBytes:
+    """Tests for _format_bytes() (SA-0MSNYWMJJ002CIJ7)."""
+
+    def test_bytes(self):
+        assert audit_runner._format_bytes(512) == "512B"
+
+    def test_kilobytes(self):
+        assert audit_runner._format_bytes(1024 * 5) == "5KB"
+
+    def test_megabytes(self):
+        assert audit_runner._format_bytes(1024 * 1024 * 2) == "2MB"
+
+
+class TestRunSessionCleanup:
+    """Tests for _run_session_cleanup() (SA-0MSNYWMJJ002CIJ7)."""
+
+    def test_calls_prune_with_resolved_retention(self):
+        """The resolved retention period is forwarded to the prune helper."""
+        args = mock.MagicMock()
+        args.session_retention_days = 42
+        with mock.patch.object(
+            audit_runner, "_prune_audit_sessions", return_value=(0, 0)
+        ) as mock_prune:
+            audit_runner._run_session_cleanup(args)
+        mock_prune.assert_called_once_with(42)
+
+    def test_calls_prune_with_env_retention(self):
+        """The env-var retention applies when no CLI flag is given."""
+        args = mock.MagicMock()
+        args.session_retention_days = None
+        with mock.patch.dict(
+            os.environ, {audit_runner.ENV_SESSION_RETENTION_DAYS: "21"}
+        ), mock.patch.object(
+            audit_runner, "_prune_audit_sessions", return_value=(0, 0)
+        ) as mock_prune:
+            audit_runner._run_session_cleanup(args)
+        mock_prune.assert_called_once_with(21)
+
+    def test_logs_pruned_count(self, capsys):
+        """The pruned count and reclaimed space are reported on stderr."""
+        args = mock.MagicMock()
+        args.session_retention_days = 112
+        with mock.patch.object(
+            audit_runner, "_prune_audit_sessions", return_value=(3, 2048)
+        ):
+            audit_runner._run_session_cleanup(args)
+        captured = capsys.readouterr()
+        assert "pruned 3 audit session(s)" in captured.err
+        assert "2KB" in captured.err
+
+    def test_silent_when_nothing_pruned(self, capsys):
+        """No log line when the prune removes nothing."""
+        args = mock.MagicMock()
+        args.session_retention_days = 112
+        with mock.patch.object(
+            audit_runner, "_prune_audit_sessions", return_value=(0, 0)
+        ):
+            audit_runner._run_session_cleanup(args)
+        captured = capsys.readouterr()
+        assert "pruned" not in captured.err
+
+
+class TestSessionCliFlags:
+    """Parser/CLI wiring for session retention + session dir
+    (SA-0MSNYWMJJ002CIJ7)."""
+
+    def test_issue_subcommand_accepts_flags(self):
+        args = audit_runner.build_parser().parse_args(
+            ["issue", "SA-X", "--session-retention-days", "7",
+             "--session-dir", "/tmp/sessions"]
+        )
+        assert args.session_retention_days == 7
+        assert args.session_dir == "/tmp/sessions"
+
+    def test_project_subcommand_accepts_flags(self):
+        args = audit_runner.build_parser().parse_args(
+            ["project", "--session-retention-days", "14",
+             "--session-dir", "/tmp/sessions"]
+        )
+        assert args.session_retention_days == 14
+        assert args.session_dir == "/tmp/sessions"
+
+    def test_defaults_are_none(self):
+        args = audit_runner.build_parser().parse_args(["issue", "SA-X"])
+        assert args.session_retention_days is None
+        assert args.session_dir is None
+
+    def test_main_sets_session_dir_env_var(self):
+        """--session-dir is exported so spawned pi subprocesses save there."""
+        env_before = os.environ.get(audit_runner.ENV_PI_SESSION_DIR)
+        try:
+            with (
+                mock.patch.object(audit_runner, "cmd_issue"),
+                mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
+                mock.patch.object(audit_runner, "_acquire_host_audit_slot"),
+                mock.patch.object(audit_runner, "_release_host_audit_slot"),
+                mock.patch.object(audit_runner, "_warn_on_orphaned_audits"),
+                mock.patch.object(
+                    audit_runner, "_prune_audit_sessions", return_value=(0, 0)
+                ),
+            ):
+                audit_runner.main(
+                    ["issue", "SA-X", "--do-not-persist",
+                     "--session-dir", "/tmp/custom-sessions"]
+                )
+            assert (
+                os.environ.get(audit_runner.ENV_PI_SESSION_DIR)
+                == "/tmp/custom-sessions"
+            )
+        finally:
+            if env_before is None:
+                os.environ.pop(audit_runner.ENV_PI_SESSION_DIR, None)
+            else:
+                os.environ[audit_runner.ENV_PI_SESSION_DIR] = env_before
+
+
 class TestCallPiAndMaybeLogEnableTools:
     """Tests for _call_pi_and_maybe_log() forwarding enable_tools (AC1-AC3)."""
 

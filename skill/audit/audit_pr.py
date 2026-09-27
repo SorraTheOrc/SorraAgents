@@ -192,9 +192,12 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
             f.write(f'DRY-RUN: would run `pi -p --mode json "/audit {wl_id}"` in {path}\n')
         return 0, log_path
 
-    # Add descriptive session-id for traceability (SA-0MSNYMKV7005P0H9).
+    # Add descriptive session-id for traceability (SA-0MSNYWMJJ002CIJ7):
+    # a fresh, per-call unique id so session-per-call isolation is preserved
+    # and the session can be traced back to the PR work item. The ``audit-``
+    # prefix is what the retention cleanup scans for.
     short_uuid = uuid.uuid4().hex[:8]
-    session_id = f"audit-{wl_id}-entrypoint-{short_uuid}"
+    session_id = f"audit-pr-{wl_id}-{short_uuid}"
     cmd = ['pi', '-p', '--mode', 'json', '--session-id', session_id, f"/audit {wl_id}"]
     try:
         proc = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=timeout)  # noqa: PLW1510

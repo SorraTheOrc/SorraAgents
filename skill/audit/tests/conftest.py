@@ -50,6 +50,27 @@ def _default_green_full_suite_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_pi_session_dir(tmp_path_factory):
+    """Redirect ``PI_CODING_AGENT_SESSION_DIR`` to an isolated temp dir.
+
+    ``audit_runner.main()`` prunes stale ``audit-*`` sessions after every
+    ``issue``/``project`` run (SA-0MSNYWMJJ002CIJ7). Tests that call
+    ``main()`` (or ``cmd_issue``/``cmd_project``) would otherwise scan —
+    and potentially delete from — the operator's real
+    ``~/.pi/agent/sessions/`` store. Pointing the env var at a per-run
+    temp directory keeps the suite hermetic; tests that exercise session-dir
+    resolution override the env var directly with their own patch.
+    """
+    isolated = tmp_path_factory.mktemp("pi-sessions")
+    with mock.patch.dict(
+        audit_runner.os.environ,
+        {audit_runner.ENV_PI_SESSION_DIR: str(isolated)},
+        clear=False,
+    ):
+        yield isolated
+
+
+@pytest.fixture(autouse=True)
 def _default_separate_process_child_audits():
     """Pin the separate-process child-audit path for pre-gate tests.
 

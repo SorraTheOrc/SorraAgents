@@ -278,10 +278,126 @@ def _build_session_id(issue_id: str, context: str) -> str:
     Format: ``audit-{issue_id}-{context}-{uuid8}`` where the UUID is the
     first 8 hex chars of ``uuid4()``.  Colons in *context* are replaced
     with underscores so the result passes ``assertValidSessionId``.
+
+    For project-level audits where both *issue_id* and *context* are
+    ``"project"``, the identifier is simplified to ``audit-project-{uuid8}``
+    to avoid the redundant ``project-project`` doublet.
     """
     safe_context = _sanitize_session_id_segment(context)
+    # Dedupe the "project-project" doublet for project-level audits.
+    if issue_id == "project" and safe_context == "project":
+        safe_context = ""
     short_uuid = uuid.uuid4().hex[:8]
-    return f"audit-{issue_id}-{safe_context}-{short_uuid}"
+    if safe_context:
+        return f"audit-{issue_id}-{safe_context}-{short_uuid}"
+    return f"audit-{issue_id}-{short_uuid}"
+
+
+# ---------------------------------------------------------------------------
+# Session retention helpers
+# ---------------------------------------------------------------------------
+
+DEFAULT_SESSION_RETENTION_DAYS = 112
+"""Default number of days to retain ``audit-*`` session files before
+automatic pruning (SA-0MSNYWMJJ002CIJ7)."""
+
+ENV_SESSION_RETENTION_DAYS = "AUDIT_SESSION_RETENTION_DAYS"
+"""Environment variable that overrides the default session retention
+period (in days). Takes effect when no CLI ``--session-retention-days``
+flag is supplied."""
+
+ENV_PI_SESSION_DIR = "PI_CODING_AGENT_SESSION_DIR"
+"""Environment variable that overrides the default Pi session directory
+path. When set, session cleanup operates on this directory instead of
+the default ``~/.pi/agent/sessions/``."""
+
+
+def _get_pi_session_dir() -> str:
+    """Return the directory where Pi stores session files.
+
+    Honours the ``PI_CODING_AGENT_SESSION_DIR`` environment variable
+    when present; falls back to ``~/.pi/agent/sessions/``.
+    """
+    override = os.environ.get(ENV_PI_SESSION_DIR)
+    if override:
+        return override
+    return os.path.join(
+        os.path.expanduser("~"), ".pi", "agent", "sessions"
+    )
+
+
+def _is_audit_session_filename(name: str) -> bool:
+    """Return True when *name* is a Pi session file for an ``audit-`` session.
+
+    Pi stores session files as ``<timestamp>_<session-id>.jsonl`` inside a
+    per-working-directory subfolder of the session root.  The audit
+    ``--session-id`` values begin with ``audit-`` (or ``audit`` for the
+    ``audit-...`` form), so the session-id segment is the part after the
+    first ``_``.  Files that are directly named ``audit-*`` (no timestamp
+    prefix) are also matched.  The check is deliberately conservative: it
+    only ever returns True for audit sessions, never for another skill's
+    sessions.
+    """
+    if "_" in name:
+        session_segment = name.split("_", 1)[1]
+    else:
+        session_segment = name
+    return session_segment.startswith("audit-")
+
+
+def _prune_audit_sessions(retention_days: int,
+                          session_dir: str | None = None) -> tuple[int, int]:
+    """Prune stale ``audit-*`` session files older than *retention_days*.
+
+    Scans the Pi session directory (see ``_get_pi_session_dir``) recursively
+    because Pi nests session files in per-working-directory subfolders.  Only
+    files whose session-id segment starts with ``audit-`` (see
+    ``_is_audit_session_filename``) are eligible; every other Pi session is
+    left untouched.  Retained files are those modified within the last
+    *retention_days* days.
+
+    Returns ``(count_pruned, bytes_freed)`` so the caller can log the
+    result.
+    """
+    root = session_dir if session_dir is not None else _get_pi_session_dir()
+    if not os.path.isdir(root):
+        return 0, 0
+
+    now = time.time()
+    cutoff = now - (retention_days * 86400)
+    count = 0
+    bytes_freed = 0
+
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if not _is_audit_session_filename(filename):
+                    continue
+                full_path = os.path.join(dirpath, filename)
+                try:
+                    stat = os.stat(full_path)
+                except OSError:
+                    continue
+                if stat.st_mtime < cutoff:
+                    try:
+                        os.unlink(full_path)
+                        count += 1
+                        bytes_freed += stat.st_size
+                    except OSError:
+                        pass  # best-effort; never raise
+    except OSError:
+        pass  # directory inaccessible — fail open
+
+    return count, bytes_freed
+
+
+def _format_bytes(n: int) -> str:
+    """Return a human-readable byte-count string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.0f}TB"
 
 
 # ---------------------------------------------------------------------------
@@ -12308,6 +12424,21 @@ def build_parser() -> argparse.ArgumentParser:
                              "Disable automatic batch drain for this run. "
                              "(SA-0MTG5TP5Z008QBL5)"
                          ))
+    p_issue.add_argument("--session-retention-days", type=int, default=None,
+                         help=(
+                             "Prune ``audit-*`` session files older than this "
+                             f"number of days after the audit completes "
+                             f"(default: {DEFAULT_SESSION_RETENTION_DAYS}; "
+                             f"override via env {ENV_SESSION_RETENTION_DAYS})"
+                         ))
+    p_issue.add_argument("--session-dir", default=None,
+                         help=(
+                             "Pi session directory to scan for audit sessions "
+                             "(default: ~/.pi/agent/sessions/ or the "
+                             f"{ENV_PI_SESSION_DIR} env var). Sets the env "
+                             "var for spawned pi subprocesses so they save "
+                             "there too"
+                         ))
 
     p_batch = sub.add_parser("batch", help="Batch-drain queued in_review audits")
     p_batch.add_argument("--max-items", type=int, default=None,
@@ -12385,6 +12516,21 @@ def build_parser() -> argparse.ArgumentParser:
                                f"(default: audit.max_citations_per_ac config key or "
                                f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
                            ))
+    p_project.add_argument("--session-retention-days", type=int, default=None,
+                           help=(
+                               "Prune ``audit-*`` session files older than this "
+                               f"number of days after the audit completes "
+                               f"(default: {DEFAULT_SESSION_RETENTION_DAYS}; "
+                               f"override via env {ENV_SESSION_RETENTION_DAYS})"
+                           ))
+    p_project.add_argument("--session-dir", default=None,
+                           help=(
+                               "Pi session directory to scan for audit sessions "
+                               "(default: ~/.pi/agent/sessions/ or the "
+                               f"{ENV_PI_SESSION_DIR} env var). Sets the env "
+                               "var for spawned pi subprocesses so they save "
+                               "there too"
+                           ))
 
     return p
 
@@ -12410,6 +12556,14 @@ def main(argv: list[str] | None = None) -> int:
     if child_screen_timeout is not None:
         os.environ[AUDIT_CHILD_SCREEN_TIMEOUT_ENV] = str(child_screen_timeout)
 
+    # CLI --session-dir overrides PI_CODING_AGENT_SESSION_DIR for this process
+    # (and, because the env var is inherited, for every spawned pi process).
+    # Cleanup scans the same directory so pruned sessions match saved ones
+    # (SA-0MSNYWMJJ002CIJ7).
+    session_dir = getattr(args, "session_dir", None)
+    if session_dir:
+        os.environ[ENV_PI_SESSION_DIR] = session_dir
+
     # Detect proxy 'cheap' mode before any pi call and serialize this run's
     # parallelism (AUDIT_PARALLELISM=1 + AUDIT_MAX_CONCURRENCY=1) so the
     # audit does not race the proxy's single-slot pool (SA-0MSN04X2S006ONH0).
@@ -12423,6 +12577,7 @@ def main(argv: list[str] | None = None) -> int:
         # CLI entry point (not inside ``cmd_issue``) so in-process recursive
         # calls (batch drain, child audits) stay re-entrant and timing-sensitive
         # unit tests that call ``cmd_issue`` directly are unaffected.
+        _rc = 0
         try:
             _acquire_host_audit_slot()
         except TimeoutError as exc:
@@ -12432,12 +12587,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"{AUDIT_MAX_HOST_AUDITS_ENV}.",
                 file=sys.stderr,
             )
+            _run_session_cleanup(args)
             return 1
         _warn_on_orphaned_audits()
         try:
-            return _run_issue_command(args)
+            _rc = _run_issue_command(args)
         finally:
             _release_host_audit_slot()
+        _run_session_cleanup(args)
+        return _rc
     elif args.command == "batch":
         with SharedTimer("audit_runner_batch") as _root_timer:
             _rc = cmd_batch(max_items=args.max_items,
@@ -12466,9 +12624,42 @@ def main(argv: list[str] | None = None) -> int:
                                   args.max_citations_per_ac
                               ))
             print(_root_timer.render(), file=sys.stderr)
+        _run_session_cleanup(args)
         return _rc
 
     return 2
+
+
+def _resolve_session_retention_days(args) -> int:
+    """Resolve the session retention period (in days).
+
+    CLI flag wins, then env var, then default (``DEFAULT_SESSION_RETENTION_DAYS``).
+    """
+    flag_val = getattr(args, "session_retention_days", None)
+    if flag_val is not None and flag_val > 0:
+        return flag_val
+    env_val = os.environ.get(ENV_SESSION_RETENTION_DAYS)
+    if env_val is not None:
+        try:
+            val = int(env_val)
+            if val > 0:
+                return val
+        except ValueError:
+            pass  # ignore invalid env values
+    return DEFAULT_SESSION_RETENTION_DAYS
+
+
+def _run_session_cleanup(args) -> None:
+    """Prune stale ``audit-*`` sessions using the resolved retention period."""
+    retention = _resolve_session_retention_days(args)
+    count, freed = _prune_audit_sessions(retention)
+    if count > 0:
+        print(
+            f"audit_runner: pruned {count} audit session(s), "
+            f"reclaimed {_format_bytes(freed)} "
+            f"(retention={retention}d)",
+            file=sys.stderr,
+        )
 
 
 def _run_issue_command(args) -> int:
