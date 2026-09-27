@@ -489,6 +489,12 @@ into the **pre-scrub** environment of a process that spawns `git` directly
    git config --local --get core.bare      # expect: false
    git config --local --get user.name
    ```
+   The pre-push hook runs `scripts/check_git_identity.py` before `wl sync`
+   (SA-0MUJ2VMF7000UHCX) and reports an actionable remedy when the effective
+   `user.email` is empty, is a known incident sentinel (e.g. `t@t.com`), or a
+   local override differs from the global identity — instead of letting the
+   author-identity gate silently refuse the merge. Run it directly with
+   `python3 scripts/check_git_identity.py --repo-root .`.
 5. **Reap orphaned audits.** `ps -eo pid,ppid,cmd | awk '$2==1'` and look for
    `audit_runner.py issue`; the F5 cap prevents a new fan-out from forming.
 6. **Record the incident** on the tracking work item and re-run the suite via

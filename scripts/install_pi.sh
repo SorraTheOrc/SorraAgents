@@ -301,6 +301,20 @@ if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
       echo "NOTE: no per-project context-budget thresholds found. Generate one with:" >&2
       echo "  python3 $HOME/.pi/agent/skills/context-audit/scripts/measure_context.py --write-thresholds docs/dev/context-budget.thresholds.json" >&2
     fi
+
+    # 5. Verify the checkout's git identity before the pre-push worklog sync
+    #    (SA-0MUJ2VMF7000UHCX). A stale/foreign user.email makes `wl sync`'s
+    #    author-identity gate refuse to merge Worklog data; surface it at
+    #    install time so it is actionable. Non-fatal (fail-open).
+    IDENTITY_GUARD="$CURRENT_REPO_ROOT/scripts/check_git_identity.py"
+    if [ -f "$IDENTITY_GUARD" ]; then
+      if identity_output="$(python3 "$IDENTITY_GUARD" --repo-root "$CURRENT_REPO_ROOT" 2>&1)"; then
+        echo "OK: git identity guard passed (wl sync author-identity gate satisfied)"
+      else
+        echo "WARNING: git identity guard failed — wl sync may refuse to merge Worklog data" >&2
+        printf '%s\n' "$identity_output" >&2
+      fi
+    fi
   else
     echo "WARNING: not inside a git repo; skipping pre-push hook wiring" >&2
   fi
