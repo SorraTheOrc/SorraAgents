@@ -135,8 +135,22 @@ def cmd_abort(item_id: str) -> dict:
         A dict with action and item_id keys.
     """
     StatusLifecycle.update_status(item_id, "open")
+    _mark_pane_aborted()
     LOG.info("Intake aborted for %s", item_id)
     return {"success": True, "action": "aborted", "item_id": item_id}
+
+
+def _mark_pane_aborted() -> None:
+    """Set the herdr pane title to the red state (fail-open).
+
+    Abort paths surface the failure even when no final report is rendered.
+    """
+    try:
+        from shared.herdr_pane import mark_aborted
+
+        mark_aborted()
+    except Exception:  # pane updates must never break abort
+        LOG.debug("herdr pane abort status update failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

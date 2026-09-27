@@ -169,7 +169,7 @@ to fail fast, or a larger value for longer batches.
 #: Process-wide host slot held for the duration of a ``cmd_issue`` call.
 #: Nested/recursive ``cmd_issue`` calls (batch drain, child audits) are
 #: re-entrant: the outer call already holds the slot for the process.
-_HOST_AUDIT_SLOT: "Semaphore | None" = None
+_HOST_AUDIT_SLOT: Semaphore | None = None
 AUDIT_LOCK_TIMEOUT_ENV = "AUDIT_LOCK_TIMEOUT"
 AUDIT_LOCK_TIMEOUT_DEFAULT = 0.0
 """Fail-fast wait (seconds) for a free audit concurrency slot.
@@ -11519,7 +11519,7 @@ def _resolve_host_lock_timeout() -> float:
     return AUDIT_HOST_LOCK_TIMEOUT_DEFAULT
 
 
-def _acquire_host_audit_slot() -> "Semaphore":
+def _acquire_host_audit_slot() -> Semaphore:
     """Acquire the process-wide host-wide audit ingress slot (F5).
 
     Re-entrant within the process: a nested ``cmd_issue`` (batch drain, child
@@ -12700,5 +12700,18 @@ def _run_issue_command(args) -> int:
     return _rc
 
 
+def _mark_abort_pane_status() -> None:
+    """Set the herdr pane title to the red state on abort/failure (fail-open)."""
+    try:
+        from shared.herdr_pane import mark_aborted
+
+        mark_aborted()
+    except Exception:  # noqa: BLE001 - pane updates must never break abort
+        return
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    if _exit_code != 0:
+        _mark_abort_pane_status()
+    raise SystemExit(_exit_code)

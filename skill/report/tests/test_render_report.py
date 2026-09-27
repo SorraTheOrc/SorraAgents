@@ -748,10 +748,14 @@ class TestJsonStdinEnvelope(unittest.TestCase):
 
         argv = ["render_report.py", "--json", "--skill-name", "implement"]
         with mock.patch.object(rr.sys, "argv", argv), \
-                mock.patch.object(rr.sys, "stdin", io.StringIO(payload)):
+                mock.patch.object(rr.sys, "stdin", io.StringIO(payload)), \
+                mock.patch.object(
+                    rr, "update_pane_title",
+                    return_value={"updated": False}) as pane:
             buffer = io.StringIO()
             with redirect_stdout(buffer):
                 rr.main()
+        self.last_pane = pane
         return buffer.getvalue()
 
     def test_full_envelope_passed(self):
@@ -767,6 +771,53 @@ class TestJsonStdinEnvelope(unittest.TestCase):
             json.dumps({"id": "SA-0X", "title": "T", "auditResult": True})
         )
         self.assertIn("\u2705 passed", output)
+
+    def test_json_path_updates_pane(self):
+        self._run_main(PASSING_ENVELOPE_JSON)
+        self.last_pane.assert_called_once()
+
+
+class TestPaneStatusIntegration(unittest.TestCase):
+    """The CLI must derive a status and update the herdr pane title (AC1/AC3)."""
+
+    def _run_cli(self, extra_argv, *, ac=None):
+        import render_report as rr
+
+        argv = ["render_report.py", "SA-0TEST0000000001",
+                "--skill-name", "implement", *(extra_argv or [])]
+        for row in ac or []:
+            argv += ["--ac", row]
+        pane_patcher = mock.patch.object(
+            rr, "update_pane_title", return_value={"updated": True})
+        with mock.patch.object(rr.sys, "argv", argv), \
+                mock.patch.object(rr, "render_from_wl", return_value="# report"), \
+                pane_patcher as pane:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rr.main()
+        return pane, buffer.getvalue()
+
+    def test_all_met_updates_pane_done(self):
+        pane, output = self._run_cli([], ac=["All good|tests|met"])
+        pane.assert_called_once()
+        args, kwargs = pane.call_args
+        self.assertEqual(args[0], "done")
+        self.assertTrue(kwargs.get("use_icons"))
+        self.assertIn("# report", output)
+
+    def test_unmet_ac_updates_pane_attention(self):
+        pane, _ = self._run_cli([], ac=["Broken|tests|unmet"])
+        self.assertEqual(pane.call_args.args[0], "attention")
+
+    def test_producer_actions_update_pane_note(self):
+        pane, _ = self._run_cli(
+            ["--producer-actions", "Please review the PR"], ac=["Ok|tests|met"])
+        self.assertEqual(pane.call_args.args[0], "note")
+
+    def test_no_icons_flag_disables_icon_prefix(self):
+        pane, _ = self._run_cli(
+            ["--no-icons"], ac=["Ok|tests|met"])
+        self.assertFalse(pane.call_args.kwargs.get("use_icons"))
 
 
 if __name__ == "__main__":

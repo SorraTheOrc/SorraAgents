@@ -3228,6 +3228,20 @@ def phase_finish(
     return report
 
 
+def _mark_pane_aborted() -> None:
+    """Set the herdr pane title to the red state on abort (fail-open).
+
+    Ensures a failed/aborted implementation surfaces in the pane grid even
+    when no end-of-session report is rendered.
+    """
+    try:
+        from shared.herdr_pane import mark_aborted
+
+        mark_aborted()
+    except Exception:  # pane updates must never break abort
+        LOG.debug("herdr pane abort status update failed", exc_info=True)
+
+
 def phase_abort(
     work_item_id: str,
     json_output: bool = False,
@@ -3262,6 +3276,9 @@ def phase_abort(
         StatusLifecycle.update_status(work_item_id, "open")
     except RuntimeError:
         LOG.error("Failed to reset work item %s status to open", work_item_id)
+
+    # Surface the abort in the herdr pane grid (fail-open; AC4).
+    _mark_pane_aborted()
 
     # ── Step 2: Find and cleanup worktree ──────────────────────────
     worktree_path = _discover_worktree(work_item_id)

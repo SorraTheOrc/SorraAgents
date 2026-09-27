@@ -220,6 +220,36 @@ Rules for callers:
    v1 is stdout only.)
 5. The rendered report ends with `</end_session>` on its own line as its final line for terminal sessions; question-ended sessions do not render the report or the marker.
 
+## Pane-title status indicator
+
+When the report is rendered through the CLI, the helper also prepends a
+status prefix to the current herdr pane label (the pane title), so an operator
+watching a grid of panes can see at a glance how each session ended — without
+opening the pane (`SA-0MTFLQEQQ0083EW1`).
+
+The prefix is prepended to the existing title (e.g. `✅ Manually triggered
+intake`) and the update is idempotent: re-running replaces the prefix rather
+than stacking a second one.
+
+| Status | When | Icon | Text fallback |
+|--------|------|------|---------------|
+| `done` | All ACs `met` and no substantive producer content | ✅ | `Done` |
+| `note` | All ACs `met` but substantive Producer Actions / Notes | ⚠️ | `Note` |
+| `attention` | Any AC verdict other than `met` (`unmet`/`partial`/`adjusted`), or an abort/failure | 🚫 | `Attention` |
+
+- **Derivation** is from the supplied AC verdicts, Producer Actions and Notes
+  (`adjust`/`partial` count as not fully met → red). The standard workflow
+  next action is not itself treated as substantive producer content.
+- **Text fallbacks** reuse the renderer's `--no-icons` / `WL_NO_ICONS=1`
+  mechanism (no colour coding).
+- **Length**: the combined title is bounded to herdr's 60-character limit,
+  preserving a trailing ` - <work-item-id>` suffix when truncation is needed.
+- **Abort paths** (`intake.py abort`, `implement.py abort`, audit-runner
+  non-zero exits) set the red state directly, even when no report is rendered.
+- **Fail-open**: outside a herdr pane (no `HERDR_PANE_ID`), when the `herdr`
+  CLI is unavailable, or if the rename call fails, the update is skipped
+  silently and never breaks the skill run (AC5).
+
 ## Renderer
 
 `$(skill_path report)/scripts/render_report.py`:

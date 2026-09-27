@@ -71,6 +71,22 @@ except ImportError:
     def worklog_dir_flag(*_a, **_kw):  # type: ignore[no-redef]
         return []
 
+try:
+    from shared.herdr_pane import (
+        derive_status,  # type: ignore[import-not-found]
+        icons_enabled,  # type: ignore[import-not-found]
+        update_pane_title,  # type: ignore[import-not-found]
+    )
+except ImportError:
+    def derive_status(*_a, **_kw):  # type: ignore[no-redef]
+        return "done"
+
+    def icons_enabled(*_a, **_kw):  # type: ignore[no-redef]
+        return True
+
+    def update_pane_title(*_a, **_kw):  # type: ignore[no-redef]
+        return {"updated": False}
+
 # ─── Icon mappings (sourced from ContextHub) ───────────────────────────
 
 # See: ../ContextHub/src/icons.ts
@@ -461,6 +477,28 @@ def render_report_from_workitem(
     )
 
 
+def apply_pane_status(
+    acceptance_criteria,
+    producer_actions=None,
+    notes=None,
+    *,
+    no_icons: bool = False,
+) -> dict:
+    """Derive the session status and update the herdr pane title.
+
+    Called at the end of the report render so the operator's pane grid shows
+    a status prefix (``✅``/``⚠️``/``🚫`` or ``Done``/``Note``/``Attention``).
+    Fail-open: never raises and never breaks a report.
+    """
+    try:
+        status = derive_status(acceptance_criteria, producer_actions, notes)
+        return update_pane_title(
+            status, use_icons=icons_enabled(no_icons),
+        )
+    except Exception:  # noqa: BLE001 - pane updates must never break a report
+        return {"updated": False}
+
+
 def render_from_wl(
     skill_name: str,
     work_item_id: str,
@@ -608,6 +646,9 @@ def main():
             next_action=args.next_action,
             audit_result=audit_result,
         )
+        apply_pane_status(
+            ac_rows, args.producer_actions, args.notes, no_icons=args.no_icons,
+        )
         print(report)
         return
 
@@ -623,6 +664,9 @@ def main():
         producer_actions=args.producer_actions,
         notes=args.notes,
         next_action=args.next_action,
+    )
+    apply_pane_status(
+        ac_rows, args.producer_actions, args.notes, no_icons=args.no_icons,
     )
     print(report)
 
