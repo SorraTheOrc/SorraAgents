@@ -3985,6 +3985,71 @@ def _extract_json_array(text: str) -> list | None:
     return None
 
 
+#: Firm instruction prefix for the single bounded JSON re-ask
+#: (SA-0MU32TCFM003B78I AC3). The re-ask is observable as context
+#: ``verdict_reask`` so it can be counted independently of the first call.
+_JSON_REASK_PREFIX = (
+    "[READ-ONLY AUDIT] [JSON RE-ASK] Do NOT close, modify, create, or delete "
+    "any work items. Do NOT execute any wl, git, or other state-modifying "
+    "commands. Return ONLY a single valid JSON array — no prose, no Markdown "
+    "code fences, and no commentary before or after the array. "
+)
+_JSON_REASK_SCHEMA = (
+    "Each element MUST be an object with keys 'index' (integer), 'verdict' "
+    "(one of met, unmet, partial, adjusted) and 'evidence' (a one-line note "
+    "with a file:line reference)."
+)
+
+
+def _reask_json_array_once(
+    issue_id: str,
+    model: str,
+    pi_bin: str,
+    debug_log: str | None,
+    timeout: int | None,
+    instruction: str,
+    priority: int | None = None,
+) -> list | None:
+    """Issue exactly one bounded 'return only the JSON array' re-ask.
+
+    Called at a Phase 1/2 parse site when the first response could not be
+    parsed into an index-bearing verdict array. The re-ask is observable
+    under the ``verdict_reask`` context and bounded by the per-call budget.
+    Returns the recovered batch, or ``None`` when the single re-ask also
+    fails (timeout, provider error, or unparseable output) — the caller then
+    falls back to the conservative ``partial`` verdict, never ``met``
+    (SA-0MU32TCFM003B78I AC3/AC5).
+    """
+    prompt = _JSON_REASK_PREFIX + _JSON_REASK_SCHEMA + "\n\n" + instruction
+    try:
+        result = _call_pi_and_maybe_log(
+            issue_id, "verdict_reask", prompt,
+            model=model, pi_bin=pi_bin, debug_log=debug_log,
+            timeout=timeout, json_expected=True,
+            priority=priority if priority is not None else Priority.MEDIUM,
+        )
+    except RuntimeError:
+        return None
+    if result.get("_timeout") or result.get("_provider_error"):
+        return None
+    raw = (
+        result.get("extracted_text", "")
+        or result.get("evidence", "")
+        or result.get("text", "")
+    )
+    batch = _extract_json_array(raw)
+    if batch is None:
+        try:
+            batch = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(batch, list) or not batch:
+        return None
+    if not any(isinstance(item, dict) and "index" in item for item in batch):
+        return None
+    return batch
+
+
 _CHECKBOX_MARKER_RE = re.compile(r"^\[[ xX~-]\]\s*")
 """Checkbox marker prefix stripped from bullet acceptance criteria.
 
@@ -6295,6 +6360,15 @@ def _deep_analyze_child(
         except json.JSONDecodeError:
             child_batch = []
             child_parse_failed = True
+    if child_parse_failed:
+        # Bounded JSON re-ask (SA-0MU32TCFM003B78I AC3).
+        reasked = _reask_json_array_once(
+            child.get("id", ""), resolved_model, pi_bin, debug_log, timeout,
+            child_prompt, priority=_resolve_audit_priority(child),
+        )
+        if reasked:
+            child_batch = reasked
+            child_parse_failed = False
 
     updated_child_acs = list(child_acs)
     if isinstance(child_batch, list):
@@ -6868,6 +6942,15 @@ def _run_phase2_deep_analysis(
             except json.JSONDecodeError:
                 batch = []
                 batch_parse_failed = True
+        if batch_parse_failed:
+            # Bounded JSON re-ask (SA-0MU32TCFM003B78I AC3).
+            reasked = _reask_json_array_once(
+                issue.get("id", ""), resolved_model, pi_bin, debug_log,
+                timeout, prompt, priority=_resolve_audit_priority(issue),
+            )
+            if reasked:
+                batch = reasked
+                batch_parse_failed = False
 
         updated_ac = list(ac_results)
         if isinstance(batch, list):
@@ -9125,6 +9208,15 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
         isinstance(item, dict) and "index" in item for item in batch
     ):
         return result, batch, raw_text
+    # Bounded JSON re-ask (SA-0MU32TCFM003B78I AC3): exactly one
+    # "return only the JSON array" retry before the caller falls back to the
+    # conservative 'partial' verdict.
+    reasked = _reask_json_array_once(
+        issue_id, model, pi_bin, debug_log, timeout, prompt,
+        priority=effective_priority,
+    )
+    if reasked:
+        return result, reasked, raw_text
     return result, [], raw_text
 
 
