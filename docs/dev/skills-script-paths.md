@@ -341,6 +341,22 @@ copied into the project:
    cd ~/.pi/agent/skills/<skill-name> && python3 ./scripts/<script>.py ...
    ```
 
+### Project-local AGENTS.md
+
+The global install provides the full agent workflow. Each project then gets a
+**project-local** `AGENTS.md` containing only the canonical reference
+structure (a single reference to `~/.pi/agent/AGENTS.md` plus a
+`## Project-specific guidance` placeholder) — never a copy of the global file:
+
+```bash
+python3 scripts/init_project_agents.py --target /path/to/project
+```
+
+See [project-agents-md.md](project-agents-md.md) for the installer behaviour
+(idempotent re-runs, append/overwrite/skip for existing rules, and the explicit
+`--copy-global` opt-in for offline use). ContextHub's `wl init` emits the same
+canonical structure and delegates workflow setup to the global install.
+
 Where `wl` stores live: worklog state is kept per repository at
 `<project-root>/.worklog/worklog-data.jsonl` (plus `sessions/`,
 `worktrees/`); worktree derives resolve the store from the worklog-dir
