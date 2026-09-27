@@ -586,6 +586,90 @@ _PI_RETRY_BACKOFF_SECONDS = 2.0
 Backoff grows linearly: 1x, 2x, ... base per retry attempt.
 """
 
+# ---------------------------------------------------------------------------
+# Per-run reliability summary (SA-0MU32TH89000YHP9, R7)
+# ---------------------------------------------------------------------------
+
+#: Stable key order for the per-run reliability summary. Operators and
+#: dashboards grep this line, so the key set and order are a contract.
+RELIABILITY_SUMMARY_KEYS = (
+    "calls",
+    "parse_ok",
+    "parse_failed",
+    "timeouts",
+    "child_skips",
+    "provider_errors",
+    "concurrency_waits",
+)
+#: Machine-greppable prefix; the full line is ``<prefix> <key=value> ...``.
+RELIABILITY_SUMMARY_PREFIX = "AUDIT_RELIABILITY_SUMMARY"
+
+_rel_lock = threading.Lock()
+_rel_counters: dict[str, int] = {k: 0 for k in RELIABILITY_SUMMARY_KEYS}
+_rel_started_at: float | None = None
+_rel_emitted = False
+
+
+def _rel_incr(key: str, amount: int = 1) -> None:
+    """Increment one reliability counter thread-safely."""
+    with _rel_lock:
+        _rel_counters[key] = _rel_counters.get(key, 0) + amount
+
+
+def _rel_reset() -> None:
+    """Reset all reliability counters and the run start clock."""
+    global _rel_started_at, _rel_emitted
+    with _rel_lock:
+        for key in RELIABILITY_SUMMARY_KEYS:
+            _rel_counters[key] = 0
+        # Use perf_counter (not monotonic) so the summary clock never
+        # interferes with the elapsed-time guard's clock (or tests that count
+        # monotonic() calls).
+        _rel_started_at = time.perf_counter()
+        _rel_emitted = False
+
+
+def _rel_snapshot() -> dict[str, int]:
+    """Return a thread-safe copy of the current reliability counters."""
+    with _rel_lock:
+        return dict(_rel_counters)
+
+
+def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
+    """Render the single per-run reliability summary line (R7 AC1).
+
+    The line is ``AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n>
+    parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n>
+    concurrency_waits=<n> elapsed_seconds=<x>`` with stable keys in
+    :data:`RELIABILITY_SUMMARY_KEYS`. When *elapsed_seconds* is omitted the
+    value is derived from the run start clock set by :func:`_rel_reset`.
+    """
+    counts = _rel_snapshot()
+    parts = [f"{key}={counts.get(key, 0)}" for key in RELIABILITY_SUMMARY_KEYS]
+    if elapsed_seconds is None:
+        if _rel_started_at is not None:
+            elapsed_seconds = time.perf_counter() - _rel_started_at
+    if elapsed_seconds is not None:
+        parts.append(f"elapsed_seconds={float(elapsed_seconds):.2f}")
+    return RELIABILITY_SUMMARY_PREFIX + " " + " ".join(parts)
+
+
+def emit_reliability_summary(elapsed_seconds: float | None = None) -> str | None:
+    """Print the per-run reliability summary exactly once (R7 AC1/AC4).
+
+    Returns the line, or ``None`` when it was already emitted for this run.
+    Safe to call from both the normal report path and an early-exit
+    ``finally`` block.
+    """
+    global _rel_emitted
+    with _rel_lock:
+        if _rel_emitted:
+            return None
+        _rel_emitted = True
+    line = render_reliability_summary(elapsed_seconds)
+    print(line, file=sys.stderr)
+    return line
+
 _STATUS_RESTORE_MAX_ATTEMPTS = 3
 """Total attempts (1 initial + retries) for the terminal status restore.
 
@@ -5421,6 +5505,19 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         )
         parse_ok = _extract_json_array(text) is not None
 
+    # Per-run reliability counters (SA-0MU32TH89000YHP9, R7). Counted for every
+    # call so the summary reflects the whole run, not only debug-logged calls.
+    _rel_incr("calls")
+    if isinstance(result, dict):
+        if result.get("_timeout"):
+            _rel_incr("timeouts")
+        if result.get("_concurrency_timeout"):
+            _rel_incr("concurrency_waits")
+        if result.get("_provider_error"):
+            _rel_incr("provider_errors")
+        elif json_expected and parse_ok is not None:
+            _rel_incr("parse_ok" if parse_ok else "parse_failed")
+
     reason = None
     target = None
     if debug_log:
@@ -9410,6 +9507,9 @@ def _budget_exceeded_ac_result(elapsed_s: float, budget_s: float) -> dict:
     }
 
 
+#: Reliability counters are incremented below; keep this near the helper.
+
+
 def _record_child_budget_exceeded(
     checkpoint: CheckpointStore | None,
     child_id: str,
@@ -9423,6 +9523,7 @@ def _record_child_budget_exceeded(
     killed after the guard fires still leaves a resumable record
     (SA-0MU32T6O0001UALR AC2/AC3).
     """
+    _rel_incr("child_skips")
     if checkpoint is None:
         return
     checkpoint.mark_child_budget_exceeded(child_id, elapsed_s, budget_s)
@@ -10754,6 +10855,13 @@ def _phase_report(ctx: _AuditContext) -> int:
 
         report = _assemble_report()
 
+        # Per-run reliability summary (R7 AC1): emit exactly one stable,
+        # machine-greppable line to stderr and append it to the report so it
+        # is persisted with the audit.
+        reliability_summary = emit_reliability_summary()
+        if reliability_summary:
+            report = report + "\n" + reliability_summary + "\n"
+
         # Persist the resumable in-main-slot pending-screens signal so a
         # later run completes exactly the outstanding child screens without a
         # full re-audit (SA-0MU32TE120012T49 AC3). Skipped when checkpointing
@@ -11512,6 +11620,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
     children are audited when it does). ``--audit-children`` forces the full
     per-child flow described above (explicit override).
     """
+
+    # Start a fresh per-run reliability counter set (R7 AC1).
+    _rel_reset()
 
     ctx = _AuditContext(
         issue_id=issue_id, persist=persist, timeout=timeout,
@@ -12363,7 +12474,8 @@ def main(argv: list[str] | None = None) -> int:
 def _run_issue_command(args) -> int:
     """Run the ``issue`` subcommand body (extracted for the F5 host gate)."""
     with SharedTimer("audit_runner_issue") as _root_timer:
-        _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
+        try:
+            _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
                         timeout=_resolve_effective_timeout(args.timeout),
                         parent_timeout=_resolve_parent_timeout(args.parent_timeout),
                         pi_bin=args.pi_bin, model=args.model,
@@ -12389,6 +12501,10 @@ def _run_issue_command(args) -> int:
                             args, "child_in_main_slot", None
                         ),
                         batch_drain=getattr(args, "batch_drain", None))
+        finally:
+            # Ensure the reliability summary is emitted even on an early exit
+            # (exception/timeout before _phase_report) — R7 AC4.
+            emit_reliability_summary()
         print(_root_timer.render(), file=sys.stderr)
     return _rc
 

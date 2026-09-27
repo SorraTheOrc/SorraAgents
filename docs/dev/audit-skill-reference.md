@@ -632,6 +632,26 @@ false-positive screen, and the verdict re-ask) can ever record
 `parse_failure`. Consumers MUST key off `parse_ok`/`reason`, not the mere
 presence of a debug entry.
 
+**Per-run reliability summary (SA-0MU32TH89000YHP9):** every `audit_runner.py
+issue` run emits **exactly one** machine-greppable summary line to stderr and
+appends it to the persisted report:
+
+```
+AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> elapsed_seconds=<x>
+```
+
+The keys (and their order) are the stable contract `RELIABILITY_SUMMARY_KEYS`;
+do not rename or reorder without a version bump. Counts are accumulated across
+all Pi calls in the run, including re-asks: `calls` (Pi calls),
+`parse_ok`/`parse_failed` (JSON-array extraction outcomes where a JSON array
+was expected), `timeouts` (`_timeout` results), `child_skips` (children
+recorded `partial (budget exceeded)`), `provider_errors` (`_provider_error`
+results), and `concurrency_waits` (audit-slot `_concurrency_timeout` results).
+The line is emitted once per run via `emit_reliability_summary()` — from the
+normal report path and, where possible, from an early-exit `finally` (timeout
+or abort before report assembly) so partial runs are still measurable. It
+contains counts only — never prompts, secrets, or credentials.
+
 **Phase 1 performance treatment (P7):** Phase 1 (automated screening) now
 mirrors the Phase 2 performance pattern, which removed the dominant Phase 1
 wall-clock cost (unbounded repository exploration during AC screening):
