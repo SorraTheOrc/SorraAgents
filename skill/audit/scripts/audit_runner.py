@@ -3793,6 +3793,18 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
 
     elapsed_seconds = _call_timer.elapsed
 
+    # Provider-error retry provenance (SA-0MU32TFKB0012ALC): how many attempts
+    # this call made. ``_provider_error_retried`` is True when at least one
+    # retry followed a provider error — including when the retry then
+    # succeeded — so reports can distinguish a flaky provider from a
+    # schema-contract failure.
+    retry_meta: dict = {}
+    if attempt > 1:
+        retry_meta = {
+            "_provider_error_attempts": attempt,
+            "_provider_error_retried": True,
+        }
+
     if provider_error:
         if ac_fallback_used is not None:
             ac_fallback_used.set()
@@ -3804,17 +3816,19 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             "extracted_text": "",
             "_provider_error": True,
             "_provider_error_message": provider_error,
+            "_provider_error_attempts": attempt,
+            "_provider_error_retried": attempt > 1,
             "elapsed_seconds": elapsed_seconds,
         }
 
     raw = stdout or ""
     if not raw:
-        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
+        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds, **retry_meta}
 
     # Parse JSON lines looking for the final agent_end message
     text = extract_pi_text(raw)
     if not text:
-        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
+        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds, **retry_meta}
 
     # Input-token capture (AC2 of SA-0MSISKM8F004NW1U): the pi JSON stream's
     # agent_end message carries the provider usage block, so each call's
@@ -3835,12 +3849,13 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 "extracted_text": text,
                 "elapsed_seconds": elapsed_seconds,
                 "input_tokens": input_tokens,
+                **retry_meta,
             }
     except json.JSONDecodeError:
         pass
 
     # If Pi returned free-form text, use it as evidence and default to met
-    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds, "input_tokens": input_tokens}
+    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds, "input_tokens": input_tokens, **retry_meta}
 
 
 def _extract_input_tokens(raw: str) -> int | None:
@@ -4752,6 +4767,15 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     adjusted_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_ADJUSTED)
     unmet_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_UNMET)
     partial_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_PARTIAL)
+    # Provider errors are reported distinctly from parse failures
+    # (SA-0MU32TFKB0012ALC AC1/AC2).
+    _provider_error_count = sum(
+        1 for r in (
+            ac_results
+            + [c for cr in child_results for c in cr.get("ac_results", [])]
+        )
+        if "Pi provider error" in _evidence_text(r.get("evidence"))
+    )
 
     not_reviewed = [
         c for c in child_results
@@ -4818,6 +4842,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"{len(not_reviewed)} children not yet in in_review/done stage."
             )
+
+    if _provider_error_count:
+        lines.append(
+            f"Provider errors: {_provider_error_count} acceptance criteria "
+            "could not be evaluated because the Pi provider returned an error "
+            "(distinct from a JSON parse failure); see the affected evidence."
+        )
 
     lines.append("")
     lines.append("## Acceptance Criteria Status")
@@ -5415,6 +5446,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             "extracted_text": result.get("extracted_text"),
             "evidence": result.get("evidence"),
             "provider_error": result.get("_provider_error_message"),
+            "provider_error_attempts": result.get("_provider_error_attempts"),
+            "provider_error_retried": result.get("_provider_error_retried"),
             "elapsed_seconds": result.get("elapsed_seconds"),
             "input_tokens": result.get("input_tokens"),
             "prompt": prompt[:1000],
@@ -6145,6 +6178,12 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     )
 
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+    # Per-run provider-error count (SA-0MU32TFKB0012ALC AC2): distinguishes a
+    # flaky provider from a schema-contract failure; feeds the R7 summary.
+    provider_error_count = sum(
+        1 for r in all_criteria
+        if "Pi provider error" in _evidence_text(r.get("evidence"))
+    )
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
     adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
 
@@ -6169,6 +6208,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     return {
         "ready_to_close": ready,
         "pending_child_screens": pending_child_screens,
+        "provider_error_count": provider_error_count,
         "summary": summary,
         "acceptance_criteria": ac_results,
         "children": child_results,
