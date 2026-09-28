@@ -134,6 +134,7 @@ except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 from test.scripts.run_tests import (
     full_suite_commands,
+    paced_runner,
     parse_node_failures,
     parse_pytest_failures,
     suite_timeout_per_command,
@@ -2742,6 +2743,15 @@ def _run_tests_via_test_skill(
                 force=True,  # execute fresh; refresh the cache entry
                 ttl=DEFAULT_TTL_SECONDS,
                 timeout=timeout,
+                # Route the audit's automatic suite execution through the test
+                # skill's host-wide "test" semaphore (SA-0MUJK94QN0015925):
+                # wrap the default runner so only a real execution (cache miss
+                # / --force) acquires a slot, while a read-only cache hit never
+                # does. This bounds nested/concurrent audit-triggered runs by
+                # the same TEST_MAX_CONCURRENCY / TEST_LOCK_TIMEOUT ceiling as
+                # run_tests.py (SA-0MTG5U75A001F1RG). A saturated host raises
+                # TestConcurrencyTimeout, surfaced below as a fail-open notice.
+                runner=paced_runner(),
             )
         except FileNotFoundError as exc:
             notice = f"command not found: {exc.filename}"

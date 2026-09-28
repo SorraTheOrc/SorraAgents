@@ -77,6 +77,7 @@ from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
     Runner,
+    _default_runner,
     query_cached,
     run_cached,
     summary_lines,
@@ -1212,7 +1213,7 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
         return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
 
 
-def paced_runner(runner: Runner) -> Runner:
+def paced_runner(runner: Runner | None = None) -> Runner:
     """Wrap a cache *runner* so each real execution holds a test-run slot.
 
     The ``run_cached`` protocol invokes *runner* only on a cache **miss**;
@@ -1221,6 +1222,12 @@ def paced_runner(runner: Runner) -> Runner:
     intended semantics: every real suite execution acquires the shared
     ``"test"`` semaphore (ceiling ``TEST_MAX_CONCURRENCY``, bounded wait
     ``TEST_LOCK_TIMEOUT``), and cache hits never consume a slot.
+
+    *runner* defaults to ``test_cache._default_runner`` (the same runner
+    ``run_cached`` uses when none is supplied), so callers that execute a
+    command through the cache with default semantics — e.g. the audit's F3
+    auto-execution (SA-0MUJK94QN0015925) — can route it through the pacer by
+    passing ``runner=paced_runner()`` alone.
 
     This is the single pacer entry point other code paths (e.g.
     ``implement.py``'s finish-gate suites, SA-0MUKHCO02009EQFG) use to route
@@ -1231,6 +1238,9 @@ def paced_runner(runner: Runner) -> Runner:
     Raises:
         TestConcurrencyTimeout: when no slot frees within ``TEST_LOCK_TIMEOUT``.
     """
+    if runner is None:
+        runner = _default_runner
+
     def _paced(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
         with _test_concurrency_slot():
             return runner(command, cwd, timeout)
