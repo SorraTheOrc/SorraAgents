@@ -152,7 +152,7 @@ class TestDocUpdates:
         content = (_REPO_ROOT / "skill" / "implement" / "SKILL.md").read_text(
             encoding="utf-8"
         )
-        assert "Intake/interview helpers: `intake`, `plan`." in content
+        assert "Intake/interview helpers: `intake`, `plan`, `interview`." in content
         assert ".command/" not in content
 
     def test_agents_global_step_4_mentions_parent_recursion(self):

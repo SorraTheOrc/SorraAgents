@@ -434,6 +434,16 @@ describe('checkFinalValidation - producer-review flag', () => {
     assert.equal(report.blockingItems.length, 1);
     assert.match(report.blockingItems[0].reason, /producer review/i);
     assert.ok(report.blockingItems[0].remediation.includes('wl update SA-1'));
+    assert.ok(
+      report.blockingItems[0].remediation.includes(
+        'wl update SA-1 --needs-producer-review false --json',
+      ),
+      'AC2: exit-12 remediation must surface the kebab-case wl command',
+    );
+    assert.ok(
+      !report.blockingItems[0].remediation.includes('--needsProducerReview'),
+      'AC2: remediation must not emit the camelCase wl flag',
+    );
   });
 
   test('needsProducerReview === false does not block', async () => {

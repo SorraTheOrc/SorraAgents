@@ -86,6 +86,80 @@ anything about the result.
 **Fix:** Add at least one real assertion (prefer multiple) — e.g. verify a
 specific DOM node exists, a state value is correct, an event was emitted.
 
+### 7. Real-Git Tests Without a Sandbox
+
+**What it looks like:** A test helper that shells out to real `git`
+(`git init`, `branch -M dev`, `worktree add`, `remote add`, `push`, `config`)
+against a `tmp_path` directory without the shared sandbox helper, relying on
+`cwd=` alone for isolation.
+
+**Why it's bad:** Git honours repository-overriding environment variables
+(`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG*`) *over* `cwd`. A value leaked into
+the process environment is inherited by every `git` subprocess, so an
+otherwise-isolated fixture mutates the live checkout. On 2026-09-24 this moved
+local `dev` onto fixture commits, created fixture branches, rewrote
+`.git/config` (identity, `core.bare`, `core.hooksPath`) and pushed fixture
+commits to the real `origin/dev` (SA-0MUG0WFP8008WN63; evidence and
+deterministic reproduction in
+[docs/dev/test-isolation.md](../../docs/dev/test-isolation.md)).
+
+**Fix:** Route every real-git helper through
+[`skill/shared/git_sandbox.py`](../shared/git_sandbox.py). It asserts the target
+is outside any git work tree, neutralises the repository overrides, pins a
+fixture-local identity, and creates repos/remotes/worktrees under `tmp_path`.
+
+```python
+from shared.git_sandbox import commit_all, init_repo, run_git
+
+def _make_repo(tmp_path):
+    repo = init_repo(tmp_path / "fixture")          # asserts containment + isolates env
+    (repo / "src").mkdir()
+    (repo / "src" / "utils.py").write_text("# utils\n")
+    commit_all(repo, "initial")
+    run_git(repo, ["branch", "origin/dev"], check=True)
+    return repo
+```
+
+The regression guard fails the suite if a test mutates the live checkout:
+see the [test skill](../test/SKILL.md#live-repo-mutation-guard-detect-only)
+and [`tests/test_live_repo_mutation_guard.py`](../../tests/test_live_repo_mutation_guard.py).
+
+### 8. Unmocked Audit / Suite Subprocess Spawns
+
+**What it looks like:** A test exercises the audit's child-audit cascade
+(`--audit-children`) or any other path that calls `subprocess.run` to spawn a
+real `audit_runner.py issue …` (or `run_tests.py` / pytest) child process,
+without mocking that spawn. The test passes a faked `wl` runner but leaves
+`subprocess.run` real.
+
+**Why it's bad:** The real child audit runs in the test process tree. On a
+cold test cache its F3 auto-execution force-executes the full suite, which
+re-runs the same test, which spawns another child audit — an unbounded
+cascade (observed 1500s+ and 19–50+ nested processes) that hangs the release
+gate. The per-run child cap (`--max-child-audits`) is per-process and cannot
+bound the cross-process depth (SA-0MUG47DYG006TV40).
+
+**Fix:** Mock `audit_runner.subprocess.run` so the child spawn is asserted,
+not executed — the same pattern as `TestChildPersistFailureFatal`
+(`skill/audit/tests/test_audit_runner_launch_context.py`) and
+`TestCascadeBoundedRecursionGuard`
+(`skill/audit/tests/test_audit_runner_children.py`). The production-side
+recursion guard (`_suite_run_in_progress()` / `LIVE_REPO_GUARD_ACTIVE`)
+bounds the cascade fail-open, but tests must still mock the spawn so they
+never depend on it.
+
+```python
+def _fake_subprocess_run(cmd, **kwargs):
+    cmd_str = " ".join(cmd)
+    if "audit_runner.py" in cmd_str and "issue" in cmd_str:
+        triggered.append(cmd_str)  # assert the (mocked) invocation
+    return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+with mock.patch.object(audit_runner.subprocess, "run",
+                       side_effect=_fake_subprocess_run):
+    ...
+```
+
 ## Positive Guidance
 
 1. **Every test must assert observable behaviour of production code:** input →
@@ -99,3 +173,13 @@ specific DOM node exists, a state value is correct, an event was emitted.
 5. **Browser / scene tests must contain at least one real assertion** (prefer
    multiple).
 6. **A test file that imports no production code is a smell — delete it.**
+7. **Real-git tests use [`skill/shared/git_sandbox.py`](../shared/git_sandbox.py)**;
+   never run `git init`/`branch -M`/`worktree add`/`push` directly against a
+   `tmp_path` path with only `cwd=` for isolation. The guard in
+   [`skill/shared/live_repo_guard.py`](../shared/live_repo_guard.py) (armed by
+   the repo-root [`conftest.py`](../../conftest.py)) fails the session if a test
+   mutates the checkout.
+8. **Tests that reach the audit child-cascade / suite subprocess must mock
+   `audit_runner.subprocess.run`** (see anti-pattern 8) so no real
+   `audit_runner.py issue` child is spawned; assert the mocked invocation
+   instead.

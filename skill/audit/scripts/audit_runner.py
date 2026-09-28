@@ -43,6 +43,13 @@ Persist + verify invariant:
   is retrievable.  If either step fails the runner exits non-zero.
   This is not configurable — it is an invariant of the runner.
 
+  ``--do-not-persist`` is a dry run: the full report (``rawOutput``) is NOT
+  stored, but a 'Ready to close: Yes' verdict STILL persists the audit
+  freshness signal (``auditedAt`` / ``auditResult``) via the atomic
+  ``wl audit-set`` path (``updatedAt = auditedAt``) so Herdr/DOWNTIME treat
+  the item as freshly audited instead of re-queuing it as a stale-audit
+  candidate.  A non-Yes verdict never bumps ``auditedAt`` (fail-closed).
+
 Exit codes:
   0 – success (report printed to stdout)
   1 – Worklog / CLI / Pi failure, persistence failure, or readback
@@ -93,12 +100,14 @@ from audit.scripts.checkpoint_store import (
 from audit.scripts.persist_audit import (
     PERSIST_CONTENT_INVALID,
     persist_audit,
+    persist_audit_freshness,
 )
 from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
 from scripts.pi_utils import extract_pi_text
 
 try:
+    from shared.git_sandbox import scrub_repository_overrides
     from shared.process_semaphore import (
         DEFAULT_MAX_WORKERS,
         ENV_MAX_WORKERS,
@@ -125,6 +134,7 @@ except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 from test.scripts.run_tests import (
     full_suite_commands,
+    paced_runner,
     parse_node_failures,
     parse_pytest_failures,
     suite_timeout_per_command,
@@ -132,9 +142,61 @@ from test.scripts.run_tests import (
 from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
 # ---------------------------------------------------------------------------
+# Recursion guard: LIVE_REPO_GUARD_ACTIVE propagation (SA-0MUG47DYG006TV40)
+# ---------------------------------------------------------------------------
+LIVE_REPO_GUARD_ACTIVE_ENV = "LIVE_REPO_GUARD_ACTIVE"
+"""Marker inherited from ``run_tests.py`` and ``live_repo_guard.py``.
+
+When set, signals that an outer test-suite run owns the checkout. Nested
+audits whose F3 auto-execution would re-enter the suite must stand down
+rather than spawning a recursive suite run (SA-0MUG47DYG006TV40).
+
+This env var is also threaded into child-audit subprocesses so they
+inherit the guard and cannot cascade further.
+"""
+
+
+def _suite_run_in_progress() -> bool:
+    """Return True when an outer test-suite run owns the checkout.
+
+    Reuses the ``LIVE_REPO_GUARD_ACTIVE`` marker set by ``run_tests.py``
+    and consumed by ``live_repo_guard.py``. A nested audit sees the marker
+    and stands down its F3 auto-execution to prevent unbounded recursion
+    (SA-0MUG47DYG006TV40 AC1/AC2).
+    """
+    return bool(os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV))
+
+
+# ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
 # ---------------------------------------------------------------------------
 AUDIT_SEMAPHORE_NAME = "audit"
+
+# Host-wide ingress cap (F5, SA-0MUIUMO7T00639FL). The per-call ``audit``
+# semaphore bounds concurrent *pi* subprocesses, and the test skill's ``test``
+# semaphore bounds suite *commands* it spawns — but independently launched
+# ``audit_runner.py issue`` processes (the 2026-09-26 incident spawned 30+)
+# are bounded by neither. This ingress cap gates the whole issue pipeline in
+# its own semaphore namespace so N+1 concurrent issues wait or exit cleanly.
+AUDIT_HOST_SEMAPHORE_NAME = "audit-host"
+AUDIT_MAX_HOST_AUDITS_ENV = "AUDIT_MAX_HOST_AUDITS"
+AUDIT_MAX_HOST_AUDITS_DEFAULT = 3
+AUDIT_HOST_LOCK_TIMEOUT_ENV = "AUDIT_HOST_LOCK_TIMEOUT"
+AUDIT_HOST_LOCK_TIMEOUT_DEFAULT = 90.0
+"""Bounded wait (seconds) for a host-wide audit ingress slot.
+
+Default 90s matches ``AUDIT_QUEUE_TIMEOUT`` and stays inside the parent
+bash-tool execution timeout (~120s): a saturated host makes the N+1th
+``audit_runner.py issue`` WAIT for a slot (so a legitimate batch of audits
+still completes) and exit cleanly with a clear message if none frees in time,
+rather than adding another concurrent suite runner. Set ``AUDIT_HOST_LOCK_TIMEOUT=0``
+to fail fast, or a larger value for longer batches.
+"""
+
+#: Process-wide host slot held for the duration of a ``cmd_issue`` call.
+#: Nested/recursive ``cmd_issue`` calls (batch drain, child audits) are
+#: re-entrant: the outer call already holds the slot for the process.
+_HOST_AUDIT_SLOT: Semaphore | None = None
 AUDIT_LOCK_TIMEOUT_ENV = "AUDIT_LOCK_TIMEOUT"
 AUDIT_LOCK_TIMEOUT_DEFAULT = 0.0
 """Fail-fast wait (seconds) for a free audit concurrency slot.
@@ -243,10 +305,126 @@ def _build_session_id(issue_id: str, context: str) -> str:
     Format: ``audit-{issue_id}-{context}-{uuid8}`` where the UUID is the
     first 8 hex chars of ``uuid4()``.  Colons in *context* are replaced
     with underscores so the result passes ``assertValidSessionId``.
+
+    For project-level audits where both *issue_id* and *context* are
+    ``"project"``, the identifier is simplified to ``audit-project-{uuid8}``
+    to avoid the redundant ``project-project`` doublet.
     """
     safe_context = _sanitize_session_id_segment(context)
+    # Dedupe the "project-project" doublet for project-level audits.
+    if issue_id == "project" and safe_context == "project":
+        safe_context = ""
     short_uuid = uuid.uuid4().hex[:8]
-    return f"audit-{issue_id}-{safe_context}-{short_uuid}"
+    if safe_context:
+        return f"audit-{issue_id}-{safe_context}-{short_uuid}"
+    return f"audit-{issue_id}-{short_uuid}"
+
+
+# ---------------------------------------------------------------------------
+# Session retention helpers
+# ---------------------------------------------------------------------------
+
+DEFAULT_SESSION_RETENTION_DAYS = 112
+"""Default number of days to retain ``audit-*`` session files before
+automatic pruning (SA-0MSNYWMJJ002CIJ7)."""
+
+ENV_SESSION_RETENTION_DAYS = "AUDIT_SESSION_RETENTION_DAYS"
+"""Environment variable that overrides the default session retention
+period (in days). Takes effect when no CLI ``--session-retention-days``
+flag is supplied."""
+
+ENV_PI_SESSION_DIR = "PI_CODING_AGENT_SESSION_DIR"
+"""Environment variable that overrides the default Pi session directory
+path. When set, session cleanup operates on this directory instead of
+the default ``~/.pi/agent/sessions/``."""
+
+
+def _get_pi_session_dir() -> str:
+    """Return the directory where Pi stores session files.
+
+    Honours the ``PI_CODING_AGENT_SESSION_DIR`` environment variable
+    when present; falls back to ``~/.pi/agent/sessions/``.
+    """
+    override = os.environ.get(ENV_PI_SESSION_DIR)
+    if override:
+        return override
+    return os.path.join(
+        os.path.expanduser("~"), ".pi", "agent", "sessions"
+    )
+
+
+def _is_audit_session_filename(name: str) -> bool:
+    """Return True when *name* is a Pi session file for an ``audit-`` session.
+
+    Pi stores session files as ``<timestamp>_<session-id>.jsonl`` inside a
+    per-working-directory subfolder of the session root.  The audit
+    ``--session-id`` values begin with ``audit-`` (or ``audit`` for the
+    ``audit-...`` form), so the session-id segment is the part after the
+    first ``_``.  Files that are directly named ``audit-*`` (no timestamp
+    prefix) are also matched.  The check is deliberately conservative: it
+    only ever returns True for audit sessions, never for another skill's
+    sessions.
+    """
+    if "_" in name:
+        session_segment = name.split("_", 1)[1]
+    else:
+        session_segment = name
+    return session_segment.startswith("audit-")
+
+
+def _prune_audit_sessions(retention_days: int,
+                          session_dir: str | None = None) -> tuple[int, int]:
+    """Prune stale ``audit-*`` session files older than *retention_days*.
+
+    Scans the Pi session directory (see ``_get_pi_session_dir``) recursively
+    because Pi nests session files in per-working-directory subfolders.  Only
+    files whose session-id segment starts with ``audit-`` (see
+    ``_is_audit_session_filename``) are eligible; every other Pi session is
+    left untouched.  Retained files are those modified within the last
+    *retention_days* days.
+
+    Returns ``(count_pruned, bytes_freed)`` so the caller can log the
+    result.
+    """
+    root = session_dir if session_dir is not None else _get_pi_session_dir()
+    if not os.path.isdir(root):
+        return 0, 0
+
+    now = time.time()
+    cutoff = now - (retention_days * 86400)
+    count = 0
+    bytes_freed = 0
+
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if not _is_audit_session_filename(filename):
+                    continue
+                full_path = os.path.join(dirpath, filename)
+                try:
+                    stat = os.stat(full_path)
+                except OSError:
+                    continue
+                if stat.st_mtime < cutoff:
+                    try:
+                        os.unlink(full_path)
+                        count += 1
+                        bytes_freed += stat.st_size
+                    except OSError:
+                        pass  # best-effort; never raise
+    except OSError:
+        pass  # directory inaccessible — fail open
+
+    return count, bytes_freed
+
+
+def _format_bytes(n: int) -> str:
+    """Return a human-readable byte-count string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.0f}TB"
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +729,90 @@ _PI_RETRY_BACKOFF_SECONDS = 2.0
 Backoff grows linearly: 1x, 2x, ... base per retry attempt.
 """
 
+# ---------------------------------------------------------------------------
+# Per-run reliability summary (SA-0MU32TH89000YHP9, R7)
+# ---------------------------------------------------------------------------
+
+#: Stable key order for the per-run reliability summary. Operators and
+#: dashboards grep this line, so the key set and order are a contract.
+RELIABILITY_SUMMARY_KEYS = (
+    "calls",
+    "parse_ok",
+    "parse_failed",
+    "timeouts",
+    "child_skips",
+    "provider_errors",
+    "concurrency_waits",
+)
+#: Machine-greppable prefix; the full line is ``<prefix> <key=value> ...``.
+RELIABILITY_SUMMARY_PREFIX = "AUDIT_RELIABILITY_SUMMARY"
+
+_rel_lock = threading.Lock()
+_rel_counters: dict[str, int] = {k: 0 for k in RELIABILITY_SUMMARY_KEYS}
+_rel_started_at: float | None = None
+_rel_emitted = False
+
+
+def _rel_incr(key: str, amount: int = 1) -> None:
+    """Increment one reliability counter thread-safely."""
+    with _rel_lock:
+        _rel_counters[key] = _rel_counters.get(key, 0) + amount
+
+
+def _rel_reset() -> None:
+    """Reset all reliability counters and the run start clock."""
+    global _rel_started_at, _rel_emitted
+    with _rel_lock:
+        for key in RELIABILITY_SUMMARY_KEYS:
+            _rel_counters[key] = 0
+        # Use perf_counter (not monotonic) so the summary clock never
+        # interferes with the elapsed-time guard's clock (or tests that count
+        # monotonic() calls).
+        _rel_started_at = time.perf_counter()
+        _rel_emitted = False
+
+
+def _rel_snapshot() -> dict[str, int]:
+    """Return a thread-safe copy of the current reliability counters."""
+    with _rel_lock:
+        return dict(_rel_counters)
+
+
+def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
+    """Render the single per-run reliability summary line (R7 AC1).
+
+    The line is ``AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n>
+    parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n>
+    concurrency_waits=<n> elapsed_seconds=<x>`` with stable keys in
+    :data:`RELIABILITY_SUMMARY_KEYS`. When *elapsed_seconds* is omitted the
+    value is derived from the run start clock set by :func:`_rel_reset`.
+    """
+    counts = _rel_snapshot()
+    parts = [f"{key}={counts.get(key, 0)}" for key in RELIABILITY_SUMMARY_KEYS]
+    if elapsed_seconds is None:
+        if _rel_started_at is not None:
+            elapsed_seconds = time.perf_counter() - _rel_started_at
+    if elapsed_seconds is not None:
+        parts.append(f"elapsed_seconds={float(elapsed_seconds):.2f}")
+    return RELIABILITY_SUMMARY_PREFIX + " " + " ".join(parts)
+
+
+def emit_reliability_summary(elapsed_seconds: float | None = None) -> str | None:
+    """Print the per-run reliability summary exactly once (R7 AC1/AC4).
+
+    Returns the line, or ``None`` when it was already emitted for this run.
+    Safe to call from both the normal report path and an early-exit
+    ``finally`` block.
+    """
+    global _rel_emitted
+    with _rel_lock:
+        if _rel_emitted:
+            return None
+        _rel_emitted = True
+    line = render_reliability_summary(elapsed_seconds)
+    print(line, file=sys.stderr)
+    return line
+
 _STATUS_RESTORE_MAX_ATTEMPTS = 3
 """Total attempts (1 initial + retries) for the terminal status restore.
 
@@ -686,12 +948,21 @@ with a fingerprint are gated on content match instead (see
 AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint: "
 """Prefix of the content-fingerprint metadata line embedded in audit reports.
 
-The content fingerprint (git HEAD sha + work-item description hash + Key Files
-list, captured at audit time) is embedded in the persisted report so a re-audit
-of an unchanged item can skip the pipeline in seconds instead of re-running it
-(SA-0MSKB6US1009CNHT). The line is parsed back out by
+The content fingerprint (per-work-item touched-file state + work-item
+description hash + Key Files list, captured at audit time) is embedded in the
+persisted report so a re-audit of an unchanged item can skip the pipeline in
+seconds instead of re-running it (SA-0MSKB6US1009CNHT,
+SA-0MSPZDALB000S18P). The line is parsed back out by
 ``_extract_content_fingerprint``.
 """
+
+#: Marker prefix used to separate commit headers from file names in
+#: ``git log --name-only`` output (SA-0MSPZDALB000S18P).
+_TOUCHED_FILES_COMMIT_MARKER = "__WL_COMMIT__"
+
+#: Regex matching a candidate 7-40 char hex commit sha (mirrors the merge
+#: gate's reference extraction in ``_resolve_item_commits``).
+_COMMIT_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
 
 AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30
 """Tolerance (seconds) for treating an audit as fresh despite a stale check.
@@ -1255,19 +1526,22 @@ def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
 
 def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None,
-                           work_item: dict | None = None) -> str | None:
+                           work_item: dict | None = None,
+                           comments: Sequence[dict] | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
 
     1. **Content-based gate (primary, SA-0MSKB6US1009CNHT):** when the
-       stored audit report carries a content fingerprint (git HEAD sha +
-       work-item description hash + Key Files list captured at audit time),
-       the audit is fresh iff the fingerprint is unchanged. This makes
-       re-audits of unchanged items return the existing report in seconds
-       instead of re-running the pipeline, even when ``updatedAt`` moved for
-       non-content reasons (e.g. a comment was added). A change in ANY
-       fingerprint component invalidates freshness and re-runs the pipeline.
+       stored audit report carries a content fingerprint (the work item's
+       per-touched-file state + description hash + Key Files list captured
+       at audit time, SA-0MSPZDALB000S18P), the audit is fresh iff the
+       fingerprint is unchanged. This makes re-audits of unchanged items
+       return the existing report in seconds instead of re-running the
+       pipeline, even when ``updatedAt`` moved for non-content reasons
+       (e.g. a comment was added), or when an UNRELATED file was committed
+       or left dirty. A change to any file the item itself touched (or to
+       its description / Key Files) invalidates freshness and re-runs.
     2. **Time gate (floor):** when the stored report carries no fingerprint
        (e.g. legacy audits persisted before the fingerprint feature), the
        existing 60s time gate is retained as the freshness floor: compare
@@ -1283,8 +1557,14 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
 
     *work_item* may be passed in to avoid a redundant ``wl show`` when the
     caller already fetched the work item (SA-0MSL1Z7E9005TLBA): it is used
-    for the fingerprint computation and the time-gate ``updatedAt``.
-    When omitted, the work item is fetched via ``wl show``.
+    for the fingerprint computation and the time-gate ``updatedAt``. When
+    omitted, the work item is fetched via ``wl show``.
+
+    *comments* is the item's already-fetched ``wl show`` comment list. It is
+    passed into the fingerprint computation so comment-recorded commit hashes
+    contribute to the touched-file set; callers must pass the SAME comments
+    at audit time and check time for the resolved set to be stable (see
+    ``_resolve_touched_files``).
     """
 
     try:
@@ -1307,13 +1587,15 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
 
     # ── Content-based freshness gate (SA-0MSKB6US1009CNHT) ─────────────
     # When the stored audit carries a content fingerprint, freshness is
-    # decided by content match: re-auditing an item whose git HEAD sha,
-    # description hash, and Key Files are unchanged returns the existing
-    # report in seconds instead of re-running the pipeline.
+    # decided by content match: re-auditing an item whose touched-file
+    # state, description hash, and Key Files are unchanged returns the
+    # existing report in seconds instead of re-running the pipeline
+    # (SA-0MSPZDALB000S18P: unrelated repo changes no longer invalidate it).
     stored_fingerprint = _extract_content_fingerprint(raw_output)
     if stored_fingerprint is not None:
         current_fingerprint = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+            comments=comments,
         )
         if current_fingerprint is None:
             # Fingerprint cannot be computed now (e.g. git unavailable) —
@@ -1381,74 +1663,296 @@ def _extract_content_fingerprint(report_text: str) -> str | None:
     return None
 
 
-def _compute_content_fingerprint(runner: Runner, issue_id: str,
-                                 worklog_dir: str | None = None,
-                                 work_item: dict | None = None) -> str | None:
-    """Compute the content fingerprint for a work item at the current state.
+def _normalise_repo_path(path: str) -> str:
+    """Normalise a git-reported or Key-Files path for comparison.
 
-    The fingerprint combines four components so that a change in ANY of them
-    invalidates freshness (SA-0MSKB6US1009CNHT, SA-0MSL1YXG7004F2BZ):
-
-    1. **git HEAD sha** — the repository state being audited.
-    2. **work-item description hash** — the audited acceptance criteria text.
-    3. **Key Files list** — the file-scope manifest of the audited item.
-    4. **working-tree state** — a hash of ``git status --porcelain`` +
-       ``git diff --name-only HEAD`` output, so uncommitted/untracked
-       changes between audits invalidate freshness (the audit reads the
-       working tree, not just HEAD). Degrades to an empty marker when git
-       is unavailable so fail-open callers keep working.
-
-    *work_item* may be passed in to avoid a redundant ``wl show`` call when
-    the caller already fetched the work item (e.g. ``cmd_issue``). When
-    omitted, the work item is fetched via ``wl show``.
-
-    Returns a sha256 hex digest of the canonical JSON payload, or ``None``
-    when the fingerprint cannot be determined (git unavailable, wl show
-    failure, or missing data) so callers fail open and re-run the pipeline.
+    Strips surrounding whitespace/backticks/quotes and a leading ``./`` so
+    the same file resolved from ``git log --name-only`` (which may quote
+    paths containing special characters) and from the description's Key
+    Files section compares equal (SA-0MSPZDALB000S18P).
     """
-    head_sha = _resolve_audited_head(runner)
-    if head_sha is None:
-        return None
+    p = (path or "").strip().strip("`").strip()
+    if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+        p = p[1:-1]
+    p = p.replace("\\\"", '"').replace("\\\\", "\\")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.strip()
+
+
+def _extract_comment_commit_hashes(comments: Sequence[dict] | None) -> list[str]:
+    """Extract candidate commit shas recorded in a work item's comments.
+
+    The implement skill records each change's commit hash in a comment on the
+    item; this parses every 7-40 hex-char token from the comment text, mirroring
+    the merge gate's reference extraction (``_resolve_item_commits``). The
+    candidates are de-duplicated (case-folded) and sorted; they are validated
+    against git when resolved, so stray hex-looking tokens are harmless.
+    Returns an empty list when there are no comments (SA-0MSPZDALB000S18P).
+    """
+    if not comments:
+        return []
+    shas: set[str] = set()
+    for comment in comments:
+        text = comment.get("comment", "") if isinstance(comment, dict) else str(comment)
+        for match in _COMMIT_SHA_RE.finditer(text or ""):
+            shas.add(match.group(0).lower())
+    return sorted(shas)
+
+
+def _resolve_touched_files(runner: Runner, issue_id: str,
+                           worklog_dir: str | None = None,
+                           work_item: dict | None = None,
+                           comments: Sequence[dict] | None = None) -> list[str] | None:
+    """Resolve the set of repository paths a work item touched.
+
+    The set is the union of (SA-0MSPZDALB000S18P):
+
+    1. files in commits whose message references the work item id
+       (``git log --all --fixed-strings --grep=<id> --name-only``) — the
+       primary source, because the implement-skill commit convention embeds
+       the item id in every commit message (``<WIP-id>: <summary>``);
+    2. files in commits whose hashes are recorded in the item's *comments*
+       (the implement skill records each change's commit hash there) — a
+       best-effort safety net for commits whose message lacks the id. Only
+       resolved when the caller supplies *comments* (see the determinism
+       note below);
+    3. the ``Key Files`` entries parsed from the description.
+
+    Paths are normalised, de-duplicated, and sorted. Returns ``None`` (the
+    fail-open signal for callers) when the set cannot be determined: git is
+    unavailable / the ``git log`` call fails, or no paths are recorded. An
+    empty set is never returned, because it would make the fingerprint blind
+    to any file change (a correctness hazard — fail stale, never fail fresh).
+
+    **Determinism.** The fingerprint is recomputed on every freshness check,
+    so the touched-file set must be identical at audit time and check time.
+    Comment-derived hashes are therefore used only when the caller explicitly
+    supplies *comments*; callers that hold the fetched item pass the same
+    comments list at both points. Callers that avoid an extra fetch (child
+    reuse paths, SA-0MSL1Z7E9005TLBA) pass ``None`` and rely on the grep +
+    Key Files sources, which keeps the two computations consistent.
+
+    *work_item* may be passed in to reuse an already-fetched item; when
+    omitted it is fetched via ``wl show`` (unless *comments* are supplied).
+    """
     if work_item is None:
         try:
             data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                            worklog_dir=worklog_dir)
-        except RuntimeError:
+        except Exception:  # noqa: BLE001 -- fail open on any wl/runner failure
+            return None
+        work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
+    description = work_item.get("description", "") or ""
+
+    paths: set[str] = set()
+
+    # (1) Files in commits referencing the work item id. One git call.
+    try:
+        proc = runner([
+            "git", "log", "--all", "--fixed-strings",
+            f"--grep={issue_id}", "--name-only",
+            f"--format={_TOUCHED_FILES_COMMIT_MARKER}%H",
+        ])
+    except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+        return None
+    if proc.returncode != 0:
+        return None  # git unavailable / not a repository ⇒ fail open
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(_TOUCHED_FILES_COMMIT_MARKER):
+            continue
+        normalised = _normalise_repo_path(stripped)
+        if normalised:
+            paths.add(normalised)
+
+    # (2) Comment-recorded commit hashes (best-effort; one batched git call).
+    #     A failure here is swallowed — the grep + Key Files sources still
+    #     determine the set, and erring toward extra paths keeps the gate
+    #     fail-stale (SA-0MSPZDALB000S18P).
+    recorded_shas = _extract_comment_commit_hashes(comments)
+    if recorded_shas:
+        try:
+            proc = runner([
+                "git", "log", "--no-walk", "--name-only", "--format=",
+                *recorded_shas,
+            ])
+        except Exception:  # noqa: BLE001 -- best-effort source
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                normalised = _normalise_repo_path(line)
+                if normalised:
+                    paths.add(normalised)
+
+    # (3) Key Files from the description.
+    for key_file in _extract_key_files(description):
+        normalised = _normalise_repo_path(key_file)
+        if normalised:
+            paths.add(normalised)
+
+    if not paths:
+        return None  # cannot determine the touched set ⇒ fail open
+    return sorted(paths)
+
+
+def _parse_porcelain_path(line: str) -> str:
+    """Extract the path from a ``git status --porcelain`` entry.
+
+    Handles the rename/copy form (``R  old -> new`` → ``new``) and the plain
+    form (``XY path`` → ``path``). The leading status column is significant
+    (a leading space is part of the two-char status), so only trailing
+    whitespace is stripped. Returns ``""`` for malformed lines.
+    """
+    entry = line.rstrip()
+    if not entry:
+        return ""
+    if " -> " in entry:
+        entry = entry.split(" -> ", 1)[1]
+    elif len(entry) > 3:
+        entry = entry[3:]
+    else:
+        return ""
+    return _normalise_repo_path(entry)
+
+
+def _compute_path_fingerprints(runner: Runner,
+                               paths: Sequence[str]) -> dict | None:
+    """Capture the current state of each touched path for the fingerprint.
+
+    For every path this records:
+
+    * ``head`` — the path's committed state: its blob hash at HEAD
+      (``git rev-parse HEAD:<path>``) when present at HEAD, else the hash of
+      the latest commit touching it (``git log -1 --format=%H -- <path>``),
+      else ``""`` for a path never committed (e.g. an untracked new file).
+    * ``worktree`` — the path's narrowed working-tree state from
+      ``git status --porcelain -- <paths>`` and
+      ``git diff --name-only HEAD -- <paths>`` (empty when clean).
+
+    Returns a ``{path: {"head": ..., "worktree": ...}}`` dict, or ``None``
+    when a git call needed for the payload fails — callers fail open and
+    re-run the pipeline (SA-0MSPZDALB000S18P). The working-tree queries are
+    batched (two calls for all paths) and the per-path budget is one
+    ``rev-parse`` (plus one fallback ``log -1`` only when the path is not at
+    HEAD), honouring the bounded-cost constraint.
+    """
+    path_list = list(paths)
+    if not path_list:
+        return None
+
+    worktree: dict[str, list[str]] = {p: [] for p in path_list}
+    for cmd in (
+        ["git", "status", "--porcelain", "--", *path_list],
+        ["git", "diff", "--name-only", "HEAD", "--", *path_list],
+    ):
+        try:
+            proc = runner(cmd)
+        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+            return None
+        if proc.returncode != 0:
+            return None  # cannot determine worktree state ⇒ fail open
+        diff_only = cmd[1] == "diff"
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if diff_only:
+                path = _normalise_repo_path(stripped)
+            else:
+                # Pass the RAW line: the leading status column is significant
+                # (a leading space is part of git's two-char status code).
+                path = _parse_porcelain_path(line)
+            if path and path in worktree:
+                worktree[path].append(stripped)
+
+    states: dict[str, dict] = {}
+    for path in path_list:
+        head_state = ""
+        try:
+            proc = runner(["git", "rev-parse", f"HEAD:{path}"])
+        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+            return None
+        if proc.returncode == 0 and proc.stdout.strip():
+            head_state = proc.stdout.strip()
+        else:
+            # Not present at HEAD (deleted / untracked): fall back to the
+            # latest commit that touched the path (empty when never committed).
+            try:
+                proc = runner(["git", "log", "-1", "--format=%H", "--", path])
+            except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+                return None
+            if proc.returncode != 0:
+                return None
+            head_state = proc.stdout.strip()
+        states[path] = {
+            "head": head_state,
+            "worktree": "\n".join(sorted(set(worktree.get(path, [])))),
+        }
+    return states
+
+
+def _compute_content_fingerprint(runner: Runner, issue_id: str,
+                                 worklog_dir: str | None = None,
+                                 work_item: dict | None = None,
+                                 comments: Sequence[dict] | None = None,
+                                 ) -> str | None:
+    """Compute the content fingerprint for a work item at the current state.
+
+    The fingerprint is taken over the work item's OWN scope — the files it
+    touched — instead of the whole repository, so an unrelated commit or an
+    unrelated working-tree change no longer invalidates a still-valid stored
+    audit (SA-0MSPZDALB000S18P). It combines (a change in ANY invalidates):
+
+    1. **per-touched-path state** — each touched path's committed state (blob
+       hash at HEAD, else latest touching commit) plus its narrowed
+       working-tree state (``_compute_path_fingerprints``), so a committed OR
+       uncommitted change to a touched file invalidates freshness;
+    2. **work-item description hash** — the audited acceptance-criteria text;
+    3. **Key Files list** — the file-scope manifest of the audited item.
+
+    The touched-file set is resolved by ``_resolve_touched_files`` (commits
+    referencing the item id + comment-recorded commit hashes + Key Files).
+
+    Tool-generated artefacts (e.g. Unity ``ProjectSettings/**`` or ``*.meta``
+    churn from batch runs) are **always invalidating** when they fall inside
+    the touched-file set: no ignore-list is applied, so a rewrite of a touched
+    artefact is treated as a genuine change (the safe direction — stale ⇒
+    re-run). See ``docs/dev/audit-skill-reference.md``.
+
+    *work_item* / *comments* may be passed in to avoid a redundant ``wl show``
+    call when the caller already fetched the item (SA-0MSL1Z7E9005TLBA). Both
+    must be supplied consistently at audit time and check time so the resolved
+    touched-file set is stable (see ``_resolve_touched_files``).
+
+    Returns a sha256 hex digest of the canonical JSON payload, or ``None``
+    when the fingerprint cannot be determined (touched set unresolved, git
+    unavailable, wl show failure, or missing data) so callers fail open and
+    re-run the pipeline.
+    """
+    if work_item is None:
+        try:
+            data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                           worklog_dir=worklog_dir)
+        except Exception:  # noqa: BLE001 -- fail open on any wl/runner failure
             return None
         work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
     description = work_item.get("description", "") or ""
     key_files = _extract_key_files(description)
+    touched = _resolve_touched_files(
+        runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+        comments=comments,
+    )
+    if touched is None:
+        return None
+    path_states = _compute_path_fingerprints(runner, touched)
+    if path_states is None:
+        return None
     payload = json.dumps({
-        "head_sha": head_sha,
+        "path_states": path_states,
         "description_hash": hashlib.sha256(description.encode("utf-8")).hexdigest(),
         "key_files": key_files,
-        "working_tree_hash": _resolve_working_tree_hash(runner),
     }, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _resolve_working_tree_hash(runner: Runner) -> str:
-    """Hash the working-tree state for the fingerprint (SA-0MSL1YXG7004F2BZ).
-
-    Combines ``git status --porcelain`` (untracked + unstaged changes) with
-    ``git diff --name-only HEAD`` (staged changes) into a deterministic
-    sorted payload, hashed with sha256. Returns a fixed empty-string marker
-    when git is unavailable so the fingerprint still works fail-open.
-    """
-    lines: list[str] = []
-    for cmd in (["git", "status", "--porcelain"], ["git", "diff", "--name-only", "HEAD"]):
-        try:
-            proc = runner(cmd)
-        except Exception:  # noqa: S112, BLE001 -- git is best-effort; swallow to stay fail-open
-            continue
-        if proc.returncode == 0:
-            for line in proc.stdout.splitlines():
-                line = line.strip()
-                if line:
-                    lines.append(line)
-    if not lines:
-        return ""
-    payload = "\n".join(sorted(set(lines)))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -2239,6 +2743,15 @@ def _run_tests_via_test_skill(
                 force=True,  # execute fresh; refresh the cache entry
                 ttl=DEFAULT_TTL_SECONDS,
                 timeout=timeout,
+                # Route the audit's automatic suite execution through the test
+                # skill's host-wide "test" semaphore (SA-0MUJK94QN0015925):
+                # wrap the default runner so only a real execution (cache miss
+                # / --force) acquires a slot, while a read-only cache hit never
+                # does. This bounds nested/concurrent audit-triggered runs by
+                # the same TEST_MAX_CONCURRENCY / TEST_LOCK_TIMEOUT ceiling as
+                # run_tests.py (SA-0MTG5U75A001F1RG). A saturated host raises
+                # TestConcurrencyTimeout, surfaced below as a fail-open notice.
+                runner=paced_runner(),
             )
         except FileNotFoundError as exc:
             notice = f"command not found: {exc.filename}"
@@ -3431,6 +3944,9 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     # timing utility (SA-0MT319YGQ002E801 AC2 — extends, does not remove).
     _call_timer = SharedTimer("pi_call")
     _call_timer.start()
+    # The pi subprocess (and any test suite it later runs) must not inherit a
+    # leaked repository-override variable (F3, SA-0MUIA3OE40001QJX).
+    pi_env = scrub_repository_overrides(os.environ)
     while True:
         attempt += 1
         try:
@@ -3448,6 +3964,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                         stderr=subprocess.PIPE,
                         text=True,
                         bufsize=1,
+                        env=pi_env,
                     )
                 except FileNotFoundError:
                     raise RuntimeError(f"pi binary not found: {pi_bin}")
@@ -3512,6 +4029,18 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
 
     elapsed_seconds = _call_timer.elapsed
 
+    # Provider-error retry provenance (SA-0MU32TFKB0012ALC): how many attempts
+    # this call made. ``_provider_error_retried`` is True when at least one
+    # retry followed a provider error — including when the retry then
+    # succeeded — so reports can distinguish a flaky provider from a
+    # schema-contract failure.
+    retry_meta: dict = {}
+    if attempt > 1:
+        retry_meta = {
+            "_provider_error_attempts": attempt,
+            "_provider_error_retried": True,
+        }
+
     if provider_error:
         if ac_fallback_used is not None:
             ac_fallback_used.set()
@@ -3523,17 +4052,19 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             "extracted_text": "",
             "_provider_error": True,
             "_provider_error_message": provider_error,
+            "_provider_error_attempts": attempt,
+            "_provider_error_retried": attempt > 1,
             "elapsed_seconds": elapsed_seconds,
         }
 
     raw = stdout or ""
     if not raw:
-        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
+        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds, **retry_meta}
 
     # Parse JSON lines looking for the final agent_end message
     text = extract_pi_text(raw)
     if not text:
-        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
+        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds, **retry_meta}
 
     # Input-token capture (AC2 of SA-0MSISKM8F004NW1U): the pi JSON stream's
     # agent_end message carries the provider usage block, so each call's
@@ -3554,12 +4085,13 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 "extracted_text": text,
                 "elapsed_seconds": elapsed_seconds,
                 "input_tokens": input_tokens,
+                **retry_meta,
             }
     except json.JSONDecodeError:
         pass
 
     # If Pi returned free-form text, use it as evidence and default to met
-    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds, "input_tokens": input_tokens}
+    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds, "input_tokens": input_tokens, **retry_meta}
 
 
 def _extract_input_tokens(raw: str) -> int | None:
@@ -3702,6 +4234,71 @@ def _extract_json_array(text: str) -> list | None:
                     continue
 
     return None
+
+
+#: Firm instruction prefix for the single bounded JSON re-ask
+#: (SA-0MU32TCFM003B78I AC3). The re-ask is observable as context
+#: ``verdict_reask`` so it can be counted independently of the first call.
+_JSON_REASK_PREFIX = (
+    "[READ-ONLY AUDIT] [JSON RE-ASK] Do NOT close, modify, create, or delete "
+    "any work items. Do NOT execute any wl, git, or other state-modifying "
+    "commands. Return ONLY a single valid JSON array — no prose, no Markdown "
+    "code fences, and no commentary before or after the array. "
+)
+_JSON_REASK_SCHEMA = (
+    "Each element MUST be an object with keys 'index' (integer), 'verdict' "
+    "(one of met, unmet, partial, adjusted) and 'evidence' (a one-line note "
+    "with a file:line reference)."
+)
+
+
+def _reask_json_array_once(
+    issue_id: str,
+    model: str,
+    pi_bin: str,
+    debug_log: str | None,
+    timeout: int | None,
+    instruction: str,
+    priority: int | None = None,
+) -> list | None:
+    """Issue exactly one bounded 'return only the JSON array' re-ask.
+
+    Called at a Phase 1/2 parse site when the first response could not be
+    parsed into an index-bearing verdict array. The re-ask is observable
+    under the ``verdict_reask`` context and bounded by the per-call budget.
+    Returns the recovered batch, or ``None`` when the single re-ask also
+    fails (timeout, provider error, or unparseable output) — the caller then
+    falls back to the conservative ``partial`` verdict, never ``met``
+    (SA-0MU32TCFM003B78I AC3/AC5).
+    """
+    prompt = _JSON_REASK_PREFIX + _JSON_REASK_SCHEMA + "\n\n" + instruction
+    try:
+        result = _call_pi_and_maybe_log(
+            issue_id, "verdict_reask", prompt,
+            model=model, pi_bin=pi_bin, debug_log=debug_log,
+            timeout=timeout, json_expected=True,
+            priority=priority if priority is not None else Priority.MEDIUM,
+        )
+    except RuntimeError:
+        return None
+    if result.get("_timeout") or result.get("_provider_error"):
+        return None
+    raw = (
+        result.get("extracted_text", "")
+        or result.get("evidence", "")
+        or result.get("text", "")
+    )
+    batch = _extract_json_array(raw)
+    if batch is None:
+        try:
+            batch = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(batch, list) or not batch:
+        return None
+    if not any(isinstance(item, dict) and "index" in item for item in batch):
+        return None
+    return batch
 
 
 _CHECKBOX_MARKER_RE = re.compile(r"^\[[ xX~-]\]\s*")
@@ -3970,12 +4567,21 @@ def _git_changed_files(runner: Runner) -> list[str]:
     root = Path(TARGET_PROJECT_ROOT).resolve()
     existing: list[str] = []
     for path in changed:
-        p = Path(path)
-        if p.is_absolute():
-            if p.exists():
+        # The ghost-path stat is best-effort: a pathological entry (e.g. a
+        # path component longer than NAME_MAX, an unreadable link, or a
+        # non-path payload returned by a mocked runner) raises OSError from
+        # ``Path.exists()``. Skip such entries rather than letting the
+        # manifest build abort (SA-0MUERWHED002FNQ4 regression: 13 audit
+        # tests failed with "File name too long").
+        try:
+            p = Path(path)
+            if p.is_absolute():
+                if p.exists():
+                    existing.append(path)
+            elif (root / p).exists() or Path(path).exists():
                 existing.append(path)
-        elif (root / p).exists() or Path(path).exists():
-            existing.append(path)
+        except OSError:
+            continue
     return existing[:_FILE_SCOPE_MAX_FILES]
 
 
@@ -4107,6 +4713,76 @@ def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
 _MISSING = object()
 
 
+#: Evidence substring marking an AC whose in-main-slot child screen has not
+#: yet been executed by the invoking session (SA-0MT2XRGEU0009QRE).
+MAIN_SLOT_PENDING_EVIDENCE = "main-session review"
+#: Suffix of the resumable pending-screens signal file (SA-0MU32TE120012T49).
+PENDING_SCREENS_SIGNAL_SUFFIX = ".pending-screens.json"
+
+
+def _pending_main_slot_child_ids(child_results: list[dict]) -> list[str]:
+    """Return ids of children whose ACs are pending in-main-slot review.
+
+    In-main-slot mode marks each unexecuted child AC ``partial`` with
+    evidence containing :data:`MAIN_SLOT_PENDING_EVIDENCE`. This is the
+    single detection point used to surface the explicit child-audit gate
+    and to write the resumable pending-screens signal
+    (SA-0MU32TE120012T49).
+    """
+    pending: list[str] = []
+    for child in child_results or []:
+        cid = str(child.get("id", "") or "")
+        acs = child.get("ac_results") or []
+        if not cid or not acs:
+            continue
+        if any(
+            a.get("verdict") == VERDICT_PARTIAL
+            and MAIN_SLOT_PENDING_EVIDENCE in str(a.get("evidence", ""))
+            for a in acs
+        ):
+            pending.append(cid)
+    return pending
+
+
+def _write_pending_screens_signal(
+    pending_ids: list[str],
+    issue_id: str,
+    owning_root: str | Path | None,
+    explicit_dir: str | None = None,
+) -> None:
+    """Persist or clear the resumable in-main-slot pending-screens signal.
+
+    Writes ``<issue_id>.pending-screens.json`` listing the child ids whose
+    main-slot screens remain and removes it when none remain, so a
+    subsequent run can complete exactly those children without a full
+    re-audit (SA-0MU32TE120012T49 AC3). Best-effort: a failure never breaks
+    the audit.
+    """
+    directory = resolve_checkpoint_dir(owning_root, explicit_dir)
+    if directory is None:
+        return
+    signal = Path(directory) / f"{issue_id}{PENDING_SCREENS_SIGNAL_SUFFIX}"
+    try:
+        if not pending_ids:
+            signal.unlink(missing_ok=True)
+            return
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        payload = {
+            "issue_id": issue_id,
+            "pending_child_screens": list(pending_ids),
+            "instructions": (
+                "Perform each emitted [AUDIT_IN_MAIN_SLOT_WORK] child screen, "
+                "persist the child audit, then re-run the parent audit; the "
+                "signal is cleared automatically when no screens remain."
+            ),
+        }
+        tmp = signal.with_name(signal.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(signal)
+    except OSError:
+        pass
+
+
 def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            child_results: list[dict],
                            code_quality_findings: list[dict] | None = None,
@@ -4169,8 +4845,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       line is emitted near the header so the report records the evidence
       source distinctly from the cache-consumption path.
 
-    *content_fingerprint* is the content fingerprint (git HEAD sha +
-      description hash + Key Files, see ``_compute_content_fingerprint``)
+    *content_fingerprint* is the content fingerprint (per-touched-file state
+      + description hash + Key Files, see ``_compute_content_fingerprint``)
       captured at audit time. When provided, an
       ``Audit content fingerprint: <hex>`` line is emitted near the header so
       the persisted report carries the freshness gate data
@@ -4243,6 +4919,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         ready = ready_before_cq
 
+    # Explicit child-audit execution gate (SA-0MU32TE120012T49): in-main-slot
+    # pending child screens are never presented as a normal result. The gate
+    # names the child ids and how to complete them, and forces Ready=No.
+    pending_child_screens = _pending_main_slot_child_ids(child_results)
+    gate_lines: list[str] = []
+    if pending_child_screens:
+        ready = "No"
+        gate_lines = [
+            "",
+            f"Child screens pending: {len(pending_child_screens)} (main-slot) — "
+            + ", ".join(pending_child_screens)
+            + ". Perform each emitted [AUDIT_IN_MAIN_SLOT_WORK] screen, persist "
+            "the child audit, then re-run the parent to collect the verdicts.",
+        ]
+
     # Build model line (only when model/model_source was explicitly provided)
     issue_id_label = issue.get("id", "") or "unknown"
     if model is not _MISSING:
@@ -4254,6 +4945,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             model_line = f"Model: {effective_model} (no provider)"
         lines = [
             f"Ready to close: {ready}",
+            *gate_lines,
             "",
             f"Audit report for work item {issue_id_label}",
             "",
@@ -4281,6 +4973,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         lines = [
             f"Ready to close: {ready}",
+            *gate_lines,
             "",
             f"Audit report for work item {issue_id_label}",
         ]
@@ -4310,6 +5003,15 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     adjusted_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_ADJUSTED)
     unmet_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_UNMET)
     partial_count = sum(1 for r in ac_results if r["verdict"] == VERDICT_PARTIAL)
+    # Provider errors are reported distinctly from parse failures
+    # (SA-0MU32TFKB0012ALC AC1/AC2).
+    _provider_error_count = sum(
+        1 for r in (
+            ac_results
+            + [c for cr in child_results for c in cr.get("ac_results", [])]
+        )
+        if "Pi provider error" in _evidence_text(r.get("evidence"))
+    )
 
     not_reviewed = [
         c for c in child_results
@@ -4337,7 +5039,17 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 parts.append(" Deep code analysis (Phase 2) completed and confirmed all verdicts.")
             lines.append(" ".join(parts))
     else:
-        if not phase2_completed and any(
+        if pending_child_screens:
+            lines.append(
+                f"Child-audit execution gate: {len(pending_child_screens)} child "
+                "screen(s) pending main-slot review ("
+                + ", ".join(pending_child_screens)
+                + "). Ready to close is blocked until each emitted "
+                "[AUDIT_IN_MAIN_SLOT_WORK] screen is performed and its child "
+                "audit persisted, then the parent is re-run. See the child-audit "
+                "execution contract in the audit reference."
+            )
+        elif not phase2_completed and any(
             r["verdict"] == VERDICT_PARTIAL
             and "pending deep code review" in _evidence_text(r.get("evidence"))
             for r in ac_results
@@ -4366,6 +5078,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"{len(not_reviewed)} children not yet in in_review/done stage."
             )
+
+    if _provider_error_count:
+        lines.append(
+            f"Provider errors: {_provider_error_count} acceptance criteria "
+            "could not be evaluated because the Pi provider returned an error "
+            "(distinct from a JSON parse failure); see the affected evidence."
+        )
 
     lines.append("")
     lines.append("## Acceptance Criteria Status")
@@ -4617,8 +5336,8 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict],
       no model line is emitted. When ``None`` or empty, the fallback
       ``Model: manual (no provider)`` is used.
     *model_source* is the source of the model (``"local"`` or ``"remote"``).
-    *content_fingerprint* is the content fingerprint (git HEAD sha +
-      description hash + Key Files, see ``_compute_content_fingerprint``)
+    *content_fingerprint* is the content fingerprint (per-touched-file state
+      + description hash + Key Files, see ``_compute_content_fingerprint``)
       captured at audit time. When provided, an
       ``Audit content fingerprint: <hex>`` line is emitted near the header so
       the persisted child report stays content-gate-able on future parent
@@ -4835,6 +5554,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            ac_fallback_used: threading.Event | None = None,
                            child_screen: bool = False,
                            ac_count: int | None = None,
+                           json_expected: bool = False,
                            priority: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
@@ -4862,6 +5582,13 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             timing line also appends ``model=<model>`` so the serving model
             is observable per call (tiered Phase 1 fast vs Phase 2 full,
             SA-0MSKB697P000T3HG).
+        json_expected: When True, the caller expects a JSON array from this
+            call; the debug entry's ``parse_ok`` field records whether the
+            production extractor found one, and ``reason`` is
+            ``parse_failure`` only when it did not. When False (default) the
+            reason is the neutral ``call_trace`` and ``parse_ok`` is None,
+            because presence of ``raw_stdout`` alone says nothing about the
+            parse outcome (SA-0MU32TAMB007HI99).
 
         # Context reduction: every forwarded pi call runs with
         ``--no-context-files --no-skills`` (see _call_pi) so audit sessions
@@ -4870,8 +5597,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     If *debug_log* is provided the entry reason will be "debug_log" and the
     provided path will be used. If *debug_log* is not provided but the pi
     result contains diagnostic fields (``raw_stdout``/``raw_stderr``), a
-    default path from ``_default_debug_log_path`` will be used and the reason
-    will be "parse_failure".
+    default path from ``_default_debug_log_path`` will be used. The reason is
+    a neutral ``call_trace`` for calls that returned, ``provider_error`` for
+    provider failures, and ``parse_failure`` only when ``json_expected`` was
+    set and the output could not be parsed (SA-0MU32TAMB007HI99).
     """
     result = _call_pi(
         prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools,
@@ -4910,14 +5639,49 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         timing += f" model={model}"
         print(timing, file=sys.stderr)
 
-    # Decide whether to write a debug line
+    # Decide whether to write a debug line.
+    #
+    # Taxonomy (SA-0MU32TAMB007HI99): this layer cannot know whether the
+    # call-site parse succeeded merely from the presence of ``raw_stdout``
+    # (which is set on *every* returned call). The default reason is therefore
+    # the neutral "call_trace"; "parse_failure" is recorded only when the
+    # caller declared that a JSON array was expected (``json_expected``) and
+    # the production extractor could not find one. ``parse_ok`` carries the
+    # explicit outcome (True/False) when a parse was attempted, else None.
+    parse_ok = None
+    if (json_expected and isinstance(result, dict)
+            and not result.get("_provider_error")):
+        text = (
+            result.get("extracted_text")
+            or extract_pi_text(result.get("raw_stdout") or "")
+        )
+        parse_ok = _extract_json_array(text) is not None
+
+    # Per-run reliability counters (SA-0MU32TH89000YHP9, R7). Counted for every
+    # call so the summary reflects the whole run, not only debug-logged calls.
+    _rel_incr("calls")
+    if isinstance(result, dict):
+        if result.get("_timeout"):
+            _rel_incr("timeouts")
+        if result.get("_concurrency_timeout"):
+            _rel_incr("concurrency_waits")
+        if result.get("_provider_error"):
+            _rel_incr("provider_errors")
+        elif json_expected and parse_ok is not None:
+            _rel_incr("parse_ok" if parse_ok else "parse_failed")
+
     reason = None
     target = None
     if debug_log:
         reason = "debug_log"
         target = Path(debug_log)
     elif isinstance(result, dict) and (result.get("raw_stdout") or result.get("raw_stderr")):
-        reason = "provider_error" if result.get("_provider_error") else "parse_failure"
+        if result.get("_provider_error"):
+            reason = "provider_error"
+        elif json_expected:
+            reason = "call_trace" if parse_ok else "parse_failure"
+        else:
+            reason = "call_trace"
         target = _default_debug_log_path(issue_id, context)
 
     if reason and target:
@@ -4925,11 +5689,14 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             "issue_id": issue_id,
             "context": context,
             "reason": reason,
+            "parse_ok": parse_ok,
             "raw_stdout": result.get("raw_stdout"),
             "raw_stderr": result.get("raw_stderr"),
             "extracted_text": result.get("extracted_text"),
             "evidence": result.get("evidence"),
             "provider_error": result.get("_provider_error_message"),
+            "provider_error_attempts": result.get("_provider_error_attempts"),
+            "provider_error_retried": result.get("_provider_error_retried"),
             "elapsed_seconds": result.get("elapsed_seconds"),
             "input_tokens": result.get("input_tokens"),
             "prompt": prompt[:1000],
@@ -4982,10 +5749,11 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
     Freshness (LP-0MSQ32MF200675AR) uses the CONTENT-fingerprint gate
     FIRST — same logic as the item-level gate (_check_audit_freshness,
     SA-0MSKB6US1009CNHT): when the stored report carries a content
-    fingerprint (git HEAD sha + description hash + Key Files captured at
-    audit time), the audit is fresh iff the fingerprint is unchanged, so a
-    child whose updatedAt moved for non-content reasons (comments, status
-    bumps) is reused instead of re-audited. The legacy TIME gate
+    fingerprint (the child's touched-file state + description hash + Key
+    Files captured at audit time, SA-0MSPZDALB000S18P), the audit is fresh
+    iff the fingerprint is unchanged, so a child whose updatedAt moved for
+    non-content reasons (comments, status bumps), or whose unrelated repo
+    files changed, is reused instead of re-audited. The legacy TIME gate
     (auditedAt vs updatedAt + AUDIT_FRESHNESS_BUFFER_SECONDS) is kept as
     the floor for fingerprint-less legacy reports. When *force* is set,
     BOTH gates are bypassed and every child is re-audited.
@@ -5367,6 +6135,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                         "child_id": child.get("id"),
                         "context": "child_ac_fallback",
                         "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
+                        "parse_ok": False if not result.get("_provider_error") else None,
                         "raw_text": raw_text,
                         "result_verdict": result.get("verdict"),
                         "result_evidence": result.get("evidence", "")[:500],
@@ -5648,9 +6417,22 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         cq_findings, fp_screen_results or []
     ))
 
-    ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq and not any_child_audit_not_ready
+    pending_child_screens = _pending_main_slot_child_ids(child_results)
+    ready = (
+        all_ac_acceptable
+        and all_children_reviewed
+        and not has_blocking_cq
+        and not any_child_audit_not_ready
+        and not pending_child_screens
+    )
 
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+    # Per-run provider-error count (SA-0MU32TFKB0012ALC AC2): distinguishes a
+    # flaky provider from a schema-contract failure; feeds the R7 summary.
+    provider_error_count = sum(
+        1 for r in all_criteria
+        if "Pi provider error" in _evidence_text(r.get("evidence"))
+    )
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
     adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
 
@@ -5674,6 +6456,8 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
 
     return {
         "ready_to_close": ready,
+        "pending_child_screens": pending_child_screens,
+        "provider_error_count": provider_error_count,
         "summary": summary,
         "acceptance_criteria": ac_results,
         "children": child_results,
@@ -5796,6 +6580,7 @@ def _deep_analyze_child(
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
             ac_count=len(child_acs),
+            json_expected=True,
             priority=_resolve_audit_priority(child),
         )
     except RuntimeError:
@@ -5864,6 +6649,15 @@ def _deep_analyze_child(
         except json.JSONDecodeError:
             child_batch = []
             child_parse_failed = True
+    if child_parse_failed:
+        # Bounded JSON re-ask (SA-0MU32TCFM003B78I AC3).
+        reasked = _reask_json_array_once(
+            child.get("id", ""), resolved_model, pi_bin, debug_log, timeout,
+            child_prompt, priority=_resolve_audit_priority(child),
+        )
+        if reasked:
+            child_batch = reasked
+            child_parse_failed = False
 
     updated_child_acs = list(child_acs)
     if isinstance(child_batch, list):
@@ -6067,6 +6861,7 @@ def _run_batch_phase2(
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
             ac_count=len(ac_list),
+            json_expected=True,
             priority=_resolve_audit_priority(issue),
         )
     except RuntimeError:
@@ -6329,6 +7124,7 @@ def _run_phase2_deep_analysis(
                 max_retries=_PHASE2_MAX_RETRIES,
                 ac_fallback_used=ac_fallback_used,
                 ac_count=len(ac_results),
+                json_expected=True,
                 priority=_resolve_audit_priority(issue),
             )
         except RuntimeError as exc:
@@ -6435,6 +7231,15 @@ def _run_phase2_deep_analysis(
             except json.JSONDecodeError:
                 batch = []
                 batch_parse_failed = True
+        if batch_parse_failed:
+            # Bounded JSON re-ask (SA-0MU32TCFM003B78I AC3).
+            reasked = _reask_json_array_once(
+                issue.get("id", ""), resolved_model, pi_bin, debug_log,
+                timeout, prompt, priority=_resolve_audit_priority(issue),
+            )
+            if reasked:
+                batch = reasked
+                batch_parse_failed = False
 
         updated_ac = list(ac_results)
         if isinstance(batch, list):
@@ -6610,6 +7415,7 @@ def _reask_verdict_array_once(
             issue.get("id", ""), "verdict_reask", prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             timeout=timeout,
+            json_expected=True,
             priority=_resolve_audit_priority(issue),
         )
     except RuntimeError:
@@ -6718,6 +7524,10 @@ class _AuditContext:
     # checkpointing is disabled (--no-checkpoint, unresolvable HEAD, or a
     # store failure) — behavior is then byte-identical to a pre-change run.
     checkpoint: CheckpointStore | None = None
+    # Resolved checkpoint directory (set by _open_checkpoint_store); used to
+    # persist the resumable in-main-slot pending-screens signal
+    # (SA-0MU32TE120012T49). None when checkpointing is disabled.
+    checkpoint_dir: str | None = None
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
@@ -7628,15 +8438,30 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             # --no-execute / AUDIT_NO_EXECUTE=1 opts out and proceeds
             # fail-open partial (no execution, no block). --run-tests is the
             # explicit override that executes on ANY non-green state.
-            head_sha = _resolve_audited_head(runner)
-            test_run = _run_tests_via_test_skill(
-                cwd=TARGET_PROJECT_ROOT,
-                parent_work_item_id=issue_id,
-                head_sha=head_sha,
-            )
-            if test_run["success"] and head_sha is not None:
-                green_run_block = _test_skill_run_prompt_block(head_sha)
-                test_skill_run_sha = head_sha
+            #
+            # Recursion guard (SA-0MUG47DYG006TV40): when an outer test-suite
+            # run owns the checkout (LIVE_REPO_GUARD_ACTIVE set), the F3
+            # auto-execution stands down to prevent unbounded cascade.
+            # A nested audit cannot itself re-enter the full suite; it
+            # proceeds fail-open partial instead.
+            if _suite_run_in_progress() and not run_tests:
+                print(
+                    "Audit F3 auto-execution stand-down: a test-suite run "
+                    "already owns the checkout (LIVE_REPO_GUARD_ACTIVE set). "
+                    "Proceeding with execution-dependent ACs partial to "
+                    "prevent unbounded cascade (SA-0MUG47DYG006TV40).",
+                    file=sys.stderr,
+                )
+            else:
+                head_sha = _resolve_audited_head(runner)
+                test_run = _run_tests_via_test_skill(
+                    cwd=TARGET_PROJECT_ROOT,
+                    parent_work_item_id=issue_id,
+                    head_sha=head_sha,
+                )
+                if test_run["success"] and head_sha is not None:
+                    green_run_block = _test_skill_run_prompt_block(head_sha)
+                    test_skill_run_sha = head_sha
 
     # ------------------------------------------------------------------
     # Capture original status + stage before the freshness gate / status
@@ -7649,6 +8474,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     original_status = "open"  # safe default
     original_stage = ""       # safe default (unknown)
     wi: dict | None = None
+    wi_comments: list = []
     try:
         item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                             worklog_dir=worklog_dir)
@@ -7658,6 +8484,10 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             wi = item_data.get("workItem")
             if not isinstance(wi, dict):
                 wi = item_data
+            # Comments live beside ``workItem`` at the top level; they carry
+            # the commit hashes the implement skill recorded, which feed the
+            # touched-file fingerprint (SA-0MSPZDALB000S18P).
+            wi_comments = item_data.get("comments", []) or []
             original_status = wi.get("status", "open")
             original_stage = wi.get("stage", "")
     except RuntimeError:
@@ -7670,7 +8500,8 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     if not force:
         fresh_report = _check_audit_freshness(runner, issue_id,
                                               worklog_dir=worklog_dir,
-                                              work_item=wi)
+                                              work_item=wi,
+                                              comments=wi_comments)
         if fresh_report is not None:
             # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
             # the fresh audit so a redundant re-audit is stopped before the
@@ -7984,6 +8815,7 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
                 issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
                 pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
                 ac_fallback_used=ac_fallback_used, child_screen=True,
+                json_expected=True,
                 priority=priority,
             )
         except RuntimeError as exc:
@@ -8237,6 +9069,7 @@ def _run_remediation_loop(
     worklog_dir: str | None,
     work_item: dict,
     content_fingerprint: str | None,
+    comments: Sequence[dict] | None = None,
 ) -> dict:
     """Confident-false-positive config remediation loop (F2 scope).
 
@@ -8332,6 +9165,7 @@ def _run_remediation_loop(
             })
         new_fp = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+            comments=comments,
         )
         results["commits"].append({
             "sha": sha,
@@ -8500,14 +9334,18 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     if merge_gate_rc is not None:
         return None
 
-    # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT):
-    # git HEAD sha + work-item description hash + Key Files list. The
-    # fingerprint is embedded in the persisted report so a re-audit of an
-    # unchanged item skips the pipeline (content-based freshness gate).
-    # Fail-open: if the fingerprint cannot be computed (git unavailable,
-    # wl failure), the audit proceeds and simply stores no fingerprint.
+    # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT,
+    # SA-0MSPZDALB000S18P): per-touched-file state + work-item description
+    # hash + Key Files list. The fingerprint is embedded in the persisted
+    # report so a re-audit of an unchanged item skips the pipeline
+    # (content-based freshness gate), while unrelated commits / working-tree
+    # changes elsewhere no longer invalidate it.
+    # Fail-open: if the fingerprint cannot be computed (touched set
+    # unresolved, git unavailable, wl failure), the audit proceeds and
+    # simply stores no fingerprint.
     content_fingerprint = _compute_content_fingerprint(
         runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+        comments=ctx.comments,
     )
 
     # ------------------------------------------------------------------
@@ -8599,6 +9437,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         worklog_dir=worklog_dir,
         work_item=work_item,
         content_fingerprint=content_fingerprint,
+        comments=ctx.comments,
     )
     cq_findings = remediation_results.get("cq_findings", cq_findings)
     fp_screen_results = remediation_results.get(
@@ -8654,6 +9493,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
             issue_id, context, prompt, model=model, pi_bin=pi_bin,
             debug_log=debug_log, enable_tools=enable_tools, timeout=timeout,
             ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+            json_expected=True,
             priority=effective_priority,
         )
     except RuntimeError as exc:
@@ -8672,6 +9512,15 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
         isinstance(item, dict) and "index" in item for item in batch
     ):
         return result, batch, raw_text
+    # Bounded JSON re-ask (SA-0MU32TCFM003B78I AC3): exactly one
+    # "return only the JSON array" retry before the caller falls back to the
+    # conservative 'partial' verdict.
+    reasked = _reask_json_array_once(
+        issue_id, model, pi_bin, debug_log, timeout, prompt,
+        priority=effective_priority,
+    )
+    if reasked:
+        return result, reasked, raw_text
     return result, [], raw_text
 
 
@@ -8717,6 +9566,7 @@ def _open_checkpoint_store(ctx: _AuditContext,
         cp_dir = resolve_checkpoint_dir(ctx.owning_root, checkpoint_dir)
         if cp_dir is None:
             return None
+        ctx.checkpoint_dir = str(cp_dir)
         git_head = _resolve_git_head_sha(ctx.runner)
         if git_head is None:
             print(
@@ -8824,6 +9674,9 @@ def _budget_exceeded_ac_result(elapsed_s: float, budget_s: float) -> dict:
     }
 
 
+#: Reliability counters are incremented below; keep this near the helper.
+
+
 def _record_child_budget_exceeded(
     checkpoint: CheckpointStore | None,
     child_id: str,
@@ -8837,6 +9690,7 @@ def _record_child_budget_exceeded(
     killed after the guard fires still leaves a resumable record
     (SA-0MU32T6O0001UALR AC2/AC3).
     """
+    _rel_incr("child_skips")
     if checkpoint is None:
         return
     checkpoint.mark_child_budget_exceeded(child_id, elapsed_s, budget_s)
@@ -9119,6 +9973,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                         "issue_id": issue_id,
                         "context": "parent_ac_fallback",
                         "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
+                        "parse_ok": False if not result.get("_provider_error") else None,
                         "raw_text": raw_text,
                         "result_verdict": result.get("verdict"),
                         "result_evidence": result.get("evidence", "")[:500],
@@ -9581,6 +10436,11 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     )
                                     if child_flags:
                                         audit_cmd.extend(child_flags)
+                                    # Propagate the LIVE_REPO_GUARD_ACTIVE marker so
+                                    # child audits inherit the recursion guard and
+                                    # cannot cascade further (SA-0MUG47DYG006TV40).
+                                    child_env = dict(os.environ)
+                                    child_env[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
                                     effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
                                     subprocess.run(
                                         audit_cmd,
@@ -9588,6 +10448,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                         capture_output=True,
                                         text=True,
                                         timeout=effective_timeout,
+                                        env=child_env,
                                     )
                                     # Re-check verdict after triggered audit
                                     verdict, reason, _audited_at = _get_child_audit_verdict(
@@ -10167,6 +11028,23 @@ def _phase_report(ctx: _AuditContext) -> int:
 
         report = _assemble_report()
 
+        # Per-run reliability summary (R7 AC1): emit exactly one stable,
+        # machine-greppable line to stderr and append it to the report so it
+        # is persisted with the audit.
+        reliability_summary = emit_reliability_summary()
+        if reliability_summary:
+            report = report + "\n" + reliability_summary + "\n"
+
+        # Persist the resumable in-main-slot pending-screens signal so a
+        # later run completes exactly the outstanding child screens without a
+        # full re-audit (SA-0MU32TE120012T49 AC3). Skipped when checkpointing
+        # is disabled (--no-checkpoint / no resolvable HEAD).
+        if ctx.checkpoint is not None and ctx.checkpoint_dir:
+            _write_pending_screens_signal(
+                _pending_main_slot_child_ids(child_results),
+                issue_id, ctx.owning_root, ctx.checkpoint_dir,
+            )
+
         # Capture the audit verdict for the status lifecycle transition.
         # The finally block only trusts this verdict when the audit pipeline
         # completed successfully (no script failures).
@@ -10455,6 +11333,11 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # restore_cmd so a verification failure can report the exact expectation.
     expected_status: str | None = None
     expected_stage: str | None = None
+    # Dry-run freshness refresh marker (SA-0MTJ0KO6L004GIZK): set only on a
+    # genuine 'Ready to close: Yes' advance when --do-not-persist was given.
+    # Applied after the transition is verified so the atomic
+    # ``updatedAt = auditedAt`` write is the item's last timestamp change.
+    dry_run_freshness_refresh = False
     # Conservative default: on any computation failure below, treat the
     # run as fallback-tainted so the debug log is retained for forensics.
     fallback_tainted = True
@@ -10540,6 +11423,10 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             expected_status, expected_stage = "completed", (
                 "done" if ctx.original_stage == "done" else "in_review"
             )
+            # Dry-run (--do-not-persist) does not store the full report, but
+            # a passing verdict must still refresh the audit freshness signal
+            # (SA-0MTJ0KO6L004GIZK). Apply it after the verified transition.
+            dry_run_freshness_refresh = not ctx.persist
         else:  # ctx.audit_verdict == "no"
             # Return to the actionable queue at a fixed pre-review stage.
             restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
@@ -10623,7 +11510,150 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         )
         _restore_pre_audit_state_on_failure(ctx)
         return 1
+
+    # Dry-run freshness refresh (SA-0MTJ0KO6L004GIZK): as the LAST write of a
+    # passing --do-not-persist run, refresh ``auditedAt``/``auditResult`` via
+    # the atomic ``wl audit-set`` path (``updatedAt = auditedAt``) WITHOUT
+    # storing the full ``rawOutput`` markdown. Placed after the terminal
+    # transition so ``auditedAt == updatedAt`` holds and Herdr/downtime stop
+    # re-queuing the item as a stale-audit candidate. A non-Yes verdict never
+    # reaches here (fail-closed: a failed dry-run must not clear staleness).
+    if dry_run_freshness_refresh:
+        fresh_rc = persist_audit_freshness(
+            ctx.issue_id,
+            runner=ctx.runner,
+            worklog_dir=ctx.worklog_dir,
+            fingerprint=ctx.content_fingerprint,
+        )
+        if fresh_rc != 0:
+            print(
+                f"Error: Failed to refresh audit freshness for {ctx.issue_id} "
+                f"after a passing dry-run (exit code {fresh_rc}); the full "
+                "report was not stored and the item may still appear stale.",
+                file=sys.stderr,
+            )
+            return fresh_rc
+        print(
+            f"Dry-run audit for {ctx.issue_id}: freshness timestamp "
+            "refreshed (full report not stored).",
+            file=sys.stderr,
+        )
     return 0
+
+
+def _resolve_max_host_audits() -> int:
+    """Resolve the host-wide concurrent ``issue`` ceiling (F5).
+
+    Precedence: ``AUDIT_MAX_HOST_AUDITS`` env var > default 3. Values below 1
+    are clamped to 1; an invalid value is ignored with a warning so a
+    misconfigured environment cannot break the audit.
+    """
+    env_value = os.environ.get(AUDIT_MAX_HOST_AUDITS_ENV)
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_MAX_HOST_AUDITS_ENV} value "
+                f"{env_value!r}; using default {AUDIT_MAX_HOST_AUDITS_DEFAULT}",
+                file=sys.stderr,
+            )
+    return AUDIT_MAX_HOST_AUDITS_DEFAULT
+
+
+def _resolve_host_lock_timeout() -> float:
+    """Resolve the bounded wait for a host-wide audit ingress slot (F5)."""
+    env_value = os.environ.get(AUDIT_HOST_LOCK_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return max(0.0, float(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_HOST_LOCK_TIMEOUT_ENV} value "
+                f"{env_value!r}; using default {AUDIT_HOST_LOCK_TIMEOUT_DEFAULT}",
+                file=sys.stderr,
+            )
+    return AUDIT_HOST_LOCK_TIMEOUT_DEFAULT
+
+
+def _acquire_host_audit_slot() -> Semaphore:
+    """Acquire the process-wide host-wide audit ingress slot (F5).
+
+    Re-entrant within the process: a nested ``cmd_issue`` (batch drain, child
+    audit) returns the already-held slot instead of deadlocking on it. Raises
+    ``TimeoutError`` when the host ceiling is saturated and the bounded wait
+    elapses.
+    """
+    global _HOST_AUDIT_SLOT
+    if _HOST_AUDIT_SLOT is not None:
+        return _HOST_AUDIT_SLOT
+    sem = Semaphore(
+        AUDIT_HOST_SEMAPHORE_NAME,
+        max_workers=_resolve_max_host_audits(),
+        timeout=_resolve_host_lock_timeout(),
+    )
+    sem.acquire()
+    _HOST_AUDIT_SLOT = sem
+    return sem
+
+
+def _release_host_audit_slot() -> None:
+    """Release the process-wide host-wide audit ingress slot (idempotent)."""
+    global _HOST_AUDIT_SLOT
+    if _HOST_AUDIT_SLOT is None:
+        return
+    try:
+        _HOST_AUDIT_SLOT.release()
+    finally:
+        _HOST_AUDIT_SLOT = None
+
+
+def _find_orphaned_audit_processes(proc_root: str = "/proc") -> list[dict]:
+    """Return ``audit_runner.py issue`` processes orphaned to PID 1 (F5).
+
+    An orphan (``PPID 1``) audit is one whose launcher has exited and which
+    can no longer be reaped/attributed — the failure mode behind the
+    2026-09-26 fan-out. Read-only: scans ``proc_root`` for ``cmdline`` files
+    containing ``audit_runner.py`` and ``issue`` and reports those whose
+    ``stat`` PPID is 1. Returns a list of ``{pid, ppid, cmdline}`` dicts;
+    never raises (a missing/short-lived entry is skipped).
+    """
+    orphans: list[dict] = []
+    root = Path(proc_root)
+    if not root.is_dir():
+        return orphans
+    for entry in root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            # Format: pid (comm) state ppid ...  — comm may contain spaces.
+            rparen = stat.rfind(")")
+            ppid = int(stat[rparen + 2:].split()[1])
+            if ppid != 1:
+                continue
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(
+                "utf-8", errors="replace"
+            )
+        except (OSError, ValueError, IndexError):
+            continue
+        if "audit_runner.py" in cmdline and "issue" in cmdline:
+            orphans.append({"pid": int(entry.name), "ppid": ppid, "cmdline": cmdline.strip()})
+    return orphans
+
+
+def _warn_on_orphaned_audits() -> list[dict]:
+    """Log a warning when orphaned audit processes are detected (F5)."""
+    orphans = _find_orphaned_audit_processes()
+    if orphans:
+        pids = ", ".join(str(o["pid"]) for o in orphans)
+        print(
+            f"Warning: detected {len(orphans)} orphaned audit process(es) "
+            f"(PPID 1): {pids}. These may each be running the test suite; "
+            "investigate and reap them.",
+            file=sys.stderr,
+        )
+    return orphans
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
@@ -10763,6 +11793,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
     children are audited when it does). ``--audit-children`` forces the full
     per-child flow described above (explicit override).
     """
+
+    # Start a fresh per-run reliability counter set (R7 AC1).
+    _rel_reset()
 
     ctx = _AuditContext(
         issue_id=issue_id, persist=persist, timeout=timeout,
@@ -11330,7 +12363,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "mode off — SA-0MT2XRGEU0009QRE)"
                          ))
     p_issue.add_argument("--do-not-persist", action="store_true",
-                         help="Do not persist the audit report via wl update")
+                         help=(
+                             "Dry run: do NOT store the full audit report "
+                             "via wl update. On a 'Ready to close: Yes' verdict "
+                             "the audit freshness timestamp (auditedAt / "
+                             "auditResult) is still persisted so Herdr/DOWNTIME "
+                             "treat the item as freshly audited; a non-Yes "
+                             "verdict leaves auditedAt unchanged. Omit this "
+                             "flag to persist the full report"
+                         ))
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_issue.add_argument("--model", default=None,
                          help="Pi model to use for review (default: resolved from .ralph.json)")
@@ -11440,6 +12481,21 @@ def build_parser() -> argparse.ArgumentParser:
                              "Disable automatic batch drain for this run. "
                              "(SA-0MTG5TP5Z008QBL5)"
                          ))
+    p_issue.add_argument("--session-retention-days", type=int, default=None,
+                         help=(
+                             "Prune ``audit-*`` session files older than this "
+                             f"number of days after the audit completes "
+                             f"(default: {DEFAULT_SESSION_RETENTION_DAYS}; "
+                             f"override via env {ENV_SESSION_RETENTION_DAYS})"
+                         ))
+    p_issue.add_argument("--session-dir", default=None,
+                         help=(
+                             "Pi session directory to scan for audit sessions "
+                             "(default: ~/.pi/agent/sessions/ or the "
+                             f"{ENV_PI_SESSION_DIR} env var). Sets the env "
+                             "var for spawned pi subprocesses so they save "
+                             "there too"
+                         ))
 
     p_batch = sub.add_parser("batch", help="Batch-drain queued in_review audits")
     p_batch.add_argument("--max-items", type=int, default=None,
@@ -11455,7 +12511,15 @@ def build_parser() -> argparse.ArgumentParser:
                              f"{AUDIT_BATCH_TIMEOUT_DEFAULT}s)"
                          ))
     p_batch.add_argument("--do-not-persist", action="store_true",
-                         help="Do not persist drained audits via wl update")
+                         help=(
+                             "Dry run: do NOT store each drained audit's full "
+                             "report via wl update. Each 'Ready to close: Yes' "
+                             "item still gets its audit freshness timestamp "
+                             "(auditedAt / auditResult) persisted so "
+                             "Herdr/DOWNTIME treat it as freshly audited; "
+                             "non-Yes items are unchanged. Omit this flag to "
+                             "persist the full reports"
+                         ))
     p_batch.add_argument("--pi-bin", default="pi", help="Path to the pi binary")
     p_batch.add_argument("--model", default=None,
                          help="Pi model to use for review")
@@ -11509,6 +12573,21 @@ def build_parser() -> argparse.ArgumentParser:
                                f"(default: audit.max_citations_per_ac config key or "
                                f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
                            ))
+    p_project.add_argument("--session-retention-days", type=int, default=None,
+                           help=(
+                               "Prune ``audit-*`` session files older than this "
+                               f"number of days after the audit completes "
+                               f"(default: {DEFAULT_SESSION_RETENTION_DAYS}; "
+                               f"override via env {ENV_SESSION_RETENTION_DAYS})"
+                           ))
+    p_project.add_argument("--session-dir", default=None,
+                           help=(
+                               "Pi session directory to scan for audit sessions "
+                               "(default: ~/.pi/agent/sessions/ or the "
+                               f"{ENV_PI_SESSION_DIR} env var). Sets the env "
+                               "var for spawned pi subprocesses so they save "
+                               "there too"
+                           ))
 
     return p
 
@@ -11534,6 +12613,14 @@ def main(argv: list[str] | None = None) -> int:
     if child_screen_timeout is not None:
         os.environ[AUDIT_CHILD_SCREEN_TIMEOUT_ENV] = str(child_screen_timeout)
 
+    # CLI --session-dir overrides PI_CODING_AGENT_SESSION_DIR for this process
+    # (and, because the env var is inherited, for every spawned pi process).
+    # Cleanup scans the same directory so pruned sessions match saved ones
+    # (SA-0MSNYWMJJ002CIJ7).
+    session_dir = getattr(args, "session_dir", None)
+    if session_dir:
+        os.environ[ENV_PI_SESSION_DIR] = session_dir
+
     # Detect proxy 'cheap' mode before any pi call and serialize this run's
     # parallelism (AUDIT_PARALLELISM=1 + AUDIT_MAX_CONCURRENCY=1) so the
     # audit does not race the proxy's single-slot pool (SA-0MSN04X2S006ONH0).
@@ -11541,34 +12628,30 @@ def main(argv: list[str] | None = None) -> int:
     _apply_proxy_mode_serialization()
 
     if args.command == "issue":
-        with SharedTimer("audit_runner_issue") as _root_timer:
-            _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
-                            timeout=_resolve_effective_timeout(args.timeout),
-                            parent_timeout=_resolve_parent_timeout(args.parent_timeout),
-                            pi_bin=args.pi_bin, model=args.model,
-                            phase1_model=getattr(args, "phase1_model", None),
-                            model_source=args.model_source, json_mode=args.json,
-                            debug_log=args.debug_log,
-                            force=args.force,
-                            worklog_dir=args.worklog_dir,
-                            batch_phase2=_phase2_batch_enabled(args.batch_phase2),
-                            green_run=args.green_run,
-                            audit_children=args.audit_children,
-                            max_child_audits=_resolve_max_child_audits(
-                                args.max_child_audits
-                            ),
-                            max_citations_per_ac=_resolve_max_citations_per_ac(
-                                args.max_citations_per_ac
-                            ),
-                            run_tests=args.run_tests,
-                            no_execute=getattr(args, "no_execute", False),
-                            checkpoint_dir=getattr(args, "checkpoint_dir", None),
-                            no_checkpoint=getattr(args, "no_checkpoint", False),
-                            child_in_main_slot=getattr(
-                                args, "child_in_main_slot", None
-                            ),
-                            batch_drain=getattr(args, "batch_drain", None))
-            print(_root_timer.render(), file=sys.stderr)
+        # Host-wide ingress gate (F5, SA-0MUIUMO7T00639FL): bound independently
+        # launched ``audit_runner.py issue`` processes so a fan-out cannot
+        # orphan 30+ concurrent test-running processes. The gate lives at the
+        # CLI entry point (not inside ``cmd_issue``) so in-process recursive
+        # calls (batch drain, child audits) stay re-entrant and timing-sensitive
+        # unit tests that call ``cmd_issue`` directly are unaffected.
+        _rc = 0
+        try:
+            _acquire_host_audit_slot()
+        except TimeoutError as exc:
+            print(
+                "audit_runner: host-wide audit concurrency limit reached "
+                f"({exc}); retry after fewer audits complete or raise "
+                f"{AUDIT_MAX_HOST_AUDITS_ENV}.",
+                file=sys.stderr,
+            )
+            _run_session_cleanup(args)
+            return 1
+        _warn_on_orphaned_audits()
+        try:
+            _rc = _run_issue_command(args)
+        finally:
+            _release_host_audit_slot()
+        _run_session_cleanup(args)
         return _rc
     elif args.command == "batch":
         with SharedTimer("audit_runner_batch") as _root_timer:
@@ -11598,10 +12681,94 @@ def main(argv: list[str] | None = None) -> int:
                                   args.max_citations_per_ac
                               ))
             print(_root_timer.render(), file=sys.stderr)
+        _run_session_cleanup(args)
         return _rc
 
     return 2
 
 
+def _resolve_session_retention_days(args) -> int:
+    """Resolve the session retention period (in days).
+
+    CLI flag wins, then env var, then default (``DEFAULT_SESSION_RETENTION_DAYS``).
+    """
+    flag_val = getattr(args, "session_retention_days", None)
+    if flag_val is not None and flag_val > 0:
+        return flag_val
+    env_val = os.environ.get(ENV_SESSION_RETENTION_DAYS)
+    if env_val is not None:
+        try:
+            val = int(env_val)
+            if val > 0:
+                return val
+        except ValueError:
+            pass  # ignore invalid env values
+    return DEFAULT_SESSION_RETENTION_DAYS
+
+
+def _run_session_cleanup(args) -> None:
+    """Prune stale ``audit-*`` sessions using the resolved retention period."""
+    retention = _resolve_session_retention_days(args)
+    count, freed = _prune_audit_sessions(retention)
+    if count > 0:
+        print(
+            f"audit_runner: pruned {count} audit session(s), "
+            f"reclaimed {_format_bytes(freed)} "
+            f"(retention={retention}d)",
+            file=sys.stderr,
+        )
+
+
+def _run_issue_command(args) -> int:
+    """Run the ``issue`` subcommand body (extracted for the F5 host gate)."""
+    with SharedTimer("audit_runner_issue") as _root_timer:
+        try:
+            _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
+                        timeout=_resolve_effective_timeout(args.timeout),
+                        parent_timeout=_resolve_parent_timeout(args.parent_timeout),
+                        pi_bin=args.pi_bin, model=args.model,
+                        phase1_model=getattr(args, "phase1_model", None),
+                        model_source=args.model_source, json_mode=args.json,
+                        debug_log=args.debug_log,
+                        force=args.force,
+                        worklog_dir=args.worklog_dir,
+                        batch_phase2=_phase2_batch_enabled(args.batch_phase2),
+                        green_run=args.green_run,
+                        audit_children=args.audit_children,
+                        max_child_audits=_resolve_max_child_audits(
+                            args.max_child_audits
+                        ),
+                        max_citations_per_ac=_resolve_max_citations_per_ac(
+                            args.max_citations_per_ac
+                        ),
+                        run_tests=args.run_tests,
+                        no_execute=getattr(args, "no_execute", False),
+                        checkpoint_dir=getattr(args, "checkpoint_dir", None),
+                        no_checkpoint=getattr(args, "no_checkpoint", False),
+                        child_in_main_slot=getattr(
+                            args, "child_in_main_slot", None
+                        ),
+                        batch_drain=getattr(args, "batch_drain", None))
+        finally:
+            # Ensure the reliability summary is emitted even on an early exit
+            # (exception/timeout before _phase_report) — R7 AC4.
+            emit_reliability_summary()
+        print(_root_timer.render(), file=sys.stderr)
+    return _rc
+
+
+def _mark_abort_pane_status() -> None:
+    """Set the herdr pane title to the red state on abort/failure (fail-open)."""
+    try:
+        from shared.herdr_pane import mark_aborted
+
+        mark_aborted()
+    except Exception:  # noqa: BLE001 - pane updates must never break abort
+        return
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    if _exit_code != 0:
+        _mark_abort_pane_status()
+    raise SystemExit(_exit_code)

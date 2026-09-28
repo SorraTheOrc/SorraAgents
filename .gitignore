@@ -3,14 +3,20 @@ Worklog Specific Ignores
 ##################################
 
 # Ignore Worklog directory by default
-.worklog/
+.worklog/*
 
 # Keep config and defaults tracked
 !.worklog/config.yaml
 !.worklog/config.defaults.yaml
+# Private (secret) config — gitignored, never tracked
+.worklog/config.private.yaml
+# ...but keep the example template tracked
+!.worklog/config.private.yaml.example
 
 # Only track plugin config (yaml), not the plugin code itself
 !.worklog/plugins/
+.worklog/plugins/**/*
+!.worklog/plugins/**/
 !.worklog/plugins/**/*.yaml
 
 # Agent framework temporary files
@@ -38,6 +44,12 @@ bun.lock
 
 __pycache__/
 *.pyc
+
+# Guard against reintroduction of the accidental nested skill/skill/ artefact:
+# an absolute symlink plus package marker that duplicated skill/shared pytest
+# collection and, inside a worktree, resolved to the main checkout's stale copy.
+# See LP-0MUHOHP82006NT3W and tests/test_nested_skill_skill_guard.py.
+skill/skill/
 
 # Local build artifacts
 build/

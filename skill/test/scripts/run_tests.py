@@ -50,7 +50,8 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +63,11 @@ if _SKILLS_ROOT_STR in sys.path:
     sys.path.remove(_SKILLS_ROOT_STR)
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
+from shared.git_sandbox import (
+    describe_diff,
+    diff_snapshots,
+    snapshot_repo_state,
+)
 from shared.process_semaphore import Semaphore
 from shared.skill_extensions import (
     DATA_FILENAME,
@@ -71,6 +77,8 @@ from shared.skill_extensions import (
 from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
+    Runner,
+    _default_runner,
     query_cached,
     run_cached,
     summary_lines,
@@ -78,6 +86,9 @@ from test_cache import (
 from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
+    log_repository_override_scrub,
+    repository_override_vars_present,
+    subprocess_env_with_scrubbed_overrides,
 )
 
 REPO_ROOT = _SKILLS_ROOT.parent
@@ -102,6 +113,15 @@ TEST_MAX_CONCURRENCY_ENV = "TEST_MAX_CONCURRENCY"
 TEST_MAX_CONCURRENCY_DEFAULT = 2
 TEST_LOCK_TIMEOUT_ENV = "TEST_LOCK_TIMEOUT"
 TEST_LOCK_TIMEOUT_DEFAULT = 600.0
+
+#: Recursion marker shared with the pytest conftest guard (F5). Set by
+#: whichever guard owns the checkout first; nested pytest/run_tests stand down.
+LIVE_REPO_GUARD_ACTIVE_ENV = "LIVE_REPO_GUARD_ACTIVE"
+
+#: Explicit operator opt-out from the strict release-gate refusal. Scrub is
+#: always applied; this only lets a rare legitimate override-vars run proceed
+#: (with a loud warning) when ``--strict-git-env`` was requested.
+STRICT_GIT_ENV_OPT_OUT_ENV = "RUN_TESTS_ALLOW_REPO_OVERRIDES"
 
 # pytest config markers, mirroring implement.py's _has_pytest_markers so the
 # test/implement/audit skills agree on whether a repo has a pytest suite
@@ -323,7 +343,12 @@ def map_changed_to_tests(
     for changed_file in changed:
         rel = Path(changed_file)
         if _is_test_file(rel):
-            selected.add(changed_file)
+            # Only select the test when it still exists on disk: a test file
+            # that was deleted/renamed away still appears in `git diff` but
+            # must not reach the pytest command line (exit 4 → phantom
+            # failure). See LP-0MTZYRTNF0092JKW.
+            if (root / changed_file).exists():
+                selected.add(changed_file)
             continue
         if rel.suffix not in TRACKED_SOURCE_EXTENSIONS:
             continue  # non-source change → no test selection
@@ -351,7 +376,11 @@ def map_changed_to_tests(
     if selected or _has_python_changes(changed):
         selected |= _expand_by_imports(root, all_tests, changed)
 
-    return selected
+    # Final existence filter: convention mapping scans the filesystem so its
+    # entries exist, but a changed test file added directly above (or an
+    # import-graph entry pointing at a removed path) may not. Guard the
+    # contract that every returned path exists on disk (LP-0MTZYRTNF0092JKW).
+    return {f for f in selected if (root / f).exists()}
 
 
 def _is_test_file(rel: Path) -> bool:
@@ -534,6 +563,14 @@ def changed_scope_commands(
     selected = map_changed_to_tests(root, changed)
     # Anything changed that is itself a test file is already in `selected`;
     # leaf-only changes (e.g. a lone docs edit) → full scope.
+    if not selected:
+        return None
+
+    # Defensive existence filter: never emit a command referencing a path that
+    # is absent from the worktree (deleted/renamed away). If filtering leaves
+    # nothing selectable, fall back to full scope rather than emitting a
+    # degenerate command that would exit 4 (LP-0MTZYRTNF0092JKW).
+    selected = {f for f in selected if (root / f).exists()}
     if not selected:
         return None
 
@@ -1141,7 +1178,14 @@ def _test_concurrency_slot() -> Iterator[None]:
 
 
 def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
-    """Run a suite command capturing stdout/stderr."""
+    """Run a suite command capturing stdout/stderr.
+
+    The environment is the shared repository-override scrub (F2,
+    SA-0MUIA3OE40001QJX): passing an explicit ``env=`` replaces the previous
+    bare inherit of the parent environment, so a leaked ``GIT_DIR`` cannot
+    redirect real-git test fixtures at the live checkout.
+    """
+    log_repository_override_scrub()
     return subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -1149,6 +1193,7 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
         text=True,
         timeout=timeout,
         check=False,
+        env=subprocess_env_with_scrubbed_overrides(),
     )
 
 
@@ -1167,6 +1212,51 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
     executable = executable_test_command(command)
     with _test_concurrency_slot():
         return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
+
+
+def paced_runner(
+    runner: Runner | None = None,
+    on_wait: Callable[[float, float], None] | None = None,
+) -> Runner:
+    """Wrap a cache *runner* so each real execution holds a test-run slot.
+
+    The ``run_cached`` protocol invokes *runner* only on a cache **miss**;
+    a cache hit returns the stored result without calling it. Wrapping the
+    runner — rather than ``run_cached`` itself — therefore gives exactly the
+    intended semantics: every real suite execution acquires the shared
+    ``"test"`` semaphore (ceiling ``TEST_MAX_CONCURRENCY``, bounded wait
+    ``TEST_LOCK_TIMEOUT``), and cache hits never consume a slot.
+
+    *runner* defaults to ``test_cache._default_runner`` (the same runner
+    ``run_cached`` uses when none is supplied), so callers that execute a
+    command through the cache with default semantics — e.g. the audit's F3
+    auto-execution (SA-0MUJK94QN0015925) — can route it through the pacer by
+    passing ``runner=paced_runner()`` alone.
+
+    *on_wait*, when supplied, is called with ``(queued_at, wait_seconds)``
+    immediately after the slot is acquired and before the command is spawned,
+    so callers can emit pacing telemetry (SA-0MUA8BSAG000YZA2 AC3).
+
+    This is the single pacer entry point other code paths (e.g.
+    ``implement.py``'s finish-gate suites, SA-0MUKHCO02009EQFG) use to route
+    their executions through the same host-wide ``"test"`` namespace as
+    ``run_tests.py`` (SA-0MTG5U75A001F1RG). A caller that does not pace keeps
+    its previous unpaced behaviour, so this is opt-in.
+
+    Raises:
+        TestConcurrencyTimeout: when no slot frees within ``TEST_LOCK_TIMEOUT``.
+    """
+    if runner is None:
+        runner = _default_runner
+
+    def _paced(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+        queued_at = time.time()
+        with _test_concurrency_slot():
+            if on_wait is not None:
+                on_wait(queued_at, time.time() - queued_at)
+            return runner(command, cwd, timeout)
+
+    return _paced
 
 
 def run_suite(
@@ -1546,6 +1636,17 @@ def build_parser() -> argparse.ArgumentParser:
         "changed files, no selectable tests).",
     )
     parser.add_argument(
+        "--strict-git-env",
+        action="store_true",
+        help="Release-gate mode: refuse to run (exit 2) when repository-"
+        "override environment variables (GIT_DIR / GIT_WORK_TREE / "
+        "GIT_CONFIG* / GIT_OBJECT_DIRECTORY / "
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES) are present, before any suite "
+        "command runs. Ad-hoc runs scrub and continue; only the release "
+        "gate opts in. Override with "
+        f"{STRICT_GIT_ENV_OPT_OUT_ENV}=1 (loud warning, not recommended).",
+    )
+    parser.add_argument(
         "--target-branch",
         default=None,
         help="Base branch for changed-file detection (default: origin/dev, "
@@ -1613,6 +1714,32 @@ def run_summary(
     return result
 
 
+def _detect_live_repo_mutation(
+    project_root: Path,
+    snapshot_before: dict[str, Any] | None,
+) -> str | None:
+    """Return a rendered diff when the suite mutated *project_root*, else None.
+
+    Detect-only: it never prevents a mutation, it stops a corrupted checkout
+    from being reported as a green suite (and therefore from being pushed).
+    ``None`` for a non-git root (no-op) and when the guard was stood down by an
+    outer guard (``snapshot_before is None``).
+    """
+    if snapshot_before is None:
+        return None
+    snapshot_after = snapshot_repo_state(project_root)
+    if not snapshot_before.get("git", True) or not snapshot_after.get("git", True):
+        return None
+    diff = diff_snapshots(snapshot_before, snapshot_after)
+    if not diff["changed"]:
+        return None
+    return (
+        "live-repo mutation detected: the test suite changed the checkout at "
+        f"{project_root}. The run is failed so a corrupted checkout cannot be "
+        "pushed as green.\n" + describe_diff(diff)
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     suites = (args.suite,)
@@ -1621,6 +1748,30 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve the project root: explicit flag wins, else detect from cwd at
     # CLI time so a non-framework invocation tests that project (SA-0MSNQV9J20010LE7).
     project_root = Path(args.project_root).resolve() if args.project_root else detect_project_root()
+
+    # Release-gate fail-fast (F4, SA-0MUIULX49001BWGG): the release path opts
+    # into ``--strict-git-env`` and refuses to run when repository-override
+    # vars are present. Scrubbing still happens everywhere (F3); this only
+    # guards the release gate where a scrub bug would be catastrophic.
+    if args.strict_git_env:
+        present = repository_override_vars_present()
+        if present and os.environ.get(STRICT_GIT_ENV_OPT_OUT_ENV) != "1":
+            print(
+                "run_tests: refusing to run the release gate with "
+                "repository-override env var(s) present: "
+                + ", ".join(present)
+                + ". Unset them (they would be scrubbed anyway) or set "
+                f"{STRICT_GIT_ENV_OPT_OUT_ENV}=1 to override (not recommended).",
+                file=sys.stderr,
+            )
+            return 2
+        if present:
+            print(
+                "run_tests: WARNING: repository-override env var(s) present "
+                f"({', '.join(present)}); proceeding because "
+                f"{STRICT_GIT_ENV_OPT_OUT_ENV}=1 (scrub still applied)",
+                file=sys.stderr,
+            )
 
     # Validate the requested type against the allowed set (minimum set plus any
     # locally-defined types) and report the full list on error (AC1/AC3).
@@ -1664,6 +1815,13 @@ def main(argv: list[str] | None = None) -> int:
     # timeoutPerCommand (F2 AC1), else the default 600.
     timeout = args.timeout or suite_timeout_per_command(project_root) or 600
 
+    # Live-repo mutation guard (F4, SA-0MUG30J5F001L57H): snapshot the checkout
+    # before the suite and fail the run if it changed. Stand down when an outer
+    # guard already owns this checkout (recursion marker), so nested runs do not
+    # double-report. No-op for non-git roots.
+    guard_active = not os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV)
+    snapshot_before = snapshot_repo_state(project_root) if guard_active else None
+
     with Timer("run_tests") as _root_timer:
         if args.summary:
             with Timer("run_summary"):
@@ -1690,18 +1848,35 @@ def main(argv: list[str] | None = None) -> int:
                 print(_root_timer.render(), file=sys.stderr)
             return 0 if summary["success"] else 1
 
-        result = run_all(
-            suites=suites,
-            cwd=project_root,
-            timeout=timeout,
-            use_cache=not args.no_cache,
-            force=args.force,
-            no_cache=args.no_cache,
-            scope=args.scope,
-            base_ref=args.target_branch or "origin/dev",
-            commands=override_commands,
-            test_type=test_type,
-        )
+        if guard_active:
+            os.environ[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
+        try:
+            result = run_all(
+                suites=suites,
+                cwd=project_root,
+                timeout=timeout,
+                use_cache=not args.no_cache,
+                force=args.force,
+                no_cache=args.no_cache,
+                scope=args.scope,
+                base_ref=args.target_branch or "origin/dev",
+                commands=override_commands,
+                test_type=test_type,
+            )
+        finally:
+            if guard_active:
+                os.environ.pop(LIVE_REPO_GUARD_ACTIVE_ENV, None)
+
+        # Live-repo mutation guard (F4, SA-0MUG30J5F001L57H). Detect-only:
+        # snapshot the checkout before and after the suite and fail the run if
+        # refs, local config or the working tree changed. This is the outer net
+        # for the pre-push release gate, which discards stdout/stderr and relies
+        # on the exit code. It is armed on cache-served runs too (nothing
+        # executes, but the delta is still verified).
+        if guard_active:
+            mutation = _detect_live_repo_mutation(project_root, snapshot_before)
+            if mutation is not None:
+                result = {**result, "success": False, "live_repo_mutation": mutation}
 
         if args.rerun_failures and result["failures"]:
             with Timer("rerun_failures"):
@@ -1724,6 +1899,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  FAILED: {failure['test_name']}")
             for notice in result["notices"]:
                 print(f"notice: {notice}")
+            if result.get("live_repo_mutation"):
+                print("ERROR: " + result["live_repo_mutation"], file=sys.stderr)
             print(_root_timer.render(), file=sys.stderr)
 
     return 0 if result["success"] else 1

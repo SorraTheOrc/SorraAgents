@@ -69,6 +69,8 @@ The `release` action runs six gating checks before merging `dev` to `main`:
 5. **Producer-review gate** — abort if **top-level** items need producer review; exit 9. Child items (covered by their parent's review) never block.
 6. **Final validation sweep** — exit 12. Sweeps **all** `in_review` items but resolves child scope first (SA-0MU2OY1N9000XL2H): a child is **covered** (skipped) when its nearest `in_review` ancestor has a passing audit (`readyToClose === true`), and **excluded** (skipped) when its parent is deleted or not `in_review` (out of the release scope). Uncovered children and top-level items are validated independently; blocking items are those with a missing/stale/failing audit or `needsProducerReview === true`. Missing/stale/transient audits are auto-remediated via `audit_runner.py issue <id>` and re-checked; genuine "not ready to close" verdicts block immediately. Covered and excluded children (with their parent ids) are reported.
 
+   **Child override / escalation (SA-0MUJLWPB10038Z8Q):** a child flagged `needsProducerReview=true` is resolved against its parent's readiness rather than blocking unconditionally. An **uncovered** child (no audit-ready `in_review` ancestor) **escalates**: the flag is set on the nearest `in_review` ancestor with a comment enumerating the child id(s), and the ancestor blocks this gate (exit 12) — so genuine producer attention still stops the release. A **covered** child is reported as a planned override; the close step (step 12) clears its flag (authorised by the parent's passing audit) and closes it. Escalation is never authorised by status alone. `--dry-run` reports the planned overrides/escalations without mutating the worklog.
+
 All gates bypass with `--skip-checks`. CI is **optional**: PR status checks must pass if present; none → merge proceeds without waiting.
 
 ### Code Freeze
@@ -92,12 +94,15 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 | 11 | Release merge verification failed (no verified dev→main merge) |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
 
+**Missing-script fail-fast (SA-0MUIVIJFT0009ZNV):** `run-release.js` resolves the canonical release script **before** the gating checks. When no script exists it exits 2 immediately and runs no git or live-`wl` gate commands — keeping the missing-script safety path cheap, deterministic, and free of worklog side effects.
+
 ## Release Process
 
 ```bash
 node $(skill_path ship)/scripts/run-release.js
 ```
 
+0. **Locate the release script (fail-fast, SA-0MUIVIJFT0009ZNV)** — resolves the canonical release script (skill-level or repository-level) **before** the gating checks and exits 2 immediately if absent; no git or live-`wl` gate commands run.
 1. **Unmerged branches check** — abort if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verify `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — exit 7 if non-terminal critical items exist.
@@ -109,7 +114,7 @@ node $(skill_path ship)/scripts/run-release.js
 9. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push. Release ops run from **main checkout**, not worktrees.
 10. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): close only after the release landed on main — tag `v<version>` exists on origin AND is an ancestor of `origin/main`; else exit 11, no items closed.
 11. **Discord notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` posts version, tag (`vX.Y.Z`), release date, PR URL, and the new version's changelog section from `CHANGELOG.md` to a configured Discord channel via webhook. Runs only after merge verification (never on `--dry-run` or failed releases). Failure (network, HTTP error, timeout) logs a warning and never changes the release exit code. See [Discord release notification](#discord-release-notification).
-12. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items only when `needsProducerReview === false`; others skipped + logged. A candidate whose `--force` close would sweep descendants **outside** the candidate set is refused and reported (SA-0MU2OY1N9000XL2H AC9/AC10).
+12. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items with `needsProducerReview === false`. A child flagged `needsProducerReview=true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared via `wl update <child> --needs-producer-review false`, an explanatory comment naming the authorising parent is added, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3); items with `null`/`undefined` flags, or `true`-but-uncovered, are skipped + logged. A candidate whose `--force` close would sweep descendants **outside** the candidate set is refused and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override or close mutation is performed; the planned actions are reported.
 
 ### Discord release notification
 
@@ -118,7 +123,13 @@ After a successful, verified release the ship skill posts release details + chan
 **Config schema** — the webhook URL is read from `discord.webhook_url`:
 
 ```yaml
-# <project>/.worklog/config.yaml (per-project, takes precedence)
+# <project>/.worklog/config.private.yaml (per-project, secret — gitignored)
+discord:
+  webhook_url: https://discord.com/api/webhooks/<id>/<token>
+```
+
+```yaml
+# <project>/.worklog/config.yaml (per-project, tracked — non-secret settings only)
 discord:
   webhook_url: https://discord.com/api/webhooks/<id>/<token>
 ```
@@ -129,10 +140,12 @@ discord:
   webhook_url: https://discord.com/api/webhooks/<id>/<token>
 ```
 
-- **Precedence (AC2):** per-project `.worklog/config.yaml` first; global `~/.pi/agent/config.yaml` fallback. Neither set → the step is skipped with an info log and the release completes normally (no error).
+- **Precedence (AC2):** per-project `.worklog/config.private.yaml` (gitignored secret) first; then `.worklog/config.yaml` (tracked); then global `~/.pi/agent/config.yaml` fallback. The first file that defines `discord.webhook_url` wins. Neither set → the step is skipped with an info log and the release completes normally (no error).
+- **Gitignored private file:** `.worklog/config.private.yaml` is explicitly gitignored (see `.gitignore`). An example template is provided at `.worklog/config.private.yaml.example` — copy it and fill in your webhook URL.
 - **Non-blocking (AC3):** a failed or slow webhook POST logs a warning and does not change the release exit code; an already-landed release is never failed by a notification failure.
 - **Discord limits (AC4):** the embed description (changelog) is truncated to ≤ 4096 chars with an ellipsis marker.
-- **Secret:** the webhook URL contains an auth token — do **not** commit it to a repository. Prefer the global `~/.pi/agent/config.yaml` (outside any repo); a repo may override via its own `.worklog/config.yaml` but must then keep that file out of version control or accept the exposure.
+- **Secret:** the webhook URL contains an auth token — do **not** commit it to a repository. The recommended location is `.worklog/config.private.yaml` (per-project, gitignored); the global `~/.pi/agent/config.yaml` is also supported as a fallback. Never store the webhook in `.worklog/config.yaml` (tracked).
+- **Migration:** an existing global `discord.webhook_url` in `~/.pi/agent/config.yaml` can be moved to `.worklog/config.private.yaml` for per-project isolation; the global fallback remains supported.
 
 #### Test isolation (mandatory)
 
@@ -163,8 +176,16 @@ Verifying the full suite is green before promoting `dev` to `main` is an **optio
 ```bash
 python3 $(skill_path test)/scripts/run_tests.py --scope full --json                    # fresh full-suite run (populates cache)
 python3 $(skill_path test)/scripts/run_tests.py --summary --suite all                   # read-only summary (shows cached scope), never executes
-python3 $(skill_path test)/scripts/run_tests.py --scope full --force --json            # fresh full-suite run for the final gate
+python3 $(skill_path test)/scripts/run_tests.py --scope full --strict-git-env --force --json   # final release gate
 ```
+
+The release gate runs with ``--strict-git-env`` (SA-0MUIULX49001BWGG): it
+refuses to start (exit 2) when a repository-override variable such as
+``GIT_DIR`` is present in the environment, because a leaked value can redirect
+real-git test fixtures at the live checkout. The pre-push hook applies the same
+``--strict-git-env`` flag for ``dev``/``main`` pushes. An operator can override
+with ``RUN_TESTS_ALLOW_REPO_OVERRIDES=1`` (loud warning; not recommended) — the
+scrub is still applied either way.
 
 The run and final-gate commands use ``--scope full`` explicitly: the release
 gate must be backed by **full-suite** evidence. A ``changed``-scope (partial)

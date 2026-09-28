@@ -21,7 +21,9 @@ const __dirname = dirname(__filename); // eslint-disable-line no-unused-vars
 import {
   parseSimpleYaml,
   readWebhookUrlFromConfig,
+  readProjectNameFromConfig,
   resolveDiscordWebhookUrl,
+  resolveProjectName,
   extractChangelogSection,
   truncateForDiscord,
   buildDiscordPayload,
@@ -196,6 +198,115 @@ describe('resolveDiscordWebhookUrl', () => {
   });
 });
 
+// ─── readProjectNameFromConfig ───────────────────────────────────────────────
+
+describe('readProjectNameFromConfig', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = mkTmpDir();
+  });
+
+  afterEach(() => {
+    rmTmpDir(tmpDir);
+  });
+
+  it('returns null for a non-existent file', () => {
+    assert.strictEqual(
+      readProjectNameFromConfig(join(tmpDir, 'nonexistent.yaml')),
+      null,
+    );
+  });
+
+  it('returns null when projectName is absent', () => {
+    writeFileSync(join(tmpDir, 'config.yaml'), 'discord:\n  webhook_url: https://example.com\n');
+    assert.strictEqual(readProjectNameFromConfig(join(tmpDir, 'config.yaml')), null);
+  });
+
+  it('returns the project name when present', () => {
+    const yaml = 'projectName: TestRepo\n';
+    writeFileSync(join(tmpDir, 'config.yaml'), yaml);
+    assert.strictEqual(
+      readProjectNameFromConfig(join(tmpDir, 'config.yaml')),
+      'TestRepo',
+    );
+  });
+
+  it('handles a corrupt YAML file gracefully', () => {
+    writeFileSync(join(tmpDir, 'config.yaml'), '\x00\x01\x02');
+    assert.strictEqual(readProjectNameFromConfig(join(tmpDir, 'config.yaml')), null);
+  });
+});
+
+// ─── resolveProjectName (AC2 — config precedence) ────────────────────────────
+
+describe('resolveProjectName', () => {
+  let projectDir, globalDir;
+
+  beforeEach(() => {
+    projectDir = mkTmpDir('project-');
+    globalDir = mkTmpDir('global-');
+  });
+
+  afterEach(() => {
+    rmTmpDir(projectDir);
+    rmTmpDir(globalDir);
+  });
+
+  it('returns null when neither config has a project name', () => {
+    const result = resolveProjectName(projectDir, {
+      projectConfigPath: join(projectDir, 'config.yaml'),
+      globalConfigPath: join(globalDir, 'config.yaml'),
+    });
+    assert.strictEqual(result, null);
+  });
+
+  it('prefers per-project config over global (AC2)', () => {
+    const projectTitle = 'MyProject';
+    const globalTitle = 'GlobalProject';
+
+    writeFileSync(join(projectDir, 'config.yaml'),
+      'projectName: ' + projectTitle + '\n');
+    writeFileSync(join(globalDir, 'config.yaml'),
+      'projectName: ' + globalTitle + '\n');
+
+    const result = resolveProjectName(projectDir, {
+      projectConfigPath: join(projectDir, 'config.yaml'),
+      globalConfigPath: join(globalDir, 'config.yaml'),
+    });
+    assert.strictEqual(result, projectTitle);
+  });
+
+  it('falls back to global config when per-project is unset', () => {
+    const globalTitle = 'GlobalProject';
+    writeFileSync(join(projectDir, 'config.yaml'), 'discord:\n  webhook_url: https://example.com\n');
+    writeFileSync(join(globalDir, 'config.yaml'),
+      'projectName: ' + globalTitle + '\n');
+
+    const result = resolveProjectName(projectDir, {
+      projectConfigPath: join(projectDir, 'config.yaml'),
+      globalConfigPath: join(globalDir, 'config.yaml'),
+    });
+    assert.strictEqual(result, globalTitle);
+  });
+
+  it('prefers per-project even when global is present', () => {
+    const projectTitle = 'LocalProject';
+    const globalTitle = 'GlobalProject';
+
+    writeFileSync(join(projectDir, 'config.yaml'),
+      'projectName: ' + projectTitle + '\n');
+    writeFileSync(join(globalDir, 'config.yaml'),
+      'projectName: ' + globalTitle + '\n');
+
+    const result = resolveProjectName(projectDir, {
+      projectConfigPath: join(projectDir, 'config.yaml'),
+      globalConfigPath: join(globalDir, 'config.yaml'),
+    });
+    assert.strictEqual(result, projectTitle);
+  });
+});
+
 // ─── extractChangelogSection (AC1) ──────────────────────────────────────────
 
 describe('extractChangelogSection', () => {
@@ -301,11 +412,12 @@ describe('buildDiscordPayload', () => {
       date: '2024-08-01',
       prUrl: 'https://github.com/example/repo/pull/42',
       changelog: '### Features\n- Added feature X\n',
+      projectName: 'ContextHub',
     });
     assert.ok(Array.isArray(payload.embeds));
     assert.strictEqual(payload.embeds.length, 1);
     const embed = payload.embeds[0];
-    assert.strictEqual(embed.title, 'Release v1.2.3');
+    assert.strictEqual(embed.title, 'ContextHub Release v1.2.3');
     assert.strictEqual(embed.color, 0x2ecc71); // green
     assert.ok(embed.description.includes('Added feature X'));
     assert.deepStrictEqual(embed.fields, [
@@ -322,9 +434,30 @@ describe('buildDiscordPayload', () => {
   });
 
   it('handles unknown version', () => {
-    const payload = buildDiscordPayload({});
-    assert.strictEqual(payload.embeds[0].title, 'Release vunknown');
+    const payload = buildDiscordPayload({ projectName: 'TestProject' });
+    assert.strictEqual(payload.embeds[0].title, 'TestProject Release vunknown');
     assert.strictEqual(payload.embeds[0].fields[0].value, 'unknown');
+  });
+
+  it('falls back to no-project-name title when projectName is absent (AC3)', () => {
+    const payload = buildDiscordPayload({ version: '1.0.0' });
+    assert.strictEqual(payload.embeds[0].title, 'Release v1.0.0');
+  });
+
+  it('includes the project name and version in the description (AC4)', () => {
+    const payload = buildDiscordPayload({
+      version: '1.2.3',
+      changelog: '### Features\n- Added feature X\n',
+      projectName: 'ContextHub',
+    });
+    const description = payload.embeds[0].description;
+    assert.ok(description.includes('ContextHub v1.2.3'));
+    assert.ok(description.includes('Added feature X'));
+  });
+
+  it('does not add a project header to the description when projectName is absent (AC4)', () => {
+    const payload = buildDiscordPayload({ version: '1.2.3', changelog: '### Features\n- X\n' });
+    assert.ok(!payload.embeds[0].description.includes('**'));
   });
 
   it('truncates long changelog in the payload', () => {
@@ -386,8 +519,35 @@ describe('sendReleaseNotification', () => {
     assert.deepStrictEqual(result, { success: true, notified: true });
 
     const payload = JSON.parse(capturedBody);
+    // Without projectName in config, falls back to generic title (AC3).
     assert.strictEqual(payload.embeds[0].title, 'Release v1.2.3');
     assert.ok(payload.embeds[0].description.includes('New feature'));
+  });
+
+  it('includes project name in title when configured (AC1)', async () => {
+    writeFileSync(join(tmpDir, 'config.yaml'),
+      'projectName: ContextHub\ndiscord:\n  webhook_url: ' + WEBHOOK_URL + '\n');
+    let capturedBody = null;
+    const mockFetch = async (url, opts) => {
+      capturedBody = opts.body;
+      return { ok: true, status: 200 };
+    };
+
+    const changelogContent = '## v1.2.3 (2024-08-01)\n### Features\n- New feature\n';
+    const result = await sendReleaseNotification(
+      { version: '1.2.3', prUrl: 'https://github.com/example/repo/pull/42', projectRoot: tmpDir },
+      {
+        fetchFn: mockFetch,
+        projectConfigPath: join(tmpDir, 'config.yaml'),
+        globalConfigPath: join(tmpDir, 'config.yaml'),
+        changelogContent,
+        now: () => new Date('2024-08-01'),
+      },
+    );
+    assert.deepStrictEqual(result, { success: true, notified: true });
+
+    const payload = JSON.parse(capturedBody);
+    assert.strictEqual(payload.embeds[0].title, 'ContextHub Release v1.2.3');
   });
 
   it('is non-blocking on HTTP error (AC3)', async () => {

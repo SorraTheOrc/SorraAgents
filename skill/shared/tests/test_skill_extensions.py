@@ -17,7 +17,6 @@ Contract under test:
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -29,6 +28,7 @@ for _path in (str(REPO_ROOT), str(_SKILLS_ROOT)):
     if _path not in sys.path:
         sys.path.append(_path)
 
+from shared.git_sandbox import init_repo
 from shared.skill_extensions import (
     DATA_FILENAME,
     EXTENSIONS_DIR,
@@ -46,20 +46,8 @@ from shared.skill_extensions import (
 
 
 def _init_git_repo(root: Path) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    )
+    """Initialise a hermetic git repo at *root* (tmp_path-rooted)."""
+    init_repo(root)
 
 
 def _write_extension(root: Path, skill: str, **files: str) -> Path:

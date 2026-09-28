@@ -2,10 +2,11 @@
 
 The plan skill's step 4 asks the user to approve a proposed feature plan.
 Approval is requested only when the work item's effort t-shirt size is
-Medium/Large/Extra Large ("scale") OR its risk level is High (Medium risk
-no longer triggers the gate on its own — dev commit a9d8b8b9).
-When effort is Extra Small/Small AND risk is Low, the plan proceeds
-directly to the automated review stages without an approval pause.
+Medium/Large/Extra Large ("scale") OR its risk level is High or higher
+(High/Severe). Medium risk no longer triggers the gate on its own
+(SA-0MTGX1I00007DBLX). When effort is Extra Small/Small AND risk is
+Low/Medium, the plan proceeds directly to the automated review stages
+without an approval pause.
 
 Missing effort/risk values default conservatively to requesting approval
 (mirroring ``resolve_complexity_tier``'s Medium default) so a human
@@ -69,9 +70,10 @@ class TestShouldRequestPlanApproval:
         assert request is True
         assert effort in reason
 
-    @pytest.mark.parametrize("risk", ["High"])
-    def test_high_risk_requests_approval(self, risk):
-        """High risk requests approval even with Extra Small effort."""
+    @pytest.mark.parametrize("risk", ["High", "Severe"])
+    def test_high_or_higher_risk_requests_approval(self, risk):
+        """High or higher risk (High/Severe) requests approval even with
+        Extra Small effort."""
         request, reason = should_request_plan_approval(
             {"effort": "Extra Small", "risk": risk}
         )
@@ -80,8 +82,8 @@ class TestShouldRequestPlanApproval:
 
     def test_medium_risk_alone_no_longer_triggers_approval(self):
         """Medium risk no longer triggers the gate by itself
-        (PLAN_APPROVAL_RISK is High-only since dev commit a9d8b8b9); a
-        small, Medium-risk item proceeds without an approval pause."""
+        (PLAN_APPROVAL_RISK is High/Severe only since SA-0MTGX1I00007DBLX);
+        a small, Medium-risk item proceeds without an approval pause."""
         request, reason = should_request_plan_approval(
             {"effort": "Small", "risk": "Medium"}
         )
@@ -171,6 +173,20 @@ class TestPlanApprovalGate:
         result = plan_approval_gate("X", runner=runner)
         assert result["request_approval"] is True
         assert "High" in result["reason"]
+
+    def test_approval_when_risk_is_severe(self):
+        """Extra Small + Severe risk (higher than High) still requests approval."""
+        runner = _FakeWlShow({"id": "X", "effort": "Extra Small", "risk": "Severe"})
+        result = plan_approval_gate("X", runner=runner)
+        assert result["request_approval"] is True
+        assert "Severe" in result["reason"]
+
+    def test_skip_when_small_and_medium_risk(self):
+        """Extra Small + Medium risk no longer requests approval on its own."""
+        runner = _FakeWlShow({"id": "X", "effort": "Extra Small", "risk": "Medium"})
+        result = plan_approval_gate("X", runner=runner)
+        assert result["request_approval"] is False
+        assert result["reason"] == ""
 
     def test_approval_when_values_absent(self):
         """Absent effort/risk default conservatively to requesting approval."""
@@ -425,8 +441,10 @@ class TestPlanApprovalReclaimInvariant:
         """Without the flag, gate semantics are byte-identical to before."""
         for effort, risk, expected in [
             ("Extra Small", "Low", False),
+            ("Extra Small", "Medium", False),
             ("Large", "Low", True),
             ("Extra Small", "High", True),
+            ("Extra Small", "Severe", True),
         ]:
             runner = _FakeWlShow({"id": "X", "effort": effort, "risk": risk})
             result = plan_approval_gate("X", runner=runner)

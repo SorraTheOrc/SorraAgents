@@ -5,6 +5,16 @@ Deep implementation-reference detail relocated from `skill/intake/SKILL.md`
 operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged.
 
+## Interview conduct
+
+Interview conduct is defined once in the canonical shared interview skill
+(`$(skill_path interview)/SKILL.md`); see
+[interview-skill-reference.md](interview-skill-reference.md) for the
+maintainer summary. `skill/intake/SKILL.md` § Interview delegates to it and
+retains only intake-specific interview inputs (seed context; per-feature
+user/stakeholder, problem, and measurable outcome). The shared rules are not
+restated here.
+
 ## Worklog resolution
 
 `intake.py` routes every `wl` call through the shared `run_wl` helper

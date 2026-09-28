@@ -397,3 +397,61 @@ def test_project_root_flag_overrides_detection(
     # The run must be cached under the explicit project root, not cache_repo.
 
     assert other.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Release-gate strict git-env refusal (F4, SA-0MUIULX49001BWGG)
+# ---------------------------------------------------------------------------
+
+
+def test_strict_git_env_refuses_when_override_present(
+    cache_repo: Path,
+    fake_run: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """--strict-git-env exits 2 before running any suite when a var is present."""
+    monkeypatch.setenv("GIT_DIR", "/tmp/leaked")
+    code = run_main(["--suite", "pytest", "--strict-git-env", "--json"])
+    assert code == 2
+    assert fake_run == []  # no suite command executed
+    assert "GIT_DIR" in capsys.readouterr().err
+
+
+def test_strict_git_env_proceeds_when_clean(
+    cache_repo: Path,
+    fake_run: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean environment lets the strict release gate run normally."""
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    code = run_main(["--suite", "pytest", "--strict-git-env", "--json"])
+    assert code == 0
+    assert len(fake_run) == 1
+
+
+def test_non_strict_with_override_proceeds(
+    cache_repo: Path,
+    fake_run: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the flag the runner scrubs and continues (F3 behaviour)."""
+    monkeypatch.setenv("GIT_DIR", "/tmp/leaked")
+    code = run_main(["--suite", "pytest", "--json"])
+    assert code == 0
+    assert len(fake_run) == 1
+
+
+def test_strict_git_env_opt_out_allows_with_warning(
+    cache_repo: Path,
+    fake_run: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The documented opt-out lets a strict run proceed with a loud warning."""
+    monkeypatch.setenv("GIT_DIR", "/tmp/leaked")
+    monkeypatch.setenv(rt.STRICT_GIT_ENV_OPT_OUT_ENV, "1")
+    code = run_main(["--suite", "pytest", "--strict-git-env", "--json"])
+    assert code == 0
+    assert len(fake_run) == 1
+    assert "WARNING" in capsys.readouterr().err
