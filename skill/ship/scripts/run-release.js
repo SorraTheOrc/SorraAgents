@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
-import { checkFinalValidation } from './check-final-validation.js';
+import { checkFinalValidation, resolveChildScope, getItemById, shellQuote } from './check-final-validation.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 import { sendReleaseNotification } from './discord-notify.js';
@@ -242,6 +242,39 @@ export function verifyReleaseMerge(version, options = {}) {
   };
 }
 
+// ── resolveCandidateCoverage ────────────────────────────────────────────────
+
+/**
+ * Resolve whether a close-candidate child is covered by an audit-ready
+ * `in_review` ancestor (SA-0MUJLWPB10038Z8Q).
+ *
+ * Reuses the final-validation parent-coverage walk so the close step
+ * (Step 9) and the final-validation gate (Step 3.7) apply identical
+ * `covered` / `uncovered` / `excluded` semantics. Only a `covered` outcome
+ * (nearest `in_review` ancestor with `readyToClose === true`) authorises
+ * clearing the child's `needsProducerReview` flag (AC1, AC3).
+ *
+ * Command boundaries are injectable for hermetic tests.
+ *
+ * @param {{id: string, title: string, parentId: string|null}} item - Child candidate.
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {(id: string) => (object|null)} [options.getItemByIdFn] - Resolves a
+ *   work item by id; defaults to {@link getItemById}.
+ * @param {(id: string) => string} [options.runAuditShow] - Runs
+ *   `wl audit-show <id> --json`; defaults to a live query.
+ * @returns {{ outcome: 'covered'|'excluded'|'uncovered', reason: string, ancestorId: string|null, parentStage: string|null }}
+ */
+export function resolveCandidateCoverage(item, options = {}) {
+  const {
+    getItemByIdFn = getItemById,
+    runAuditShow = (workItemId) => execSync(
+      `wl audit-show ${workItemId} --json`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ),
+  } = options;
+  return resolveChildScope(item, { getItemByIdFn, runAuditShow });
+}
+
 // ── getDescendants ───────────────────────────────────────────────────────────
 
 /**
@@ -320,7 +353,18 @@ export function getDescendants(itemId) {
  * @param {(itemId: string) => string[]} [options.getDescendantsFn] -
  *   Descendant resolver (for candidate-set scoping); defaults to
  *   {@link getDescendants}.
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[]}> }}
+ * @param {(item: object) => {outcome: string, ancestorId: string|null}} [options.getAncestorAuditFn] -
+ *   Resolves whether a child is covered by an audit-ready `in_review`
+ *   ancestor; defaults to {@link resolveCandidateCoverage}. Only a `covered`
+ *   outcome authorises clearing a child's `needsProducerReview` flag
+ *   (SA-0MUJLWPB10038Z8Q AC1/AC3).
+ * @param {(childId: string, ancestorId: string, reason: string) => void} [options.runOverrideCommand] -
+ *   Clears the child's `needsProducerReview` flag and records the explanatory
+ *   comment; defaults to `wl update <child> --needs-producer-review false`
+ *   followed by `wl comment add <child>` (AC1/AC4).
+ * @param {boolean} [options.dryRun=false] - When true, intended child
+ *   overrides are reported but no `wl` mutation is performed (AC4).
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -330,6 +374,18 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
     getDescendantsFn = getDescendants,
+    getAncestorAuditFn = (item) => resolveCandidateCoverage(item),
+    runOverrideCommand = (childId, ancestorId, reason) => {
+      execSync(
+        `wl update ${childId} --needs-producer-review false --json`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      execSync(
+        `wl comment add ${childId} --comment ${shellQuote(reason)} --author ship --json`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+    },
+    dryRun = false,
   } = options;
 
   if (!version) {
@@ -340,8 +396,11 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: 0,
       skippedItems: [],
+      overriddenCount: 0,
+      overriddenItems: [],
       refusedCount: 0,
       refusedItems: [],
+      dryRun,
     };
   }
 
@@ -359,26 +418,83 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: 0,
       skippedItems: [],
+      overriddenCount: 0,
+      overriddenItems: [],
       refusedCount: 0,
       refusedItems: [],
+      dryRun,
     };
   }
 
   console.log(`Found ${items.length} work item(s).`);
 
-  // Filter: only close items where needsProducerReview === false
-  const toClose = items.filter(
-    (item) => item.needsProducerReview === false,
-  );
-  const skippedItems = items
-    .filter(
-      (item) => item.needsProducerReview !== false,
-    )
-    .map((item) => ({
+  // Filter: close items where needsProducerReview === false. A child with
+  // needsProducerReview === true whose nearest in_review ancestor is an
+  // audit-ready release candidate (readyToClose === true) is OVERRIDDEN:
+  // its flag is cleared (with an explanatory comment) and it is closed
+  // (SA-0MUJLWPB10038Z8Q AC1). The override is authorised ONLY by the
+  // parent's passing audit — never by status alone (AC3). Items with
+  // needsProducerReview null/undefined, or true-but-uncovered, are skipped.
+  const toClose = [];
+  const overriddenItems = [];
+  const skippedItems = [];
+  for (const item of items) {
+    if (item.needsProducerReview === false) {
+      toClose.push(item);
+      continue;
+    }
+
+    if (item.needsProducerReview === true && item.parentId) {
+      let coverage = null;
+      try {
+        coverage = getAncestorAuditFn(item);
+      } catch (err) {
+        console.warn(`  ⚠ Could not resolve ancestor audit for ${item.id}: ${err.message}`);
+      }
+      if (coverage && coverage.outcome === 'covered') {
+        const reason = `Auto-override by ship release (SA-0MUJLWPB10038Z8Q): `
+          + `needsProducerReview cleared — this child is covered by the passing `
+          + `audit of in_review ancestor ${coverage.ancestorId}.`;
+        if (dryRun) {
+          console.log(
+            `  ○ ${item.title || item.id} (${item.id}) — dry-run: would override `
+            + `needsProducerReview via ancestor ${coverage.ancestorId}`,
+          );
+        } else {
+          try {
+            runOverrideCommand(item.id, coverage.ancestorId, reason);
+            console.log(
+              `  ✓ ${item.title || item.id} (${item.id}) — cleared needsProducerReview `
+              + `(covered by ${coverage.ancestorId})`,
+            );
+          } catch (err) {
+            console.warn(
+              `  ⚠ Failed to override ${item.id} (${item.title}): ${err.message}`,
+            );
+            skippedItems.push({
+              id: item.id,
+              title: item.title,
+              reason: `Skipped (override failed: ${err.message})`,
+            });
+            continue;
+          }
+        }
+        overriddenItems.push({
+          id: item.id,
+          title: item.title,
+          ancestorId: coverage.ancestorId,
+        });
+        toClose.push(item);
+        continue;
+      }
+    }
+
+    skippedItems.push({
       id: item.id,
       title: item.title,
       reason: 'Skipped (needs producer review)',
-    }));
+    });
+  }
 
   if (skippedItems.length > 0) {
     console.log(`\nSkipping ${skippedItems.length} work item(s) that need producer review:`);
@@ -393,6 +509,16 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   // a descendant that is not itself a close candidate must not be force-closed
   // — it would close out-of-scope work. Such candidates are refused and
   // reported (an explicit, reversible exclusion decision) instead.
+  if (overriddenItems.length > 0) {
+    console.log(`\nChild producer-review overrides (${overriddenItems.length}):`);
+    for (const entry of overriddenItems) {
+      console.log(
+        `  ✓ ${entry.title || entry.id} (${entry.id}) — covered by ${entry.ancestorId}`,
+      );
+    }
+    console.log('');
+  }
+
   const candidateIds = new Set(toClose.map((item) => item.id));
   const refusedItems = [];
   const closable = [];
@@ -425,8 +551,11 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       errorCount: 0,
       skippedCount: skippedItems.length,
       skippedItems,
+      overriddenCount: overriddenItems.length,
+      overriddenItems,
       refusedCount: refusedItems.length,
       refusedItems,
+      dryRun,
     };
   }
 
@@ -437,6 +566,14 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   const errors = [];
 
   for (const item of closable) {
+    if (dryRun) {
+      // `--dry-run` must not mutate the worklog (AC4) — report the intended
+      // close without invoking `wl close`.
+      console.log(
+        `  ○ ${item.title || item.id} — dry-run: would close with reason: "Shipped in v${version}"`,
+      );
+      continue;
+    }
     try {
       const reason = `Shipped in v${version}`;
       // --force: the audit gate (Step 2) already verified audit readiness for
@@ -457,7 +594,10 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   }
 
   let summary;
-  if (errorCount === 0) {
+  if (dryRun) {
+    summary = `Dry-run: ${closable.length} work item(s) would be closed`
+      + ` (${overriddenItems.length} child override(s) planned).`;
+  } else if (errorCount === 0) {
     summary = `All ${closedCount} work item(s) closed successfully.`;
   } else {
     summary = `Closed ${closedCount} work item(s); ${errorCount} error(s) (non-fatal).`;
@@ -465,6 +605,9 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
 
   if (skippedItems.length > 0) {
     summary += ` ${skippedItems.length} item(s) skipped (needs producer review).`;
+  }
+  if (overriddenItems.length > 0) {
+    summary += ` ${overriddenItems.length} child(ren) overridden (parent audit authorises flag clear).`;
   }
   if (refusedItems.length > 0) {
     summary += ` ${refusedItems.length} item(s) refused (collateral descendants outside candidate set).`;
@@ -481,8 +624,11 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     errorCount,
     skippedCount: skippedItems.length,
     skippedItems,
+    overriddenCount: overriddenItems.length,
+    overriddenItems,
     refusedCount: refusedItems.length,
     refusedItems,
+    dryRun,
   };
 }
 
@@ -818,7 +964,9 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   // this gate is NOT scoped to top-level items — child audit gaps block too.
   startStep('Step 3.7: final validation check');
   if (!skipChecks) {
-    const finalValidationReport = await checkFinalValidation();
+    // `dryRun` is threaded through so a dry-run reports planned child
+    // overrides / parent escalations without mutating the worklog (AC4).
+    const finalValidationReport = await checkFinalValidation({ dryRun: isDryRun });
     if (finalValidationReport.hasBlockingItems) {
       console.error(
         '⚠️  Final-validation gate check failed — some in_review items have unresolved audit or producer-review issues:\n',
@@ -955,7 +1103,7 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
 
     // ── Step 9: Close work items shipped in this release (non-blocking) ──
     startStep('Step 9: close work items');
-    const closeResult = closeWorkItemsAfterRelease(version);
+    const closeResult = closeWorkItemsAfterRelease(version, { dryRun: isDryRun });
     if (!closeResult.success && closeResult.errorCount > 0) {
       console.warn(`\n⚠ Non-critical: ${closeResult.message}`);
     }

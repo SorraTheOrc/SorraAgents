@@ -18,7 +18,7 @@ All scripts below are internal implementation details — they are not exposed a
 | `./skill/ship/scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
 | `./skill/ship/scripts/check-unmerged-branches.js` | Unmerged branch detection |
 | `./skill/ship/scripts/check-audit-gate.js` | Audit readiness and producer-review gating (`getCandidateItems`, `getTopLevelCandidateItems`, `checkAuditReadyToClose`, `checkProducerReviewStatus`, `resolveAuditRunner`) |
-| `./skill/ship/scripts/check-final-validation.js` | Final-validation sweep (parent-coverage / out-of-scope aware; `checkFinalValidation`, `getInReviewItems`, `getItemById`, `resolveChildScope`, `classifyAudit`, `isAuditStale`) |
+| `./skill/ship/scripts/check-final-validation.js` | Final-validation sweep (parent-coverage / out-of-scope aware; `checkFinalValidation`, `getInReviewItems`, `getItemById`, `resolveChildScope`, `findInReviewAncestor`, `classifyAudit`, `isAuditStale`) |
 | `./skill/ship/scripts/check-critical-items.js` | Critical-items gating |
 | `./skill/ship/scripts/check-worklog-refs.js` | Worklog refs gating |
 | `./skill/ship/scripts/discord-notify.js` | Post-release Discord notification (`sendReleaseNotification`, config resolution, changelog extraction/truncation, embed payload, non-blocking webhook POST) |
@@ -137,8 +137,32 @@ are reported in `coveredChildren`/`excludedChildren` (with the parent id and
 stage). Missing/stale/transient audits are auto-remediated via
 `audit_runner.py issue <id>`; genuine "not ready to close" verdicts block
 immediately with no re-audit attempt. Command boundaries (`getItemsFn`,
-`getItemByIdFn`, `runAuditShow`, `runAuditCommand`, `resolveAuditRunnerFn`)
-are injectable for hermetic tests. `--skip-checks` bypasses the gate.
+`getItemByIdFn`, `runAuditShow`, `runAuditCommand`, `resolveAuditRunnerFn`,
+`runCloseCommand`, `dryRun`) are injectable for hermetic tests.
+`--skip-checks` bypasses the gate.
+
+#### Child override / escalation contract (SA-0MUJLWPB10038Z8Q)
+
+A child flagged `needsProducerReview=true` is resolved against its parent's
+readiness instead of blocking unconditionally:
+
+- **Escalation (uncovered child, AC2).** When no audit-ready `in_review`
+  ancestor covers the child, the gate sets `needsProducerReview=true` on the
+  **nearest `in_review` ancestor** (resolved by `findInReviewAncestor`) with a
+  `--comment` enumerating the child id(s), and surfaces that ancestor as a
+  blocking item — the escalated ancestor fails the gate (exit 12) so genuine
+  producer attention still stops the release. Setting the flag also makes the
+  ancestor fail the producer-review gate (exit 9) on the next run. The child
+  itself is removed from the blocking set once escalated.
+- **Planned override (covered child, AC1 reporting).** A covered child flagged
+  `needsProducerReview=true` is reported in `plannedOverrides` (the close step
+  performs the actual override).
+- **Dry-run (AC4).** With `dryRun: true` no `wl` mutation is performed; a
+  planned escalation is reported (`escalatedItems[].planned === true`) and does
+  **not** block. The report includes a `(dry-run)` note.
+
+`getItemByIdFn` resolves the ancestor chain and `runCloseCommand(itemId, args)`
+runs the escalation `wl update`; both are injectable.
 
 ## Release Process
 ## Release Process
@@ -165,7 +189,29 @@ Steps:
    - the tag commit is an ancestor of `origin/main` (`git merge-base --is-ancestor`).
    If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
 10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
-11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Logs warnings on individual close failures.
+11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures.
+
+### Child producer-review override (close step)
+
+`closeWorkItemsAfterRelease(version, options)` accepts these injectable
+boundaries (all hermetic-test friendly):
+
+- `getCandidateItemsFn` — candidate query (defaults to `getCandidateItems()`).
+- `getDescendantsFn` — descendant resolver for candidate-set scoping.
+- `getAncestorAuditFn(item)` — resolves whether a child is `covered` by an
+  audit-ready `in_review` ancestor (defaults to `resolveCandidateCoverage`,
+  which reuses the final-validation `resolveChildScope` walk so the close step
+  and Step 3.7 share identical semantics). Only `covered` authorises the
+  override.
+- `runOverrideCommand(childId, ancestorId, reason)` — clears the child flag and
+  posts the explanatory comment (defaults to `wl update <child>
+  --needs-producer-review false` + `wl comment add <child> ...`).
+- `runCloseCommand(itemId, reason)` — closes a candidate.
+- `dryRun` — when true, planned overrides/closes are reported but no mutation
+  is performed.
+
+The result includes `overriddenCount` / `overriddenItems` so the planned
+overrides are auditable.
 
 ### Discord release notification
 

@@ -28,9 +28,22 @@
  * immediately with no re-audit attempt. Producer-review flags are reported
  * with the command needed to clear them.
  *
+ * **Escalation for uncovered children (SA-0MUJLWPB10038Z8Q):** When an
+ * uncovered child has `needsProducerReview === true` and no audit-ready
+ * `in_review` ancestor, the gate escalates by setting `needsProducerReview`
+ * `true` on the nearest `in_review` ancestor (or top-level parent) and adds
+ * a comment enumerating the child id(s). Because the producer-review gate
+ * (Step 3.6, exit 9) has already run, the escalated ancestor is surfaced as a
+ * **blocking item** so the current release fails this gate (exit 12); the flag
+ * also makes the ancestor fail the producer-review gate (exit 9) on the next
+ * run. The child is removed from the blocking list once escalated (it no
+ * longer blocks independently — its parent does). Escalation requires an
+ * injectable `runCloseCommand` boundary (used for `wl update`); tests must
+ * inject a no-op to remain hermetic.
+ *
  * Command boundaries (`getItemsFn`, `runAuditShow`, `runAuditCommand`,
- * `resolveAuditRunnerFn`) are injectable so unit tests are hermetic — no
- * live `wl`/`audit_runner` invocations.
+ * `resolveAuditRunnerFn`, `runCloseCommand`, `getItemByIdFn`) are injectable
+ * so unit tests are hermetic — no live `wl`/`audit_runner` invocations.
  */
 
 import { execSync } from 'node:child_process';
@@ -50,6 +63,22 @@ import {
 // runner's fast, content-fingerprint freshness path).
 export const AUDIT_FRESHNESS_BUFFER_SECONDS = 60;
 export const AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30;
+
+// ── shellQuote ───────────────────────────────────────────────────────────────
+
+/**
+ * Quote a single argument for safe interpolation into a shell command.
+ *
+ * Wraps the value in single quotes and escapes any embedded single quote.
+ * Used by the default escalation boundary so a comment containing spaces or
+ * punctuation is passed as one argument to `wl` (not re-split by the shell).
+ *
+ * @param {string} value - The raw argument value.
+ * @returns {string} The shell-safe quoted argument.
+ */
+export function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
 
 // ── parseIsoUtc ──────────────────────────────────────────────────────────────
 
@@ -249,6 +278,44 @@ export function getItemById(itemId) {
   }
 }
 
+// ── findInReviewAncestor ─────────────────────────────────────────────────────
+
+/**
+ * Find the nearest `in_review` ancestor of a work item.
+ *
+ * Walks the parent chain from the given item's `parentId` upward, returning
+ * the first ancestor whose stage is `in_review`. Returns `null` when no
+ * such ancestor exists.
+ *
+ * @param {{id: string, parentId: string|null}} item - The child work item.
+ * @param {(id: string) => (object|null)} getItemByIdFn - Work item resolver.
+ * @returns {string|null} The nearest `in_review` ancestor id, or `null`.
+ */
+export function findInReviewAncestor(item, getItemByIdFn) {
+  const visited = new Set([item.id]);
+  let ancestorId = item.parentId;
+  while (ancestorId) {
+    if (visited.has(ancestorId)) {
+      return null; // cycle detected — don't escalate
+    }
+    visited.add(ancestorId);
+    let ancestor;
+    try {
+      ancestor = getItemByIdFn(ancestorId);
+    } catch {
+      return null; // resolution failure — fall back to blocking directly
+    }
+    if (!ancestor) {
+      return null; // ancestor doesn't exist — no escalation target
+    }
+    if (ancestor.stage === 'in_review') {
+      return ancestorId;
+    }
+    ancestorId = ancestor.parentId;
+  }
+  return null;
+}
+
 // ── resolveChildScope ────────────────────────────────────────────────────────
 
 /**
@@ -356,7 +423,12 @@ export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
  * Run the final validation sweep over **all** `in_review` work items.
  *
  * For each item:
- *   - `needsProducerReview === true` → blocking (AC4) with remediation.
+ *   - `needsProducerReview === true` → blocking (AC4) with remediation. An
+ *     **uncovered child** with the flag set is escalated to its nearest
+ *     `in_review` ancestor instead (SA-0MUJLWPB10038Z8Q): the ancestor is
+ *     flagged `needsProducerReview=true` with a comment enumerating the
+ *     child(ren), and the child is removed from the blocking list (the
+ *     parent now blocks the producer-review gate).
  *   - audit `missing` / `stale` / `transient` → auto-remediate via the audit
  *     runner, then re-check; pass → unblocked, still failing → blocking
  *     (AC2).
@@ -378,6 +450,12 @@ export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
  *   runner script path; defaults to `resolveAuditRunner`.
  * @param {(id: string) => (object|null)} [options.getItemByIdFn] - Resolves a
  *   work item by id (for parent-chain coverage); defaults to {@link getItemById}.
+ * @param {(itemId: string, args: string[]) => string} [options.runCloseCommand] -
+ *   Runs a `wl` sub-command (used for the escalation `wl update`); defaults
+ *   to `wl <args> --json`. Tests inject a no-op to stay hermetic.
+ * @param {boolean} [options.dryRun=false] - When true, planned escalations
+ *   are reported but no `wl` mutation is performed and escalation does not
+ *   block (AC4).
  * @returns {Promise<{
  *   hasBlockingItems: boolean,
  *   blockingItems: Array<{
@@ -389,9 +467,12 @@ export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
  *     remediation: string
  *   }>,
  *   remediatedItems: Array<{ workItemId: string, title: string, reason: string }>,
+ *   escalatedItems: Array<{ workItemId: string, title: string, ancestorId: string, reason: string, planned: boolean }>,
+ *   plannedOverrides: Array<{ workItemId: string, title: string, ancestorId: string, reason: string }>,
  *   coveredChildren: Array<{ workItemId: string, title: string, parentId: string|null, reason: string }>,
  *   excludedChildren: Array<{ workItemId: string, title: string, parentId: string|null, parentStage: string|null, reason: string }>,
  *   passingCount: number,
+ *   dryRun: boolean,
  *   message: string
  * }>}
  */
@@ -409,6 +490,11 @@ export async function checkFinalValidation(options = {}) {
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
     getItemByIdFn = getItemById,
+    runCloseCommand = (itemId, args) => execSync(
+      `wl ${args.map(shellQuote).join(' ')} --json`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ),
+    dryRun = false,
   } = options;
 
   const items = getItemsFn();
@@ -418,15 +504,20 @@ export async function checkFinalValidation(options = {}) {
       hasBlockingItems: false,
       blockingItems: [],
       remediatedItems: [],
+      escalatedItems: [],
+      plannedOverrides: [],
       coveredChildren: [],
       excludedChildren: [],
       passingCount: 0,
+      dryRun,
       message: 'No in_review work items found. Final-validation gate passed.',
     };
   }
 
   const blockingItems = [];
   const remediatedItems = [];
+  const escalatedItems = [];
+  const plannedOverrides = [];
   const coveredChildren = [];
   const excludedChildren = [];
   let passingCount = 0;
@@ -445,6 +536,18 @@ export async function checkFinalValidation(options = {}) {
           parentId: scope.ancestorId,
           reason: scope.reason,
         });
+        // Covered child flagged for producer review → the close step performs
+        // the override (SA-0MUJLWPB10038Z8Q AC1). Report it as planned here so
+        // `--dry-run` surfaces the intended overrides (AC4). The real override
+        // (flag clear + comment) happens in `closeWorkItemsAfterRelease`.
+        if (item.needsProducerReview === true) {
+          plannedOverrides.push({
+            workItemId: item.id,
+            title: item.title,
+            ancestorId: scope.ancestorId,
+            reason: 'covered by audit-ready in_review parent audit',
+          });
+        }
         continue;
       }
       if (scope.outcome === 'excluded') {
@@ -466,8 +569,53 @@ export async function checkFinalValidation(options = {}) {
     let producerReview = false;
     let auditIssue = false;
 
-    // ── Producer-review flag (AC1d, AC4) ───────────────────────────────
+    // ── Producer-review flag (AC1d, AC2, AC4) ─────────────────────────
     if (item.needsProducerReview === true) {
+      // Escalation for uncovered children (SA-0MUJLWPB10038Z8Q AC2): set
+      // needsProducerReview=true on the nearest in_review ancestor with a
+      // comment enumerating the child id(s). The parent then blocks the
+      // producer-review gate. Only applies to uncovered children (parentId
+      // is set and resolveChildScope returned 'uncovered').
+      if (item.parentId) {
+        const ancestorId = findInReviewAncestor(item, getItemByIdFn);
+        if (ancestorId) {
+          const escalationMsg =
+            `Uncovered child ${item.id} (${item.title}) requires producer review; `
+            + `escalating to in_review ancestor ${ancestorId}.`;
+          escalatedItems.push({
+            workItemId: item.id,
+            title: item.title,
+            ancestorId,
+            reason: 'needsProducerReview escalated to in_review ancestor',
+            planned: dryRun,
+          });
+          if (dryRun) {
+            // `--dry-run` must not mutate the worklog (AC4).
+            console.log(
+              `Final-validation gate (dry-run): would escalate ${item.id} `
+              + `needsProducerReview to ancestor ${ancestorId}.`,
+            );
+            continue;
+          }
+          try {
+            runCloseCommand(ancestorId, [
+              'update', ancestorId,
+              '--needs-producer-review', 'true',
+              '--comment', `final-validation: ${escalationMsg}`,
+            ]);
+            console.log(
+              `Final-validation gate: escalated ${item.id} needsProducerReview to ancestor ${ancestorId}.`,
+            );
+            // Child no longer blocks independently — parent does.
+            continue;
+          } catch (err) {
+            console.warn(
+              `Final-validation gate: escalation of ${item.id} to ${ancestorId} failed: ${err.message}. Blocking directly.`,
+            );
+            escalatedItems.pop();
+          }
+        }
+      }
       producerReview = true;
       reasons.push('Flagged for producer review');
     }
@@ -546,6 +694,47 @@ export async function checkFinalValidation(options = {}) {
     }
   }
 
+  // ── Escalation → parent blocks the gate (SA-0MUJLWPB10038Z8Q) ───────────
+  // A child escalated to its parent must fail THIS gate: the producer-review
+  // gate (Step 3.6) has already run, so flagging the parent here only takes
+  // effect on the next release. To block the current release deterministically
+  // the escalated ancestor is surfaced as a blocking item (unless it is
+  // already blocking for another reason). Under `--dry-run` nothing was
+  // mutated, so the planned escalation must NOT block (AC4).
+  const escalatedByAncestor = new Map();
+  for (const escalated of escalatedItems) {
+    if (escalated.planned) {
+      continue;
+    }
+    if (!escalatedByAncestor.has(escalated.ancestorId)) {
+      escalatedByAncestor.set(escalated.ancestorId, []);
+    }
+    escalatedByAncestor.get(escalated.ancestorId).push(escalated.workItemId);
+  }
+  for (const [ancestorId, childIds] of escalatedByAncestor) {
+    if (blockingItems.some((entry) => entry.workItemId === ancestorId)) {
+      continue;
+    }
+    let ancestorTitle = ancestorId;
+    try {
+      const ancestor = getItemByIdFn(ancestorId);
+      if (ancestor && ancestor.title) {
+        ancestorTitle = ancestor.title;
+      }
+    } catch {
+      // Title lookup is cosmetic — fall back to the id.
+    }
+    const reason = `Escalated producer review from child(ren): ${childIds.join(', ')}`;
+    blockingItems.push({
+      workItemId: ancestorId,
+      title: ancestorTitle,
+      reasons: [reason],
+      reason,
+      summary: null,
+      remediation: buildProducerReviewRemediationCommand(ancestorId),
+    });
+  }
+
   // ── Build report ───────────────────────────────────────────────────────
   const buildScopeNote = (lines) => {
     if (coveredChildren.length > 0) {
@@ -584,6 +773,59 @@ export async function checkFinalValidation(options = {}) {
     });
   };
 
+  const buildEscalatedNote = (lines) => {
+    if (escalatedItems.length === 0) {
+      return;
+    }
+    const planned = escalatedItems.filter((e) => e.planned);
+    if (planned.length > 0) {
+      lines.push(
+        '',
+        `Note (dry-run): ${planned.length} uncovered child(ren) flagged for producer ` +
+          'review would be escalated to their nearest in_review ancestor (no mutation performed):',
+        '',
+      );
+      planned.forEach((entry, i) => {
+        lines.push(
+          `${i + 1}. ${entry.title} (${entry.workItemId}) → would escalate to ${entry.ancestorId}`,
+        );
+      });
+    }
+    const actual = escalatedItems.filter((e) => !e.planned);
+    if (actual.length > 0) {
+      lines.push(
+        '',
+        `Note: ${actual.length} uncovered child(ren) flagged for producer review ` +
+          'were escalated to their nearest in_review ancestor (the parent now blocks ' +
+          'the producer-review gate for this release):',
+        '',
+      );
+      actual.forEach((entry, i) => {
+        lines.push(
+          `${i + 1}. ${entry.title} (${entry.workItemId}) → escalated to ${entry.ancestorId}`,
+        );
+      });
+    }
+  };
+
+  const buildPlannedOverridesNote = (lines) => {
+    if (plannedOverrides.length === 0) {
+      return;
+    }
+    lines.push(
+      '',
+      `Note: ${plannedOverrides.length} covered child(ren) flagged for producer ` +
+        'review will be overridden at close time (flag cleared) because their nearest ' +
+        'in_review ancestor has a passing audit:',
+      '',
+    );
+    plannedOverrides.forEach((entry, i) => {
+      lines.push(
+        `${i + 1}. ${entry.title} (${entry.workItemId}) → covered by audit of ${entry.ancestorId}`,
+      );
+    });
+  };
+
   if (blockingItems.length === 0) {
     const lines = [
       `All ${items.length} in_review work item(s) passed final validation ` +
@@ -593,14 +835,19 @@ export async function checkFinalValidation(options = {}) {
         'Final-validation gate passed.',
     ];
     buildRemediatedNote(lines);
+    buildEscalatedNote(lines);
+    buildPlannedOverridesNote(lines);
     buildScopeNote(lines);
     return {
       hasBlockingItems: false,
       blockingItems: [],
       remediatedItems,
+      escalatedItems,
+      plannedOverrides,
       coveredChildren,
       excludedChildren,
       passingCount,
+      dryRun,
       message: lines.join('\n'),
     };
   }
@@ -626,6 +873,8 @@ export async function checkFinalValidation(options = {}) {
   });
 
   buildRemediatedNote(lines);
+  buildEscalatedNote(lines);
+  buildPlannedOverridesNote(lines);
   buildScopeNote(lines);
 
   lines.push(
@@ -639,9 +888,12 @@ export async function checkFinalValidation(options = {}) {
     hasBlockingItems: true,
     blockingItems,
     remediatedItems,
+    escalatedItems,
+    plannedOverrides,
     coveredChildren,
     excludedChildren,
     passingCount,
+    dryRun,
     message: lines.join('\n'),
   };
 }
