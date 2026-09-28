@@ -47,6 +47,15 @@ configured runner):
   cache keys and count as full-suite evidence (SA-0MSN6FBFS006Z5QP).
 - `IMPLEMENT_TEST_COMMAND` overrides detection entirely (per-repo test
   command, e.g. a Unity test runner invoked via a repo-local script).
+- **Paced execution (SA-0MUKHCO02009EQFG):** every real suite execution
+  triggered by `implement.py` (changed- and full-scope, all tooling
+  branches) acquires the shared `"test"` semaphore from the test skill via
+  `paced_runner`, before spawning. Cache hits never invoke the runner and so
+  never consume a slot (parity with `run_tests.py`). The ceiling and bounded
+  wait come from `TEST_MAX_CONCURRENCY` / `TEST_LOCK_TIMEOUT`; on saturation
+  the gate returns a clear failed result (logged with an actionable retry
+  hint) and stores no cache entry, so a saturated host cannot be
+  oversubscribed by concurrent finish gates.
 
 The returned dict includes `skipped` (bool) and `tooling` (str | None) in
 addition to `success`/`stdout`/`stderr`/`exit_code`/`failures`.

@@ -70,10 +70,19 @@ try:
     # skill's scripts) must still start implement.py — changed-scope then
     # degrades to full scope with a warning.
     from test.scripts.run_tests import (
+        TestConcurrencyTimeout as _TestConcurrencyTimeout,
+    )
+    from test.scripts.run_tests import (
         changed_scope_commands as _changed_scope_commands,
     )
+    from test.scripts.run_tests import paced_runner as _test_paced_runner
 except ModuleNotFoundError:
     _changed_scope_commands = None  # type: ignore[assignment]
+    _test_paced_runner = None  # type: ignore[assignment]
+
+    class _TestConcurrencyTimeout(RuntimeError):  # type: ignore[no-redef]
+        """Fallback when the test skill is unavailable (never raised)."""
+
 from test_cache import run_cached
 from test_runner import canonicalize_quiet_test_command
 
@@ -1992,6 +2001,52 @@ def _shell_command_runner(
     )
 
 
+def _paced_runner(runner: Any) -> Any:
+    """Route a cache *runner* through the test skill's host-wide pacer.
+
+    Wrapping the runner (not ``run_cached`` itself) means only ACTUAL
+    executions acquire a ``"test"`` semaphore slot; a cache hit never
+    invokes the runner and so never consumes a slot
+    (SA-0MUKHCO02009EQFG AC1/AC2). Falls back to the unmodified runner on
+    partial skill installs where the test skill is unavailable (degraded,
+    unpaced execution rather than failing the gate outright).
+    """
+    if _test_paced_runner is None:
+        return runner
+    return _test_paced_runner(runner)
+
+
+def _run_cached_paced(command: str, **kwargs: Any) -> dict[str, Any]:
+    """``run_cached`` with the runner paced through the test semaphore.
+
+    On ``TEST_LOCK_TIMEOUT`` saturation, returns a clear failed result (the
+    exception path stores nothing in the cache, so a saturated host never
+    poisons the cache with a phantom timeout entry). Mirrors the test
+    skill's bounded-wait semantics (SA-0MTG5U75A001F1RG,
+    SA-0MUKHCO02009EQFG AC3).
+    """
+    runner = kwargs.pop("runner", None)
+    if runner is not None:
+        kwargs["runner"] = _paced_runner(runner)
+    try:
+        return run_cached(command, **kwargs)
+    except _TestConcurrencyTimeout as exc:
+        LOG.error(
+            "Implement run_tests: could not acquire a test-run slot — %s. "
+            "Another suite is executing; retry later, or raise "
+            "TEST_LOCK_TIMEOUT to wait longer.",
+            exc,
+        )
+        return {
+            "stdout": "",
+            "stderr": str(exc),
+            "exit_code": 1,
+            "command": command,
+            "git_state": "",
+            "cached": False,
+        }
+
+
 def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
     """Run only the tests affected by the worktree's changes vs *base_ref*.
 
@@ -2023,7 +2078,7 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     pytest_cmds = [c for c in commands if c.startswith("pytest")]
     if not pytest_cmds:
         return None
-    run = run_cached(
+    run = _run_cached_paced(
         pytest_cmds[0],
         cwd=cwd,
         timeout=_resolve_test_timeout(cwd),
@@ -2114,7 +2169,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd,
             )
         return _finalize_test_result(
-            run_cached(
+            _run_cached_paced(
                 override,
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
@@ -2139,7 +2194,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 "suiteCommands) — falling back to full scope.",
                 cwd,
             )
-        pytest_run = run_cached(
+        pytest_run = _run_cached_paced(
             PYTEST_CMD,
             cwd=cwd,
             timeout=_resolve_test_timeout(cwd),
@@ -2152,7 +2207,7 @@ def run_tests(cwd: str, scope: str = "changed",
         final_tooling = "pytest"
         if result["exit_code"] != 0 and _has_test_script(cwd):
             # Try npm test as fallback (also cached, canonical form)
-            npm_run = run_cached(
+            npm_run = _run_cached_paced(
                 NPM_TEST_CMD,
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
@@ -2179,7 +2234,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd,
             )
         return _finalize_test_result(
-            run_cached(
+            _run_cached_paced(
                 NPM_TEST_CMD,
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
@@ -2219,7 +2274,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd,
             )
         return _finalize_test_result(
-            run_cached(
+            _run_cached_paced(
                 command,
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),

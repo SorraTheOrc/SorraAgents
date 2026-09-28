@@ -116,6 +116,19 @@ hits are completely unaffected by concurrency saturation.
 acquires the concurrency slot before executing. Under saturation, a forced run
 waits bounded rather than failing fast.
 
+**Reusable pacer for other callers (`paced_runner`, SA-0MUKHCO02009EQFG):** the
+test skill exposes `paced_runner(runner)` as the single entry point for other
+code paths that execute suites through `run_cached`. It wraps a cache *runner*
+so each real execution holds a `"test"` slot, while cache hits — which never
+invoke the runner — consume no slot. `implement.py`'s finish gate (changed- and
+full-scope, all tooling branches: pytest / npm / override / repo-script) now
+passes its runners through `paced_runner`, so implement-gate executions are
+bounded by the same host-wide ceiling as `run_tests.py` and can no longer
+oversubscribe the host alongside audit-triggered or browser runs. On
+saturation the gate returns a clear failed result (logged: `Implement
+run_tests: could not acquire a test-run slot …`) and stores no cache entry —
+raise `TEST_LOCK_TIMEOUT` to wait longer.
+
 ### 1. Suite-command resolution order (F2, SA-0MSTMYE79006NA61)
 
 The full suite is `full_suite_commands(project_root)`, resolved in this

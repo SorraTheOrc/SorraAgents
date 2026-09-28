@@ -18,6 +18,7 @@ concurrency primitive):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -53,6 +54,7 @@ from run_tests import (
     _cached_runner,
     _test_lock_timeout,
     _test_semaphore_max_workers,
+    paced_runner,
     run_suite,
 )
 
@@ -336,3 +338,62 @@ def test_single_ceiling_serializes_cross_process(monkeypatch):
     acquired = [r for r in results if r.get("acquired") is not None]
     assert len(acquired) == 3, f"starvation/deadlock: {results}"
     assert _max_concurrent(results) == 1, f"not serialized: {results}"
+
+
+# ---------------------------------------------------------------------------
+# paced_runner: reusable pacer entry point (SA-0MUKHCO02009EQFG)
+# ---------------------------------------------------------------------------
+
+
+class TestPacedRunner:
+    """``paced_runner`` wraps a cache runner so real executions hold a slot.
+
+    ``run_cached`` invokes its runner only on a cache MISS, so wrapping the
+    runner (not ``run_cached``) gives the intended semantics: real
+    executions are paced, cache hits never acquire a slot.
+    """
+
+    def test_wrapper_does_not_acquire_until_invoked(self):
+        """Merely building the wrapper must not touch the semaphore."""
+        with mock.patch(
+            "run_tests._test_concurrency_slot",
+        ) as slot:
+            paced = paced_runner(lambda cmd, cwd, t: SimpleNamespace())
+            slot.assert_not_called()
+            paced("pytest", "/tmp", 10)
+            slot.assert_called_once()
+
+    def test_invocation_holds_slot_around_runner(self):
+        """The wrapped runner runs inside the ``_test_concurrency_slot``."""
+        order: list[str] = []
+
+        @contextlib.contextmanager
+        def _fake_slot():
+            order.append("acquire")
+            try:
+                yield
+            finally:
+                order.append("release")
+
+        def _runner(cmd, cwd, timeout):
+            order.append("execute")
+            return SimpleNamespace(stdout="ok", stderr="", returncode=0)
+
+        with mock.patch("run_tests._test_concurrency_slot", _fake_slot):
+            result = paced_runner(_runner)("pytest", "/tmp", 10)
+
+        assert result.stdout == "ok"
+        assert order == ["acquire", "execute", "release"]
+
+    def test_timeout_propagates_as_test_concurrency_timeout(self):
+        """A saturated slot surfaces as ``TestConcurrencyTimeout``."""
+        @contextlib.contextmanager
+        def _busy_slot():
+            raise TestConcurrencyTimeout("busy")
+            yield  # pragma: no cover
+
+        with mock.patch("run_tests._test_concurrency_slot", _busy_slot):
+            with pytest.raises(TestConcurrencyTimeout):
+                paced_runner(
+                    lambda cmd, cwd, t: SimpleNamespace()
+                )("pytest", "/tmp", 10)

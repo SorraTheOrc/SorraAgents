@@ -76,6 +76,7 @@ from shared.skill_extensions import (
 from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
+    Runner,
     query_cached,
     run_cached,
     summary_lines,
@@ -1209,6 +1210,32 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
     executable = executable_test_command(command)
     with _test_concurrency_slot():
         return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
+
+
+def paced_runner(runner: Runner) -> Runner:
+    """Wrap a cache *runner* so each real execution holds a test-run slot.
+
+    The ``run_cached`` protocol invokes *runner* only on a cache **miss**;
+    a cache hit returns the stored result without calling it. Wrapping the
+    runner — rather than ``run_cached`` itself — therefore gives exactly the
+    intended semantics: every real suite execution acquires the shared
+    ``"test"`` semaphore (ceiling ``TEST_MAX_CONCURRENCY``, bounded wait
+    ``TEST_LOCK_TIMEOUT``), and cache hits never consume a slot.
+
+    This is the single pacer entry point other code paths (e.g.
+    ``implement.py``'s finish-gate suites, SA-0MUKHCO02009EQFG) use to route
+    their executions through the same host-wide ``"test"`` namespace as
+    ``run_tests.py`` (SA-0MTG5U75A001F1RG). A caller that does not pace keeps
+    its previous unpaced behaviour, so this is opt-in.
+
+    Raises:
+        TestConcurrencyTimeout: when no slot frees within ``TEST_LOCK_TIMEOUT``.
+    """
+    def _paced(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+        with _test_concurrency_slot():
+            return runner(command, cwd, timeout)
+
+    return _paced
 
 
 def run_suite(
