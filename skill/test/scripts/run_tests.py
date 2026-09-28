@@ -50,7 +50,8 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -1213,7 +1214,10 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
         return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
 
 
-def paced_runner(runner: Runner | None = None) -> Runner:
+def paced_runner(
+    runner: Runner | None = None,
+    on_wait: Callable[[float, float], None] | None = None,
+) -> Runner:
     """Wrap a cache *runner* so each real execution holds a test-run slot.
 
     The ``run_cached`` protocol invokes *runner* only on a cache **miss**;
@@ -1229,6 +1233,10 @@ def paced_runner(runner: Runner | None = None) -> Runner:
     auto-execution (SA-0MUJK94QN0015925) — can route it through the pacer by
     passing ``runner=paced_runner()`` alone.
 
+    *on_wait*, when supplied, is called with ``(queued_at, wait_seconds)``
+    immediately after the slot is acquired and before the command is spawned,
+    so callers can emit pacing telemetry (SA-0MUA8BSAG000YZA2 AC3).
+
     This is the single pacer entry point other code paths (e.g.
     ``implement.py``'s finish-gate suites, SA-0MUKHCO02009EQFG) use to route
     their executions through the same host-wide ``"test"`` namespace as
@@ -1242,7 +1250,10 @@ def paced_runner(runner: Runner | None = None) -> Runner:
         runner = _default_runner
 
     def _paced(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+        queued_at = time.time()
         with _test_concurrency_slot():
+            if on_wait is not None:
+                on_wait(queued_at, time.time() - queued_at)
             return runner(command, cwd, timeout)
 
     return _paced

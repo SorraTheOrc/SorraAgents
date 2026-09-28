@@ -127,7 +127,22 @@ bounded by the same host-wide ceiling as `run_tests.py` and can no longer
 oversubscribe the host alongside audit-triggered or browser runs. On
 saturation the gate returns a clear failed result (logged: `Implement
 run_tests: could not acquire a test-run slot …`) and stores no cache entry —
-raise `TEST_LOCK_TIMEOUT` to wait longer.
+raise `TEST_LOCK_TIMEOUT` to wait longer. `paced_runner(runner, on_wait=…)`
+also reports `(queued_at, wait_seconds)` immediately after the slot is
+acquired; implement-gate runs use this to emit a
+`test slot acquired — queued_at=… wait_seconds=…` line, so contention is
+observable rather than silent (SA-0MUA8BSAG000YZA2 AC3).
+
+**Browser-suite contention (SA-0MUA8BSAG000YZA2):** with every execution path
+paced by the shared `"test"` semaphore, cross-suite oversubscription is bounded
+by `TEST_MAX_CONCURRENCY` — the historically observed 30+ concurrent
+`vitest`/Chromium processes came from **unpaced** `run_cached` call paths
+(implement.py finish gates and the audit F3 path, both now paced), not from a
+raised cap. Repos whose suites spin up a 4-worker Chromium/browser stage and
+that must never overlap another suite's browser stage should set
+`TEST_MAX_CONCURRENCY=1` in the environment (env-var mechanism only; no config
+file). Slot-file pruning beyond the ceiling is tracked separately
+(ContextHub WL-0MUL1DSEF004IJU9).
 
 ### 1. Suite-command resolution order (F2, SA-0MSTMYE79006NA61)
 

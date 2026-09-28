@@ -397,3 +397,47 @@ class TestPacedRunner:
                 paced_runner(
                     lambda cmd, cwd, t: SimpleNamespace()
                 )("pytest", "/tmp", 10)
+
+
+class TestPacedRunnerTelemetry:
+    """``paced_runner(on_wait=...)`` reports slot-acquisition telemetry."""
+
+    def test_on_wait_receives_queued_at_and_wait_seconds(self):
+        order: list[str] = []
+        waits: list[tuple[float, float]] = []
+
+        @contextlib.contextmanager
+        def _fake_slot():
+            order.append("acquire")
+            try:
+                yield
+            finally:
+                order.append("release")
+
+        def _runner(cmd, cwd, timeout):
+            order.append("execute")
+            return SimpleNamespace(stdout="ok", stderr="", returncode=0)
+
+        with mock.patch("run_tests._test_concurrency_slot", _fake_slot):
+            paced_runner(
+                _runner,
+                on_wait=lambda queued_at, wait: waits.append((queued_at, wait)),
+            )("pytest", "/tmp", 10)
+
+        assert len(waits) == 1
+        queued_at, wait = waits[0]
+        assert isinstance(queued_at, float)
+        assert wait >= 0.0
+        # Telemetry fires after acquisition, before execution.
+        assert order == ["acquire", "execute", "release"]
+
+    def test_no_callback_is_silent(self):
+        """Omitting ``on_wait`` keeps the previous behaviour (no callback)."""
+        with mock.patch(
+            "run_tests._test_concurrency_slot",
+            contextlib.nullcontext,
+        ):
+            result = paced_runner(
+                lambda c, w, t: SimpleNamespace(stdout="ok", stderr="", returncode=0)
+            )("pytest", "/tmp", 10)
+        assert result.stdout == "ok"

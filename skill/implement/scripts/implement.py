@@ -2001,19 +2001,37 @@ def _shell_command_runner(
     )
 
 
+def _log_test_slot_wait(queued_at: float, wait_seconds: float) -> None:
+    """Emit implement-gate pacing telemetry (SA-0MUA8BSAG000YZA2 AC3).
+
+    Called by the test skill's pacer once a "test" slot is held and just
+    before the command is spawned, so a contended host produces an
+    observable ``queued_at`` / ``wait_seconds`` line instead of silently
+    colliding.
+    """
+    LOG.info(
+        "Implement run_tests: test slot acquired — queued_at=%.3f "
+        "wait_seconds=%.3f",
+        queued_at,
+        wait_seconds,
+    )
+
+
 def _paced_runner(runner: Any) -> Any:
     """Route a cache *runner* through the test skill's host-wide pacer.
 
     Wrapping the runner (not ``run_cached`` itself) means only ACTUAL
     executions acquire a ``"test"`` semaphore slot; a cache hit never
     invokes the runner and so never consumes a slot
-    (SA-0MUKHCO02009EQFG AC1/AC2). Falls back to the unmodified runner on
+    (SA-0MUKHCO02009EQFG AC1/AC2). The pacer also emits a
+    ``queued_at`` / ``wait_seconds`` telemetry line after acquiring the slot
+    (SA-0MUA8BSAG000YZA2 AC3). Falls back to the unmodified runner on
     partial skill installs where the test skill is unavailable (degraded,
     unpaced execution rather than failing the gate outright).
     """
     if _test_paced_runner is None:
         return runner
-    return _test_paced_runner(runner)
+    return _test_paced_runner(runner, on_wait=_log_test_slot_wait)
 
 
 def _run_cached_paced(command: str, **kwargs: Any) -> dict[str, Any]:

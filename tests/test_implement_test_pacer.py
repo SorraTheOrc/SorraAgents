@@ -237,3 +237,44 @@ class TestNoUnguardedExecutionPath:
         assert "acquire" in events, (
             f"{tooling}/{scope} branch passed an unpaced runner: {events}"
         )
+
+
+class TestImplementGatePacingTelemetry:
+    """AC3 (SA-0MUA8BSAG000YZA2): implement-gate runs emit pacing telemetry."""
+
+    def test_full_scope_gate_logs_queued_at_and_wait_seconds(
+        self, monkeypatch, caplog, _capture_runner
+    ):
+        mod, captured = _capture_runner
+        events: list[str] = []
+        _patch_slot(monkeypatch, mod, _record_slot(events))
+
+        mod.run_tests("/tmp", scope="full")
+
+        runner = captured["runner"]
+        with caplog.at_level("INFO"):
+            runner(captured["command"], captured["cwd"], captured["timeout"])
+
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any(
+            "queued_at=" in m and "wait_seconds=" in m for m in messages
+        ), f"no queued_at/wait_seconds telemetry line: {messages}"
+
+    def test_changed_scope_gate_logs_telemetry(
+        self, monkeypatch, caplog, _capture_runner
+    ):
+        mod, captured = _capture_runner
+        monkeypatch.setattr(mod, "_changed_scope_commands", lambda *a, **k: [SCOPED_CMD])
+        events: list[str] = []
+        _patch_slot(monkeypatch, mod, _record_slot(events))
+
+        mod.run_tests("/tmp", scope="changed")
+
+        runner = captured["runner"]
+        with caplog.at_level("INFO"):
+            runner(captured["command"], captured["cwd"], captured["timeout"])
+
+        assert any(
+            "queued_at=" in rec.getMessage() and "wait_seconds=" in rec.getMessage()
+            for rec in caplog.records
+        )
