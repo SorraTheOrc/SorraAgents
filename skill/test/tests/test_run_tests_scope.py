@@ -13,7 +13,6 @@ Tests cover:
 from __future__ import annotations
 
 import json
-import subprocess
 
 # Resolve the module under test — same pattern as run_tests.py itself.
 # The runner lives at <skills>/test/scripts/run_tests.py; inserting that
@@ -32,7 +31,6 @@ if str(_RUNNER_DIR) not in _sys.path:
     _sys.path.insert(0, str(_RUNNER_DIR))
 
 import run_tests
-
 from run_tests import (
     build_parser,
     changed_scope_commands,
@@ -41,6 +39,7 @@ from run_tests import (
     run_all,
     run_suite,
 )
+from shared.git_sandbox import commit_all, init_repo, run_git
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -49,8 +48,7 @@ from run_tests import (
 
 def _make_repo(tmp_path: Path) -> Path:
     """Create a minimal git repo with test and source files."""
-    repo = tmp_path / "test_repo"
-    repo.mkdir()
+    repo = init_repo(tmp_path / "test_repo")
     (repo / "src").mkdir()
     (repo / "tests").mkdir()
 
@@ -64,23 +62,29 @@ def _make_repo(tmp_path: Path) -> Path:
     (repo / "tests" / "test_foo.py").write_text("import src.foo\n")
     (repo / "tests" / "test_bar.py").write_text("import src.bar\n")
 
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
-
-    # Initial commit
-    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+    # Initial commit (identity + hermetic environment come from the sandbox)
+    commit_all(repo, "initial")
 
     # Second commit on dev so HEAD~1 always exists for fallback tests
     (repo / "README.md").write_text("# test repo\n")
-    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "docs: add readme"], cwd=repo, check=True, capture_output=True)
+    commit_all(repo, "docs: add readme")
 
     # Create a remote-like branch for merge-base resolution
-    subprocess.run(["git", "branch", "origin/dev"], cwd=repo, check=True, capture_output=True)
+    run_git(repo, ["branch", "origin/dev"], check=True)
 
+    return repo
+
+
+def _init_repo_with_dev(repo: Path, *, message: str = "initial") -> Path:
+    """Create a hermetic repo at *repo* on branch ``dev`` with one commit.
+
+    Every git invocation is routed through the shared sandbox helper so a
+    leaked repository-overriding environment variable (``GIT_DIR``,
+    ``GIT_WORK_TREE``, …) cannot redirect the fixture away from *repo*
+    (SA-0MUG0WFP8008WN63 — parent AC1).
+    """
+    init_repo(repo, default_branch="dev")
+    commit_all(repo, message)
     return repo
 
 
@@ -117,7 +121,7 @@ class TestComputeChangedFiles:
         repo = _make_repo(tmp_path)
 
         # Remove origin/dev
-        subprocess.run(["git", "branch", "-D", "origin/dev"], cwd=repo, check=True, capture_output=True)
+        run_git(repo, ["branch", "-D", "origin/dev"], check=True)
 
         (repo / "src" / "bar.py").write_text("# bar — modified\n")
 
@@ -131,10 +135,10 @@ class TestComputeChangedFiles:
         (repo / "src" / "utils.py").write_text("# utils — modified\n")
 
         # Move to a feature branch so we can delete the dev branch
-        subprocess.run(["git", "checkout", "-b", "feature"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-D", "origin/dev"], cwd=repo, check=True, capture_output=True)
+        run_git(repo, ["checkout", "-b", "feature"], check=True)
+        run_git(repo, ["branch", "-D", "origin/dev"], check=True)
         # Delete local dev branch; HEAD~1 is now the only base available
-        subprocess.run(["git", "branch", "-D", "dev"], cwd=repo, check=True, capture_output=True)
+        run_git(repo, ["branch", "-D", "dev"], check=True)
 
         result = compute_changed_files(repo, base_ref="origin/dev")
         assert "src/utils.py" in result
@@ -204,12 +208,7 @@ class TestMapChangedToTests:
         (repo / "tests" / "test_foo.py").write_text("import foo\n")
         (repo / "tests" / "test_bar.py").write_text("import bar2\n")
 
-        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+        _init_repo_with_dev(repo)
 
         changed = {"src/utils.py"}
         tests = map_changed_to_tests(repo, changed)
@@ -305,12 +304,7 @@ class TestChangedScopeCommands:
         (repo / "tests" / "node" / "utils.test.mjs").write_text('import test from "node:test";')
         (repo / "tests" / "node" / "other.test.mjs").write_text('import test from "node:test";')
 
-        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+        _init_repo_with_dev(repo)
 
         (repo / "src" / "utils.mjs").write_text("export const helper = 2;\n")
 
@@ -342,12 +336,7 @@ class TestPerSuiteChangedScope:
         (repo / "tests" / "test_foo.py").write_text("\n")
         (repo / "tests" / "node" / "utils.test.mjs").write_text("import test from \"node:test\";\n")
         (repo / "src" / "foo.py").write_text("from src import utils\n")
-        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+        _init_repo_with_dev(repo, message="init")
         (repo / "src" / "foo.py").write_text("from src import utils\nchanged\n")
 
         captured: list[str] = []
@@ -355,7 +344,11 @@ class TestPerSuiteChangedScope:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
+        # Bypass the shared concurrency semaphore so the test is not
+        # flaky when the host-wide TEST_MAX_CONCURRENCY slot is saturated
+        # (SA-0MUF9TXFN009I6Q2).
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
             result = run_suite(
                 "pytest",
                 cwd=repo,
@@ -376,12 +369,7 @@ class TestPerSuiteChangedScope:
         (repo / "src").mkdir()
         (repo / "pytest.ini").write_text("[pytest]\n")
         (repo / "tests" / "test_foo.py").write_text("\n")
-        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+        _init_repo_with_dev(repo, message="init")
         # change only a doc — no test files selectable
         (repo / "README.md").write_text("# changed\n")
 
@@ -390,7 +378,11 @@ class TestPerSuiteChangedScope:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
+        # Bypass the shared "test" semaphore: a saturated host must not turn
+        # this unit test into a TestConcurrencyTimeout flake
+        # (SA-0MUF9TXFN009I6Q2, SA-0MUGXZGVZ001UFPG).
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
             result = run_suite(
                 "pytest",
                 cwd=repo,
@@ -411,12 +403,7 @@ class TestPerSuiteChangedScope:
         (repo / "pytest.ini").write_text("[pytest]\n")
         (repo / "tests" / "test_utils.py").write_text("\n")
         (repo / "src" / "utils.py").write_text("x = 1\n")
-        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-M", "dev"], cwd=repo, check=True, capture_output=True)
+        _init_repo_with_dev(repo, message="init")
         (repo / "src" / "utils.py").write_text("x = 2\n")
 
         def fake_cached(command, cwd, **kwargs):
@@ -451,7 +438,10 @@ class TestScopePropagated:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
+        # Bypass the shared "test" semaphore (SA-0MUF9TXFN009I6Q2,
+        # SA-0MUGXZGVZ001UFPG).
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
             result = run_suite(
                 "pytest",
                 cwd="/tmp",
@@ -471,7 +461,10 @@ class TestScopePropagated:
             captured.append(" ".join(cmd_list))
             return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run):
+        # Bypass the shared "test" semaphore (SA-0MUF9TXFN009I6Q2,
+        # SA-0MUGXZGVZ001UFPG).
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
             result = run_all(
                 suites=("pytest",),
                 cwd="/tmp",
@@ -534,3 +527,183 @@ class TestCLIFlags:
         parser = build_parser()
         args = parser.parse_args([])
         assert args.target_branch is None
+
+
+# ---------------------------------------------------------------------------
+# Deleted/non-existent path regression tests (F1 — red baseline)
+# These tests reproduce the bug where `map_changed_to_tests()` adds changed
+# test-file paths without verifying they still exist on disk. They FAIL
+# against the unfixed code and should PASS after the fix in F2.
+# ---------------------------------------------------------------------------
+
+
+class TestDeletedPathSelection:
+    """AC1/AC3: deleted test files must be excluded from changed-scope selection."""
+
+    def test_deleted_test_file_excluded_from_map(self, tmp_path: Path) -> None:
+        """A test file that is tracked-in-git as changed but deleted from the
+        worktree must NOT appear in map_changed_to_tests() results.
+
+        This reproduces the original bug where a git-diff entry for a deleted
+        test file was unconditionally added to the selection set.
+        """
+        repo = _make_repo(tmp_path)
+
+        # Add and commit a test file, then delete it
+        (repo / "tests" / "test_extra.py").write_text("import src.extra\n")
+        commit_all(repo, "add test_extra")
+
+        # Now delete the file (it will appear in git diff as a deletion)
+        (repo / "tests" / "test_extra.py").unlink()
+
+        # Simulate changed files: the deleted file appears in git diff
+        changed = {"tests/test_extra.py"}
+        tests = map_changed_to_tests(repo, changed)
+
+        # BUG: currently this assertion FAILS because the deleted file is
+        # still included in the selection.
+        assert "tests/test_extra.py" not in tests, (
+            "deleted test file tests/test_extra.py was included in "
+            "map_changed_to_tests() selection even though the file no longer "
+            "exists on disk"
+        )
+
+    def test_deleted_test_file_excluded_from_changed_scope_commands(
+        self, tmp_path: Path
+    ) -> None:
+        """A deletion-only change must cause changed_scope_commands() to return
+        None (full-scope fallback), not emit a command referencing the
+        non-existent file.
+
+        This is AC2: changed_scope_commands() must never emit a command that
+        references a non-existent path.
+        """
+        repo = _make_repo(tmp_path)
+        (repo / "pytest.ini").write_text("[pytest]\n")
+
+        # Add and commit a test file, then delete it
+        (repo / "tests" / "test_extra.py").write_text("import src.extra\n")
+        commit_all(repo, "add test_extra")
+
+        # Now delete the file
+        (repo / "tests" / "test_extra.py").unlink()
+
+        # The changed file is the deleted test
+        changed = {"tests/test_extra.py"}
+        cmds = changed_scope_commands(repo, base_ref="dev", changed_files=changed)
+
+        # BUG: currently this assertion FAILS because the command still
+        # references the non-existent file.
+        assert cmds is None, (
+            f"changed_scope_commands() returned a command for a deleted test file: {cmds}. "
+            "Expected None (full-scope fallback) when the only changed test is deleted."
+        )
+
+    def test_mixed_deleted_and_modified_selection_excludes_deleted(
+        self, tmp_path: Path
+    ) -> None:
+        """A mixed change (one deleted test file + one modified source file)
+        must select only the test corresponding to the modified source, not
+        the deleted test.
+
+        Regression for AC1/AC3: deleted paths must not appear in the emitted command.
+        """
+        repo = _make_repo(tmp_path)
+        (repo / "pytest.ini").write_text("[pytest]\n")
+
+        # Add and commit a test file, then delete it
+        (repo / "tests" / "test_extra.py").write_text("import src.extra\n")
+        commit_all(repo, "add test_extra")
+
+        # Modify src/utils.py AND delete test_extra.py
+        (repo / "src" / "utils.py").write_text("# utils — modified\n")
+        (repo / "tests" / "test_extra.py").unlink()
+
+        changed = {"src/utils.py", "tests/test_extra.py"}
+        tests = map_changed_to_tests(repo, changed)
+
+        # test_utils.py should be selected (from modified src/utils.py)
+        assert "tests/test_utils.py" in tests
+        # test_extra.py should NOT be selected (it was deleted)
+        assert "tests/test_extra.py" not in tests, (
+            "deleted test file tests/test_extra.py was included in selection "
+            "alongside an existing change"
+        )
+
+    def test_deleted_test_file_in_changed_scope_commands_mixed(
+        self, tmp_path: Path
+    ) -> None:
+        """For a mixed change (modified source + deleted test), the emitted
+        command must contain only existing paths.
+
+        Regression for AC3: the pytest command should not reference the
+        deleted file.
+        """
+        repo = _make_repo(tmp_path)
+        (repo / "pytest.ini").write_text("[pytest]\n")
+
+        # Add and commit a test file, then delete it
+        (repo / "tests" / "test_extra.py").write_text("import src.extra\n")
+        commit_all(repo, "add test_extra")
+
+        # Modify src/utils.py AND delete test_extra.py
+        (repo / "src" / "utils.py").write_text("# utils — modified\n")
+        (repo / "tests" / "test_extra.py").unlink()
+
+        changed = {"src/utils.py", "tests/test_extra.py"}
+        cmds = changed_scope_commands(repo, base_ref="dev", changed_files=changed)
+
+        # BUG: currently this assertion FAILS because the command still
+        # references the non-existent file.
+        assert cmds is not None
+        assert len(cmds) == 1
+        cmd = cmds[0]
+        assert "pytest" in cmd.lower()
+        assert "tests/test_utils.py" in cmd
+        assert "tests/test_extra.py" not in cmd, (
+            f"deleted test file tests/test_extra.py appears in changed-scope "
+            f"command: {cmd}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Hermetic sandbox invariant (SA-0MUG0WFP8008WN63 — parent AC1)
+# ---------------------------------------------------------------------------
+
+
+class TestRepoHelpersAreHermetic:
+    """Every repo-building helper in this module must be sandbox-hermetic.
+
+    Regression guard for parent AC1: a leaked repository-overriding
+    environment variable (``GIT_DIR``) must not redirect the helpers away from
+    their ``tmp_path`` sandbox, and each helper's repository must resolve
+    inside ``tmp_path``.
+    """
+
+    def test_leaked_git_dir_cannot_redirect_repo_helpers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        victim = init_repo(tmp_path / "victim")
+        (victim / "real.txt").write_text("real", encoding="utf-8")
+        commit_all(victim, "victim base")
+        victim_head = run_git(victim, ["rev-parse", "HEAD"], check=True).stdout.strip()
+
+        direct_dir = tmp_path / "sandbox_repo"
+        direct_dir.mkdir()
+        (direct_dir / "fixture.txt").write_text("fixture", encoding="utf-8")
+
+        monkeypatch.setenv("GIT_DIR", str(victim / ".git"))
+        try:
+            direct = _init_repo_with_dev(direct_dir)
+            full = _make_repo(tmp_path / "sandbox_make")
+        finally:
+            monkeypatch.delenv("GIT_DIR", raising=False)
+
+        # The leaked GIT_DIR must not have touched the victim repository.
+        assert run_git(victim, ["rev-parse", "HEAD"], check=True).stdout.strip() == victim_head
+        # ...and both helpers' repositories must resolve inside the tmp_path sandbox.
+        for created in (direct, full):
+            toplevel = run_git(
+                created, ["rev-parse", "--show-toplevel"], check=True
+            ).stdout.strip()
+            assert Path(toplevel).resolve() == created.resolve()

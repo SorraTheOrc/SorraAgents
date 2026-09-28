@@ -73,7 +73,7 @@ def test_run_audit_dry_run(tmp_path):
 def test_run_audit_includes_session_id_non_dry_run(tmp_path, monkeypatch):
     """AC2: run_audit_in_worktree adds --session-id when dry_run=False.
 
-    The session-id must be ``audit-{wl_id}-entrypoint-{uuid8}`` with an
+    The session-id must be ``audit-pr-{wl_id}-{uuid8}`` with an
     8-hex-char UUID suffix, and the WL id must be embedded.
     """
     captured = {}
@@ -94,7 +94,7 @@ def test_run_audit_includes_session_id_non_dry_run(tmp_path, monkeypatch):
     assert '--session-id' in cmd
     idx = cmd.index('--session-id')
     session_id = cmd[idx + 1]
-    assert session_id.startswith('audit-SA-TEST-entrypoint-')
+    assert session_id.startswith('audit-pr-SA-TEST-')
     suffix = session_id.rsplit('-', 1)[1]
     assert len(suffix) == 8
     int(suffix, 16)

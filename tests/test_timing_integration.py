@@ -17,6 +17,7 @@ resolution so the tests work from a git worktree too.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -152,6 +153,8 @@ class TestHumanModeTiming:
              "--headline", "Integration verification"],
             capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
             timeout=120,
+            # Never touch a live herdr pane from the test suite.
+            env={**os.environ, "HERDR_PANE_ID": "", "HERDR_ENV": ""},
         )
         assert proc.returncode == 0, f"render_report failed: {proc.stderr[:300]}"
         assert proc.stdout.startswith("# Completed integration-test"), (

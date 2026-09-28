@@ -100,6 +100,10 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
     (skill_pkg / "test_cache.py").write_text(real_tc)
     real_tr = (_REPO_ROOT / "skill" / "test_runner.py").read_text()
     (skill_pkg / "test_runner.py").write_text(real_tr)
+    # Provide the stdlib-only git sandbox helper (SA-0MUIA3OE40001QJX) —
+    # test_runner re-exports the shared repository-override scrub from it.
+    real_gs = (_REPO_ROOT / "skill" / "shared" / "git_sandbox.py").read_text()
+    (skill_pkg / "shared" / "git_sandbox.py").write_text(real_gs)
     # Provide the graceful-failure guard (F3, SA-0MSWJ9ZEU001HDVT) —
     # implement.py imports guard_shared_import at module load.
     real_ig = (_REPO_ROOT / "skill" / "import_guard.py").read_text()

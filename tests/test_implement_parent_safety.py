@@ -240,8 +240,10 @@ class TestAbortAndFailure:
             mock.patch.object(implement_mod, "cleanup_worktree_processes", return_value={}),
             mock.patch.object(implement_mod, "_discover_worktree", return_value=None),
             mock.patch.object(implement_mod, "_restore_repo_state", return_value=None),
+            mock.patch.object(implement_mod, "_mark_pane_aborted") as mark_aborted,
         ):
             report = implement_mod.phase_abort("SA-CHILD-X", json_output=True)
 
         assert report["success"] is True
         assert ("SA-CHILD-X", "open") in calls
+        mark_aborted.assert_called_once()

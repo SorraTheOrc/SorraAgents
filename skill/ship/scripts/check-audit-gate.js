@@ -271,8 +271,10 @@ export function resolveAuditRunner(fsMod = { existsSync }) {
  * Build an actionable remediation command string for a work item that is
  * blocked by the producer-review gate.
  *
- * Suggests running the audit to clear the flag or manually setting
- * `needsProducerReview = false` via `wl update`.
+ * Suggests running the audit to clear the flag or clearing it manually
+ * with `wl update <id> --needs-producer-review false` (the `wl` CLI flag is
+ * kebab-case; the JSON field read back from `wl --json` is
+ * `needsProducerReview`).
  *
  * @param {string} workItemId - The ID of the blocking work item.
  * @returns {string} A shell command to resolve the producer-review flag.
@@ -280,7 +282,7 @@ export function resolveAuditRunner(fsMod = { existsSync }) {
 export function buildProducerReviewRemediationCommand(workItemId) {
   return [
     `  # Clear the producer-review flag for ${workItemId}:`,
-    `  wl update ${workItemId} --needsProducerReview false --json`,
+    `  wl update ${workItemId} --needs-producer-review false --json`,
     `  # Or re-run audit to auto-resolve:`,
     `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId}`,
   ].join('\n');

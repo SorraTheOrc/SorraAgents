@@ -27,7 +27,7 @@ by the autoplan decision logic).
 - Do not create a work item for the planning process itself.
 - Each feature must be deliverable as a minimal end-to-end slice (code, tests, docs, infra, observability).
 - Identify existing implementations or features that can be reused.
-- Use concise interview style: ≤3 high-signal questions per iteration; prefer multiple-choice but allow freeform.
+- Follow the shared [interview conduct contract](../interview/SKILL.md) for all interview behaviour (question volume, multiple-choice preference, explicit preferred option, producer-review handoff, Appendix recording).
 - Do not invent requirements, dates, or owners — propose options and ask for confirmation.
 - Respect `.gitignore` and agent ignore rules.
 - If the user is uncertain, add clarifying questions rather than guessing.
@@ -134,14 +134,15 @@ python3 ./plan_helpers.py plan-approval-gate <work-item-id>
 
 Expected keys: `request_approval` (`true`/`false`) and `reason`. The gate
 requests approval when effort is Medium/Large/Extra Large **OR** risk is
-Medium/High; it skips when effort is Extra Small/Small **AND** risk is Low.
-Absent effort/risk → default conservatively to requesting approval (a human
-checkpoint is never silently skipped).
+High or higher (High/Severe, the top of the `wl` risk scale); it skips when
+effort is Extra Small/Small **AND** risk is Low/Medium. Absent effort/risk →
+default conservatively to requesting approval (a human checkpoint is never
+silently skipped).
 
 - **`request_approval == true`**: present the plan and ask the user to
   accept, edit, reorder, or split/merge — iterating until approved. State
   the reason explicitly (e.g. "This plan requires your confirmation because
-  its effort is Large scale and its risk is Medium.").
+  its effort is Large scale and its risk is High.").
 - **`request_approval == false`**: do NOT ask; proceed directly to step 5
   (vertical slice verification) and step 6 (automated review stages).
 
@@ -235,15 +236,28 @@ Then output a summary of what each stage checked/found.
 
 3. Interview
 
-   In iterations (≤3 questions each), gather the minimum information for an actionable plan. Per feature capture: **Target outcome**, **Definition of done** (pass/fail checks + automated tests), **Constraints** (performance, compatibility, rollout, timeline), **Risky assumptions** (where a prototype is needed and what "success" means). Iterate until the breakdown is clear. Review existing Appendix entries first — don't re-ask answered questions.
+   Follow the shared [interview conduct contract](../interview/SKILL.md) for all
+   interview behaviour — question volume (≤ 3 high-signal questions per
+   iteration), multiple-choice preferred with freeform allowed, the explicit
+   preferred-option recommendation rule, the producer-review handoff via
+   `wl reviewed`, and idempotent Appendix recording of questions/answers.
 
-   **Producer review:** When the agent cannot proceed without producer input (clarifying questions unanswered, critical information missing), mark the work item as needing producer review. **Handoff-only:** only release to `open` when the session genuinely ends and waits for an open-ended producer reply; if the run will resume in-session (e.g. approval pane), **hold `in_progress`** or re-claim via `StatusLifecycle.ensure_claimed` immediately on resume before any mutation (see Status lifecycle). A downtime run with no interactive approver must hold or abort — never release to `open` mid-run:
+   **Plan-specific interview inputs:** Gather the minimum information for an
+   actionable plan; review existing Appendix entries first — don't re-ask
+   answered questions. Iterate until the breakdown is clear. Per feature
+   capture: **Target outcome**, **Definition of done** (pass/fail checks +
+   automated tests), **Constraints** (performance, compatibility, rollout,
+   timeline), and **Risky assumptions** (where a prototype is needed and what
+   "success" means).
 
-   ```bash
-   wl reviewed <work-item-id> true
-   ```
-
-   This flags the item so the producer knows attention is required. The agent should STOP and wait for the producer's response. Once answers are received, re-claim (`StatusLifecycle.ensure_claimed`) then continue the interview or proceed.
+   **Producer review:** when producer input is required (clarifying questions
+   unanswered, critical information missing), follow the shared contract's
+   `wl reviewed` handoff. **Handoff-only:** only release to `open` when the
+   session genuinely ends and waits for an open-ended producer reply; if the
+   run will resume in-session, **hold `in_progress`** or re-claim via
+   `StatusLifecycle.ensure_claimed` immediately on resume before any mutation
+   (see Status lifecycle). A downtime run with no interactive approver must
+   hold or abort — never release to `open` mid-run.
 
 4. Propose feature plan (agent responsibility + user confirmation)
 

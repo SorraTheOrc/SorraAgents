@@ -36,6 +36,23 @@ def _free_audit_slot():
     ):
         yield
 
+
+@pytest.fixture(autouse=True)
+def _standalone_audit_suite_context(monkeypatch):
+    """Simulate a standalone audit (no ancestor suite run) for this module.
+
+    The repo-root ``conftest.py`` arms the live-repo mutation guard, which
+    sets ``LIVE_REPO_GUARD_ACTIVE`` for the whole pytest session. The F3
+    recursion guard (SA-0MUG47DYG006TV40) reads that marker to stand down
+    a *nested* audit's automatic suite execution — correct behaviour when
+    an audit runs inside a test suite, but it means this module's
+    standalone-F3 tests (which assert auto-execution) must clear the marker
+    to model a production standalone audit. The nested stand-down path is
+    covered by ``TestCascadeBoundedRecursionGuard`` in
+    ``test_audit_runner_children.py``.
+    """
+    monkeypatch.delenv("LIVE_REPO_GUARD_ACTIVE", raising=False)
+
 _GREEN_RUN_HEAD = "a1b2c3d4e5f67890abcdef1234567890abcdef12"
 
 _GREEN_RUN_OTHER = "f1e2d3c4b5a67890fedcba0987654321fedcba98"
@@ -1809,3 +1826,112 @@ class TestRunTestsCliFlag:
         )
         assert args.no_execute is True
 
+
+
+class TestNestedSuiteRecursionGuard:
+    """SA-0MUG47DYG006TV40: the F3 recursion guard gates auto-execution on
+    ancestor suite ownership (``LIVE_REPO_GUARD_ACTIVE``).
+
+    AC2 requires a *nested* audit (one already running inside a suite run)
+    to stand down rather than re-entering the full suite; AC4 requires a
+    *standalone* audit to keep auto-executing. This class tests both sides
+    of the gate directly. The autouse ``_standalone_audit_suite_context``
+    fixture clears the marker by default; the nested test re-sets it.
+    """
+
+    def _make_runner(self):
+        """Minimal mock runner for a single childless item."""
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if list(cmd[:2]) == ["git", "rev-parse"]:
+                return SimpleNamespace(
+                    returncode=0, stdout=_GREEN_RUN_HEAD + "\n", stderr=""
+                )
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open"},
+                    }),
+                    stderr="",
+                )
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": _GREEN_RUN_DESC,
+                            "status": "in_progress",
+                        },
+                        "children": [],
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
+        return mock_runner
+
+    def _run_issue(self):
+        """Run cmd_issue on a cache miss, returning the test-skill mock."""
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                return_value={"extracted_text": "[]"},
+            ),
+            mock.patch.object(audit_runner, "query_cached", return_value=None),
+            mock.patch.object(
+                audit_runner, "_run_tests_via_test_skill",
+                return_value={
+                    "success": True, "results": [], "failures": [],
+                    "triaged": [], "notice": "",
+                },
+            ) as mock_run_tests,
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=self._make_runner(),
+            )
+        return rc, mock_run_tests
+
+    def test_standalone_audit_still_auto_executes_on_cache_miss(self):
+        """AC4: without ancestor suite ownership the standalone audit's F3
+        still auto-executes the suite on a cache miss."""
+        # The autouse fixture cleared the marker: this is a standalone audit.
+        assert audit_runner._suite_run_in_progress() is False
+        rc, mock_run_tests = self._run_issue()
+        assert rc == 0
+        mock_run_tests.assert_called_once()
+
+    def test_nested_audit_stands_down_without_executing(self, capsys):
+        """AC2: when an ancestor suite run owns the checkout, the nested
+        audit's F3 stands down — no suite execution — with a clear
+        diagnostic."""
+        with mock.patch.dict(
+            audit_runner.os.environ, {"LIVE_REPO_GUARD_ACTIVE": "1"}
+        ):
+            rc, mock_run_tests = self._run_issue()
+        assert rc == 0
+        mock_run_tests.assert_not_called()
+        err = capsys.readouterr().err
+        assert "F3 auto-execution stand-down" in err
+        assert "SA-0MUG47DYG006TV40" in err

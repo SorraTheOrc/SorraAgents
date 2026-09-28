@@ -116,6 +116,34 @@ hits are completely unaffected by concurrency saturation.
 acquires the concurrency slot before executing. Under saturation, a forced run
 waits bounded rather than failing fast.
 
+**Reusable pacer for other callers (`paced_runner`, SA-0MUKHCO02009EQFG):** the
+test skill exposes `paced_runner(runner)` as the single entry point for other
+code paths that execute suites through `run_cached`. It wraps a cache *runner*
+so each real execution holds a `"test"` slot, while cache hits — which never
+invoke the runner — consume no slot. `implement.py`'s finish gate (changed- and
+full-scope, all tooling branches: pytest / npm / override / repo-script) now
+passes its runners through `paced_runner`, so implement-gate executions are
+bounded by the same host-wide ceiling as `run_tests.py` and can no longer
+oversubscribe the host alongside audit-triggered or browser runs. On
+saturation the gate returns a clear failed result (logged: `Implement
+run_tests: could not acquire a test-run slot …`) and stores no cache entry —
+raise `TEST_LOCK_TIMEOUT` to wait longer. `paced_runner(runner, on_wait=…)`
+also reports `(queued_at, wait_seconds)` immediately after the slot is
+acquired; implement-gate runs use this to emit a
+`test slot acquired — queued_at=… wait_seconds=…` line, so contention is
+observable rather than silent (SA-0MUA8BSAG000YZA2 AC3).
+
+**Browser-suite contention (SA-0MUA8BSAG000YZA2):** with every execution path
+paced by the shared `"test"` semaphore, cross-suite oversubscription is bounded
+by `TEST_MAX_CONCURRENCY` — the historically observed 30+ concurrent
+`vitest`/Chromium processes came from **unpaced** `run_cached` call paths
+(implement.py finish gates and the audit F3 path, both now paced), not from a
+raised cap. Repos whose suites spin up a 4-worker Chromium/browser stage and
+that must never overlap another suite's browser stage should set
+`TEST_MAX_CONCURRENCY=1` in the environment (env-var mechanism only; no config
+file). Slot-file pruning beyond the ceiling is tracked separately
+(ContextHub WL-0MUL1DSEF004IJU9).
+
 ### 1. Suite-command resolution order (F2, SA-0MSTMYE79006NA61)
 
 The full suite is `full_suite_commands(project_root)`, resolved in this
@@ -241,11 +269,25 @@ Selected test files are passed explicitly (`pytest tests/test_foo.py ...`),
 so a scoped run is deterministic and cache-keyed distinctly from the full
 suite.
 
+**Deleted / non-existent paths (LP-0MTZYRTNF0092JKW).** A deleted or
+renamed-away test file still appears in `git diff` even though it is absent
+from the worktree. `map_changed_to_tests()` adds a changed test path only
+when `(root / path).exists()`, and applies a final existence filter over the
+whole selection (covering convention-mapped and import-graph entries too).
+`changed_scope_commands()` repeats the filter defensively; if nothing
+selectable remains (a deletion-only change) it returns `None`, forcing the
+full-scope fallback. This prevents emitting `pytest <deleted-file>`, which
+exits 4 ("file or directory not found") and would otherwise be reported as
+a phantom test failure. The implement skill's changed-scope gate mirrors
+this: a scoped pytest exit 4 is treated as "selection unavailable" →
+full-scope fallback, while a genuine failure (exit 1) still blocks.
+
 **Fallback to full scope** (with a logged warning) happens when no subset
 can be selected: no diff base / no changed files, all changed files are
-non-test/unmapped, the repo declares custom `suiteCommands` in
-`.pi/test-config.json` (not introspectable), or the repo has no subsettable
-tooling. A scoped run never silently skips testing.
+non-test/unmapped, the selection references only deleted/non-existent paths,
+the repo declares custom `suiteCommands` in `.pi/test-config.json` (not
+introspectable), or the repo has no subsettable tooling. A scoped run never
+silently skips testing.
 
 **Result JSON** carries `scope` (`full`/`changed`) at the run level
 (`run_all` outputs `scope` + per-suite `resolved_scopes`); `run_suite`

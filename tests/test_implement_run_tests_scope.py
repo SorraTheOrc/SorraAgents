@@ -150,3 +150,86 @@ class TestScopeMetadata:
         assert result["scope"] == "full"
         assert any("npm tooling is not subsettable" in r.message
                    for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Deleted-path implement-gate regression tests (F1 — red baseline)
+# ---------------------------------------------------------------------------
+
+
+class TestDeletedPathImplementGate:
+    """AC3: implement.py changed-scope gate must not abort on deleted-file
+    pytest exit code 4; it should fall back to full scope."""
+
+    def test_deletion_only_change_falls_back_to_full_not_fail(
+        self, monkeypatch: pytest.MonkeyPatch, caplog
+    ):
+        """When changed-scope pytest returns exit code 4 (file not found /
+        no tests collected because the only test was deleted), the gate must
+        fall back to the full suite — not report 'Test run failed'.
+
+        Regression test for the original bug: `implement.py finish` aborted
+        its changed-scope gate with 'Test run failed' when a deleted test
+        file reached pytest (exit 4).
+        """
+        mod = _load_implement()
+        monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
+        # Simulate the selector returning a command that references a
+        # deleted file — exactly what the unfixed run_tests.py emits.
+        monkeypatch.setattr(
+            mod, "_changed_scope_commands",
+            lambda *a, **k: [SCOPED_CMD],
+        )
+
+        captured: list[str] = []
+
+        def fake_run_cached(command: str, **kwargs) -> dict:
+            captured.append(command)
+            if command == SCOPED_CMD:
+                # pytest exit 4 = "file or directory not found" — the deleted
+                # test file reached the command line.
+                return _canned_run(exit_code=4, stdout="")
+            return _canned_run(exit_code=0, stdout="full suite ok")
+
+        monkeypatch.setattr(mod, "run_cached", fake_run_cached)
+
+        with caplog.at_level("WARNING"):
+            result = mod.run_tests("/tmp", scope="changed")
+
+        # BUG: currently this assertion FAILS because the gate returns the
+        # exit-4 scoped result directly and never falls back to full scope.
+        assert captured == [SCOPED_CMD, mod.PYTEST_CMD], (
+            f"Expected scoped run followed by full-scope fallback, got: {captured}"
+        )
+        assert result["scope"] == "full", (
+            "deletion-only changed-scope run (exit 4) did not fall back to "
+            "full scope"
+        )
+        assert result["success"] is True
+
+    def test_scoped_failure_exit_1_still_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A genuine test failure (exit 1) must remain a hard failure — the
+        exit-4 fallback must not swallow real failures.
+        """
+        mod = _load_implement()
+        monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
+        monkeypatch.setattr(
+            mod, "_changed_scope_commands",
+            lambda *a, **k: [SCOPED_CMD],
+        )
+
+        captured: list[str] = []
+
+        def fake_run_cached(command: str, **kwargs) -> dict:
+            captured.append(command)
+            return _canned_run(exit_code=1, stdout="1 failed")
+
+        monkeypatch.setattr(mod, "run_cached", fake_run_cached)
+        result = mod.run_tests("/tmp", scope="changed")
+
+        # Exit 1 remains a scoped failure — no full-scope fallback.
+        assert captured == [SCOPED_CMD], f"got {captured}"
+        assert result["scope"] == "changed"
+        assert result["success"] is False

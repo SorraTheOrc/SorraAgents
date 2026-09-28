@@ -9,6 +9,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -515,12 +516,50 @@ describe('buildProducerReviewRemediationCommand', () => {
     assert.equal(typeof mod.buildProducerReviewRemediationCommand, 'function');
   });
 
-  test('returns a string containing wl update command', async () => {
+  test('emits the exact kebab-case --needs-producer-review command (AC1)', async () => {
     const mod = await import(MODULE_PATH);
     const cmd = mod.buildProducerReviewRemediationCommand('SA-001');
     assert.equal(typeof cmd, 'string');
-    assert.ok(cmd.includes('wl update SA-001'), 'Should contain wl update command');
-    assert.ok(cmd.includes('needsProducerReview'), 'Should mention needsProducerReview');
+    assert.ok(
+      cmd.includes('wl update SA-001 --needs-producer-review false --json'),
+      'Should emit the exact kebab-case wl command',
+    );
+  });
+
+  test('does not emit the camelCase --needsProducerReview flag (AC1)', async () => {
+    const mod = await import(MODULE_PATH);
+    const cmd = mod.buildProducerReviewRemediationCommand('SA-001');
+    assert.ok(
+      !cmd.includes('--needsProducerReview'),
+      'Must not emit the camelCase CLI flag that wl rejects',
+    );
+  });
+
+  test('emitted flag is accepted by the installed wl CLI (AC3)', async () => {
+    const mod = await import(MODULE_PATH);
+    const cmd = mod.buildProducerReviewRemediationCommand('SA-001');
+    const flag = cmd.match(/--needs-producer-review/);
+    assert.ok(flag, 'remediation should contain --needs-producer-review');
+
+    let help;
+    try {
+      help = execFileSync('wl', ['update', '--help'], { encoding: 'utf8' });
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        // wl not installed in this environment; AC3 is covered by documented
+        // manual verification recorded on the work item.
+        return;
+      }
+      throw err;
+    }
+    assert.ok(
+      help.includes('--needs-producer-review'),
+      'wl update --help should document --needs-producer-review',
+    );
+    assert.ok(
+      !help.includes('--needsProducerReview'),
+      'wl update does not accept the camelCase flag',
+    );
   });
 });
 

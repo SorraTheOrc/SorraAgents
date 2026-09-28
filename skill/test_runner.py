@@ -3,7 +3,19 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import sys
 from pathlib import Path
+
+# Canonical repository-override scrub helper, re-exported here as a single
+# import surface for the test-execution paths (test_cache, run_tests,
+# audit_runner). The helper itself lives in the stdlib-only
+# ``shared.git_sandbox`` module so it stays loadable by file location
+# (SA-0MUIA3OE40001QJX).
+from shared.git_sandbox import (  # noqa: F401  (re-export)
+    REPOSITORY_OVERRIDE_ENV_VARS,
+    repository_override_vars_present,
+    scrub_repository_overrides,
+)
 
 QUIET_PYTEST_FLAGS = ("-q", "-r", "a", "--disable-warnings")
 QUIET_NPM_FLAGS = ("--silent",)
@@ -11,6 +23,36 @@ QUIET_NPM_FLAGS = ("--silent",)
 # Resolved pytest command — set by resolve_pytest_command() and then reused.
 # Kept as a module global so the PATH probe runs once per process.
 _PYTEST_COMMAND: str | None = None
+
+# Emit the repository-override scrub diagnostic at most once per process so a
+# long suite run does not repeat it for every spawned command.
+_SCRUB_DIAGNOSTIC_LOGGED = False
+
+
+def log_repository_override_scrub(env: dict[str, str] | None = None) -> tuple[str, ...]:
+    """Emit a one-time diagnostic naming scrubbed repository-override vars.
+
+    Never logs the variable *values* (they may point at sensitive paths).
+    Returns the names present in *env* (defaulting to ``os.environ``) so
+    callers can use the result without a second scan. Silent when none are
+    present and after the first emission.
+    """
+    global _SCRUB_DIAGNOSTIC_LOGGED
+    present = repository_override_vars_present(env)
+    if present and not _SCRUB_DIAGNOSTIC_LOGGED:
+        _SCRUB_DIAGNOSTIC_LOGGED = True
+        print(
+            "test-runner: scrubbed repository-override env var(s) before "
+            "spawning a test subprocess: " + ", ".join(present),
+            file=sys.stderr,
+        )
+    return present
+
+
+def _reset_scrub_diagnostic() -> None:
+    """Test hook: allow the one-time diagnostic to fire again."""
+    global _SCRUB_DIAGNOSTIC_LOGGED
+    _SCRUB_DIAGNOSTIC_LOGGED = False
 
 
 def resolve_pytest_command() -> str:
@@ -220,6 +262,24 @@ def canonicalize_quiet_test_command(command: str, *, show_locals: bool = False) 
 def canonicalize_quiet_pytest_command(command: str, *, show_locals: bool = False) -> str:
     """Backward-compatible wrapper for pytest-only callers."""
     return canonicalize_quiet_test_command(command, show_locals=show_locals)
+
+
+def subprocess_env_with_scrubbed_overrides(
+    base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Scrubbed, PATH-augmented environment for spawning test subprocesses.
+
+    Combines the shared repository-override scrub with the ``~/.local/bin``
+    PATH injection the runners rely on (user-installed ``pytest`` is not on
+    PATH in restricted agent/cron shells). Unrelated variables are preserved
+    and the input mapping is never mutated.
+    """
+    env = scrub_repository_overrides(os.environ if base is None else base)
+    local_bin = os.path.expanduser("~/.local/bin")
+    path_value = env.get("PATH", "")
+    if local_bin not in path_value.split(os.pathsep):
+        env["PATH"] = local_bin + os.pathsep + path_value
+    return env
 
 
 def _strip_output_redirects(tokens: list[str]) -> list[str]:

@@ -60,8 +60,11 @@ DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 # is in the risk set, the plan skill asks the user to approve the proposed
 # feature plan (and explains why). Otherwise the plan proceeds straight to
 # the automated review stages without an approval pause.
+# "High or higher": wl risk levels are Low/Medium/High/Severe, so the risk
+# gate covers High AND Severe. Medium risk no longer triggers approval on
+# its own (SA-0MTGX1I00007DBLX).
 PLAN_APPROVAL_EFFORT: frozenset[str] = frozenset({"Medium", "Large", "Extra Large"})
-PLAN_APPROVAL_RISK: frozenset[str] = frozenset({"High"})
+PLAN_APPROVAL_RISK: frozenset[str] = frozenset({"High", "Severe"})
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +353,8 @@ def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
 
     Returns ``(request_approval, reason)``:
     - ``request_approval``: True when the work item's effort t-shirt size is
-      Medium/Large/Extra Large ("scale") OR its risk level is High.
+      Medium/Large/Extra Large ("scale") OR its risk level is High or higher
+      (High/Severe). Medium risk alone does not trigger the gate.
     - ``reason``: a human-readable clause explaining what triggered the gate,
       used to tell the user why a human checkpoint is required. Empty string
       when approval is not needed.

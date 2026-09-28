@@ -116,10 +116,10 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 8335,
-  "project_agents": 1723,
-  "skills_prose": 1694,
-  "total": 11752
+  "global_agents": 10220,
+  "project_agents": 3285,
+  "skills_prose": 1968,
+  "total": 15473
 }
 ```
 
@@ -173,6 +173,13 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > regenerated to the new measured surface so the gate remains green for the
 > approved content.
 >
+> **Session-per-child guidance bump (2026-09-26, SA-0MTLCCIPU0050Q52 /
+> SA-0MUCMMYTV008QWI2):** the "Epic/parent items — one session per child"
+> procedural guidance added ~1,336 B to `AGENTS_GLOBAL.md` (`global_agents
+> 8884` → `10220`; `total 14137` → `15473`; `project_agents` and
+> `skills_prose` unchanged). Thresholds were regenerated to the new measured
+> surface so the gate remains green for the approved content.
+>
 > ### Enforcement (committed gate)
 >
 > The regression gate is enforced in two places:
@@ -181,9 +188,20 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 >    fails the push when a threshold is exceeded. Bypass with
 >    `CONTEXT_BUDGET_SKIP=1` (not recommended). Fail-open when the tooling is
 >    absent (e.g. worktrees of old commits).
-> 2. **Full-suite test** (`tests/test_context_budget_gate.py`): asserts the
->    gate passes with the committed thresholds; runs on every test-suite
->    execution, so CI and pre-`in_review` runs fail on regression.
+> 2. **Tests**: `tests/test_context_budget_gate.py` asserts the gate passes
+>    with the committed thresholds; `tests/test_pre_push_context_budget_gate.py`
+>    drives the hook end-to-end with a simulated `dev` push and asserts that a
+>    threshold exceed blocks the push. Both run on every test-suite execution,
+>    so CI and pre-`in_review` runs fail on regression.
+>
+> The hook is only **active** when git dispatches to it. Two supported
+> mechanisms satisfy this: (a) `core.hooksPath` points at `.githooks`
+> (recommended; `install_pi.sh` sets this idempotently), or (b) the committed
+> hook is installed into the active hooks directory (e.g.
+> `.git/hooks/pre-push`). Verify with `git config core.hooksPath` and confirm
+> the hook that git actually runs contains the context-budget gate. Repair the
+> recommended wiring with `git config core.hooksPath .githooks`. A clone whose
+> active hook is stale or missing the gate silently skips the check.
 >
 > Manual invocation:
 >

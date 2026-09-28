@@ -73,6 +73,33 @@ class ClaimError(RuntimeError):
     """
 
 
+def _normalise_status(status: object) -> str:
+    """Normalise a work-item status value to its canonical hyphenated form.
+
+    ``wl`` accepts and stores statuses in hyphenated form (``in-progress``),
+    but callers, older data, and other tooling occasionally use the
+    underscore variant (``in_progress``). Replacing ``_`` with ``-`` lets
+    every status comparison in this module accept either spelling instead
+    of matching a single literal (LP-0MUESDZVW006YJ1N; the claim guard must
+    not reject a genuinely claimed item — SA-0MTFTFUIH000UWM9).
+
+    Only status values are normalised; stage values (``intake_complete``,
+    ``plan_complete``, ``in_review``) legitimately use underscores and are
+    never passed through this helper.
+
+    Args:
+        status: Raw status value from ``wl`` (or a caller). Non-string
+            values are treated as an empty status.
+
+    Returns:
+        The status with underscores replaced by hyphens, or ``""`` for
+        non-string input.
+    """
+    if not isinstance(status, str):
+        return ""
+    return status.replace("_", "-")
+
+
 # Type alias for an injectable command runner.
 # Takes a command list, returns a CompletedProcess (like subprocess.run).
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
@@ -100,15 +127,18 @@ def _resolve_owning_checkout_root(module_file: Path) -> Path:
     module file, the first ancestor that owns ``skill/shared`` and is
     NOT a worktree is the framework main checkout.
 
-    A tracked nested copy ``skill/skill/shared/status_lifecycle.py`` (see
-    commit aea4c741) makes a naive existence check match the *parent* of the
-    real checkout (``<repo>/skill``) one level too deep, because that parent
-    also "owns" the nested copy. Such a parent never has a ``.git`` member
-    of its own, so the walk requires the owning candidate to be a git
-    checkout root (``.git`` directory; worktrees with a ``.git`` FILE are
-    skipped, which restores the pre-nested-copy resolution to the main
-    checkout for worktree launches). The walk therefore falls through any
-    nested-copy-only candidate to the real owner.
+    A nested ``skill/skill/shared/status_lifecycle.py`` copy makes a naive
+    existence check match the *parent* of the real checkout (``<repo>/skill``)
+    one level too deep, because that parent also "owns" the nested copy. Such
+    a parent never has a ``.git`` member of its own, so the walk requires the
+    owning candidate to be a git checkout root (``.git`` directory; worktrees
+    with a ``.git`` FILE are skipped, which restores the pre-nested-copy
+    resolution to the main checkout for worktree launches). The walk therefore
+    falls through any nested-copy-only candidate to the real owner.
+
+    The tracked copy that originally triggered this (commit aea4c741, an
+    absolute symlink) was removed in LP-0MUHOHP82006NT3W; the defensive walk
+    is retained so a stray nested copy can never shift the resolved root.
     """
     current = module_file.parent  # skill/shared
     for candidate in current.parents:
@@ -594,7 +624,7 @@ class StatusLifecycle:
         data = StatusLifecycle.show(work_item_id, runner=runner)
         wi = data.get("workItem", {}) if isinstance(data, dict) else {}
         status = wi.get("status", "") if isinstance(wi, dict) else ""
-        if status != "in-progress":
+        if _normalise_status(status) != "in-progress":
             raise ClaimError(
                 f"Work item {work_item_id} must be in-progress before mutation "
                 f"(current status: {status or 'unknown'}). "
@@ -635,7 +665,7 @@ class StatusLifecycle:
         data = StatusLifecycle.show(work_item_id, runner=runner)
         wi = data.get("workItem", {}) if isinstance(data, dict) else {}
         status = wi.get("status", "") if isinstance(wi, dict) else ""
-        if status == "in-progress":
+        if _normalise_status(status) == "in-progress":
             LOG.debug("ensure_claimed: %s already in-progress — no-op", work_item_id)
             return data
         kwargs: dict = {"status": "in-progress", "runner": runner}

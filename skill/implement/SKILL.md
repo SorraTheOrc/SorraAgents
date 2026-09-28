@@ -20,7 +20,7 @@ through code, tests, and docs.
 
 ## References to Bundled Resources
 
-- Intake/interview helpers: `intake`, `plan`.
+- Intake/interview helpers: `intake`, `plan`, `interview`.
 
 Security note — scope: this restriction applies to **protected branches**
 (`main`/`master`/`HEAD`) and to **creating PRs**: do not push to them or open
@@ -33,6 +33,11 @@ no additional approval, provided the build passes and the test gate is green:
 affected by the change — fast iteration), then runs a **final `--scope full`
 gate** before commit, and the **pre-push hook re-runs the full suite**
 (`--scope full`) on the actual push to `dev`/`main` (SA-0MT6BYQHB008DOGC).
+Changed-scope selection ignores deleted/non-existent test paths and falls
+back to the full suite when nothing selectable remains; a scoped pytest
+exit 4 ("file or directory not found") is likewise treated as selection
+unavailable and falls back to full scope, while a genuine failure (exit 1)
+still blocks the gate (LP-0MTZYRTNF0092JKW).
 When in doubt, produce the exact
 `git`/`gh`/`wl` commands for a human to run.
 
@@ -228,12 +233,18 @@ PRDs/plans/docs; confirm expected tests/validation.
 
 4.1. Definition gate (must pass before implementation)
 
-Verify: clear scope (in/out-of-scope); concrete, testable ACs; constraints and
-compatibility expectations; unknowns captured as explicit questions.
+- Verify: clear scope (in/out-of-scope); concrete, testable ACs; constraints and
+  compatibility expectations; unknowns captured as explicit questions.
+- **Risk/effort gate:** for `plan_complete` items missing `risk` or `effort`, the
+  skill automatically runs the effort-and-risk evaluation and persists estimates
+  via `wl update` — it does NOT fail the gate (SA-0MTTSWHQE0072N9J).  Items with
+  both fields set proceed normally.  If evaluation fails, a warning is logged but
+  the run proceeds.
 
-If the gate fails: (1) `StatusLifecycle.update_status(<work-item-id>, "open")`;
-(2) not well-defined → intake interview (`../intake/SKILL.md`); too large →
-plan interview (`/skill:plan`); (3) inform the user and ask whether to restart.
+If the gate fails (definition issues only, not missing estimates): (1)
+`StatusLifecycle.update_status(<work-item-id>, "open")`; (2) not well-defined →
+intake interview (`../intake/SKILL.md`); too large → plan interview
+(`/skill:plan`); (3) inform the user and ask whether to restart.
 
 **Producer review:** When the agent cannot proceed because the work item is
 ill-defined (unclear scope, untestable ACs, missing constraints) and needs
@@ -246,6 +257,17 @@ wl reviewed <work-item-id> true
 This flags the item so the producer knows the work item needs clarification
 before implementation can proceed. The agent should STOP and wait for the
 producer's response.
+
+**Missing risk/effort estimates.** When a `plan_complete` item is missing
+`risk` and/or `effort` fields, the implement skill runs the
+[effort-and-risk skill](../effort-and-risk/SKILL.md) automatically to produce
+and persist estimates via `wl update --risk/--effort`.  Items with both fields
+already set proceed normally — no gate error, no behaviour change for items
+that are already sized.  The evaluation runs before the worktree is created
+(Step 6.1) so the dispatcher can re-classify the item as implement-dispatchable
+after estimates are persisted.  If the evaluation fails (orchestrator not
+found, subprocess error, timeout), the skill logs a warning and proceeds
+without estimates — it does **not** block the run (SA-0MTTSWHQE0072N9J).
 
 4.2. Detect "already implemented" and close gaps (if applicable)
 
@@ -292,7 +314,18 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 
 > **`node_modules` is auto-symlinked:** `implement.py start` creates
 > `<worktree>/node_modules -> <repo-root>/node_modules` when the main checkout
-> has one (SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** — writes pass through the symlink, corrupting the shared tree.
+> has one (SA-0MSGS763C006SM1B). It also symlinks **nested** `node_modules`
+> directories: every `<pkg>/node_modules` found in the main checkout whose
+> parent package directory already exists in the worktree gets a matching
+> symlink (`<worktree>/<pkg>/node_modules -> <main-checkout>/<pkg>/node_modules`),
+> so workspace/monorepo packages and pi packages resolve their dependencies in
+> the worktree (OSL-0MUFG3PJA00379CT). Discovery is bounded — it prunes `.git`
+> and `.worklog` and never descends into a `node_modules` tree. Existing
+> entries are never overwritten and a missing parent package directory is never
+> fabricated. **Do NOT run `npm install` inside a worktree** — writes pass
+> through the symlink, corrupting the shared tree. A branch that changes
+> `package.json` still resolves the main checkout's dependencies; reinstall in
+> the main checkout if that matters.
 
 > **Git submodules are auto-initialised:** `implement.py start` runs
 > ``git submodule update --init --recursive`` inside the new worktree (SA-0MSN52GGN002B0AZ).
@@ -329,6 +362,32 @@ run `implement.py finish <child-id>`, and re-run
 parent reports all children terminal. Each child is implemented in its own
 worktree (never the main checkout); sequential children reuse/rotate the
 `.worklog/worktrees` machinery.
+
+**One session per child (session isolation).** Invoking `/skill:implement
+<parent-id>` on an epic starts a **new Pi session for each child** — do not
+implement every child in one accumulating session. Each child's session
+opens with a clean context window containing only that child's work-item
+description, acceptance criteria, and relevant context. Session isolation
+layers on top of the existing guarantees:
+
+- **Serial, dependency order.** Children are still implemented serially with
+  blocking items first; the dependency, cycle, and blocked-child guards
+  below are unchanged.
+- **Worktree isolation preserved.** Every child is still implemented in its
+  own worktree created by `phase_start`; session and worktree isolation are
+  independent and both apply.
+- **Session logging.** Each new session comments on the child work item with
+  its session id (`<agent_action> - Session ID: <pi_session_id> -
+  <path_to_sessions_log>`), per the AGENTS.md session-logging convention.
+- **Error isolation.** A failure in one child's session does not affect the
+  other children's sessions: the failed child is reset to `open`, the parent
+  phase reports which children succeeded and which failed, and
+  already-completed siblings are never regressed.
+- **Parent advanced last.** The parent is advanced to `completed`/`in_review`
+  only after **all** child sessions have reached a terminal stage.
+
+This mirrors the "Epic/parent items — one session per child" guidance in
+`AGENTS_GLOBAL.md`.
 
 Guards (deterministic, in `phase_parent`):
 
@@ -388,6 +447,20 @@ See ``../refactor/SKILL.md``.
   > `WORKLOG_SKIP_PRE_PUSH=1 git push origin HEAD:refs/heads/dev`. Nothing is
   > lost by skipping the sync at push time — the main checkout syncs the data
   > on its own pushes.
+
+- **Post-push local parent sync (SA-0MUGX1DIT000M7S1).** `implement.py finish`
+  fast-forwards the main checkout's **local parent branch** (`dev`) to the
+  pushed tip *after* a successful push, so the next `implement.py parent` /
+  `start` forks the following child worktree from an up-to-date base instead
+  of a stale one. The sync is **safe-skip**: it performs a `git fetch origin
+  dev` followed by a `--ff-only` merge (when `dev` is checked out) or a
+  non-checked-out ref fetch (`git fetch origin dev:dev`) — it never
+  force-updates and never loses local commits. It is skipped (with a logged
+  warning, and without failing the already-successful finish) when the main
+  checkout is dirty, the remote is unreachable, or the local parent branch has
+  diverged. `implement.py start` also refreshes the parent branch before
+  `git worktree add`, so children never start from a stale base even when
+  another actor pushed concurrently.
 - After pushing, clean up the worktree:
 
   ```bash

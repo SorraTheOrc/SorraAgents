@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from audit.scripts import audit_runner
 from audit.tests.wl_helpers import make_stateful_runner
+from shared.git_sandbox import commit_all, init_bare_remote, init_repo, run_git
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -87,8 +88,7 @@ def _make_real_repo(tmp_path: Path, prefix: str = "WL",
     """
     projects = tmp_path / "projects"
     owning = projects / "ctxhub"
-    owning.mkdir(parents=True)
-    (owning / "src").mkdir()
+    (owning / "src").mkdir(parents=True)
     (owning / "src" / "main.py").write_text("print('hi')\n", encoding="utf-8")
     (owning / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
     wl_dir = owning / ".worklog"
@@ -100,41 +100,36 @@ def _make_real_repo(tmp_path: Path, prefix: str = "WL",
     origin.mkdir()
 
     def _git(*args: str, cwd: Path) -> str:
-        proc = subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                              capture_output=True, text=True)
+        proc = run_git(cwd, list(args), check=True)
         return proc.stdout.strip()
 
     shas: dict[str, str] = {}
-    _git("init", "--bare", cwd=origin)
-    _git("init", cwd=owning)
-    _git("config", "user.email", "t@t.com", cwd=owning)
-    _git("config", "user.name", "T", cwd=owning)
-    _git("remote", "add", "origin", str(origin), cwd=owning)
+    init_bare_remote(origin, sandbox_root=tmp_path)
+    init_repo(owning, sandbox_root=tmp_path)
+    run_git(owning, ["config", "user.email", "t@t.com"], check=True)
+    run_git(owning, ["config", "user.name", "T"], check=True)
+    run_git(owning, ["remote", "add", "origin", str(origin)], check=True)
     (owning / "src" / "main.py").write_text("print('dev1')\n", encoding="utf-8")
-    _git("add", "-A", cwd=owning)
-    _git("commit", "-m", "dev first", cwd=owning)
+    commit_all(owning, "dev first")
     shas["dev_default"] = _git("rev-parse", "HEAD", cwd=owning)
-    _git("branch", "-M", "dev", cwd=owning)
     if second_dev_commit:
         (owning / "src" / "main.py").write_text(
             "print('dev2')\n", encoding="utf-8"
         )
-        _git("add", "-A", cwd=owning)
-        _git("commit", "-m", "dev second: rename tab", cwd=owning)
+        commit_all(owning, "dev second: rename tab")
     shas["dev_head"] = _git("rev-parse", "HEAD", cwd=owning)
-    _git("push", "origin", "dev", cwd=owning)
+    run_git(owning, ["push", "origin", "dev"], check=True)
 
     if feature_branch:
-        _git("checkout", "-b", f"wl-{issue_id}-rename-tab", shas["dev_head"],
-             cwd=owning)
+        run_git(owning, ["checkout", "-b", f"wl-{issue_id}-rename-tab",
+                         shas["dev_head"]], check=True)
         shas["feature_parent"] = _git("rev-parse", "HEAD", cwd=owning)
         (owning / "src" / "tab.py").write_text(
             "tab = 'Worklog'\n", encoding="utf-8"
         )
-        _git("add", "-A", cwd=owning)
-        _git("commit", "-m", "rename podcast tab to Worklog", cwd=owning)
+        commit_all(owning, "rename podcast tab to Worklog")
         shas["feature_head"] = _git("rev-parse", "HEAD", cwd=owning)
-        _git("checkout", "dev", cwd=owning)
+        run_git(owning, ["checkout", "dev"], check=True)
     return wl_dir, owning, shas
 
 
@@ -269,14 +264,10 @@ class TestVerifyMergedInDev:
         )
         # Remove dev everywhere: local branch (from a temp checkout), the
         # remote branch, and the remote-tracking ref.
-        subprocess.run(["git", "checkout", "-q", "-b", "tmp-no-dev"],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-D", "dev"], cwd=str(owning),
-                       check=True, capture_output=True)
-        subprocess.run(["git", "push", "-q", "origin", "--delete", "dev"],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "update-ref", "-d", "refs/remotes/origin/dev"],
-                       cwd=str(owning), check=False, capture_output=True)
+        run_git(owning, ["checkout", "-q", "-b", "tmp-no-dev"], check=True)
+        run_git(owning, ["branch", "-D", "dev"], check=True)
+        run_git(owning, ["push", "-q", "origin", "--delete", "dev"], check=True)
+        run_git(owning, ["update-ref", "-d", "refs/remotes/origin/dev"], check=False)
         ctx = _ctx_with_runner(owning, "WL-X")
         merged, evidence, baseline = audit_runner._verify_merged_in_dev(
             ctx, [shas["dev_default"]], ""
@@ -670,14 +661,10 @@ class TestAuditBaseFreshness:
         rewound to dev_default so local HEAD lacks the delivered work."""
         _wl, owning, shas = _make_real_repo(tmp_path)
         branch = "wl-WL-0MSI4TAT70058921-rename-tab"
-        subprocess.run(["git", "push", "-q", "origin", f"{branch}:dev"],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "checkout", "-q", "dev"],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "reset", "-q", "--hard", shas["dev_default"]],
-                       cwd=str(owning), check=True, capture_output=True)
-        subprocess.run(["git", "fetch", "-q", "origin", "dev"],
-                       cwd=str(owning), check=True, capture_output=True)
+        run_git(owning, ["push", "-q", "origin", f"{branch}:dev"], check=True)
+        run_git(owning, ["checkout", "-q", "dev"], check=True)
+        run_git(owning, ["reset", "-q", "--hard", shas["dev_default"]], check=True)
+        run_git(owning, ["fetch", "-q", "origin", "dev"], check=True)
         return owning, shas
 
     def test_fresh_when_local_base_contains_delivered_commits(self, tmp_path):
@@ -1015,3 +1002,44 @@ class TestCommentReferencedEvidence:
         commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
         assert "4f1f0452abc" in commits
         assert branch == ""
+
+
+# ---------------------------------------------------------------------------
+# Hermetic sandbox invariant (SA-0MUG0WFP8008WN63 — parent AC1)
+# ---------------------------------------------------------------------------
+
+
+class TestRealRepoHelpersAreHermetic:
+    """Every real-git fixture helper in this module must be sandbox-hermetic.
+
+    Regression guard for parent AC1: a leaked repository-overriding
+    environment variable (``GIT_DIR``) must not redirect the repo factory
+    away from its ``tmp_path`` sandbox, and the created repository must
+    resolve inside ``tmp_path``.
+    """
+
+    def test_leaked_git_dir_cannot_redirect_make_real_repo(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        victim = init_repo(tmp_path / "victim")
+        (victim / "real.txt").write_text("real", encoding="utf-8")
+        commit_all(victim, "victim base")
+        before = run_git(
+            victim, ["rev-list", "--all", "--count"], check=True
+        ).stdout.strip()
+
+        monkeypatch.setenv("GIT_DIR", str(victim / ".git"))
+        try:
+            _wl, owning, _shas = _make_real_repo(tmp_path / "made")
+        finally:
+            monkeypatch.delenv("GIT_DIR", raising=False)
+
+        # The leaked GIT_DIR must not have touched the victim repository.
+        assert run_git(
+            victim, ["rev-list", "--all", "--count"], check=True
+        ).stdout.strip() == before
+        # ...and the fixture repository must resolve inside the tmp_path sandbox.
+        toplevel = run_git(
+            owning, ["rev-parse", "--show-toplevel"], check=True
+        ).stdout.strip()
+        assert Path(toplevel).resolve() == owning.resolve()

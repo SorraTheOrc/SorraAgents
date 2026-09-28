@@ -44,6 +44,7 @@ import subprocess
 import sys
 import time
 import traceback
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -59,7 +60,7 @@ from import_guard import guard_shared_import
 
 try:
     from shared.code_freeze import is_code_freeze_active
-    from shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
+    from shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
     from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
@@ -69,10 +70,19 @@ try:
     # skill's scripts) must still start implement.py — changed-scope then
     # degrades to full scope with a warning.
     from test.scripts.run_tests import (
+        TestConcurrencyTimeout as _TestConcurrencyTimeout,
+    )
+    from test.scripts.run_tests import (
         changed_scope_commands as _changed_scope_commands,
     )
+    from test.scripts.run_tests import paced_runner as _test_paced_runner
 except ModuleNotFoundError:
     _changed_scope_commands = None  # type: ignore[assignment]
+    _test_paced_runner = None  # type: ignore[assignment]
+
+    class _TestConcurrencyTimeout(RuntimeError):  # type: ignore[no-redef]
+        """Fallback when the test skill is unavailable (never raised)."""
+
 from test_cache import run_cached
 from test_runner import canonicalize_quiet_test_command
 
@@ -354,7 +364,7 @@ def wl_show(work_item_id: str) -> dict[str, Any]:
         Parsed JSON dict from ``wl show``.
     """
     cmd = ["wl", "show", work_item_id, "--json"]
-    cmd[1:1] = worklog_dir_flag()
+    cmd[1:1] = resolve_worklog_flags(cmd)
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.error("Failed to fetch work item %s: %s", work_item_id, result.stderr.strip())
@@ -382,7 +392,7 @@ def wl_show_children(work_item_id: str) -> list[dict[str, Any]]:
         List of child work-item dicts (may be empty).
     """
     cmd = ["wl", "show", work_item_id, "--children", "--json"]
-    cmd[1:1] = worklog_dir_flag()
+    cmd[1:1] = resolve_worklog_flags(cmd)
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.error(
@@ -416,7 +426,7 @@ def wl_dep_blockers(work_item_id: str) -> list[dict[str, Any]]:
         List of outbound dependency-edge dicts (may be empty).
     """
     cmd = ["wl", "dep", "list", work_item_id, "--json"]
-    cmd[1:1] = worklog_dir_flag()
+    cmd[1:1] = resolve_worklog_flags(cmd)
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.error(
@@ -450,7 +460,7 @@ def wl_add_comment(work_item_id: str, comment: str) -> bool:
         "wl", "comment", "add", work_item_id,
         "--comment", comment, "--author", "implement",
     ]
-    cmd[1:1] = worklog_dir_flag()
+    cmd[1:1] = resolve_worklog_flags(cmd)
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.warning("Failed to add comment to %s: %s", work_item_id, result.stderr.strip())
@@ -480,6 +490,193 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
         LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
     else:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
+
+
+def _check_and_evaluate_risk_effort(
+    work_item_id: str, work_item: dict[str, Any],
+) -> dict[str, Any]:
+    """Check risk/effort estimates; run effort-and-risk if missing (SA-0MTTSWHQE0072N9J).
+
+    When a plan_complete item lacks ``risk`` and/or ``effort`` fields, this
+    function runs the effort-and-risk skill to produce and persist estimates
+    via ``wl update``.  Items that already have both fields are passed
+    through unchanged — no gate error, no behaviour change.
+
+    Args:
+        work_item_id: The work-item identifier.
+        work_item: The work-item dict from ``wl show``.
+
+    Returns:
+        A dict with keys ``success`` (bool), ``estimates_provided`` (bool),
+        ``effort`` (str|None), ``risk`` (str|None) and optional ``error``.
+    """
+    risk = work_item.get("risk") or ""
+    effort = work_item.get("effort") or ""
+    stage = work_item.get("stage", "")
+
+    # Only evaluate items that are plan_complete (the gate only applies here)
+    if stage != "plan_complete":
+        LOG.info(
+            "Risk/effort evaluation skipped: stage is %r (not plan_complete)",
+            stage,
+        )
+        return {
+            "success": True,
+            "estimates_provided": False,
+            "reason": f"stage={stage}",
+        }
+
+    # Both fields present — no evaluation needed (no behaviour change)
+    if risk and effort:
+        LOG.info(
+            "Risk/effort already set: risk=%r effort=%r",
+            risk, effort,
+        )
+        return {
+            "success": True,
+            "estimates_provided": False,
+            "reason": "estimates already present",
+        }
+
+    # ── Missing estimates: run the effort-and-risk evaluation ────────────
+    LOG.warning(
+        "Missing risk/effort on plan_complete item %s "
+        "(risk=%r effort=%r) — running evaluation.",
+        work_item_id, risk, effort,
+    )
+
+    # Fetch children for a better estimate (reuses the shared helper so the
+    # cross-repo worklog resolution stays consistent — OSL-0MUI78ROQ005B37N).
+    children = []
+    for child in wl_show_children(work_item_id):
+        children.append({
+            "id": child.get("id", ""),
+            "title": child.get("title", ""),
+            "probability": 2,
+            "impact": 1,
+        })
+
+    # Build the payload for the orchestrator
+    payload = {
+        "o": 2.0,
+        "m": 4.0,
+        "p": 8.0,
+        "overheads": {
+            "coordination": 1.0,
+            "review": 1.0,
+            "testing": 1.0,
+            "risk_buffer": 1.0,
+        },
+        "parent": {"probability": 2.1, "impact": 2.1},
+        "children": children,
+        "certainty": 85.0,
+        "assumptions": [
+            "Default O/M/P used because no prior estimates exist",
+            "Standard overheads applied",
+        ],
+        "unknowns": [
+            "Exact scope may differ from initial understanding",
+        ],
+        "issue_id": work_item_id,
+    }
+
+    # Locate the orchestrator script
+    skill_root = str(Path(__file__).resolve().parents[2])
+    orchestrator = os.path.join(
+        skill_root, "effort-and-risk", "scripts", "orchestrate_estimate.py",
+    )
+
+    if not os.path.isfile(orchestrator):
+        LOG.error(
+            "effort-and-risk orchestrator not found at %s — "
+            "item will be blocked.",
+            orchestrator,
+        )
+        return {
+            "success": False,
+            "estimates_provided": False,
+            "error": "orchestrator not found",
+        }
+
+    # Run the orchestrator
+    try:
+        proc = subprocess.run(
+            ["python3", orchestrator],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+        if proc.returncode != 0:
+            LOG.error(
+                "effort-and-risk evaluation failed (rc=%d): %s",
+                proc.returncode, proc.stderr.strip(),
+            )
+            return {
+                "success": False,
+                "estimates_provided": False,
+                "error": f"orchestrator failed: {proc.stderr.strip()}",
+            }
+
+        # The orchestrator updates the work item via wl update internally.
+        # Parse the output to report what was produced.
+        try:
+            result = json.loads(proc.stdout.strip())
+        except json.JSONDecodeError:
+            result = {}
+
+        # Check whether the update succeeded
+        update_ok = result.get("update_result", {}).get("success", False)
+        if not update_ok:
+            LOG.error(
+                "Failed to persist estimates for %s: %s",
+                work_item_id,
+                result.get("update_result", {}),
+            )
+            return {
+                "success": False,
+                "estimates_provided": False,
+                "error": "failed to persist estimates via wl update",
+            }
+
+        wl_effort = result.get("effort", {}).get("tshirt", "")
+        wl_risk = result.get("risk", {}).get("level", "")
+        # Map risk level to wl label
+        risk_map = {"Low": "Low", "Medium": "Medium", "High": "High", "Critical": "Severe", "Severe": "Severe"}
+        wl_risk_label = risk_map.get(wl_risk, "Medium")
+
+        LOG.info(
+            "Risk/effort evaluated and persisted: risk=%s effort=%s",
+            wl_risk_label, wl_effort,
+        )
+        return {
+            "success": True,
+            "estimates_provided": True,
+            "risk": wl_risk_label,
+            "effort": wl_effort,
+        }
+
+    except subprocess.TimeoutExpired:
+        LOG.error(
+            "effort-and-risk evaluation timed out for %s",
+            work_item_id,
+        )
+        return {
+            "success": False,
+            "estimates_provided": False,
+            "error": "evaluation timed out (5 min)",
+        }
+    except Exception as exc:  # noqa: BLE001
+        LOG.error(
+            "Unexpected error running effort-and-risk for %s: %s",
+            work_item_id, exc,
+        )
+        return {
+            "success": False,
+            "estimates_provided": False,
+            "error": str(exc),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +1107,128 @@ def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> b
     return True
 
 
+# Directories pruned by the nested node_modules discovery walk. ``.git`` and
+# ``.worklog`` are large/irrelevant trees; ``node_modules`` is pruned so the
+# walk never descends into (and therefore never mirrors) a dependency tree's
+# own nested dependencies (OSL-0MUFG3PJA00379CT).
+_NESTED_NODE_MODULES_PRUNE_DIRS = frozenset({".git", ".worklog", "node_modules"})
+
+
+def _iter_nested_node_modules(repo_root: str) -> Iterator[tuple[str, str]]:
+    """Yield nested ``node_modules`` directories under the main checkout.
+
+    Walks *repo_root* top-down, pruning :data:`_NESTED_NODE_MODULES_PRUNE_DIRS`
+    (so ``.git``/``.worklog`` trees are ignored and a ``node_modules``
+    directory is never descended into) and never following symlinked
+    directories. The repository-root ``node_modules`` is excluded — it is
+    owned by :func:`_ensure_node_modules_symlink`.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+
+    Yields:
+        ``(rel_parent, rel_node_modules)`` POSIX-style paths relative to
+        *repo_root*, e.g. ``(".pi/packages/x", ".pi/packages/x/node_modules")``.
+    """
+    repo = Path(repo_root)
+    for dirpath, dirnames, _filenames in os.walk(repo, topdown=True):
+        current = Path(dirpath)
+        rel_parent = os.path.relpath(current, repo)
+        # A nested candidate is a child named node_modules, but not the
+        # repository-root one (handled separately).
+        is_nested_candidate = rel_parent != "." and "node_modules" in dirnames
+        # Prune heavy/irrelevant trees, dependency trees, and symlinked
+        # directories (never follow — avoids loops and branch shadowing).
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if name not in _NESTED_NODE_MODULES_PRUNE_DIRS
+            and not (current / name).is_symlink()
+        )
+        if not is_nested_candidate:
+            continue
+        if not (current / "node_modules").is_dir():  # pragma: no cover - defensive
+            continue
+        yield rel_parent, os.path.join(rel_parent, "node_modules")
+
+
+def _ensure_nested_node_modules_symlinks(
+    worktree_path: str, repo_root: str | None
+) -> int:
+    """Auto-symlink the main checkout's *nested* node_modules into a worktree.
+
+    Companion to :func:`_ensure_node_modules_symlink`, which only links the
+    repository-root ``node_modules``. On checkouts whose dependencies live in a
+    nested/workspace package (for example a pi package under
+    ``.pi/packages/<pkg>/node_modules``) the worktree would otherwise have no
+    dependencies at all, so tools run from the worktree (``pi``, ``tsx``) fail
+    with ``Cannot find module``.
+
+    For every nested ``node_modules`` directory discovered in the main checkout
+    (:func:`_iter_nested_node_modules`) this creates
+    ``<worktree>/<rel>/node_modules`` as a symlink to
+    ``<main-checkout>/<rel>/node_modules`` when BOTH conditions hold:
+
+    - the worktree has no entry at that path (dir or symlink) — never
+      overwrite; AND
+    - the parent directory ``<worktree>/<rel>`` already exists — never
+      fabricate a package directory the branch removed (avoids shadowing
+      branch state).
+
+    Best-effort only: a per-candidate failure is logged at ``WARNING`` and does
+    not abort; remaining candidates are still processed. Symlinks only — the
+    helper never copies, installs, or invokes a package manager.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+
+    Returns:
+        Number of nested node_modules symlinks created.
+    """
+    if not repo_root:
+        LOG.info("No repo root known; skipping nested node_modules symlinks.")
+        return 0
+
+    wt_root = Path(worktree_path)
+    repo = Path(repo_root)
+    created = 0
+
+    for rel_parent, rel_nm in _iter_nested_node_modules(repo_root):
+        wt_nm = wt_root / rel_nm
+        if os.path.lexists(wt_nm):
+            LOG.info(
+                "Worktree already has %s; skipping nested node_modules symlink.",
+                wt_nm,
+            )
+            continue
+        wt_parent = wt_root / rel_parent
+        if not wt_parent.is_dir():
+            LOG.info(
+                "Worktree has no %s; skipping nested node_modules symlink "
+                "(would fabricate a package directory).",
+                wt_parent,
+            )
+            continue
+        main_nm = repo / rel_nm
+        try:
+            os.symlink(str(main_nm), str(wt_nm), target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            LOG.warning(
+                "Failed to symlink nested node_modules %s -> %s: %s",
+                wt_nm,
+                main_nm,
+                exc,
+            )
+            continue
+        LOG.info("Symlinked %s -> %s", wt_nm, main_nm)
+        created += 1
+
+    if created:
+        LOG.info("Created %d nested node_modules symlink(s).", created)
+    return created
+
+
 def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool:
     """Initialize git submodules inside a newly-created worktree.
 
@@ -1073,6 +1392,161 @@ def _restore_repo_state(repo_root: str) -> None:
     """
     run_cmd(["git", "checkout", DEFAULT_PARENT_BRANCH], cwd=repo_root, check=False)
     run_cmd(["git", "pull", "origin", DEFAULT_PARENT_BRANCH], cwd=repo_root, check=False)
+
+
+def _sync_parent_branch(
+    repo_root: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> dict[str, Any]:
+    """Sync the main checkout's local parent branch to origin/<parent_branch>.
+
+    After ``implement.py finish`` pushes a child branch to ``origin/<parent>",
+    the local parent branch can be left behind.  This helper fast-forwards
+    the local parent branch so that the next ``phase_start`` / child
+    worktree starts from an up-to-date base (AC1 / AC3).
+
+    Safety (AC2):
+        When the update is not safe — dirty working tree, checkout is on
+        another branch or detached, or the local branch has diverged — the
+        helper returns a *skipped* result without failing.  Local commits
+        are never lost.
+
+    Args:
+        repo_root: Path to the repo root.
+        parent_branch: The parent branch to sync (default: ``dev``).
+
+    Returns:
+        Dict with ``method`` ("synced" | "skipped"), ``success`` (bool),
+        and optional ``reason`` / ``warning``.
+    """
+    result: dict[str, Any] = {
+        "method": "none",
+        "success": True,
+    }
+
+    # ── Pre-condition checks (safe-skip semantics) ─────────────────
+
+    # 1. Dirty working tree → skip (check the main checkout, not the
+    #    worktree we may currently be invoked from)
+    status_output = git_status(repo_root)
+    if git_has_dirty_files(status_output):
+        result["method"] = "skipped"
+        result["success"] = True
+        result["reason"] = "dirty_working_tree"
+        result["warning"] = (
+            f"Skipped syncing parent branch {parent_branch}: "
+            "dirty working tree detected."
+        )
+        LOG.info("%s", result["warning"])
+        return result
+
+    # 2. Fetch the latest parent ref. Remote unreachable → degrade
+    #    gracefully (report, never fail a finish that already pushed).
+    fetch_result = run_cmd(
+        ["git", "fetch", "origin", parent_branch],
+        cwd=repo_root,
+        check=False,
+        timeout=120,
+    )
+    if fetch_result.returncode != 0:
+        result["method"] = "skipped"
+        result["success"] = True
+        result["reason"] = "fetch_failed"
+        result["warning"] = (
+            f"Skipped syncing parent branch {parent_branch}: "
+            f"git fetch origin {parent_branch} failed. "
+            f"The finish push may have succeeded but local {parent_branch} "
+            f"was not updated."
+        )
+        LOG.info("%s", result["warning"])
+        return result
+
+    # 3. Determine the current branch of the main checkout
+    branch_result = run_cmd(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo_root,
+        check=False,
+    )
+    if branch_result.returncode != 0:
+        result["method"] = "skipped"
+        result["success"] = True
+        result["reason"] = "cannot_determine_branch"
+        result["warning"] = "Could not determine current branch."
+        LOG.info("%s", result["warning"])
+        return result
+
+    current_branch = branch_result.stdout.strip()
+    # Use the fully-qualified remote-tracking ref so a stale local branch
+    # literally named ``origin/<parent>`` cannot shadow it (git would
+    # otherwise warn and resolve to the local branch).
+    remote_parent_ref = f"refs/remotes/origin/{parent_branch}"
+
+    if current_branch == parent_branch:
+        # 4a. Checked out on the parent branch: fast-forward with
+        #     ``merge --ff-only`` (refuses on divergence; never rewrites
+        #     the working tree or loses local commits).
+        ff_result = run_cmd(
+            ["git", "merge-base", "--is-ancestor",
+             "HEAD", remote_parent_ref],
+            cwd=repo_root,
+            check=False,
+        )
+        if ff_result.returncode != 0:
+            result["method"] = "skipped"
+            result["success"] = True
+            result["reason"] = "diverged"
+            result["warning"] = (
+                f"Skipped syncing parent branch {parent_branch}: "
+                f"local {parent_branch} has diverged from "
+                f"origin/{parent_branch}; --ff-only is not possible "
+                f"without risking local commits."
+            )
+            LOG.info("%s", result["warning"])
+            return result
+
+        merge_result = run_cmd(
+            ["git", "merge", "--ff-only", remote_parent_ref],
+            cwd=repo_root,
+            check=False,
+        )
+        if merge_result.returncode != 0:
+            result["method"] = "skipped"
+            result["success"] = True
+            result["reason"] = "merge_failed"
+            result["warning"] = (
+                f"Skipped syncing parent branch {parent_branch}: "
+                f"--ff-only merge failed (unexpected)."
+            )
+            LOG.info("%s", result["warning"])
+            return result
+    else:
+        # 4b. Not checked out on the parent branch (another branch or
+        #     detached HEAD): update the local ref directly via
+        #     ``git fetch origin <parent>:<parent>``. Git refuses a
+        #     non-fast-forward update, so local commits are never lost,
+        #     and no branch switch is performed.
+        ref_fetch_result = run_cmd(
+            ["git", "fetch", "origin",
+             f"{parent_branch}:{parent_branch}"],
+            cwd=repo_root,
+            check=False,
+            timeout=120,
+        )
+        if ref_fetch_result.returncode != 0:
+            result["method"] = "skipped"
+            result["success"] = True
+            result["reason"] = "diverged_or_checked_out"
+            result["warning"] = (
+                f"Skipped syncing parent branch {parent_branch}: "
+                f"current branch is '{current_branch}'; the local "
+                f"{parent_branch} ref was not updated (diverged or "
+                f"cannot be fetched non-checked-out)."
+            )
+            LOG.info("%s", result["warning"])
+            return result
+
+    result["method"] = "synced"
+    LOG.info("Synced parent branch %s to origin/%s", parent_branch, parent_branch)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1527,6 +2001,70 @@ def _shell_command_runner(
     )
 
 
+def _log_test_slot_wait(queued_at: float, wait_seconds: float) -> None:
+    """Emit implement-gate pacing telemetry (SA-0MUA8BSAG000YZA2 AC3).
+
+    Called by the test skill's pacer once a "test" slot is held and just
+    before the command is spawned, so a contended host produces an
+    observable ``queued_at`` / ``wait_seconds`` line instead of silently
+    colliding.
+    """
+    LOG.info(
+        "Implement run_tests: test slot acquired — queued_at=%.3f "
+        "wait_seconds=%.3f",
+        queued_at,
+        wait_seconds,
+    )
+
+
+def _paced_runner(runner: Any) -> Any:
+    """Route a cache *runner* through the test skill's host-wide pacer.
+
+    Wrapping the runner (not ``run_cached`` itself) means only ACTUAL
+    executions acquire a ``"test"`` semaphore slot; a cache hit never
+    invokes the runner and so never consumes a slot
+    (SA-0MUKHCO02009EQFG AC1/AC2). The pacer also emits a
+    ``queued_at`` / ``wait_seconds`` telemetry line after acquiring the slot
+    (SA-0MUA8BSAG000YZA2 AC3). Falls back to the unmodified runner on
+    partial skill installs where the test skill is unavailable (degraded,
+    unpaced execution rather than failing the gate outright).
+    """
+    if _test_paced_runner is None:
+        return runner
+    return _test_paced_runner(runner, on_wait=_log_test_slot_wait)
+
+
+def _run_cached_paced(command: str, **kwargs: Any) -> dict[str, Any]:
+    """``run_cached`` with the runner paced through the test semaphore.
+
+    On ``TEST_LOCK_TIMEOUT`` saturation, returns a clear failed result (the
+    exception path stores nothing in the cache, so a saturated host never
+    poisons the cache with a phantom timeout entry). Mirrors the test
+    skill's bounded-wait semantics (SA-0MTG5U75A001F1RG,
+    SA-0MUKHCO02009EQFG AC3).
+    """
+    runner = kwargs.pop("runner", None)
+    if runner is not None:
+        kwargs["runner"] = _paced_runner(runner)
+    try:
+        return run_cached(command, **kwargs)
+    except _TestConcurrencyTimeout as exc:
+        LOG.error(
+            "Implement run_tests: could not acquire a test-run slot — %s. "
+            "Another suite is executing; retry later, or raise "
+            "TEST_LOCK_TIMEOUT to wait longer.",
+            exc,
+        )
+        return {
+            "stdout": "",
+            "stderr": str(exc),
+            "exit_code": 1,
+            "command": command,
+            "git_state": "",
+            "cached": False,
+        }
+
+
 def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
     """Run only the tests affected by the worktree's changes vs *base_ref*.
 
@@ -1558,7 +2096,7 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     pytest_cmds = [c for c in commands if c.startswith("pytest")]
     if not pytest_cmds:
         return None
-    run = run_cached(
+    run = _run_cached_paced(
         pytest_cmds[0],
         cwd=cwd,
         timeout=_resolve_test_timeout(cwd),
@@ -1567,6 +2105,21 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
         ),
         scope="changed",
     )
+    # pytest exit 4 is a *usage* error: "file or directory not found" (or a
+    # similar no-valid-items condition). It means the selection referenced a
+    # path that is not runnable — typically a deleted/renamed test file that
+    # still appeared in `git diff`. That is not a test failure: return None so
+    # the caller falls back to the full suite (fail-closed) instead of
+    # aborting finish with a phantom "Test run failed". A genuine failure is
+    # exit 1 and must still block (LP-0MTZYRTNF0092JKW).
+    if run.get("exit_code") == 4:
+        LOG.warning(
+            "Implement run_tests: changed-scope pytest exited 4 (no valid "
+            "test paths — likely a deleted/renamed test file) in %s — "
+            "falling back to full scope.",
+            cwd,
+        )
+        return None
     return _finalize_test_result(run, tooling="pytest", scope="changed")
 
 
@@ -1634,7 +2187,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd,
             )
         return _finalize_test_result(
-            run_cached(
+            _run_cached_paced(
                 override,
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
@@ -1659,7 +2212,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 "suiteCommands) — falling back to full scope.",
                 cwd,
             )
-        pytest_run = run_cached(
+        pytest_run = _run_cached_paced(
             PYTEST_CMD,
             cwd=cwd,
             timeout=_resolve_test_timeout(cwd),
@@ -1672,7 +2225,7 @@ def run_tests(cwd: str, scope: str = "changed",
         final_tooling = "pytest"
         if result["exit_code"] != 0 and _has_test_script(cwd):
             # Try npm test as fallback (also cached, canonical form)
-            npm_run = run_cached(
+            npm_run = _run_cached_paced(
                 NPM_TEST_CMD,
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
@@ -1699,7 +2252,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd,
             )
         return _finalize_test_result(
-            run_cached(
+            _run_cached_paced(
                 NPM_TEST_CMD,
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
@@ -1739,7 +2292,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd,
             )
         return _finalize_test_result(
-            run_cached(
+            _run_cached_paced(
                 command,
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
@@ -1921,7 +2474,7 @@ def _is_work_item_open(work_item_id: str) -> bool:
     """
     try:
         cmd = ["wl", "show", work_item_id, "--json"]
-        cmd[1:1] = worklog_dir_flag()
+        cmd[1:1] = resolve_worklog_flags(cmd)
         result = run_cmd(cmd, check=False, timeout=30)
         if result.returncode != 0:
             return False
@@ -2070,6 +2623,7 @@ def phase_start(
     4. Safety gate: check for dirty working tree
     5. Stash hygiene gate: warn on orphaned stashes (fail-open, --allow-orphaned-stashes to skip)
     6. Fetch work item details (audit)
+    6.5. Refresh parent branch from origin (AC3)
     7. Create a worktree from the parent branch
     8. Register signal handlers
     9. Write persistent state
@@ -2221,6 +2775,44 @@ def phase_start(
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
 
+    # ── Step 6.1: Check risk/effort estimates — evaluate if missing ────
+    # (SA-0MTTSWHQE0072N9J) plan_complete items without risk/effort now
+    # trigger an automatic evaluation instead of failing the gate.
+    LOG.info("Checking risk/effort estimates for %s...", work_item_id)
+    re_result = _check_and_evaluate_risk_effort(work_item_id, work_item)
+    report.setdefault("steps", {})["risk_effort"] = re_result
+    if re_result.get("estimates_provided"):
+        LOG.info(
+            "Risk/effort evaluated: risk=%s effort=%s",
+            re_result.get("risk"), re_result.get("effort"),
+        )
+        if not json_output:
+            print(
+                f"\nℹ  Risk/effort estimated: risk={re_result.get('risk')} "
+                f"effort={re_result.get('effort')}\n",
+            )
+    elif not re_result.get("success", True):
+        # Evaluation failed — log but do NOT block; the item can still be
+        # implemented (the estimates will be missing but the gate is pass).
+        LOG.warning(
+            "Risk/effort evaluation failed for %s: %s — proceeding without estimates.",
+            work_item_id, re_result.get("error", "unknown"),
+        )
+
+    # ── Step 6.5: Refresh parent branch before creating worktree (AC3) ─
+    # Ensure the parent branch is up-to-date before forking a child
+    # worktree. This prevents children from starting from a stale base
+    # when another actor pushed to origin/<parent> between the last
+    # finish and this start. Degrades gracefully (dirty/offline/diverged
+    # → fall back to the local branch; never fails the start phase).
+    repo_root = _get_repo_root() or str(Path.cwd().resolve())
+    LOG.info("Refreshing parent branch %s from origin...", parent_branch)
+    refresh_result = _sync_parent_branch(repo_root, parent_branch)
+    report["steps"] = report.get("steps", {})
+    report["steps"]["sync_parent_branch"] = refresh_result
+    if refresh_result.get("warning"):
+        LOG.info("Parent-branch refresh: %s", refresh_result["warning"])
+
     # ── Step 7: Create worktree ────────────────────────────────────
     wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
     branch = branch_name_for(work_item_id, slug)
@@ -2245,6 +2837,12 @@ def phase_start(
     # dist-spawning tests resolve dependencies without manual setup. Never
     # fatal: skip when either side lacks node_modules (SA-0MSGS763C006SM1B).
     _ensure_node_modules_symlink(abs_wt_path, _get_repo_root())
+
+    # Nested/workspace packages keep their own node_modules (e.g. a pi package
+    # under .pi/packages/<pkg>); symlink those too so tools run from the
+    # worktree resolve dependencies. Best-effort: never fatal
+    # (OSL-0MUFG3PJA00379CT).
+    _ensure_nested_node_modules_symlinks(abs_wt_path, _get_repo_root())
 
     # Initialise git submodules in the worktree (git worktree add does not
     # do this automatically). Best-effort: a warning on failure, never fatal.
@@ -2323,7 +2921,7 @@ def phase_finish(
     6. Clean up worktree processes
     7. Remove worktree
     8. Push to dev
-    9. Restore repo state
+    9. Sync local parent branch (post-push, AC1/AC2)
     10. Mark in_review
 
     All implementation work MUST be done inside the worktree created by
@@ -2625,13 +3223,12 @@ def phase_finish(
                 LOG.warning(msg)
                 report["steps"]["worktree_removed"] = False
 
-            # ── Step 7: Restore repo state ─────────────────────────────────
+            # ── Step 7: Resolve repo_root for push & sync ──────────────────
             repo_root = (
                 state.repo_root
                 if state
                 else (_get_repo_root() or str(Path.cwd().resolve()))
             )
-            _restore_repo_state(repo_root)
 
             # ── Step 8: Push to dev ────────────────────────────────────────
             LOG.info("Pushing to dev...")
@@ -2640,6 +3237,19 @@ def phase_finish(
 
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
+
+            # ── Step 9: Sync local parent branch (AC1 / AC2) ───────────────
+            # After a successful push, bring the main checkout's local
+            # parent branch (dev) up to date so the next child worktree
+            # does not start from a stale base.
+            sync_parent_branch = (
+                state.parent_branch if state else DEFAULT_PARENT_BRANCH
+            )
+            LOG.info("Syncing local parent branch %s...", sync_parent_branch)
+            sync_result = _sync_parent_branch(repo_root, sync_parent_branch)
+            report["steps"]["sync_parent_branch"] = sync_result
+            if sync_result.get("warning"):
+                LOG.info("Parent-branch sync: %s", sync_result["warning"])
 
             # StatusLifecycle.__exit__ sets status=completed, stage=in_review
 
@@ -2691,6 +3301,20 @@ def phase_finish(
     return report
 
 
+def _mark_pane_aborted() -> None:
+    """Set the herdr pane title to the red state on abort (fail-open).
+
+    Ensures a failed/aborted implementation surfaces in the pane grid even
+    when no end-of-session report is rendered.
+    """
+    try:
+        from shared.herdr_pane import mark_aborted
+
+        mark_aborted()
+    except Exception:  # pane updates must never break abort
+        LOG.debug("herdr pane abort status update failed", exc_info=True)
+
+
 def phase_abort(
     work_item_id: str,
     json_output: bool = False,
@@ -2725,6 +3349,9 @@ def phase_abort(
         StatusLifecycle.update_status(work_item_id, "open")
     except RuntimeError:
         LOG.error("Failed to reset work item %s status to open", work_item_id)
+
+    # Surface the abort in the herdr pane grid (fail-open; AC4).
+    _mark_pane_aborted()
 
     # ── Step 2: Find and cleanup worktree ──────────────────────────
     worktree_path = _discover_worktree(work_item_id)

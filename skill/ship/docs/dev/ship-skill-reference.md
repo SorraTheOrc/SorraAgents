@@ -14,14 +14,24 @@ internal — the only user-facing action is `release`.
 # Required keys (set once per project):
 projectName: MyProject       # Human-readable project name
 prefix: LP                   # Worklog item prefix
+```
 
+This file is version-controlled and must contain **only non-secret settings**.
+Never store the Discord webhook (or any other secret) here.
+
+### Per-project private configuration (`<project>/.worklog/config.private.yaml`)
+
+```yaml
 # ── Optional: Discord release notification (SA-0MSQ6K7Z1002H14Z) ──
+# Gitignored — never committed. Copy from .worklog/config.private.yaml.example.
 discord:
   webhook_url: https://discord.com/api/webhooks/<id>/<token>
 ```
 
-The `discord.webhook_url` field is a **secret** containing an auth token.  It
-must never be committed to version control.
+The `discord.webhook_url` field is a **secret** containing an auth token.
+`.worklog/config.private.yaml` is explicitly gitignored, so it must never be
+committed. A placeholder template is provided at
+`.worklog/config.private.yaml.example`.
 
 ### Global configuration fallback (`~/.pi/agent/config.yaml`)
 
@@ -33,9 +43,14 @@ discord:
 
 ### Config precedence (AC2)
 
-1. Per-project `.worklog/config.yaml` → `discord.webhook_url`
-2. Global `~/.pi/agent/config.yaml` → `discord.webhook_url` (fallback)
-3. Neither set → notification skipped (info log, release proceeds)
+1. Per-project `.worklog/config.private.yaml` → `discord.webhook_url` (gitignored secret)
+2. Per-project `.worklog/config.yaml` → `discord.webhook_url` (tracked, non-secret)
+3. Global `~/.pi/agent/config.yaml` → `discord.webhook_url` (fallback)
+4. Neither set → notification skipped (info log, release proceeds)
+
+The first file that defines `discord.webhook_url` wins. The existing global
+value can be migrated to `.worklog/config.private.yaml` for per-project
+isolation; the global fallback remains supported.
 
 ### Non-blocking semantics (AC3)
 
@@ -167,7 +182,7 @@ Post-release Discord notification (non-blocking).
 
 ### `resolveDiscordWebhookUrl(projectRoot, options)`
 
-Resolve the Discord webhook URL with precedence (AC2).
+Resolve the Discord webhook URL with precedence (AC2): private → project → global.
 
 **Returns:** `string | null`
 

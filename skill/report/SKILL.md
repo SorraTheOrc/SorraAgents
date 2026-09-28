@@ -106,6 +106,16 @@ from the agent's memory. Fields and sources:
 | Children | `children` array length | — (count only) |
 | Audit | `auditResult` (`null` → not run; `readyToClose` true/false) | ContextHub audit set |
 
+The audit verdict is resolved deterministically, in this precedence order:
+
+1. the structured top-level `auditResult.readyToClose` (authoritative);
+2. a legacy boolean `workItem.auditResult` (keeps simple-dict callers working);
+3. the legacy `workItem.audit` mirror — an explicit
+   `Ready to close: Yes|No` line in `audit.text` wins, otherwise a `status`
+   of `Complete` (or similar) is treated as a pass;
+4. otherwise `unknown` → `❔ not run` (an unaudited item never fabricates a
+   verdict).
+
 Unknown/missing values render the neutral marker `— N/A`; known values with
 no ContextHub icon (e.g. non-epic issue types) render as plain text. Icons
 are decorative — the textual value always accompanies them.
@@ -210,14 +220,44 @@ Rules for callers:
    v1 is stdout only.)
 5. The rendered report ends with `</end_session>` on its own line as its final line for terminal sessions; question-ended sessions do not render the report or the marker.
 
+## Pane-title status indicator
+
+When the report is rendered through the CLI, the helper also prepends a
+status prefix to the current herdr pane label (the pane title), so an operator
+watching a grid of panes can see at a glance how each session ended — without
+opening the pane (`SA-0MTFLQEQQ0083EW1`).
+
+The prefix is prepended to the existing title (e.g. `✅ Manually triggered
+intake`) and the update is idempotent: re-running replaces the prefix rather
+than stacking a second one.
+
+| Status | When | Icon | Text fallback |
+|--------|------|------|---------------|
+| `done` | All ACs `met` and no substantive producer content | ✅ | `Done` |
+| `note` | All ACs `met` but substantive Producer Actions / Notes | ⚠️ | `Note` |
+| `attention` | Any AC verdict other than `met` (`unmet`/`partial`/`adjusted`), or an abort/failure | 🚫 | `Attention` |
+
+- **Derivation** is from the supplied AC verdicts, Producer Actions and Notes
+  (`adjust`/`partial` count as not fully met → red). The standard workflow
+  next action is not itself treated as substantive producer content.
+- **Text fallbacks** reuse the renderer's `--no-icons` / `WL_NO_ICONS=1`
+  mechanism (no colour coding).
+- **Length**: the combined title is bounded to herdr's 60-character limit,
+  preserving a trailing ` - <work-item-id>` suffix when truncation is needed.
+- **Abort paths** (`intake.py abort`, `implement.py abort`, audit-runner
+  non-zero exits) set the red state directly, even when no report is rendered.
+- **Fail-open**: outside a herdr pane (no `HERDR_PANE_ID`), when the `herdr`
+  CLI is unavailable, or if the rename call fails, the update is skipped
+  silently and never breaks the skill run (AC5).
+
 ## Renderer
 
 `$(skill_path report)/scripts/render_report.py`:
 
-- `render_report(data, *, skill_name, headline, ac_rows, producer_actions=None, notes="", next_action="review", no_icons=False)` → full report markdown.
-- `render_metadata(data, no_icons=False)` → the `## Meta-Data` bullet block.
-- `render_ac_table(ac_rows)` → the AC table body.
-- `extract_metadata(data, no_icons=False)` → ordered `{label: (icon_text, raw_text)}` dict.
+- `render_report(...)` → full report markdown.
+- `render_metadata(work_item, children=None, audit_result=None)` → the `## Meta-Data` bullet block. `audit_result` is the **top-level** `auditResult` object from the `wl show --json` envelope; when omitted, the legacy `workItem.auditResult` / `workItem.audit` fallbacks apply (see the precedence list above).
+- `render_report_from_workitem(work_item, *, skill_name, headline, acceptance_criteria, ..., children=None, audit_result=None)` → full report from an already-fetched work-item dict plus the envelope's structured `auditResult`.
+- `render_from_wl(skill_name, work_item_id, ...)` → fetches the `wl show <id> --children --json` envelope and threads its top-level `auditResult` into the metadata.
 - CLI (`render_report.py <id> --skill-name ... --ac ...`): fetches the item
   via `wl show <id> --children --json` (worklog store resolved via the
   shared prefix-to-sibling scan, so it works from any cwd incl. git

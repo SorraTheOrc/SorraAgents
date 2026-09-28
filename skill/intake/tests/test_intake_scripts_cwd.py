@@ -110,6 +110,7 @@ class TestIntakeCwdIndependence:
                 "shared.status_lifecycle.worklog_dir_flag",
                 return_value=["--worklog-dir", "/fake/proj/.worklog"],
             ),
+            mock.patch.object(intake, "_mark_pane_aborted"),
         ):
             m.return_value = _ok_proc(["wl"])
             result = intake.cmd_abort("TEST-123")
@@ -191,6 +192,7 @@ class TestIntakeCwdIntegration:
             capture_output=True,
             text=True,
             check=False,
+            env={**os.environ, "HERDR_PANE_ID": "", "HERDR_ENV": ""},
         )
         assert proc.returncode == 0, f"intake abort failed: {proc.stdout} {proc.stderr}"
         result = json.loads(proc.stdout)

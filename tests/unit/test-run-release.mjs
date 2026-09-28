@@ -191,6 +191,26 @@ describe('run-release: missing-script detection', () => {
       `Expected skill-level path in output, got:\n${out}`,
     );
   });
+
+  test('fails fast without running the worklog/audit gates', () => {
+    // Regression for SA-0MUIVIJFT0009ZNV: the missing-script guard must run
+    // before the live-worklog gates. Otherwise, under parallel node test-file
+    // execution, the gates' `wl` queries exceed the 10s spawnSync timeout in
+    // runRunRelease() and the process is killed before the missing-script
+    // message prints — an environment-dependent flake.
+    const res = runRunRelease();
+    const out = (res.stdout || '') + '\n' + (res.stderr || '');
+    assert.ok(
+      out.includes('Ship automated release unavailable'),
+      `Expected the missing-script message, got:\n${out}`,
+    );
+    assert.ok(
+      !out.includes('Warning: Failed to query') &&
+        !out.includes('Gating check failed') &&
+        !out.includes('Audit gate check failed'),
+      `Missing-script path must not run the worklog/audit gates, got:\n${out}`,
+    );
+  });
 });
 
 describe('run-release: script found path', () => {

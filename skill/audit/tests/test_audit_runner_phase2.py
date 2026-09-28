@@ -635,7 +635,7 @@ class TestPhase2FileScopeManifest:
         """Return a side_effect that matches _call_pi_and_maybe_log's signature."""
         def _side_effect(issue_id, context, prompt, model="m", pi_bin="pi",
                          debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                         ac_fallback_used=None, ac_count=None, priority=None):
+                         ac_fallback_used=None, ac_count=None, json_expected=None, priority=None):
             captured["prompt"] = prompt
             return {"extracted_text": "[]"}
         return _side_effect
@@ -752,7 +752,7 @@ class TestPhase2FileScopeManifest:
 
         def _fake_call(issue_id, context, prompt, model="m", pi_bin="pi",
                        debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                       ac_fallback_used=None, ac_count=None, priority=None):
+                       ac_fallback_used=None, ac_count=None, json_expected=None, priority=None):
             prompts.append(prompt)
             return {"extracted_text": "[]"}
 
@@ -1019,7 +1019,7 @@ class TestPhase2ParallelChildCalls:
 
         def _slow_call(issue_id, context, prompt, model="m", pi_bin="pi",
                        debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                       ac_fallback_used=None, ac_count=None, priority=None):
+                       ac_fallback_used=None, ac_count=None, json_expected=None, priority=None):
             if context.startswith("phase2_child"):
                 started.wait(timeout=5)  # raises BrokenBarrierError if not concurrent
             return {"extracted_text": "[]"}
@@ -1054,7 +1054,7 @@ class TestPhase2ParallelChildCalls:
 
         def _ordered_call(issue_id, context, prompt, model="m", pi_bin="pi",
                           debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                          ac_fallback_used=None, ac_count=None, priority=None):
+                          ac_fallback_used=None, ac_count=None, json_expected=None, priority=None):
             if context.startswith("phase2_child"):
                 call_order.append(issue_id)
             return {"extracted_text": "[]"}
@@ -1102,14 +1102,19 @@ class TestPhase2ParallelChildCalls:
         assert 1 <= cap <= 4
 
     def test_legacy_alias_fallback(self):
-        """Legacy AUDIT_PHASE2_PARALLELISM is honored when AUDIT_PARALLELISM is unset."""
+        """Legacy AUDIT_PHASE2_PARALLELISM is honored when AUDIT_PARALLELISM is unset.
+
+        The ambient environment is cleared so an audit-internal
+        ``AUDIT_PARALLELISM`` export cannot leak in and mask the legacy alias
+        (SA-0MUERWHED002FNQ4).
+        """
         with mock.patch.dict(
             audit_runner.os.environ,
             {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV_LEGACY: "3"},
-            clear=False,
+            clear=True,
         ):
             # Ensure the new name is not set
-            assert audit_runner.AUDIT_PARALLELISM_ENV not in audit_runner.os.environ or audit_runner.os.environ.get(audit_runner.AUDIT_PARALLELISM_ENV) is None
+            assert audit_runner.AUDIT_PARALLELISM_ENV not in audit_runner.os.environ
             cap = audit_runner._resolve_parallelism()
         assert cap == 3
 
@@ -1138,7 +1143,7 @@ class TestPhase2ParallelChildCalls:
 
         def _recording_call(issue_id, context, prompt, model="m", pi_bin="pi",
                             debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                            ac_fallback_used=None, ac_count=None, priority=None):
+                            ac_fallback_used=None, ac_count=None, json_expected=None, priority=None):
             call_ids.append(issue_id)
             return {"extracted_text": "[]"}
 
@@ -1164,7 +1169,7 @@ class TestPhase2ParallelChildCalls:
 
         def _call_with_timeout(issue_id, context, prompt, model="m", pi_bin="pi",
                                debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                               ac_fallback_used=None, ac_count=None, priority=None):
+                               ac_fallback_used=None, ac_count=None, json_expected=None, priority=None):
             if issue_id == "C-1":
                 return {"_timeout": True, "verdict": "unmet",
                         "evidence": "timed out", "extracted_text": ""}
@@ -1346,7 +1351,7 @@ class TestPhase2RetryTuning:
         def _provider_error_call(issue_id, context, prompt, model="m",
                                  pi_bin="pi", debug_log=None,
                                  enable_tools=False, timeout=None,
-                                 max_retries=None, ac_fallback_used=None, ac_count=None, priority=None):
+                                 max_retries=None, ac_fallback_used=None, ac_count=None, json_expected=None, priority=None):
             if context.startswith("phase2_child"):
                 return {
                     "verdict": "unmet",

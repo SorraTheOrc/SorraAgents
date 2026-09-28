@@ -86,8 +86,8 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   runner="$repo_root/skill/test/scripts/run_tests.py"
   if [ -n "$repo_root" ] && [ -f "$runner" ]; then
-    echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full" >&2
-    if python3 "$runner" --scope full --json >/dev/null 2>&1; then
+    echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env" >&2
+    if python3 "$runner" --scope full --strict-git-env --json >/dev/null 2>&1; then
       echo "pre-push: full suite green (cached runs make repeat pushes cheap)" >&2
     else
       echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2
@@ -123,6 +123,23 @@ else
   echo "worklog: wl/worklog not found; skipping pre-push sync" >&2
   exit 0
 fi
+
+# ── Git-identity guard (SA-0MUJ2VMF7000UHCX) ─────────────────────────────────
+# A stale/foreign user.email makes `wl sync`'s author-identity gate refuse to
+# merge incoming Worklog data (silent strand — see the 2026-09-26 incident in
+# docs/dev/test-isolation.md §9.4). Detect and report it before the sync so the
+# operator gets an actionable remedy instead of a cryptic refusal. Fail-open:
+# on a mismatch the sync is skipped (the code push still proceeds).
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+identity_guard="$repo_root/scripts/check_git_identity.py"
+if [ -n "$repo_root" ] && [ -f "$identity_guard" ]; then
+  identity_output="$(python3 "$identity_guard" --repo-root "$repo_root" 2>&1)" || {
+    printf '%s\n' "$identity_output" >&2
+    echo "worklog: skipping sync — fix the git identity above, then re-push." >&2
+    exit 0
+  }
+fi
+
 "$WL" sync || {
   echo "worklog: pre-push sync failed (pushing anyway)" >&2
   exit 0

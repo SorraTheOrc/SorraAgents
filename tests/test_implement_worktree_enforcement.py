@@ -16,7 +16,14 @@ This test suite exercises `_worktree_placement_violation()` directly:
 5. No violation: main checkout dirty with unrelated changes but the work
    lives in the worktree (the gate must not block legitimate finishes).
 
-Related work item: SA-0MSGKAWXQ009VVG2
+Related work item: SA-0MSGKAWXQ009VVG2.
+
+The real-git fixture is routed through ``skill/shared/git_sandbox.py`` so a
+leaked repository-override environment (``GIT_DIR``/``GIT_WORK_TREE``/
+``GIT_CONFIG*``) can never redirect the git subprocesses away from the
+``tmp_path`` sandbox; ``GIT_DIR`` in particular overrides ``cwd`` and made the
+fixture fail at ``git commit`` (SA-0MUK4CK2O008N9G9, test anti-pattern #7 in
+``skill/shared/test-writing-guidelines.md``).
 """
 
 import subprocess
@@ -24,6 +31,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared import git_sandbox as gs
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -86,6 +94,10 @@ else:
         capture_output=True,
         text=True,
         timeout=30,
+        # The runner calls ``_worktree_placement_violation``, which shells out
+        # to git using the inherited environment. Scrub repository overrides so
+        # a poisoned ``GIT_DIR`` cannot make the gate inspect the wrong repo.
+        env=gs.sanitized_git_env(),
     )
 
 
@@ -109,38 +121,25 @@ def _result_of(proc: subprocess.CompletedProcess) -> str:
 def worktree_env(tmp_path):
     """Create a minimal git repo (dev branch) with a worktree.
 
+    The repo and worktree are created through the shared hermetic sandbox so
+    they never depend on (or are redirected by) the ambient environment.
+
     Returns dict with:
         - repo_root: Path to the main repo
         - worktree_dir: Path to the worktree
     """
-    repo_root = tmp_path / "main_repo"
-    repo_root.mkdir()
-    subprocess.run(["git", "init"], cwd=str(repo_root), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    repo_root = gs.init_repo(tmp_path / "main_repo", default_branch="main")
 
     # Create an initial commit
-    (repo_root / "README.md").write_text("# Test")
-    subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "commit", "-m", "Initial commit"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    (repo_root / "README.md").write_text("# Test", encoding="utf-8")
+    gs.commit_all(repo_root, "Initial commit")
 
-    # Create dev branch
-    subprocess.run(["git", "branch", "dev"], cwd=str(repo_root), check=True,
-                   capture_output=True)
+    # Create dev branch at the initial commit
+    gs.run_git(repo_root, ["branch", "dev"], check=True)
 
     # Create a worktree from dev
-    worktree_dir = tmp_path / "test_worktree"
-    worktree_dir = worktree_dir.resolve()
-    subprocess.run(
-        ["git", "worktree", "add", "--track", "-b",
-         "wl-test-branch", str(worktree_dir), "dev"],
-        cwd=str(repo_root), check=True, capture_output=True,
-    )
+    worktree_dir = (tmp_path / "test_worktree").resolve()
+    gs.add_worktree(repo_root, worktree_dir, "wl-test-branch", base="dev")
 
     return {
         "repo_root": repo_root.resolve(),

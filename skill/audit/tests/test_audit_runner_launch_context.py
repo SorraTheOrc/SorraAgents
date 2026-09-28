@@ -37,6 +37,13 @@ if str(REPO_ROOT) not in sys.path:
 from audit.scripts import audit_runner
 from audit.scripts.persist_audit import PERSIST_CONTENT_INVALID
 from audit.tests.wl_helpers import make_stateful_runner
+from shared.git_sandbox import (
+    GitSandboxError,
+    add_worktree,
+    commit_all,
+    init_repo,
+    run_git,
+)
 
 # ===========================================================================
 # Helpers
@@ -499,49 +506,21 @@ class TestRootFileOnlyRepoManifest:
     def _init_repo(tmp_path: Path) -> Path:
         """Init a real git repo whose distinctive markers are all root files.
 
-        SAFETY GUARD: refuse to run if tmp_path sits inside the live repo.
-        This prevents the historical incident (SA-0MU8EKJYY007PT42) where
-        tmp_path resolved to the project root and the fixture's git surface —
-        ``git init``, ``git add -A`` and ``git commit`` — wiped 472 files
-        from the live checkout. The guard is the only thing standing between
-        the fixture's git commands and the surrounding repository, so it must
-        reject any tmp_path nested inside a git repository, not merely the
-        repository root.
+        SAFETY GUARD: refuses to run if *tmp_path* sits inside any git work
+        tree (the sandbox helper rejects both the live repo root and any path
+        nested inside an enclosing repository). This preserves the historical
+        incident guard (SA-0MU8EKJYY007PT42): the fixture's ``git add`` /
+        ``git commit`` must never touch the live checkout.
         """
-        # --- Defensive guard: tmp_path must not be inside ANY git repository ---
-        # Reject both the live repo root and any path nested inside an
-        # enclosing repository: a nested tmp_path would still let the fixture
-        # create and commit a repository inside the live checkout.
-        try:
-            enclosing_repo = subprocess.run(
-                ["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True, check=True,
-            ).stdout.strip()
-        except subprocess.CalledProcessError:
-            enclosing_repo = ""  # not inside any git repo — safe to proceed.
-        assert not enclosing_repo, (
-            f"_init_repo refused: tmp_path {tmp_path} is inside git repository "
-            f"{enclosing_repo!r}. Running the fixture here would risk "
-            "committing into the live repository."
-        )
-
-        repo = tmp_path / "root-file-repo"
-        repo.mkdir()
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        subprocess.run(
-            ["git", "-C", str(repo), "config", "user.email", "t@t.com"],
-            check=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(repo), "config", "user.name", "T"], check=True
-        )
+        repo = init_repo(tmp_path / "root-file-repo")
+        run_git(repo, ["config", "user.email", "t@t.com"], check=True)
+        run_git(repo, ["config", "user.name", "T"], check=True)
         for name in TestRootFileOnlyRepoManifest.ROOT_FILES:
             (repo / name).write_text("x\n", encoding="utf-8")
         shared = repo / TestRootFileOnlyRepoManifest.SHARED_SUBDIR
         shared.mkdir()
         (shared / "test_a.py").write_text("x\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+        commit_all(repo, "init")
         return repo
 
     @staticmethod
@@ -616,9 +595,9 @@ class TestRootFileOnlyRepoManifest:
         repository inside the live checkout.
         """
         for unsafe_path in (REPO_ROOT, REPO_ROOT / "skill"):
-            with pytest.raises(AssertionError) as exc_info:
+            with pytest.raises(GitSandboxError) as exc_info:
                 self._init_repo(unsafe_path)
-            assert "is inside git repository" in str(exc_info.value)
+            assert "inside git work tree" in str(exc_info.value)
 
     def test_repo_index_root_file_list_is_bounded(self, tmp_path):
         """Risk mitigation: the root-file name list is bounded so a repo with
@@ -781,6 +760,12 @@ class TestChildPersistFailureFatal:
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
+            # Mock the child-audit subprocess spawn so the test does not
+            # execute a real audit_runner.py issue subprocess (which would
+            # trigger F3 auto-execution and potentially recurse into the
+            # full suite under a cold cache — SA-0MUG47DYG006TV40 AC3).
+            mock.patch.object(audit_runner.subprocess, "run",
+                              return_value=mock.MagicMock(returncode=0)),
         ):
             rc = audit_runner.cmd_issue(
                 "OSL-1", persist=True, force=True,
@@ -965,7 +950,6 @@ def _make_real_git_project_with_worktree(tmp_path: Path,
     Returns ``(worklog_dir, owning_root, worktree_path, main_head,
     worktree_head)``.
     """
-    import subprocess as sp
 
     projects = tmp_path / "projects"
     owning_root = projects / "open_source_llm"
@@ -978,29 +962,21 @@ def _make_real_git_project_with_worktree(tmp_path: Path,
         f"projectName: Open Source LLM\nprefix: {prefix}\n", encoding="utf-8"
     )
 
-    def _git(*args: str, cwd: Path) -> str:
-        proc = sp.run(["git", *args], cwd=str(cwd), check=True,
-                      capture_output=True, text=True)
-        return proc.stdout.strip()
-
-    _git("init", cwd=owning_root)
-    _git("config", "user.email", "test@test.com", cwd=owning_root)
-    _git("config", "user.name", "Test", cwd=owning_root)
-    _git("add", "-A", cwd=owning_root)
-    _git("commit", "-m", "main", cwd=owning_root)
-    main_head = _git("rev-parse", "HEAD", cwd=owning_root)
+    init_repo(owning_root, default_branch="main", sandbox_root=tmp_path)
+    commit_all(owning_root, "main")
+    main_head = run_git(owning_root, ["rev-parse", "HEAD"], check=True).stdout.strip()
 
     worktree_path = (worklog_dir / "worktrees" / "wl-OSL-1-test").resolve()
-    _git("worktree", "add", "-b", "wl-OSL-1-test",
-         str(worktree_path), cwd=owning_root)
+    add_worktree(owning_root, worktree_path, "wl-OSL-1-test")
     # worktree-only tracked file (committed on the worktree branch).
     (worktree_path / "wt_only").mkdir()
     (worktree_path / "wt_only" / "main.py").write_text("print('wt')\n")
-    _git("add", "-A", cwd=worktree_path)
-    _git("commit", "-m", "worktree-only", cwd=worktree_path)
+    commit_all(worktree_path, "worktree-only")
     # worktree-only untracked file (uncommitted working-tree state).
     (worktree_path / "wt_uncommitted.txt").write_text("wt state\n")
-    worktree_head = _git("rev-parse", "HEAD", cwd=worktree_path)
+    worktree_head = run_git(
+        worktree_path, ["rev-parse", "HEAD"], check=True
+    ).stdout.strip()
     return worklog_dir, owning_root, worktree_path, main_head, worktree_head
 
 
@@ -1099,4 +1075,43 @@ class TestWorktreeLaunchGitResolution:
             changed = audit_runner._git_changed_files(runner)
         assert "wt_uncommitted.txt" in changed, (
             f"changed files must reflect the worktree working tree: {changed}"
+        )
+
+
+# ===========================================================================
+# Stale-sibling isolation (SA-0MUIMLPLH006TKY1)
+# ===========================================================================
+
+
+class TestStaleSiblingIsolation:
+    """Flow tests must not resolve synthetic ids through the real scan root.
+
+    Regression for SA-0MUIMLPLH006TKY1:
+    ``TestLifecycleVerification.test_swallowed_no_update_fails_nonzero``
+    audits the synthetic id ``TEST-1``. The real prefix-to-sibling scan root
+    is ``REPO_ROOT.parent``; a stale ``TEST``-prefixed worklog left behind on
+    the host (e.g. ``/tmp/wlfields-test`` from an earlier suite) matched that
+    prefix and made the launch-context guard reject the item, so the lifecycle
+    test failed on otherwise-unrelated hosts. The autouse ownership fixture now
+    redirects the scan to an empty isolated directory, keeping flow tests
+    hermetic.
+    """
+
+    def test_scan_root_is_isolated_from_real_siblings(self):
+        """The active sibling scan root must not be the real repo parent, and
+        must expose no prefix-matching worklog to synthetic-id flow tests."""
+        from shared import status_lifecycle as shared
+
+        assert shared.SIBLING_SCAN_ROOT != shared.REPO_ROOT.parent, (
+            "flow tests must not scan the real sibling root where stale "
+            "prefix-matching worklogs can hijack synthetic ids"
+        )
+        assert shared._find_worklog_dir_by_prefix("TEST") is None
+
+    def test_synthetic_id_resolves_to_launch_root(self):
+        """With the scan isolated, ``TEST-1`` resolves to the launch project
+        root, so the launch-context guard does not abort the flow test."""
+        assert (
+            audit_runner._resolve_owning_project_root("TEST-1")
+            == audit_runner.TARGET_PROJECT_ROOT
         )
