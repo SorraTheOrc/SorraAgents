@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1475,4 +1476,137 @@ class TestNonStringEvidenceTolerance:
         ]
         assert audit_runner._evidence_has_infra_failure_markers(
             ac_results, []) is False
+
+
+class TestCascadeBoundedRecursionGuard:
+    """SA-0MUG47DYG006TV40 AC2: regression tests for the recursion guard.
+
+    The cascade path is:
+      parent audit → child audit subprocess → F3 cache-miss → run_cached
+      → full suite → same test → child audit subprocess → ...
+
+    The guard works by:
+      1. LIVE_REPO_GUARD_ACTIVE env var is set by run_tests.py and
+         propagated into child-audit subprocesses (audit_runner.py).
+      2. When a child audit sees the marker, its F3 auto-execution
+         stands down with a diagnostic instead of executing the suite.
+
+    These tests verify both parts of the guard.
+    """
+
+    def test_suite_run_in_progress_detects_marker(self):
+        """_suite_run_in_progress returns True when the marker is set."""
+        saved = os.environ.pop("LIVE_REPO_GUARD_ACTIVE", None)
+        try:
+            assert audit_runner._suite_run_in_progress() is False
+            os.environ["LIVE_REPO_GUARD_ACTIVE"] = "1"
+            assert audit_runner._suite_run_in_progress() is True
+        finally:
+            if saved is not None:
+                os.environ["LIVE_REPO_GUARD_ACTIVE"] = saved
+            elif saved is None:
+                os.environ.pop("LIVE_REPO_GUARD_ACTIVE", None)
+
+    def test_child_env_propagates_guard_marker(self, tmp_path):
+        """Child-audit subprocesses inherit LIVE_REPO_GUARD_ACTIVE.
+
+        The subprocess.run call that spawns a child audit must pass
+        LIVE_REPO_GUARD_ACTIVE=1 in the child's environment, regardless
+        of whether the parent audit was launched with the marker set.
+        This ensures the cascade cannot recurse through child audits
+        (SA-0MUG47DYG006TV40 AC2).
+        """
+        envs_captured: list[dict] = []
+
+        def _side_effect(cmd):
+            """Fake wl runner for the child-audit flow."""
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str and "TEST-1" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {
+                            "rawOutput": "Ready to close: Yes\n-- TEST-1 --\n",
+                            "auditedAt": "2026-01-01T00:00:00.000Z",
+                        },
+                    }),
+                    stderr="",
+                )
+            if "show" in cmd_str and "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": "## Acceptance Criteria\n- AC1: ok.",
+                            "status": "in_progress",
+                        },
+                        "children": [
+                            {
+                                "id": "CHILD-1",
+                                "title": "Child",
+                                "status": "open",
+                                "stage": "plan_complete",
+                                "description": "## Acceptance Criteria\n- AC1: ok.",
+                            },
+                        ],
+                    }),
+                    stderr="",
+                )
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner = mock.MagicMock()
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
+
+        def _fake_subprocess_run(cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            if "audit_runner.py" in cmd_str and "issue" in cmd_str:
+                child_env = kwargs.get("env", os.environ.copy())
+                envs_captured.append(child_env)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                return_value={"extracted_text": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "mocked"},
+                ])}
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_run_phase2_deep_analysis",
+                side_effect=lambda wi, ac, cr, **kw: (ac, cr, True),
+            ),
+            mock.patch.object(audit_runner, "persist_audit", return_value=0),
+            mock.patch.object(
+                audit_runner.subprocess, "run", side_effect=_fake_subprocess_run
+            ),
+        ):
+            # No LIVE_REPO_GUARD_ACTIVE set — standalone parent audit.
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=True, force=True,
+                runner=mock_runner,
+                audit_children=True,
+                parent_timeout=None,
+            )
+
+        assert rc == 0
+        assert len(envs_captured) == 1
+        # The child must inherit LIVE_REPO_GUARD_ACTIVE so the cascade
+        # cannot recurse.
+        assert envs_captured[0].get("LIVE_REPO_GUARD_ACTIVE") == "1"
 

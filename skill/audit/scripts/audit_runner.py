@@ -141,6 +141,32 @@ from test.scripts.run_tests import (
 from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
 # ---------------------------------------------------------------------------
+# Recursion guard: LIVE_REPO_GUARD_ACTIVE propagation (SA-0MUG47DYG006TV40)
+# ---------------------------------------------------------------------------
+LIVE_REPO_GUARD_ACTIVE_ENV = "LIVE_REPO_GUARD_ACTIVE"
+"""Marker inherited from ``run_tests.py`` and ``live_repo_guard.py``.
+
+When set, signals that an outer test-suite run owns the checkout. Nested
+audits whose F3 auto-execution would re-enter the suite must stand down
+rather than spawning a recursive suite run (SA-0MUG47DYG006TV40).
+
+This env var is also threaded into child-audit subprocesses so they
+inherit the guard and cannot cascade further.
+"""
+
+
+def _suite_run_in_progress() -> bool:
+    """Return True when an outer test-suite run owns the checkout.
+
+    Reuses the ``LIVE_REPO_GUARD_ACTIVE`` marker set by ``run_tests.py``
+    and consumed by ``live_repo_guard.py``. A nested audit sees the marker
+    and stands down its F3 auto-execution to prevent unbounded recursion
+    (SA-0MUG47DYG006TV40 AC1/AC2).
+    """
+    return bool(os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV))
+
+
+# ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
 # ---------------------------------------------------------------------------
 AUDIT_SEMAPHORE_NAME = "audit"
@@ -8402,15 +8428,30 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             # --no-execute / AUDIT_NO_EXECUTE=1 opts out and proceeds
             # fail-open partial (no execution, no block). --run-tests is the
             # explicit override that executes on ANY non-green state.
-            head_sha = _resolve_audited_head(runner)
-            test_run = _run_tests_via_test_skill(
-                cwd=TARGET_PROJECT_ROOT,
-                parent_work_item_id=issue_id,
-                head_sha=head_sha,
-            )
-            if test_run["success"] and head_sha is not None:
-                green_run_block = _test_skill_run_prompt_block(head_sha)
-                test_skill_run_sha = head_sha
+            #
+            # Recursion guard (SA-0MUG47DYG006TV40): when an outer test-suite
+            # run owns the checkout (LIVE_REPO_GUARD_ACTIVE set), the F3
+            # auto-execution stands down to prevent unbounded cascade.
+            # A nested audit cannot itself re-enter the full suite; it
+            # proceeds fail-open partial instead.
+            if _suite_run_in_progress() and not run_tests:
+                print(
+                    "Audit F3 auto-execution stand-down: a test-suite run "
+                    "already owns the checkout (LIVE_REPO_GUARD_ACTIVE set). "
+                    "Proceeding with execution-dependent ACs partial to "
+                    "prevent unbounded cascade (SA-0MUG47DYG006TV40).",
+                    file=sys.stderr,
+                )
+            else:
+                head_sha = _resolve_audited_head(runner)
+                test_run = _run_tests_via_test_skill(
+                    cwd=TARGET_PROJECT_ROOT,
+                    parent_work_item_id=issue_id,
+                    head_sha=head_sha,
+                )
+                if test_run["success"] and head_sha is not None:
+                    green_run_block = _test_skill_run_prompt_block(head_sha)
+                    test_skill_run_sha = head_sha
 
     # ------------------------------------------------------------------
     # Capture original status + stage before the freshness gate / status
@@ -10385,6 +10426,11 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     )
                                     if child_flags:
                                         audit_cmd.extend(child_flags)
+                                    # Propagate the LIVE_REPO_GUARD_ACTIVE marker so
+                                    # child audits inherit the recursion guard and
+                                    # cannot cascade further (SA-0MUG47DYG006TV40).
+                                    child_env = dict(os.environ)
+                                    child_env[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
                                     effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
                                     subprocess.run(
                                         audit_cmd,
@@ -10392,6 +10438,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                         capture_output=True,
                                         text=True,
                                         timeout=effective_timeout,
+                                        env=child_env,
                                     )
                                     # Re-check verdict after triggered audit
                                     verdict, reason, _audited_at = _get_child_audit_verdict(

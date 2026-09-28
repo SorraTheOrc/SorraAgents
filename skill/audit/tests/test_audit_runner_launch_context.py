@@ -760,6 +760,12 @@ class TestChildPersistFailureFatal:
                 return_value={"success": True, "findings": [],
                               "fixes_applied": 0},
             ),
+            # Mock the child-audit subprocess spawn so the test does not
+            # execute a real audit_runner.py issue subprocess (which would
+            # trigger F3 auto-execution and potentially recurse into the
+            # full suite under a cold cache — SA-0MUG47DYG006TV40 AC3).
+            mock.patch.object(audit_runner.subprocess, "run",
+                              return_value=mock.MagicMock(returncode=0)),
         ):
             rc = audit_runner.cmd_issue(
                 "OSL-1", persist=True, force=True,

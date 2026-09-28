@@ -28,6 +28,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -67,6 +69,23 @@ _FAILING_TEST_RUN = {
 # The F3/F4 escape hatch (F4 AC4): the audit must not execute the suite when
 # this env var is set, even on a cache miss.
 AUDIT_NO_EXECUTE_ENV = "AUDIT_NO_EXECUTE"
+
+
+@pytest.fixture(autouse=True)
+def _standalone_audit_suite_context(monkeypatch):
+    """Simulate a standalone audit (no ancestor suite run) for this module.
+
+    The repo-root ``conftest.py`` arms the live-repo mutation guard, which
+    sets ``LIVE_REPO_GUARD_ACTIVE`` for the whole pytest session. The F3
+    recursion guard (SA-0MUG47DYG006TV40) reads that marker to stand down
+    a *nested* audit's automatic suite execution — correct behaviour when
+    an audit runs inside a test suite, but it means this module's
+    standalone-F3 tests (which assert auto-execution) must clear the marker
+    to model a production standalone audit. The nested stand-down path is
+    covered by ``TestCascadeBoundedRecursionGuard`` in
+    ``test_audit_runner_children.py``.
+    """
+    monkeypatch.delenv("LIVE_REPO_GUARD_ACTIVE", raising=False)
 
 
 def _make_cmd_issue_runner(description: str = _GREEN_RUN_DESC,

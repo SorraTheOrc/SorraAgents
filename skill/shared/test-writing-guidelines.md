@@ -124,6 +124,42 @@ The regression guard fails the suite if a test mutates the live checkout:
 see the [test skill](../test/SKILL.md#live-repo-mutation-guard-detect-only)
 and [`tests/test_live_repo_mutation_guard.py`](../../tests/test_live_repo_mutation_guard.py).
 
+### 8. Unmocked Audit / Suite Subprocess Spawns
+
+**What it looks like:** A test exercises the audit's child-audit cascade
+(`--audit-children`) or any other path that calls `subprocess.run` to spawn a
+real `audit_runner.py issue …` (or `run_tests.py` / pytest) child process,
+without mocking that spawn. The test passes a faked `wl` runner but leaves
+`subprocess.run` real.
+
+**Why it's bad:** The real child audit runs in the test process tree. On a
+cold test cache its F3 auto-execution force-executes the full suite, which
+re-runs the same test, which spawns another child audit — an unbounded
+cascade (observed 1500s+ and 19–50+ nested processes) that hangs the release
+gate. The per-run child cap (`--max-child-audits`) is per-process and cannot
+bound the cross-process depth (SA-0MUG47DYG006TV40).
+
+**Fix:** Mock `audit_runner.subprocess.run` so the child spawn is asserted,
+not executed — the same pattern as `TestChildPersistFailureFatal`
+(`skill/audit/tests/test_audit_runner_launch_context.py`) and
+`TestCascadeBoundedRecursionGuard`
+(`skill/audit/tests/test_audit_runner_children.py`). The production-side
+recursion guard (`_suite_run_in_progress()` / `LIVE_REPO_GUARD_ACTIVE`)
+bounds the cascade fail-open, but tests must still mock the spawn so they
+never depend on it.
+
+```python
+def _fake_subprocess_run(cmd, **kwargs):
+    cmd_str = " ".join(cmd)
+    if "audit_runner.py" in cmd_str and "issue" in cmd_str:
+        triggered.append(cmd_str)  # assert the (mocked) invocation
+    return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+with mock.patch.object(audit_runner.subprocess, "run",
+                       side_effect=_fake_subprocess_run):
+    ...
+```
+
 ## Positive Guidance
 
 1. **Every test must assert observable behaviour of production code:** input →
@@ -143,3 +179,7 @@ and [`tests/test_live_repo_mutation_guard.py`](../../tests/test_live_repo_mutati
    [`skill/shared/live_repo_guard.py`](../shared/live_repo_guard.py) (armed by
    the repo-root [`conftest.py`](../../conftest.py)) fails the session if a test
    mutates the checkout.
+8. **Tests that reach the audit child-cascade / suite subprocess must mock
+   `audit_runner.subprocess.run`** (see anti-pattern 8) so no real
+   `audit_runner.py issue` child is spawned; assert the mocked invocation
+   instead.
