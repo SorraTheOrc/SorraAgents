@@ -168,6 +168,27 @@ def _suite_run_in_progress() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Cascade-audit demotion suppression (SA-0MUJAPC680078396)
+# ---------------------------------------------------------------------------
+AUDIT_CASCADE_AUDIT_ENV = "AUDIT_CASCADE_AUDIT"
+"""Marker threaded into cascade-triggered child-audit subprocesses.
+
+When set, signals that this audit was triggered as a side-effect of a
+parent audit's ``--audit-children`` cascade.  The child's
+``_apply_terminal_lifecycle`` suppresses demotion (restores the
+original stage) when the child was already ``in_review`` or ``done``
+at audit start — a parent-triggered re-audit must never silently
+push completed/in-review work back into the actionable queue
+(SA-0MUJAPC680078396 AC2).
+"""
+
+
+def _is_cascade_audit() -> bool:
+    """Return True when this audit was cascade-triggered by a parent."""
+    return bool(os.environ.get(AUDIT_CASCADE_AUDIT_ENV))
+
+
+# ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
 # ---------------------------------------------------------------------------
 AUDIT_SEMAPHORE_NAME = "audit"
@@ -4882,7 +4903,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            auto_green_run_sha: str | None = None,
                            test_skill_run_sha: str | None = None,
                            content_fingerprint: str | None = None,
-                           merge_gate_evidence: str | None = None) -> str:
+                           merge_gate_evidence: str | None = None,
+                           snapshot_exempt: set[str] | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -4962,28 +4984,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     # Children that inherited the parent's pass (parent-first pass-through,
     # SA-0MSKB6VJA005N43F) count as reviewed by virtue of the parent — they
     # are not independently audited but the parent verdict covers them.
+    # Snapshot-exempt children (SA-0MUJAPC680078396): children that were
+    # in_review/done at audit start remain exempt even if demoted by a
+    # cascade-triggered re-audit.
     active_children = [c for c in child_results if c.get("stage") not in ("", None)]
     all_children_reviewed = all(
-        c.get("stage") in ("in_review", "done") or c.get("inherited_pass")
+        _child_is_exempt(c, snapshot_exempt)
+        or c.get("stage") in ("in_review", "done")
+        or c.get("inherited_pass")
         for c in active_children
     )
 
     # Check each active (non-exempt) child's persisted audit verdict
-    # Exempt children: status=deleted (wl delete), completed/done (already closed),
-    # and those in in_review stage (per spec, in_review children do not
-    # block parent closure — only pre-review stages block).
-    def _is_exempt_child(c: dict) -> bool:
-        # Deleted children are fully closed
-        if c.get("status") == "deleted":
-            return True
-        # Completed/done children are fully closed
-        if c.get("status") == "completed" and c.get("stage") == "done":
-            return True
-        # Children in in_review stage should not have their audit verdicts
-        # block parent closure (per audit spec)
-        return c.get("stage") == "in_review"
-
-    non_exempt_children = [c for c in active_children if not _is_exempt_child(c)]
+    # Exempt children: status=deleted, completed/done, in_review, inherited_pass,
+    # or snapshot-exempt (SA-0MUJAPC680078396).
+    non_exempt_children = [c for c in active_children if not _child_is_exempt(c, snapshot_exempt)]
     any_child_audit_not_ready = any(
         c.get("child_audit_ready") is False
         for c in non_exempt_children
@@ -6376,8 +6391,43 @@ def _annotate_skip_evidence(ac_results: list[dict], note: str) -> list[dict]:
     return updated
 
 
-def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict],
-                                fp_screen_results: list[dict] | None = None) -> tuple[bool, str]:
+def _child_is_exempt(
+    child: dict,
+    snapshot_exempt: set[str] | None = None,
+) -> bool:
+    """Check whether a child is exempt from blocking parent closure.
+
+    Exempt children:
+    - ``stage == in_review`` or ``status == completed`` / ``stage == done``
+    - ``status == deleted`` (fully closed)
+    - ``inherited_pass`` is True (parent-first pass-through)
+    - **snapshot-exempt**: the child was ``in_review`` or ``done`` at audit
+      start, captured in *snapshot_exempt* (SA-0MUJAPC680078396).  Such
+      children retain their exemption even if a cascade-triggered re-audit
+      later demotes them.
+    """
+    if child.get("status") == "deleted":
+        return True
+    if child.get("status") == "completed" and child.get("stage") == "done":
+        return True
+    if child.get("stage") == "in_review":
+        return True
+    if child.get("inherited_pass"):
+        return True
+    # Snapshot-based exemption (SA-0MUJAPC680078396): if this child was
+    # exempt at audit start, it remains exempt regardless of any
+    # cascade-triggered re-audit demotion.
+    if snapshot_exempt is not None and child.get("id") in snapshot_exempt:
+        return True
+    return False
+
+
+def _has_phase1_blocking_issues(
+    cq_findings: list[dict],
+    child_results: list[dict],
+    fp_screen_results: list[dict] | None = None,
+    snapshot_exempt: set[str] | None = None,
+) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
     Returns (blocked, reason). If blocked, Phase 2 deep analysis should be
@@ -6418,7 +6468,7 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
     ]
     blocked_children = [
         c for c in active_children
-        if c.get("stage") not in ("in_review", "done")
+        if not _child_is_exempt(c, snapshot_exempt)
     ]
     if blocked_children:
         names = ", ".join(f"{c.get('title', '?')} ({c.get('stage', '?')})" for c in blocked_children[:3])
@@ -6426,11 +6476,11 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
 
     # Check each active child's persisted audit verdict
     # A child with child_audit_ready=False means its own audit says "not ready"
-    # Children in in_review stage are exempt from this check (per audit spec,
-    # in_review children do NOT block parent closure — only pre-review stages block).
+    # Exempt children (per audit spec, in_review children do NOT block parent
+    # closure — only pre-review stages block).  Snapshot-exempt children
+    # (SA-0MUJAPC680078396) are also exempt from verdict checking.
     for c in active_children:
-        # Skip in_review children — their audit verdicts do not block Phase 1
-        if c.get("stage") == "in_review":
+        if _child_is_exempt(c, snapshot_exempt):
             continue
         car = c.get("child_audit_ready")
         if car is False:
@@ -6441,14 +6491,18 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
 
     return False, ""
 
-def _build_issue_json(issue: dict, ac_results: list[dict],
-                      child_results: list[dict],
-                      code_quality_findings: list[dict] | None = None,
-                      code_quality_fixes_applied: int = 0,
-                      fp_screen_results: list[dict] | None = None,
-                      remediation_results: dict | None = None,
-                      phase2_completed: bool = False,
-                      phase2_skip_note: str | None = None) -> dict:
+def _build_issue_json(
+    issue: dict,
+    ac_results: list[dict],
+    child_results: list[dict],
+    code_quality_findings: list[dict] | None = None,
+    code_quality_fixes_applied: int = 0,
+    fp_screen_results: list[dict] | None = None,
+    remediation_results: dict | None = None,
+    phase2_completed: bool = False,
+    phase2_skip_note: str | None = None,
+    snapshot_exempt: set[str] | None = None,
+) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
     Ready-to-close logic:
@@ -6469,27 +6523,21 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     # Check that all active children are in in_review or done stage.
     # Children that inherited the parent's pass (parent-first pass-through,
     # SA-0MSKB6VJA005N43F) count as reviewed by virtue of the parent.
+    # Snapshot-exempt children (SA-0MUJAPC680078396): children that were
+    # in_review/done at audit start remain exempt even if demoted by a
+    # cascade-triggered re-audit.
     active_children = [c for c in child_results if c.get("stage") not in ("", None)]
     all_children_reviewed = all(
-        c.get("stage") in ("in_review", "done") or c.get("inherited_pass")
+        _child_is_exempt(c, snapshot_exempt)
+        or c.get("stage") in ("in_review", "done")
+        or c.get("inherited_pass")
         for c in active_children
     )
 
     # Check each non-exempt child's persisted audit verdict
-    # Exempt children: status=deleted (wl delete), completed/done (already closed),
-    # and those in in_review stage (per spec, in_review children do not
-    # block parent closure — only pre-review stages block).
-    def _is_exempt(c: dict) -> bool:
-        # Deleted children are fully closed
-        if c.get("status") == "deleted":
-            return True
-        # Completed/done children are fully closed
-        if c.get("status") == "completed" and c.get("stage") == "done":
-            return True
-        # Children in in_review stage should not have their audit verdicts
-        # block parent closure (per audit spec)
-        return c.get("stage") == "in_review"
-    non_exempt_children = [c for c in active_children if not _is_exempt(c)]
+    # Exempt children: status=deleted, completed/done, in_review, inherited_pass,
+    # or snapshot-exempt (SA-0MUJAPC680078396).
+    non_exempt_children = [c for c in active_children if not _child_is_exempt(c, snapshot_exempt)]
     any_child_audit_not_ready = any(
         c.get("child_audit_ready") is False
         for c in non_exempt_children
@@ -7606,6 +7654,17 @@ class _AuditContext:
     separate-process path.
     """
     phase1_model: str | None = None
+    snapshot_exempt_children: set[str] = field(default_factory=set)
+    """Child IDs that were exempt (in_review/done) at audit start.
+
+    Used by the child-exemption snapshot / no-side-effect-demotion
+    contract (SA-0MUJAPC680078396).  The parent's closure decision
+    evaluates against the *pre-audit* stage of these children, so a
+    cascade-triggered child re-audit that demotes an exempt child does
+    not retroactively block the parent.  The child-side lifecycle also
+    suppresses demotion when the cascade flag is set (see
+    _apply_terminal_lifecycle).
+    """
 
     # Phase checkpoint store (SA-0MT6EZUS9004FJ9T): bound by cmd_issue after
     # the launch-context gate; read by _phase1_parent_screening and
@@ -7718,6 +7777,30 @@ def _bind_fetched_item(ctx: _AuditContext, data: dict) -> None:
     ctx.children = payload.get("children", []) or []
     ctx.description = work_item.get("description", "") or ""
     ctx.comments = payload.get("comments", []) or []
+
+
+def _capture_exempt_children_snapshot(ctx: _AuditContext) -> None:
+    """Capture which children were exempt at audit start (SA-0MUJAPC680078396).
+
+    Children whose ``stage`` is ``in_review`` or whose ``status`` is
+    ``completed`` and ``stage`` is ``done`` are exempt from blocking the
+    parent's closure.  This snapshot is captured BEFORE any child
+    re-audits run, so the parent's closure decision uses the *pre-audit*
+    stage of these children.
+
+    The snapshot is stored in ``ctx.snapshot_exempt_children`` as a set
+    of child IDs for efficient lookup.
+    """
+    snapshot: set[str] = set()
+    for child in ctx.children:
+        child_id = child.get("id", "")
+        child_stage = child.get("stage", "")
+        child_status = child.get("status", "")
+        if child_stage == "in_review" or (
+            child_status == "completed" and child_stage == "done"
+        ):
+            snapshot.add(child_id)
+    ctx.snapshot_exempt_children = snapshot
 
 
 def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], str]:
@@ -10535,8 +10618,13 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     # Propagate the LIVE_REPO_GUARD_ACTIVE marker so
                                     # child audits inherit the recursion guard and
                                     # cannot cascade further (SA-0MUG47DYG006TV40).
+                                    # Propagate the AUDIT_CASCADE_AUDIT marker so
+                                    # child audits know they were cascade-triggered
+                                    # and suppress lifecycle demotion on exempt
+                                    # children (SA-0MUJAPC680078396 AC2).
                                     child_env = dict(os.environ)
                                     child_env[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
+                                    child_env[AUDIT_CASCADE_AUDIT_ENV] = "1"
                                     effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
                                     subprocess.run(
                                         audit_cmd,
@@ -11111,6 +11199,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 test_skill_run_sha=test_skill_run_sha,
                 content_fingerprint=content_fingerprint,
                 merge_gate_evidence=ctx.merge_gate_evidence,
+                snapshot_exempt=ctx.snapshot_exempt_children,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if ctx.script_failure:
@@ -11155,6 +11244,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 remediation_results=ctx.remediation_results,
                 phase2_completed=phase2_completed,
                 phase2_skip_note=phase2_skip_note,
+                snapshot_exempt=ctx.snapshot_exempt_children,
             )
             payload["child_persist_results"] = child_persist_results
             # Include script failure info in JSON output
@@ -11583,16 +11673,51 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             dry_run_freshness_refresh = not ctx.persist
         else:  # ctx.audit_verdict == "no"
             # Return to the actionable queue at a fixed pre-review stage.
-            restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
-            expected_status, expected_stage = "open", "plan_complete"
-            # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
-            # integration fails the audit closed and flags the item for
-            # producer review so the producer investigates and integrates
-            # manually — never proceed past Phase 1 with unmerged work.
-            if ctx.merge_gate_blocker:
-                restore_cmd = ["wl", "update", ctx.issue_id,
-                               "--status", "open", "--stage", "plan_complete",
-                               "--needs-producer-review", "yes", "--json"]
+            # Cascade-audit suppression (SA-0MUJAPC680078396 AC2): when this
+            # audit was auto-triggered by a parent's ``--audit-children``
+            # cascade AND the item was already ``in_review`` or ``done``
+            # before this run, suppress the demotion — a parent-triggered
+            # re-audit must never silently push completed/in-review work
+            # back into the actionable queue.
+            _cascade_suppress_demotion = (
+                _is_cascade_audit()
+                and ctx.original_stage in ("in_review", "done")
+            )
+            if _cascade_suppress_demotion:
+                # Restore the original stage instead of demoting.
+                safe_status, safe_stage = _coerce_valid_status_stage(
+                    ctx.original_status, ctx.original_stage,
+                )
+                restore_cmd = [
+                    "wl", "update", ctx.issue_id,
+                    "--status", safe_status,
+                    "--stage", safe_stage,
+                    "--assignee", "",
+                    "--json",
+                ]
+                expected_status, expected_stage = safe_status, safe_stage
+                print(
+                    f"Cascade-audit: suppressed demotion for {ctx.issue_id} "
+                    f"(was {ctx.original_stage}; verdict 'No' is from "
+                    "a parent-triggered re-audit, not an independent review).",
+                    file=sys.stderr,
+                )
+            else:
+                restore_cmd = [
+                    "wl", "update", ctx.issue_id,
+                    "--status", "open", "--stage", "plan_complete", "--json",
+                ]
+                expected_status, expected_stage = "open", "plan_complete"
+                # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
+                # integration fails the audit closed and flags the item for
+                # producer review so the producer investigates and integrates
+                # manually — never proceed past Phase 1 with unmerged work.
+                if ctx.merge_gate_blocker:
+                    restore_cmd = [
+                        "wl", "update", ctx.issue_id,
+                        "--status", "open", "--stage", "plan_complete",
+                        "--needs-producer-review", "yes", "--json",
+                    ]
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(
             f"Error: could not compute terminal status for {ctx.issue_id}: {exc}; "
@@ -12038,6 +12163,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
                               worklog_dir=ctx.worklog_dir)
             rc = 1
         else:
+            # Capture the child-exemption snapshot at the very start of the
+            # audit — before Phase 1 screening or any child re-audit runs
+            # (SA-0MUJAPC680078396).  Children that were ``in_review`` or
+            # ``done`` at this point are exempt from blocking the parent's
+            # closure, even if a cascade-triggered child audit later demotes
+            # them.
+            _capture_exempt_children_snapshot(ctx)
             _phase1_parent_screening(ctx)
             rc = _phase_children(ctx)
             if rc is not None:
