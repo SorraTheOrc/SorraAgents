@@ -193,6 +193,34 @@ export function reshapeContext(messages, signal) {
 }
 
 // ---------------------------------------------------------------------------
+// Stale ExtensionContext safety
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the current session id from a pi `ExtensionContext` without ever
+ * throwing on a stale/invalidated ctx.
+ *
+ * After a session replacement or reload, pi invalidates previously captured
+ * extension contexts: reading `ctx.sessionManager` (or calling
+ * `getSessionId`) then throws `This extension ctx is stale ...`. Extension
+ * event handlers and async callbacks run outside pi's try/catch, so an
+ * unguarded throw can crash the whole pi process (SA-0MUEIOGT2005IR7F).
+ * This helper converts that failure into a `null` result so callers can fail
+ * safe — no-op for a response, or pass the context through unchanged.
+ *
+ * @param {unknown} ctx pi ExtensionContext (or a stale stub)
+ * @returns {string | null} the session id, or null when unavailable/stale
+ */
+export function safeSessionId(ctx) {
+  try {
+    const sessionId = ctx?.sessionManager?.getSessionId?.();
+    return typeof sessionId === "string" ? sessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Per-session bridge (stateful glue, still dependency-free)
 // ---------------------------------------------------------------------------
 

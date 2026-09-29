@@ -26,6 +26,7 @@ const {
   formatSignal,
   createSignalExtractor,
   createCapturingFetch,
+  safeSetStatus,
 } = await import(MODULE);
 
 // ---------------------------------------------------------------------------
@@ -248,5 +249,70 @@ describe("passthrough safety (AC4)", () => {
 
   test("unrecognised comments are surfaced verbatim (nothing swallowed)", () => {
     assert.equal(formatSignal("custom proxy note"), "custom proxy note");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stale UI handle safety (SA-0MUEIOGT2005IR7F / SA-0MUJASFYL003P3RK)
+//
+// `statusUi` is captured at `turn_start`; the capturing-fetch callback and
+// `turn_end` may run after a session replacement/reload has invalidated the
+// captured UI handle. Reading `ui.theme` or calling `ui.setStatus` then throws
+// `This extension ctx is stale ...` outside pi's try/catch, crashing pi.
+// `safeSetStatus` must swallow that failure and report whether the write
+// happened.
+// ---------------------------------------------------------------------------
+
+describe("safeSetStatus (stale UI fail-safe)", () => {
+  test("writes dim-formatted text to a live UI handle", () => {
+    const calls = [];
+    const ui = {
+      theme: { fg: (style, text) => `<${style}>${text}` },
+      setStatus: (key, value) => calls.push([key, value]),
+    };
+    assert.equal(safeSetStatus(ui, "proxy-signals", "chain exhausted"), true);
+    assert.deepEqual(calls, [["proxy-signals", "<dim>chain exhausted"]]);
+  });
+
+  test("clears status (undefined) without touching theme", () => {
+    const calls = [];
+    const ui = {
+      get theme() {
+        throw new Error("theme must not be read when clearing");
+      },
+      setStatus: (key, value) => calls.push([key, value]),
+    };
+    assert.equal(safeSetStatus(ui, "proxy-signals", undefined), true);
+    assert.deepEqual(calls, [["proxy-signals", undefined]]);
+  });
+
+  test("no-ops (no throw) when setStatus throws on a stale UI handle", () => {
+    const ui = {
+      theme: { fg: (_style, text) => text },
+      setStatus() {
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload.",
+        );
+      },
+    };
+    assert.doesNotThrow(() => safeSetStatus(ui, "proxy-signals", "signal"));
+    assert.equal(safeSetStatus(ui, "proxy-signals", "signal"), false);
+  });
+
+  test("no-ops (no throw) when the theme accessor throws on a stale UI handle", () => {
+    const ui = {
+      get theme() {
+        throw new Error("This extension ctx is stale");
+      },
+      setStatus() {
+        throw new Error("setStatus must not be called");
+      },
+    };
+    assert.equal(safeSetStatus(ui, "proxy-signals", "signal"), false);
+  });
+
+  test("no-ops (no throw) for a null/absent UI handle", () => {
+    assert.equal(safeSetStatus(null, "proxy-signals", "signal"), false);
+    assert.equal(safeSetStatus(undefined, "proxy-signals", "signal"), false);
   });
 });
