@@ -962,27 +962,103 @@ def git_commit(cwd: str, message: str) -> bool:
     return True
 
 
-def git_push_to_dev(cwd: str, branch: str) -> bool:
+class PushTimeoutError(RuntimeError):
+    """Raised when a push times out, carrying commit/branch info for recovery."""
+
+    def __init__(self, commit_hash: str, branch: str, timeout: int) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.timeout = timeout
+        super().__init__(
+            f"Push to dev timed out after {timeout}s. "
+            f"Commit {commit_hash} on branch {branch} is local. "
+            f"Push manually: git push origin {branch}:refs/heads/dev"
+        )
+
+
+def _kill_process_group(pid: int) -> None:
+    """Kill the entire process group rooted at *pid* (POSIX only).
+
+    Used to clean up orphaned children of a timed-out ``git push`` — the
+    pre-push hook spawns ``run_tests.py`` which may outlive the parent
+    process if the ``git push`` is killed.
+
+    Args:
+        pid: PID of the process to kill (typically the ``git`` process).
+    """
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        # The process may have already exited — best effort.
+        pass
+
+
+def git_push_to_dev(
+    cwd: str, branch: str, commit_hash: str | None = None, timeout: int | None = None,
+) -> bool:
     """Push the current branch into the dev branch on origin.
+
+    The push timeout is resolved from ``.pi/test-config.json``
+    (``timeoutPerCommand``) and defaults to 600 s.  On timeout the
+    pre-push hook's child processes are terminated via process-group
+    kill (AC2).  If the timeout expires a ``PushTimeoutError`` is raised
+    carrying the commit hash and branch so the caller can post a
+    manual-push comment and leave recoverable state (AC3).
 
     Args:
         cwd: Working directory (worktree root).
         branch: Local branch name to push.
+        commit_hash: The commit hash being pushed (used in recovery).
+        timeout: Override timeout in seconds (defaults to resolved config).
 
     Returns:
         True if the push succeeded.
+
+    Raises:
+        ``PushTimeoutError``: push timed out — carries commit_hash/branch
+            so the caller can produce a recovery comment.
     """
-    # Push to dev (refs/heads/dev target)
-    result = run_cmd(
-        ["git", "push", "origin", f"{branch}:refs/heads/dev"],
-        cwd=cwd,
-        check=False,
-        timeout=120,
-    )
-    if result.returncode != 0:
-        LOG.error("git push to dev failed: %s", result.stderr.strip())
+    if timeout is None:
+        timeout = _resolve_test_timeout(cwd)
+
+    # Spawn the push in its own process group so that a timeout kills the
+    # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
+    try:
+        proc = subprocess.Popen(
+            ["git", "push", "origin", f"{branch}:refs/heads/dev"],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,  # new process group
+            env={**os.environ},
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill the entire process group so orphaned hook children don't
+            # survive and deadlock subsequent push attempts.
+            _kill_process_group(proc.pid)
+            proc.wait()
+            LOG.error(
+                "git push to dev timed out after %d s (pre-push hook still "
+                "running).",
+                timeout,
+            )
+            # Raise with recoverable-state info (AC3)
+            raise PushTimeoutError(
+                commit_hash or "unknown", branch, timeout,
+            ) from None
+        if proc.returncode != 0:
+            LOG.error(
+                "git push to dev failed: %s", stderr.decode(errors="replace").strip(),
+            )
+            return False
+        return True
+    except Exception as exc:
+        if isinstance(exc, PushTimeoutError):
+            raise
+        LOG.error("git push to dev error: %s", exc)
         return False
-    return True
 
 
 def git_get_commit_hash(cwd: str) -> str:
@@ -3232,8 +3308,21 @@ def phase_finish(
 
             # ── Step 8: Push to dev ────────────────────────────────────────
             LOG.info("Pushing to dev...")
-            if not git_push_to_dev(repo_root, branch):
-                raise RuntimeError("git push to dev failed.")
+            try:
+                if not git_push_to_dev(repo_root, branch, commit_hash):
+                    raise RuntimeError("git push to dev failed.")
+            except PushTimeoutError as exc:
+                # AC3: recoverable state — commit is safe, branch info retained.
+                # Post a manual-push comment and re-raise so the outer handler
+                # resets status to open.
+                wl_add_comment(
+                    work_item_id,
+                    f"Push to dev timed out after {exc.timeout}s (pre-push hook "
+                    f"still running, likely the full test suite). Commit "
+                    f"{exc.commit_hash} is local on branch {exc.branch}.\n"
+                    f"Push manually: git push origin {exc.branch}:refs/heads/dev",
+                )
+                raise RuntimeError(f"git push to dev timed out: {exc}") from exc
 
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
@@ -3262,11 +3351,15 @@ def phase_finish(
             StatusLifecycle.update_status(work_item_id, "open")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
-        if "git push to dev failed" in msg:
-            wl_add_comment(
-                work_item_id,
-                f"Push to dev failed. Commit {commit_hash} is local. "
-                f"Push manually: git push origin {branch}:refs/heads/dev",
+        if "git push to dev failed" in msg or "git push to dev timed out" in msg:
+            # Already posted a manual-push comment from the push handler;
+            # the commit hash and branch are in the comment already.
+            LOG.warning(
+                "Push %s. Commit %s on branch %s is local and can be "
+                "pushed manually.",
+                "timed out" if "timed out" in msg else "failed",
+                commit_hash,
+                branch,
             )
         elif "git commit failed" in msg:
             wl_add_comment(work_item_id, "Commit failed during finish phase.")

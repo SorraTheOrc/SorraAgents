@@ -59,3 +59,49 @@ configured runner):
 
 The returned dict includes `skipped` (bool) and `tooling` (str | None) in
 addition to `success`/`stdout`/`stderr`/`exit_code`/`failures`.
+
+## Push timeout (SA-0MUH9R74O002MQDU)
+
+`implement.py finish` pushes to `dev` via `git_push_to_dev()`.  The push
+timeout is resolved from `.pi/test-config.json` (`timeoutPerCommand`) via
+`_resolve_test_timeout()`, defaulting to 600 s when absent — the old
+hard-coded 120 s is removed.
+
+The push is spawned in its own process group (`start_new_session=True`) so that
+a `TimeoutExpired` kills the entire tree (including the pre-push hook's
+`run_tests.py` child) via `os.killpg()`.  This prevents orphaned hook
+processes from surviving and deadlocking subsequent push attempts.
+
+On timeout a `PushTimeoutError` (subclass of `RuntimeError`) is raised carrying:
+
+- `commit_hash` — the local commit that was created
+- `branch` — the feature branch name
+- `timeout` — the resolved timeout value
+
+`phase_finish` catches this error, posts a manual-push comment on the work
+item, and re-raises as a `RuntimeError`.  The outer `RuntimeError` handler
+resets status to `open` and reports the error; the commit and branch remain
+intact for manual recovery.
+
+Recovery from the manual-push comment:
+
+```bash
+git push origin <branch>:refs/heads/dev
+```
+
+### Process-group kill (AC2)
+
+`_kill_process_group(pid)` calls `os.killpg(os.getpgid(pid), signal.SIGKILL)`;
+`ProcessLookupError` and `PermissionError` are silently swallowed (the process
+may already have exited).  This is best-effort — the goal is to kill surviving
+children, not to guarantee it.
+
+### Recoverable state (AC3)
+
+A push timeout never silently loses work:
+
+1. The commit is already created locally before the push.
+2. `PushTimeoutError` carries `commit_hash` and `branch`.
+3. `wl_add_comment` posts a full manual-push instruction including both.
+4. Status is reset to `open` (not abandoned).
+5. The agent or operator can push manually with the posted instruction.

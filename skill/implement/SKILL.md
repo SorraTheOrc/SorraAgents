@@ -112,6 +112,29 @@ projects that explicitly create the file get the override.
 Set the value high enough to cover the full suite with headroom (e.g. TCE uses
 1500 to cover its ~19-minute suite).
 
+### Push Timeout (SA-0MUH9R74O002MQDU)
+
+The push step (git push to `dev`) also uses `_resolve_test_timeout()` to
+resolve its timeout from `timeoutPerCommand` in `.pi/test-config.json`, defaulting
+to 600 s when the config is absent.  The old hard-coded 120 s timeout is removed.
+
+When the push times out (typically because the pre-push hook is still running the
+full test suite):
+
+- The entire process group is killed via `os.killpg()` so orphaned
+  `run_tests.py` children cannot survive and deadlock subsequent pushes.
+- A `PushTimeoutError` is raised carrying the commit hash, branch name, and
+  timeout value.
+- `phase_finish` catches this and posts a manual-push comment on the work item
+  (commit hash + branch + `git push origin` instruction).
+- The work item status is reset to `open` (not silently abandoned).
+
+Recovery: push manually from the main checkout:
+
+```bash
+git push origin <branch>:refs/heads/dev
+```
+
 ## Status Safety & Abort Handling
 
 ### Critical Rule: Always Reset Status on Abort
