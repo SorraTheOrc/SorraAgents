@@ -535,6 +535,163 @@ class TestConclusion(unittest.TestCase):
         self.assertIn("Ready for plan.", result)
 
 
+class TestConditionalHeader(unittest.TestCase):
+    """Verify the header reflects session outcome (AC1/AC5)."""
+
+    def setUp(self):
+        from render_report import render_report
+        self.render_report = render_report
+
+    def test_all_met_shows_completed_header(self):
+        result = self.render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=[
+                ("1", "AC one", "test", "met"),
+                ("2", "AC two", "test", "met"),
+            ],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="ship",
+        )
+        self.assertIn("# Completed implement", result)
+        self.assertNotIn("# Incomplete implement", result)
+
+    def test_any_unmet_shows_incomplete_header(self):
+        result = self.render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=[
+                ("1", "AC one", "test", "met"),
+                ("2", "AC two", "test", "unmet"),
+            ],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="plan",
+        )
+        self.assertIn("# Incomplete implement", result)
+        self.assertNotIn("# Completed implement", result)
+
+    def test_empty_ac_shows_completed_header(self):
+        """Empty AC list with no producer actions/notes => completed."""
+        result = self.render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=[],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="review",
+        )
+        self.assertIn("# Completed implement", result)
+
+    def test_all_unmet_shows_incomplete_header(self):
+        result = self.render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=[
+                ("1", "Broken", "test", "unmet"),
+                ("2", "Also broken", "test", "unmet"),
+            ],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="plan",
+        )
+        self.assertIn("# Incomplete implement", result)
+
+
+class TestConditionalConclusion(unittest.TestCase):
+    """Verify the conclusion reflects session outcome (AC1/AC2/AC3)."""
+
+    def setUp(self):
+        from render_report import render_report
+        self.render_report = render_report
+
+    def test_all_met_conclusion_ready_for_next_action(self):
+        result = self.render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=[
+                ("1", "AC one", "test", "met"),
+            ],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="ship",
+        )
+        self.assertIn("This completes the implement process for", result)
+        self.assertIn("Ready for ship.", result)
+        self.assertNotIn("incomplete", result.lower())
+        self.assertNotIn("requires attention", result.lower())
+
+    def test_any_unmet_conclusion_incomplete_requires_attention(self):
+        result = self.render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=[
+                ("1", "AC one", "test", "met"),
+                ("2", "AC two", "test", "unmet"),
+            ],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="plan",
+        )
+        self.assertIn("incomplete", result.lower())
+        self.assertIn("requires attention", result.lower())
+        self.assertNotIn("This completes the", result)
+        self.assertNotIn("Ready for plan.", result)
+
+    def test_empty_ac_conclusion_ready_for_next_action(self):
+        """Empty AC list with no producer actions/notes => completed."""
+        result = self.render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=[],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="review",
+        )
+        self.assertIn("Ready for review.", result)
+        self.assertNotIn("incomplete", result.lower())
+        self.assertNotIn("requires attention", result.lower())
+
+    def test_all_unmet_conclusion(self):
+        result = self.render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=[
+                ("1", "Broken", "test", "unmet"),
+            ],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="plan",
+        )
+        self.assertIn("incomplete", result.lower())
+        self.assertIn("requires attention", result.lower())
+
+
 class TestParseAcArgs(unittest.TestCase):
     """Verify the _parse_ac_args helper function."""
 
