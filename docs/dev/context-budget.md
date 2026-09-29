@@ -116,12 +116,16 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 10220,
+  "global_agents": 11053,
   "project_agents": 3285,
   "skills_prose": 1968,
-  "total": 15473
+  "total": 16306
 }
 ```
+
+> **Recovery section (CG-0MUFIBB2X008A136 / SA-0MUN83EAF000G903):**
+> thresholds raised to accommodate the "Recovering from a wiped/corrupt
+> worklog database" section added to `AGENTS_GLOBAL.md` (see below).
 
 > **Scope — what counts:** thresholds are measured with
 > `measure_context.py --include-hidden` (all 16 skills, including the 5 hidden
