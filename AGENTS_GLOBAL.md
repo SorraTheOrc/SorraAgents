@@ -84,6 +84,18 @@ and relevant context.
 
 - wl is the primary source of truth; only source code is more authoritative. Always use `--json` for programmatic use. New work items discovered during work → `wl create`: child if blocking (`--parent <current-id>`), else `discovered-from:<current-id>` in the description. Check `wl next` before asking what to work on.
 
+## Recovering from a wiped/corrupt worklog database
+
+If the worklog database becomes wiped or corrupt (e.g. a mistaken `wl import`), the recovery procedure is:
+
+1. **Run `wl init`** — this reinitialises the worklog store with a fresh database. It is the canonical recovery path.
+
+> **WARNING:** `wl import` is **destructive** — it replaces the entire target worklog store. Only use `wl import` with a verified full export/backup. An accidental `wl import` can wipe thousands of work items in seconds.
+
+If `wl init` alone does not restore the data you need (e.g. when working from a backup rather than a fresh store), check for pre-migration snapshots:
+
+- `.worklog/backups/worklog.db.<timestamp>` — created automatically before `wl doctor upgrade` migrations. Restore by copying the snapshot into place and running `wl init`.
+
 ## Local skill extensions
 
 A project may augment a global skill from its repo via

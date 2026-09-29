@@ -3083,11 +3083,12 @@ def phase_finish(
     3. Build
     4. Test (with fix-and-re-run loop)
     5. Commit
-    6. Clean up worktree processes
-    7. Remove worktree
-    8. Push to dev
-    9. Sync local parent branch (post-push, AC1/AC2)
-    10. Mark in_review
+    6. Fast-forward dev in the main checkout (AC1 — context-budget fix)
+    7. Clean up worktree processes
+    8. Remove worktree
+    9. Push to dev
+    10. Sync local parent branch (post-push, AC1/AC2)
+    11. Mark in_review
 
     All implementation work MUST be done inside the worktree created by
     ``phase_start``. If the current directory is outside the worktree and the
@@ -3370,14 +3371,75 @@ def phase_finish(
             }
             LOG.info("Committed at %s", commit_hash)
 
-            # ── Step 5: Clean up worktree processes ────────────────────────
+            # ── Step 5: Fast-forward dev in the main checkout ──────────────
+            # Before removing the worktree, bring the main checkout's local
+            # dev branch up to the new commit (AC1).  This ensures that when
+            # the pre-push hook measures the working tree (which is the main
+            # checkout at push time), it sees the updated files — so
+            # context-budget compliant commits that modify AGENTS.md etc. no
+            # longer trigger the stale-checkout failure.
+            repo_root = (
+                state.repo_root
+                if state
+                else (_get_repo_root() or str(Path.cwd().resolve()))
+            )
+            try:
+                LOG.info(
+                    "Fast-forwarding dev in main checkout (%s) to %s ...",
+                    repo_root,
+                    commit_hash,
+                )
+                # 1. Fetch latest origin/dev so our local-tracking ref is current.
+                fetch_result = run_cmd(
+                    ["git", "fetch", "origin", "dev"], cwd=repo_root,
+                )
+                if fetch_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git fetch origin dev failed: {fetch_result.stderr.strip()}"
+                    )
+                # 2. Ensure the main checkout is on dev (and clean).
+                checkout_result = run_cmd(
+                    ["git", "checkout", "dev"], cwd=repo_root,
+                )
+                if checkout_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git checkout dev failed: {checkout_result.stderr.strip()}"
+                    )
+                # 3. Fast-forward origin/dev → local dev (synchronises with any
+                #    concurrent pushes before we merge our commit).
+                merge_origin_result = run_cmd(
+                    ["git", "merge", "--ff-only", "origin/dev"], cwd=repo_root,
+                )
+                if merge_origin_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git merge origin/dev failed (non-fast-forward or conflict): "
+                        f"{merge_origin_result.stderr.strip()}"
+                    )
+                # 4. Fast-forward our new commit onto dev.
+                merge_commit_result = run_cmd(
+                    ["git", "merge", "--ff-only", commit_hash], cwd=repo_root,
+                )
+                if merge_commit_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git merge --ff-only {commit_hash} failed: "
+                        f"{merge_commit_result.stderr.strip()}"
+                    )
+                LOG.info("Fast-forward to %s succeeded", commit_hash)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "Fast-forward dev failed (%s); push will proceed from the "
+                    "stale checkout — the context-budget gate may reject the push.",
+                    exc,
+                )
+
+            # ── Step 5b: Clean up worktree processes ───────────────────────
             LOG.info("Cleaning up worktree processes...")
             cleanup_result = cleanup_worktree_processes(worktree_path)
             report["steps"]["cleanup"] = cleanup_result
             if cleanup_result.get("warning"):
                 LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
 
-            # ── Step 6: Remove worktree ────────────────────────────────────
+            # ── Step 6: Remove worktree ───────────────────────────────────
             LOG.info("Removing worktree...")
             remove_state(worktree_path)
             if not _remove_worktree(
@@ -3388,14 +3450,8 @@ def phase_finish(
                 LOG.warning(msg)
                 report["steps"]["worktree_removed"] = False
 
-            # ── Step 7: Resolve repo_root for push & sync ──────────────────
-            repo_root = (
-                state.repo_root
-                if state
-                else (_get_repo_root() or str(Path.cwd().resolve()))
-            )
-
-            # ── Step 8: Push to dev ────────────────────────────────────────
+            # ── Step 7: Push to dev ────────────────────────────────────────
+            # repo_root was resolved in Step 5 (fast-forward) above.
             LOG.info("Pushing to dev...")
             try:
                 if not git_push_to_dev(repo_root, branch, commit_hash):
@@ -3416,7 +3472,7 @@ def phase_finish(
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
 
-            # ── Step 9: Sync local parent branch (AC1 / AC2) ───────────────
+            # ── Step 8: Sync local parent branch (AC1 / AC2) ──────────────
             # After a successful push, bring the main checkout's local
             # parent branch (dev) up to date so the next child worktree
             # does not start from a stale base.
@@ -3458,7 +3514,7 @@ def phase_finish(
             LOG.error(msg)
         return report
 
-    #── Step 9: Add completion comment ─────────────────────────────
+    # ── Step 9: Add completion comment ─────────────────────────────
     wl_add_comment(
         work_item_id,
         f"Implementation complete.\n- Commit: {commit_hash}\n- Branch: {branch}\n- Worktree: {worktree_path}",
