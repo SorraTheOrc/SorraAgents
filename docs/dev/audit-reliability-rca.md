@@ -182,14 +182,35 @@ gap** (no explicit "N child screens pending" gate), addressed by R5.
 
 ### F6 — Provider errors are conflated with parse failures — **CONFIRMED**
 
-9 real `provider_error` entries (1.1 % of calls): HTTP 500
-(SA-0MSL1Z70C007B9VZ, ×3), HTTP 503 `mode_switch_drain`
-(SA-0MSNYMKV7005P0H9), and `Connection error.` (SA-0MSM6VU2K001IMVP,
-SA-0MSRWAY9A005Q0CB, SA-0MSUT8GQP004WSYN, SA-0MU8EKJYY007PT42,
-SA-0MUDUXXMK006ANA0, plus 1 in `verdict_reask`). These *are* labelled
-`provider_error` in `_call_pi_and_maybe_log`, but the call-site debug writes
-(e.g. `child_ac_fallback`) and the summary surfaces do not separate them from
-parse failures, so downstream counts still conflate the two.
+9 `provider_error` entries (1.1 % of calls) were originally recorded as real
+provider faults: HTTP 500 (SA-0MSL1Z70C007B9VZ, ×3), HTTP 503
+`mode_switch_drain` (SA-0MSNYMKV7005P0H9), and `Connection error.`
+(SA-0MSM6VU2K001IMVP, SA-0MSRWAY9A005Q0CB, SA-0MSUT8GQP004WSYN,
+SA-0MU8EKJYY007PT42, SA-0MUDUXXMK006ANA0, plus 1 in `verdict_reask`). These
+*are* labelled `provider_error` in `_call_pi_and_maybe_log`, but the call-site
+debug writes (e.g. `child_ac_fallback`) and the summary surfaces do not
+separate them from parse failures, so downstream counts still conflate the two.
+
+**Attribution correction — `Connection error.` is an extension crash, not a
+provider fault (2026-09-29, SA-0MUEIOGT2005IR7F / SA-0MUJASLS9005UA47).** A
+corpus scan of every `reason=provider_error` entry with a non-empty
+`raw_stderr` shows the `Connection error.` entries carry a stale
+`ExtensionContext` exception — `This extension ctx is stale after session
+replacement or reload` — followed by a `Node.js v22.x` process-exit banner.
+The **fatal, uncaught** throw is raised by the ContextHub-owned `worklog`
+recovery extension (`register-recovery.ts`: `_notifyFn` captures the handler
+`ctx` and later calls `ctx.ui.notify` from the async retry loop). The
+SorraAgents-owned `proxy-compaction-bridge` and `proxy-sse-signals`
+extensions throw the same stale-ctx error, but pi catches those as non-fatal
+`Extension error (...)` lines. Because audit prompts are read-only and
+self-contained, `_call_pi` now adds `--no-extensions` alongside
+`--no-context-files --no-skills` (SA-0MUEIOGT2005IR7F AC1), so no extension
+can load into an audit session and the crash cannot recur there. The fatal
+ContextHub crash is fixed separately under **WL-0MUIV50EJ007VH9B**. The
+genuine provider faults are the HTTP 500 (×3) and HTTP 503 `mode_switch_drain`
+(×1) entries; the `Connection error.` entries are re-attributed to the
+extension crash above. R1/R6/R7 remain the observability fix that separates
+whatever provider errors do occur from parse failures.
 
 ---
 
