@@ -180,6 +180,15 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > `skills_prose` unchanged). Thresholds were regenerated to the new measured
 > surface so the gate remains green for the approved content.
 >
+> **Worklog recovery guidance bump (2026-09-29, CG-0MUFIBB2X008A136 /
+> SA-0MUN83EAF000G903):** the "Recovering from a wiped/corrupt worklog
+> database" safety section added ~833 B to `AGENTS_GLOBAL.md` (`global_agents
+> 10220` → `11053`; `total 15473` → `16306`; `project_agents` and
+> `skills_prose` unchanged). The addition was deliberate (critical recovery
+> guidance applied to every project), so the thresholds were regenerated to the
+> new measured surface with justification rather than compacting the safety
+> text (SA-0MUN83EAF000G903 AC3).
+>
 > ### Enforcement (committed gate)
 >
 > The regression gate is enforced in two places:
