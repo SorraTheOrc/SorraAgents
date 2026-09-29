@@ -2199,6 +2199,74 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     return _finalize_test_result(run, tooling="pytest", scope="changed")
 
 
+def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
+    """Try to select a named test group from changed files and run it.
+
+    Uses the shared :func:`select_group_from_changed_files` to map touched
+    paths to the smallest sufficient group (SA-0MUJKF2HP001BR51).  When a
+    group is selected, its commands are executed through the cache.  Returns
+    None when no groups are defined or no group matches — the caller falls
+    back to the full suite.
+
+    This runs BEFORE the existing changed-file → test-file selector because
+    a group is a coarser but still targeted scope: an audit-skill change
+    triggers the ``audit`` group (not every test in the repo).
+    """
+    try:
+        import run_tests as _rt  # noqa: PLC0415
+        from run_tests import (  # noqa: PLC0415
+            select_group_from_changed_files as _select_group,
+            group_commands as _group_cmds,
+        )
+    except ImportError:
+        return None
+
+    changed = _rt.compute_changed_files(Path(cwd), base_ref=base_ref or "origin/dev")
+    if not changed:
+        return None
+
+    group_name = _select_group(changed, Path(cwd))
+    if group_name is None:
+        return None
+
+    group_cmds = _group_cmds(group_name, Path(cwd))
+    if group_cmds is None:
+        return None
+
+    # Run the group's commands through the cache
+    results = []
+    for cmd in group_cmds:
+        run = _run_cached_paced(
+            cmd,
+            cwd=cwd,
+            timeout=_resolve_test_timeout(cwd),
+            runner=lambda command, cwd_, timeout_: run_cmd(
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+            ),
+            scope="full",
+        )
+        results.append(run)
+
+    # Combine results
+    all_failures = []
+    exit_code = 0
+    for r in results:
+        if r["exit_code"] != 0:
+            exit_code = r["exit_code"]
+            # Extract failure info from stderr
+            for line in (r.get("stderr", "") or "").splitlines():
+                if "FAILED" in line or "ERROR" in line:
+                    all_failures.append(line.strip())
+                elif "AssertionError" in line or "failed:" in line.lower():
+                    all_failures.append(line.strip())
+
+    return _finalize_test_result(
+        {"exit_code": exit_code, "stdout": "", "stderr": "", "failures": all_failures},
+        tooling=f"group:{group_name}",
+        scope="full",
+    )
+
+
 def run_tests(cwd: str, scope: str = "changed",
               base_ref: str | None = None) -> dict[str, Any]:
     """Run the project test suite, routed through the per-repo run cache.
@@ -2207,11 +2275,15 @@ def run_tests(cwd: str, scope: str = "changed",
 
     - ``changed`` (default): run only the tests affected by the worktree's
       changes vs *base_ref* (``origin/dev`` default). Used by the finish
-      build/test/commit loop for fast iteration. When no subset can be
-      selected (no dev baseline, no changed files, only non-test changes,
-      custom ``suiteCommands``, or a non-pytest tooling), falls back to the
-      full suite with a logged warning — a scoped run must never silently
-      skip testing.
+      build/test/commit loop for fast iteration. Selection order:
+
+      1. Named group from ``.pi/test-config.json`` → mapped from changed
+         paths (SA-0MUJKF2HP001BR51).
+      2. Changed-file → test-file selector (existing behaviour).
+      3. Full suite (fallback when nothing is subsettable).
+
+      Falls back to the full suite with a logged warning when no subset can
+      be selected — a scoped run must never silently skip testing.
     - ``full``: the complete suite (populates/consumes the full-suite cache
       entry that audit and the pre-push hook rely on).
 
@@ -2279,13 +2351,24 @@ def run_tests(cwd: str, scope: str = "changed",
     # 2. pytest (with npm test fallback when the repo also has a test script)
     if tooling == "pytest":
         if scope == "changed":
+            # Try named group selection first (SA-0MUJKF2HP001BR51):
+            # map changed files to the smallest sufficient group.
+            group_result = _run_group_from_changed_files(cwd, base_ref=base_ref)
+            if group_result is not None:
+                LOG.info(
+                    "Implement run_tests: selected group '%s' from changed files in %s",
+                    group_result.get("tooling", "unknown"),
+                    cwd,
+                )
+                return group_result
+            # Fall through to the existing changed-file → test-file selector.
             scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
             if scoped is not None:
                 return scoped
             LOG.warning(
                 "Implement run_tests: changed-scope selection unavailable in "
-                "%s (no dev baseline, no changed tests, or custom "
-                "suiteCommands) — falling back to full scope.",
+                "%s (no dev baseline, no changed tests, no matching groups, "
+                "or custom suiteCommands) — falling back to full scope.",
                 cwd,
             )
         pytest_run = _run_cached_paced(
