@@ -112,17 +112,67 @@ def scrub_repository_overrides(
     return cleaned
 
 
+def is_worktree_git_dir(
+    git_dir: str | os.PathLike[str],
+    *,
+    top: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Return ``True`` when *git_dir* is a worktree-managed git directory.
+
+    Git sets ``GIT_DIR`` to ``<main_checkout>/.git/worktrees/<name>`` when a
+    hook runs from a linked worktree, so the value alone is not evidence of a
+    leaked repository override. This predicate recognises that shape so the
+    release-gate fail-fast can allow a legitimate worktree ``GIT_DIR`` while
+    still refusing a genuine leak (SA-0MUMR3QPM002VK7M).
+
+    Args:
+        git_dir: Candidate ``GIT_DIR`` value.
+        top: The **main checkout** root. When omitted, it is resolved from the
+            current process directory via :func:`main_checkout_root` (the
+            common production case: the pre-push hook runs in the linked
+            worktree).
+
+    Returns:
+        ``True`` when *git_dir* resolves under
+        ``<main_checkout>/.git/worktrees/``.
+    """
+    if top is None:
+        top = main_checkout_root(os.getcwd())
+    if top is None:
+        return False
+    worktrees_dir = Path(top).resolve() / ".git" / "worktrees"
+    try:
+        Path(git_dir).resolve().relative_to(worktrees_dir)
+    except (ValueError, OSError):
+        return False
+    return True
+
+
 def repository_override_vars_present(
     env: Mapping[str, str] | None = None,
+    *,
+    top: str | os.PathLike[str] | None = None,
 ) -> tuple[str, ...]:
     """Return the repository-override variable names present in *env*.
 
     Used by the runner diagnostics (log which variables were stripped, never
     their values) and by the release-gate fail-fast check. Defaults to
     ``os.environ``.
+
+    A worktree-managed ``GIT_DIR`` (see :func:`is_worktree_git_dir`) is **not**
+    reported: git sets it for pre-push hooks run from a linked worktree, and
+    the release gate must run there without the opt-out override
+    (SA-0MUMR3QPM002VK7M). Every other override value is still reported.
     """
     source: Mapping[str, str] = os.environ if env is None else env
-    return tuple(name for name in REPOSITORY_OVERRIDE_ENV_VARS if name in source)
+    present: list[str] = []
+    for name in REPOSITORY_OVERRIDE_ENV_VARS:
+        if name not in source:
+            continue
+        if name == "GIT_DIR" and is_worktree_git_dir(source[name], top=top):
+            continue
+        present.append(name)
+    return tuple(present)
 
 
 def sanitized_git_env() -> dict[str, str]:

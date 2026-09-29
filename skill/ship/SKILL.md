@@ -183,7 +183,10 @@ The release gate runs with ``--strict-git-env`` (SA-0MUIULX49001BWGG): it
 refuses to start (exit 2) when a repository-override variable such as
 ``GIT_DIR`` is present in the environment, because a leaked value can redirect
 real-git test fixtures at the live checkout. The pre-push hook applies the same
-``--strict-git-env`` flag for ``dev``/``main`` pushes. An operator can override
+``--strict-git-env`` flag for ``dev``/``main`` pushes. A **worktree-managed**
+``GIT_DIR`` (``<main>/.git/worktrees/<name>``, which git exports to hooks run
+from a linked worktree) is exempt — it is git's own hook environment, not a
+leak (SA-0MUMR3QPM002VK7M). An operator can override any genuine detection
 with ``RUN_TESTS_ALLOW_REPO_OVERRIDES=1`` (loud warning; not recommended) — the
 scrub is still applied either way.
 

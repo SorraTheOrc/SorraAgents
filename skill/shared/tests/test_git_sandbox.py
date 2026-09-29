@@ -30,6 +30,15 @@ for _path in (str(REPO_ROOT), str(REPO_ROOT / "skill")):
 
 from shared import git_sandbox as gs
 
+
+def _seeded_repo(tmp_path: Path, name: str = "main") -> Path:
+    """A hermetic repo with one commit, ready for ``git worktree add``."""
+    repo = gs.init_repo(tmp_path / name, default_branch="dev")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    return repo
+
+
 # ---------------------------------------------------------------------------
 # AC1/AC2 — sandbox containment
 # ---------------------------------------------------------------------------
@@ -301,6 +310,61 @@ class TestRepositoryOverrideVarsPresent:
 
     def test_empty_when_none_present(self):
         assert gs.repository_override_vars_present({"PATH": "z"}) == ()
+
+    def test_worktree_managed_git_dir_is_not_reported(self, tmp_path):
+        """A worktree ``GIT_DIR`` (set by git for pre-push hooks) is allowed.
+
+        SA-0MUMR3QPM002VK7M: the release gate must run from a linked worktree
+        without the documented opt-out override.
+        """
+        repo = _seeded_repo(tmp_path)
+        gs.add_worktree(repo, tmp_path / "wt", "feature")
+        worktree_git_dir = repo / ".git" / "worktrees" / "wt"
+        assert worktree_git_dir.is_dir()
+
+        env = {"GIT_DIR": str(worktree_git_dir), "PATH": "/bin"}
+        assert gs.repository_override_vars_present(env, top=repo) == ()
+
+    def test_non_worktree_git_dir_is_still_reported(self, tmp_path):
+        """A genuine leaked ``GIT_DIR`` is still refused (AC2)."""
+        repo = _seeded_repo(tmp_path)
+
+        env = {"GIT_DIR": str(repo / ".git"), "PATH": "/bin"}
+        assert gs.repository_override_vars_present(env, top=repo) == ("GIT_DIR",)
+
+
+class TestIsWorktreeGitDir:
+    """SA-0MUMR3QPM002VK7M: recognise git's worktree-managed ``GIT_DIR``."""
+
+    def test_true_for_a_registered_worktree_git_dir(self, tmp_path):
+        repo = _seeded_repo(tmp_path)
+        gs.add_worktree(repo, tmp_path / "wt", "feature")
+        worktree_git_dir = repo / ".git" / "worktrees" / "wt"
+
+        assert gs.is_worktree_git_dir(worktree_git_dir, top=repo) is True
+
+    def test_false_for_the_main_checkout_git_dir(self, tmp_path):
+        repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+        assert gs.is_worktree_git_dir(repo / ".git", top=repo) is False
+
+    def test_false_for_a_leaked_absolute_path(self, tmp_path):
+        repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+        assert gs.is_worktree_git_dir("/tmp/leaked", top=repo) is False
+
+    def test_false_when_no_anchor_resolves(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(gs, "main_checkout_root", lambda _path: None)
+        assert gs.is_worktree_git_dir("/tmp/leaked") is False
+
+    def test_resolves_anchor_from_cwd_when_top_omitted(
+        self, tmp_path, monkeypatch
+    ):
+        """The production path resolves the main checkout from cwd itself."""
+        repo = _seeded_repo(tmp_path)
+        gs.add_worktree(repo, tmp_path / "wt", "feature")
+        worktree_git_dir = repo / ".git" / "worktrees" / "wt"
+        monkeypatch.chdir(tmp_path / "wt")
+
+        assert gs.is_worktree_git_dir(worktree_git_dir) is True
 
 
 class TestImportSurface:

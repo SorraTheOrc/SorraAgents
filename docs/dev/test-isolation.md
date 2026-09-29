@@ -441,7 +441,7 @@ points every cached/audited suite run passes through.
 | Test-skill runner scrub | `run_tests._run_cmd` | Passes an explicit scrubbed `env=` (previously inherited the parent env). |
 | Audit pi-launch scrub | `audit_runner._call_pi` | Passes a scrubbed `env=` to the `pi` subprocess so a later test run cannot inherit a leaked override. |
 | Startup diagnostic | `test_runner.log_repository_override_scrub` | Emits **once** per process, naming (never the values of) the stripped variables; silent when none are present. |
-| Release-gate fail-fast | `run_tests.py --strict-git-env` (invoked by `.githooks/pre-push` for `dev`/`main` and documented in [`skill/ship/SKILL.md`](../../skill/ship/SKILL.md)) | Refuses to start (exit 2) when an override var is present, before any suite command runs. Operator opt-out: `RUN_TESTS_ALLOW_REPO_OVERRIDES=1` (loud warning; scrub still applied). |
+| Release-gate fail-fast | `run_tests.py --strict-git-env` (invoked by `.githooks/pre-push` for `dev`/`main` and documented in [`skill/ship/SKILL.md`](../../skill/ship/SKILL.md)) | Refuses to start (exit 2) when an override var is present, before any suite command runs. Operator opt-out: `RUN_TESTS_ALLOW_REPO_OVERRIDES=1` (loud warning; scrub still applied). A **worktree-managed** `GIT_DIR` (`<main>/.git/worktrees/<name>`, which git exports to hooks run from a linked worktree) is exempt via `shared.git_sandbox.is_worktree_git_dir` — it is git's own hook environment, not a leak, and refusing it blocked every implement-workflow worktree push (SA-0MUMR3QPM002VK7M). Genuine leaks (any other `GIT_DIR`, and every other override var) are still refused. |
 | Host-wide audit cap | `audit_runner.main` `issue` ingress | Bounds independently launched `audit_runner.py issue` processes via the shared `audit-host` flock semaphore (`AUDIT_MAX_HOST_AUDITS`, default 3; `AUDIT_HOST_LOCK_TIMEOUT`, default 90s bounded wait). The N+1th process waits for a slot and exits cleanly with a clear message if none frees in time, instead of adding another concurrent suite runner. |
 | Orphan detection | `audit_runner._find_orphaned_audit_processes` / `_warn_on_orphaned_audits` | Scans `/proc` for `audit_runner.py issue` processes with `PPID 1` and warns, so an orphaned fan-out is visible. |
 | Detect-only live-repo guard | `run_tests.py` `_detect_live_repo_mutation` (+ the repo-root `conftest.py` plugin) | Unchanged inner net: fails a run that mutated its own checkout, but only *after* the mutation. |
@@ -451,7 +451,9 @@ proof for every production path, plus an assertion that `refs/heads/dev` and
 `refs/remotes/origin/dev` cannot be moved by a fixture),
 `skill/shared/tests/test_git_sandbox.py` (scrub helper contract),
 `skill/audit/tests/test_audit_runner_concurrency.py` (host cap + orphan
-detection), and `tests/test_run_tests_cache.py` (strict release gate).
+detection), and `tests/test_run_tests_cache.py` (strict release gate,
+including the worktree-hook exemption and the non-worktree refusal,
+SA-0MUMR3QPM002VK7M).
 
 ### 9.3 Residual risk — the external launcher
 
