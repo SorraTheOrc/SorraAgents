@@ -114,7 +114,10 @@ run:
 
    A transient abort must **never demote** an `in_review` item to `open` —
    restore exactly what was captured (fall back to `open`/`plan_complete`
-   only when the pre-audit state could not be determined).
+   only when the pre-audit state could not be determined).  If the captured
+   (status, stage) pair is known to be invalid (e.g. `blocked`/`in_review`,
+   which `wl` rejects), coerce the stage to `plan_complete` while preserving
+   the status, so the restore succeeds (SA-0MUIVCJLW000RUC1).
 3. **Append a failure notice** to the run log with a progress summary:
    elapsed time, the last phase marker seen, and the trigger that caused the
    abort.

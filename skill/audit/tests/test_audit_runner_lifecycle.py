@@ -16,6 +16,78 @@ from audit.scripts import audit_runner
 from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
+class TestCoerceValidStatusStage:
+    """Unit tests for the _coerce_valid_status_stage helper.
+
+    Ensures the helper validates status/stage pairs against the
+    _STATUS_STAGE_COMPAT mapping and coerces invalid combinations to valid
+    defaults (preserving the captured status, adjusting only the stage).
+    """
+
+    def test_valid_combo_returns_unchanged(self):
+        """A valid (status, stage) pair is returned as-is."""
+        result = audit_runner._coerce_valid_status_stage("open", "plan_complete")
+        assert result == ("open", "plan_complete")
+
+        result = audit_runner._coerce_valid_status_stage("completed", "in_review")
+        assert result == ("completed", "in_review")
+
+        result = audit_runner._coerce_valid_status_stage("completed", "done")
+        assert result == ("completed", "done")
+
+    def test_none_status_defaults_to_open(self):
+        """None status defaults to 'open'."""
+        result = audit_runner._coerce_valid_status_stage(None, "plan_complete")
+        assert result == ("open", "plan_complete")
+
+    def test_none_stage_applies_default_logic(self):
+        """None stage uses the fallback: in_review for completed, plan_complete otherwise."""
+        result = audit_runner._coerce_valid_status_stage("completed", None)
+        assert result == ("completed", "in_review")
+
+        result = audit_runner._coerce_valid_status_stage("open", None)
+        assert result == ("open", "plan_complete")
+
+    def test_invalid_combo_blocked_in_review_coerces_to_plan_complete(self, capsys):
+        """blocked/in_review is invalid → coerced to blocked/plan_complete."""
+        result = audit_runner._coerce_valid_status_stage("blocked", "in_review")
+        assert result == ("blocked", "plan_complete")
+        err = capsys.readouterr().err
+        assert "Warning" in err
+        assert "blocked/in_review" in err
+        assert "coercing to (blocked/plan_complete)" in err
+
+    def test_invalid_combo_in_progress_in_review_coerces(self, capsys):
+        """in-progress/in_review is invalid → coerced to in-progress/plan_complete."""
+        result = audit_runner._coerce_valid_status_stage("in-progress", "in_review")
+        assert result == ("in-progress", "plan_complete")
+        err = capsys.readouterr().err
+        assert "Warning" in err
+
+    def test_invalid_combo_blocked_done_coerces(self, capsys):
+        """blocked/done is invalid → coerced to blocked/plan_complete."""
+        result = audit_runner._coerce_valid_status_stage("blocked", "done")
+        assert result == ("blocked", "plan_complete")
+        err = capsys.readouterr().err
+        assert "coercing to" in err
+
+    def test_all_valid_combinations(self):
+        """Every valid combo from the mapping is accepted unchanged."""
+        for status, valid_stages in audit_runner._STATUS_STAGE_COMPAT.items():
+            for stage in valid_stages:
+                result = audit_runner._coerce_valid_status_stage(status, stage)
+                assert result == (status, stage), (
+                    f"Expected ({status}, {stage}) to be valid"
+                )
+
+    def test_unknown_status_defaults_to_plan_complete(self, capsys):
+        """An unknown status falls back to plan_complete for the stage."""
+        result = audit_runner._coerce_valid_status_stage("unknown-status", "in_review")
+        assert result == ("unknown-status", "plan_complete")
+        err = capsys.readouterr().err
+        assert "Warning" in err
+
+
 @pytest.fixture(autouse=True)
 def _free_audit_slot():
     """Neutralize the host-wide audit semaphore for deterministic unit tests.
@@ -343,6 +415,42 @@ class TestVerdictDrivenStatusLifecycle:
         # Restored to the captured pre-audit state, assignee cleared
         assert "--status" in last and "completed" in last
         assert "--stage" in last and "in_review" in last
+        assert "--assignee" in last and "" in last
+
+    def test_failure_on_invalid_combo_blocked_in_review_coerces(self):
+        """AC1: A failure on an item whose captured state is invalid
+        (blocked/in_review) coerces to a valid combination (blocked/plan_complete)
+        instead of failing all restore attempts.
+
+        This is the regression case for SA-0MUIVCJLW000RUC1: when an item is
+        imported or refiled with an incompatible status/stage combo, the
+        restore path must still succeed by coercing the stage.
+        """
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes",
+            status="blocked", stage="in_review",
+            fail_children_show=True,
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "blocked" in last
+        assert "--stage" in last and "plan_complete" in last
+        assert "--assignee" in last and "" in last
+
+    def test_failure_on_invalid_combo_in_progress_in_review_coerces(self):
+        """AC1: in_progress/in_review is also invalid → coerced to
+        in_progress/plan_complete."""
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes",
+            status="in_progress", stage="in_review",
+            fail_children_show=True,
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "in_progress" in last
+        assert "--stage" in last and "plan_complete" in last
         assert "--assignee" in last and "" in last
 
     # ------------------------------------------------------------------

@@ -11235,6 +11235,63 @@ def _lifecycle_state_matches(
     return actual_status == expected_status and actual_stage == expected_stage
 
 
+# ---------------------------------------------------------------------------
+# Status/stage compatibility (mirrors ContextHub's statusStageCompatibility).
+# Kept inlined to avoid importing from ContextHub — the audit runner is
+# self-contained.
+# ---------------------------------------------------------------------------
+_STATUS_STAGE_COMPAT: dict[str, frozenset[str]] = {
+    "open": frozenset({"idea", "intake_complete", "plan_complete"}),
+    "in-progress": frozenset({"intake_complete", "plan_complete"}),
+    "input_needed": frozenset({"idea", "intake_complete", "plan_complete"}),
+    "blocked": frozenset({"idea", "intake_complete", "plan_complete"}),
+    "completed": frozenset({"in_review", "done"}),
+    "deleted": frozenset({"idea", "intake_complete", "plan_complete", "done"}),
+}
+_DEFAULT_SAFE_STAGE = "plan_complete"
+
+
+def _coerce_valid_status_stage(status, stage):
+    """Validate and coerce a (status, stage) pair to a valid combination.
+
+    When the captured pre-audit status/stage is incompatible (e.g. ``blocked``
+    + ``in_review``), keep the captured status but fall back to the nearest
+    valid stage.  A warning is printed to ``stderr`` so operators know the
+    original state was non-standard.
+
+    Args:
+        status: The pre-audit status (may be ``None`` → defaults to ``"open"``).
+        stage:  The pre-audit stage (may be ``None``).
+
+    Returns:
+        A ``(status, stage)`` tuple guaranteed to be a valid combination per the
+        ``_STATUS_STAGE_COMPAT`` mapping.
+    """
+    effective_status = status or "open"
+    effective_stage = stage
+
+    # If stage is None, apply the existing fallback logic.
+    if effective_stage is None:
+        effective_stage = (
+            "in_review" if effective_status == "completed" else "plan_complete"
+        )
+
+    # Check validity.
+    valid_stages = _STATUS_STAGE_COMPAT.get(effective_status)
+    if valid_stages is not None and effective_stage in valid_stages:
+        return effective_status, effective_stage
+
+    # Invalid combo — coerce.
+    coerced_stage = _DEFAULT_SAFE_STAGE
+    print(
+        f"Warning: pre-audit state ({effective_status}/{effective_stage}) is "
+        f"an invalid status/stage combination; coercing to "
+        f"({effective_status}/{coerced_stage}).",
+        file=sys.stderr,
+    )
+    return effective_status, coerced_stage
+
+
 def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
     """Best-effort restore of the captured pre-audit state after a failed
     terminal transition (WL-0MSWFRM800073Y81).
@@ -11245,11 +11302,15 @@ def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
     the item observable and consistent; any residual failure is logged
     loudly rather than silently ignored. Falls back to ``open``/``plan_complete``
     only when the pre-audit state could not be captured.
+
+    If the captured (status, stage) pair is invalid (e.g. ``blocked`` +
+    ``in_review``), ``_coerce_valid_status_stage`` keeps the status but
+    coerces the stage to a valid default, so the restore never fails due to
+    an incompatible combination.
     """
-    safe_status = ctx.original_status or "open"
-    safe_stage = ctx.original_stage
-    if not safe_stage:
-        safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+    safe_status, safe_stage = _coerce_valid_status_stage(
+        ctx.original_status, ctx.original_stage,
+    )
     cmd = [
         "wl", "update", ctx.issue_id,
         "--status", safe_status,
@@ -11378,12 +11439,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             # when the original state could not be determined (capture
             # failed / unknown). The assignee is cleared so the item stays
             # observable in the actionable queue for a re-audit.
-            safe_status = ctx.original_status
-            safe_stage = ctx.original_stage
-            if not safe_stage:
-                # Stage unknown (capture failed): pick a stage valid for
-                # the restored status so wl never rejects the combo.
-                safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+            safe_status, safe_stage = _coerce_valid_status_stage(
+                ctx.original_status, ctx.original_stage,
+            )
             if ctx.audit_completed and ctx.audit_verdict == "yes":
                 # Never silently diverge (WL-0MSN7XAUS008WOPQ AC4): a
                 # completed run whose report parsed 'Ready to close: Yes'
