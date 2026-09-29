@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MUMEJSWN004746A
+# smell: simplification
+# severity: medium
+# description: Use a single `if` statement instead of nested `if` statements
+# -->
 #!/usr/bin/env python3
 """Audit runner – deterministic audit orchestration.
 

@@ -254,6 +254,27 @@ pay attention to `description`, `acceptance criteria`, `comments`. Restate
 ACs/status; surface blockers/dependencies/missing requirements; inspect linked
 PRDs/plans/docs; confirm expected tests/validation.
 
+**Checking for rejected producer audits:** If the work item has been returned
+from a producer audit (status not `in_review`/`completed`, or the agent
+suspects a prior audit rejected it), fetch the audit record and any related
+comments to understand **why** it was rejected:
+
+```bash
+wl audit-show <work-item-id> --json
+wl comment list <work-item-id> --json
+```
+
+- The audit record's `rawOutput` field (under `audit.rawOutput`) contains
+  the full audit report including the `Ready to close:` verdict and per-AC
+  verdicts with evidence for any `unmet`/`partial` criteria.
+- Comments may contain additional context from the producer or previous
+  agent sessions.
+- **Always use the most recent rejection reason.** If multiple audit records
+  or comments reference rejections, compare timestamps (`audit.auditedAt` and
+  `comment.createdAt`) and act on the latest. Earlier rejections may have
+  already been addressed by subsequent fixes — do not act on stale rejection
+  reasons.
+
 4.1. Definition gate (must pass before implementation)
 
 - Verify: clear scope (in/out-of-scope); concrete, testable ACs; constraints and

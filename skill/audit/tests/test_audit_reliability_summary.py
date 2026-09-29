@@ -113,7 +113,6 @@ class TestReliabilitySummaryEarlyExit:
         )
         with mock.patch.object(
             audit_runner, "cmd_issue", side_effect=RuntimeError("boom")
-        ):
-            with pytest.raises(RuntimeError):
-                audit_runner._run_issue_command(args)
+        ), pytest.raises(RuntimeError):
+            audit_runner._run_issue_command(args)
         assert audit_runner.RELIABILITY_SUMMARY_PREFIX in capsys.readouterr().err

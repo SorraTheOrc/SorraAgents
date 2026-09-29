@@ -60,7 +60,7 @@ def implement_mod():
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     """Run a git command, raising on failure."""
-    proc = subprocess.run(  # noqa: PLW1510
+    proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         capture_output=True,

@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MUMEJY2P009KWKS
+# smell: unknown
+# severity: medium
+# description: `datetime.datetime()` called without a `tzinfo` argument
+# -->
 #!/usr/bin/env python3
 """Tests: detect_regressions() must only flag slips that happened *inside* the window.
 

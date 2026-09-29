@@ -1,3 +1,15 @@
+
+# <!-- REFACTOR-SA-0MUMEJVW00096MA8
+# smell: bug_risk
+# severity: medium
+# description: Function definition does not bind loop variable `calls`
+# -->
+
+# <!-- REFACTOR-SA-0MUMEJV3U001FBT4
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `result` is never used
+# -->
 #!/usr/bin/env python3
 """Audit JSON-contract tolerance and bounded re-ask tests (SA-0MU32TCFM003B78I).
 
@@ -27,7 +39,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from audit.scripts import audit_runner
-
 
 # ---------------------------------------------------------------------------
 # AC2: tolerant extraction

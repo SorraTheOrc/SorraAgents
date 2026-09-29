@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MUMEJX7G009PKO5
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `stdout` is never used
+# -->
 #!/usr/bin/env python3
 """Orchestration script for the implement skill workflow.
 
@@ -2213,10 +2219,12 @@ def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict
     triggers the ``audit`` group (not every test in the repo).
     """
     try:
-        import run_tests as _rt  # noqa: PLC0415
-        from run_tests import (  # noqa: PLC0415
-            select_group_from_changed_files as _select_group,
+        import run_tests as _rt
+        from run_tests import (
             group_commands as _group_cmds,
+        )
+        from run_tests import (
+            select_group_from_changed_files as _select_group,
         )
     except ImportError:
         return None
@@ -2255,9 +2263,7 @@ def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict
             exit_code = r["exit_code"]
             # Extract failure info from stderr
             for line in (r.get("stderr", "") or "").splitlines():
-                if "FAILED" in line or "ERROR" in line:
-                    all_failures.append(line.strip())
-                elif "AssertionError" in line or "failed:" in line.lower():
+                if "FAILED" in line or "ERROR" in line or "AssertionError" in line or "failed:" in line.lower():
                     all_failures.append(line.strip())
 
     return _finalize_test_result(

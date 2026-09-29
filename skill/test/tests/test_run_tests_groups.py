@@ -19,8 +19,6 @@ import sys as _sys
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"
 if str(_RUNNER_DIR) not in _sys.path:
@@ -28,12 +26,11 @@ if str(_RUNNER_DIR) not in _sys.path:
 
 import run_tests
 from run_tests import (
+    _paths_match_spec,
     _read_groups,
     _read_groups_with_full,
-    _paths_match_spec,
     group_commands,
     group_scope_commands,
-    list_groups,
     select_group_from_changed_files,
 )
 

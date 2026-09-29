@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MUMEJSWN004746A
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
 #!/usr/bin/env python3
 """faster-whisper worker for the voice-input pi extension.
 
@@ -41,7 +47,8 @@ import binascii
 import json
 import signal
 import sys
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
@@ -164,9 +171,9 @@ def _segment_text(segment: Any) -> str:
 
 def handle_command(
     message: dict[str, Any],
-    session: "TranscriptionSession | None",
+    session: TranscriptionSession | None,
     args: argparse.Namespace,
-) -> "TranscriptionSession | None":
+) -> TranscriptionSession | None:
     """Dispatch one protocol command. Returns the (possibly new) session."""
     kind = message.get("type")
 
