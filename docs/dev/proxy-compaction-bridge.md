@@ -77,6 +77,28 @@ rebuilt as:
 `context` results are dispatch-only and non-destructive: the session JSONL is
 never written by the extension.
 
+### Stale-context fail-safe (SA-0MUEIOGT2005IR7F)
+
+pi invalidates extension contexts when it replaces or reloads a session. A
+handler that then reads the captured `ctx.sessionManager` throws
+`This extension ctx is stale after session replacement or reload`; because the
+`after_provider_response`/`context` handlers run outside pi's try/catch, an
+unguarded throw can crash the pi process (observed in audit-runner subprocesses
+as a spurious `provider_error: Connection error.`).
+
+Both handlers therefore resolve the session id through `safeSessionId(ctx)`
+(`compaction-bridge.js`), which returns `null` instead of throwing when the
+context is stale or absent:
+
+- `after_provider_response`: a `null` session id means no new signal is
+  captured — the handler no-ops and any prior per-session state is untouched.
+- `context`: a `null` session id means the handler returns `undefined`
+  (pass-through) — dispatch is never reshaped on an unknown session.
+
+A live context is unaffected: the captured/reshape behaviour is byte-for-byte
+unchanged, and the pure `safeSessionId` guard is covered by
+`tests/unit/test_compaction-bridge.mjs` with a stale-ctx stub.
+
 ## Files
 
 - `pi-client/proxy-compaction-bridge/index.ts` — extension entry (event

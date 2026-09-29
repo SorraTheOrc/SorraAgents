@@ -33,17 +33,26 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createCompactionBridge } from "./compaction-bridge.js";
+import { createCompactionBridge, safeSessionId } from "./compaction-bridge.js";
 
 export default function (pi: ExtensionAPI) {
   const bridge = createCompactionBridge();
 
   pi.on("after_provider_response", (event, ctx) => {
-    bridge.handleResponse(ctx.sessionManager.getSessionId(), event.headers);
+    // A stale ctx (after a session replacement/reload) throws on
+    // `ctx.sessionManager` access; resolve it safely and no-op instead of
+    // letting the throw escape the handler (SA-0MUEIOGT2005IR7F).
+    const sessionId = safeSessionId(ctx);
+    if (sessionId === null) return;
+    bridge.handleResponse(sessionId, event.headers);
   });
 
   pi.on("context", (event, ctx) => {
-    const messages = bridge.reshape(ctx.sessionManager.getSessionId(), event.messages);
+    // Stale ctx → pass the context through unchanged (never reshape on an
+    // unknown session).
+    const sessionId = safeSessionId(ctx);
+    if (sessionId === null) return;
+    const messages = bridge.reshape(sessionId, event.messages);
     if (!messages) return; // no signal / not applicable → pass through unchanged
     return { messages } as { messages: typeof event.messages };
   });
