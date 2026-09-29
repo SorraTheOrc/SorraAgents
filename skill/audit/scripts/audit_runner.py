@@ -3870,12 +3870,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                        --exclude-tools ask_question`` to enable file-reading
                        capabilities in the Pi agent session.
 
-        # Context reduction: every call adds ``--no-context-files --no-skills``
-        so each pi session starts with minimal static context (~2KB instead of
-        ~49KB of duplicated global+project AGENTS.md plus the skills section).
-        Audit prompts are fully self-contained (read-only mandate, JSON
-        format, FILE SCOPE manifest, criteria) and must never depend on
-        AGENTS.md or skill descriptions.
+        # Context reduction + isolation: every call adds
+        # ``--no-context-files --no-skills --no-extensions``
+        # so each pi session starts with minimal static context (~2KB instead of
+        # ~49KB of duplicated global+project AGENTS.md plus the skills section),
+        # with no interactive/UI extensions loaded. Audit prompts are fully
+        # self-contained (read-only mandate, JSON format, FILE SCOPE manifest,
+        # criteria) and must never depend on AGENTS.md, skill descriptions, or
+        # extension-provided behaviour.
 
         max_retries: Maximum number of extra attempts after a provider error.
             When None, falls back to ``_PI_MAX_RETRIES`` (2). Long
@@ -3919,12 +3921,19 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             "--tools", "read,bash,grep,find,ls",
             "--exclude-tools", "ask_question",
         ])
-    # Context reduction (SA-0MSISKM8F004NW1U): audit prompts are fully
-    # self-contained, so drop the duplicated global+project AGENTS.md load
-    # (~40KB) and the skills section (~7KB) from every pi call in both tool
-    # modes. Both flags are loader toggles compatible with --mode json and
-    # --tools; prompts must never rely on AGENTS.md or skill descriptions.
-    cmd.extend(["--no-context-files", "--no-skills"])
+    # Context reduction + isolation (SA-0MSISKM8F004NW1U,
+    # SA-0MUEIOGT2005IR7F): audit prompts are fully self-contained, so drop the
+    # duplicated global+project AGENTS.md load (~40KB) and the skills section
+    # (~7KB) from every pi call in both tool modes. Also disable extension
+    # discovery (--no-extensions): interactive/UI extensions (compaction
+    # mirroring, status line, recovery) must not run inside audit sessions —
+    # after a session replacement/reload a stale ExtensionContext makes their
+    # async callbacks throw outside pi's try/catch and crash the pi process,
+    # surfacing as a spurious ``provider_error: Connection error.`` that blocks
+    # the audit/ship final-validation gate. All three are loader toggles
+    # compatible with --mode json and --tools; prompts must never rely on
+    # AGENTS.md, skill descriptions, or extensions.
+    cmd.extend(["--no-context-files", "--no-skills", "--no-extensions"])
     # Session-id: attach a descriptive session identifier so audit sessions
     # can be traced back to the work item being audited (SA-0MSNYMKV7005P0H9).
     if issue_id:

@@ -282,6 +282,7 @@ class TestCallPiEnableTools:
         # Context reduction flags are present in the tool-enabled path
         assert "--no-context-files" in args
         assert "--no-skills" in args
+        assert "--no-extensions" in args
 
     def test_command_unchanged_when_enable_tools_false(self):
         """AC2: _call_pi() does NOT add --tools when enable_tools=False (default)."""
@@ -302,6 +303,7 @@ class TestCallPiEnableTools:
         # Context reduction flags are present in the no-tools path
         assert "--no-context-files" in args
         assert "--no-skills" in args
+        assert "--no-extensions" in args
 
     def test_default_enable_tools_is_false(self):
         """AC3: Default value of enable_tools is False (backward compatible)."""
@@ -331,6 +333,7 @@ class TestCallPiEnableTools:
         assert args == [
             "pi", "-p", "--mode", "json", "--model", "test-model",
             "test prompt", "--no-context-files", "--no-skills",
+            "--no-extensions",
         ]
 
     def test_context_reduction_flags_present_in_both_tool_modes(self):
@@ -350,8 +353,10 @@ class TestCallPiEnableTools:
             args = mock_popen.call_args[0][0]
             assert "--no-context-files" in args
             assert "--no-skills" in args
+            assert "--no-extensions" in args
             # Flags come after the prompt, before/around the tools block
             assert args.index("--no-context-files") < args.index("--no-skills")
+            assert args.index("--no-skills") < args.index("--no-extensions")
             if enable_tools:
                 assert "--tools" in args
             else:
@@ -590,6 +595,7 @@ class TestCallPiSessionId:
         args = mock_popen.call_args[0][0]
         assert "--no-context-files" in args
         assert "--no-skills" in args
+        assert "--no-extensions" in args
         assert "--tools" in args
 
 
