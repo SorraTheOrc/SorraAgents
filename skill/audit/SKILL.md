@@ -67,7 +67,11 @@ the runner verifies the launch context:
    the FILE SCOPE manifest must reference the item repository's files. A
    manifest built from the audit skill's own tree (or lacking the item
    repo) aborts with `Error: Audit scope error: ...` and a non-zero exit
-   instead of emitting misleading "unmet" verdicts.
+   instead of emitting misleading "unmet" verdicts. The check also fails
+   closed when the item's resolved touched-file set is non-empty and NONE
+   of those files appear in the manifest — so a manifest that references
+   the repo but omits the item's own committed files can never be accepted
+   (SA-0MUJNZ5RN0078B5M, SA-0MUKCOW1I001MJ7O).
 3. **Child persistence is fatal:** a child audit that cannot be persisted
    (`wl audit-set` rc!=0, e.g. "Work item not found") aborts the run with a
    non-zero exit — a parent report whose child audits never landed is

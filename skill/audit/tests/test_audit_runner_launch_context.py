@@ -126,6 +126,13 @@ def _make_minimal_runner(recorded: list[list[str]] | None = None,
                 stderr=proc.stderr,
             )
 
+        # Fake git against an empty repository: success with no output. This
+        # keeps touched-file resolution fail-open (``_resolve_touched_files``
+        # returns None) instead of treating the generic wl JSON sentinel as a
+        # repository path (SA-0MUKCOW1I001MJ7O).
+        if cmd and cmd[0] == "git":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
         if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
             return SimpleNamespace(
                 returncode=0,
@@ -388,6 +395,85 @@ class TestFileScopeManifestValidation:
             assert audit_runner._validate_file_scope_manifest(
                 "tests/ (11 files)", tmp_path
             ) is None
+
+    def test_manifest_omitting_touched_files_is_rejected(self, tmp_path):
+        """SA-0MUKCOW1I001MJ7O: a manifest that references the item repo but
+        omits every touched file cannot verify the item's changes.
+        """
+        _target, target_root, patcher = _make_sibling_projects(tmp_path)
+        manifest = (
+            "Repository index (top-level layout):\n- src/ (42 files)"
+        )
+        with patcher:
+            error = audit_runner._validate_file_scope_manifest(
+                manifest, target_root,
+                touched_files=["src/implementation.py"],
+            )
+        assert error is not None
+        assert "Audit scope error" in error
+
+    def test_manifest_containing_touched_file_is_accepted(self, tmp_path):
+        """SA-0MUKCOW1I001MJ7O: when the touched set appears, validation passes."""
+        _target, target_root, patcher = _make_sibling_projects(tmp_path)
+        manifest = (
+            "Touched files (from the item's commits):\n"
+            "- `src/implementation.py`\n\n"
+            "Repository index (top-level layout):\n- src/ (42 files)"
+        )
+        with patcher:
+            error = audit_runner._validate_file_scope_manifest(
+                manifest, target_root,
+                touched_files=["src/implementation.py"],
+            )
+        assert error is None
+
+    def test_touched_files_none_and_empty_fail_open(self, tmp_path):
+        """SA-0MUKCOW1I001MJ7O: an unresolvable/empty touched set never blocks."""
+        _target, target_root, patcher = _make_sibling_projects(tmp_path)
+        manifest = (
+            "Repository index (top-level layout):\n- src/ (42 files)"
+        )
+        with patcher:
+            assert audit_runner._validate_file_scope_manifest(
+                manifest, target_root, touched_files=None,
+            ) is None
+            assert audit_runner._validate_file_scope_manifest(
+                manifest, target_root, touched_files=[],
+            ) is None
+
+    def test_built_manifest_always_covers_committed_touched_files(self, tmp_path):
+        """SA-0MUKCOW1I001MJ7O: the builder + validator compose — a manifest
+        built for an item with resolvable touched files always passes the
+        touched-files coverage check (the omission is impossible to build).
+        """
+        _target, target_root, patcher = _make_sibling_projects(tmp_path)
+        committed = ["src/implementation.py", "src/helpers/util.py"]
+        issue = {
+            "id": "OSL-1",
+            "title": "T",
+            "description": "## Key Files\n\n- `src/implementation.py`\n",
+        }
+
+        def _runner(cmd):
+            cmd = [str(c) for c in cmd]
+            joined = " ".join(cmd)
+            marker = audit_runner._TOUCHED_FILES_COMMIT_MARKER
+            if cmd[:2] == ["git", "log"] and "--name-only" in joined:
+                out = marker + "abc1234\n" + "\n".join(committed)
+            elif cmd[:2] == ["git", "ls-files"]:
+                out = "\n".join(committed)
+            else:
+                out = ""
+            return SimpleNamespace(returncode=0, stdout=out + "\n", stderr="")
+
+        manifest = audit_runner._build_file_scope_manifest(
+            issue, [], runner=_runner,
+        )
+        with patcher:
+            error = audit_runner._validate_file_scope_manifest(
+                manifest, target_root, touched_files=committed,
+            )
+        assert error is None
 
     def test_missing_item_repo_aborts_before_phase2(self, tmp_path):
         """AC4(b): a scope manifest missing the item repo aborts the run

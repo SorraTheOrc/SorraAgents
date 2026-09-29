@@ -1455,8 +1455,24 @@ def _distinctive_project_top_levels(owning_root: Path) -> list[str]:
     return sorted(owning_tops - framework_tops)
 
 
+def _manifest_names_path(manifest: str, path: str) -> bool:
+    """Whether the manifest text contains a normalised repository *path*.
+
+    Used by the touched-files coverage check: a path resolved from git
+    (``skill/foo/bar.py``) is compared case-insensitively against the
+    manifest text after ``_normalise_repo_path`` strips quotes/backticks and
+    a leading ``./``.
+    """
+    normalised = _normalise_repo_path(path)
+    if not normalised:
+        return False
+    return normalised.lower() in manifest.lower()
+
+
 def _validate_file_scope_manifest(file_scope: str,
-                                  owning_root: Path | None) -> str | None:
+                                  owning_root: Path | None,
+                                  touched_files: Sequence[str] | None = None,
+                                  ) -> str | None:
     """Validate the FILE SCOPE manifest covers the work item's repository.
 
     Returns an error message when the manifest does NOT reference the owning
@@ -1470,21 +1486,39 @@ def _validate_file_scope_manifest(file_scope: str,
     distinctive markers are all root-level files are handled by
     ``_repo_index``, which lists root file names in the ``(root)`` index
     entry so the markers surface in the manifest (SA-0MSUBX8PP0087OEA).
+
+    *touched_files* (SA-0MUKCOW1I001MJ7O) is the item's resolved touched-file
+    set. When it is a non-empty sequence and NONE of its paths appear in the
+    manifest, the manifest cannot verify the item's own changes and a scope
+    error is returned — the fail-closed guard against a manifest that
+    references the repo but omits the item's files (the
+    SA-0MUJNZ5RN0078B5M false-verdict defect). When the set is ``None`` or
+    empty (git unavailable / unknown) the check fails open, preserving the
+    prior behaviour.
     """
     if owning_root is None:
         return None
     distinctive = _distinctive_project_top_levels(owning_root)
-    if not distinctive:
-        return None  # nothing distinctive to verify against — fail open
     manifest_lower = file_scope.lower()
-    if any(entry.lower() in manifest_lower for entry in distinctive):
-        return None
-    return (
-        f"Audit scope error: the Phase 2 FILE SCOPE manifest does not contain "
-        f"the work item repository files (owning project: {owning_root}). The "
-        f"resolved scope is the audit skill's own tree or another repository; "
-        f"re-launch the audit from {owning_root} and re-run."
-    )
+    if distinctive and not any(
+        entry.lower() in manifest_lower for entry in distinctive
+    ):
+        return (
+            f"Audit scope error: the Phase 2 FILE SCOPE manifest does not contain "
+            f"the work item repository files (owning project: {owning_root}). The "
+            f"resolved scope is the audit skill's own tree or another repository; "
+            f"re-launch the audit from {owning_root} and re-run."
+        )
+    if touched_files and not any(
+        _manifest_names_path(file_scope, path) for path in touched_files
+    ):
+        return (
+            f"Audit scope error: the Phase 2 FILE SCOPE manifest references the "
+            f"work item repository ({owning_root}) but omits every file the item "
+            f"touched, so the item's changes cannot be verified. Re-run the audit "
+            f"so the manifest includes the item's committed touched files."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1745,26 +1779,31 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
         work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
     description = work_item.get("description", "") or ""
 
+    # An empty item id cannot be grepped: ``--grep=`` would match every
+    # commit. Emit only the Key Files source (or fail open) instead.
+    issue_id = (issue_id or "").strip()
+
     paths: set[str] = set()
 
     # (1) Files in commits referencing the work item id. One git call.
-    try:
-        proc = runner([
-            "git", "log", "--all", "--fixed-strings",
-            f"--grep={issue_id}", "--name-only",
-            f"--format={_TOUCHED_FILES_COMMIT_MARKER}%H",
-        ])
-    except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
-        return None
-    if proc.returncode != 0:
-        return None  # git unavailable / not a repository ⇒ fail open
-    for line in proc.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(_TOUCHED_FILES_COMMIT_MARKER):
-            continue
-        normalised = _normalise_repo_path(stripped)
-        if normalised:
-            paths.add(normalised)
+    if issue_id:
+        try:
+            proc = runner([
+                "git", "log", "--all", "--fixed-strings",
+                f"--grep={issue_id}", "--name-only",
+                f"--format={_TOUCHED_FILES_COMMIT_MARKER}%H",
+            ])
+        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+            return None
+        if proc.returncode != 0:
+            return None  # git unavailable / not a repository ⇒ fail open
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(_TOUCHED_FILES_COMMIT_MARKER):
+                continue
+            normalised = _normalise_repo_path(stripped)
+            if normalised:
+                paths.add(normalised)
 
     # (2) Comment-recorded commit hashes (best-effort; one batched git call).
     #     A failure here is swallowed — the grep + Key Files sources still
@@ -4677,12 +4716,23 @@ def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
                                runner: Runner | None = None) -> str:
     """Build the file-scope manifest injected into the Phase 2 prompt.
 
-    Combines the work item's Key Files, the git changed-file list, a
-    lightweight repo index, and Phase 1 evidence file:line refs (P4). The
-    manifest lets the model verify in-scope files without unbounded
-    repository exploration (the dominant Phase 2 cost).
+    Combines the work item's Key Files, the git changed-file list, the
+    item's committed *touched* files (resolved via
+    ``_resolve_touched_files``), a lightweight repo index, and Phase 1
+    evidence file:line refs (P4). The manifest lets the model verify
+    in-scope files without unbounded repository exploration (the dominant
+    Phase 2 cost).
 
-    *runner* is used for git queries and defaults to ``_default_runner``.
+    The touched-file source is essential on the normal post-implementation
+    checkout: the item's work is committed and the working tree is clean, so
+    ``_git_changed_files`` contributes nothing and the manifest would
+    otherwise omit the item's real changes — producing false "outside the
+    manifest" verdicts (SA-0MUJNZ5RN0078B5M).
+
+    Paths are de-duplicated across the Key Files / Changed files / Touched
+    files sections so each file is listed once, and the combined listing is
+    bounded by ``_FILE_SCOPE_MAX_FILES``. *runner* is used for git queries
+    and defaults to ``_default_runner``.
     """
     if runner is None:
         runner = _default_runner
@@ -4694,10 +4744,35 @@ def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
         key_lines = "\n".join(f"- `{f}`" for f in key_files[:_FILE_SCOPE_MAX_FILES])
         sections.append(f"Key Files (from the work item):\n{key_lines}")
 
+    # Committed touched files: on a clean checkout this is the ONLY source
+    # that captures the item's real changes (SA-0MUJNZ5RN0078B5M). Resolve
+    # before rendering the Changed-files section so the two can be diffed.
+    # Guard on a non-empty id: an empty ``--grep=`` would match every commit.
+    issue_id = str(issue.get("id", "") or "")
+    touched = []
+    if issue_id:
+        touched = _resolve_touched_files(
+            runner, issue_id, work_item=issue,
+        ) or []
+    touched_set = set(touched)
+    key_set = set(key_files)
+
     changed = _git_changed_files(runner)
+    changed = [f for f in changed if f not in key_set]
     if changed:
         changed_lines = "\n".join(f"- `{f}`" for f in changed)
         sections.append(f"Changed files (git diff / status):\n{changed_lines}")
+
+    # Only list touched paths not already covered by Key Files / changed so
+    # each file is named once and the bounded budget is spent on new paths.
+    touched_only = sorted(touched_set - key_set - set(changed))
+    if touched_only:
+        touched_lines = "\n".join(
+            f"- `{f}`" for f in touched_only[:_FILE_SCOPE_MAX_FILES]
+        )
+        sections.append(
+            f"Touched files (from the item's commits):\n{touched_lines}"
+        )
 
     refs = _phase1_evidence_refs(ac_results)
     if refs:
@@ -7084,7 +7159,12 @@ def _run_phase2_deep_analysis(
         # instead of emitting misleading 'unmet' verdicts.
         if owning_root is None:
             owning_root = _resolve_owning_project_root(issue.get("id", ""))
-        scope_error = _validate_file_scope_manifest(file_scope, owning_root)
+        touched_files = _resolve_touched_files(
+            runner, issue.get("id", ""), work_item=issue,
+        )
+        scope_error = _validate_file_scope_manifest(
+            file_scope, owning_root, touched_files=touched_files,
+        )
         if scope_error:
             raise AuditScopeError(scope_error)
 
@@ -9885,8 +9965,15 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
         # Validate the FILE SCOPE manifest covers the item repository
         # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
         # (e.g. the audit skill's own tree) would emit misleading
-        # 'unmet' verdicts — abort with a scope error instead.
-        scope_error = _validate_file_scope_manifest(file_scope, owning_root)
+        # 'unmet' verdicts — abort with a scope error instead. The resolved
+        # touched set also guards against a manifest that references the repo
+        # but omits the item's own committed files (SA-0MUKCOW1I001MJ7O).
+        touched_files = _resolve_touched_files(
+            runner, work_item.get("id", ""), work_item=work_item,
+        )
+        scope_error = _validate_file_scope_manifest(
+            file_scope, owning_root, touched_files=touched_files,
+        )
         if scope_error:
             if json_mode:
                 print(json.dumps({"error": scope_error}, indent=2))
