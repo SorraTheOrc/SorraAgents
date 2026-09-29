@@ -118,7 +118,15 @@ or `/skill:refactor` with no ID for a full-project scan.
 
 ### Output
 
-Structured report with: files analyzed, smells detected, smells fixed, work items created, REFACTOR comments injected.
+A human-readable report titled ``=== <project_name> Refactor Report ===``,
+where ``<project_name>`` is resolved from ``.worklog/config.yaml``'s
+``projectName`` key (falling back to the project directory name).  The report
+includes: files analyzed, smells detected, smells fixed, work items created,
+REFACTOR comments injected.
+
+The ``--json`` flag outputs a structured JSON dict instead of the human-readable
+report.  The ``--dry-run`` flag renders the same ``=== <project_name> Refactor
+Report ===`` heading without making any changes.
 
 ## Configuration
 

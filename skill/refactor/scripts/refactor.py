@@ -45,6 +45,7 @@ from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
 
 try:
+    from shared.project_name import resolve_project_name
     from shared.status_lifecycle import StatusLifecycle
     from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
@@ -723,7 +724,8 @@ def _main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, default=str))
     else:
         summary = report["summary"]
-        print("=== Refactor Report ===")
+        project_name = resolve_project_name()
+        print(f"=== {project_name} Refactor Report ===")
         print(f"Files analyzed: {summary['files_analyzed']}")
         print(f"Auto-fixed:     {summary['auto_fixed']}")
         print(f"Remaining smells: {summary['total_smells']}")
