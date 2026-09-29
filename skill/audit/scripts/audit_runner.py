@@ -701,6 +701,11 @@ machinery (``skill/test/scripts/run_tests.py``) when the operator passes
 default used by ``run_tests.py`` itself.
 """
 
+TRIAGE_MAX_CALLS = 100
+"""Hard cap on triage calls per run. Prevents runaway triage loops when
+``parse_pytest_failures`` over-produces records for a single failing test
+(see SA-0MUMC6LGE005UQNS)."""
+
 AUDIT_PARENT_TIMEOUT_ENV = "AUDIT_PARENT_TIMEOUT"
 """Environment variable name for overriding the cumulative elapsed-time guard.
 
@@ -2851,21 +2856,38 @@ def _run_tests_via_test_skill(
     success = bool(results) and not notice and not failures
 
     # Triage failures per the test skill (AC4) — never silently ignored.
+    # Deduplicate by test_name and enforce a hard cap to prevent runaway
+    # triage loops when parse_pytest_failures over-produces records
+    # (SA-0MUMC6LGE005UQNS).
     if failures:
         try:
             from triage.scripts.check_or_create import check_or_create
         except ImportError:
             check_or_create = None
+        seen: set[str] = set()
+        triaged_calls = 0
         for failure in failures:
+            test_name = failure.get("test_name", "")
+            if test_name in seen:
+                continue  # dedup — only triage each distinct test once
+            seen.add(test_name)
             if check_or_create is None:
                 triaged.append({
-                    "test_name": failure.get("test_name", ""),
+                    "test_name": test_name,
                     "error": "triage helper unavailable",
                 })
                 continue
+            triaged_calls += 1
+            if triaged_calls > TRIAGE_MAX_CALLS:
+                triaged.append({
+                    "test_name": test_name,
+                    "error": f"triage call limit reached (cap={TRIAGE_MAX_CALLS}); "
+                             f"{len(failures) - len(seen)} failures suppressed",
+                })
+                break  # cap — never hang the audit
             try:
                 triaged.append(check_or_create({
-                    "test_name": failure.get("test_name", ""),
+                    "test_name": test_name,
                     "stdout_excerpt": failure.get("stdout_excerpt", ""),
                     "stack_trace": failure.get("stack_trace", ""),
                     "repo_path": str(project_root),
@@ -2874,7 +2896,7 @@ def _run_tests_via_test_skill(
                 }))
             except Exception as exc:  # noqa: BLE001 -- triage must never crash the audit
                 triaged.append({
-                    "test_name": failure.get("test_name", ""),
+                    "test_name": test_name,
                     "error": str(exc),
                 })
 

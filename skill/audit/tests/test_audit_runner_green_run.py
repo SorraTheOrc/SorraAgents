@@ -1612,6 +1612,100 @@ class TestRunTestsViaTestSkill:
         assert result["success"] is False
         assert result["triaged"][0]["error"] == "triage boom"
 
+    def test_duplicate_failure_lines_deduped(self, tmp_path, capsys):
+        """AC1: duplicate FAILED summary lines for one test are deduped.
+
+        Regression guard for SA-0MUMC6LGE005UQNS: when the pytest output
+        contains many duplicate/ambiguous FAILED summary lines for a single
+        test (observed under concurrent full-suite runs), only one
+        ``check_or_create`` call is made.
+        """
+        _with_pytest_config(tmp_path)
+
+        # Build output with 50 duplicate FAILED lines for the same test.
+        duplicate_lines = "\n".join(
+            [
+                "FAILED tests/test_x.py::test_boom - AssertionError: boom"
+                for _ in range(50)
+            ]
+        )
+        duplicate_output = duplicate_lines + "\n1 error, 49 duplicates in 0.05s\n"
+
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": duplicate_output,
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "triage.scripts.check_or_create.check_or_create",
+            return_value={"issueId": "SA-TRIAGE-1", "created": True},
+        ) as mock_triage:
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        # All 50 parsed records, but only 1 triage call.
+        assert len(result["failures"]) == 50
+        assert mock_triage.call_count == 1
+        # The completion line shows 50 failures, 1 triaged.
+        err = capsys.readouterr().err
+        assert "failures=50 triaged=1" in err
+
+    def test_triage_call_cap(self, tmp_path, capsys):
+        """AC2: triage count is bounded by a hard cap.
+
+        Regression guard for SA-0MUMC6LGE005UQNS: even with many distinct
+        failing tests, ``check_or_create`` is called at most ``TRIAGE_MAX_CALLS``
+        times and the function always returns.
+        """
+        _with_pytest_config(tmp_path)
+
+        # Build output with 200 distinct FAILED lines.
+        num_failures = 200
+        lines = [
+            f"FAILED tests/test_{i:03d}.py::test_boom{i} - AssertionError: boom"
+            for i in range(num_failures)
+        ]
+        cap_output = "\n".join(lines)
+        cap_output += f"\n{num_failures} failed in 0.10s\n"
+
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": cap_output,
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "triage.scripts.check_or_create.check_or_create",
+            return_value={"issueId": "SA-TRIAGE-1", "created": True},
+        ) as mock_triage:
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        # The cap kicks in; only TRIAGE_MAX_CALLS calls are made.
+        assert mock_triage.call_count == audit_runner.TRIAGE_MAX_CALLS
+        # The last triaged entry carries the cap-suppressed error.
+        assert "triage call limit reached" in result["triaged"][-1]["error"]
+        # The run completes and returns (no hang).
+        assert result["success"] is False
+        err = capsys.readouterr().err
+        assert "Test skill run completed" in err
+
+
 class TestRunTestsPromptInjection:
     """Prompt-content assertions for the --run-tests path (SA-0MSJELSWS002UF60)."""
 
