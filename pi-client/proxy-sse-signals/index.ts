@@ -27,7 +27,7 @@ import type {
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { createCapturingFetch } from "./sse-signals.js";
+import { createCapturingFetch, safeSetStatus } from "./sse-signals.js";
 
 /** Provider whose event-stream bodies carry the proxy's SSE comment signals. */
 const PROXY_PROVIDER = "Local Proxy";
@@ -45,9 +45,14 @@ export default function (pi: ExtensionAPI) {
     statusUi = ctx.hasUI ? ctx.ui : null;
   });
 
-  pi.on("turn_end", (_event, ctx) => {
+  pi.on("turn_end", () => {
+    // Always clear the captured handle first so a stale/replaced ctx cannot
+    // leak state, then clear the status line through the (possibly stale)
+    // handle. safeSetStatus swallows stale-ctx throws — this handler must
+    // never raise (SA-0MUEIOGT2005IR7F).
+    const ui = statusUi;
     statusUi = null;
-    if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+    safeSetStatus(ui, STATUS_KEY, undefined);
   });
 
   const capturingStreamSimple = (
@@ -60,9 +65,11 @@ export default function (pi: ExtensionAPI) {
       return streamSimple(model, context, options);
     }
     const capturingFetch = createCapturingFetch(globalThis.fetch, (signalText) => {
-      if (!statusUi) return;
-      // Dim styling matches the existing progress/status output convention.
-      statusUi.setStatus(STATUS_KEY, statusUi.theme.fg("dim", signalText));
+      // safeSetStatus applies the dim styling and no-ops when the captured
+      // handle is stale (after a session replacement); this callback runs
+      // outside pi's try/catch, so it must never throw
+      // (SA-0MUEIOGT2005IR7F).
+      safeSetStatus(statusUi, STATUS_KEY, signalText);
     });
     return streamSimple(model, context, { ...options, fetch: capturingFetch });
   };
