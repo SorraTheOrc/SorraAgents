@@ -690,21 +690,6 @@ def suite_timeout_per_command(project_root: Path | None = None) -> int | None:
         return None
     timeout = int(timeout)
     return timeout if timeout > 0 else None
-def suite_timeout_per_command(project_root: Path | None = None) -> int | None:
-    """Optional per-command timeout (seconds) from the extension file.
-
-    Returns the ``timeoutPerCommand`` value when present and positive, else
-    None (callers fall back to their default per-command timeout).
-    """
-    root = Path(project_root or REPO_ROOT).resolve()
-    config = _read_test_config(root)
-    if config is None:
-        return None
-    timeout = config.get("timeoutPerCommand")
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-        return None
-    timeout = int(timeout)
-    return timeout if timeout > 0 else None
 
 
 # ---------------------------------------------------------------------------
