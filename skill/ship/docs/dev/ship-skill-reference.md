@@ -81,6 +81,34 @@ characters with an ellipsis marker (`…`) when it exceeds the limit.
 | 8.5 | Discord notification (non-blocking) | No |
 | 9 | Close work items (non-blocking) | No |
 
+### Step 2: Audit readiness gate (exit 6)
+
+`checkAuditReadyToClose()` (`check-audit-gate.js`) verifies **top-level**
+`in_review` items (`parentId == null`) have a passing audit. Children are
+covered by their parent's audit and never block.
+
+Missing, **stale**, and transient audits are auto-remediated conservatively:
+the gate re-runs `audit_runner.py issue <id>` and re-checks `wl audit-show`,
+blocking only if the item still fails after the re-run. A **stale** verdict is
+one whose `auditedAt` predates the item's last update (per the shared freshness
+buffer/tolerance in `audit-freshness.js`) — the verdict is not trustworthy, so
+it is remediated rather than blocking immediately. This is the same staleness
+precedence as Step 3.7 (SA-0MUOO5UEB008RXBP): before this change, Step 2
+treated a stale failing verdict as genuine and killed the release (exit 6)
+before the staleness-aware sweep could run.
+
+A **fresh** genuine "not ready to close" verdict blocks immediately with **no**
+re-audit attempt. A remediation-runner failure is treated as blocking with the
+manual remediation command surfaced — never silently passed. `--skip-checks`
+bypasses the gate.
+
+**Shared freshness module:** `audit-freshness.js` owns `isAuditStale`,
+`parseIsoUtc`, and the freshness constants; `check-audit-gate.js` and
+`check-final-validation.js` both import them. The module exists to avoid an
+import cycle between the two gate modules (`check-final-validation.js` already
+imports from `check-audit-gate.js`). `check-final-validation.js` re-exports
+these symbols for backward compatibility.
+
 ### Step 3.7: Final validation sweep (exit 12)
 
 The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX,
@@ -255,6 +283,7 @@ Verifying the full suite before promotion uses the test skill's cached runner
 | `git-helpers.js` | Branch naming & policy |
 | `check-unmerged-branches.js` | Detect unmerged branches |
 | `check-audit-gate.js` | Pre-release audit gate |
+| `audit-freshness.js` | Shared audit-staleness heuristics (`isAuditStale`, `parseIsoUtc`, freshness constants) used by both audit gates |
 | `check-final-validation.js` | Final validation sweep (parent-coverage / out-of-scope aware, exit 12) |
 | `check-critical-items.js` | Critical item gating |
 | `check-worklog-refs.js` | Validate worklog references |

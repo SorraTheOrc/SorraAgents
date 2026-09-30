@@ -2,7 +2,10 @@
  * check-audit-gate.js — Audit readiness and producer-review gating for the ship skill.
  *
  * This module provides gating functions for the release process:
- *   1. Audit readiness — checks all `in_review` work items have `audit.readyToClose`.
+ *   1. Audit readiness — checks **top-level** `in_review` items have
+ *      `audit.readyToClose`. Missing/stale/transient audits are auto-remediated
+ *      (stale semantics shared with the Step-3.7 sweep via ./audit-freshness.js);
+ *      a fresh genuine failure blocks.
  *   2. Producer review — checks that no candidate items have `needsProducerReview = true`.
  *
  * Both gates are complementary and must pass before a release proceeds.
@@ -32,6 +35,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isAuditStale } from './audit-freshness.js';
 
 // Module constants for audit-runner path resolution: the in-repo copy of the
 // audit skill is preferred; the globally installed skill is the fallback.
@@ -64,22 +68,25 @@ const HOME_DIR = homedir();
  * by `checkProducerReviewStatus()` for the producer-review gating step.
  * Also projects `parentId` (SA-0MSUT8GQP004WSYN) so callers can
  * distinguish top-level items from children; `getTopLevelCandidateItems()`
- * uses it to scope the release gates.
+ * uses it to scope the release gates. `updatedAt` is projected so
+ * `getAuditStatus()` can evaluate audit staleness (SA-0MUOO5UEB008RXBP).
  *
  * Invoked via `bash -c` (not plain /bin/sh) because `set -o pipefail`
  * is a bash-ism not supported by dash (Ubuntu/Debian's default sh) —
  * see LP-0MSQ0NTMO00577UJ.
  *
- * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null }>}
+ * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null, updatedAt: string|null }>}
  */
 export function getCandidateItems() {
   try {
     // Single query: stage=in_review implies status=completed (the
     // completed-minus-done == in_review invariant), piped through jq so only
-    // {id, title, needsProducerReview, parentId} enters the execSync buffer.
+    // {id, title, needsProducerReview, parentId, updatedAt} enters the execSync
+    // buffer (updatedAt lets the gate evaluate audit staleness —
+    // SA-0MUOO5UEB008RXBP).
     const output = execSync(
       `bash -c 'set -o pipefail; wl list --stage in_review --json ` +
-      `| jq -c \"[.workItems[] | {id, title, needsProducerReview, parentId}]\"'`,
+      `| jq -c \"[.workItems[] | {id, title, needsProducerReview, parentId, updatedAt}]\"'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     const projected = JSON.parse(output);
@@ -96,6 +103,7 @@ export function getCandidateItems() {
         ? item.needsProducerReview
         : null,
       parentId: item.parentId !== undefined ? item.parentId : null,
+      updatedAt: item.updatedAt !== undefined ? item.updatedAt : null,
     }));
   } catch (err) {
     console.error(`Warning: Failed to query release candidates: ${err.message}`);
@@ -115,7 +123,7 @@ export function getCandidateItems() {
  * release (SA-0MSUT8GQP004WSYN). An orphaned `in_review` item with no
  * parent (`parentId == null`) IS top-level and remains gated.
  *
- * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null }>}
+ * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null, updatedAt: string|null }>}
  */
 export function getTopLevelCandidateItems() {
   return getCandidateItems().filter((item) => item.parentId === null);
@@ -170,16 +178,20 @@ export function isTimeoutOrTransientAudit(audit) {
  * @returns {{
  *   isBlocking: boolean,
  *   transient: boolean,
+ *   stale: boolean,
+ *   passing: boolean,
  *   reason: string,
  *   summary: string|null
  * }}
  */
 export function getAuditStatus(workItem, auditData) {
-  // No audit data or audit is null → blocking
+  // No audit data or audit is null → blocking (missing).
   if (!auditData || auditData.audit === null || auditData.audit === undefined) {
     return {
       isBlocking: true,
       transient: false,
+      stale: false,
+      passing: false,
       reason: 'No audit found',
       summary: null,
     };
@@ -187,11 +199,17 @@ export function getAuditStatus(workItem, auditData) {
 
   const audit = auditData.audit;
 
-  // Check readyToClose
+  // Check readyToClose. A passing verdict is never blocking; the `stale` flag
+  // is still reported so callers (e.g. classifyAudit) can distinguish a fresh
+  // pass from an outdated one, while parent-coverage logic keys off `passing`
+  // only (a stale-passing audit still covers its children — the Step-2
+  // readiness gate is authoritative for top-level items).
   if (audit.readyToClose === true) {
     return {
       isBlocking: false,
       transient: false,
+      stale: isAuditStale(workItem, auditData),
+      passing: true,
       reason: 'Ready to close',
       summary: audit.summary || null,
     };
@@ -204,16 +222,37 @@ export function getAuditStatus(workItem, auditData) {
     return {
       isBlocking: false,
       transient: true,
+      stale: false,
+      passing: false,
       reason:
         'Audit timed out or hit a transient failure — not blocking (re-audit recommended)',
       summary: audit.summary || null,
     };
   }
 
-  // readyToClose is false or missing → blocking
+  // A failing verdict that predates the work item's last update is stale: the
+  // verdict is not trustworthy (the item may have changed since), so it is
+  // treated as remediable rather than an immediate block. This aligns the
+  // Step-2 audit gate with the Step-3.7 final-validation sweep
+  // (SA-0MUOO5UEB008RXBP).
+  if (isAuditStale(workItem, auditData)) {
+    return {
+      isBlocking: false,
+      transient: false,
+      stale: true,
+      passing: false,
+      reason:
+        'Audit is stale (performed before the work item was last updated) — not blocking (re-audit recommended)',
+      summary: audit.summary || null,
+    };
+  }
+
+  // readyToClose is false or missing → genuine blocking failure.
   return {
     isBlocking: true,
     transient: false,
+    stale: false,
+    passing: false,
     reason: 'Audit verdict: not ready to close',
     summary: audit.summary || null,
   };
@@ -423,7 +462,7 @@ export async function attemptAuditRemediation(workItem, { runAuditShow, runAudit
     const output = runAuditShow(workItem.id);
     const auditData = JSON.parse(output);
     const status = getAuditStatus(workItem, auditData);
-    if (status.isBlocking || status.transient) {
+    if (status.isBlocking || status.transient || status.stale) {
       return {
         status: 'blocking',
         reason: status.reason,
@@ -450,13 +489,15 @@ export async function attemptAuditRemediation(workItem, { runAuditShow, runAudit
  * Check all top-level `in_review` work items for audit readiness.
  *
  * For each top-level candidate item, queries `wl audit-show <id> --json`
- * and checks `audit.readyToClose`. Items whose audit is **missing** or
+ * and checks `audit.readyToClose`. Items whose audit is **missing**,
+ * **stale** (performed before the item's last update), or
  * **transient** (timeout/provider-error/FailureNotice) are auto-remediated:
  * the gate re-runs the audit (`audit_runner.py issue <id>`, which persists
  * per its own contract — the gate never calls `wl update` directly), then
  * re-checks `wl audit-show`; the item blocks only if it still fails after
- * the re-run. Genuine "not ready to close" verdicts block immediately with
- * no re-audit attempt (conservative remediation, SA-0MSUT8GQP004WSYN AC2).
+ * the re-run. Genuine (fresh) "not ready to close" verdicts block immediately
+ * with no re-audit attempt (conservative remediation, SA-0MSUT8GQP004WSYN AC2;
+ * stale handling shared with Step 3.7 per SA-0MUOO5UEB008RXBP).
  *
  * Command boundaries are injectable (mirroring the
  * `closeWorkItemsAfterRelease` `runCloseCommand` pattern) so unit tests are
@@ -554,14 +595,22 @@ export async function checkAuditReadyToClose(options = {}) {
 
     const status = getAuditStatus(item, auditData);
 
-    // Missing audit (no audit record at all) or transient (timed out /
-    // provider error / FailureNotice): attempt conservative auto-remediation.
+    // Missing audit (no audit record at all), stale (the verdict predates the
+    // item's last update), or transient (timed out / provider error /
+    // FailureNotice): attempt conservative auto-remediation. A stale failing
+    // verdict is not trustworthy, so — matching the Step-3.7 sweep — it is
+    // remediated rather than blocking immediately (SA-0MUOO5UEB008RXBP).
     const isMissingAudit = status.isBlocking && status.reason === 'No audit found';
-    if (isMissingAudit || status.transient) {
+    if (isMissingAudit || status.transient || status.stale) {
       // Log the remediation attempt per item (SA-0MSUT8GQP004WSYN AC6) so a
       // slow release gate is attributable.
+      const auditKind = isMissingAudit
+        ? 'missing audit'
+        : status.stale
+          ? 'stale audit'
+          : 'transient audit';
       console.log(
-        `Audit gate: auto-remediating ${item.id} (${isMissingAudit ? 'missing audit' : 'transient audit'})...`,
+        `Audit gate: auto-remediating ${item.id} (${auditKind})...`,
       );
       const remediation = await attemptAuditRemediation(item, {
         runAuditShow,

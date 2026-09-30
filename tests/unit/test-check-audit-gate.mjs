@@ -246,6 +246,133 @@ describe('isTimeoutOrTransientAudit', () => {
 });
 
 // ---------------------------------------------------------------------------
+// getAuditStatus / checkAuditReadyToClose — staleness awareness
+// (SA-0MUOO5UEB008RXBP: Step 2 must share the Step-3.7 staleness semantics;
+// a stale failing verdict must not hard-block the release)
+// ---------------------------------------------------------------------------
+describe('audit staleness — Step 2 shares Step 3.7 semantics', () => {
+  const STALE_ITEM = {
+    id: 'SA-STALE-1',
+    title: 'Stale Item',
+    needsProducerReview: false,
+    parentId: null,
+    updatedAt: '2026-09-05T10:00:00Z',
+  };
+  const FRESH_ITEM = { ...STALE_ITEM, updatedAt: '2026-09-04T10:00:00Z' };
+  const staleFailingAudit = () => JSON.stringify({
+    success: true,
+    workItemId: STALE_ITEM.id,
+    audit: {
+      readyToClose: false,
+      auditedAt: '2026-09-04T08:00:00Z',
+      rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria not met.',
+    },
+  });
+  const freshFailingAudit = () => JSON.stringify({
+    success: true,
+    workItemId: FRESH_ITEM.id,
+    audit: {
+      readyToClose: false,
+      auditedAt: '2026-09-04T09:59:55Z',
+      rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria not met.',
+    },
+  });
+
+  test('classifies a stale failing audit as non-blocking + stale', async () => {
+    const mod = await import(MODULE_PATH);
+    const result = mod.getAuditStatus(STALE_ITEM, JSON.parse(staleFailingAudit()));
+    assert.equal(result.isBlocking, false, 'stale failing verdict must not hard-block Step 2');
+    assert.equal(result.stale, true);
+    assert.equal(result.passing, false);
+    assert.match(result.reason, /stale/i);
+  });
+
+  test('classifies a fresh failing audit as blocking', async () => {
+    const mod = await import(MODULE_PATH);
+    const result = mod.getAuditStatus(FRESH_ITEM, JSON.parse(freshFailingAudit()));
+    assert.equal(result.isBlocking, true, 'a fresh genuine verdict must still block');
+    assert.equal(result.stale, false);
+    assert.equal(result.reason, 'Audit verdict: not ready to close');
+  });
+
+  test('classifies a stale passing audit as passing (still covers children)', async () => {
+    const mod = await import(MODULE_PATH);
+    const result = mod.getAuditStatus(STALE_ITEM, {
+      audit: { readyToClose: true, auditedAt: '2026-09-04T08:00:00Z', summary: 'ok' },
+    });
+    assert.equal(result.isBlocking, false);
+    assert.equal(result.passing, true, 'a passing audit covers children even when stale');
+    assert.equal(result.stale, true);
+  });
+
+  test('auto-remediates a stale item and unblocks when the re-run passes', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let auditShowCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [STALE_ITEM],
+      runAuditShow: () => {
+        auditShowCalls += 1;
+        return auditShowCalls === 1
+          ? staleFailingAudit()
+          : JSON.stringify({
+            audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z', summary: 'ok' },
+          });
+      },
+      runAuditCommand: () => { remediationCalls += 1; return ''; },
+    });
+    assert.equal(remediationCalls, 1, 'a stale item must be auto-remediated once');
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.remediatedItems.length, 1);
+    assert.equal(report.remediatedItems[0].workItemId, STALE_ITEM.id);
+  });
+
+  test('blocks a stale item whose remediation re-run still fails', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [STALE_ITEM],
+      runAuditShow: () => staleFailingAudit(),
+      runAuditCommand: () => { remediationCalls += 1; return ''; },
+    });
+    assert.equal(remediationCalls, 1);
+    assert.equal(report.hasBlockingItems, true, 'still-stale after remediation must block');
+    assert.equal(report.blockingItems[0].workItemId, STALE_ITEM.id);
+  });
+
+  test('a fresh failing verdict blocks without spawning remediation', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [FRESH_ITEM],
+      runAuditShow: () => freshFailingAudit(),
+      runAuditCommand: () => { remediationCalls += 1; return ''; },
+    });
+    assert.equal(remediationCalls, 0, 'a genuine fresh verdict must not trigger a re-audit');
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems[0].reason, 'Audit verdict: not ready to close');
+  });
+
+  test('still auto-remediates a missing audit (regression)', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let auditShowCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [FRESH_ITEM],
+      runAuditShow: () => {
+        auditShowCalls += 1;
+        return auditShowCalls === 1
+          ? JSON.stringify({ audit: null })
+          : JSON.stringify({ audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z' } });
+      },
+      runAuditCommand: () => { remediationCalls += 1; return ''; },
+    });
+    assert.equal(remediationCalls, 1);
+    assert.equal(report.hasBlockingItems, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. checkAuditReadyToClose returns expected structure
 // ---------------------------------------------------------------------------
 test('check-audit-gate: checkAuditReadyToClose returns expected structure', async () => {
@@ -659,7 +786,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
     assert.ok(calls[0].includes('--stage in_review'), `should filter stage, got: ${calls[0]}`);
     assert.ok(!calls[0].includes('--status completed'), `should drop redundant status filter (completed-minus-done == in_review), got: ${calls[0]}`);
     assert.ok(calls[0].includes('--json'), `should request JSON, got: ${calls[0]}`);
-    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false, parentId: null }]);
+    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false, parentId: null, updatedAt: null }]);
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -726,6 +853,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
       title: 'Dash-safe',
       needsProducerReview: false,
       parentId: null,
+      updatedAt: null,
     }], 'query must run under bash so set -o pipefail works on dash');
     rmSync(tmpDir, { recursive: true, force: true });
   });

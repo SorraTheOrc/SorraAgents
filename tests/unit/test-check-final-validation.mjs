@@ -49,6 +49,22 @@ test('check-final-validation: exports expected functions', async () => {
   assert.equal(typeof mod.resolveChildScope, 'function');
 });
 
+// ── shared audit-freshness module (SA-0MUOO5UEB008RXBP) ─────────────────────
+
+test('check-final-validation: re-exports the shared audit-freshness module', async () => {
+  const mod = await import(MODULE_PATH);
+  const freshnessPath = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-freshness.js');
+  assert.ok(existsSync(freshnessPath), 'shared audit-freshness.js should exist');
+  const fresh = await import(freshnessPath);
+  assert.equal(mod.isAuditStale, fresh.isAuditStale, 'isAuditStale must be the shared export');
+  assert.equal(mod.parseIsoUtc, fresh.parseIsoUtc, 'parseIsoUtc must be the shared export');
+  assert.equal(
+    mod.AUDIT_FRESHNESS_BUFFER_SECONDS,
+    fresh.AUDIT_FRESHNESS_BUFFER_SECONDS,
+    'freshness buffer constant must come from the shared module',
+  );
+});
+
 // ── parseIsoUtc ──────────────────────────────────────────────────────────────
 
 describe('parseIsoUtc', () => {
@@ -530,6 +546,31 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
     assert.equal(report.hasBlockingItems, true);
     assert.equal(report.blockingItems[0].workItemId, 'SA-CHILD-1');
     assert.equal(report.coveredChildren.length, 0);
+  });
+
+  // Regression (SA-0MUOO5UEB008RXBP): now that a stale failing verdict is
+  // classified as non-blocking, coverage must NOT be granted by a stale
+  // failing parent — only a *passing* parent audit covers its children.
+  test('a stale failing parent audit does NOT cover the child', async () => {
+    const report = await runScopedGate({
+      items: [SCOPED_CHILD],
+      parents: { 'SA-P1': PARENT_IN_REVIEW },
+      audits: {
+        // readyToClose=false, auditedAt (08:00) well before parent updatedAt
+        // (09:00) → stale, non-passing → must not cover SA-CHILD-1.
+        'SA-P1': {
+          success: true,
+          audit: {
+            readyToClose: false,
+            auditedAt: '2026-09-04T08:00:00Z',
+            rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria not met.',
+          },
+        },
+        'SA-CHILD-1': AUDIT_PASSING, // child has its own fresh passing audit
+      },
+    });
+    assert.equal(report.coveredChildren.length, 0, 'stale failing parent must not cover the child');
+    assert.equal(report.hasBlockingItems, false, 'the child passes on its own fresh audit');
   });
 
   test('a child whose parent is not in_review is excluded (never blocks)', async () => {

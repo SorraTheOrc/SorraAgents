@@ -55,14 +55,19 @@ import {
   attemptAuditRemediation,
 } from './check-audit-gate.js';
 
-// Freshness constants mirrored from the audit runner
-// (skill/audit/scripts/audit_runner.py) so the staleness heuristic matches
-// the runner's own freshness gate. Kept in sync deliberately: the runner is
-// the source of truth for freshness; this gate only needs a conservative
-// signal that a re-audit is worthwhile (a false "stale" merely triggers the
-// runner's fast, content-fingerprint freshness path).
-export const AUDIT_FRESHNESS_BUFFER_SECONDS = 60;
-export const AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30;
+// Shared audit-freshness heuristics (parseIsoUtc, isAuditStale) and the
+// freshness constants now live in ./audit-freshness.js so both this gate
+// (Step 3.7) and check-audit-gate.js (Step 2) apply identical staleness
+// semantics without an import cycle (check-final-validation already imports
+// from check-audit-gate). Re-exported here for backward compatibility —
+// existing consumers and unit tests import these from this module
+// (SA-0MUOO5UEB008RXBP).
+export {
+  AUDIT_FRESHNESS_BUFFER_SECONDS,
+  AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS,
+  parseIsoUtc,
+  isAuditStale,
+} from './audit-freshness.js';
 
 // ── shellQuote ───────────────────────────────────────────────────────────────
 
@@ -80,76 +85,6 @@ export function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-// ── parseIsoUtc ──────────────────────────────────────────────────────────────
-
-/**
- * Parse an ISO-8601 timestamp into a `Date`, treating a missing timezone as
- * UTC. Returns `null` for missing/unparseable values (fail open).
- *
- * @param {string|undefined|null} value - ISO-8601 timestamp.
- * @returns {Date|null}
- */
-export function parseIsoUtc(value) {
-  if (!value || typeof value !== 'string') {
-    return null;
-  }
-  // Normalise the trailing 'Z' for older runtimes while keeping full
-  // ISO-8601 support.
-  const normalised = value.replace(/Z$/, '+00:00');
-  const withZone = /[+-]\d{2}:?\d{2}$/.test(normalised) ? normalised : `${normalised}+00:00`;
-  const parsed = new Date(withZone);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-// ── isAuditStale ─────────────────────────────────────────────────────────────
-
-/**
- * Determine whether an existing audit is stale relative to its work item.
- *
- * Mirrors the audit runner's time-gate floor
- * (`_check_audit_freshness`, skill/audit/scripts/audit_runner.py): an audit
- * is fresh when its `auditedAt` is strictly more than
- * `AUDIT_FRESHNESS_BUFFER_SECONDS` after the item's `updatedAt`, or when the
- * item was updated within `AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS` **after**
- * the audit (the audit's own persistence writes bump `updatedAt`).
- * Everything else is stale.
- *
- * The runner's *primary* freshness signal is a content fingerprint (git
- * HEAD + description hash + Key Files + working tree). This gate cannot
- * recompute that fingerprint cheaply, so it uses the time gate as a
- * conservative signal: a false "stale" only causes a re-run, and the runner
- * short-circuits re-runs of unchanged content via its fingerprint fast path.
- *
- * @param {{ id: string, title: string, updatedAt?: string|null }} workItem -
- *   The work item (must carry `updatedAt` when available).
- * @param {object|null} auditData - Parsed `wl audit-show <id> --json` payload.
- * @returns {boolean} True when the audit exists but is stale; false when no
- *   audit exists, when freshness cannot be determined, or when the audit is
- *   fresh.
- */
-export function isAuditStale(workItem, auditData) {
-  if (!auditData || !auditData.audit) {
-    return false;
-  }
-  const auditTime = parseIsoUtc(auditData.audit.auditedAt);
-  const updateTime = parseIsoUtc(workItem && workItem.updatedAt);
-  if (!auditTime || !updateTime) {
-    return false; // Cannot determine — fail open, never falsely block.
-  }
-
-  const bufferMs = AUDIT_FRESHNESS_BUFFER_SECONDS * 1000;
-  if (auditTime.getTime() > updateTime.getTime() + bufferMs) {
-    return false; // Audit is newer than the item — fresh.
-  }
-
-  const writeDeltaMs = updateTime.getTime() - auditTime.getTime();
-  if (writeDeltaMs >= 0 && writeDeltaMs <= AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS * 1000) {
-    return false; // The item's own audit-persistence write — fresh.
-  }
-
-  return true;
-}
-
 // ── classifyAudit ────────────────────────────────────────────────────────────
 
 /**
@@ -158,13 +93,16 @@ export function isAuditStale(workItem, auditData) {
  * Precedence (first match wins):
  *   1. `missing`   — no audit record exists.
  *   2. `transient` — audit timed out / provider error / FailureNotice.
- *   3. `stale`     — audit exists but is outdated (see {@link isAuditStale}).
+ *   3. `stale`     — audit exists but is outdated (see
+ *      {@link module:audit-freshness.isAuditStale}).
  *   4. `failing`   — a fresh audit with a genuine "not ready to close" verdict.
  *   5. `passing`   — a fresh audit that is ready to close.
  *
  * Staleness takes precedence over the verdict: a stale verdict is not
  * trustworthy, so a stale "not ready to close" is remediated (and re-blocked
- * only if it still fails) rather than blocked immediately.
+ * only if it still fails) rather than blocked immediately. The classification
+ * is delegated to `getAuditStatus()` (shared with Step 2) so both release
+ * gates apply identical precedence (SA-0MUOO5UEB008RXBP).
  *
  * @param {{ id: string, title: string, updatedAt?: string|null }} workItem -
  *   The work item being checked.
@@ -180,7 +118,7 @@ export function classifyAudit(workItem, auditData) {
   if (status.transient) {
     return { kind: 'transient', reason: status.reason, summary: status.summary || null };
   }
-  if (isAuditStale(workItem, auditData)) {
+  if (status.stale) {
     return {
       kind: 'stale',
       reason: 'Audit is stale (performed before the work item was last updated)',
@@ -398,7 +336,13 @@ export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
       };
     }
     const parentStatus = getAuditStatus(parentItem, auditData);
-    if (!parentStatus.isBlocking && !parentStatus.transient) {
+    // Coverage requires a *passing* parent audit (readyToClose === true). A
+    // stale/non-passing in_review ancestor does not cover the child — the walk
+    // continues up the chain. Using the explicit `passing` flag (rather than
+    // the old `!isBlocking && !transient` pair) keeps this correct now that
+    // getAuditStatus() classifies a stale failing audit as non-blocking
+    // (SA-0MUOO5UEB008RXBP).
+    if (parentStatus.passing) {
       return {
         outcome: 'covered',
         reason: `covered by passing parent audit ${ancestorId}`,
