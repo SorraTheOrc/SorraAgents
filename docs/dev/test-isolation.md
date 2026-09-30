@@ -451,9 +451,12 @@ proof for every production path, plus an assertion that `refs/heads/dev` and
 `refs/remotes/origin/dev` cannot be moved by a fixture),
 `skill/shared/tests/test_git_sandbox.py` (scrub helper contract),
 `skill/audit/tests/test_audit_runner_concurrency.py` (host cap + orphan
-detection), and `tests/test_run_tests_cache.py` (strict release gate,
+detection), `tests/test_run_tests_cache.py` (strict release gate,
 including the worktree-hook exemption and the non-worktree refusal,
-SA-0MUMR3QPM002VK7M).
+SA-0MUMR3QPM002VK7M), and
+`tests/test_git_identity_guard.py::TestPrePushWiring::test_ambient_hook_bypass_var_is_scrubbed`
+(ambient hook-bypass variables scrubbed from the hook subprocess env; see
+§9.6, SA-0MUN83EXN004JBMW).
 
 ### 9.3 Residual risk — the external launcher
 
@@ -508,3 +511,33 @@ into the **pre-scrub** environment of a process that spawns `git` directly
   work-item comment on SA-0MUIA3OE40001QJX for the exact command and result.
 - `origin/dev`/`refs/heads/dev` fixture-immutability asserted by
   `tests/test_repository_override_isolation.py::test_poisoned_env_cannot_move_dev_or_origin_dev`.
+
+### 9.6 Ambient hook-bypass variables (SA-0MUN83EXN004JBMW)
+
+The §9.2 layers scrub **repository-override** variables, not the
+``.githooks/pre-push`` **bypass switches** (`WORKLOG_SKIP_PRE_PUSH`,
+`BRANCH_POLICY_SKIP`, `CONTEXT_BUDGET_SKIP`, `TEST_SCOPE_SKIP`). An operator
+pushing from a worktree exports `WORKLOG_SKIP_PRE_PUSH=1` (the documented
+tracked-hook bypass). When the suite itself is launched under that
+environment, the variable is inherited by the pytest process and then by any
+hook subprocess a test spawns, so the hook takes its early bypass exit
+**before** the git-identity guard and `wl sync`.
+
+This was a test-isolation defect, not a hook defect:
+`tests/test_git_identity_guard.py::TestPrePushWiring` built its hook
+subprocess env with `_env()`, which scrubbed only the repository-override
+variables. Under `WORKLOG_SKIP_PRE_PUSH=1` both wiring cases failed, and
+`run_tests.py` recorded those failures in the cache keyed by git state — a
+gate poisoning its own push to `dev` (observed blocking SA-0MULPQ3BK001A1M5).
+
+The fix keeps `_env()` an explicit, **allow-listed** scrub (never a blanket
+`os.environ` clear, so `PATH`/`HOME` handling is untouched): it now also drops
+`_HOOK_BYPASS_VARS` — `WORKLOG_SKIP_PRE_PUSH` plus the sibling switches the
+hook reads — so ambient values never reach the hook subprocess. Each wiring
+test re-sets the switches it needs explicitly, so the test controls them
+rather than inheriting them. The production hook's documented
+`WORKLOG_SKIP_PRE_PUSH=1` bypass is unchanged. Regression coverage:
+`tests/test_git_identity_guard.py::TestPrePushWiring::test_ambient_hook_bypass_var_is_scrubbed`
+(pollutes the parent environment, asserts `_env()` omits every bypass switch,
+and asserts the mismatched-identity case still reports `git identity mismatch`
+and skips `wl sync`).
