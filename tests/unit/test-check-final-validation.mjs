@@ -497,14 +497,15 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
   }
 
   /** Run the gate with a parent-map resolver and a per-id audit dispatcher. */
-  async function runScopedGate({ items, parents = {}, audits = {}, runAuditCommand } = {}) {
+  async function runScopedGate({ items, parents = {}, audits = {}, runAuditCommand, createRemediationBudgetFn, runAuditShow } = {}) {
     const mod = await import(MODULE_PATH);
     return mod.checkFinalValidation({
       getItemsFn: () => items,
       getItemByIdFn: (id) => (id in parents ? parents[id] : null),
-      runAuditShow: auditDispatch(audits),
+      runAuditShow: runAuditShow || auditDispatch(audits),
       runAuditCommand: runAuditCommand || (() => 'ok'),
       resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      ...(createRemediationBudgetFn ? { createRemediationBudgetFn } : {}),
     });
   }
 
@@ -699,6 +700,62 @@ describe('checkFinalValidation - remediation runner failure', () => {
     assert.equal(report.blockingItems.length, 1);
     assert.match(report.blockingItems[0].reason, /Audit remediation failed/);
     assert.ok(report.blockingItems[0].remediation.includes('audit_runner.py issue SA-1'));
+  });
+});
+
+describe('checkFinalValidation - bounded remediation budget', () => {
+  async function runGate({ items, runAuditCommand, createRemediationBudgetFn, runAuditShow } = {}) {
+    const mod = await import(MODULE_PATH);
+    return mod.checkFinalValidation({
+      getItemsFn: () => items,
+      getItemByIdFn: () => null,
+      runAuditShow,
+      runAuditCommand: runAuditCommand || (() => 'ok'),
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      ...(createRemediationBudgetFn ? { createRemediationBudgetFn } : {}),
+    });
+  }
+
+  test('stops at the attempt cap and blocks remaining items with offline guidance', async () => {
+    const budgetMod = await import(
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js'),
+    );
+    const items = [
+      { id: 'SA-T1', title: 'Top One', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      { id: 'SA-T2', title: 'Top Two', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+    ];
+    let remediationCalls = 0;
+    let t1Shows = 0;
+    const runAuditShow = (id) => {
+      if (id === 'SA-T1') {
+        t1Shows += 1;
+        return t1Shows === 1
+          ? JSON.stringify({ audit: null })
+          : JSON.stringify({ audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z' } });
+      }
+      return JSON.stringify({ audit: null });
+    };
+    const report = await runGate({
+      items,
+      runAuditShow,
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      createRemediationBudgetFn: () => new budgetMod.RemediationBudget({
+        maxItems: 1,
+        budgetMs: 1_000_000,
+      }),
+    });
+    assert.equal(remediationCalls, 1);
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems.length, 1);
+    assert.equal(report.blockingItems[0].workItemId, 'SA-T2');
+    assert.match(report.blockingItems[0].reason, /budget exhausted/i);
+    assert.match(
+      report.blockingItems[0].remediation,
+      /audit_runner\.py batch/,
+      'offline-refresh guidance must be surfaced',
+    );
+    assert.equal(report.remediatedItems.length, 1);
+    assert.equal(report.remediatedItems[0].workItemId, 'SA-T1');
   });
 });
 

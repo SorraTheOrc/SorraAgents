@@ -109,6 +109,23 @@ import cycle between the two gate modules (`check-final-validation.js` already
 imports from `check-audit-gate.js`). `check-final-validation.js` re-exports
 these symbols for backward compatibility.
 
+**Bounded remediation (SA-0MUOO5V0P00461X8):** in-gate remediation is bounded
+by `audit-remediation.js` so a backlog of slow audits cannot hold the release
+(and Code Freeze) for hours. Configuration (env, all optional):
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `SHIP_AUDIT_REMEDIATION_TIMEOUT_MS` | `1800000` (30 min) | Per-item `audit_runner.py issue` timeout |
+| `SHIP_AUDIT_REMEDIATION_BUDGET_MS` | `1800000` (30 min) | Total wall-clock remediation budget per gate run |
+| `SHIP_AUDIT_REMEDIATION_MAX_ITEMS` | `5` | Maximum in-gate remediation attempts per gate run |
+
+When the budget is exhausted, the remaining items are reported **blocking**
+with an offline-refresh instruction (`python3 skill/audit/scripts/audit_runner.py
+batch`), never as "not ready to close". `classifyRemediationError()` labels a
+runner failure `timeout` / `concurrency` / `provider` / `error`, so an
+infrastructure failure is distinguishable from a work verdict (surfaced as the
+`category` field on the blocking entry and in the reason text).
+
 ### Step 3.7: Final validation sweep (exit 12)
 
 The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX,
@@ -144,9 +161,11 @@ Covered and excluded children are reported in `coveredChildren` /
 `excludedChildren` and never block. Missing, stale, and transient audits are
 auto-remediated conservatively by re-running `audit_runner.py issue <id>` and
 re-checking `wl audit-show`; successfully-remediated items are unblocked and
-reported separately. Genuine "not ready to close" verdicts block immediately
-with **no** re-audit attempt. The gate never calls `wl update` directly.
-`--skip-checks` bypasses it.
+reported separately. Remediation is bounded by the same
+`SHIP_AUDIT_REMEDIATION_*` budget as Step 2 (SA-0MUOO5V0P00461X8): once
+exhausted, remaining items block with an offline-refresh instruction. Genuine
+"not ready to close" verdicts block immediately with **no** re-audit attempt.
+The gate never calls `wl update` directly. `--skip-checks` bypasses it.
 
 **Script:** `scripts/check-final-validation.js`
 
@@ -284,6 +303,7 @@ Verifying the full suite before promotion uses the test skill's cached runner
 | `check-unmerged-branches.js` | Detect unmerged branches |
 | `check-audit-gate.js` | Pre-release audit gate |
 | `audit-freshness.js` | Shared audit-staleness heuristics (`isAuditStale`, `parseIsoUtc`, freshness constants) used by both audit gates |
+| `audit-remediation.js` | Bounded in-gate remediation (`RemediationBudget`, `classifyRemediationError`, env-configurable timeout/budget/attempt cap) |
 | `check-final-validation.js` | Final validation sweep (parent-coverage / out-of-scope aware, exit 12) |
 | `check-critical-items.js` | Critical item gating |
 | `check-worklog-refs.js` | Validate worklog references |

@@ -36,6 +36,12 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isAuditStale } from './audit-freshness.js';
+import {
+  RemediationBudget,
+  classifyRemediationError,
+  resolveRemediationTimeoutMs,
+  OFFLINE_AUDIT_REFRESH_HINT,
+} from './audit-remediation.js';
 
 // Module constants for audit-runner path resolution: the in-repo copy of the
 // audit skill is preferred; the globally installed skill is the fallback.
@@ -450,9 +456,15 @@ export async function attemptAuditRemediation(workItem, { runAuditShow, runAudit
     const runnerPath = resolveAuditRunnerFn();
     runAuditCommand(runnerPath, workItem.id);
   } catch (err) {
+    // Classify the failure so an infrastructure problem (timeout/concurrency/
+    // provider) is distinguishable from a genuine verdict
+    // (SA-0MUOO5V0P00461X8). The "Audit remediation failed" prefix is retained
+    // for backward compatibility with existing reports/tests.
+    const { category, detail } = classifyRemediationError(err);
     return {
       status: 'runner-failed',
-      reason: `Audit remediation failed: ${err.stderr?.toString()?.trim() || err.message}`,
+      category,
+      reason: `Audit remediation failed (${category}): ${detail}`,
       summary: null,
     };
   }
@@ -514,6 +526,9 @@ export async function attemptAuditRemediation(workItem, { runAuditShow, runAudit
  *   its stdout.
  * @param {() => string} [options.resolveAuditRunnerFn] - Resolves the audit
  *   runner script path; defaults to `resolveAuditRunner`.
+ * @param {() => import('./audit-remediation.js').RemediationBudget} [options.createRemediationBudgetFn] -
+ *   Factory for the bounded remediation budget; defaults to a fresh
+ *   `RemediationBudget` (env-configured). Injectable for deterministic tests.
  * @returns {Promise<{
  *   hasBlockingItems: boolean,
  *   blockingItems: Array<{
@@ -551,9 +566,12 @@ export async function checkAuditReadyToClose(options = {}) {
       // Per-item timeout guard (SA-0MSUT8GQP004WSYN AC6 / R1): a hung audit
       // runner must not stall the whole release gate. The default audit
       // runner hard-times-out internally, so this is a belt-and-braces cap.
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 600000 },
+      // Configurable via SHIP_AUDIT_REMEDIATION_TIMEOUT_MS
+      // (SA-0MUOO5V0P00461X8).
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveRemediationTimeoutMs() },
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
+    createRemediationBudgetFn = () => new RemediationBudget(),
   } = options;
 
   // Step 1: Collect candidate items — top-level only. Children are covered
@@ -575,6 +593,7 @@ export async function checkAuditReadyToClose(options = {}) {
   const blockingItems = [];
   const transientItems = [];
   const remediatedItems = [];
+  const budget = createRemediationBudgetFn();
 
   for (const item of items) {
     let auditData = null;
@@ -612,11 +631,31 @@ export async function checkAuditReadyToClose(options = {}) {
       console.log(
         `Audit gate: auto-remediating ${item.id} (${auditKind})...`,
       );
+      // Bounded remediation (SA-0MUOO5V0P00461X8): once the budget is spent
+      // (attempt cap or wall clock), stop re-auditing and report the remaining
+      // items with an offline-refresh instruction instead of implying the work
+      // is not ready to close.
+      if (!budget.canAttempt()) {
+        console.log(
+          `Audit gate: remediation budget exhausted (${budget.describe()}) — skipping ${item.id}.`,
+        );
+        blockingItems.push({
+          workItemId: item.id,
+          title: item.title,
+          reason:
+            `Audit remediation budget exhausted (${budget.describe()}) — `
+            + 'audit needs refreshing offline',
+          summary: null,
+          remediation: `${buildRemediationCommand(item.id)}\n  # ${OFFLINE_AUDIT_REFRESH_HINT}`,
+        });
+        continue;
+      }
       const remediation = await attemptAuditRemediation(item, {
         runAuditShow,
         runAuditCommand,
         resolveAuditRunnerFn,
       });
+      budget.record();
       if (remediation.status === 'passing') {
         console.log(`Audit gate: ${item.id} auto-remediated successfully.`);
       } else if (remediation.status === 'runner-failed') {
@@ -635,12 +674,15 @@ export async function checkAuditReadyToClose(options = {}) {
         });
       } else if (remediation.status === 'runner-failed') {
         // The remediation runner itself failed — never silently pass; block
-        // and surface the manual remediation command.
+        // and surface the manual remediation command. `category` records
+        // whether the failure was infrastructure (timeout/concurrency/provider)
+        // or another error (SA-0MUOO5V0P00461X8).
         blockingItems.push({
           workItemId: item.id,
           title: item.title,
           reason: remediation.reason,
           summary: null,
+          category: remediation.category,
           remediation: buildRemediationCommand(item.id),
         });
       } else {

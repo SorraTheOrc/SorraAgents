@@ -1250,6 +1250,69 @@ describe('checkAuditReadyToClose - remediation runner failure', () => {
   });
 });
 
+describe('checkAuditReadyToClose - bounded remediation budget', () => {
+  test('stops at the attempt cap and blocks remaining items with offline guidance', async () => {
+    const mod = await import(MODULE_PATH);
+    const budgetMod = await import(
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js'),
+    );
+    const items = [
+      { id: 'SA-A', title: 'Item A', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      { id: 'SA-B', title: 'Item B', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+    ];
+    let remediationCalls = 0;
+    let aShows = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => items,
+      runAuditShow: (id) => {
+        if (id === 'SA-A') {
+          aShows += 1;
+          return aShows === 1
+            ? JSON.stringify({ audit: null })
+            : JSON.stringify({ audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z' } });
+        }
+        return JSON.stringify({ audit: null });
+      },
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      createRemediationBudgetFn: () => new budgetMod.RemediationBudget({
+        maxItems: 1,
+        budgetMs: 1_000_000,
+      }),
+    });
+
+    assert.equal(remediationCalls, 1, 'only the funded remediation may run');
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems.length, 1, 'the un-funded item is reported blocking');
+    assert.equal(report.blockingItems[0].workItemId, 'SA-B');
+    assert.match(report.blockingItems[0].reason, /budget exhausted/i);
+    assert.match(
+      report.blockingItems[0].remediation,
+      /audit_runner\.py batch/,
+      'offline-refresh guidance must be surfaced',
+    );
+    assert.equal(report.remediatedItems.length, 1);
+    assert.equal(report.remediatedItems[0].workItemId, 'SA-A');
+  });
+
+  test('classifies a remediation timeout distinctly in the blocking reason', async () => {
+    const mod = await import(MODULE_PATH);
+    const timeoutErr = new Error('killed');
+    timeoutErr.code = 'ETIMEDOUT';
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [
+        { id: 'SA-TO', title: 'Timeout Item', needsProducerReview: false, parentId: null },
+      ],
+      runAuditShow: () => JSON.stringify({ audit: null }),
+      runAuditCommand: () => { throw timeoutErr; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+    assert.equal(report.hasBlockingItems, true);
+    assert.match(report.blockingItems[0].reason, /Audit remediation failed \(timeout\)/);
+    assert.equal(report.blockingItems[0].category, 'timeout');
+  });
+});
+
 describe('resolveAuditRunner - path resolution', () => {
   test('prefers the in-repo audit runner when it exists', async () => {
     const mod = await import(MODULE_PATH);

@@ -54,6 +54,11 @@ import {
   resolveAuditRunner,
   attemptAuditRemediation,
 } from './check-audit-gate.js';
+import {
+  RemediationBudget,
+  resolveRemediationTimeoutMs,
+  OFFLINE_AUDIT_REFRESH_HINT,
+} from './audit-remediation.js';
 
 // Shared audit-freshness heuristics (parseIsoUtc, isAuditStale) and the
 // freshness constants now live in ./audit-freshness.js so both this gate
@@ -429,10 +434,13 @@ export async function checkFinalValidation(options = {}) {
     ),
     runAuditCommand = (runnerPath, workItemId) => execSync(
       `python3 "${runnerPath}" issue ${workItemId}`,
-      // Per-item timeout guard, consistent with the audit gate's 600s cap.
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 600000 },
+      // Per-item timeout guard, consistent with the audit gate's cap.
+      // Configurable via SHIP_AUDIT_REMEDIATION_TIMEOUT_MS
+      // (SA-0MUOO5V0P00461X8).
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveRemediationTimeoutMs() },
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
+    createRemediationBudgetFn = () => new RemediationBudget(),
     getItemByIdFn = getItemById,
     runCloseCommand = (itemId, args) => execSync(
       `wl ${args.map(shellQuote).join(' ')} --json`,
@@ -465,6 +473,7 @@ export async function checkFinalValidation(options = {}) {
   const coveredChildren = [];
   const excludedChildren = [];
   let passingCount = 0;
+  const budget = createRemediationBudgetFn();
 
   for (const item of items) {
     // ── Child scope: parent coverage / out-of-scope exclusion ───────────
@@ -586,24 +595,40 @@ export async function checkFinalValidation(options = {}) {
         || classification.kind === 'transient';
 
       if (needsRemediation) {
-        console.log(
-          `Final-validation gate: auto-remediating ${item.id} ` +
-          `(${classification.kind} audit)...`,
-        );
-        const remediation = await attemptAuditRemediation(item, {
-          runAuditShow,
-          runAuditCommand,
-          resolveAuditRunnerFn,
-        });
-        if (remediation.status === 'passing') {
-          console.log(`Final-validation gate: ${item.id} auto-remediated successfully.`);
-          remediated = true;
-          summary = remediation.summary || summary;
-        } else {
-          console.log(`Final-validation gate: ${item.id} still failing after remediation — blocking.`);
+        // Bounded remediation (SA-0MUOO5V0P00461X8): once the budget is spent,
+        // stop re-auditing and report the item with an offline-refresh
+        // instruction instead of implying it is not ready to close.
+        if (!budget.canAttempt()) {
+          console.log(
+            `Final-validation gate: remediation budget exhausted `
+            + `(${budget.describe()}) — skipping ${item.id}.`,
+          );
           auditIssue = true;
-          reasons.push(remediation.reason);
-          summary = remediation.summary || summary;
+          reasons.push(
+            `Audit remediation budget exhausted (${budget.describe()}) — `
+            + 'audit needs refreshing offline',
+          );
+        } else {
+          console.log(
+            `Final-validation gate: auto-remediating ${item.id} ` +
+            `(${classification.kind} audit)...`,
+          );
+          const remediation = await attemptAuditRemediation(item, {
+            runAuditShow,
+            runAuditCommand,
+            resolveAuditRunnerFn,
+          });
+          budget.record();
+          if (remediation.status === 'passing') {
+            console.log(`Final-validation gate: ${item.id} auto-remediated successfully.`);
+            remediated = true;
+            summary = remediation.summary || summary;
+          } else {
+            console.log(`Final-validation gate: ${item.id} still failing after remediation — blocking.`);
+            auditIssue = true;
+            reasons.push(remediation.reason);
+            summary = remediation.summary || summary;
+          }
         }
       } else if (classification.kind === 'failing') {
         auditIssue = true;
@@ -617,7 +642,9 @@ export async function checkFinalValidation(options = {}) {
         remediationParts.push(buildProducerReviewRemediationCommand(item.id));
       }
       if (auditIssue) {
-        remediationParts.push(buildRemediationCommand(item.id));
+        remediationParts.push(
+          `${buildRemediationCommand(item.id)}\n  # ${OFFLINE_AUDIT_REFRESH_HINT}`,
+        );
       }
       blockingItems.push({
         workItemId: item.id,
