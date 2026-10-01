@@ -22,8 +22,10 @@ concurrent WIP.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import subprocess
+import warnings
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -42,8 +44,9 @@ def _load_guard_module():
 _guard = _load_guard_module()
 
 
+@functools.cache
 def _is_tracked(path: Path) -> bool:
-    """Return True if *path* is tracked by git."""
+    """Return True if *path* is tracked by git (cached per path)."""
     result = subprocess.run(
         ["git", "ls-files", "--error-unmatch", str(path)],
         cwd=str(_REPO_ROOT),
@@ -64,24 +67,33 @@ def _ignore_untracked_skill_dirs(collection_path: Path) -> bool:
         return False
 
     parts = rel.parts
-    # Check if path starts with "skill/..."
+    # The skill directory is always the first two components: skill/<name>.
     if len(parts) < 2 or parts[0] != "skill":
         return False
 
-    # Walk up from the collection path to find the top-level skill dir.
-    # For "skill/foo/tests/test_x.py", the skill dir is "skill/foo/".
-    # For "skill/foo/", it's "skill/foo/".
-    for i in range(2, len(parts) + 1):
-        skill_dir = _REPO_ROOT / Path(*parts[:i])
-        if not skill_dir.is_dir():
-            continue
-        # Check if this skill directory is tracked
-        if _is_tracked(skill_dir):
-            return False  # tracked — allow collection
-        else:
-            return True   # untracked — ignore
+    skill_dir = _REPO_ROOT / parts[0] / parts[1]
+    if not skill_dir.is_dir():
+        return False
+    return not _is_tracked(skill_dir)
 
-    return False
+
+def _untracked_skill_dirs() -> list[str]:
+    """Names of candidate skill dirs (``SKILL.md`` or ``tests/``) untracked
+    by git — another agent's in-progress WIP (SA-0MUPDDMXB0088CMM).
+
+    ``__pycache__`` and other non-skill artefacts are excluded so the warning
+    stays actionable.
+    """
+    skills_root = _REPO_ROOT / "skill"
+    if not skills_root.is_dir():
+        return []
+    return sorted(
+        d.name
+        for d in skills_root.iterdir()
+        if d.is_dir()
+        and ((d / "SKILL.md").exists() or (d / "tests").is_dir())
+        and not _is_tracked(d)
+    )
 
 
 def pytest_ignore_collect(collection_path: Path, config):
@@ -93,3 +105,10 @@ def pytest_ignore_collect(collection_path: Path, config):
 
 def pytest_configure(config):
     _guard.register(config, root=_REPO_ROOT)
+    untracked = _untracked_skill_dirs()
+    if untracked:
+        warnings.warn(
+            "untracked skill dir(s) present (concurrent agent WIP?) — "
+            "excluded from collection: " + ", ".join(untracked),
+            stacklevel=1,
+        )

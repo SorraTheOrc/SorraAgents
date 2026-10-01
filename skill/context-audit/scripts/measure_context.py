@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -124,21 +125,79 @@ def skill_description_prose(
     ``disable-model-invocation: true`` are excluded by default because they
     do not appear in the session's skills-discovery block; pass
     ``include_hidden=True`` to audit all skills.
+
+    Untracked ``skill/<name>/`` directories (another agent's in-progress WIP)
+    are ignored: they are not part of the committed startup surface and must
+    not break the inventory (SA-0MUPDDMXB0088CMM).
     """
     result: dict[str, str] = {}
+    tracked = tracked_skill_dirs(repo_root)
     for skill_md in sorted(repo_root.glob(SKILL_MD_GLOB)):
+        name = skill_md.parent.name
+        if tracked is not None and name not in tracked:
+            continue
         text = skill_md.read_text(encoding="utf-8")
         frontmatter = extract_frontmatter(text)
         if not include_hidden and "disable-model-invocation: true" in frontmatter:
             continue
-        result[skill_md.parent.name] = parse_description(frontmatter)
+        result[name] = parse_description(frontmatter)
     return result
+
+
+def tracked_skill_dirs(repo_root: Path) -> set[str] | None:
+    """Names of ``skill/<name>/`` directories tracked by git.
+
+    Returns ``None`` when git is unavailable (e.g. an exported tarball), so
+    callers fall back to including every directory.  A concurrent agent may
+    leave an untracked ``skill/<name>/`` WIP directory in the main checkout;
+    excluding it keeps the skill inventory and context budget stable
+    (SA-0MUPDDMXB0088CMM).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--", "skill/"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    names: set[str] = set()
+    for line in proc.stdout.splitlines():
+        parts = line.split("/")
+        if len(parts) >= 2 and parts[0] == "skill":
+            names.add(parts[1])
+    return names
+
+
+def untracked_skill_dirs(repo_root: Path) -> list[str]:
+    """Names of untracked ``skill/<name>/`` directories that contain a
+    ``SKILL.md`` (another agent's in-progress WIP).
+
+    Callers use this to emit a clear warning instead of failing with a
+    confusing inventory/collection error (SA-0MUPDDMXB0088CMM).
+    """
+    tracked = tracked_skill_dirs(repo_root)
+    if tracked is None:
+        return []
+    return sorted(
+        skill_md.parent.name
+        for skill_md in repo_root.glob(SKILL_MD_GLOB)
+        if skill_md.parent.name not in tracked
+    )
 
 
 def hidden_skill_names(repo_root: Path) -> list[str]:
     """Names of skills with ``disable-model-invocation: true``."""
+    tracked = tracked_skill_dirs(repo_root)
     names: list[str] = []
     for skill_md in sorted(repo_root.glob(SKILL_MD_GLOB)):
+        if tracked is not None and skill_md.parent.name not in tracked:
+            continue
         frontmatter = extract_frontmatter(skill_md.read_text(encoding="utf-8"))
         if "disable-model-invocation: true" in frontmatter:
             names.append(skill_md.parent.name)
