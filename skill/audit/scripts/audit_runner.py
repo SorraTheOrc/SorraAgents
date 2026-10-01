@@ -1729,6 +1729,62 @@ def _extract_content_fingerprint(report_text: str) -> str | None:
     return None
 
 
+def cmd_check_freshness(issue_id: str,
+                        worklog_dir: str | None = None) -> int:
+    """Report whether a work item's stored audit is still fresh — read-only.
+
+    Read-only companion to the audit pipeline (SA-0MUOO5W8J001DYTI): it never
+    runs an audit and never mutates the worklog. It reuses the runner's own
+    freshness gate (:func:`_check_audit_freshness`) so callers (e.g. the ship
+    release gates) can consume the persisted content fingerprint without
+    duplicating the fingerprint logic in another language.
+
+    Prints a single JSON object::
+
+        {"workItemId", "fresh", "hasFingerprint", "auditedAt", "reason"}
+
+    Always exits 0 (fresh/stale/absent are all valid results); a lookup
+    failure is reported as ``fresh: false`` with the reason so the caller can
+    fail open to the normal time gate.
+    """
+    runner = _default_runner
+    audited_at = None
+    has_fingerprint = False
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
+        audit = data.get("audit") if isinstance(data, dict) else None
+        if isinstance(audit, dict):
+            audited_at = audit.get("auditedAt")
+            has_fingerprint = _extract_content_fingerprint(
+                audit.get("rawOutput") or ""
+            ) is not None
+        fresh_report = _check_audit_freshness(runner, issue_id,
+                                              worklog_dir=worklog_dir)
+        fresh = fresh_report is not None
+        if fresh:
+            reason = ("content fingerprint unchanged" if has_fingerprint
+                      else "within freshness window")
+        elif not audited_at:
+            reason = "no stored audit"
+        elif has_fingerprint:
+            reason = "content changed"
+        else:
+            reason = "stale (legacy audit, time gate)"
+    except RuntimeError as exc:
+        fresh = False
+        reason = f"freshness check failed: {exc}"
+
+    print(json.dumps({
+        "workItemId": issue_id,
+        "fresh": fresh,
+        "hasFingerprint": has_fingerprint,
+        "auditedAt": audited_at,
+        "reason": reason,
+    }))
+    return 0
+
+
 def _normalise_repo_path(path: str) -> str:
     """Normalise a git-reported or Key-Files path for comparison.
 
@@ -12903,6 +12959,18 @@ def build_parser() -> argparse.ArgumentParser:
                                "there too"
                            ))
 
+    p_freshness = sub.add_parser(
+        "check-freshness",
+        help=(
+            "Read-only: report whether a work item's stored audit is still "
+            "fresh (content fingerprint / time gate). Never runs an audit "
+            "and never mutates the worklog (SA-0MUOO5W8J001DYTI)"
+        ),
+    )
+    p_freshness.add_argument("issue_id", help="Work item id to check")
+    p_freshness.add_argument("--worklog-dir", default=None,
+                             help="Explicit .worklog directory to target (overrides auto-resolution)")
+
     return p
 
 
@@ -12997,6 +13065,10 @@ def main(argv: list[str] | None = None) -> int:
             print(_root_timer.render(), file=sys.stderr)
         _run_session_cleanup(args)
         return _rc
+    elif args.command == "check-freshness":
+        # Read-only freshness probe (SA-0MUOO5W8J001DYTI): no pi, no worklog
+        # mutation, no host audit slot.
+        return cmd_check_freshness(args.issue_id, worklog_dir=args.worklog_dir)
 
     return 2
 

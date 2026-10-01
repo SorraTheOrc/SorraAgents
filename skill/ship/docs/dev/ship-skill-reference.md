@@ -144,6 +144,18 @@ only the in-gate re-audit attempts. The `readyToClose === true` requirement is
 offline-refresh guidance. Unlike `--skip-checks` it does not bypass the other
 gates, and it is a wrapper-only flag (never forwarded to the merge script).
 
+**Content-fingerprint fast path (SA-0MUOO5W8J001DYTI):** before re-auditing a
+time-stale item, the gates call the audit runner read-only
+(`queryContentFreshness()` → `audit_runner.py check-freshness <id> --json`,
+which reuses the runner's own `_check_audit_freshness`). A fingerprint-bearing
+audit whose content is unchanged is treated as trustworthy (no re-audit): a
+passing verdict is fresh; a failing verdict is a current genuine failure and
+blocks immediately. Legacy (fingerprint-less) audits, content changes, and
+probe errors fall back to the time gate / re-audit path. The probe is only
+attempted when the stored report actually carries an
+`Audit content fingerprint:` line (`hasContentFingerprint()`), so fingerprint-less
+items never spawn the runner.
+
 ### Step 3.7: Final validation sweep (exit 12)
 
 The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX,

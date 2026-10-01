@@ -53,6 +53,8 @@ import {
   buildProducerReviewRemediationCommand,
   resolveAuditRunner,
   attemptAuditRemediation,
+  queryContentFreshness,
+  hasContentFingerprint,
 } from './check-audit-gate.js';
 import {
   RemediationBudget,
@@ -442,6 +444,7 @@ export async function checkFinalValidation(options = {}) {
     resolveAuditRunnerFn = resolveAuditRunner,
     createRemediationBudgetFn = () => new RemediationBudget(),
     skipRemediation = false,
+    queryContentFreshnessFn = queryContentFreshness,
     getItemByIdFn = getItemById,
     runCloseCommand = (itemId, args) => execSync(
       `wl ${args.map(shellQuote).join(' ')} --json`,
@@ -588,7 +591,22 @@ export async function checkFinalValidation(options = {}) {
     }
 
     if (!queryFailed) {
-      const classification = classifyAudit(item, auditData);
+      let classification = classifyAudit(item, auditData);
+
+      // Content-fingerprint fast path (SA-0MUOO5W8J001DYTI): a time-stale audit
+      // whose stored content fingerprint still matches needs no re-audit. Ask
+      // the runner read-only: passing + content-fresh → fresh (no remediation);
+      // failing + content-fresh → the verdict is current, so block immediately.
+      if (classification.kind === 'stale' && hasContentFingerprint(auditData)) {
+        const freshness = queryContentFreshnessFn(item.id);
+        if (freshness.fresh) {
+          const status = getAuditStatus(item, auditData);
+          classification = status.passing
+            ? { kind: 'passing', reason: `Content fingerprint unchanged (${freshness.reason})`, summary: classification.summary }
+            : { kind: 'failing', reason: `Audit verdict: not ready to close (content-fresh: ${freshness.reason})`, summary: classification.summary };
+        }
+      }
+
       summary = classification.summary;
 
       const needsRemediation = classification.kind === 'missing'

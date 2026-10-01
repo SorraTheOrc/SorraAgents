@@ -36,6 +36,12 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isAuditStale } from './audit-freshness.js';
+
+// Prefix of the content-fingerprint metadata line embedded in persisted audit
+// reports by the audit runner (`audit_runner.py`). Mirrored here so the gate
+// can detect a fingerprint-bearing audit without spawning the runner
+// (SA-0MUOO5W8J001DYTI).
+export const AUDIT_CONTENT_FINGERPRINT_PREFIX = 'Audit content fingerprint: ';
 import {
   RemediationBudget,
   classifyRemediationError,
@@ -310,6 +316,79 @@ export function resolveAuditRunner(fsMod = { existsSync }) {
   return inRepo;
 }
 
+// ── queryContentFreshness ────────────────────────────────────────────────────
+
+/**
+ * Ask the audit runner (read-only) whether a work item's stored audit is still
+ * fresh by content fingerprint (SA-0MUOO5W8J001DYTI).
+ *
+ * Delegates to `audit_runner.py check-freshness <id> --json`, which reuses the
+ * runner's own `_check_audit_freshness` (content fingerprint first, then the
+ * time gate) without running an audit or mutating the worklog. This lets the
+ * ship gates treat a time-stale-but-content-unchanged audit as trustworthy
+ * instead of re-auditing it, while a content change still triggers a re-audit.
+ *
+ * Fails open: any error (runner missing, command failure, bad JSON) returns
+ * `{ fresh: false }` so the caller falls back to the conservative time gate —
+ * never falsely passing a stale audit.
+ *
+ * @param {string} workItemId - Work item id.
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {(cmd: string) => string} [options.runCommand] - Command runner.
+ * @param {() => string} [options.resolveAuditRunnerFn] - Runner path resolver.
+ * @returns {{ fresh: boolean, reason: string, hasFingerprint: boolean, auditedAt: string|null }}
+ */
+export function queryContentFreshness(workItemId, options = {}) {
+  const {
+    runCommand = (cmd) => execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }),
+    resolveAuditRunnerFn = resolveAuditRunner,
+  } = options;
+  try {
+    const runner = resolveAuditRunnerFn();
+    const output = runCommand(`python3 "${runner}" check-freshness ${workItemId} --json`);
+    const parsed = JSON.parse(output);
+    return {
+      fresh: !!(parsed && parsed.fresh === true),
+      reason: (parsed && parsed.reason) || '',
+      hasFingerprint: !!(parsed && parsed.hasFingerprint),
+      auditedAt: (parsed && parsed.auditedAt) || null,
+    };
+  } catch (err) {
+    return {
+      fresh: false,
+      reason: `check-freshness failed: ${err.stderr?.toString()?.trim() || err.message}`,
+      hasFingerprint: false,
+      auditedAt: null,
+    };
+  }
+}
+
+// ── hasContentFingerprint ────────────────────────────────────────────────────
+
+/**
+ * Whether a stored audit's report carries a content fingerprint.
+ *
+ * The audit runner embeds a metadata line ``Audit content fingerprint: <sha>``
+ * in the persisted report when the fingerprint feature captured one. Only
+ * fingerprint-bearing audits can be resolved by content (the `check-freshness`
+ * probe); legacy audits fall back to the time gate. Detecting it here keeps the
+ * gates hermetic — no runner invocation for fingerprint-less audits — and
+ * implements the AC3 fallback.
+ *
+ * @param {object|null} auditData - Parsed `wl audit-show <id> --json` payload.
+ * @returns {boolean}
+ */
+export function hasContentFingerprint(auditData) {
+  const audit = auditData && auditData.audit;
+  if (!audit) {
+    return false;
+  }
+  const haystack = [audit.rawOutput, audit.summary]
+    .filter((v) => typeof v === 'string')
+    .join('\n');
+  return haystack.includes(AUDIT_CONTENT_FINGERPRINT_PREFIX);
+}
+
 // ── buildProducerReviewRemediationCommand ────────────────────────────────────
 
 /**
@@ -573,6 +652,7 @@ export async function checkAuditReadyToClose(options = {}) {
     resolveAuditRunnerFn = resolveAuditRunner,
     createRemediationBudgetFn = () => new RemediationBudget(),
     skipRemediation = false,
+    queryContentFreshnessFn = queryContentFreshness,
   } = options;
 
   // Step 1: Collect candidate items — top-level only. Children are covered
@@ -613,7 +693,28 @@ export async function checkAuditReadyToClose(options = {}) {
       continue;
     }
 
-    const status = getAuditStatus(item, auditData);
+    let status = getAuditStatus(item, auditData);
+
+    // Content-fingerprint fast path (SA-0MUOO5W8J001DYTI): a time-stale audit
+    // whose stored content fingerprint still matches needs no re-audit. Ask the
+    // runner read-only and upgrade the classification accordingly:
+    //   - passing + content-fresh → treat as fresh (no remediation);
+    //   - failing + content-fresh → the verdict is current, so block immediately.
+    if (status.stale && hasContentFingerprint(auditData)) {
+      const freshness = queryContentFreshnessFn(item.id);
+      if (freshness.fresh) {
+        status = status.passing
+          ? { ...status, stale: false, reason: `Content fingerprint unchanged (${freshness.reason})` }
+          : {
+            isBlocking: true,
+            transient: false,
+            stale: false,
+            passing: false,
+            reason: `Audit verdict: not ready to close (content-fresh: ${freshness.reason})`,
+            summary: status.summary,
+          };
+      }
+    }
 
     // Missing audit (no audit record at all), stale (the verdict predates the
     // item's last update), or transient (timed out / provider error /

@@ -1352,6 +1352,99 @@ describe('checkAuditReadyToClose - narrow --skip-audit-remediation bypass', () =
   });
 });
 
+describe('checkAuditReadyToClose - content-fingerprint fast path', () => {
+  const FP_LINE = 'Audit content fingerprint: deadbeef';
+  const ITEM = { id: 'SA-CF', title: 'CF', needsProducerReview: false, parentId: null, updatedAt: '2026-09-05T10:00:00Z' };
+  const fpAudit = (readyToClose) => JSON.stringify({
+    audit: {
+      readyToClose,
+      auditedAt: '2026-09-04T08:00:00Z',
+      rawOutput: `Ready to close: ${readyToClose ? 'Yes' : 'No'}\n${FP_LINE}`,
+    },
+  });
+
+  test('treats a stale-passing fingerprint audit as fresh (no re-audit)', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let freshnessCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [ITEM],
+      runAuditShow: () => fpAudit(true),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+      queryContentFreshnessFn: () => {
+        freshnessCalls += 1;
+        return { fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: null };
+      },
+    });
+    assert.equal(freshnessCalls, 1, 'the fingerprint probe must run once');
+    assert.equal(remediationCalls, 0, 'content-fresh audit must not be re-audited');
+    assert.equal(report.hasBlockingItems, false);
+  });
+
+  test('a content-fresh failing verdict blocks without a re-audit', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [ITEM],
+      runAuditShow: () => fpAudit(false),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+      queryContentFreshnessFn: () => ({ fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: null }),
+    });
+    assert.equal(remediationCalls, 0, 'a current failing verdict must not be re-audited');
+    assert.equal(report.hasBlockingItems, true);
+    assert.match(report.blockingItems[0].reason, /content-fresh/);
+  });
+
+  test('a content-changed fingerprint audit is remediated', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let shows = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [ITEM],
+      runAuditShow: () => {
+        shows += 1;
+        // Plan pass: stale fingerprint audit. Re-check after remediation: a
+        // fresh passing audit (as a real re-run would persist).
+        return shows === 1
+          ? fpAudit(true)
+          : JSON.stringify({ audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z', summary: 'ok' } });
+      },
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+      queryContentFreshnessFn: () => ({ fresh: false, reason: 'content changed', hasFingerprint: true, auditedAt: null }),
+    });
+    assert.equal(remediationCalls, 1, 'content-changed stale audit must be re-audited');
+    assert.equal(report.hasBlockingItems, false);
+  });
+
+  test('hasContentFingerprint detects the metadata line', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(mod.hasContentFingerprint({ audit: { rawOutput: `x\n${FP_LINE}` } }), true);
+    assert.equal(mod.hasContentFingerprint({ audit: { rawOutput: 'no fp' } }), false);
+    assert.equal(mod.hasContentFingerprint({ audit: null }), false);
+    assert.equal(mod.hasContentFingerprint(null), false);
+  });
+
+  test('queryContentFreshness parses the runner JSON and fails open on error', async () => {
+    const mod = await import(MODULE_PATH);
+    const ok = mod.queryContentFreshness('SA-1', {
+      runCommand: () => JSON.stringify({ fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: 'x' }),
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+    });
+    assert.equal(ok.fresh, true);
+    assert.equal(ok.hasFingerprint, true);
+
+    const bad = mod.queryContentFreshness('SA-1', {
+      runCommand: () => { const e = new Error('boom'); e.stderr = Buffer.from('nope'); throw e; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+    });
+    assert.equal(bad.fresh, false);
+    assert.match(bad.reason, /check-freshness failed/);
+  });
+});
+
 describe('resolveAuditRunner - path resolution', () => {
   test('prefers the in-repo audit runner when it exists', async () => {
     const mod = await import(MODULE_PATH);

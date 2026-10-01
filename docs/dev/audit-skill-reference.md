@@ -252,6 +252,29 @@ Skipping: audit still fresh
 
 No status lifecycle transitions occur, and no persistence is performed. An explicit ``Ready to close: No`` verdict in the stored report is returned verbatim — it is never masked by a freshness skip.
 
+### Read-only probe: ``check-freshness`` (SA-0MUOO5W8J001DYTI)
+
+Read-only consumers (e.g. the ship release gates) can query this freshness gate
+**without running an audit** via a dedicated subcommand:
+
+```bash
+python3 skill/audit/scripts/audit_runner.py check-freshness <id> --json
+```
+
+It prints one JSON object and always exits 0:
+
+```json
+{"workItemId": "<id>", "fresh": true, "hasFingerprint": true, "auditedAt": "...", "reason": "content fingerprint unchanged"}
+```
+
+``fresh`` is the same verdict :func:`_check_audit_freshness` computes (content
+fingerprint first, then the legacy time gate). It performs no status lifecycle
+transition, persists nothing, launches no ``pi`` call, and does not acquire the
+host audit slot. A lookup failure is reported as ``fresh: false`` with a
+``freshness check failed: ...`` reason so callers fail open to the conservative
+time gate. This lets the ship gates treat a time-stale but content-unchanged
+audit as fresh instead of spending the release window re-auditing it.
+
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). A child whose stored audit carries an unchanged fingerprint AND a parseable verdict is reused: its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
 
 ## Re-audit coordination check
