@@ -286,5 +286,50 @@ class TestCollectMetrics(unittest.TestCase):
             self.assertIn("pids", item)
 
 
+# ---------------------------------------------------------------------------
+# Per-category threshold boundaries (AC1)
+# ---------------------------------------------------------------------------
+
+class TestCategoryBoundaries(unittest.TestCase):
+    """Boundary classification for every configured metric category."""
+
+    def setUp(self):
+        self.cfg = metrics.load_config()
+
+    def _classify(self, category, value):
+        return metrics.classify_metric(value, self.cfg[category])["status"]
+
+    def test_cpu_pressure_boundaries(self):
+        self.assertEqual(self._classify("cpu_pressure", 69.9), "low")
+        self.assertEqual(self._classify("cpu_pressure", 70), "warning")
+        self.assertEqual(self._classify("cpu_pressure", 85), "critical")
+
+    def test_memory_usage_boundaries(self):
+        self.assertEqual(self._classify("memory_usage", 79.9), "low")
+        self.assertEqual(self._classify("memory_usage", 80), "warning")
+        self.assertEqual(self._classify("memory_usage", 95), "critical")
+
+    def test_io_pressure_boundaries(self):
+        self.assertEqual(self._classify("io_pressure", 49.9), "low")
+        self.assertEqual(self._classify("io_pressure", 50), "warning")
+        self.assertEqual(self._classify("io_pressure", 80), "critical")
+
+    def test_swap_usage_boundaries(self):
+        self.assertEqual(self._classify("swap_usage", 29.9), "low")
+        self.assertEqual(self._classify("swap_usage", 30), "warning")
+        self.assertEqual(self._classify("swap_usage", 70), "critical")
+
+    def test_zombie_processes_boundaries(self):
+        self.assertEqual(self._classify("zombie_processes", 4), "low")
+        self.assertEqual(self._classify("zombie_processes", 5), "warning")
+        self.assertEqual(self._classify("zombie_processes", 20), "critical")
+
+    def test_load_average_multiplier_boundaries(self):
+        thresholds = metrics._multiplier_thresholds(self.cfg["load_average"], 16)
+        self.assertEqual(metrics.classify_metric(11.0, thresholds)["status"], "low")
+        self.assertEqual(metrics.classify_metric(11.2, thresholds)["status"], "warning")
+        self.assertEqual(metrics.classify_metric(24.0, thresholds)["status"], "critical")
+
+
 if __name__ == "__main__":
     unittest.main()
