@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // run-release.js — safe wrapper to invoke repository-level release script
-// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks] [--bump patch|minor|major]
+// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks] [--bump patch|minor|major] [--refresh-audits]
 //
 // The --bump flag is passed through to the canonical release script
 // (merge-dev-to-main.sh) and controls which part of the semver is
@@ -13,6 +13,7 @@ import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
 import { checkFinalValidation, resolveChildScope, getItemById, shellQuote } from './check-final-validation.js';
+import { runRefreshAuditsAction } from './refresh-audits.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 import { sendReleaseNotification } from './discord-notify.js';
@@ -112,7 +113,7 @@ export function clearCodeFreezeMarker(projectRoot = resolveProjectRoot()) {
 // Flags consumed by run-release.js itself (e.g. gate bypass) and therefore
 // NEVER forwarded to the canonical merge script, which rejects unknown flags
 // with exit 2 ("Unknown arg: ..."). See SA-0MSKYGAWJ0009M3P.
-const WRAPPER_ONLY_FLAGS = new Set(['--skip-checks']);
+const WRAPPER_ONLY_FLAGS = new Set(['--skip-checks', '--refresh-audits']);
 
 /**
  * Compute the argument list to forward to the canonical merge script.
@@ -800,6 +801,13 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * @returns {number} Exit code (0 = success).
  */
 export async function runRelease(cliArgs = []) {
+  // Pre-flight-only audit refresh (SA-0MUOO5VMH005VF69): refresh the audits for
+  // in_review items and exit WITHOUT merging and WITHOUT setting the Code
+  // Freeze marker, so a large backlog never freezes the project.
+  if (cliArgs.includes('--refresh-audits')) {
+    return runRefreshAuditsAction(cliArgs);
+  }
+
   const projectRoot = resolveProjectRoot();
   setCodeFreezeMarker(projectRoot);
   try {

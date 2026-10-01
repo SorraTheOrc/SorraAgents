@@ -42,7 +42,27 @@ All scripts are internal implementation details — the only user-facing action 
 ```bash
 # Execute a release (dev → main merge)
 node $(skill_path ship)/scripts/run-release.js
+
+# Pre-flight only: refresh in_review audits, then exit (no merge, no Code Freeze)
+node $(skill_path ship)/scripts/run-release.js --refresh-audits
 ```
+
+### Pre-flight audit refresh (`--refresh-audits`)
+
+A large backlog of missing/stale audits can make the in-gate remediation
+(SA-0MUOO5V0P00461X8) slow even though it is bounded. Run the
+**pre-flight-only** refresh first:
+
+```bash
+node $(skill_path ship)/scripts/run-release.js --refresh-audits [--dry-run]
+```
+
+It refreshes the audits for `in_review` items (children included) using the
+same bounded remediation, then exits **without merging and without setting the
+Code Freeze marker** (SA-0MUOO5VMH005VF69). Exit code 0 when nothing remains;
+12 when items still need attention. `--dry-run` reports the plan without
+invoking the audit runner. After a successful refresh, run the normal release;
+the gates then find fresh audits and do little work.
 
 For programmatic access to internal helpers (used by the implement workflow),
 import the modules from the skill directory resolved via `skill_path` (e.g.

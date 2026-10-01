@@ -81,6 +81,18 @@ characters with an ellipsis marker (`…`) when it exceeds the limit.
 | 8.5 | Discord notification (non-blocking) | No |
 | 9 | Close work items (non-blocking) | No |
 
+### Pre-flight audit refresh (`--refresh-audits`)
+
+`run-release.js --refresh-audits [--dry-run]` is a **pre-flight-only** action
+(SA-0MUOO5VMH005VF69): it refreshes missing/stale/transient audits for all
+`in_review` items via `refresh-audits.js`, then exits **without merging and
+without setting the Code Freeze marker**. Exit code 0 when nothing remains, 12
+when items still need attention. `--dry-run` reports the plan (`fresh` /
+`toRefresh` / `failing`) without invoking the audit runner. The refresh reuses
+`planAuditRefresh()` / `refreshAudits()` and the bounded `RemediationBudget`, so
+it can never run unbounded. `--refresh-audits` is a wrapper-only flag (never
+forwarded to the merge script).
+
 ### Step 2: Audit readiness gate (exit 6)
 
 `checkAuditReadyToClose()` (`check-audit-gate.js`) verifies **top-level**
@@ -304,6 +316,7 @@ Verifying the full suite before promotion uses the test skill's cached runner
 | `check-audit-gate.js` | Pre-release audit gate |
 | `audit-freshness.js` | Shared audit-staleness heuristics (`isAuditStale`, `parseIsoUtc`, freshness constants) used by both audit gates |
 | `audit-remediation.js` | Bounded in-gate remediation (`RemediationBudget`, `classifyRemediationError`, env-configurable timeout/budget/attempt cap) |
+| `refresh-audits.js` | Pre-flight-only audit refresh (`planAuditRefresh`, `refreshAudits`, `runRefreshAuditsAction`) for `--refresh-audits` |
 | `check-final-validation.js` | Final validation sweep (parent-coverage / out-of-scope aware, exit 12) |
 | `check-critical-items.js` | Critical item gating |
 | `check-worklog-refs.js` | Validate worklog references |

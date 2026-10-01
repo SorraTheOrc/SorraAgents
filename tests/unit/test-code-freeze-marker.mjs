@@ -35,6 +35,7 @@ const CHECK_UNMERGED_BRANCHES_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 
 const CHECK_AUDIT_GATE_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-audit-gate.js');
 const AUDIT_FRESHNESS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-freshness.js');
 const AUDIT_REMEDIATION_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js');
+const REFRESH_AUDITS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'refresh-audits.js');
 const CHECK_FINAL_VALIDATION_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-final-validation.js');
 const CHECK_CRITICAL_ITEMS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-critical-items.js');
 const CHECK_WORKLOG_REFS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-worklog-refs.js');
@@ -52,6 +53,7 @@ function makeTempSkillDir() {
   writeFileSync(join(skillScriptDir, 'check-audit-gate.js'), readFileSync(CHECK_AUDIT_GATE_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'audit-freshness.js'), readFileSync(AUDIT_FRESHNESS_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'audit-remediation.js'), readFileSync(AUDIT_REMEDIATION_SRC, 'utf8'));
+  writeFileSync(join(skillScriptDir, 'refresh-audits.js'), readFileSync(REFRESH_AUDITS_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'check-final-validation.js'), readFileSync(CHECK_FINAL_VALIDATION_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'check-critical-items.js'), readFileSync(CHECK_CRITICAL_ITEMS_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'check-worklog-refs.js'), readFileSync(CHECK_WORKLOG_REFS_SRC, 'utf8'));
