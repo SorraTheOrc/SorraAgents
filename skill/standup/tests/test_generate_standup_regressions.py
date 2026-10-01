@@ -17,7 +17,7 @@ behaviour:
   - an item completed+in_review before that slipped *outside* the window is NOT flagged;
   - an item still completed+in_review is NOT flagged;
   - an item that was never completed+in_review before is NOT flagged.
-"""  # noqa: EXE001
+"""
 from __future__ import annotations
 
 import importlib.util

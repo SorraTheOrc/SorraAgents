@@ -12,7 +12,7 @@ Resolution order
 
 This helper accepts an explicit ``worklog_dir`` so that callers (and tests) are
 deterministic and do not rely on the current working directory.
-"""  # noqa: D205, D400
+"""
 
 from __future__ import annotations
 
@@ -79,14 +79,14 @@ def resolve_project_name(worklog_dir: str | os.PathLike | None = None) -> str:
     if wd:
         try:
             parent_name = Path(wd).parent.name
-        except Exception:  # noqa: BLE001, S110
+        except Exception:  # noqa: BLE001
             parent_name = None
 
     # ── Branch 3: current working directory name ────────────────────────
     cwd_name: str | None = None
     try:
         cwd_name = Path.cwd().name
-    except Exception:  # noqa: BLE001, S110
+    except Exception:  # noqa: BLE001
         cwd_name = None
 
     return _first_non_empty(parent_name, cwd_name)

@@ -4,7 +4,7 @@ Covers:
 - ``resolve_project_name`` resolution branches (AC2)
 - Report heading includes the project name (AC1)
 - ``--dry-run`` output uses the same heading (AC4)
-"""  # noqa: D205, D400
+"""
 
 import io
 import json
@@ -16,7 +16,6 @@ from unittest import mock
 
 import pytest
 import yaml
-
 
 # ── Shared helpers ──────────────────────────────────────────────────────
 
@@ -148,13 +147,12 @@ class TestReportHeading:
         args = ["--dry-run"] + (extra_args or [])
 
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            with mock.patch.dict(
-                os.environ, {"WL_WORKLOG_DIR": str(worklog)}, clear=False
-            ):
-                from skill.refactor.scripts import refactor as rf
+        with redirect_stdout(buf), mock.patch.dict(
+            os.environ, {"WL_WORKLOG_DIR": str(worklog)}, clear=False
+        ):
+            from skill.refactor.scripts import refactor as rf
 
-                rf.main(args)
+            rf.main(args)
 
         return buf.getvalue()
 
@@ -169,13 +167,12 @@ class TestReportHeading:
         dir_name = worklog.parent.name
 
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            with mock.patch.dict(
-                os.environ, {"WL_WORKLOG_DIR": str(worklog)}, clear=False
-            ):
-                from skill.refactor.scripts import refactor as rf
+        with redirect_stdout(buf), mock.patch.dict(
+            os.environ, {"WL_WORKLOG_DIR": str(worklog)}, clear=False
+        ):
+            from skill.refactor.scripts import refactor as rf
 
-                rf.main(["--dry-run"])
+            rf.main(["--dry-run"])
 
         output = buf.getvalue()
         assert f"=== {dir_name} Refactor Report ===" in output
@@ -192,13 +189,12 @@ class TestReportHeading:
         worklog = _make_worklog_dir({"projectName": "JsonProject"})
 
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            with mock.patch.dict(
-                os.environ, {"WL_WORKLOG_DIR": str(worklog)}, clear=False
-            ):
-                from skill.refactor.scripts import refactor as rf
+        with redirect_stdout(buf), mock.patch.dict(
+            os.environ, {"WL_WORKLOG_DIR": str(worklog)}, clear=False
+        ):
+            from skill.refactor.scripts import refactor as rf
 
-                rf.main(["--dry-run", "--json"])
+            rf.main(["--dry-run", "--json"])
 
         output = buf.getvalue()
         data = json.loads(output)

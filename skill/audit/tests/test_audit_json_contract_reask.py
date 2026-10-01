@@ -1,4 +1,10 @@
 
+# <!-- REFACTOR-SA-0MUQ2OT8V009M5A3
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
+
 # <!-- REFACTOR-SA-0MUMEJVW00096MA8
 # smell: bug_risk
 # severity: medium
@@ -26,7 +32,7 @@ Covers:
   back to the conservative ``partial``, never ``met``.
 
 All tests run offline with ``_call_pi_and_maybe_log`` mocked.
-"""  # noqa: EXE001
+"""
 from __future__ import annotations
 
 import json

@@ -1,4 +1,10 @@
 
+# <!-- REFACTOR-SA-0MUQ2OU12009Q8V5
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
+
 # <!-- REFACTOR-SA-0MUMEJX7G009PKO5
 # smell: ruff_specific
 # severity: medium
@@ -34,7 +40,7 @@ Exit codes:
   0 – success
   1 – error during execution (non-abort)
   2 – aborted
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 

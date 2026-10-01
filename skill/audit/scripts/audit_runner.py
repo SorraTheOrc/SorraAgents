@@ -1,4 +1,10 @@
 
+# <!-- REFACTOR-SA-0MUQ2OMWJ009QW4O
+# smell: formatting
+# severity: low
+# description: Shebang should be at the beginning of the file
+# -->
+
 # <!-- REFACTOR-SA-0MUMEJSWN004746A
 # smell: simplification
 # severity: medium
