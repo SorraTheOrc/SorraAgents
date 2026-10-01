@@ -35,6 +35,7 @@ WORK_ITEM_SKILLS = [
     "find-related",
     "implement",
     "intake",
+    "machine-hygiene",
     "plan",
     "refactor",
     "resolve-pr-comments",
