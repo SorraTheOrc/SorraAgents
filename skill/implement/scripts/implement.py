@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MUQ2OU12009Q8V5
 # smell: formatting
@@ -10,7 +11,6 @@
 # severity: medium
 # description: Unpacked variable `stdout` is never used
 # -->
-#!/usr/bin/env python3
 """Orchestration script for the implement skill workflow.
 
 Manages the deterministic lifecycle of an implementation work item: claim,
@@ -1045,7 +1045,7 @@ def git_push_to_dev(
             env={**os.environ},
         )
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            _stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             # Kill the entire process group so orphaned hook children don't
             # survive and deadlock subsequent push attempts.

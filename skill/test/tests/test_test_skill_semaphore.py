@@ -392,11 +392,13 @@ class TestPacedRunner:
             raise TestConcurrencyTimeout("busy")
             yield  # pragma: no cover
 
-        with mock.patch("run_tests._test_concurrency_slot", _busy_slot):
-            with pytest.raises(TestConcurrencyTimeout):
-                paced_runner(
-                    lambda cmd, cwd, t: SimpleNamespace()
-                )("pytest", "/tmp", 10)
+        with (
+            mock.patch("run_tests._test_concurrency_slot", _busy_slot),
+            pytest.raises(TestConcurrencyTimeout),
+        ):
+            paced_runner(
+                lambda cmd, cwd, t: SimpleNamespace()
+            )("pytest", "/tmp", 10)
 
 
 class TestPacedRunnerTelemetry:

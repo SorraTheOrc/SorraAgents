@@ -165,20 +165,32 @@ class TestCLIGroups:
             },
         }
         repo = _make_project(tmp_path, groups=groups)
-        with mock.patch.object(run_tests, "detect_project_root", return_value=repo):
-            with mock.patch.object(run_tests, "allowed_test_types", return_value=["full"]):
-                with mock.patch.object(run_tests, "resolve_type_commands", return_value=["pytest"]):
-                    exit_code = run_tests.main(["--group", "unknown"])
-                    assert exit_code == 2
+        with (
+            mock.patch.object(run_tests, "detect_project_root", return_value=repo),
+            mock.patch.object(
+                run_tests, "allowed_test_types", return_value=["full"]
+            ),
+            mock.patch.object(
+                run_tests, "resolve_type_commands", return_value=["pytest"]
+            ),
+        ):
+            exit_code = run_tests.main(["--group", "unknown"])
+            assert exit_code == 2
 
     def test_group_in_main_unknown_group_no_config(self, tmp_path: Path) -> None:
         """--group with no groups defined returns exit code 2."""
         repo = _make_project(tmp_path, groups=None)
-        with mock.patch.object(run_tests, "detect_project_root", return_value=repo):
-            with mock.patch.object(run_tests, "allowed_test_types", return_value=["full"]):
-                with mock.patch.object(run_tests, "resolve_type_commands", return_value=["pytest"]):
-                    exit_code = run_tests.main(["--group", "audit"])
-                    assert exit_code == 2
+        with (
+            mock.patch.object(run_tests, "detect_project_root", return_value=repo),
+            mock.patch.object(
+                run_tests, "allowed_test_types", return_value=["full"]
+            ),
+            mock.patch.object(
+                run_tests, "resolve_type_commands", return_value=["pytest"]
+            ),
+        ):
+            exit_code = run_tests.main(["--group", "audit"])
+            assert exit_code == 2
 
 
 # ---------------------------------------------------------------------------

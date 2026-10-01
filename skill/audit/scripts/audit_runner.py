@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MUQ2OMWJ009QW4O
 # smell: formatting
@@ -10,7 +11,6 @@
 # severity: medium
 # description: Use a single `if` statement instead of nested `if` statements
 # -->
-#!/usr/bin/env python3
 """Audit runner – deterministic audit orchestration.
 
 Provides two subcommands:
@@ -827,9 +827,8 @@ def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
     """
     counts = _rel_snapshot()
     parts = [f"{key}={counts.get(key, 0)}" for key in RELIABILITY_SUMMARY_KEYS]
-    if elapsed_seconds is None:
-        if _rel_started_at is not None:
-            elapsed_seconds = time.perf_counter() - _rel_started_at
+    if elapsed_seconds is None and _rel_started_at is not None:
+        elapsed_seconds = time.perf_counter() - _rel_started_at
     if elapsed_seconds is not None:
         parts.append(f"elapsed_seconds={float(elapsed_seconds):.2f}")
     return RELIABILITY_SUMMARY_PREFIX + " " + " ".join(parts)
@@ -6507,9 +6506,7 @@ def _child_is_exempt(
     # Snapshot-based exemption (SA-0MUJAPC680078396): if this child was
     # exempt at audit start, it remains exempt regardless of any
     # cascade-triggered re-audit demotion.
-    if snapshot_exempt is not None and child.get("id") in snapshot_exempt:
-        return True
-    return False
+    return bool(snapshot_exempt is not None and child.get("id") in snapshot_exempt)
 
 
 def _has_phase1_blocking_issues(

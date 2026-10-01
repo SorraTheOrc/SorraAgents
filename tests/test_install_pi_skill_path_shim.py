@@ -86,6 +86,7 @@ class TestShimInstallWiring:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         assert result.returncode == 0, f"installed shim failed: {result.stderr}"
         assert result.stdout.strip().endswith("/report")
@@ -110,6 +111,7 @@ class TestShimResolution:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
 
     def test_resolves_known_skill(self):
@@ -149,6 +151,7 @@ class TestShimSourceMode:
             text=True,
             cwd=str(REPO_ROOT),
             timeout=10,
+            check=False,
         )
         line = result.stdout.strip()
         mode = line.split()[0] if line else ""

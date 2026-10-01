@@ -1,10 +1,10 @@
+#!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MUMEJSWN004746A
 # smell: formatting
 # severity: low
 # description: Shebang is present but file is not executable
 # -->
-#!/usr/bin/env python3
 """faster-whisper worker for the voice-input pi extension.
 
 The worker owns a single ``faster_whisper.WhisperModel`` for the lifetime of the
