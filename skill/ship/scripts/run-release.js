@@ -113,7 +113,7 @@ export function clearCodeFreezeMarker(projectRoot = resolveProjectRoot()) {
 // Flags consumed by run-release.js itself (e.g. gate bypass) and therefore
 // NEVER forwarded to the canonical merge script, which rejects unknown flags
 // with exit 2 ("Unknown arg: ..."). See SA-0MSKYGAWJ0009M3P.
-const WRAPPER_ONLY_FLAGS = new Set(['--skip-checks', '--refresh-audits']);
+const WRAPPER_ONLY_FLAGS = new Set(['--skip-checks', '--refresh-audits', '--skip-audit-remediation']);
 
 /**
  * Compute the argument list to forward to the canonical merge script.
@@ -822,6 +822,10 @@ export async function runRelease(cliArgs = []) {
 async function runReleaseImpl(cliArgs = [], projectRoot) {
   const args = [...cliArgs];
   const skipChecks = args.includes('--skip-checks');
+  // Narrow audit bypass (SA-0MUOO5WV0006D7UD): skip only the in-gate audit
+  // *remediation* while still requiring every in-scope item to have a passing
+  // audit. Distinct from --skip-checks (which bypasses every gate).
+  const skipAuditRemediation = args.includes('--skip-audit-remediation');
   const isDryRun = args.includes('--dry-run');
   const isForce = args.includes('--force');
 
@@ -902,7 +906,7 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   // ── Step 2: Check audit readiness (gating step) ────────────────────────
   startStep('Step 2: audit readiness check');
   if (!skipChecks) {
-    const auditReport = await checkAuditReadyToClose();
+    const auditReport = await checkAuditReadyToClose({ skipRemediation: skipAuditRemediation });
     if (auditReport.hasBlockingItems) {
       console.error(
         '⚠️  Audit gate check failed — some work items are not ready to close:\n',
@@ -974,7 +978,7 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   if (!skipChecks) {
     // `dryRun` is threaded through so a dry-run reports planned child
     // overrides / parent escalations without mutating the worklog (AC4).
-    const finalValidationReport = await checkFinalValidation({ dryRun: isDryRun });
+    const finalValidationReport = await checkFinalValidation({ dryRun: isDryRun, skipRemediation: skipAuditRemediation });
     if (finalValidationReport.hasBlockingItems) {
       console.error(
         '⚠️  Final-validation gate check failed — some in_review items have unresolved audit or producer-review issues:\n',

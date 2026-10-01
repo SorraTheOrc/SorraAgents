@@ -441,6 +441,7 @@ export async function checkFinalValidation(options = {}) {
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
     createRemediationBudgetFn = () => new RemediationBudget(),
+    skipRemediation = false,
     getItemByIdFn = getItemById,
     runCloseCommand = (itemId, args) => execSync(
       `wl ${args.map(shellQuote).join(' ')} --json`,
@@ -595,10 +596,20 @@ export async function checkFinalValidation(options = {}) {
         || classification.kind === 'transient';
 
       if (needsRemediation) {
-        // Bounded remediation (SA-0MUOO5V0P00461X8): once the budget is spent,
-        // stop re-auditing and report the item with an offline-refresh
-        // instruction instead of implying it is not ready to close.
-        if (!budget.canAttempt()) {
+        // Narrow bypass (SA-0MUOO5WV0006D7UD): do not re-audit in-gate if
+        // --skip-audit-remediation was requested; report the item blocking.
+        if (skipRemediation) {
+          console.log(
+            `Final-validation gate: skipping in-gate remediation for ${item.id} `
+            + '(--skip-audit-remediation) — blocking.',
+          );
+          auditIssue = true;
+          reasons.push(`${classification.reason} (in-gate remediation skipped)`);
+          summary = classification.summary;
+        } else if (!budget.canAttempt()) {
+          // Bounded remediation (SA-0MUOO5V0P00461X8): once the budget is spent,
+          // stop re-auditing and report the item with an offline-refresh
+          // instruction instead of implying it is not ready to close.
           console.log(
             `Final-validation gate: remediation budget exhausted `
             + `(${budget.describe()}) — skipping ${item.id}.`,

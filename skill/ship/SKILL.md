@@ -64,6 +64,17 @@ Code Freeze marker** (SA-0MUOO5VMH005VF69). Exit code 0 when nothing remains;
 invoking the audit runner. After a successful refresh, run the normal release;
 the gates then find fresh audits and do little work.
 
+### Narrow audit bypass (`--skip-audit-remediation`)
+
+`node $(skill_path ship)/scripts/run-release.js --skip-audit-remediation` skips
+only the **in-gate** audit re-audit attempts (SA-0MUOO5WV0006D7UD). Every
+in-scope item must still have a passing audit (`readyToClose === true`), so a
+missing/stale/failing audit still blocks the release — with the offline-refresh
+guidance. Unlike `--skip-checks`, it does **not** bypass the unmerged-branches,
+critical-items, worklog-refs, producer-review, or final-validation gates. It is
+not forwarded to the merge script. Typical use: run `--refresh-audits` first,
+then `--skip-audit-remediation` for the release so no gate ever spawns an audit.
+
 For programmatic access to internal helpers (used by the implement workflow),
 import the modules from the skill directory resolved via `skill_path` (e.g.
 `$(skill_path ship)/scripts/ship.js`):

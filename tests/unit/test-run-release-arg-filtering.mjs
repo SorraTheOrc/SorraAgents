@@ -58,6 +58,20 @@ describe('run-release: releaseScriptForwardArgs', () => {
     );
   });
 
+  test('strips the narrow --skip-audit-remediation wrapper-only flag', () => {
+    assert.deepEqual(
+      releaseScriptForwardArgs(['--skip-audit-remediation', '--force']),
+      ['--force'],
+    );
+  });
+
+  test('strips --refresh-audits when combined with other flags', () => {
+    assert.deepEqual(
+      releaseScriptForwardArgs(['--refresh-audits', '--dry-run', '--bump', 'minor']),
+      ['--dry-run', '--bump', 'minor'],
+    );
+  });
+
   test('keeps all merge-script flags unchanged', () => {
     const args = ['--dry-run', '--force', '--work-item-id', 'SA-000', '--bump', 'minor'];
     assert.deepEqual(releaseScriptForwardArgs(args), args);

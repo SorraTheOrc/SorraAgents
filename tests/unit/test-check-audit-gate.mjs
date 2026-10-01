@@ -1313,6 +1313,45 @@ describe('checkAuditReadyToClose - bounded remediation budget', () => {
   });
 });
 
+describe('checkAuditReadyToClose - narrow --skip-audit-remediation bypass', () => {
+  test('skips in-gate remediation but still blocks a missing audit', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      skipRemediation: true,
+      getCandidateItemsFn: () => [
+        { id: 'SA-S', title: 'Skip', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      ],
+      runAuditShow: () => JSON.stringify({ audit: null }),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+    assert.equal(remediationCalls, 0, 'skip must not invoke the audit runner');
+    assert.equal(report.hasBlockingItems, true, 'readyToClose requirement is not relaxed');
+    assert.match(report.blockingItems[0].reason, /remediation skipped/);
+    assert.match(report.blockingItems[0].remediation, /audit_runner\.py batch/);
+  });
+
+  test('still blocks a fresh genuine failing verdict', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      skipRemediation: true,
+      getCandidateItemsFn: () => [
+        { id: 'SA-F', title: 'Fail', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      ],
+      runAuditShow: () => JSON.stringify({
+        audit: { readyToClose: false, auditedAt: '2026-09-04T09:59:55Z', rawOutput: 'Ready to close: No\n\n2 not met.' },
+      }),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+    assert.equal(remediationCalls, 0);
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems[0].reason, 'Audit verdict: not ready to close');
+  });
+});
+
 describe('resolveAuditRunner - path resolution', () => {
   test('prefers the in-repo audit runner when it exists', async () => {
     const mod = await import(MODULE_PATH);

@@ -138,6 +138,12 @@ runner failure `timeout` / `concurrency` / `provider` / `error`, so an
 infrastructure failure is distinguishable from a work verdict (surfaced as the
 `category` field on the blocking entry and in the reason text).
 
+**Narrow audit bypass (`--skip-audit-remediation`, SA-0MUOO5WV0006D7UD):** skips
+only the in-gate re-audit attempts. The `readyToClose === true` requirement is
+**not** relaxed — a missing/stale/failing audit still blocks with the
+offline-refresh guidance. Unlike `--skip-checks` it does not bypass the other
+gates, and it is a wrapper-only flag (never forwarded to the merge script).
+
 ### Step 3.7: Final validation sweep (exit 12)
 
 The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX,

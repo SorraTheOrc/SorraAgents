@@ -572,6 +572,7 @@ export async function checkAuditReadyToClose(options = {}) {
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
     createRemediationBudgetFn = () => new RemediationBudget(),
+    skipRemediation = false,
   } = options;
 
   // Step 1: Collect candidate items — top-level only. Children are covered
@@ -621,6 +622,23 @@ export async function checkAuditReadyToClose(options = {}) {
     // remediated rather than blocking immediately (SA-0MUOO5UEB008RXBP).
     const isMissingAudit = status.isBlocking && status.reason === 'No audit found';
     if (isMissingAudit || status.transient || status.stale) {
+      // Narrow bypass (SA-0MUOO5WV0006D7UD): when --skip-audit-remediation is
+      // set, do not re-audit in-gate — report the item blocking with the
+      // offline hint. The readyToClose requirement is NOT relaxed.
+      if (skipRemediation) {
+        console.log(
+          `Audit gate: skipping in-gate remediation for ${item.id} `
+          + '(--skip-audit-remediation) — blocking.',
+        );
+        blockingItems.push({
+          workItemId: item.id,
+          title: item.title,
+          reason: `${status.reason} (in-gate remediation skipped)`,
+          summary: status.summary || null,
+          remediation: `${buildRemediationCommand(item.id)}\n  # ${OFFLINE_AUDIT_REFRESH_HINT}`,
+        });
+        continue;
+      }
       // Log the remediation attempt per item (SA-0MSUT8GQP004WSYN AC6) so a
       // slow release gate is attributable.
       const auditKind = isMissingAudit
