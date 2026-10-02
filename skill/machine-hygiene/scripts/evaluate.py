@@ -156,6 +156,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: parse args, run the workflow and emit output.
+
+    Returns 0 on success, 3 when actions were proposed but none approved,
+    and 1 on error.
+    """
     args = _build_parser().parse_args(argv)
     try:
         result = run_workflow(
