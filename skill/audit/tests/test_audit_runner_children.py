@@ -1200,6 +1200,25 @@ class TestParentFirstChildPassThrough:
         assert child_result.get("inherited_pass") is None
         assert child_result["child_audit_ready"] is False
 
+    def test_parent_passes_pre_review_child_audited_and_blocks(self, capsys):
+        """SA-0MUD5OMQG0068P4I (AC4): a child at a pre-review stage does NOT
+        inherit the parent pass — it is audited independently and the report
+        is 'Ready to close: No', naming the blocking child."""
+        rc, captured = self._run([
+            self._child("CHILD-1", stage="intake_complete"),
+        ])
+        assert rc == 0
+        child = captured["child_results"][0]
+        # Never inherited: a pre-review child is audited independently.
+        assert child.get("inherited_pass") is None
+        # A full per-child Phase 1 review ran (not the zero-audit path).
+        assert any("child:" in c for c in captured["pi_calls"])
+        out = capsys.readouterr().out
+        assert "Ready to close: No" in out
+        assert "All children are in in_review or done stage." not in out
+        # The blocking child is named in the summary.
+        assert "CHILD-1" in out
+
     def test_blocking_cq_skips_parent_phase2(self):
         """Blocking CQ findings skip the parent Phase 2 deep call in the
         parent-first flow — the verdict is already 'Ready to close: No' via
@@ -1613,4 +1632,62 @@ class TestCascadeBoundedRecursionGuard:
         # The child must inherit LIVE_REPO_GUARD_ACTIVE so the cascade
         # cannot recurse.
         assert envs_captured[0].get("LIVE_REPO_GUARD_ACTIVE") == "1"
+
+
+class TestPreReviewChildBlocksClosure:
+    """SA-0MUD5OMQG0068P4I (regression for SA-0MUA4Q431008HIH0): a child in a
+    pre-review stage must block parent closure even when an inherited pass has
+    been recorded. Previously ``inherited_pass`` exempted the child from the
+    stage check, producing a false-positive ``Ready to close: Yes`` and a
+    summary that claimed all children were in ``in_review``/``done``.
+    """
+
+    @pytest.mark.parametrize("stage", ["idea", "intake_complete", "plan_complete"])
+    def test_pre_review_child_with_inherited_pass_blocks_ready_to_close(self, stage):
+        issue = {"id": "SA-PARENT", "title": "Parent", "description": ""}
+        ac_results = [{"text": "AC1", "verdict": "met", "evidence": "p.py:1"}]
+        child = {
+            "title": "Auto-triaged test failure",
+            "id": "SA-PREREVIEW",
+            "status": "open",
+            "stage": stage,
+            "inherited_pass": True,  # wrongly granted pre-fix
+            "child_audit_ready": True,
+            "ac_results": [
+                {"text": "CAC1", "verdict": "met", "evidence": "c.py:1"},
+            ],
+        }
+        report = audit_runner._assemble_issue_report(issue, ac_results, [child])
+        assert report.startswith("Ready to close: No")
+        # The false claim must be gone, and the blocking child named.
+        assert "All children are in in_review or done stage." not in report
+        assert "SA-PREREVIEW" in report
+
+    def test_inherited_pass_is_not_a_stage_exemption(self):
+        """``inherited_pass`` alone must never exempt a pre-review child."""
+        assert audit_runner._child_is_exempt(
+            {"id": "C", "stage": "intake_complete", "inherited_pass": True}
+        ) is False
+
+    def test_inherited_pass_in_review_child_still_exempt(self):
+        """Parent-first inheritance remains legitimate for reviewed children."""
+        assert audit_runner._child_is_exempt(
+            {"id": "C", "stage": "in_review", "inherited_pass": True}
+        ) is True
+
+    @pytest.mark.parametrize("stage", ["idea", "intake_complete", "plan_complete"])
+    def test_phase1_blocking_pre_review_inherited_child(self, stage):
+        """Phase 1 blocking names a pre-review child holding a stale pass."""
+        child = {
+            "title": "Auto-triaged test failure",
+            "id": "SA-PREREVIEW",
+            "status": "open",
+            "stage": stage,
+            "inherited_pass": True,
+            "child_audit_ready": True,
+            "ac_results": [],
+        }
+        blocked, reason = audit_runner._has_phase1_blocking_issues([], [child])
+        assert blocked is True
+        assert "Auto-triaged test failure" in reason
 
