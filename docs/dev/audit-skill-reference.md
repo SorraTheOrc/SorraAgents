@@ -481,7 +481,7 @@ The check operates at two points in Phase 1 child orchestration (the pre-pass an
 
 **Parent-first child pass-through (default):** item audits run a **full parent-only audit first** — Phase 1 screens parent ACs only (no child AC screening) and Phase 2 parent deep analysis completes before any child audit is considered (SA-0MSKB6VJA005N43F). The parent verdict then drives the child pass-through:
 
-- **Parent passes with no gaps** (all ACs `met`/`adjusted`, no blocking CQ findings) → all children **inherit passed** by virtue of the parent — zero child audits. Children whose own content changed (content-fingerprint mismatch, Feature 1) are never silently inherited-passed: they are audited.
+- **Parent passes with no gaps** (all ACs `met`/`adjusted`, no blocking CQ findings) → children already in `in_review`/`done` **inherit passed** by virtue of the parent (zero child audits for them). Children in a pre-review stage (`idea`/`intake_complete`/`plan_complete`) are **never** inherited — they are audited independently and block parent closure. Children whose own content changed (content-fingerprint mismatch, Feature 1) are likewise never silently inherited-passed: they are audited (SA-0MUA4Q431008HIH0).
 - **Parent has gaps** (`unmet`/`partial` ACs or blocking CQ findings) → only the child(ren) mapped to the gap files (via the Phase 1/2 file-scope manifest and child Key Files) receive full audits; unrelated children are not audited.
 - Inherited/not-audited children are marked **explicitly** in the report (`Inherited from parent pass` / `Not audited (unrelated to parent gaps)`) — never silent.
 - Verdict semantics are unchanged: a relevant not-ready child still blocks the parent (`Ready to close: No`).

@@ -1025,9 +1025,12 @@ class TestParentFirstChildPassThrough:
         }
 
     def test_parent_passes_children_inherit(self):
-        """AC1/AC2: parent passes with no gaps → all children inherit passed;
-        zero child audit calls run."""
-        rc, captured = self._run([self._child("CHILD-1"), self._child("CHILD-2")])
+        """AC1/AC2: parent passes with no gaps → children already in review
+        inherit passed; zero child audit calls run."""
+        rc, captured = self._run([
+            self._child("CHILD-1", stage="in_review"),
+            self._child("CHILD-2", stage="in_review"),
+        ])
         assert rc == 0
         children = captured["child_results"]
         assert len(children) == 2
@@ -1038,7 +1041,7 @@ class TestParentFirstChildPassThrough:
 
     def test_parent_passes_report_marks_inherited(self):
         """AC4: the report explicitly marks inherited children."""
-        rc, captured = self._run([self._child("CHILD-1")])
+        rc, captured = self._run([self._child("CHILD-1", stage="in_review")])
         assert rc == 0
         child = captured["child_results"][0]
         assert child["inherited_pass"] is True
@@ -1046,9 +1049,9 @@ class TestParentFirstChildPassThrough:
         assert "Inherited from parent pass" in child["ac_results"][0]["text"]
 
     def test_parent_passes_ready_to_close(self):
-        """AC2: parent passes → inherited children count as reviewed, so the
-        parent is ready to close."""
-        rc, captured = self._run([self._child("CHILD-1")])
+        """AC2: parent passes → inherited (in-review) children count as
+        reviewed, so the parent is ready to close."""
+        rc, captured = self._run([self._child("CHILD-1", stage="in_review")])
         assert rc == 0
         # The report assembly captured ac_results; ready-to-close derives from
         # child_audit_ready flags (all True) + stage check.
@@ -1096,8 +1099,9 @@ class TestParentFirstChildPassThrough:
 
     def test_changed_child_not_inherited(self):
         """AC6: a child whose content changed (fingerprint mismatch) is not
-        silently inherited-passed — it is audited."""
-        child = self._child("CHILD-1")
+        silently inherited-passed — it is audited even though it is already
+        in review."""
+        child = self._child("CHILD-1", stage="in_review")
         # The runner returns a stored (stale) audit for the child; combined
         # with a different git HEAD the content fingerprint will not match →
         # the child's content changed → audited, not inherited.

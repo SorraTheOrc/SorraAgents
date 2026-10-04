@@ -4977,6 +4977,20 @@ def _write_pending_screens_signal(
         pass
 
 
+def _format_blocking_children(children: list[dict]) -> str:
+    """Render pre-review children for the report's summary line.
+
+    Mirrors the naming used by ``_has_phase1_blocking_issues`` so the
+    human-readable summary names the same children that block closure
+    (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
+    """
+    return ", ".join(
+        f"{c.get('title') or c.get('id', '?')} "
+        f"({c.get('id', '?')}, {c.get('stage', '?')})"
+        for c in children
+    )
+
+
 def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            child_results: list[dict],
                            code_quality_findings: list[dict] | None = None,
@@ -5070,9 +5084,11 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
     # Check that all active children are in in_review or done stage.
-    # Children that inherited the parent's pass (parent-first pass-through,
-    # SA-0MSKB6VJA005N43F) count as reviewed by virtue of the parent — they
-    # are not independently audited but the parent verdict covers them.
+    # The stage check is independent of inherited_pass (parent-first
+    # pass-through, SA-0MSKB6VJA005N43F): an inherited child is always in
+    # review, so only the actual stage counts here. A pre-review child must
+    # block closure even if an inherited pass was recorded
+    # (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
     # Snapshot-exempt children (SA-0MUJAPC680078396): children that were
     # in_review/done at audit start remain exempt even if demoted by a
     # cascade-triggered re-audit.
@@ -5080,7 +5096,6 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     all_children_reviewed = all(
         _child_is_exempt(c, snapshot_exempt)
         or c.get("stage") in ("in_review", "done")
-        or c.get("inherited_pass")
         for c in active_children
     )
 
@@ -5220,7 +5235,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             )
             if adjusted_count > 0:
                 parts.append(f"({adjusted_count} with acceptable variance)")
-            parts.append(". All children are in in_review or done stage.")
+            if all_children_reviewed:
+                parts.append(". All children are in in_review or done stage.")
+            elif not_reviewed:
+                parts.append(
+                    ". Children not yet in in_review/done stage: "
+                    f"{_format_blocking_children(not_reviewed)}."
+                )
             if phase2_skip_note:
                 parts.append(f" Phase 2 deep analysis skipped: {phase2_skip_note}.")
             elif phase2_completed:
@@ -5250,7 +5271,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         elif unmet_count > 0 and not_reviewed:
             lines.append(
                 f"{unmet_count} acceptance criteria not met AND "
-                f"{len(not_reviewed)} children not yet in in_review/done stage."
+                f"{len(not_reviewed)} children not yet in in_review/done stage: "
+                f"{_format_blocking_children(not_reviewed)}."
             )
         elif unmet_count > 0:
             lines.append(
@@ -5262,9 +5284,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"{partial_count} of {len(ac_results)} acceptance criteria are "
                 f"only partially met."
             )
+        elif not_reviewed:
+            lines.append(
+                f"{len(not_reviewed)} children not yet in in_review/done stage: "
+                f"{_format_blocking_children(not_reviewed)}."
+            )
         else:
             lines.append(
-                f"{len(not_reviewed)} children not yet in in_review/done stage."
+                "Ready to close is No: one or more criteria are not met."
             )
 
     if _provider_error_count:
@@ -6489,7 +6516,6 @@ def _child_is_exempt(
     Exempt children:
     - ``stage == in_review`` or ``status == completed`` / ``stage == done``
     - ``status == deleted`` (fully closed)
-    - ``inherited_pass`` is True (parent-first pass-through)
     - **snapshot-exempt**: the child was ``in_review`` or ``done`` at audit
       start, captured in *snapshot_exempt* (SA-0MUJAPC680078396).  Such
       children retain their exemption even if a cascade-triggered re-audit
@@ -6501,8 +6527,12 @@ def _child_is_exempt(
         return True
     if child.get("stage") == "in_review":
         return True
-    if child.get("inherited_pass"):
-        return True
+    # NOTE: ``inherited_pass`` is deliberately NOT an exemption. The
+    # parent-first pass-through only applies to children already in
+    # ``in_review``/``done`` (guarded at assignment, SA-0MUD5R5EQ000D1V2), so
+    # the stage checks above already cover them; treating the flag itself as
+    # an exemption let a pre-review child bypass the stage block
+    # (SA-0MUA4Q431008HIH0).
     # Snapshot-based exemption (SA-0MUJAPC680078396): if this child was
     # exempt at audit start, it remains exempt regardless of any
     # cascade-triggered re-audit demotion.
@@ -6545,13 +6575,13 @@ def _has_phase1_blocking_issues(
                 )
             return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
 
-    # Check children stages — skip deleted children and inherited-pass
-    # children (parent-first pass-through, SA-0MSKB6VJA005N43F: an inherited
-    # child is reviewed by virtue of the parent's pass).
+    # Check children stages — skip deleted children. inherited_pass is NOT
+    # an exemption (parent-first pass-through, SA-0MSKB6VJA005N43F): only the
+    # actual stage counts, so a pre-review child handed an inherited pass
+    # still blocks closure (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
     active_children = [
         c for c in child_results
         if c.get("stage") not in ("", None) and c.get("status") != "deleted"
-        and not c.get("inherited_pass")
     ]
     blocked_children = [
         c for c in active_children
@@ -6608,8 +6638,10 @@ def _build_issue_json(
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
     # Check that all active children are in in_review or done stage.
-    # Children that inherited the parent's pass (parent-first pass-through,
-    # SA-0MSKB6VJA005N43F) count as reviewed by virtue of the parent.
+    # The stage check is independent of inherited_pass (parent-first
+    # pass-through, SA-0MSKB6VJA005N43F): an inherited child is always in
+    # review, so only the actual stage counts here
+    # (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
     # Snapshot-exempt children (SA-0MUJAPC680078396): children that were
     # in_review/done at audit start remain exempt even if demoted by a
     # cascade-triggered re-audit.
@@ -6617,7 +6649,6 @@ def _build_issue_json(
     all_children_reviewed = all(
         _child_is_exempt(c, snapshot_exempt)
         or c.get("stage") in ("in_review", "done")
-        or c.get("inherited_pass")
         for c in active_children
     )
 
@@ -11034,12 +11065,21 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         continue
 
                     if not parent_gaps:
-                        # Parent passed with no gaps → child inherits passed
-                        # (AC2), unless the child's own content changed (AC6 —
-                        # changed children are never silently inherited-passed).
-                        if _child_content_changed(
-                            runner, child["id"], worklog_dir=worklog_dir,
-                            work_item=child,
+                        # Parent passed with no gaps. A child may inherit that
+                        # pass (AC2) only when it has actually reached review
+                        # (in_review/done); a pre-review child has not been
+                        # implemented/reviewed yet, so it must be audited
+                        # independently and must block closure — inherited_pass
+                        # must never exempt a pre-review child from the stage
+                        # check (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
+                        # Changed children are also never silently
+                        # inherited-passed (AC6).
+                        if (
+                            child.get("stage") not in ("in_review", "done")
+                            or _child_content_changed(
+                                runner, child["id"], worklog_dir=worklog_dir,
+                                work_item=child,
+                            )
                         ):
                             cr["child_audit_ready"] = False
                             pending_children.append((len(child_results), child))
