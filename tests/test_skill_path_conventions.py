@@ -29,7 +29,12 @@ cannot recur undetected.
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
+
+import pytest
+
+from tests.skill_inventory import tracked_skill_names
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = REPO_ROOT / "skill"
@@ -74,8 +79,18 @@ def _find_legacy_refs(text: str) -> list[str]:
 
 
 def _all_skill_files() -> list[Path]:
-    """Every SKILL.md under the repo's skill/ directory."""
-    return sorted(SKILL_DIR.glob("*/SKILL.md"))
+    """Every **tracked** SKILL.md under the repo's skill/ directory.
+
+    Untracked ``skill/<name>/`` dirs are a concurrent agent's uncommitted WIP;
+    they must not be scanned or the full suite goes red in the main checkout
+    for work that has not been delivered (SA-0MUU206QT001M66F).  When git is
+    unavailable, fall back to scanning every directory.
+    """
+    files = sorted(SKILL_DIR.glob("*/SKILL.md"))
+    tracked = tracked_skill_names(REPO_ROOT)
+    if tracked is None:
+        return files
+    return [f for f in files if f.parent.name in tracked]
 
 
 def _relative_script_refs(text: str) -> list[str]:
@@ -161,3 +176,48 @@ def test_detector_ignores_skill_path_and_prohibition_prose() -> None:
     )
     assert _find_legacy_refs(clean) == []
     assert _relative_script_refs(clean) == []
+
+
+# Name of the untracked fixture skill used to reproduce concurrent-agent WIP.
+_UNTRACKED_FIXTURE_NAME = "temp-untracked-conventions-fixture"
+
+
+@pytest.fixture
+def untracked_skill_dir():
+    """Create an untracked ``skill/<name>/`` dir with a violating SKILL.md.
+
+    Reproduces a concurrent agent's uncommitted WIP directory.  It is removed
+    on teardown so the live-repo mutation guard sees an unchanged checkout.
+    """
+    skill_dir = SKILL_DIR / _UNTRACKED_FIXTURE_NAME
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {_UNTRACKED_FIXTURE_NAME}\n"
+        "description: Temp untracked skill for path-convention tests.\n"
+        "---\n\n"
+        "# Temp\n\n"
+        "Run `./scripts/pane-triage.py` to start.\n"
+        "./scripts/pane-triage.py\n",
+        encoding="utf-8",
+    )
+    try:
+        yield skill_dir
+    finally:
+        shutil.rmtree(skill_dir, ignore_errors=True)
+
+
+def test_untracked_skill_dir_is_ignored(untracked_skill_dir) -> None:
+    """AC1: the guard passes with an untracked skill dir present."""
+    # The fixture must actually carry a violation, else this test is vacuous.
+    text = (untracked_skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    assert _relative_script_refs(text), "fixture must contain a CWD-relative ref"
+    # The real guard must not flag the untracked fixture (nor any tracked doc).
+    test_no_relative_script_invocations_in_any_skill_doc()
+
+
+def test_all_skill_files_excludes_untracked_dir(untracked_skill_dir) -> None:
+    """AC2: untracked dirs are excluded; tracked skills remain in scope."""
+    names = {f.parent.name for f in _all_skill_files()}
+    assert _UNTRACKED_FIXTURE_NAME not in names
+    assert "implement" in names  # a known tracked skill is still scanned
