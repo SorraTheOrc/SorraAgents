@@ -11648,6 +11648,143 @@ def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
         )
 
 
+def _is_terminal_lifecycle(status, stage) -> bool:
+    """Whether a work item is already terminal.
+
+    Terminal means ``stage == "done"`` or ``status == "deleted"`` — the two
+    states in which a descendant must never be re-marked, re-commented, or
+    resurrected by the audit cascade (SA-0MUR7Y3BJ004FGPP AC2).
+    """
+    return str(stage or "") == "done" or str(status or "") == "deleted"
+
+
+def _iter_descendants_with_state(runner: Runner, root_id: str,
+                                worklog_dir: str | None):
+    """Yield ``(id, status, stage)`` for the full recursive subtree of *root_id*.
+
+    Depth-first over ``wl show <id> --children --json``, cycle-safe via a
+    visited set and excluding the root. A failure to resolve one node's
+    children is logged and skipped (non-fatal) so a single wl hiccup never
+    aborts the cascade. Reuses the children payload's own status/stage so no
+    extra per-descendant ``wl show`` is required.
+    """
+    visited = {root_id}
+    stack = [root_id]
+    while stack:
+        current = stack.pop()
+        try:
+            data = _run_wl(
+                runner,
+                ["wl", "show", current, "--children", "--json"],
+                worklog_dir=worklog_dir,
+            )
+        except RuntimeError as exc:
+            print(
+                f"Warning: descendant cascade could not resolve children of "
+                f"{current}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        for child in data.get("children") or []:
+            if not isinstance(child, dict):
+                continue
+            child_id = child.get("id")
+            if not child_id or child_id in visited:
+                continue
+            visited.add(child_id)
+            yield child_id, child.get("status"), child.get("stage")
+            stack.append(child_id)
+
+
+def _cascade_descendants_terminal(
+    parent_id: str,
+    audit_timestamp: str,
+    runner: Runner,
+    worklog_dir: str | None = None,
+    persist: bool = True,
+) -> int:
+    """Terminalise every descendant of an audit-approved parent.
+
+    Authorised ONLY by a passing parent audit verdict (the caller invokes it
+    exclusively from the verified ``ctx.audit_verdict == "yes"`` success path
+    in :func:`_apply_terminal_lifecycle`) — never by status/stage alone.
+    Setting every descendant to ``status=completed, stage=done`` with an
+    explanatory comment means an audit-approved parent can be closed without
+    a force-close sweep.
+
+    Safety properties (SA-0MUR7Y3BJ004FGPP AC1-AC3/AC5):
+
+    - Idempotent: already-terminal (``stage == "done"``) and ``deleted``
+      descendants are skipped — no update, no comment, nothing resurrected.
+    - Dry-run safe: ``persist=False`` suppresses the cascade entirely.
+    - Non-fatal: a per-child ``wl`` failure is logged loudly and does not
+      abort the audit; the next passing audit completes the cascade.
+
+    Args:
+        parent_id: The audited parent whose subtree is being terminalised.
+        audit_timestamp: ISO-8601 timestamp of the authorising audit,
+            embedded in each cascade comment.
+        runner: Injectable ``wl`` runner.
+        worklog_dir: Explicit worklog directory override.
+        persist: ``False`` under ``--do-not-persist`` (dry-run).
+
+    Returns:
+        The number of descendants actually cascaded.
+    """
+    if not persist:
+        print(
+            f"Dry-run: skipping descendant cascade for {parent_id}.",
+            file=sys.stderr,
+        )
+        return 0
+
+    cascaded = 0
+    for child_id, status, stage in _iter_descendants_with_state(
+        runner, parent_id, worklog_dir
+    ):
+        if _is_terminal_lifecycle(status, stage):
+            continue
+        try:
+            _run_wl(
+                runner,
+                ["wl", "update", child_id, "--status", "completed",
+                 "--stage", "done", "--json"],
+                worklog_dir=worklog_dir,
+            )
+        except RuntimeError as exc:
+            print(
+                f"Warning: cascade failed to terminalise {child_id} "
+                f"(descendant of {parent_id}): {exc}",
+                file=sys.stderr,
+            )
+            continue
+        comment = (
+            f"Cascaded to completed/done by audit-approved parent {parent_id} "
+            f"(audit {audit_timestamp}): the parent audit passed, so all its "
+            f"descendants are considered complete."
+        )
+        try:
+            _run_wl(
+                runner,
+                ["wl", "comment", "add", child_id, "--comment", comment,
+                 "--author", "audit", "--json"],
+                worklog_dir=worklog_dir,
+            )
+        except RuntimeError as exc:
+            print(
+                f"Warning: cascade comment failed for {child_id}: {exc}",
+                file=sys.stderr,
+            )
+        cascaded += 1
+    if cascaded:
+        print(
+            f"Cascade: terminalised {cascaded} descendant(s) of "
+            f"audit-approved parent {parent_id}.",
+            file=sys.stderr,
+        )
+    return cascaded
+
+
 def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     """Phase 6 — verdict-driven terminal status transition + debug-log cleanup.
 
@@ -11715,6 +11852,11 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # Conservative default: on any computation failure below, treat the
     # run as fallback-tainted so the debug log is retained for forensics.
     fallback_tainted = True
+    # Set True ONLY in the verified 'Ready to close: Yes' advance branch
+    # below. The descendant cascade is authorised by this flag alone — it
+    # must never fire on the 'no'/restore/fallback branches
+    # (SA-0MUR7Y3BJ004FGPP AC3; the SA-0MU2OY1N9000XL2H scope guard).
+    cascade_authorised = False
     try:
         # Infra-fallback provenance: a "No" derived from infrastructure-
         # failure fallbacks must restore, never demote. The flag does NOT
@@ -11780,6 +11922,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             # redundant approvals (SA-0MSSVKYEW008PJ9H). The flag is
             # inserted before the trailing --json (file convention:
             # --json is always the last flag).
+            # This is the sole authorisation for the descendant cascade
+            # below — a passing verdict, not status/stage (AC3).
+            cascade_authorised = True
             cmd = ["wl", "update", ctx.issue_id]
             if ctx.original_stage == "done":
                 cmd += ["--status", "completed"]
@@ -11916,6 +12061,30 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         )
         _restore_pre_audit_state_on_failure(ctx)
         return 1
+
+    # Verdict-authorised descendant cascade (SA-0MUR7Y3BJ004FGPP): a passing
+    # parent audit terminalises its whole subtree so the parent can be closed
+    # without a force-close sweep. Runs ONLY on the verified 'yes' advance
+    # (cascade_authorised), never on the 'no'/restore/fallback branches, and
+    # is suppressed under --do-not-persist (checked here and inside the
+    # helper). A cascade failure never fails the audit (per-child try/except
+    # inside the helper). The scope guard (SA-0MU2OY1N9000XL2H) is unaffected:
+    # a non-passing parent never reaches this point, so it still refuses to
+    # close over non-terminal descendants.
+    if cascade_authorised and ctx.persist:
+        try:
+            _cascade_descendants_terminal(
+                ctx.issue_id,
+                datetime.now(timezone.utc).isoformat(),
+                runner=ctx.runner,
+                worklog_dir=ctx.worklog_dir,
+                persist=ctx.persist,
+            )
+        except Exception as exc:  # noqa: BLE001 -- cascade must never abort the audit
+            print(
+                f"Warning: descendant cascade for {ctx.issue_id} failed: {exc}",
+                file=sys.stderr,
+            )
 
     # Dry-run freshness refresh (SA-0MTJ0KO6L004GIZK): as the LAST write of a
     # passing --do-not-persist run, refresh ``auditedAt``/``auditResult`` via

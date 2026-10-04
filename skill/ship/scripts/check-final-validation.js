@@ -223,6 +223,43 @@ export function getItemById(itemId) {
   }
 }
 
+// ── getItemLifecycle ─────────────────────────────────────────────────────────
+
+/**
+ * Resolve a single work item's lifecycle state (`status`/`stage`) by id.
+ *
+ * Used by the post-release close step to distinguish terminal descendants
+ * (`stage: done` or `status: deleted`) — which `wl close --force` may sweep
+ * harmlessly — from genuinely non-terminal descendants that must still refuse
+ * the close (SA-0MUR7Y3BJ004FGPP AC4). Returns `null` when the item cannot be
+ * resolved (missing/deleted/unreadable); callers treat an unresolved
+ * descendant as non-terminal (fail-safe, so the close is refused rather than
+ * silently sweeping unknown work).
+ *
+ * @param {string} itemId - Work item id.
+ * @returns {{id: string, status: string|null, stage: string|null}|null}
+ */
+export function getItemLifecycle(itemId) {
+  try {
+    const output = execSync(`wl show ${itemId} --json`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const parsed = JSON.parse(output);
+    if (!parsed || parsed.success === false || !parsed.workItem) {
+      return null;
+    }
+    const wi = parsed.workItem;
+    return {
+      id: wi.id || itemId,
+      status: wi.status !== undefined ? wi.status : null,
+      stage: wi.stage !== undefined ? wi.stage : null,
+    };
+  } catch (_err) {
+    return null;
+  }
+}
+
 // ── findInReviewAncestor ─────────────────────────────────────────────────────
 
 /**

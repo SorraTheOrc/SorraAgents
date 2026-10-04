@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
-import { checkFinalValidation, resolveChildScope, getItemById, shellQuote } from './check-final-validation.js';
+import { checkFinalValidation, resolveChildScope, getItemById, getItemLifecycle, shellQuote } from './check-final-validation.js';
 import { runRefreshAuditsAction } from './refresh-audits.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
@@ -354,6 +354,12 @@ export function getDescendants(itemId) {
  * @param {(itemId: string) => string[]} [options.getDescendantsFn] -
  *   Descendant resolver (for candidate-set scoping); defaults to
  *   {@link getDescendants}.
+ * @param {(itemId: string) => ({status: string|null, stage: string|null}|null)} [options.getItemLifecycleFn] -
+ *   Lifecycle resolver for descendants; terminal descendants (`stage: done`
+ *   or `status: deleted`) are excluded from the collateral set so an
+ *   audit-approved parent with a fully-cascaded terminal subtree closes
+ *   without a false refusal (SA-0MUR7Y3BJ004FGPP AC4). Defaults to
+ *   {@link getItemLifecycle}.
  * @param {(item: object) => {outcome: string, ancestorId: string|null}} [options.getAncestorAuditFn] -
  *   Resolves whether a child is covered by an audit-ready `in_review`
  *   ancestor; defaults to {@link resolveCandidateCoverage}. Only a `covered`
@@ -375,6 +381,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
     getDescendantsFn = getDescendants,
+    getItemLifecycleFn = getItemLifecycle,
     getAncestorAuditFn = (item) => resolveCandidateCoverage(item),
     runOverrideCommand = (childId, ancestorId, reason) => {
       execSync(
@@ -531,7 +538,25 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       console.warn(`  ⚠ Could not resolve descendants for ${item.id}: ${err.message}`);
       descendants = [];
     }
-    const collateral = descendants.filter((id) => !candidateIds.has(id));
+    const collateral = descendants.filter((id) => {
+      if (candidateIds.has(id)) return false;
+      // Terminal descendants (`stage: done` or `status: deleted`) are NOT
+      // collateral: `wl close --force` may sweep them harmlessly, and an
+      // audit-approved parent routinely arrives with a fully-cascaded
+      // terminal subtree (SA-0MUR7Y3BJ004FGPP). Only descendants still in a
+      // non-terminal lifecycle state — or unresolvable ones (fail-safe) —
+      // refuse the close, preserving the scope guard SA-0MU2OY1N9000XL2H.
+      let lifecycle = null;
+      try {
+        lifecycle = getItemLifecycleFn(id);
+      } catch (err) {
+        console.warn(`  ⚠ Could not resolve lifecycle for descendant ${id}: ${err.message}`);
+        lifecycle = null;
+      }
+      const terminal = !!lifecycle
+        && (lifecycle.stage === 'done' || lifecycle.status === 'deleted');
+      return !terminal;
+    });
     if (collateral.length > 0) {
       const reason = `Refused: --force close would sweep descendant(s) outside the candidate set: ${collateral.join(', ')}`;
       console.log(`  ○ ${item.title || item.id} (${item.id}) — ${reason}`);

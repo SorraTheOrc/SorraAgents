@@ -369,6 +369,30 @@ Every window emits exactly one stderr line with
 `batch_start`, `batch_end`, `items_processed`, `queue_remaining`,
 `items_included` (ISO timestamps; including zero-item windows).
 
+## Descendant cascade on a passing parent audit (SA-0MUR7Y3BJ004FGPP)
+
+When a parent's audit verdict is `Ready to close: Yes` and the terminal
+transition has been **verified** (`wl show` readback, WL-0MSVVFBJ2003RRYK),
+`_apply_terminal_lifecycle` invokes `_cascade_descendants_terminal`:
+
+- **Helper:** `_cascade_descendants_terminal(parent_id, audit_timestamp, runner, worklog_dir, persist)` walks the full recursive subtree via `_iter_descendants_with_state` (`wl show <id> --children --json`). For each descendant that is not already terminal (`stage: done`) and not `deleted` it issues `wl update <id> --status completed --stage done --json`, then `wl comment add <id>` naming the authorising parent and the audit timestamp.
+- **Invocation point:** only the verified `ctx.audit_verdict == "yes"` advance branch (`cascade_authorised`), after the parent's own transition succeeds; never on the `No`, restore, fallback-tainted, or partially-applied branches.
+- **Authorisation:** a passing audit verdict is the sole authorisation — `status`/`stage` alone never triggers a cascade. A non-passing parent therefore still refuses to close over non-terminal descendants (SA-0MU2OY1N9000XL2H unchanged).
+- **Idempotence / `deleted`-safety:** already-terminal and `deleted` descendants are skipped before any update or comment, so re-auditing a passing parent produces no further mutations and no duplicate comments; nothing is ever re-opened or resurrected.
+- **Dry-run:** `--do-not-persist` suppresses the cascade entirely (the call site guards on `ctx.persist`, and the helper also early-returns).
+- **Non-fatal:** a per-child `wl` failure is caught, logged to stderr, and does not abort the audit; the next passing audit completes the remaining cascade.
+- **Worklog routing:** the helper reuses `_run_wl`, so `--worklog-dir` is resolved through the shared helpers and the cascade targets the item's own store regardless of cwd.
+
+### Ship-side terminal-descendant exclusion (AC4)
+
+`closeWorkItemsAfterRelease` computes `collateral` as descendants that are
+neither release candidates nor terminal (`stage: done` / `status: deleted`,
+resolved via the injected `getItemLifecycleFn`, default `getItemLifecycle`).
+A descendant whose lifecycle cannot be resolved is treated as non-terminal
+(fail-safe), preserving the SA-0MU2OY1N9000XL2H scope guard. This is
+defence-in-depth for the audit-side cascade above (SA-0MUR7Y3BJ004FGPP AC4,
+overlapping SA-0MUJKPDAA002VVDP).
+
 ## Scripts
 
 - **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--phase1-model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`

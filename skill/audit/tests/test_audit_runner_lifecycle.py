@@ -993,3 +993,135 @@ class TestLifecycleVerification:
             if s == "completed"
         ]
         assert terminal_updates == [("completed", "in_review")]
+
+
+class _LifecycleStateRunner:
+    """Minimal stateful ``wl`` runner for direct lifecycle calls.
+
+    Applies ``wl update`` mutations to a modelled status/stage so the
+    post-update readback verification (WL-0MSVVFBJ2003RRYK) passes, and
+    records every command for assertions.
+    """
+
+    def __init__(self, initial=("in_progress", "in_progress")):
+        self.status, self.stage = initial
+        self.commands = []
+        self.updates = []
+
+    def __call__(self, cmd):
+        cmd = list(cmd)
+        self.commands.append(cmd)
+        if "update" in cmd:
+            self.updates.append(cmd)
+            if "--status" in cmd:
+                self.status = cmd[cmd.index("--status") + 1]
+            if "--stage" in cmd:
+                self.stage = cmd[cmd.index("--stage") + 1]
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+        if "show" in cmd and "--children" not in cmd:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": "TEST-1", "status": self.status,
+                        "stage": self.stage,
+                    },
+                }),
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"success": True}), stderr="",
+        )
+
+
+class TestCascadeOnPassingParentAudit:
+    """AC1/AC3/AC5: the descendant cascade fires only on a verified passing
+    parent audit and is suppressed under dry-run.
+
+    These tests drive :func:`_apply_terminal_lifecycle` directly with a
+    constructed context, patching the cascade helper so the verdict/authorisation
+    gating is asserted in isolation from the cascade's own behaviour (covered
+    by ``test_audit_runner_children.py``).
+    """
+
+    def _ctx(self, runner, *, verdict="yes", persist=True, completed=True,
+             script_failure=None):
+        ctx = audit_runner._AuditContext(
+            issue_id="TEST-1", persist=persist, timeout=None,
+            parent_timeout=None, pi_bin="pi", model=None,
+            model_source="default", runner=runner, json_mode=False,
+            debug_log=None, force=True, worklog_dir=None, batch_phase2=False,
+            green_run=None, audit_children=False, max_child_audits=None,
+            run_tests=False,
+        )
+        ctx.audit_verdict = verdict
+        ctx.audit_completed = completed
+        ctx.script_failure = script_failure
+        ctx.original_status = "in_progress"
+        ctx.original_stage = "in_progress"
+        ctx.wi = {"id": "TEST-1", "parentId": None}
+        return ctx
+
+    def _apply(self, ctx):
+        with mock.patch.object(
+            audit_runner, "_cascade_descendants_terminal", return_value=0,
+        ) as cascade:
+            rc = audit_runner._apply_terminal_lifecycle(ctx)
+        return rc, cascade
+
+    def test_passing_parent_audit_triggers_cascade(self):
+        runner = _LifecycleStateRunner()
+        rc, cascade = self._apply(self._ctx(runner))
+        assert rc == 0
+        cascade.assert_called_once()
+        args, kwargs = cascade.call_args
+        assert args[0] == "TEST-1"
+        assert isinstance(args[1], str) and args[1]
+        assert kwargs["persist"] is True
+        assert kwargs["runner"] is runner
+
+    def test_dry_run_suppresses_cascade(self):
+        runner = _LifecycleStateRunner()
+        rc, cascade = self._apply(self._ctx(runner, persist=False))
+        assert rc == 0
+        cascade.assert_not_called()
+
+    def test_failing_parent_audit_does_not_cascade(self):
+        runner = _LifecycleStateRunner(("completed", "in_review"))
+        _rc, cascade = self._apply(self._ctx(runner, verdict="no"))
+        cascade.assert_not_called()
+        # Existing demotion behaviour is unchanged.
+        assert any(
+            "--status" in cmd and cmd[cmd.index("--status") + 1] == "open"
+            and "--stage" in cmd and cmd[cmd.index("--stage") + 1] == "plan_complete"
+            for cmd in runner.updates
+        )
+
+    def test_incomplete_run_does_not_cascade(self):
+        runner = _LifecycleStateRunner()
+        _rc, cascade = self._apply(
+            self._ctx(runner, verdict="yes", completed=False)
+        )
+        cascade.assert_not_called()
+
+    def test_script_failure_restore_does_not_cascade(self):
+        runner = _LifecycleStateRunner(("completed", "in_review"))
+        _rc, cascade = self._apply(
+            self._ctx(
+                runner, verdict="yes",
+                script_failure={"script": "x", "error": "boom"},
+            )
+        )
+        cascade.assert_not_called()
+
+    def test_cascade_failure_never_aborts_audit(self):
+        runner = _LifecycleStateRunner()
+        with mock.patch.object(
+            audit_runner, "_cascade_descendants_terminal",
+            side_effect=RuntimeError("cascade exploded"),
+        ):
+            rc = audit_runner._apply_terminal_lifecycle(self._ctx(runner))
+        assert rc == 0

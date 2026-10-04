@@ -1691,3 +1691,173 @@ class TestPreReviewChildBlocksClosure:
         assert blocked is True
         assert "Auto-triaged test failure" in reason
 
+
+class _CascadeRunner:
+    """Stateful mock ``wl`` runner for the descendant-cascade tests.
+
+    Models a small work-item tree so idempotence can be exercised: an
+    ``wl update <id> --status completed --stage done`` mutates the modelled
+    state, so a second cascade run observes the children as terminal.
+    """
+
+    def __init__(self, tree, states, fail_updates=()):
+        self.tree = tree
+        self.states = {k: tuple(v) for k, v in states.items()}
+        self.fail_updates = set(fail_updates)
+        self.commands = []
+        self.updates = []
+        self.comments = []
+
+    def _ok(self, payload):
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps(payload), stderr="",
+        )
+
+    def _children(self, parent_id):
+        return [
+            {"id": cid, "status": self.states.get(cid, ("open", "plan_complete"))[0],
+             "stage": self.states.get(cid, ("open", "plan_complete"))[1]}
+            for cid in self.tree.get(parent_id, [])
+        ]
+
+    def __call__(self, cmd):
+        cmd = list(cmd)
+        self.commands.append(cmd)
+        if "show" in cmd and "--children" in cmd:
+            item_id = cmd[cmd.index("show") + 1]
+            return self._ok({
+                "success": True,
+                "workItem": {"id": item_id},
+                "children": self._children(item_id),
+            })
+        if "show" in cmd:
+            item_id = cmd[cmd.index("show") + 1]
+            status, stage = self.states.get(item_id, ("open", "plan_complete"))
+            return self._ok({
+                "success": True,
+                "workItem": {"id": item_id, "status": status, "stage": stage},
+            })
+        if "update" in cmd:
+            item_id = cmd[cmd.index("update") + 1]
+            if item_id in self.fail_updates:
+                return SimpleNamespace(
+                    returncode=1, stdout="", stderr="boom",
+                )
+            status = cmd[cmd.index("--status") + 1] if "--status" in cmd else None
+            stage = cmd[cmd.index("--stage") + 1] if "--stage" in cmd else None
+            if status and stage:
+                self.states[item_id] = (status, stage)
+            self.updates.append((item_id, cmd))
+            return self._ok({"success": True})
+        if "comment" in cmd and "add" in cmd:
+            add_idx = cmd.index("add")
+            item_id = cmd[add_idx + 1]
+            text = cmd[cmd.index("--comment") + 1] if "--comment" in cmd else ""
+            self.comments.append((item_id, text))
+            return self._ok({"success": True})
+        return self._ok({"success": True})
+
+
+class TestCascadeDescendantsTerminal:
+    """AC1-AC3/AC5: ``_cascade_descendants_terminal`` contract.
+
+    A passing parent audit terminalises the whole recursive subtree
+    (``status=completed, stage=done``) with an explanatory comment; it is
+    idempotent, ``deleted``-safe, dry-run suppressed, and non-fatal on a
+    per-child failure.
+    """
+
+    AUDIT_TS = "2026-10-02T12:00:00+00:00"
+
+    def _tree(self):
+        # PARENT → C1 (in_review), C2 (terminal done), C3 (open) → GC (open),
+        # plus a deleted child D1.
+        return {
+            "PARENT": ["C1", "C2", "C3", "D1"],
+            "C3": ["GC"],
+        }
+
+    def _states(self):
+        return {
+            "PARENT": ("in_progress", "in_progress"),
+            "C1": ("completed", "in_review"),
+            "C2": ("completed", "done"),
+            "C3": ("open", "plan_complete"),
+            "D1": ("deleted", "done"),
+            "GC": ("open", "plan_complete"),
+        }
+
+    def test_passing_parent_terminalises_full_subtree(self):
+        runner = _CascadeRunner(self._tree(), self._states())
+        cascaded = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        assert cascaded == 3  # C1, C3, GC — not C2 (terminal), not D1 (deleted)
+        updated = {item_id for item_id, _ in runner.updates}
+        assert updated == {"C1", "C3", "GC"}
+        for _item_id, cmd in runner.updates:
+            assert "--status" in cmd and cmd[cmd.index("--status") + 1] == "completed"
+            assert "--stage" in cmd and cmd[cmd.index("--stage") + 1] == "done"
+        # Each cascaded child got exactly one explanatory comment naming the
+        # authorising parent and the audit timestamp.
+        commented = {item_id for item_id, _ in runner.comments}
+        assert commented == {"C1", "C3", "GC"}
+        for _item_id, text in runner.comments:
+            assert "PARENT" in text
+            assert self.AUDIT_TS in text
+
+    def test_idempotent_rerun_no_further_mutation(self):
+        runner = _CascadeRunner(self._tree(), self._states())
+        first = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        assert first == 3
+        updates_after_first = len(runner.updates)
+        comments_after_first = len(runner.comments)
+        second = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        assert second == 0
+        assert len(runner.updates) == updates_after_first
+        assert len(runner.comments) == comments_after_first
+
+    def test_deleted_and_terminal_descendants_are_skipped(self):
+        runner = _CascadeRunner(self._tree(), self._states())
+        audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        assert "C2" not in {item_id for item_id, _ in runner.updates}
+        assert "D1" not in {item_id for item_id, _ in runner.updates}
+        assert "C2" not in {item_id for item_id, _ in runner.comments}
+        assert "D1" not in {item_id for item_id, _ in runner.comments}
+
+    def test_dry_run_suppresses_cascade_entirely(self):
+        runner = _CascadeRunner(self._tree(), self._states())
+        cascaded = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner, persist=False,
+        )
+        assert cascaded == 0
+        assert runner.updates == []
+        assert runner.comments == []
+        # No wl command at all (the helper returns before walking the tree).
+        assert runner.commands == []
+
+    def test_per_child_failure_is_non_fatal(self):
+        runner = _CascadeRunner(
+            self._tree(), self._states(), fail_updates={"C3"},
+        )
+        cascaded = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        # C1 and GC still cascaded; C3's failure did not abort the sweep.
+        updated = {item_id for item_id, _ in runner.updates}
+        assert updated == {"C1", "GC"}
+        assert cascaded == 2
+
+    def test_leaf_parent_cascades_nothing(self):
+        runner = _CascadeRunner({}, {})
+        assert audit_runner._cascade_descendants_terminal(
+            "LEAF", self.AUDIT_TS, runner=runner,
+        ) == 0
+        assert runner.updates == []
+
