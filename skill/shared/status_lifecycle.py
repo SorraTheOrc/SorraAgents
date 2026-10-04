@@ -401,12 +401,16 @@ def _default_runner(cmd: list[str]) -> subprocess.CompletedProcess:
     )
 
 
-def _run_wl_with_runner(runner: Runner, cmd: list[str]) -> dict:
+def _run_wl_with_runner(runner: Runner, cmd: list[str], explicit_dir: str | None = None) -> dict:
     """Run a ``wl`` command via an injectable runner and return parsed JSON.
 
     Args:
         runner: A callable that takes a command list and returns a CompletedProcess.
         cmd: The command as a list of strings.
+        explicit_dir: Optional explicit ``.worklog`` directory. When given it
+            takes precedence over prefix-to-sibling and cwd-chain resolution
+            (used by skills that already resolved their target store, e.g.
+            standup's ``--worklog-dir``).
 
     Returns:
         The parsed JSON response dict.
@@ -421,7 +425,7 @@ def _run_wl_with_runner(runner: Runner, cmd: list[str]) -> dict:
         # Inject --worklog-dir with precedence: explicit > prefix-to-sibling
         # scan > cwd chain > none, so the command targets the correct worklog
         # store regardless of the caller's cwd.
-        full_cmd[1:1] = resolve_worklog_flags(full_cmd)
+        full_cmd[1:1] = resolve_worklog_flags(full_cmd, explicit_dir=explicit_dir)
     LOG.debug("Running: %s", " ".join(full_cmd))
     proc = runner(full_cmd)
     if proc.returncode != 0:
@@ -448,7 +452,11 @@ def _run_wl(cmd: list[str]) -> dict:
     return _run_wl_with_runner(_default_runner, cmd)
 
 
-def run_wl(cmd: list[str], runner: Runner | None = None) -> dict:
+def run_wl(
+    cmd: list[str],
+    runner: Runner | None = None,
+    explicit_dir: str | None = None,
+) -> dict:
     """Run a ``wl`` command via the shared runner (public helper).
 
     Thin public wrapper over :func:`_run_wl_with_runner` for skill scripts
@@ -457,6 +465,8 @@ def run_wl(cmd: list[str], runner: Runner | None = None) -> dict:
     Args:
         cmd: The ``wl`` command as a list of strings.
         runner: Optional injectable command runner for testing.
+        explicit_dir: Optional explicit ``.worklog`` directory; takes
+            precedence over automatic resolution.
 
     Returns:
         The parsed JSON response dict.
@@ -464,7 +474,9 @@ def run_wl(cmd: list[str], runner: Runner | None = None) -> dict:
     Raises:
         RuntimeError: If the command fails or returns invalid JSON.
     """
-    return _run_wl_with_runner(runner or _default_runner, cmd)
+    return _run_wl_with_runner(
+        runner or _default_runner, cmd, explicit_dir=explicit_dir
+    )
 
 
 # ======================================================================

@@ -16,7 +16,7 @@ Default time window: 24 hours starting at 06:00 the previous day
 Usage:
     python3 generate_standup.py [--json] [--verbose] [--output-path <path>] [--count N]
                             [--startTime <ISO>] [--duration <hours>]
-                            [--worklog-dir <path>]
+                            [--worklog-dir <path>] [--no-sync]
 
 Flags:
     --json           Output raw JSON data instead of the formatted report
@@ -32,6 +32,12 @@ Flags:
                      Bypasses cwd-based resolution. Also honored via WL_WORKLOG_DIR
                      env var; the value is forwarded to every wl invocation as
                      --worklog-dir <path>.
+    --no-sync        Skip the initial `wl sync` (offline/deterministic runs and
+                     tests). By default the worklog is synced first, non-fatally.
+
+The script runs `wl sync` (lock-aware, non-fatal) before its first `wl next`
+/ `wl list` fetch so the Herdr selection list reflects the shared remote
+state.
 """
 
 import json
@@ -41,6 +47,19 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Make the shared skill helpers importable when this file is launched as a
+# script from any cwd (sys.path[0] is the script directory, not the skills root).
+_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
+
+from import_guard import guard_shared_import
+
+try:
+    from shared.worklog_sync import sync_worklog
+except ModuleNotFoundError as _missing_shared:  # pragma: no cover
+    guard_shared_import(_missing_shared.name)
 
 DEFAULT_BROWSE_COUNT = 20
 HERDR_CONFIG_PATH = Path.home() / ".config" / "herdr" / "worklog-plugin.json"
@@ -952,6 +971,29 @@ def format_report(data, browse_count=None):
     return "\n".join(lines)
 
 
+def _run_with_sync(report_fn, worklog_dir=None, no_sync=False, sync_fn=None):
+    """Run ``wl sync`` before *report_fn* (non-fatal).
+
+    The sync is the first worklog operation so the report's `wl next` / `wl
+    list` fetches see the shared remote state (WL-0MUAD8U24001ZK5K AC2). It is
+    non-fatal: a failed or skipped sync never prevents the report from being
+    generated (AC4).
+
+    Args:
+        report_fn: Callable that builds the report data (the first fetch).
+        worklog_dir: Optional explicit ``.worklog`` directory to sync.
+        no_sync: Forwarded to the sync helper (``--no-sync`` escape hatch).
+        sync_fn: Optional sync callable for tests; defaults to
+            :func:`shared.worklog_sync.sync_worklog`.
+
+    Returns:
+        The value returned by *report_fn*.
+    """
+    sync = sync_fn or sync_worklog
+    sync(worklog_dir=worklog_dir, no_sync=no_sync)
+    return report_fn()
+
+
 def main():
     global WORKLOG_DIR
     args = sys.argv[1:]
@@ -977,6 +1019,7 @@ def main():
 
     json_output = "--json" in args
     verbose = "--verbose" in args
+    no_sync = "--no-sync" in args
     output_path = None
     browse_count = None
     start_time_str = None
@@ -1021,7 +1064,16 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    data = generate_report(verbose=verbose, browse_count=browse_count, window_start=window_start, window_end=window_end)
+    data = _run_with_sync(
+        lambda: generate_report(
+            verbose=verbose,
+            browse_count=browse_count,
+            window_start=window_start,
+            window_end=window_end,
+        ),
+        worklog_dir=WORKLOG_DIR,
+        no_sync=no_sync,
+    )
 
     if json_output:
         output = json.dumps(data, indent=2)

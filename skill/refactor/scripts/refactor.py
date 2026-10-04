@@ -17,6 +17,11 @@ Usage:
   refactor.py --json                   # JSON output for agents
   refactor.py --no-llm                 # Linter only
   refactor.py --no-linter              # LLM only
+  refactor.py --no-sync                # Skip the initial `wl sync`
+
+The script runs `wl sync` (lock-aware, non-fatal) as its first worklog
+operation so analysis and work-item creation see the shared remote state.
+Use `--no-sync` for offline/deterministic runs.
 
 Exit codes:
   0 – success (no smells or all handled)
@@ -48,6 +53,7 @@ try:
     from shared.project_name import resolve_project_name
     from shared.status_lifecycle import StatusLifecycle
     from shared.timing import Timer
+    from shared.worklog_sync import sync_worklog
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 
@@ -602,6 +608,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip LLM-based detection",
     )
     parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        help=(
+            "Skip the initial `wl sync` (offline/deterministic runs and "
+            "tests). By default the worklog is synced first, non-fatally."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be changed without making changes",
@@ -685,6 +699,35 @@ def _build_pipeline_runner(args: argparse.Namespace) -> Callable[[], dict[str, A
     return _run
 
 
+def _run_with_sync(
+    pipeline_runner: Callable[[], dict[str, Any]],
+    no_sync: bool = False,
+    sync_fn: Callable[..., dict[str, Any]] | None = None,
+    work_item_id: str | None = None,
+) -> dict[str, Any]:
+    """Run ``wl sync`` first, then the refactor pipeline.
+
+    The sync is the first worklog operation so the pipeline's reads and
+    work-item creation see the shared remote state (WL-0MUAD8U24001ZK5K AC1).
+    It is non-fatal: a failed or skipped sync never prevents the pipeline
+    from running (AC4).
+
+    Args:
+        pipeline_runner: Callable that runs the refactor pipeline.
+        no_sync: Forwarded to the sync helper (``--no-sync`` escape hatch).
+        sync_fn: Optional sync callable for tests; defaults to
+            :func:`shared.worklog_sync.sync_worklog`.
+        work_item_id: Optional work-item id whose owning store should be
+            synced (prefix resolution for cross-repo items).
+
+    Returns:
+        The pipeline report dict.
+    """
+    sync = sync_fn or sync_worklog
+    sync(no_sync=no_sync, work_item_id=work_item_id)
+    return pipeline_runner()
+
+
 def _load_config(config_path: str | None) -> dict[str, Any] | None:
     """Load a JSON config file if specified.
 
@@ -715,9 +758,12 @@ def _main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
     )
 
-    # Build and run the pipeline (with StatusLifecycle if work_item_id given)
+    # Build and run the pipeline (with StatusLifecycle if work_item_id given).
+    # `wl sync` runs first (non-fatal), before any worklog read/comment/create.
     pipeline_runner = _build_pipeline_runner(args)
-    report = pipeline_runner()
+    report = _run_with_sync(
+        pipeline_runner, no_sync=args.no_sync, work_item_id=args.work_item_id
+    )
 
     # Output section (unchanged):
     if args.json:

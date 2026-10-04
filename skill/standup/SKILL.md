@@ -20,7 +20,7 @@ by construction — no second ranking.
 ## Invocation
 
 ```bash
-python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [--verbose] [--output-path <path>] [--startTime <ISO>] [--duration <hours>] [--worklog-dir <path>]
+python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [--verbose] [--output-path <path>] [--startTime <ISO>] [--duration <hours>] [--worklog-dir <path>] [--no-sync]
 ```
 
 | Flag | Default | Description |
@@ -32,8 +32,23 @@ python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [
 | `--startTime <ISO>` | prev day 06:00 | Window start (e.g. `2026-09-03T06:00:00`) |
 | `--duration <hours>` | 24 | Window length in hours |
 | `--worklog-dir <path>` | cwd | Explicit `.worklog` dir (e.g. `/path/to/project/.worklog`); also honored via `WL_WORKLOG_DIR` env var. Bypasses cwd-based resolution so the report works from any directory |
+| `--no-sync` | off | Skip the initial `wl sync` (offline/deterministic runs and tests) |
 
 Default time window: **24 hours starting at 06:00 the previous day** (yesterday 06:00 → today 06:00). Override with `--startTime` and/or `--duration`.
+
+### Sync-first
+
+Before its first `wl next` / `wl list` fetch, the script runs `wl sync` (via the
+shared `worklog_sync` helper) so the Herdr selection list and
+completions reflect the shared remote state.
+
+- **Lock-aware**: passes `--if-idle`, so a concurrent sync makes this one skip
+  (exit 0) rather than block or pile up.
+- **Non-fatal**: offline, unborn-HEAD, author-gate, lock-contention, or a
+  missing `.worklog` context is logged as a warning; the report is still
+  generated from local data and the exit code is unchanged.
+- **Disable** with `--no-sync` for offline or deterministic runs (tests use
+  this to stay hermetic).
 
 ## Report Structure
 
