@@ -939,18 +939,30 @@ The mode query is best-effort: a timeout/unreachable proxy must never block
 or fail the audit, so the wait is capped at ~3 s.
 """
 
+AUDIT_SLOT_STATUS_PATH = "/llama/local/status"
+"""Path of the proxy slot-status endpoint (appended to the proxy base URL).
+
+Single source of truth for the endpoint path so the slot-status default and
+any derived URL stay in sync (SA-0MUV2UBMT008OE2E).
+"""
+
 AUDIT_SLOT_STATUS_URL_ENV = "AUDIT_SLOT_STATUS_URL"
 """Environment variable name for the local proxy slot-status endpoint.
 
 The runner queries this endpoint to derive the dynamic child-call
-concurrency ceiling (LP-0MSQ32S2M001EA74 AC3). Defaults to
-``AUDIT_SLOT_STATUS_URL_DEFAULT`` (http://localhost:8000/llama/local/status).
+concurrency ceiling (LP-0MSQ32S2M001EA74 AC3). When set, it is used verbatim
+(highest precedence); otherwise the endpoint is derived from the proxy base
+URL (``AUDIT_PROXY_BASE_URL`` → ``AUDIT_PROXY_BASE_URL_DEFAULT``) plus
+``AUDIT_SLOT_STATUS_PATH`` so it can never diverge from the proxy-mode host
+(SA-0MUV2UBMT008OE2E).
 """
 
-AUDIT_SLOT_STATUS_URL_DEFAULT = "http://localhost:8000/llama/local/status"
-"""Default local proxy slot-status endpoint (``/llama/local/status``).
+AUDIT_SLOT_STATUS_URL_DEFAULT = AUDIT_PROXY_BASE_URL_DEFAULT.rstrip("/") + AUDIT_SLOT_STATUS_PATH
+"""Default local proxy slot-status endpoint (``<proxy base>/llama/local/status``).
 
-Reports ``available_slots``/``total_slots`` from llama-server ``/slots`` with
+Derived from ``AUDIT_PROXY_BASE_URL_DEFAULT`` so the slot-status host can
+never diverge from the proxy-mode host (SA-0MUV2UBMT008OE2E). Reports
+``available_slots``/``total_slots`` from llama-server ``/slots`` with
 fail-open to ``session_slot_pool_size`` when no model is loaded
 (LP-0MSI06HPB0043MV1).
 """
@@ -3474,6 +3486,27 @@ def _resolve_parallelism() -> int:
     return _PARALLELISM_DEFAULT
 
 
+def _proxy_base_url() -> str:
+    """Resolve the llm-manager proxy base URL.
+
+    Precedence: ``AUDIT_PROXY_BASE_URL`` env var >
+    ``AUDIT_PROXY_BASE_URL_DEFAULT``. Single source of truth for both the
+    proxy-mode query and the derived slot-status endpoint, so the two can
+    never target different hosts (SA-0MUV2UBMT008OE2E).
+    """
+    return os.environ.get(AUDIT_PROXY_BASE_URL_ENV, AUDIT_PROXY_BASE_URL_DEFAULT)
+
+
+def _default_slot_status_url() -> str:
+    """Derive the slot-status endpoint from the proxy base URL.
+
+    Returns ``<proxy base>/llama/local/status`` so the slot-status host stays
+    aligned with the proxy-mode host unless ``AUDIT_SLOT_STATUS_URL``
+    overrides it (SA-0MUV2UBMT008OE2E).
+    """
+    return _proxy_base_url().rstrip("/") + AUDIT_SLOT_STATUS_PATH
+
+
 def _query_slot_status(url: str | None = None,
                        timeout: float = AUDIT_SLOT_STATUS_TIMEOUT) -> tuple[int | None, int | None]:
     """Best-effort query of the local proxy slot-status endpoint.
@@ -3483,11 +3516,23 @@ def _query_slot_status(url: str | None = None,
     unreachable, times out, returns non-JSON, or lacks the slot fields
     (fail-open — the caller degrades to the configured static ceiling).
 
+    Endpoint resolution (highest precedence first):
+
+    1. the explicit ``url`` argument,
+    2. the ``AUDIT_SLOT_STATUS_URL`` env var (used verbatim),
+    3. ``<proxy base>/llama/local/status`` derived from
+       ``AUDIT_PROXY_BASE_URL`` → ``AUDIT_PROXY_BASE_URL_DEFAULT``
+       (:func:`_default_slot_status_url`).
+
     The query uses a short timeout (``AUDIT_SLOT_STATUS_TIMEOUT`` = 1 s) and
     never raises: the dynamic ceiling must never block or fail the audit
     when the endpoint is unavailable (LP-0MSQ32S2M001EA74 AC3).
     """
-    target = url or os.environ.get(AUDIT_SLOT_STATUS_URL_ENV, AUDIT_SLOT_STATUS_URL_DEFAULT)
+    target = (
+        url
+        or os.environ.get(AUDIT_SLOT_STATUS_URL_ENV)
+        or _default_slot_status_url()
+    )
     try:
         with urllib.request.urlopen(target, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -3516,9 +3561,7 @@ def _query_proxy_mode(base_url: str | None = None,
     The query uses a short timeout (``AUDIT_PROXY_MODE_TIMEOUT`` = 3 s) and
     never raises: the mode check must never block or fail the audit.
     """
-    target = base_url or os.environ.get(
-        AUDIT_PROXY_BASE_URL_ENV, AUDIT_PROXY_BASE_URL_DEFAULT
-    )
+    target = base_url or _proxy_base_url()
     endpoint = target.rstrip("/") + "/admin/mode"
     try:
         with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
