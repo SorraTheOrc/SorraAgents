@@ -455,3 +455,66 @@ def test_strict_git_env_opt_out_allows_with_warning(
     assert code == 0
     assert len(fake_run) == 1
     assert "WARNING" in capsys.readouterr().err
+
+
+def test_strict_git_env_allows_worktree_hook_git_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worktree-managed GIT_DIR (git's pre-push hook env) is allowed.
+
+    SA-0MUMR3QPM002VK7M: reproduce the real hook environment — cwd is the
+    linked worktree and git has exported ``GIT_DIR`` to
+    ``<main>/.git/worktrees/<name>`` — and assert the strict release gate runs
+    the suite (exit 0) instead of refusing (exit 2).
+    """
+    from shared import git_sandbox as gs
+
+    repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    worktree = gs.add_worktree(repo, tmp_path / "wt", "feature")
+    worktree_git_dir = repo / ".git" / "worktrees" / "wt"
+    assert worktree_git_dir.is_dir()
+
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("GIT_DIR", str(worktree_git_dir))
+    monkeypatch.setattr(rt, "REPO_ROOT", worktree)
+    monkeypatch.setattr(rt, "detect_project_root", lambda: worktree)
+
+    calls: list[str] = []
+
+    def fake(cmd: list[str], **kwargs):
+        calls.append(" ".join(cmd))
+        return SimpleNamespace(returncode=0, stdout=SUMMARY_OUTPUT, stderr="")
+
+    monkeypatch.setattr(rt, "_run_cmd", fake)
+
+    code = run_main(["--suite", "pytest", "--strict-git-env", "--json"])
+    assert code == 0
+    assert len(calls) == 1
+
+
+def test_strict_git_env_still_refuses_non_worktree_git_dir_from_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A genuine leaked GIT_DIR is refused even when cwd is a worktree (AC2)."""
+    from shared import git_sandbox as gs
+
+    repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    worktree = gs.add_worktree(repo, tmp_path / "wt", "feature")
+
+    # cwd is a real worktree, but GIT_DIR points at the main checkout's gitdir
+    # rather than a worktree-managed path: a leaked override, not a hook env.
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+    monkeypatch.setattr(rt, "REPO_ROOT", worktree)
+    monkeypatch.setattr(rt, "detect_project_root", lambda: worktree)
+
+    code = run_main(["--suite", "pytest", "--strict-git-env", "--json"])
+    assert code == 2
+    assert "GIT_DIR" in capsys.readouterr().err

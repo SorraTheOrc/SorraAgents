@@ -226,6 +226,16 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
    logged as "Skipped (needs producer review)". This is a non-blocking step —
    individual close failures are logged as warnings but do not affect the
    release outcome.
+   - **Terminal descendants do not block the close.** `wl close --force`
+     recursively sweeps a parent's descendants, so the close step refuses a
+     candidate whose subtree contains work outside the candidate set (the
+     scope guard, SA-0MU2OY1N9000XL2H). A passing parent audit now cascades
+     its descendants to `completed`/`done` (SA-0MUR7Y3BJ004FGPP), and the
+     close step additionally excludes terminal (`stage: done` / `status:
+     deleted`) descendants from that collateral set (defence-in-depth,
+     SA-0MUJKPDAA002VVDP). An audit-approved parent therefore closes without
+     a false `--force` collateral refusal; only descendants still in a
+     genuinely non-terminal state are named in a refusal.
 4. Version numbering, tagging, and tag pushing are **now automated** as part
    of the merge script (`merge-dev-to-main.sh`). Before merging, the script:
    - Increments the version in `package.json` (default: patch bump).

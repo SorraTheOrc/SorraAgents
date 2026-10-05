@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.1.19 (2026-10-05)
+### Features
+- Run only the tests that matter for each change, so updates ship faster and more reliably. (SA-0MUJKF2HP001BR51)
+- Refactor reports now show which project was scanned, so results are easier to identify. (SA-0MUMHH4BB000WEM9)
+- Audits now queue fairly instead of failing, so your work gets reviewed faster. (SA-0MTG0Y34T007ZHPF)
+### Bug Fixes
+- Pre-push checks now run reliably even when hook-bypass settings are active. (SA-0MUN83EXN004JBMW)
+- Pushing from a worktree now passes the pre-push test gate without special overrides. (SA-0MUMR3QPM002VK7M)
+- Fixes a bug that could prevent your progress from syncing correctly after finishing a level. (SA-0MUM5UWL4005YH0X)
+- Audits no longer leave items stuck in an unrecoverable state after a failure. (SA-0MUIVCJLW000RUC1)
+- Long test runs no longer block your changes from being saved. (SA-0MUH9R74O002MQDU)
+- Audits no longer fail with false connection errors caused by extension crashes. (SA-0MUEIOGT2005IR7F)
+- Audits no longer undo completed work or wrongly block finished tasks. (SA-0MUJAPC680078396)
+- Audits now finish reliably instead of hanging when tests fail. (SA-0MUMC6LGE005UQNS)
+- Releases no longer get stuck on outdated audit checks, so shipping is faster and more reliable. (SA-0MUOO5TRU005ALBL)
+- Other agents' unfinished work no longer blocks your tests from running. (SA-0MUPDDMXB0088CMM)
+- Claimed work items no longer get blocked by a status check error. (SA-0MTYMCWYW004KV6G)
+- Audits no longer wrongly mark work as ready to close when a child task is still unfinished. (SA-0MUA4Q431008HIH0)
+- Reports now clearly show when a task is incomplete instead of falsely claiming success. (SA-0MULPQ3BK001A1M5)
+- Passing a parent audit now automatically completes all its unfinished child tasks. (SA-0MUR7Y3BJ004FGPP)
+- Skill checks no longer fail when another update is in progress. (SA-0MUQ96V5W000TMTU)
+- Fixed a broken internal test so new game updates can be released without delays. (SA-0MUU206QT001M66F)
+- Intake sessions now correctly show as complete instead of falsely reporting incomplete. (SA-0MUUCNXNG004RG5Z)
+- Audits now use your configured proxy address for concurrency checks, so they run at the right speed. (SA-0MUV2UBMT008OE2E)
+- Test results now correctly reflect your own project instead of the framework's. (SA-0MSNQV9J20010LE7)
+### Other
+- We've made behind-the-scenes improvements to keep the game running smoothly. (SA-0MU0X9CRI009QKKK)
+- Worklog data can now be safely recovered if it's ever wiped or corrupted. (SA-0MSOKVN9I0012G7T)
+
 ## v0.1.18 (2026-09-28)
 ### Features
 - Low and medium risk plans now skip approval, so you get to play faster. (SA-0MTGX1I00007DBLX)

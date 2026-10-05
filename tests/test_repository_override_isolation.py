@@ -123,7 +123,7 @@ def test_audit_runner_suite_env_has_no_repository_overrides(tmp_path, monkeypatc
     sandbox.mkdir()
     captured_envs: list[dict[str, str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003 - mirrors subprocess.run
+    def fake_run(cmd, **kwargs):
         if kwargs.get("env") is not None:
             captured_envs.append(dict(kwargs["env"]))
         return SimpleNamespace(stdout="1 passed in 0.01s\n", stderr="", returncode=0)
@@ -172,15 +172,15 @@ def test_audit_pi_launch_scrubs_repository_overrides(tmp_path, monkeypatch):
     class _FakeProcess:
         returncode = 0
 
-        def communicate(self, timeout=None):  # noqa: ANN001, ANN201
+        def communicate(self, timeout=None):
             return stream, ""
 
-        def kill(self):  # noqa: ANN201
+        def kill(self):
             pass
 
     captured: dict = {}
 
-    def fake_popen(cmd, **kwargs):  # noqa: ANN001, ANN003, ANN201
+    def fake_popen(cmd, **kwargs):
         captured["env"] = kwargs.get("env")
         return _FakeProcess()
 

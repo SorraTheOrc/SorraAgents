@@ -18,10 +18,20 @@ Non-work-item skills (speak) must remain unwired.
 """
 from __future__ import annotations
 
+import sys
+import warnings
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = REPO_ROOT / "skill"
+
+# Load the context-audit measurement module by path so the skill inventory
+# (and the untracked-dir filter) has a single source of truth.
+_MEASURE_DIR = REPO_ROOT / "skill" / "context-audit" / "scripts"
+if str(_MEASURE_DIR) not in sys.path:
+    sys.path.insert(0, str(_MEASURE_DIR))
+
+import measure_context as mc
 
 # Skills whose flow creates/updates work items and must end with the
 # standardized report. git-management and owner-inference were retired
@@ -35,6 +45,7 @@ WORK_ITEM_SKILLS = [
     "find-related",
     "implement",
     "intake",
+    "machine-hygiene",
     "plan",
     "refactor",
     "resolve-pr-comments",
@@ -107,11 +118,26 @@ class TestNonWorkItemSkillsUnwired:
             )
 
     def test_all_skilled_skills_are_covered_by_one_of_the_lists(self):
-        """Guard against adding a new work-item skill without wiring it."""
+        """Guard against adding a new work-item skill without wiring it.
+
+        Untracked ``skill/<name>/`` directories are another agent's WIP and
+        are ignored with a clear warning rather than failing the suite
+        (SA-0MUPDDMXB0088CMM).
+        """
+        untracked = mc.untracked_skill_dirs(REPO_ROOT)
+        if untracked:
+            warnings.warn(
+                "ignoring untracked skill dir(s) (concurrent WIP): "
+                + ", ".join(untracked),
+                stacklevel=2,
+            )
+        tracked = mc.tracked_skill_dirs(REPO_ROOT)
         actual = sorted(
             d.name
             for d in SKILL_DIR.iterdir()
-            if d.is_dir() and (d / "SKILL.md").exists()
+            if d.is_dir()
+            and (d / "SKILL.md").exists()
+            and (tracked is None or d.name in tracked)
         )
         expected = sorted(WORK_ITEM_SKILLS + NON_WORK_ITEM_SKILLS + ["report"])
         assert actual == expected, (

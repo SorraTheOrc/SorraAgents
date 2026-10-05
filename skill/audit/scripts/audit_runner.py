@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+
+# <!-- REFACTOR-SA-0MUQ2OMWJ009QW4O
+# smell: formatting
+# severity: low
+# description: Shebang should be at the beginning of the file
+# -->
+
+# <!-- REFACTOR-SA-0MUMEJSWN004746A
+# smell: simplification
+# severity: medium
+# description: Use a single `if` statement instead of nested `if` statements
+# -->
 """Audit runner – deterministic audit orchestration.
 
 Provides two subcommands:
@@ -165,6 +177,27 @@ def _suite_run_in_progress() -> bool:
     (SA-0MUG47DYG006TV40 AC1/AC2).
     """
     return bool(os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV))
+
+
+# ---------------------------------------------------------------------------
+# Cascade-audit demotion suppression (SA-0MUJAPC680078396)
+# ---------------------------------------------------------------------------
+AUDIT_CASCADE_AUDIT_ENV = "AUDIT_CASCADE_AUDIT"
+"""Marker threaded into cascade-triggered child-audit subprocesses.
+
+When set, signals that this audit was triggered as a side-effect of a
+parent audit's ``--audit-children`` cascade.  The child's
+``_apply_terminal_lifecycle`` suppresses demotion (restores the
+original stage) when the child was already ``in_review`` or ``done``
+at audit start — a parent-triggered re-audit must never silently
+push completed/in-review work back into the actionable queue
+(SA-0MUJAPC680078396 AC2).
+"""
+
+
+def _is_cascade_audit() -> bool:
+    """Return True when this audit was cascade-triggered by a parent."""
+    return bool(os.environ.get(AUDIT_CASCADE_AUDIT_ENV))
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +465,50 @@ def _format_bytes(n: int) -> str:
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
 
+#: Default cap on the number of code-quality finding rows rendered into the
+#: human-readable audit report table. The report text is later passed to
+#: ``wl`` on the command line; an unbounded table (e.g. when a linter mis-
+#: parses non-matching files and emits hundreds of spurious findings) can
+#: exceed the OS argv limit and make persistence fail with ``E2BIG``
+#: (WL-0MSS55LFU00973S2). Blocking/closure logic always uses the FULL finding
+#: list — this cap is display-only. Overridable via
+#: ``AUDIT_MAX_FINDINGS_IN_REPORT``.
+MAX_FINDINGS_IN_REPORT_DEFAULT = 50
+MAX_FINDINGS_IN_REPORT_ENV = "AUDIT_MAX_FINDINGS_IN_REPORT"
+
+
+def _resolve_max_findings_in_report() -> int:
+    """Resolve the code-quality findings cap rendered in the audit report.
+
+    Precedence: ``AUDIT_MAX_FINDINGS_IN_REPORT`` environment variable
+    (positive integer) > :data:`MAX_FINDINGS_IN_REPORT_DEFAULT`. Invalid or
+    non-positive values fall back to the default with a warning (never block
+    the audit).
+    """
+    env_value = os.environ.get(MAX_FINDINGS_IN_REPORT_ENV)
+    if env_value is None or not env_value.strip():
+        return MAX_FINDINGS_IN_REPORT_DEFAULT
+    try:
+        parsed = int(env_value)
+    except ValueError:
+        print(
+            f"Warning: invalid {MAX_FINDINGS_IN_REPORT_ENV} value "
+            f"{env_value!r}; using the default "
+            f"({MAX_FINDINGS_IN_REPORT_DEFAULT}).",
+            file=sys.stderr,
+        )
+        return MAX_FINDINGS_IN_REPORT_DEFAULT
+    if parsed < 1:
+        print(
+            f"Warning: {MAX_FINDINGS_IN_REPORT_ENV} must be a positive "
+            f"integer, got {parsed}; using the default "
+            f"({MAX_FINDINGS_IN_REPORT_DEFAULT}).",
+            file=sys.stderr,
+        )
+        return MAX_FINDINGS_IN_REPORT_DEFAULT
+    return parsed
+
+
 CALL_PI_TIMEOUT = 1800
 """Internal timeout (seconds) for each Pi model subprocess call.
 
@@ -674,6 +751,11 @@ machinery (``skill/test/scripts/run_tests.py``) when the operator passes
 default used by ``run_tests.py`` itself.
 """
 
+TRIAGE_MAX_CALLS = 100
+"""Hard cap on triage calls per run. Prevents runaway triage loops when
+``parse_pytest_failures`` over-produces records for a single failing test
+(see SA-0MUMC6LGE005UQNS)."""
+
 AUDIT_PARENT_TIMEOUT_ENV = "AUDIT_PARENT_TIMEOUT"
 """Environment variable name for overriding the cumulative elapsed-time guard.
 
@@ -789,9 +871,8 @@ def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
     """
     counts = _rel_snapshot()
     parts = [f"{key}={counts.get(key, 0)}" for key in RELIABILITY_SUMMARY_KEYS]
-    if elapsed_seconds is None:
-        if _rel_started_at is not None:
-            elapsed_seconds = time.perf_counter() - _rel_started_at
+    if elapsed_seconds is None and _rel_started_at is not None:
+        elapsed_seconds = time.perf_counter() - _rel_started_at
     if elapsed_seconds is not None:
         parts.append(f"elapsed_seconds={float(elapsed_seconds):.2f}")
     return RELIABILITY_SUMMARY_PREFIX + " " + " ".join(parts)
@@ -902,18 +983,30 @@ The mode query is best-effort: a timeout/unreachable proxy must never block
 or fail the audit, so the wait is capped at ~3 s.
 """
 
+AUDIT_SLOT_STATUS_PATH = "/llama/local/status"
+"""Path of the proxy slot-status endpoint (appended to the proxy base URL).
+
+Single source of truth for the endpoint path so the slot-status default and
+any derived URL stay in sync (SA-0MUV2UBMT008OE2E).
+"""
+
 AUDIT_SLOT_STATUS_URL_ENV = "AUDIT_SLOT_STATUS_URL"
 """Environment variable name for the local proxy slot-status endpoint.
 
 The runner queries this endpoint to derive the dynamic child-call
-concurrency ceiling (LP-0MSQ32S2M001EA74 AC3). Defaults to
-``AUDIT_SLOT_STATUS_URL_DEFAULT`` (http://localhost:8000/llama/local/status).
+concurrency ceiling (LP-0MSQ32S2M001EA74 AC3). When set, it is used verbatim
+(highest precedence); otherwise the endpoint is derived from the proxy base
+URL (``AUDIT_PROXY_BASE_URL`` → ``AUDIT_PROXY_BASE_URL_DEFAULT``) plus
+``AUDIT_SLOT_STATUS_PATH`` so it can never diverge from the proxy-mode host
+(SA-0MUV2UBMT008OE2E).
 """
 
-AUDIT_SLOT_STATUS_URL_DEFAULT = "http://localhost:8000/llama/local/status"
-"""Default local proxy slot-status endpoint (``/llama/local/status``).
+AUDIT_SLOT_STATUS_URL_DEFAULT = AUDIT_PROXY_BASE_URL_DEFAULT.rstrip("/") + AUDIT_SLOT_STATUS_PATH
+"""Default local proxy slot-status endpoint (``<proxy base>/llama/local/status``).
 
-Reports ``available_slots``/``total_slots`` from llama-server ``/slots`` with
+Derived from ``AUDIT_PROXY_BASE_URL_DEFAULT`` so the slot-status host can
+never diverge from the proxy-mode host (SA-0MUV2UBMT008OE2E). Reports
+``available_slots``/``total_slots`` from llama-server ``/slots`` with
 fail-open to ``session_slot_pool_size`` when no model is loaded
 (LP-0MSI06HPB0043MV1).
 """
@@ -1455,8 +1548,24 @@ def _distinctive_project_top_levels(owning_root: Path) -> list[str]:
     return sorted(owning_tops - framework_tops)
 
 
+def _manifest_names_path(manifest: str, path: str) -> bool:
+    """Whether the manifest text contains a normalised repository *path*.
+
+    Used by the touched-files coverage check: a path resolved from git
+    (``skill/foo/bar.py``) is compared case-insensitively against the
+    manifest text after ``_normalise_repo_path`` strips quotes/backticks and
+    a leading ``./``.
+    """
+    normalised = _normalise_repo_path(path)
+    if not normalised:
+        return False
+    return normalised.lower() in manifest.lower()
+
+
 def _validate_file_scope_manifest(file_scope: str,
-                                  owning_root: Path | None) -> str | None:
+                                  owning_root: Path | None,
+                                  touched_files: Sequence[str] | None = None,
+                                  ) -> str | None:
     """Validate the FILE SCOPE manifest covers the work item's repository.
 
     Returns an error message when the manifest does NOT reference the owning
@@ -1470,21 +1579,39 @@ def _validate_file_scope_manifest(file_scope: str,
     distinctive markers are all root-level files are handled by
     ``_repo_index``, which lists root file names in the ``(root)`` index
     entry so the markers surface in the manifest (SA-0MSUBX8PP0087OEA).
+
+    *touched_files* (SA-0MUKCOW1I001MJ7O) is the item's resolved touched-file
+    set. When it is a non-empty sequence and NONE of its paths appear in the
+    manifest, the manifest cannot verify the item's own changes and a scope
+    error is returned — the fail-closed guard against a manifest that
+    references the repo but omits the item's files (the
+    SA-0MUJNZ5RN0078B5M false-verdict defect). When the set is ``None`` or
+    empty (git unavailable / unknown) the check fails open, preserving the
+    prior behaviour.
     """
     if owning_root is None:
         return None
     distinctive = _distinctive_project_top_levels(owning_root)
-    if not distinctive:
-        return None  # nothing distinctive to verify against — fail open
     manifest_lower = file_scope.lower()
-    if any(entry.lower() in manifest_lower for entry in distinctive):
-        return None
-    return (
-        f"Audit scope error: the Phase 2 FILE SCOPE manifest does not contain "
-        f"the work item repository files (owning project: {owning_root}). The "
-        f"resolved scope is the audit skill's own tree or another repository; "
-        f"re-launch the audit from {owning_root} and re-run."
-    )
+    if distinctive and not any(
+        entry.lower() in manifest_lower for entry in distinctive
+    ):
+        return (
+            f"Audit scope error: the Phase 2 FILE SCOPE manifest does not contain "
+            f"the work item repository files (owning project: {owning_root}). The "
+            f"resolved scope is the audit skill's own tree or another repository; "
+            f"re-launch the audit from {owning_root} and re-run."
+        )
+    if touched_files and not any(
+        _manifest_names_path(file_scope, path) for path in touched_files
+    ):
+        return (
+            f"Audit scope error: the Phase 2 FILE SCOPE manifest references the "
+            f"work item repository ({owning_root}) but omits every file the item "
+            f"touched, so the item's changes cannot be verified. Re-run the audit "
+            f"so the manifest includes the item's committed touched files."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1663,6 +1790,62 @@ def _extract_content_fingerprint(report_text: str) -> str | None:
     return None
 
 
+def cmd_check_freshness(issue_id: str,
+                        worklog_dir: str | None = None) -> int:
+    """Report whether a work item's stored audit is still fresh — read-only.
+
+    Read-only companion to the audit pipeline (SA-0MUOO5W8J001DYTI): it never
+    runs an audit and never mutates the worklog. It reuses the runner's own
+    freshness gate (:func:`_check_audit_freshness`) so callers (e.g. the ship
+    release gates) can consume the persisted content fingerprint without
+    duplicating the fingerprint logic in another language.
+
+    Prints a single JSON object::
+
+        {"workItemId", "fresh", "hasFingerprint", "auditedAt", "reason"}
+
+    Always exits 0 (fresh/stale/absent are all valid results); a lookup
+    failure is reported as ``fresh: false`` with the reason so the caller can
+    fail open to the normal time gate.
+    """
+    runner = _default_runner
+    audited_at = None
+    has_fingerprint = False
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
+        audit = data.get("audit") if isinstance(data, dict) else None
+        if isinstance(audit, dict):
+            audited_at = audit.get("auditedAt")
+            has_fingerprint = _extract_content_fingerprint(
+                audit.get("rawOutput") or ""
+            ) is not None
+        fresh_report = _check_audit_freshness(runner, issue_id,
+                                              worklog_dir=worklog_dir)
+        fresh = fresh_report is not None
+        if fresh:
+            reason = ("content fingerprint unchanged" if has_fingerprint
+                      else "within freshness window")
+        elif not audited_at:
+            reason = "no stored audit"
+        elif has_fingerprint:
+            reason = "content changed"
+        else:
+            reason = "stale (legacy audit, time gate)"
+    except RuntimeError as exc:
+        fresh = False
+        reason = f"freshness check failed: {exc}"
+
+    print(json.dumps({
+        "workItemId": issue_id,
+        "fresh": fresh,
+        "hasFingerprint": has_fingerprint,
+        "auditedAt": audited_at,
+        "reason": reason,
+    }))
+    return 0
+
+
 def _normalise_repo_path(path: str) -> str:
     """Normalise a git-reported or Key-Files path for comparison.
 
@@ -1745,26 +1928,31 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
         work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
     description = work_item.get("description", "") or ""
 
+    # An empty item id cannot be grepped: ``--grep=`` would match every
+    # commit. Emit only the Key Files source (or fail open) instead.
+    issue_id = (issue_id or "").strip()
+
     paths: set[str] = set()
 
     # (1) Files in commits referencing the work item id. One git call.
-    try:
-        proc = runner([
-            "git", "log", "--all", "--fixed-strings",
-            f"--grep={issue_id}", "--name-only",
-            f"--format={_TOUCHED_FILES_COMMIT_MARKER}%H",
-        ])
-    except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
-        return None
-    if proc.returncode != 0:
-        return None  # git unavailable / not a repository ⇒ fail open
-    for line in proc.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(_TOUCHED_FILES_COMMIT_MARKER):
-            continue
-        normalised = _normalise_repo_path(stripped)
-        if normalised:
-            paths.add(normalised)
+    if issue_id:
+        try:
+            proc = runner([
+                "git", "log", "--all", "--fixed-strings",
+                f"--grep={issue_id}", "--name-only",
+                f"--format={_TOUCHED_FILES_COMMIT_MARKER}%H",
+            ])
+        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
+            return None
+        if proc.returncode != 0:
+            return None  # git unavailable / not a repository ⇒ fail open
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(_TOUCHED_FILES_COMMIT_MARKER):
+                continue
+            normalised = _normalise_repo_path(stripped)
+            if normalised:
+                paths.add(normalised)
 
     # (2) Comment-recorded commit hashes (best-effort; one batched git call).
     #     A failure here is swallowed — the grep + Key Files sources still
@@ -2785,21 +2973,38 @@ def _run_tests_via_test_skill(
     success = bool(results) and not notice and not failures
 
     # Triage failures per the test skill (AC4) — never silently ignored.
+    # Deduplicate by test_name and enforce a hard cap to prevent runaway
+    # triage loops when parse_pytest_failures over-produces records
+    # (SA-0MUMC6LGE005UQNS).
     if failures:
         try:
             from triage.scripts.check_or_create import check_or_create
         except ImportError:
             check_or_create = None
+        seen: set[str] = set()
+        triaged_calls = 0
         for failure in failures:
+            test_name = failure.get("test_name", "")
+            if test_name in seen:
+                continue  # dedup — only triage each distinct test once
+            seen.add(test_name)
             if check_or_create is None:
                 triaged.append({
-                    "test_name": failure.get("test_name", ""),
+                    "test_name": test_name,
                     "error": "triage helper unavailable",
                 })
                 continue
+            triaged_calls += 1
+            if triaged_calls > TRIAGE_MAX_CALLS:
+                triaged.append({
+                    "test_name": test_name,
+                    "error": f"triage call limit reached (cap={TRIAGE_MAX_CALLS}); "
+                             f"{len(failures) - len(seen)} failures suppressed",
+                })
+                break  # cap — never hang the audit
             try:
                 triaged.append(check_or_create({
-                    "test_name": failure.get("test_name", ""),
+                    "test_name": test_name,
                     "stdout_excerpt": failure.get("stdout_excerpt", ""),
                     "stack_trace": failure.get("stack_trace", ""),
                     "repo_path": str(project_root),
@@ -2808,7 +3013,7 @@ def _run_tests_via_test_skill(
                 }))
             except Exception as exc:  # noqa: BLE001 -- triage must never crash the audit
                 triaged.append({
-                    "test_name": failure.get("test_name", ""),
+                    "test_name": test_name,
                     "error": str(exc),
                 })
 
@@ -3325,6 +3530,27 @@ def _resolve_parallelism() -> int:
     return _PARALLELISM_DEFAULT
 
 
+def _proxy_base_url() -> str:
+    """Resolve the llm-manager proxy base URL.
+
+    Precedence: ``AUDIT_PROXY_BASE_URL`` env var >
+    ``AUDIT_PROXY_BASE_URL_DEFAULT``. Single source of truth for both the
+    proxy-mode query and the derived slot-status endpoint, so the two can
+    never target different hosts (SA-0MUV2UBMT008OE2E).
+    """
+    return os.environ.get(AUDIT_PROXY_BASE_URL_ENV, AUDIT_PROXY_BASE_URL_DEFAULT)
+
+
+def _default_slot_status_url() -> str:
+    """Derive the slot-status endpoint from the proxy base URL.
+
+    Returns ``<proxy base>/llama/local/status`` so the slot-status host stays
+    aligned with the proxy-mode host unless ``AUDIT_SLOT_STATUS_URL``
+    overrides it (SA-0MUV2UBMT008OE2E).
+    """
+    return _proxy_base_url().rstrip("/") + AUDIT_SLOT_STATUS_PATH
+
+
 def _query_slot_status(url: str | None = None,
                        timeout: float = AUDIT_SLOT_STATUS_TIMEOUT) -> tuple[int | None, int | None]:
     """Best-effort query of the local proxy slot-status endpoint.
@@ -3334,11 +3560,23 @@ def _query_slot_status(url: str | None = None,
     unreachable, times out, returns non-JSON, or lacks the slot fields
     (fail-open — the caller degrades to the configured static ceiling).
 
+    Endpoint resolution (highest precedence first):
+
+    1. the explicit ``url`` argument,
+    2. the ``AUDIT_SLOT_STATUS_URL`` env var (used verbatim),
+    3. ``<proxy base>/llama/local/status`` derived from
+       ``AUDIT_PROXY_BASE_URL`` → ``AUDIT_PROXY_BASE_URL_DEFAULT``
+       (:func:`_default_slot_status_url`).
+
     The query uses a short timeout (``AUDIT_SLOT_STATUS_TIMEOUT`` = 1 s) and
     never raises: the dynamic ceiling must never block or fail the audit
     when the endpoint is unavailable (LP-0MSQ32S2M001EA74 AC3).
     """
-    target = url or os.environ.get(AUDIT_SLOT_STATUS_URL_ENV, AUDIT_SLOT_STATUS_URL_DEFAULT)
+    target = (
+        url
+        or os.environ.get(AUDIT_SLOT_STATUS_URL_ENV)
+        or _default_slot_status_url()
+    )
     try:
         with urllib.request.urlopen(target, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -3367,9 +3605,7 @@ def _query_proxy_mode(base_url: str | None = None,
     The query uses a short timeout (``AUDIT_PROXY_MODE_TIMEOUT`` = 3 s) and
     never raises: the mode check must never block or fail the audit.
     """
-    target = base_url or os.environ.get(
-        AUDIT_PROXY_BASE_URL_ENV, AUDIT_PROXY_BASE_URL_DEFAULT
-    )
+    target = base_url or _proxy_base_url()
     endpoint = target.rstrip("/") + "/admin/mode"
     try:
         with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
@@ -3870,12 +4106,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                        --exclude-tools ask_question`` to enable file-reading
                        capabilities in the Pi agent session.
 
-        # Context reduction: every call adds ``--no-context-files --no-skills``
-        so each pi session starts with minimal static context (~2KB instead of
-        ~49KB of duplicated global+project AGENTS.md plus the skills section).
-        Audit prompts are fully self-contained (read-only mandate, JSON
-        format, FILE SCOPE manifest, criteria) and must never depend on
-        AGENTS.md or skill descriptions.
+        # Context reduction + isolation: every call adds
+        # ``--no-context-files --no-skills --no-extensions``
+        # so each pi session starts with minimal static context (~2KB instead of
+        # ~49KB of duplicated global+project AGENTS.md plus the skills section),
+        # with no interactive/UI extensions loaded. Audit prompts are fully
+        # self-contained (read-only mandate, JSON format, FILE SCOPE manifest,
+        # criteria) and must never depend on AGENTS.md, skill descriptions, or
+        # extension-provided behaviour.
 
         max_retries: Maximum number of extra attempts after a provider error.
             When None, falls back to ``_PI_MAX_RETRIES`` (2). Long
@@ -3919,12 +4157,19 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             "--tools", "read,bash,grep,find,ls",
             "--exclude-tools", "ask_question",
         ])
-    # Context reduction (SA-0MSISKM8F004NW1U): audit prompts are fully
-    # self-contained, so drop the duplicated global+project AGENTS.md load
-    # (~40KB) and the skills section (~7KB) from every pi call in both tool
-    # modes. Both flags are loader toggles compatible with --mode json and
-    # --tools; prompts must never rely on AGENTS.md or skill descriptions.
-    cmd.extend(["--no-context-files", "--no-skills"])
+    # Context reduction + isolation (SA-0MSISKM8F004NW1U,
+    # SA-0MUEIOGT2005IR7F): audit prompts are fully self-contained, so drop the
+    # duplicated global+project AGENTS.md load (~40KB) and the skills section
+    # (~7KB) from every pi call in both tool modes. Also disable extension
+    # discovery (--no-extensions): interactive/UI extensions (compaction
+    # mirroring, status line, recovery) must not run inside audit sessions —
+    # after a session replacement/reload a stale ExtensionContext makes their
+    # async callbacks throw outside pi's try/catch and crash the pi process,
+    # surfacing as a spurious ``provider_error: Connection error.`` that blocks
+    # the audit/ship final-validation gate. All three are loader toggles
+    # compatible with --mode json and --tools; prompts must never rely on
+    # AGENTS.md, skill descriptions, or extensions.
+    cmd.extend(["--no-context-files", "--no-skills", "--no-extensions"])
     # Session-id: attach a descriptive session identifier so audit sessions
     # can be traced back to the work item being audited (SA-0MSNYMKV7005P0H9).
     if issue_id:
@@ -4668,12 +4913,23 @@ def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
                                runner: Runner | None = None) -> str:
     """Build the file-scope manifest injected into the Phase 2 prompt.
 
-    Combines the work item's Key Files, the git changed-file list, a
-    lightweight repo index, and Phase 1 evidence file:line refs (P4). The
-    manifest lets the model verify in-scope files without unbounded
-    repository exploration (the dominant Phase 2 cost).
+    Combines the work item's Key Files, the git changed-file list, the
+    item's committed *touched* files (resolved via
+    ``_resolve_touched_files``), a lightweight repo index, and Phase 1
+    evidence file:line refs (P4). The manifest lets the model verify
+    in-scope files without unbounded repository exploration (the dominant
+    Phase 2 cost).
 
-    *runner* is used for git queries and defaults to ``_default_runner``.
+    The touched-file source is essential on the normal post-implementation
+    checkout: the item's work is committed and the working tree is clean, so
+    ``_git_changed_files`` contributes nothing and the manifest would
+    otherwise omit the item's real changes — producing false "outside the
+    manifest" verdicts (SA-0MUJNZ5RN0078B5M).
+
+    Paths are de-duplicated across the Key Files / Changed files / Touched
+    files sections so each file is listed once, and the combined listing is
+    bounded by ``_FILE_SCOPE_MAX_FILES``. *runner* is used for git queries
+    and defaults to ``_default_runner``.
     """
     if runner is None:
         runner = _default_runner
@@ -4685,10 +4941,35 @@ def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
         key_lines = "\n".join(f"- `{f}`" for f in key_files[:_FILE_SCOPE_MAX_FILES])
         sections.append(f"Key Files (from the work item):\n{key_lines}")
 
+    # Committed touched files: on a clean checkout this is the ONLY source
+    # that captures the item's real changes (SA-0MUJNZ5RN0078B5M). Resolve
+    # before rendering the Changed-files section so the two can be diffed.
+    # Guard on a non-empty id: an empty ``--grep=`` would match every commit.
+    issue_id = str(issue.get("id", "") or "")
+    touched = []
+    if issue_id:
+        touched = _resolve_touched_files(
+            runner, issue_id, work_item=issue,
+        ) or []
+    touched_set = set(touched)
+    key_set = set(key_files)
+
     changed = _git_changed_files(runner)
+    changed = [f for f in changed if f not in key_set]
     if changed:
         changed_lines = "\n".join(f"- `{f}`" for f in changed)
         sections.append(f"Changed files (git diff / status):\n{changed_lines}")
+
+    # Only list touched paths not already covered by Key Files / changed so
+    # each file is named once and the bounded budget is spent on new paths.
+    touched_only = sorted(touched_set - key_set - set(changed))
+    if touched_only:
+        touched_lines = "\n".join(
+            f"- `{f}`" for f in touched_only[:_FILE_SCOPE_MAX_FILES]
+        )
+        sections.append(
+            f"Touched files (from the item's commits):\n{touched_lines}"
+        )
 
     refs = _phase1_evidence_refs(ac_results)
     if refs:
@@ -4783,6 +5064,20 @@ def _write_pending_screens_signal(
         pass
 
 
+def _format_blocking_children(children: list[dict]) -> str:
+    """Render pre-review children for the report's summary line.
+
+    Mirrors the naming used by ``_has_phase1_blocking_issues`` so the
+    human-readable summary names the same children that block closure
+    (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
+    """
+    return ", ".join(
+        f"{c.get('title') or c.get('id', '?')} "
+        f"({c.get('id', '?')}, {c.get('stage', '?')})"
+        for c in children
+    )
+
+
 def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            child_results: list[dict],
                            code_quality_findings: list[dict] | None = None,
@@ -4798,7 +5093,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            auto_green_run_sha: str | None = None,
                            test_skill_run_sha: str | None = None,
                            content_fingerprint: str | None = None,
-                           merge_gate_evidence: str | None = None) -> str:
+                           merge_gate_evidence: str | None = None,
+                           snapshot_exempt: set[str] | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -4875,31 +5171,25 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
     # Check that all active children are in in_review or done stage.
-    # Children that inherited the parent's pass (parent-first pass-through,
-    # SA-0MSKB6VJA005N43F) count as reviewed by virtue of the parent — they
-    # are not independently audited but the parent verdict covers them.
+    # The stage check is independent of inherited_pass (parent-first
+    # pass-through, SA-0MSKB6VJA005N43F): an inherited child is always in
+    # review, so only the actual stage counts here. A pre-review child must
+    # block closure even if an inherited pass was recorded
+    # (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
+    # Snapshot-exempt children (SA-0MUJAPC680078396): children that were
+    # in_review/done at audit start remain exempt even if demoted by a
+    # cascade-triggered re-audit.
     active_children = [c for c in child_results if c.get("stage") not in ("", None)]
     all_children_reviewed = all(
-        c.get("stage") in ("in_review", "done") or c.get("inherited_pass")
+        _child_is_exempt(c, snapshot_exempt)
+        or c.get("stage") in ("in_review", "done")
         for c in active_children
     )
 
     # Check each active (non-exempt) child's persisted audit verdict
-    # Exempt children: status=deleted (wl delete), completed/done (already closed),
-    # and those in in_review stage (per spec, in_review children do not
-    # block parent closure — only pre-review stages block).
-    def _is_exempt_child(c: dict) -> bool:
-        # Deleted children are fully closed
-        if c.get("status") == "deleted":
-            return True
-        # Completed/done children are fully closed
-        if c.get("status") == "completed" and c.get("stage") == "done":
-            return True
-        # Children in in_review stage should not have their audit verdicts
-        # block parent closure (per audit spec)
-        return c.get("stage") == "in_review"
-
-    non_exempt_children = [c for c in active_children if not _is_exempt_child(c)]
+    # Exempt children: status=deleted, completed/done, in_review, inherited_pass,
+    # or snapshot-exempt (SA-0MUJAPC680078396).
+    non_exempt_children = [c for c in active_children if not _child_is_exempt(c, snapshot_exempt)]
     any_child_audit_not_ready = any(
         c.get("child_audit_ready") is False
         for c in non_exempt_children
@@ -5032,7 +5322,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             )
             if adjusted_count > 0:
                 parts.append(f"({adjusted_count} with acceptable variance)")
-            parts.append(". All children are in in_review or done stage.")
+            if all_children_reviewed:
+                parts.append(". All children are in in_review or done stage.")
+            elif not_reviewed:
+                parts.append(
+                    ". Children not yet in in_review/done stage: "
+                    f"{_format_blocking_children(not_reviewed)}."
+                )
             if phase2_skip_note:
                 parts.append(f" Phase 2 deep analysis skipped: {phase2_skip_note}.")
             elif phase2_completed:
@@ -5062,7 +5358,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         elif unmet_count > 0 and not_reviewed:
             lines.append(
                 f"{unmet_count} acceptance criteria not met AND "
-                f"{len(not_reviewed)} children not yet in in_review/done stage."
+                f"{len(not_reviewed)} children not yet in in_review/done stage: "
+                f"{_format_blocking_children(not_reviewed)}."
             )
         elif unmet_count > 0:
             lines.append(
@@ -5074,9 +5371,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"{partial_count} of {len(ac_results)} acceptance criteria are "
                 f"only partially met."
             )
+        elif not_reviewed:
+            lines.append(
+                f"{len(not_reviewed)} children not yet in in_review/done stage: "
+                f"{_format_blocking_children(not_reviewed)}."
+            )
         else:
             lines.append(
-                f"{len(not_reviewed)} children not yet in in_review/done stage."
+                "Ready to close is No: one or more criteria are not met."
             )
 
     if _provider_error_count:
@@ -5237,21 +5539,35 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 "**Medium/low severity findings detected — "
                 "these are reported as warnings and do not block closure.**"
             )
+        findings_cap = _resolve_max_findings_in_report()
+        total_findings = len(cq_findings)
+        rendered_findings = cq_findings[:findings_cap]
         lines.append("")
         lines.append("| # | Severity | File | Line | Message | Linter | Code |")
         lines.append("|---|----------|------|------|---------|--------|------|")
-        for i, f in enumerate(cq_findings, 1):
+        for i, f in enumerate(rendered_findings, 1):
             lines.append(
                 f"| {i} | {f.get('severity', '?')} | "
                 f"{f.get('file', '?')} | {f.get('line', 0)} | "
                 f"{f.get('message', '')} | {f.get('linter', '?')} | "
                 f"{f.get('code', '')} |"
             )
+        if total_findings > findings_cap:
+            omitted = total_findings - findings_cap
+            lines.append("")
+            lines.append(
+                f"*{omitted} additional findings omitted for brevity "
+                f"(showing {findings_cap} of {total_findings}; "
+                f"cap: {findings_cap}).*"
+            )
 
         # False-positive screen section (SA-0MST01O4G002VPBR AC3/AC4):
         # per-finding classifications + justifications surface in the
         # human-readable report. Screen-failed runs annotate every entry.
+        # Capped to the same limit as the findings table so the rendered
+        # report stays bounded (WL-0MSS55LFU00973S2).
         if fp_results:
+            rendered_fp = fp_results[:findings_cap]
             lines.append("")
             lines.append("#### False-positive screen")
             lines.append("")
@@ -5264,13 +5580,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 lines.append("")
             lines.append("| # | File | Line | Code | Classification | Justification |")
             lines.append("|---|------|------|------|----------------|---------------|")
-            for e in fp_results:
+            for e in rendered_fp:
                 f = e.get("finding", {})
                 lines.append(
                     f"| {e.get('index', 0) + 1} | {f.get('file', '?')} | "
                     f"{f.get('line', 0)} | {f.get('code', '?')} | "
                     f"{e.get('classification', '?')} | "
                     f"{e.get('justification', '')} |"
+                )
+            if len(fp_results) > findings_cap:
+                fp_omitted = len(fp_results) - findings_cap
+                lines.append("")
+                lines.append(
+                    f"*{fp_omitted} additional false-positive screen entries "
+                    f"omitted for brevity (showing {findings_cap} of "
+                    f"{len(fp_results)}).*"
                 )
 
     # Remediation loop section (SA-0MST01OIN008MXYT / F2): applied
@@ -6292,8 +6616,44 @@ def _annotate_skip_evidence(ac_results: list[dict], note: str) -> list[dict]:
     return updated
 
 
-def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict],
-                                fp_screen_results: list[dict] | None = None) -> tuple[bool, str]:
+def _child_is_exempt(
+    child: dict,
+    snapshot_exempt: set[str] | None = None,
+) -> bool:
+    """Check whether a child is exempt from blocking parent closure.
+
+    Exempt children:
+    - ``stage == in_review`` or ``status == completed`` / ``stage == done``
+    - ``status == deleted`` (fully closed)
+    - **snapshot-exempt**: the child was ``in_review`` or ``done`` at audit
+      start, captured in *snapshot_exempt* (SA-0MUJAPC680078396).  Such
+      children retain their exemption even if a cascade-triggered re-audit
+      later demotes them.
+    """
+    if child.get("status") == "deleted":
+        return True
+    if child.get("status") == "completed" and child.get("stage") == "done":
+        return True
+    if child.get("stage") == "in_review":
+        return True
+    # NOTE: ``inherited_pass`` is deliberately NOT an exemption. The
+    # parent-first pass-through only applies to children already in
+    # ``in_review``/``done`` (guarded at assignment, SA-0MUD5R5EQ000D1V2), so
+    # the stage checks above already cover them; treating the flag itself as
+    # an exemption let a pre-review child bypass the stage block
+    # (SA-0MUA4Q431008HIH0).
+    # Snapshot-based exemption (SA-0MUJAPC680078396): if this child was
+    # exempt at audit start, it remains exempt regardless of any
+    # cascade-triggered re-audit demotion.
+    return bool(snapshot_exempt is not None and child.get("id") in snapshot_exempt)
+
+
+def _has_phase1_blocking_issues(
+    cq_findings: list[dict],
+    child_results: list[dict],
+    fp_screen_results: list[dict] | None = None,
+    snapshot_exempt: set[str] | None = None,
+) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
     Returns (blocked, reason). If blocked, Phase 2 deep analysis should be
@@ -6324,17 +6684,17 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
                 )
             return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
 
-    # Check children stages — skip deleted children and inherited-pass
-    # children (parent-first pass-through, SA-0MSKB6VJA005N43F: an inherited
-    # child is reviewed by virtue of the parent's pass).
+    # Check children stages — skip deleted children. inherited_pass is NOT
+    # an exemption (parent-first pass-through, SA-0MSKB6VJA005N43F): only the
+    # actual stage counts, so a pre-review child handed an inherited pass
+    # still blocks closure (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
     active_children = [
         c for c in child_results
         if c.get("stage") not in ("", None) and c.get("status") != "deleted"
-        and not c.get("inherited_pass")
     ]
     blocked_children = [
         c for c in active_children
-        if c.get("stage") not in ("in_review", "done")
+        if not _child_is_exempt(c, snapshot_exempt)
     ]
     if blocked_children:
         names = ", ".join(f"{c.get('title', '?')} ({c.get('stage', '?')})" for c in blocked_children[:3])
@@ -6342,11 +6702,11 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
 
     # Check each active child's persisted audit verdict
     # A child with child_audit_ready=False means its own audit says "not ready"
-    # Children in in_review stage are exempt from this check (per audit spec,
-    # in_review children do NOT block parent closure — only pre-review stages block).
+    # Exempt children (per audit spec, in_review children do NOT block parent
+    # closure — only pre-review stages block).  Snapshot-exempt children
+    # (SA-0MUJAPC680078396) are also exempt from verdict checking.
     for c in active_children:
-        # Skip in_review children — their audit verdicts do not block Phase 1
-        if c.get("stage") == "in_review":
+        if _child_is_exempt(c, snapshot_exempt):
             continue
         car = c.get("child_audit_ready")
         if car is False:
@@ -6357,14 +6717,18 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
 
     return False, ""
 
-def _build_issue_json(issue: dict, ac_results: list[dict],
-                      child_results: list[dict],
-                      code_quality_findings: list[dict] | None = None,
-                      code_quality_fixes_applied: int = 0,
-                      fp_screen_results: list[dict] | None = None,
-                      remediation_results: dict | None = None,
-                      phase2_completed: bool = False,
-                      phase2_skip_note: str | None = None) -> dict:
+def _build_issue_json(
+    issue: dict,
+    ac_results: list[dict],
+    child_results: list[dict],
+    code_quality_findings: list[dict] | None = None,
+    code_quality_fixes_applied: int = 0,
+    fp_screen_results: list[dict] | None = None,
+    remediation_results: dict | None = None,
+    phase2_completed: bool = False,
+    phase2_skip_note: str | None = None,
+    snapshot_exempt: set[str] | None = None,
+) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
     Ready-to-close logic:
@@ -6383,29 +6747,24 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
     # Check that all active children are in in_review or done stage.
-    # Children that inherited the parent's pass (parent-first pass-through,
-    # SA-0MSKB6VJA005N43F) count as reviewed by virtue of the parent.
+    # The stage check is independent of inherited_pass (parent-first
+    # pass-through, SA-0MSKB6VJA005N43F): an inherited child is always in
+    # review, so only the actual stage counts here
+    # (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
+    # Snapshot-exempt children (SA-0MUJAPC680078396): children that were
+    # in_review/done at audit start remain exempt even if demoted by a
+    # cascade-triggered re-audit.
     active_children = [c for c in child_results if c.get("stage") not in ("", None)]
     all_children_reviewed = all(
-        c.get("stage") in ("in_review", "done") or c.get("inherited_pass")
+        _child_is_exempt(c, snapshot_exempt)
+        or c.get("stage") in ("in_review", "done")
         for c in active_children
     )
 
     # Check each non-exempt child's persisted audit verdict
-    # Exempt children: status=deleted (wl delete), completed/done (already closed),
-    # and those in in_review stage (per spec, in_review children do not
-    # block parent closure — only pre-review stages block).
-    def _is_exempt(c: dict) -> bool:
-        # Deleted children are fully closed
-        if c.get("status") == "deleted":
-            return True
-        # Completed/done children are fully closed
-        if c.get("status") == "completed" and c.get("stage") == "done":
-            return True
-        # Children in in_review stage should not have their audit verdicts
-        # block parent closure (per audit spec)
-        return c.get("stage") == "in_review"
-    non_exempt_children = [c for c in active_children if not _is_exempt(c)]
+    # Exempt children: status=deleted, completed/done, in_review, inherited_pass,
+    # or snapshot-exempt (SA-0MUJAPC680078396).
+    non_exempt_children = [c for c in active_children if not _child_is_exempt(c, snapshot_exempt)]
     any_child_audit_not_ready = any(
         c.get("child_audit_ready") is False
         for c in non_exempt_children
@@ -7075,7 +7434,12 @@ def _run_phase2_deep_analysis(
         # instead of emitting misleading 'unmet' verdicts.
         if owning_root is None:
             owning_root = _resolve_owning_project_root(issue.get("id", ""))
-        scope_error = _validate_file_scope_manifest(file_scope, owning_root)
+        touched_files = _resolve_touched_files(
+            runner, issue.get("id", ""), work_item=issue,
+        )
+        scope_error = _validate_file_scope_manifest(
+            file_scope, owning_root, touched_files=touched_files,
+        )
         if scope_error:
             raise AuditScopeError(scope_error)
 
@@ -7517,6 +7881,17 @@ class _AuditContext:
     separate-process path.
     """
     phase1_model: str | None = None
+    snapshot_exempt_children: set[str] = field(default_factory=set)
+    """Child IDs that were exempt (in_review/done) at audit start.
+
+    Used by the child-exemption snapshot / no-side-effect-demotion
+    contract (SA-0MUJAPC680078396).  The parent's closure decision
+    evaluates against the *pre-audit* stage of these children, so a
+    cascade-triggered child re-audit that demotes an exempt child does
+    not retroactively block the parent.  The child-side lifecycle also
+    suppresses demotion when the cascade flag is set (see
+    _apply_terminal_lifecycle).
+    """
 
     # Phase checkpoint store (SA-0MT6EZUS9004FJ9T): bound by cmd_issue after
     # the launch-context gate; read by _phase1_parent_screening and
@@ -7629,6 +8004,30 @@ def _bind_fetched_item(ctx: _AuditContext, data: dict) -> None:
     ctx.children = payload.get("children", []) or []
     ctx.description = work_item.get("description", "") or ""
     ctx.comments = payload.get("comments", []) or []
+
+
+def _capture_exempt_children_snapshot(ctx: _AuditContext) -> None:
+    """Capture which children were exempt at audit start (SA-0MUJAPC680078396).
+
+    Children whose ``stage`` is ``in_review`` or whose ``status`` is
+    ``completed`` and ``stage`` is ``done`` are exempt from blocking the
+    parent's closure.  This snapshot is captured BEFORE any child
+    re-audits run, so the parent's closure decision uses the *pre-audit*
+    stage of these children.
+
+    The snapshot is stored in ``ctx.snapshot_exempt_children`` as a set
+    of child IDs for efficient lookup.
+    """
+    snapshot: set[str] = set()
+    for child in ctx.children:
+        child_id = child.get("id", "")
+        child_stage = child.get("stage", "")
+        child_status = child.get("status", "")
+        if child_stage == "in_review" or (
+            child_status == "completed" and child_stage == "done"
+        ):
+            snapshot.add(child_id)
+    ctx.snapshot_exempt_children = snapshot
 
 
 def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], str]:
@@ -9876,8 +10275,15 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
         # Validate the FILE SCOPE manifest covers the item repository
         # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
         # (e.g. the audit skill's own tree) would emit misleading
-        # 'unmet' verdicts — abort with a scope error instead.
-        scope_error = _validate_file_scope_manifest(file_scope, owning_root)
+        # 'unmet' verdicts — abort with a scope error instead. The resolved
+        # touched set also guards against a manifest that references the repo
+        # but omits the item's own committed files (SA-0MUKCOW1I001MJ7O).
+        touched_files = _resolve_touched_files(
+            runner, work_item.get("id", ""), work_item=work_item,
+        )
+        scope_error = _validate_file_scope_manifest(
+            file_scope, owning_root, touched_files=touched_files,
+        )
         if scope_error:
             if json_mode:
                 print(json.dumps({"error": scope_error}, indent=2))
@@ -10439,8 +10845,13 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     # Propagate the LIVE_REPO_GUARD_ACTIVE marker so
                                     # child audits inherit the recursion guard and
                                     # cannot cascade further (SA-0MUG47DYG006TV40).
+                                    # Propagate the AUDIT_CASCADE_AUDIT marker so
+                                    # child audits know they were cascade-triggered
+                                    # and suppress lifecycle demotion on exempt
+                                    # children (SA-0MUJAPC680078396 AC2).
                                     child_env = dict(os.environ)
                                     child_env[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
+                                    child_env[AUDIT_CASCADE_AUDIT_ENV] = "1"
                                     effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
                                     subprocess.run(
                                         audit_cmd,
@@ -10763,12 +11174,21 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         continue
 
                     if not parent_gaps:
-                        # Parent passed with no gaps → child inherits passed
-                        # (AC2), unless the child's own content changed (AC6 —
-                        # changed children are never silently inherited-passed).
-                        if _child_content_changed(
-                            runner, child["id"], worklog_dir=worklog_dir,
-                            work_item=child,
+                        # Parent passed with no gaps. A child may inherit that
+                        # pass (AC2) only when it has actually reached review
+                        # (in_review/done); a pre-review child has not been
+                        # implemented/reviewed yet, so it must be audited
+                        # independently and must block closure — inherited_pass
+                        # must never exempt a pre-review child from the stage
+                        # check (SA-0MUA4Q431008HIH0 / SA-0MUD5R5EQ000D1V2).
+                        # Changed children are also never silently
+                        # inherited-passed (AC6).
+                        if (
+                            child.get("stage") not in ("in_review", "done")
+                            or _child_content_changed(
+                                runner, child["id"], worklog_dir=worklog_dir,
+                                work_item=child,
+                            )
                         ):
                             cr["child_audit_ready"] = False
                             pending_children.append((len(child_results), child))
@@ -11015,6 +11435,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 test_skill_run_sha=test_skill_run_sha,
                 content_fingerprint=content_fingerprint,
                 merge_gate_evidence=ctx.merge_gate_evidence,
+                snapshot_exempt=ctx.snapshot_exempt_children,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if ctx.script_failure:
@@ -11059,6 +11480,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 remediation_results=ctx.remediation_results,
                 phase2_completed=phase2_completed,
                 phase2_skip_note=phase2_skip_note,
+                snapshot_exempt=ctx.snapshot_exempt_children,
             )
             payload["child_persist_results"] = child_persist_results
             # Include script failure info in JSON output
@@ -11226,6 +11648,63 @@ def _lifecycle_state_matches(
     return actual_status == expected_status and actual_stage == expected_stage
 
 
+# ---------------------------------------------------------------------------
+# Status/stage compatibility (mirrors ContextHub's statusStageCompatibility).
+# Kept inlined to avoid importing from ContextHub — the audit runner is
+# self-contained.
+# ---------------------------------------------------------------------------
+_STATUS_STAGE_COMPAT: dict[str, frozenset[str]] = {
+    "open": frozenset({"idea", "intake_complete", "plan_complete"}),
+    "in-progress": frozenset({"intake_complete", "plan_complete"}),
+    "input_needed": frozenset({"idea", "intake_complete", "plan_complete"}),
+    "blocked": frozenset({"idea", "intake_complete", "plan_complete"}),
+    "completed": frozenset({"in_review", "done"}),
+    "deleted": frozenset({"idea", "intake_complete", "plan_complete", "done"}),
+}
+_DEFAULT_SAFE_STAGE = "plan_complete"
+
+
+def _coerce_valid_status_stage(status, stage):
+    """Validate and coerce a (status, stage) pair to a valid combination.
+
+    When the captured pre-audit status/stage is incompatible (e.g. ``blocked``
+    + ``in_review``), keep the captured status but fall back to the nearest
+    valid stage.  A warning is printed to ``stderr`` so operators know the
+    original state was non-standard.
+
+    Args:
+        status: The pre-audit status (may be ``None`` → defaults to ``"open"``).
+        stage:  The pre-audit stage (may be ``None``).
+
+    Returns:
+        A ``(status, stage)`` tuple guaranteed to be a valid combination per the
+        ``_STATUS_STAGE_COMPAT`` mapping.
+    """
+    effective_status = status or "open"
+    effective_stage = stage
+
+    # If stage is None, apply the existing fallback logic.
+    if effective_stage is None:
+        effective_stage = (
+            "in_review" if effective_status == "completed" else "plan_complete"
+        )
+
+    # Check validity.
+    valid_stages = _STATUS_STAGE_COMPAT.get(effective_status)
+    if valid_stages is not None and effective_stage in valid_stages:
+        return effective_status, effective_stage
+
+    # Invalid combo — coerce.
+    coerced_stage = _DEFAULT_SAFE_STAGE
+    print(
+        f"Warning: pre-audit state ({effective_status}/{effective_stage}) is "
+        f"an invalid status/stage combination; coercing to "
+        f"({effective_status}/{coerced_stage}).",
+        file=sys.stderr,
+    )
+    return effective_status, coerced_stage
+
+
 def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
     """Best-effort restore of the captured pre-audit state after a failed
     terminal transition (WL-0MSWFRM800073Y81).
@@ -11236,11 +11715,15 @@ def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
     the item observable and consistent; any residual failure is logged
     loudly rather than silently ignored. Falls back to ``open``/``plan_complete``
     only when the pre-audit state could not be captured.
+
+    If the captured (status, stage) pair is invalid (e.g. ``blocked`` +
+    ``in_review``), ``_coerce_valid_status_stage`` keeps the status but
+    coerces the stage to a valid default, so the restore never fails due to
+    an incompatible combination.
     """
-    safe_status = ctx.original_status or "open"
-    safe_stage = ctx.original_stage
-    if not safe_stage:
-        safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+    safe_status, safe_stage = _coerce_valid_status_stage(
+        ctx.original_status, ctx.original_stage,
+    )
     cmd = [
         "wl", "update", ctx.issue_id,
         "--status", safe_status,
@@ -11272,6 +11755,143 @@ def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
             f"--stage {safe_stage}`.",
             file=sys.stderr,
         )
+
+
+def _is_terminal_lifecycle(status, stage) -> bool:
+    """Whether a work item is already terminal.
+
+    Terminal means ``stage == "done"`` or ``status == "deleted"`` — the two
+    states in which a descendant must never be re-marked, re-commented, or
+    resurrected by the audit cascade (SA-0MUR7Y3BJ004FGPP AC2).
+    """
+    return str(stage or "") == "done" or str(status or "") == "deleted"
+
+
+def _iter_descendants_with_state(runner: Runner, root_id: str,
+                                worklog_dir: str | None):
+    """Yield ``(id, status, stage)`` for the full recursive subtree of *root_id*.
+
+    Depth-first over ``wl show <id> --children --json``, cycle-safe via a
+    visited set and excluding the root. A failure to resolve one node's
+    children is logged and skipped (non-fatal) so a single wl hiccup never
+    aborts the cascade. Reuses the children payload's own status/stage so no
+    extra per-descendant ``wl show`` is required.
+    """
+    visited = {root_id}
+    stack = [root_id]
+    while stack:
+        current = stack.pop()
+        try:
+            data = _run_wl(
+                runner,
+                ["wl", "show", current, "--children", "--json"],
+                worklog_dir=worklog_dir,
+            )
+        except RuntimeError as exc:
+            print(
+                f"Warning: descendant cascade could not resolve children of "
+                f"{current}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        for child in data.get("children") or []:
+            if not isinstance(child, dict):
+                continue
+            child_id = child.get("id")
+            if not child_id or child_id in visited:
+                continue
+            visited.add(child_id)
+            yield child_id, child.get("status"), child.get("stage")
+            stack.append(child_id)
+
+
+def _cascade_descendants_terminal(
+    parent_id: str,
+    audit_timestamp: str,
+    runner: Runner,
+    worklog_dir: str | None = None,
+    persist: bool = True,
+) -> int:
+    """Terminalise every descendant of an audit-approved parent.
+
+    Authorised ONLY by a passing parent audit verdict (the caller invokes it
+    exclusively from the verified ``ctx.audit_verdict == "yes"`` success path
+    in :func:`_apply_terminal_lifecycle`) — never by status/stage alone.
+    Setting every descendant to ``status=completed, stage=done`` with an
+    explanatory comment means an audit-approved parent can be closed without
+    a force-close sweep.
+
+    Safety properties (SA-0MUR7Y3BJ004FGPP AC1-AC3/AC5):
+
+    - Idempotent: already-terminal (``stage == "done"``) and ``deleted``
+      descendants are skipped — no update, no comment, nothing resurrected.
+    - Dry-run safe: ``persist=False`` suppresses the cascade entirely.
+    - Non-fatal: a per-child ``wl`` failure is logged loudly and does not
+      abort the audit; the next passing audit completes the cascade.
+
+    Args:
+        parent_id: The audited parent whose subtree is being terminalised.
+        audit_timestamp: ISO-8601 timestamp of the authorising audit,
+            embedded in each cascade comment.
+        runner: Injectable ``wl`` runner.
+        worklog_dir: Explicit worklog directory override.
+        persist: ``False`` under ``--do-not-persist`` (dry-run).
+
+    Returns:
+        The number of descendants actually cascaded.
+    """
+    if not persist:
+        print(
+            f"Dry-run: skipping descendant cascade for {parent_id}.",
+            file=sys.stderr,
+        )
+        return 0
+
+    cascaded = 0
+    for child_id, status, stage in _iter_descendants_with_state(
+        runner, parent_id, worklog_dir
+    ):
+        if _is_terminal_lifecycle(status, stage):
+            continue
+        try:
+            _run_wl(
+                runner,
+                ["wl", "update", child_id, "--status", "completed",
+                 "--stage", "done", "--json"],
+                worklog_dir=worklog_dir,
+            )
+        except RuntimeError as exc:
+            print(
+                f"Warning: cascade failed to terminalise {child_id} "
+                f"(descendant of {parent_id}): {exc}",
+                file=sys.stderr,
+            )
+            continue
+        comment = (
+            f"Cascaded to completed/done by audit-approved parent {parent_id} "
+            f"(audit {audit_timestamp}): the parent audit passed, so all its "
+            f"descendants are considered complete."
+        )
+        try:
+            _run_wl(
+                runner,
+                ["wl", "comment", "add", child_id, "--comment", comment,
+                 "--author", "audit", "--json"],
+                worklog_dir=worklog_dir,
+            )
+        except RuntimeError as exc:
+            print(
+                f"Warning: cascade comment failed for {child_id}: {exc}",
+                file=sys.stderr,
+            )
+        cascaded += 1
+    if cascaded:
+        print(
+            f"Cascade: terminalised {cascaded} descendant(s) of "
+            f"audit-approved parent {parent_id}.",
+            file=sys.stderr,
+        )
+    return cascaded
 
 
 def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
@@ -11341,6 +11961,11 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # Conservative default: on any computation failure below, treat the
     # run as fallback-tainted so the debug log is retained for forensics.
     fallback_tainted = True
+    # Set True ONLY in the verified 'Ready to close: Yes' advance branch
+    # below. The descendant cascade is authorised by this flag alone — it
+    # must never fire on the 'no'/restore/fallback branches
+    # (SA-0MUR7Y3BJ004FGPP AC3; the SA-0MU2OY1N9000XL2H scope guard).
+    cascade_authorised = False
     try:
         # Infra-fallback provenance: a "No" derived from infrastructure-
         # failure fallbacks must restore, never demote. The flag does NOT
@@ -11369,12 +11994,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             # when the original state could not be determined (capture
             # failed / unknown). The assignee is cleared so the item stays
             # observable in the actionable queue for a re-audit.
-            safe_status = ctx.original_status
-            safe_stage = ctx.original_stage
-            if not safe_stage:
-                # Stage unknown (capture failed): pick a stage valid for
-                # the restored status so wl never rejects the combo.
-                safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+            safe_status, safe_stage = _coerce_valid_status_stage(
+                ctx.original_status, ctx.original_stage,
+            )
             if ctx.audit_completed and ctx.audit_verdict == "yes":
                 # Never silently diverge (WL-0MSN7XAUS008WOPQ AC4): a
                 # completed run whose report parsed 'Ready to close: Yes'
@@ -11409,6 +12031,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             # redundant approvals (SA-0MSSVKYEW008PJ9H). The flag is
             # inserted before the trailing --json (file convention:
             # --json is always the last flag).
+            # This is the sole authorisation for the descendant cascade
+            # below — a passing verdict, not status/stage (AC3).
+            cascade_authorised = True
             cmd = ["wl", "update", ctx.issue_id]
             if ctx.original_stage == "done":
                 cmd += ["--status", "completed"]
@@ -11429,16 +12054,51 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             dry_run_freshness_refresh = not ctx.persist
         else:  # ctx.audit_verdict == "no"
             # Return to the actionable queue at a fixed pre-review stage.
-            restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
-            expected_status, expected_stage = "open", "plan_complete"
-            # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
-            # integration fails the audit closed and flags the item for
-            # producer review so the producer investigates and integrates
-            # manually — never proceed past Phase 1 with unmerged work.
-            if ctx.merge_gate_blocker:
-                restore_cmd = ["wl", "update", ctx.issue_id,
-                               "--status", "open", "--stage", "plan_complete",
-                               "--needs-producer-review", "yes", "--json"]
+            # Cascade-audit suppression (SA-0MUJAPC680078396 AC2): when this
+            # audit was auto-triggered by a parent's ``--audit-children``
+            # cascade AND the item was already ``in_review`` or ``done``
+            # before this run, suppress the demotion — a parent-triggered
+            # re-audit must never silently push completed/in-review work
+            # back into the actionable queue.
+            _cascade_suppress_demotion = (
+                _is_cascade_audit()
+                and ctx.original_stage in ("in_review", "done")
+            )
+            if _cascade_suppress_demotion:
+                # Restore the original stage instead of demoting.
+                safe_status, safe_stage = _coerce_valid_status_stage(
+                    ctx.original_status, ctx.original_stage,
+                )
+                restore_cmd = [
+                    "wl", "update", ctx.issue_id,
+                    "--status", safe_status,
+                    "--stage", safe_stage,
+                    "--assignee", "",
+                    "--json",
+                ]
+                expected_status, expected_stage = safe_status, safe_stage
+                print(
+                    f"Cascade-audit: suppressed demotion for {ctx.issue_id} "
+                    f"(was {ctx.original_stage}; verdict 'No' is from "
+                    "a parent-triggered re-audit, not an independent review).",
+                    file=sys.stderr,
+                )
+            else:
+                restore_cmd = [
+                    "wl", "update", ctx.issue_id,
+                    "--status", "open", "--stage", "plan_complete", "--json",
+                ]
+                expected_status, expected_stage = "open", "plan_complete"
+                # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
+                # integration fails the audit closed and flags the item for
+                # producer review so the producer investigates and integrates
+                # manually — never proceed past Phase 1 with unmerged work.
+                if ctx.merge_gate_blocker:
+                    restore_cmd = [
+                        "wl", "update", ctx.issue_id,
+                        "--status", "open", "--stage", "plan_complete",
+                        "--needs-producer-review", "yes", "--json",
+                    ]
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(
             f"Error: could not compute terminal status for {ctx.issue_id}: {exc}; "
@@ -11510,6 +12170,30 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         )
         _restore_pre_audit_state_on_failure(ctx)
         return 1
+
+    # Verdict-authorised descendant cascade (SA-0MUR7Y3BJ004FGPP): a passing
+    # parent audit terminalises its whole subtree so the parent can be closed
+    # without a force-close sweep. Runs ONLY on the verified 'yes' advance
+    # (cascade_authorised), never on the 'no'/restore/fallback branches, and
+    # is suppressed under --do-not-persist (checked here and inside the
+    # helper). A cascade failure never fails the audit (per-child try/except
+    # inside the helper). The scope guard (SA-0MU2OY1N9000XL2H) is unaffected:
+    # a non-passing parent never reaches this point, so it still refuses to
+    # close over non-terminal descendants.
+    if cascade_authorised and ctx.persist:
+        try:
+            _cascade_descendants_terminal(
+                ctx.issue_id,
+                datetime.now(timezone.utc).isoformat(),
+                runner=ctx.runner,
+                worklog_dir=ctx.worklog_dir,
+                persist=ctx.persist,
+            )
+        except Exception as exc:  # noqa: BLE001 -- cascade must never abort the audit
+            print(
+                f"Warning: descendant cascade for {ctx.issue_id} failed: {exc}",
+                file=sys.stderr,
+            )
 
     # Dry-run freshness refresh (SA-0MTJ0KO6L004GIZK): as the LAST write of a
     # passing --do-not-persist run, refresh ``auditedAt``/``auditResult`` via
@@ -11884,6 +12568,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
                               worklog_dir=ctx.worklog_dir)
             rc = 1
         else:
+            # Capture the child-exemption snapshot at the very start of the
+            # audit — before Phase 1 screening or any child re-audit runs
+            # (SA-0MUJAPC680078396).  Children that were ``in_review`` or
+            # ``done`` at this point are exempt from blocking the parent's
+            # closure, even if a cascade-triggered child audit later demotes
+            # them.
+            _capture_exempt_children_snapshot(ctx)
             _phase1_parent_screening(ctx)
             rc = _phase_children(ctx)
             if rc is not None:
@@ -12589,6 +13280,18 @@ def build_parser() -> argparse.ArgumentParser:
                                "there too"
                            ))
 
+    p_freshness = sub.add_parser(
+        "check-freshness",
+        help=(
+            "Read-only: report whether a work item's stored audit is still "
+            "fresh (content fingerprint / time gate). Never runs an audit "
+            "and never mutates the worklog (SA-0MUOO5W8J001DYTI)"
+        ),
+    )
+    p_freshness.add_argument("issue_id", help="Work item id to check")
+    p_freshness.add_argument("--worklog-dir", default=None,
+                             help="Explicit .worklog directory to target (overrides auto-resolution)")
+
     return p
 
 
@@ -12683,6 +13386,10 @@ def main(argv: list[str] | None = None) -> int:
             print(_root_timer.render(), file=sys.stderr)
         _run_session_cleanup(args)
         return _rc
+    elif args.command == "check-freshness":
+        # Read-only freshness probe (SA-0MUOO5W8J001DYTI): no pi, no worklog
+        # mutation, no host audit slot.
+        return cmd_check_freshness(args.issue_id, worklog_dir=args.worklog_dir)
 
     return 2
 

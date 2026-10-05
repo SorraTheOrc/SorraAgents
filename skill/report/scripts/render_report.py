@@ -339,6 +339,21 @@ def render_metadata(
     return metadata
 
 
+# ─── Session status derivation ─────────────────────────────────────────
+
+def _derive_session_status(acceptance_criteria):
+    """Derive the session status from AC verdicts.
+
+    Returns ``"completed"`` when all ACs are met (or the list is empty);
+    ``"incomplete"`` when any AC has a verdict other than ``"met"``.
+    """
+    for row in acceptance_criteria or []:
+        # rows are (ac#, description, metric, verdict)
+        if len(row) >= 4 and row[3] != "met":
+            return "incomplete"
+    return "completed"
+
+
 # ─── Report rendering ──────────────────────────────────────────────────
 
 def render_report(
@@ -382,8 +397,11 @@ def render_report(
     """
     lines = []
 
+    # Derive session status from AC verdicts
+    status = _derive_session_status(acceptance_criteria)
+
     # Header
-    lines.append(f"# Completed {skill_name}")
+    lines.append(f"# {status.title()} {skill_name}")
     lines.append("")
     lines.append(f"**{title}** ({work_item_id})")
     lines.append("")
@@ -435,10 +453,17 @@ def render_report(
     # Conclusion
     lines.append("## Conclusion")
     lines.append("")
-    lines.append(
-        f"This completes the {skill_name} process for "
-        f"{work_item_id} ({title}). Ready for {next_action}."
-    )
+    if status == "completed":
+        lines.append(
+            f"This completes the {skill_name} process for "
+            f"{work_item_id} ({title}). Ready for {next_action}."
+        )
+    else:
+        lines.append(
+            f"{skill_name.title()} session for {work_item_id} ({title}) "
+            f"is incomplete. Requires attention "
+            f"({next_action})."
+        )
     lines.append("")
     lines.append("</end_session>")
 

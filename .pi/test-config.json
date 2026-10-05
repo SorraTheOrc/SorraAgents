@@ -1,1 +1,51 @@
-{"timeoutPerCommand": 1500}
+{
+  "timeoutPerCommand": 1500,
+  "groups": {
+    "audit": {
+      "description": "Audit skill tests and audit-related test suites",
+      "commands": [
+        "pytest -q -r a --disable-warnings skill/audit/tests/"
+      ],
+      "paths": [
+        "skill/audit/**"
+      ]
+    },
+    "test": {
+      "description": "Test skill core tests and test infrastructure",
+      "commands": [
+        "pytest -q -r a --disable-warnings skill/test/tests/"
+      ],
+      "paths": [
+        "skill/test/**",
+        "skill/test_cache.py"
+      ]
+    },
+    "shared": {
+      "description": "Shared skill utilities and cross-cutting tests",
+      "commands": [
+        "pytest -q -r a --disable-warnings skill/shared/tests/"
+      ],
+      "paths": [
+        "skill/shared/**"
+      ]
+    },
+    "implement": {
+      "description": "Implement skill tests",
+      "commands": [
+        "pytest -q -r a --disable-warnings skill/implement/tests/"
+      ],
+      "paths": [
+        "skill/implement/**"
+      ]
+    },
+    "full": {
+      "description": "Full project test suite (all groups)",
+      "commands": [
+        "pytest -q -r a --disable-warnings"
+      ],
+      "paths": [
+        "**"
+      ]
+    }
+  }
+}

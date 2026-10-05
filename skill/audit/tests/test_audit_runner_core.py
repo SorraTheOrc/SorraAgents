@@ -282,6 +282,7 @@ class TestCallPiEnableTools:
         # Context reduction flags are present in the tool-enabled path
         assert "--no-context-files" in args
         assert "--no-skills" in args
+        assert "--no-extensions" in args
 
     def test_command_unchanged_when_enable_tools_false(self):
         """AC2: _call_pi() does NOT add --tools when enable_tools=False (default)."""
@@ -302,6 +303,7 @@ class TestCallPiEnableTools:
         # Context reduction flags are present in the no-tools path
         assert "--no-context-files" in args
         assert "--no-skills" in args
+        assert "--no-extensions" in args
 
     def test_default_enable_tools_is_false(self):
         """AC3: Default value of enable_tools is False (backward compatible)."""
@@ -331,6 +333,7 @@ class TestCallPiEnableTools:
         assert args == [
             "pi", "-p", "--mode", "json", "--model", "test-model",
             "test prompt", "--no-context-files", "--no-skills",
+            "--no-extensions",
         ]
 
     def test_context_reduction_flags_present_in_both_tool_modes(self):
@@ -350,8 +353,10 @@ class TestCallPiEnableTools:
             args = mock_popen.call_args[0][0]
             assert "--no-context-files" in args
             assert "--no-skills" in args
+            assert "--no-extensions" in args
             # Flags come after the prompt, before/around the tools block
             assert args.index("--no-context-files") < args.index("--no-skills")
+            assert args.index("--no-skills") < args.index("--no-extensions")
             if enable_tools:
                 assert "--tools" in args
             else:
@@ -590,6 +595,7 @@ class TestCallPiSessionId:
         args = mock_popen.call_args[0][0]
         assert "--no-context-files" in args
         assert "--no-skills" in args
+        assert "--no-extensions" in args
         assert "--tools" in args
 
 
@@ -3253,6 +3259,13 @@ class TestSlotAwareConcurrency:
 
     def test_slot_status_constants(self):
         assert audit_runner.AUDIT_SLOT_STATUS_URL_ENV == "AUDIT_SLOT_STATUS_URL"
+        # The default endpoint is DERIVED from the proxy base URL so the two
+        # reference constants can never diverge (SA-0MUV2UBMT008OE2E).
+        expected = (
+            audit_runner.AUDIT_PROXY_BASE_URL_DEFAULT.rstrip("/")
+            + audit_runner.AUDIT_SLOT_STATUS_PATH
+        )
+        assert audit_runner.AUDIT_SLOT_STATUS_URL_DEFAULT == expected
         assert audit_runner.AUDIT_SLOT_STATUS_URL_DEFAULT.endswith("/llama/local/status")
         assert audit_runner.AUDIT_SLOT_STATUS_TIMEOUT <= 2  # short timeout (1s)
 
@@ -3261,6 +3274,75 @@ class TestSlotAwareConcurrency:
         with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_MAX_CHILD_CONCURRENCY_ENV: "1"}, clear=False), \
              self._mock_slot_status(4, 4):
             assert audit_runner._resolve_child_concurrency() == 1
+
+class TestSlotStatusEndpointResolution:
+    """Slot-status endpoint derives from the proxy base URL (SA-0MUV2UBMT008OE2E).
+
+    Previously ``AUDIT_SLOT_STATUS_URL_DEFAULT`` hard-coded ``localhost:8000``
+    while ``AUDIT_PROXY_BASE_URL_DEFAULT`` pointed at ``192.168.0.199:8000``,
+    so the slot query always missed the real proxy on the default deployment.
+    The default now follows the proxy base URL resolution.
+    """
+
+    @staticmethod
+    def _mock_status_response(body: bytes = b'{"available_slots": 2, "total_slots": 4}'):
+        mock_resp = mock.MagicMock()
+        mock_resp.read.return_value = body
+        mock_resp.__enter__.return_value = mock_resp
+        return mock.patch("urllib.request.urlopen", return_value=mock_resp)
+
+    def test_default_derives_from_proxy_base_url(self):
+        """The default slot URL is the proxy base URL + the status path."""
+        expected = (
+            audit_runner.AUDIT_PROXY_BASE_URL_DEFAULT.rstrip("/")
+            + audit_runner.AUDIT_SLOT_STATUS_PATH
+        )
+        assert audit_runner.AUDIT_SLOT_STATUS_URL_DEFAULT == expected
+        assert audit_runner._default_slot_status_url() == expected
+
+    def test_query_defaults_to_proxy_base_url_when_no_env(self):
+        """No env overrides → the query targets the proxy default host."""
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True), \
+             self._mock_status_response() as mock_open:
+            audit_runner._query_slot_status()
+        assert mock_open.call_args[0][0] == audit_runner.AUDIT_SLOT_STATUS_URL_DEFAULT
+
+    def test_query_uses_proxy_base_url_env(self):
+        """AUDIT_PROXY_BASE_URL drives the slot default when the slot URL is unset."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PROXY_BASE_URL_ENV: "http://alt:9000"},
+            clear=True,
+        ), self._mock_status_response() as mock_open:
+            audit_runner._query_slot_status()
+        assert mock_open.call_args[0][0] == "http://alt:9000/llama/local/status"
+
+    def test_slot_url_env_takes_precedence_over_proxy_base_url(self):
+        """AUDIT_SLOT_STATUS_URL is used verbatim, ignoring the proxy base URL."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {
+                audit_runner.AUDIT_PROXY_BASE_URL_ENV: "http://alt:9000",
+                audit_runner.AUDIT_SLOT_STATUS_URL_ENV: "http://override:7000/custom/status",
+            },
+            clear=True,
+        ), self._mock_status_response() as mock_open:
+            audit_runner._query_slot_status()
+        assert mock_open.call_args[0][0] == "http://override:7000/custom/status"
+
+    def test_explicit_url_param_wins_over_everything(self):
+        """The explicit ``url`` argument is highest precedence."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {
+                audit_runner.AUDIT_PROXY_BASE_URL_ENV: "http://alt:9000",
+                audit_runner.AUDIT_SLOT_STATUS_URL_ENV: "http://override:7000/custom/status",
+            },
+            clear=True,
+        ), self._mock_status_response() as mock_open:
+            audit_runner._query_slot_status(url="http://explicit:1/status")
+        assert mock_open.call_args[0][0] == "http://explicit:1/status"
+
 
 class TestProxyModeSerialization:
     """Proxy cheap-mode detection + per-run serialization (SA-0MSN04X2S006ONH0).

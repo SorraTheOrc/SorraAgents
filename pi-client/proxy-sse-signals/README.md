@@ -56,3 +56,9 @@ handling are unaffected — the SSE body passes through byte-for-byte.
   `PROXY_PROVIDER` in `index.ts`.
 - The proxy-side emission convention is unchanged (`: ` prefixed SSE
   comments); this extension only surfaces signals that already arrive.
+- Stale-context fail-safe (SA-0MUEIOGT2005IR7F): `statusUi` is captured at
+  `turn_start`; the capturing-fetch callback and `turn_end` may run after a
+  session replacement/reload has invalidated that handle. Both paths write via
+  `safeSetStatus(ui, key, text)` (`sse-signals.js`), which dim-formats the text
+  and swallows the stale-ctx throw, so the write is a silent no-op instead of
+  crashing pi. `turn_end` always clears the captured handle, stale or not.

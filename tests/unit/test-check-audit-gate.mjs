@@ -246,6 +246,133 @@ describe('isTimeoutOrTransientAudit', () => {
 });
 
 // ---------------------------------------------------------------------------
+// getAuditStatus / checkAuditReadyToClose — staleness awareness
+// (SA-0MUOO5UEB008RXBP: Step 2 must share the Step-3.7 staleness semantics;
+// a stale failing verdict must not hard-block the release)
+// ---------------------------------------------------------------------------
+describe('audit staleness — Step 2 shares Step 3.7 semantics', () => {
+  const STALE_ITEM = {
+    id: 'SA-STALE-1',
+    title: 'Stale Item',
+    needsProducerReview: false,
+    parentId: null,
+    updatedAt: '2026-09-05T10:00:00Z',
+  };
+  const FRESH_ITEM = { ...STALE_ITEM, updatedAt: '2026-09-04T10:00:00Z' };
+  const staleFailingAudit = () => JSON.stringify({
+    success: true,
+    workItemId: STALE_ITEM.id,
+    audit: {
+      readyToClose: false,
+      auditedAt: '2026-09-04T08:00:00Z',
+      rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria not met.',
+    },
+  });
+  const freshFailingAudit = () => JSON.stringify({
+    success: true,
+    workItemId: FRESH_ITEM.id,
+    audit: {
+      readyToClose: false,
+      auditedAt: '2026-09-04T09:59:55Z',
+      rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria not met.',
+    },
+  });
+
+  test('classifies a stale failing audit as non-blocking + stale', async () => {
+    const mod = await import(MODULE_PATH);
+    const result = mod.getAuditStatus(STALE_ITEM, JSON.parse(staleFailingAudit()));
+    assert.equal(result.isBlocking, false, 'stale failing verdict must not hard-block Step 2');
+    assert.equal(result.stale, true);
+    assert.equal(result.passing, false);
+    assert.match(result.reason, /stale/i);
+  });
+
+  test('classifies a fresh failing audit as blocking', async () => {
+    const mod = await import(MODULE_PATH);
+    const result = mod.getAuditStatus(FRESH_ITEM, JSON.parse(freshFailingAudit()));
+    assert.equal(result.isBlocking, true, 'a fresh genuine verdict must still block');
+    assert.equal(result.stale, false);
+    assert.equal(result.reason, 'Audit verdict: not ready to close');
+  });
+
+  test('classifies a stale passing audit as passing (still covers children)', async () => {
+    const mod = await import(MODULE_PATH);
+    const result = mod.getAuditStatus(STALE_ITEM, {
+      audit: { readyToClose: true, auditedAt: '2026-09-04T08:00:00Z', summary: 'ok' },
+    });
+    assert.equal(result.isBlocking, false);
+    assert.equal(result.passing, true, 'a passing audit covers children even when stale');
+    assert.equal(result.stale, true);
+  });
+
+  test('auto-remediates a stale item and unblocks when the re-run passes', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let auditShowCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [STALE_ITEM],
+      runAuditShow: () => {
+        auditShowCalls += 1;
+        return auditShowCalls === 1
+          ? staleFailingAudit()
+          : JSON.stringify({
+            audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z', summary: 'ok' },
+          });
+      },
+      runAuditCommand: () => { remediationCalls += 1; return ''; },
+    });
+    assert.equal(remediationCalls, 1, 'a stale item must be auto-remediated once');
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.remediatedItems.length, 1);
+    assert.equal(report.remediatedItems[0].workItemId, STALE_ITEM.id);
+  });
+
+  test('blocks a stale item whose remediation re-run still fails', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [STALE_ITEM],
+      runAuditShow: () => staleFailingAudit(),
+      runAuditCommand: () => { remediationCalls += 1; return ''; },
+    });
+    assert.equal(remediationCalls, 1);
+    assert.equal(report.hasBlockingItems, true, 'still-stale after remediation must block');
+    assert.equal(report.blockingItems[0].workItemId, STALE_ITEM.id);
+  });
+
+  test('a fresh failing verdict blocks without spawning remediation', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [FRESH_ITEM],
+      runAuditShow: () => freshFailingAudit(),
+      runAuditCommand: () => { remediationCalls += 1; return ''; },
+    });
+    assert.equal(remediationCalls, 0, 'a genuine fresh verdict must not trigger a re-audit');
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems[0].reason, 'Audit verdict: not ready to close');
+  });
+
+  test('still auto-remediates a missing audit (regression)', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let auditShowCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [FRESH_ITEM],
+      runAuditShow: () => {
+        auditShowCalls += 1;
+        return auditShowCalls === 1
+          ? JSON.stringify({ audit: null })
+          : JSON.stringify({ audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z' } });
+      },
+      runAuditCommand: () => { remediationCalls += 1; return ''; },
+    });
+    assert.equal(remediationCalls, 1);
+    assert.equal(report.hasBlockingItems, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. checkAuditReadyToClose returns expected structure
 // ---------------------------------------------------------------------------
 test('check-audit-gate: checkAuditReadyToClose returns expected structure', async () => {
@@ -659,7 +786,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
     assert.ok(calls[0].includes('--stage in_review'), `should filter stage, got: ${calls[0]}`);
     assert.ok(!calls[0].includes('--status completed'), `should drop redundant status filter (completed-minus-done == in_review), got: ${calls[0]}`);
     assert.ok(calls[0].includes('--json'), `should request JSON, got: ${calls[0]}`);
-    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false, parentId: null }]);
+    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false, parentId: null, updatedAt: null }]);
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -726,6 +853,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
       title: 'Dash-safe',
       needsProducerReview: false,
       parentId: null,
+      updatedAt: null,
     }], 'query must run under bash so set -o pipefail works on dash');
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -1119,6 +1247,201 @@ describe('checkAuditReadyToClose - remediation runner failure', () => {
     assert.equal(report.hasBlockingItems, true);
     assert.equal(report.blockingItems.length, 1);
     assert.match(report.blockingItems[0].reason, /Failed to re-check audit after remediation/);
+  });
+});
+
+describe('checkAuditReadyToClose - bounded remediation budget', () => {
+  test('stops at the attempt cap and blocks remaining items with offline guidance', async () => {
+    const mod = await import(MODULE_PATH);
+    const budgetMod = await import(
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js'),
+    );
+    const items = [
+      { id: 'SA-A', title: 'Item A', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      { id: 'SA-B', title: 'Item B', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+    ];
+    let remediationCalls = 0;
+    let aShows = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => items,
+      runAuditShow: (id) => {
+        if (id === 'SA-A') {
+          aShows += 1;
+          return aShows === 1
+            ? JSON.stringify({ audit: null })
+            : JSON.stringify({ audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z' } });
+        }
+        return JSON.stringify({ audit: null });
+      },
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      createRemediationBudgetFn: () => new budgetMod.RemediationBudget({
+        maxItems: 1,
+        budgetMs: 1_000_000,
+      }),
+    });
+
+    assert.equal(remediationCalls, 1, 'only the funded remediation may run');
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems.length, 1, 'the un-funded item is reported blocking');
+    assert.equal(report.blockingItems[0].workItemId, 'SA-B');
+    assert.match(report.blockingItems[0].reason, /budget exhausted/i);
+    assert.match(
+      report.blockingItems[0].remediation,
+      /audit_runner\.py batch/,
+      'offline-refresh guidance must be surfaced',
+    );
+    assert.equal(report.remediatedItems.length, 1);
+    assert.equal(report.remediatedItems[0].workItemId, 'SA-A');
+  });
+
+  test('classifies a remediation timeout distinctly in the blocking reason', async () => {
+    const mod = await import(MODULE_PATH);
+    const timeoutErr = new Error('killed');
+    timeoutErr.code = 'ETIMEDOUT';
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [
+        { id: 'SA-TO', title: 'Timeout Item', needsProducerReview: false, parentId: null },
+      ],
+      runAuditShow: () => JSON.stringify({ audit: null }),
+      runAuditCommand: () => { throw timeoutErr; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+    assert.equal(report.hasBlockingItems, true);
+    assert.match(report.blockingItems[0].reason, /Audit remediation failed \(timeout\)/);
+    assert.equal(report.blockingItems[0].category, 'timeout');
+  });
+});
+
+describe('checkAuditReadyToClose - narrow --skip-audit-remediation bypass', () => {
+  test('skips in-gate remediation but still blocks a missing audit', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      skipRemediation: true,
+      getCandidateItemsFn: () => [
+        { id: 'SA-S', title: 'Skip', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      ],
+      runAuditShow: () => JSON.stringify({ audit: null }),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+    assert.equal(remediationCalls, 0, 'skip must not invoke the audit runner');
+    assert.equal(report.hasBlockingItems, true, 'readyToClose requirement is not relaxed');
+    assert.match(report.blockingItems[0].reason, /remediation skipped/);
+    assert.match(report.blockingItems[0].remediation, /audit_runner\.py batch/);
+  });
+
+  test('still blocks a fresh genuine failing verdict', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      skipRemediation: true,
+      getCandidateItemsFn: () => [
+        { id: 'SA-F', title: 'Fail', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      ],
+      runAuditShow: () => JSON.stringify({
+        audit: { readyToClose: false, auditedAt: '2026-09-04T09:59:55Z', rawOutput: 'Ready to close: No\n\n2 not met.' },
+      }),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+    assert.equal(remediationCalls, 0);
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems[0].reason, 'Audit verdict: not ready to close');
+  });
+});
+
+describe('checkAuditReadyToClose - content-fingerprint fast path', () => {
+  const FP_LINE = 'Audit content fingerprint: deadbeef';
+  const ITEM = { id: 'SA-CF', title: 'CF', needsProducerReview: false, parentId: null, updatedAt: '2026-09-05T10:00:00Z' };
+  const fpAudit = (readyToClose) => JSON.stringify({
+    audit: {
+      readyToClose,
+      auditedAt: '2026-09-04T08:00:00Z',
+      rawOutput: `Ready to close: ${readyToClose ? 'Yes' : 'No'}\n${FP_LINE}`,
+    },
+  });
+
+  test('treats a stale-passing fingerprint audit as fresh (no re-audit)', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let freshnessCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [ITEM],
+      runAuditShow: () => fpAudit(true),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+      queryContentFreshnessFn: () => {
+        freshnessCalls += 1;
+        return { fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: null };
+      },
+    });
+    assert.equal(freshnessCalls, 1, 'the fingerprint probe must run once');
+    assert.equal(remediationCalls, 0, 'content-fresh audit must not be re-audited');
+    assert.equal(report.hasBlockingItems, false);
+  });
+
+  test('a content-fresh failing verdict blocks without a re-audit', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [ITEM],
+      runAuditShow: () => fpAudit(false),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+      queryContentFreshnessFn: () => ({ fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: null }),
+    });
+    assert.equal(remediationCalls, 0, 'a current failing verdict must not be re-audited');
+    assert.equal(report.hasBlockingItems, true);
+    assert.match(report.blockingItems[0].reason, /content-fresh/);
+  });
+
+  test('a content-changed fingerprint audit is remediated', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let shows = 0;
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [ITEM],
+      runAuditShow: () => {
+        shows += 1;
+        // Plan pass: stale fingerprint audit. Re-check after remediation: a
+        // fresh passing audit (as a real re-run would persist).
+        return shows === 1
+          ? fpAudit(true)
+          : JSON.stringify({ audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z', summary: 'ok' } });
+      },
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+      queryContentFreshnessFn: () => ({ fresh: false, reason: 'content changed', hasFingerprint: true, auditedAt: null }),
+    });
+    assert.equal(remediationCalls, 1, 'content-changed stale audit must be re-audited');
+    assert.equal(report.hasBlockingItems, false);
+  });
+
+  test('hasContentFingerprint detects the metadata line', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(mod.hasContentFingerprint({ audit: { rawOutput: `x\n${FP_LINE}` } }), true);
+    assert.equal(mod.hasContentFingerprint({ audit: { rawOutput: 'no fp' } }), false);
+    assert.equal(mod.hasContentFingerprint({ audit: null }), false);
+    assert.equal(mod.hasContentFingerprint(null), false);
+  });
+
+  test('queryContentFreshness parses the runner JSON and fails open on error', async () => {
+    const mod = await import(MODULE_PATH);
+    const ok = mod.queryContentFreshness('SA-1', {
+      runCommand: () => JSON.stringify({ fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: 'x' }),
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+    });
+    assert.equal(ok.fresh, true);
+    assert.equal(ok.hasFingerprint, true);
+
+    const bad = mod.queryContentFreshness('SA-1', {
+      runCommand: () => { const e = new Error('boom'); e.stderr = Buffer.from('nope'); throw e; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+    });
+    assert.equal(bad.fresh, false);
+    assert.match(bad.reason, /check-freshness failed/);
   });
 });
 

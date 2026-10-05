@@ -100,6 +100,11 @@ are asserted verbatim in the unit tests.
 
 - Only response headers are read; no pi internals are modified (extension file
   only).
+- Stale-context fail-safe (SA-0MUEIOGT2005IR7F): after a session
+  replacement/reload pi invalidates the captured extension ctx. Both handlers
+  resolve the session id via `safeSessionId(ctx)`, which returns `null`
+  instead of throwing, so a stale ctx is a silent no-op (no signal captured /
+  context passed through) rather than a crash.
 - Header availability depends on the provider/transport exposing HTTP response
   headers. The "Local Proxy" provider uses pi's built-in `openai-completions`
   transport, which fires `after_provider_response` with the real response

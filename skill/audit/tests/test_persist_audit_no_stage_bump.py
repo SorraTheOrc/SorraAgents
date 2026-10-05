@@ -307,9 +307,14 @@ class TestPersistAuditNoStageBump:
             "the audit-text update must not pass --stage "
             "(SA-0MTHC710X003ORZM, skill/audit/scripts/persist_audit.py)."
         )
-        # Double-check the helper itself: _run_audit_text_update's cmd list
-        # must be exactly [wl_bin, "update", issue_id, "--audit-text", text]
-        assert '[wl_bin, "update", issue_id, "--audit-text", text]' in joined, (
+        # Double-check the helper itself: _run_audit_text_update builds the
+        # argv from the inline/file flag pair (WL-0MSS55LFU00973S2) and must
+        # never hard-code a --stage argument.
+        assert 'cmd = [wl_bin, "update", issue_id, *text_flags]' in joined, (
             "Expected _run_audit_text_update to build "
-            "[wl_bin, 'update', issue_id, '--audit-text', text] without --stage"
+            "[wl_bin, 'update', issue_id, *text_flags] without --stage"
+        )
+        assert '_inline_or_file_flags(text, "--audit-text")' in joined, (
+            "Expected _run_audit_text_update to select inline vs "
+            'file-based flags via _inline_or_file_flags(text, "--audit-text")'
         )

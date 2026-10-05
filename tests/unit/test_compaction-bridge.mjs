@@ -45,6 +45,7 @@ const {
   pairTurns,
   reshapeContext,
   createCompactionBridge,
+  safeSessionId,
 } = await import(MODULE);
 
 // ---------------------------------------------------------------------------
@@ -486,5 +487,68 @@ describe("createCompactionBridge", () => {
     bridge.handleResponse("s1", validHeaders("second", 3, 1));
     const result = bridge.reshape("s1", history());
     assert.equal(result[2].content, "second");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stale ExtensionContext safety (SA-0MUEIOGT2005IR7F / SA-0MUJASFYL003P3RK)
+//
+// After a session replacement/reload pi invalidates previously captured
+// extension contexts. Reading `ctx.sessionManager` (or calling
+// `getSessionId`) then throws `This extension ctx is stale ...`; because the
+// access happens in an event handler / async callback outside pi's try/catch,
+// the throw would crash the pi process. `safeSessionId` must convert that into
+// a safe `null` so the handlers can fail safe.
+// ---------------------------------------------------------------------------
+
+describe("safeSessionId (stale ctx fail-safe)", () => {
+  test("returns the live session id unchanged", () => {
+    const ctx = { sessionManager: { getSessionId: () => "live-session" } };
+    assert.equal(safeSessionId(ctx), "live-session");
+  });
+
+  test("returns null (no throw) when the sessionManager accessor is stale", () => {
+    const ctx = {
+      get sessionManager() {
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload.",
+        );
+      },
+    };
+    assert.doesNotThrow(() => safeSessionId(ctx));
+    assert.equal(safeSessionId(ctx), null);
+  });
+
+  test("returns null (no throw) when getSessionId itself throws", () => {
+    const ctx = {
+      sessionManager: {
+        getSessionId() {
+          throw new Error("This extension ctx is stale");
+        },
+      },
+    };
+    assert.equal(safeSessionId(ctx), null);
+  });
+
+  test("returns null for a missing ctx or sessionManager", () => {
+    assert.equal(safeSessionId(undefined), null);
+    assert.equal(safeSessionId(null), null);
+    assert.equal(safeSessionId({}), null);
+    assert.equal(safeSessionId({ sessionManager: null }), null);
+  });
+
+  test("a stale ctx never lets a capture/reshape cycle throw", () => {
+    const bridge = createCompactionBridge();
+    const stale = {
+      get sessionManager() {
+        throw new Error("This extension ctx is stale");
+      },
+    };
+    assert.doesNotThrow(() => {
+      const sessionId = safeSessionId(stale);
+      if (sessionId === null) return;
+      bridge.handleResponse(sessionId, validHeaders());
+      bridge.reshape(sessionId, history());
+    });
   });
 });

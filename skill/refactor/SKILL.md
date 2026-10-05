@@ -34,6 +34,9 @@ before the final commit) to identify and address code quality issues.
   in-place before detection
 - **Pre-existing smells**: Non-auto-fixable issues become Worklog work items
   with REFACTOR comments to prevent duplicates
+- **Sync-first**: `wl sync --if-idle` runs as the first worklog operation (see
+  [Worklog sync](#worklog-sync)) so analysis and work-item creation never race
+  a stale local store
 
 ### Architecture
 
@@ -49,6 +52,20 @@ refactor/
     ├── __init__.py            # Scripts package init
     └── refactor.py            # Main orchestration script
 ```
+
+## Worklog sync
+
+Before doing anything else, the script runs `wl sync` (via the shared
+`worklog_sync` helper) so the local store includes remote
+changes. This prevents duplicate `REFACTOR` work items and stale analysis.
+
+- The sync is **lock-aware**: it passes `--if-idle`, so if another sync is in
+  progress the command skips (exit 0) instead of blocking and piling up.
+- The sync is **non-fatal**: offline, unborn-HEAD, author-gate, or
+  lock-contention failures log a warning and the script continues with local
+  data. The script's exit-code semantics are unchanged.
+- When no `.worklog` context is resolvable the sync is skipped gracefully.
+- Pass `--no-sync` to skip the sync entirely (offline or deterministic runs).
 
 ## When To Use
 
@@ -88,7 +105,7 @@ never left in `in_progress` when the script exits.
 ## Invocation
 
 ```bash
-python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-linter] [--dry-run] [--json] [--parent-branch <branch>] [--config <path>]
+python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-linter] [--dry-run] [--json] [--parent-branch <branch>] [--config <path>] [--no-sync]
 ```
 
 | Invocation | Scan scope | Status management |
@@ -105,7 +122,7 @@ python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-lint
 ### Invocation
 
 ```bash
-python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-linter] [--dry-run] [--json] [--parent-branch <branch>] [--config <path>]
+python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-linter] [--dry-run] [--json] [--parent-branch <branch>] [--config <path>] [--no-sync]
 ```
 
 Agent invocation: `/refactor <work-item-id>` (session-only mode)
@@ -118,7 +135,15 @@ or `/skill:refactor` with no ID for a full-project scan.
 
 ### Output
 
-Structured report with: files analyzed, smells detected, smells fixed, work items created, REFACTOR comments injected.
+A human-readable report titled ``=== <project_name> Refactor Report ===``,
+where ``<project_name>`` is resolved from ``.worklog/config.yaml``'s
+``projectName`` key (falling back to the project directory name).  The report
+includes: files analyzed, smells detected, smells fixed, work items created,
+REFACTOR comments injected.
+
+The ``--json`` flag outputs a structured JSON dict instead of the human-readable
+report.  The ``--dry-run`` flag renders the same ``=== <project_name> Refactor
+Report ===`` heading without making any changes.
 
 ## Configuration
 
@@ -132,6 +157,7 @@ Structured report with: files analyzed, smells detected, smells fixed, work item
 | `--json` | Output results in JSON format |
 | `--parent-branch <branch>` | Override parent branch for diff (default: dev) |
 | `--config <path>` | Path to custom `.refactor.json` config file |
+| `--no-sync` | Skip the initial `wl sync` (offline/deterministic runs) |
 
 ### `.refactor.json` Configuration
 

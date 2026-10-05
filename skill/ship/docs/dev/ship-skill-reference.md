@@ -81,6 +81,81 @@ characters with an ellipsis marker (`…`) when it exceeds the limit.
 | 8.5 | Discord notification (non-blocking) | No |
 | 9 | Close work items (non-blocking) | No |
 
+### Pre-flight audit refresh (`--refresh-audits`)
+
+`run-release.js --refresh-audits [--dry-run]` is a **pre-flight-only** action
+(SA-0MUOO5VMH005VF69): it refreshes missing/stale/transient audits for all
+`in_review` items via `refresh-audits.js`, then exits **without merging and
+without setting the Code Freeze marker**. Exit code 0 when nothing remains, 12
+when items still need attention. `--dry-run` reports the plan (`fresh` /
+`toRefresh` / `failing`) without invoking the audit runner. The refresh reuses
+`planAuditRefresh()` / `refreshAudits()` and the bounded `RemediationBudget`, so
+it can never run unbounded. `--refresh-audits` is a wrapper-only flag (never
+forwarded to the merge script).
+
+### Step 2: Audit readiness gate (exit 6)
+
+`checkAuditReadyToClose()` (`check-audit-gate.js`) verifies **top-level**
+`in_review` items (`parentId == null`) have a passing audit. Children are
+covered by their parent's audit and never block.
+
+Missing, **stale**, and transient audits are auto-remediated conservatively:
+the gate re-runs `audit_runner.py issue <id>` and re-checks `wl audit-show`,
+blocking only if the item still fails after the re-run. A **stale** verdict is
+one whose `auditedAt` predates the item's last update (per the shared freshness
+buffer/tolerance in `audit-freshness.js`) — the verdict is not trustworthy, so
+it is remediated rather than blocking immediately. This is the same staleness
+precedence as Step 3.7 (SA-0MUOO5UEB008RXBP): before this change, Step 2
+treated a stale failing verdict as genuine and killed the release (exit 6)
+before the staleness-aware sweep could run.
+
+A **fresh** genuine "not ready to close" verdict blocks immediately with **no**
+re-audit attempt. A remediation-runner failure is treated as blocking with the
+manual remediation command surfaced — never silently passed. `--skip-checks`
+bypasses the gate.
+
+**Shared freshness module:** `audit-freshness.js` owns `isAuditStale`,
+`parseIsoUtc`, and the freshness constants; `check-audit-gate.js` and
+`check-final-validation.js` both import them. The module exists to avoid an
+import cycle between the two gate modules (`check-final-validation.js` already
+imports from `check-audit-gate.js`). `check-final-validation.js` re-exports
+these symbols for backward compatibility.
+
+**Bounded remediation (SA-0MUOO5V0P00461X8):** in-gate remediation is bounded
+by `audit-remediation.js` so a backlog of slow audits cannot hold the release
+(and Code Freeze) for hours. Configuration (env, all optional):
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `SHIP_AUDIT_REMEDIATION_TIMEOUT_MS` | `1800000` (30 min) | Per-item `audit_runner.py issue` timeout |
+| `SHIP_AUDIT_REMEDIATION_BUDGET_MS` | `1800000` (30 min) | Total wall-clock remediation budget per gate run |
+| `SHIP_AUDIT_REMEDIATION_MAX_ITEMS` | `5` | Maximum in-gate remediation attempts per gate run |
+
+When the budget is exhausted, the remaining items are reported **blocking**
+with an offline-refresh instruction (`python3 skill/audit/scripts/audit_runner.py
+batch`), never as "not ready to close". `classifyRemediationError()` labels a
+runner failure `timeout` / `concurrency` / `provider` / `error`, so an
+infrastructure failure is distinguishable from a work verdict (surfaced as the
+`category` field on the blocking entry and in the reason text).
+
+**Narrow audit bypass (`--skip-audit-remediation`, SA-0MUOO5WV0006D7UD):** skips
+only the in-gate re-audit attempts. The `readyToClose === true` requirement is
+**not** relaxed — a missing/stale/failing audit still blocks with the
+offline-refresh guidance. Unlike `--skip-checks` it does not bypass the other
+gates, and it is a wrapper-only flag (never forwarded to the merge script).
+
+**Content-fingerprint fast path (SA-0MUOO5W8J001DYTI):** before re-auditing a
+time-stale item, the gates call the audit runner read-only
+(`queryContentFreshness()` → `audit_runner.py check-freshness <id> --json`,
+which reuses the runner's own `_check_audit_freshness`). A fingerprint-bearing
+audit whose content is unchanged is treated as trustworthy (no re-audit): a
+passing verdict is fresh; a failing verdict is a current genuine failure and
+blocks immediately. Legacy (fingerprint-less) audits, content changes, and
+probe errors fall back to the time gate / re-audit path. The probe is only
+attempted when the stored report actually carries an
+`Audit content fingerprint:` line (`hasContentFingerprint()`), so fingerprint-less
+items never spawn the runner.
+
 ### Step 3.7: Final validation sweep (exit 12)
 
 The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX,
@@ -116,9 +191,11 @@ Covered and excluded children are reported in `coveredChildren` /
 `excludedChildren` and never block. Missing, stale, and transient audits are
 auto-remediated conservatively by re-running `audit_runner.py issue <id>` and
 re-checking `wl audit-show`; successfully-remediated items are unblocked and
-reported separately. Genuine "not ready to close" verdicts block immediately
-with **no** re-audit attempt. The gate never calls `wl update` directly.
-`--skip-checks` bypasses it.
+reported separately. Remediation is bounded by the same
+`SHIP_AUDIT_REMEDIATION_*` budget as Step 2 (SA-0MUOO5V0P00461X8): once
+exhausted, remaining items block with an offline-refresh instruction. Genuine
+"not ready to close" verdicts block immediately with **no** re-audit attempt.
+The gate never calls `wl update` directly. `--skip-checks` bypasses it.
 
 **Script:** `scripts/check-final-validation.js`
 
@@ -255,6 +332,9 @@ Verifying the full suite before promotion uses the test skill's cached runner
 | `git-helpers.js` | Branch naming & policy |
 | `check-unmerged-branches.js` | Detect unmerged branches |
 | `check-audit-gate.js` | Pre-release audit gate |
+| `audit-freshness.js` | Shared audit-staleness heuristics (`isAuditStale`, `parseIsoUtc`, freshness constants) used by both audit gates |
+| `audit-remediation.js` | Bounded in-gate remediation (`RemediationBudget`, `classifyRemediationError`, env-configurable timeout/budget/attempt cap) |
+| `refresh-audits.js` | Pre-flight-only audit refresh (`planAuditRefresh`, `refreshAudits`, `runRefreshAuditsAction`) for `--refresh-audits` |
 | `check-final-validation.js` | Final validation sweep (parent-coverage / out-of-scope aware, exit 12) |
 | `check-critical-items.js` | Critical item gating |
 | `check-worklog-refs.js` | Validate worklog references |

@@ -60,7 +60,7 @@ def implement_mod():
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     """Run a git command, raising on failure."""
-    proc = subprocess.run(  # noqa: PLW1510
+    proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         capture_output=True,
@@ -498,7 +498,10 @@ class TestFinishOrdering:
         finish_start = self.SOURCE.index("def phase_finish(")
         finish_end = self.SOURCE.index("def phase_abort(", finish_start)
         body = self.SOURCE[finish_start:finish_end]
-        push_idx = body.index("git_push_to_dev(repo_root, branch)")
+        # Match the call prefix: the push helper gained recovery args
+        # (commit_hash/timeout) in SA-0MUH9R74O002MQDU, and this guard
+        # only verifies push-before-sync ordering (SA-0MUM5UWL4005YH0X).
+        push_idx = body.index("git_push_to_dev(repo_root, branch")
         sync_idx = body.index("_sync_parent_branch(repo_root,")
         assert sync_idx > push_idx, (
             "local parent sync must run AFTER the push to dev"

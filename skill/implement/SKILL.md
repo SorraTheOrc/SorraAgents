@@ -112,6 +112,29 @@ projects that explicitly create the file get the override.
 Set the value high enough to cover the full suite with headroom (e.g. TCE uses
 1500 to cover its ~19-minute suite).
 
+### Push Timeout (SA-0MUH9R74O002MQDU)
+
+The push step (git push to `dev`) also uses `_resolve_test_timeout()` to
+resolve its timeout from `timeoutPerCommand` in `.pi/test-config.json`, defaulting
+to 600 s when the config is absent.  The old hard-coded 120 s timeout is removed.
+
+When the push times out (typically because the pre-push hook is still running the
+full test suite):
+
+- The entire process group is killed via `os.killpg()` so orphaned
+  `run_tests.py` children cannot survive and deadlock subsequent pushes.
+- A `PushTimeoutError` is raised carrying the commit hash, branch name, and
+  timeout value.
+- `phase_finish` catches this and posts a manual-push comment on the work item
+  (commit hash + branch + `git push origin` instruction).
+- The work item status is reset to `open` (not silently abandoned).
+
+Recovery: push manually from the main checkout:
+
+```bash
+git push origin <branch>:refs/heads/dev
+```
+
 ## Status Safety & Abort Handling
 
 ### Critical Rule: Always Reset Status on Abort
@@ -230,6 +253,27 @@ The item is already claimed from Step 1. Fetch `wl show <work-item-id> --json`;
 pay attention to `description`, `acceptance criteria`, `comments`. Restate
 ACs/status; surface blockers/dependencies/missing requirements; inspect linked
 PRDs/plans/docs; confirm expected tests/validation.
+
+**Checking for rejected producer audits:** If the work item has been returned
+from a producer audit (status not `in_review`/`completed`, or the agent
+suspects a prior audit rejected it), fetch the audit record and any related
+comments to understand **why** it was rejected:
+
+```bash
+wl audit-show <work-item-id> --json
+wl comment list <work-item-id> --json
+```
+
+- The audit record's `rawOutput` field (under `audit.rawOutput`) contains
+  the full audit report including the `Ready to close:` verdict and per-AC
+  verdicts with evidence for any `unmet`/`partial` criteria.
+- Comments may contain additional context from the producer or previous
+  agent sessions.
+- **Always use the most recent rejection reason.** If multiple audit records
+  or comments reference rejections, compare timestamps (`audit.auditedAt` and
+  `comment.createdAt`) and act on the latest. Earlier rejections may have
+  already been addressed by subsequent fixes — do not act on stale rejection
+  reasons.
 
 4.1. Definition gate (must pass before implementation)
 

@@ -271,14 +271,18 @@ Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../re
 
 ```bash
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
-  --skill-name <skill_name> \
+  --skill-name intake \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
-  --ac "<...>|<...>|unmet" \
+  --ac "Intake brief drafted — problem statement, users, ACs, constraints, key files | Brief file present | met" \
+  --ac "Acceptance criteria defined — testable and measurable | Brief reviewed | met" \
+  --ac "Effort and risk assessed — size and risk estimate recorded | Effort/risk report present | met" \
+  --ac "Related work gathered — find-related report collected | Related work comment present | met" \
   [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```
+
+> **ACs must represent the intake process's own deliverables** — not the work item's feature acceptance criteria. Passing the feature ACs (which are unmet until the feature is built) would incorrectly cause the renderer to report the intake session as "incomplete" when it actually completed successfully.
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the

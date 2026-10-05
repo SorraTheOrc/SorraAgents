@@ -1025,9 +1025,12 @@ class TestParentFirstChildPassThrough:
         }
 
     def test_parent_passes_children_inherit(self):
-        """AC1/AC2: parent passes with no gaps → all children inherit passed;
-        zero child audit calls run."""
-        rc, captured = self._run([self._child("CHILD-1"), self._child("CHILD-2")])
+        """AC1/AC2: parent passes with no gaps → children already in review
+        inherit passed; zero child audit calls run."""
+        rc, captured = self._run([
+            self._child("CHILD-1", stage="in_review"),
+            self._child("CHILD-2", stage="in_review"),
+        ])
         assert rc == 0
         children = captured["child_results"]
         assert len(children) == 2
@@ -1038,7 +1041,7 @@ class TestParentFirstChildPassThrough:
 
     def test_parent_passes_report_marks_inherited(self):
         """AC4: the report explicitly marks inherited children."""
-        rc, captured = self._run([self._child("CHILD-1")])
+        rc, captured = self._run([self._child("CHILD-1", stage="in_review")])
         assert rc == 0
         child = captured["child_results"][0]
         assert child["inherited_pass"] is True
@@ -1046,9 +1049,9 @@ class TestParentFirstChildPassThrough:
         assert "Inherited from parent pass" in child["ac_results"][0]["text"]
 
     def test_parent_passes_ready_to_close(self):
-        """AC2: parent passes → inherited children count as reviewed, so the
-        parent is ready to close."""
-        rc, captured = self._run([self._child("CHILD-1")])
+        """AC2: parent passes → inherited (in-review) children count as
+        reviewed, so the parent is ready to close."""
+        rc, captured = self._run([self._child("CHILD-1", stage="in_review")])
         assert rc == 0
         # The report assembly captured ac_results; ready-to-close derives from
         # child_audit_ready flags (all True) + stage check.
@@ -1096,8 +1099,9 @@ class TestParentFirstChildPassThrough:
 
     def test_changed_child_not_inherited(self):
         """AC6: a child whose content changed (fingerprint mismatch) is not
-        silently inherited-passed — it is audited."""
-        child = self._child("CHILD-1")
+        silently inherited-passed — it is audited even though it is already
+        in review."""
+        child = self._child("CHILD-1", stage="in_review")
         # The runner returns a stored (stale) audit for the child; combined
         # with a different git HEAD the content fingerprint will not match →
         # the child's content changed → audited, not inherited.
@@ -1195,6 +1199,25 @@ class TestParentFirstChildPassThrough:
         # Content changed → audited, not inherited
         assert child_result.get("inherited_pass") is None
         assert child_result["child_audit_ready"] is False
+
+    def test_parent_passes_pre_review_child_audited_and_blocks(self, capsys):
+        """SA-0MUD5OMQG0068P4I (AC4): a child at a pre-review stage does NOT
+        inherit the parent pass — it is audited independently and the report
+        is 'Ready to close: No', naming the blocking child."""
+        rc, captured = self._run([
+            self._child("CHILD-1", stage="intake_complete"),
+        ])
+        assert rc == 0
+        child = captured["child_results"][0]
+        # Never inherited: a pre-review child is audited independently.
+        assert child.get("inherited_pass") is None
+        # A full per-child Phase 1 review ran (not the zero-audit path).
+        assert any("child:" in c for c in captured["pi_calls"])
+        out = capsys.readouterr().out
+        assert "Ready to close: No" in out
+        assert "All children are in in_review or done stage." not in out
+        # The blocking child is named in the summary.
+        assert "CHILD-1" in out
 
     def test_blocking_cq_skips_parent_phase2(self):
         """Blocking CQ findings skip the parent Phase 2 deep call in the
@@ -1609,4 +1632,232 @@ class TestCascadeBoundedRecursionGuard:
         # The child must inherit LIVE_REPO_GUARD_ACTIVE so the cascade
         # cannot recurse.
         assert envs_captured[0].get("LIVE_REPO_GUARD_ACTIVE") == "1"
+
+
+class TestPreReviewChildBlocksClosure:
+    """SA-0MUD5OMQG0068P4I (regression for SA-0MUA4Q431008HIH0): a child in a
+    pre-review stage must block parent closure even when an inherited pass has
+    been recorded. Previously ``inherited_pass`` exempted the child from the
+    stage check, producing a false-positive ``Ready to close: Yes`` and a
+    summary that claimed all children were in ``in_review``/``done``.
+    """
+
+    @pytest.mark.parametrize("stage", ["idea", "intake_complete", "plan_complete"])
+    def test_pre_review_child_with_inherited_pass_blocks_ready_to_close(self, stage):
+        issue = {"id": "SA-PARENT", "title": "Parent", "description": ""}
+        ac_results = [{"text": "AC1", "verdict": "met", "evidence": "p.py:1"}]
+        child = {
+            "title": "Auto-triaged test failure",
+            "id": "SA-PREREVIEW",
+            "status": "open",
+            "stage": stage,
+            "inherited_pass": True,  # wrongly granted pre-fix
+            "child_audit_ready": True,
+            "ac_results": [
+                {"text": "CAC1", "verdict": "met", "evidence": "c.py:1"},
+            ],
+        }
+        report = audit_runner._assemble_issue_report(issue, ac_results, [child])
+        assert report.startswith("Ready to close: No")
+        # The false claim must be gone, and the blocking child named.
+        assert "All children are in in_review or done stage." not in report
+        assert "SA-PREREVIEW" in report
+
+    def test_inherited_pass_is_not_a_stage_exemption(self):
+        """``inherited_pass`` alone must never exempt a pre-review child."""
+        assert audit_runner._child_is_exempt(
+            {"id": "C", "stage": "intake_complete", "inherited_pass": True}
+        ) is False
+
+    def test_inherited_pass_in_review_child_still_exempt(self):
+        """Parent-first inheritance remains legitimate for reviewed children."""
+        assert audit_runner._child_is_exempt(
+            {"id": "C", "stage": "in_review", "inherited_pass": True}
+        ) is True
+
+    @pytest.mark.parametrize("stage", ["idea", "intake_complete", "plan_complete"])
+    def test_phase1_blocking_pre_review_inherited_child(self, stage):
+        """Phase 1 blocking names a pre-review child holding a stale pass."""
+        child = {
+            "title": "Auto-triaged test failure",
+            "id": "SA-PREREVIEW",
+            "status": "open",
+            "stage": stage,
+            "inherited_pass": True,
+            "child_audit_ready": True,
+            "ac_results": [],
+        }
+        blocked, reason = audit_runner._has_phase1_blocking_issues([], [child])
+        assert blocked is True
+        assert "Auto-triaged test failure" in reason
+
+
+class _CascadeRunner:
+    """Stateful mock ``wl`` runner for the descendant-cascade tests.
+
+    Models a small work-item tree so idempotence can be exercised: an
+    ``wl update <id> --status completed --stage done`` mutates the modelled
+    state, so a second cascade run observes the children as terminal.
+    """
+
+    def __init__(self, tree, states, fail_updates=()):
+        self.tree = tree
+        self.states = {k: tuple(v) for k, v in states.items()}
+        self.fail_updates = set(fail_updates)
+        self.commands = []
+        self.updates = []
+        self.comments = []
+
+    def _ok(self, payload):
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps(payload), stderr="",
+        )
+
+    def _children(self, parent_id):
+        return [
+            {"id": cid, "status": self.states.get(cid, ("open", "plan_complete"))[0],
+             "stage": self.states.get(cid, ("open", "plan_complete"))[1]}
+            for cid in self.tree.get(parent_id, [])
+        ]
+
+    def __call__(self, cmd):
+        cmd = list(cmd)
+        self.commands.append(cmd)
+        if "show" in cmd and "--children" in cmd:
+            item_id = cmd[cmd.index("show") + 1]
+            return self._ok({
+                "success": True,
+                "workItem": {"id": item_id},
+                "children": self._children(item_id),
+            })
+        if "show" in cmd:
+            item_id = cmd[cmd.index("show") + 1]
+            status, stage = self.states.get(item_id, ("open", "plan_complete"))
+            return self._ok({
+                "success": True,
+                "workItem": {"id": item_id, "status": status, "stage": stage},
+            })
+        if "update" in cmd:
+            item_id = cmd[cmd.index("update") + 1]
+            if item_id in self.fail_updates:
+                return SimpleNamespace(
+                    returncode=1, stdout="", stderr="boom",
+                )
+            status = cmd[cmd.index("--status") + 1] if "--status" in cmd else None
+            stage = cmd[cmd.index("--stage") + 1] if "--stage" in cmd else None
+            if status and stage:
+                self.states[item_id] = (status, stage)
+            self.updates.append((item_id, cmd))
+            return self._ok({"success": True})
+        if "comment" in cmd and "add" in cmd:
+            add_idx = cmd.index("add")
+            item_id = cmd[add_idx + 1]
+            text = cmd[cmd.index("--comment") + 1] if "--comment" in cmd else ""
+            self.comments.append((item_id, text))
+            return self._ok({"success": True})
+        return self._ok({"success": True})
+
+
+class TestCascadeDescendantsTerminal:
+    """AC1-AC3/AC5: ``_cascade_descendants_terminal`` contract.
+
+    A passing parent audit terminalises the whole recursive subtree
+    (``status=completed, stage=done``) with an explanatory comment; it is
+    idempotent, ``deleted``-safe, dry-run suppressed, and non-fatal on a
+    per-child failure.
+    """
+
+    AUDIT_TS = "2026-10-02T12:00:00+00:00"
+
+    def _tree(self):
+        # PARENT → C1 (in_review), C2 (terminal done), C3 (open) → GC (open),
+        # plus a deleted child D1.
+        return {
+            "PARENT": ["C1", "C2", "C3", "D1"],
+            "C3": ["GC"],
+        }
+
+    def _states(self):
+        return {
+            "PARENT": ("in_progress", "in_progress"),
+            "C1": ("completed", "in_review"),
+            "C2": ("completed", "done"),
+            "C3": ("open", "plan_complete"),
+            "D1": ("deleted", "done"),
+            "GC": ("open", "plan_complete"),
+        }
+
+    def test_passing_parent_terminalises_full_subtree(self):
+        runner = _CascadeRunner(self._tree(), self._states())
+        cascaded = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        assert cascaded == 3  # C1, C3, GC — not C2 (terminal), not D1 (deleted)
+        updated = {item_id for item_id, _ in runner.updates}
+        assert updated == {"C1", "C3", "GC"}
+        for _item_id, cmd in runner.updates:
+            assert "--status" in cmd and cmd[cmd.index("--status") + 1] == "completed"
+            assert "--stage" in cmd and cmd[cmd.index("--stage") + 1] == "done"
+        # Each cascaded child got exactly one explanatory comment naming the
+        # authorising parent and the audit timestamp.
+        commented = {item_id for item_id, _ in runner.comments}
+        assert commented == {"C1", "C3", "GC"}
+        for _item_id, text in runner.comments:
+            assert "PARENT" in text
+            assert self.AUDIT_TS in text
+
+    def test_idempotent_rerun_no_further_mutation(self):
+        runner = _CascadeRunner(self._tree(), self._states())
+        first = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        assert first == 3
+        updates_after_first = len(runner.updates)
+        comments_after_first = len(runner.comments)
+        second = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        assert second == 0
+        assert len(runner.updates) == updates_after_first
+        assert len(runner.comments) == comments_after_first
+
+    def test_deleted_and_terminal_descendants_are_skipped(self):
+        runner = _CascadeRunner(self._tree(), self._states())
+        audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        assert "C2" not in {item_id for item_id, _ in runner.updates}
+        assert "D1" not in {item_id for item_id, _ in runner.updates}
+        assert "C2" not in {item_id for item_id, _ in runner.comments}
+        assert "D1" not in {item_id for item_id, _ in runner.comments}
+
+    def test_dry_run_suppresses_cascade_entirely(self):
+        runner = _CascadeRunner(self._tree(), self._states())
+        cascaded = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner, persist=False,
+        )
+        assert cascaded == 0
+        assert runner.updates == []
+        assert runner.comments == []
+        # No wl command at all (the helper returns before walking the tree).
+        assert runner.commands == []
+
+    def test_per_child_failure_is_non_fatal(self):
+        runner = _CascadeRunner(
+            self._tree(), self._states(), fail_updates={"C3"},
+        )
+        cascaded = audit_runner._cascade_descendants_terminal(
+            "PARENT", self.AUDIT_TS, runner=runner,
+        )
+        # C1 and GC still cascaded; C3's failure did not abort the sweep.
+        updated = {item_id for item_id, _ in runner.updates}
+        assert updated == {"C1", "GC"}
+        assert cascaded == 2
+
+    def test_leaf_parent_cascades_nothing(self):
+        runner = _CascadeRunner({}, {})
+        assert audit_runner._cascade_descendants_terminal(
+            "LEAF", self.AUDIT_TS, runner=runner,
+        ) == 0
+        assert runner.updates == []
 

@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests.skill_inventory import tracked_skill_names
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = REPO_ROOT / "skill"
 
@@ -56,7 +58,17 @@ def _relative_links(skill_file: Path) -> list[tuple[int, str, str]]:
 
 
 def _all_skill_files() -> list[Path]:
-    return sorted(SKILL_DIR.glob("*/SKILL.md"))
+    """Every **tracked** SKILL.md under the repo's skill/ directory.
+
+    Untracked ``skill/<name>/`` dirs are a concurrent agent's uncommitted WIP
+    and must not be link-checked (SA-0MUU206QT001M66F).  When git is
+    unavailable, fall back to scanning every directory.
+    """
+    files = sorted(SKILL_DIR.glob("*/SKILL.md"))
+    tracked = tracked_skill_names(REPO_ROOT)
+    if tracked is None:
+        return files
+    return [f for f in files if f.parent.name in tracked]
 
 
 def _all_reference_docs() -> list[Path]:

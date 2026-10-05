@@ -24,16 +24,26 @@ modified during the current session and takes appropriate action:
 
 ## How It Works
 
-The refactor step follows four phases:
+The step follows five phases:
 
 ```
 Implementation → Refactor → Build → Test → Commit
                        │
+                       ├─ Worklog sync (`wl sync --if-idle`, non-fatal)
                        ├─ Session boundary detection
                        ├─ Hybrid smell detection (linters + LLM)
                        ├─ Auto-fix session-introduced smells
                        └─ Create work items for pre-existing smells
 ```
+
+### 0. Worklog Sync
+
+The step begins by running `wl sync --if-idle` (through the shared
+`worklog_sync` helper) so the local store includes remote
+changes before any work item is read or created. This prevents duplicate
+`REFACTOR` work items. The sync is lock-aware (skips if another sync is in
+progress) and non-fatal (a failure logs a warning and the step continues with
+local data). Pass `--no-sync` to skip it for offline/deterministic runs.
 
 ### 1. Session Boundary Detection
 
@@ -138,6 +148,7 @@ python3 skill/refactor/scripts/refactor.py --verbose
 | `--dry-run` | Show what would be changed without making changes | False |
 | `--json` | Output results as JSON | False |
 | `--verbose` | Enable verbose logging | False |
+| `--no-sync` | Skip the initial `wl sync` (offline/deterministic runs) | False |
 
 ## Configuration
 
@@ -242,9 +253,11 @@ The following code smells are currently detected:
 
 ### Duplicate work items created
 
-- The refactor step checks for existing REFACTOR comments before creating
-  work items. If duplicates occur, check that the comment format matches
-  the expected pattern.
+- The refactor step syncs the worklog first (`wl sync --if-idle`) and checks
+  for existing REFACTOR comments before creating work items. If duplicates
+  still occur, check that the comment format matches the expected pattern and
+  that the sync was not skipped (`--no-sync`) or failed (offline/author gate) —
+  a failed sync is non-fatal and logs a warning.
 - Manually close duplicate work items with `wl close <id> --reason "duplicate"`.
 
 ### LLM analysis is not running
