@@ -34,17 +34,30 @@ configured runner):
   and no repo-local runner → the test step is **skipped** and reported as
   a no-op (`success: True`, `skipped: True`), so finish proceeds to commit
   → push instead of aborting on ENOENT or `Missing script: "test"`.
-- Detection order: `IMPLEMENT_TEST_COMMAND` env override → pytest → npm
-  `test` script → repo-local runner (`run_tests.sh` /
+- Suite resolution order (single source of truth, F2 AC4): the test
+  skill's `full_suite_commands()` — `.pi/test-config.json` `suiteCommands`
+  first (when declared it is the *primary* list and convention detection is
+  skipped), then convention detection (pytest → node suite dirs →
+  npm-test). This is the same order `skill/test/scripts/run_tests.py` uses,
+  so the finish gate exercises the repo's real full suite instead of a
+  pytest-first heuristic (WL-0MUL6LCE00042MB0).
+- Legacy convention detection (`IMPLEMENT_TEST_COMMAND` env override →
+  pytest → npm `test` script → repo-local runner (`run_tests.sh` /
   `run_unity_tests.sh` / `run_unity_tests.bat`) → Unity project
-  (Unity-specific skip message) → generic skip.
-- Repos WITH tooling are unaffected: the detected command runs (through
-  the run cache) and a real failure still blocks finish. When pytest is
-  detected, `npm test` remains the fallback if the repo also defines a
-  `scripts.test` entry. Commands are the canonical quiet forms
-  (`pytest -q -r a --disable-warnings` / `npm --silent test`, via
-  `canonicalize_quiet_test_command`) so cached runs share the test skill's
-  cache keys and count as full-suite evidence (SA-0MSN6FBFS006Z5QP).
+  (Unity-specific skip message) → generic skip) remains as the fallback
+  when the test skill is unavailable (partial install) or resolves no
+  suite. It preserves implement.py's superset support for repo-local
+  runners and Unity projects that the test skill does not model.
+- An explicitly-empty `suiteCommands: []` is authoritative: the test step
+  is skipped (no convention fallback), matching the test skill.
+- Repos WITH tooling are unaffected: every resolved command runs (through
+  the run cache) and a real failure in any of them still blocks finish.
+  Multiple resolved commands (a declared `suiteCommands` list, or pytest
+  plus node suite dirs) are all run and combined into one result. Commands
+  are the canonical quiet forms (`pytest -q -r a --disable-warnings` /
+  `npm --silent test`, via `canonicalize_quiet_test_command`) so cached runs
+  share the test skill's cache keys and count as full-suite evidence
+  (SA-0MSN6FBFS006Z5QP).
 - `IMPLEMENT_TEST_COMMAND` overrides detection entirely (per-repo test
   command, e.g. a Unity test runner invoked via a repo-local script).
 - **Paced execution (SA-0MUKHCO02009EQFG):** every real suite execution

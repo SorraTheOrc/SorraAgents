@@ -87,9 +87,17 @@ try:
     from test.scripts.run_tests import (
         changed_scope_commands as _changed_scope_commands,
     )
+    from test.scripts.run_tests import (
+        extension_suite_commands as _extension_suite_commands,
+    )
+    from test.scripts.run_tests import (
+        full_suite_commands as _full_suite_commands,
+    )
     from test.scripts.run_tests import paced_runner as _test_paced_runner
 except ModuleNotFoundError:
     _changed_scope_commands = None  # type: ignore[assignment]
+    _extension_suite_commands = None  # type: ignore[assignment]
+    _full_suite_commands = None  # type: ignore[assignment]
     _test_paced_runner = None  # type: ignore[assignment]
 
     class _TestConcurrencyTimeout(RuntimeError):  # type: ignore[no-redef]
@@ -2211,6 +2219,57 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     return _finalize_test_result(run, tooling="pytest", scope="changed")
 
 
+def _run_commands(
+    commands: list[str], cwd: str, tooling: str, scope: str = "full"
+) -> dict[str, Any]:
+    """Run each command through the per-repo cache and combine the results.
+
+    Commands are resolved by the test skill's ``full_suite_commands`` /
+    ``changed_scope_commands`` (the single source of truth) and executed in
+    order through the paced cache runner. The first non-zero exit code is
+    reported, and stdout/stderr are concatenated so a multi-command suite
+    (e.g. pytest plus one command per node suite dir, or the declared
+    ``suiteCommands``) yields one aggregated result.
+
+    Args:
+        commands: Shell command strings to run in order.
+        cwd: Worktree root.
+        tooling: Tooling label recorded on the result.
+        scope: ``full`` or ``changed`` (recorded as cache/evidence metadata).
+
+    Returns:
+        A finalised test result dict.
+    """
+    exit_code = 0
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    for command in commands:
+        run = _run_cached_paced(
+            command,
+            cwd=cwd,
+            timeout=_resolve_test_timeout(cwd),
+            runner=lambda command, cwd_, timeout_: run_cmd(
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+            ),
+            scope=scope,
+        )
+        if run["exit_code"] != 0 and exit_code == 0:
+            exit_code = run["exit_code"]
+        if run.get("stdout"):
+            stdout_parts.append(run["stdout"])
+        if run.get("stderr"):
+            stderr_parts.append(run["stderr"])
+    return _finalize_test_result(
+        {
+            "exit_code": exit_code,
+            "stdout": "\n".join(stdout_parts),
+            "stderr": "\n".join(stderr_parts),
+        },
+        tooling=tooling,
+        scope=scope,
+    )
+
+
 def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
     """Try to select a named test group from changed files and run it.
 
@@ -2247,36 +2306,83 @@ def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict
     if group_cmds is None:
         return None
 
-    # Run the group's commands through the cache
-    results = []
-    for cmd in group_cmds:
-        run = _run_cached_paced(
-            cmd,
-            cwd=cwd,
-            timeout=_resolve_test_timeout(cwd),
-            runner=lambda command, cwd_, timeout_: run_cmd(
-                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
-            ),
-            scope="full",
-        )
-        results.append(run)
-
-    # Combine results
-    all_failures = []
-    exit_code = 0
-    for r in results:
-        if r["exit_code"] != 0:
-            exit_code = r["exit_code"]
-            # Extract failure info from stderr
-            for line in (r.get("stderr", "") or "").splitlines():
-                if "FAILED" in line or "ERROR" in line or "AssertionError" in line or "failed:" in line.lower():
-                    all_failures.append(line.strip())
-
-    return _finalize_test_result(
-        {"exit_code": exit_code, "stdout": "", "stderr": "", "failures": all_failures},
-        tooling=f"group:{group_name}",
-        scope="full",
+    return _run_commands(
+        group_cmds, cwd, tooling=f"group:{group_name}", scope="full"
     )
+
+
+def _resolve_full_suite_commands(cwd: str) -> list[str] | None:
+    """Resolve the repo's full suite via the test skill's single source of truth.
+
+    Delegates to ``full_suite_commands`` (extension ``suiteCommands`` first,
+    then convention detection: pytest → node suites → npm-test). Returns
+    ``None`` when the test skill is unavailable (partial install) or the
+    repo has no suite at all, so the caller can fall back to implement.py's
+    legacy convention detection (which additionally supports repo-local
+    runner scripts and Unity). Returns ``[]`` only when the repo explicitly
+    declares an empty ``suiteCommands`` list — authoritative "no runnable
+    suite", never a convention fallback (F2 AC1).
+    """
+    if _full_suite_commands is None:
+        return None
+    root = Path(cwd).resolve()
+    try:
+        commands = list(_full_suite_commands(root))
+    except Exception as exc:  # noqa: BLE001 - degrade to convention detection
+        LOG.warning(
+            "Implement run_tests: full_suite_commands(%s) failed (%s) — "
+            "falling back to convention detection.",
+            root,
+            exc,
+        )
+        return None
+    if commands:
+        return commands
+    # Empty result: authoritative only when the extension file explicitly
+    # declares suiteCommands (including an empty list).
+    if _extension_suite_commands is not None:
+        try:
+            declared = _extension_suite_commands(root)
+        except Exception:  # noqa: BLE001 - treat as undeclared
+            declared = None
+        if declared is not None:
+            return []
+    return None
+
+
+def _run_resolved_suite(
+    cwd: str,
+    commands: list[str],
+    scope: str = "changed",
+    base_ref: str | None = None,
+) -> dict[str, Any]:
+    """Run a resolved full-suite command list, honouring changed scope.
+
+    ``scope="changed"`` first tries the test skill's changed-file selector
+    (named group, then file-level selection). When no subset is available
+    (custom ``suiteCommands``, no dev baseline, no matching tests, or a
+    node-only selection) it warns and runs the full command list so a scoped
+    run never silently skips testing.
+    """
+    if scope == "changed":
+        group_result = _run_group_from_changed_files(cwd, base_ref=base_ref)
+        if group_result is not None:
+            LOG.info(
+                "Implement run_tests: selected group '%s' from changed files in %s",
+                group_result.get("tooling", "unknown"),
+                cwd,
+            )
+            return group_result
+        scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
+        if scoped is not None:
+            return scoped
+        LOG.warning(
+            "Implement run_tests: changed-scope selection unavailable in "
+            "%s (no dev baseline, no changed tests, custom suiteCommands, "
+            "or node-only selection) — falling back to full scope.",
+            cwd,
+        )
+    return _run_commands(commands, cwd, tooling="suite", scope="full")
 
 
 def run_tests(cwd: str, scope: str = "changed",
@@ -2305,24 +2411,24 @@ def run_tests(cwd: str, scope: str = "changed",
     ``skipped: True``) so finish proceeds to commit → push instead of
     aborting on ENOENT / ``Missing script: "test"``.
 
-    Detection order:
+    Suite resolution order (single source of truth, F2 AC4):
 
     1. ``IMPLEMENT_TEST_COMMAND`` env var — per-repo override; run as-is.
-    2. pytest — when the repo declares pytest (config markers or test files)
-       AND the module imports via ``python3``.
-    3. npm — when the root package.json defines a ``scripts.test`` entry.
-    4. repo-local runner — ``run_tests.sh`` / ``run_unity_tests.sh`` /
-       ``run_unity_tests.bat`` at the repo root.
-    5. Unity project (``Assets/`` or ``ProjectSettings/ProjectVersion.txt``)
-       without a configured runner → skipped with a Unity-specific message.
-    6. Otherwise → skipped with a generic no-tooling message.
+    2. The test skill's ``full_suite_commands`` — ``.pi/test-config.json``
+       ``suiteCommands`` first, then convention detection (pytest → node
+       suite dirs → npm-test). When ``suiteCommands`` is declared it is the
+       primary list and convention detection is skipped (F2 AC1).
+    3. Legacy convention detection (only when the test skill is unavailable
+       or resolved no suite): pytest → npm → repo-local runner → Unity →
+       skip. This preserves implement.py's superset support for repos the
+       test skill does not model (``run_tests.sh``, Unity projects).
 
-    Repos WITH tooling behave as before: the detected command runs (through
+    Repos WITH tooling behave as before: the resolved command(s) run through
     ``skill.test_cache.run_cached`` — a valid cached result for the same
-    worktree git state within the TTL is reused, see SA-0MSGN5OJ4002OZKY)
-    and a non-zero exit still blocks finish. When pytest is the detected
-    tooling, npm test remains the fallback if the repo also defines a
-    ``scripts.test`` entry.
+    worktree git state within the TTL is reused (SA-0MSGN5OJ4002OZKY) — and
+    a non-zero exit still blocks finish. Multiple resolved commands (e.g. a
+    declared ``suiteCommands`` list, or pytest plus node suite dirs) all run
+    and their results are combined.
 
     Args:
         cwd: Working directory (worktree root).
@@ -2334,8 +2440,8 @@ def run_tests(cwd: str, scope: str = "changed",
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
         ``exit_code`` (int), ``failures`` (list[str]), ``scope`` (str), plus
         ``skipped`` (bool — True when no tooling was found) and ``tooling``
-        (str | None — the detected runner: pytest/npm/repo-script/override/
-        unity).
+        (str | None — the resolved runner: ``suite`` (test-skill resolution),
+        pytest/npm/repo-script/override/unity).
     """
     # 1. Per-repo override (env var) — highest precedence
     override = os.environ.get("IMPLEMENT_TEST_COMMAND", "").strip()
@@ -2358,9 +2464,32 @@ def run_tests(cwd: str, scope: str = "changed",
             scope="full",
         )
 
+    # 2. Delegate to the test skill's single source of truth for suite
+    #    resolution (F2 AC4 / WL-0MUL6LCE00042MB0): ``suiteCommands`` first,
+    #    then convention detection (pytest → node suites → npm-test). This
+    #    ensures the finish gate exercises the repo's real full suite (e.g.
+    #    ContextHub's vitest commands) instead of implement.py's duplicate
+    #    pytest-first detection. ``None`` means the skill is unavailable or
+    #    no suite was resolved, so the legacy convention detection below
+    #    still handles repo-local runners / Unity / no-tooling repos.
+    resolved_suite = _resolve_full_suite_commands(cwd)
+    if resolved_suite is not None:
+        if not resolved_suite:
+            return _skip_test_result(
+                "No test suite declared or detected — skipping test step "
+                "(no-op).",
+                tooling=None,
+            )
+        return _run_resolved_suite(
+            cwd, resolved_suite, scope=scope, base_ref=base_ref
+        )
+
+    # 3. Legacy convention detection (test skill unavailable or no suite
+    #    resolved): preserve implement.py's superset support for repo-local
+    #    runner scripts and Unity projects.
     tooling = _detect_test_tooling(cwd)
 
-    # 2. pytest (with npm test fallback when the repo also has a test script)
+    # 3a. pytest (with npm test fallback when the repo also has a test script)
     if tooling == "pytest":
         if scope == "changed":
             # Try named group selection first (SA-0MUJKF2HP001BR51):
@@ -2414,7 +2543,7 @@ def run_tests(cwd: str, scope: str = "changed",
             final_tooling = "npm"
         return _finalize_test_result(result, tooling=final_tooling, scope="full")
 
-    # 3. npm test script (no pytest suite)
+    # 3b. npm test script (no pytest suite)
     if tooling == "npm":
         if scope == "changed":
             LOG.warning(
@@ -2436,7 +2565,7 @@ def run_tests(cwd: str, scope: str = "changed",
             scope="full",
         )
 
-    # 4. Repo-local runner script
+    # 3c. Repo-local runner script
     if tooling == "repo-script":
         runner_script = _find_repo_test_runner(cwd)
         if runner_script is None:
@@ -2474,7 +2603,7 @@ def run_tests(cwd: str, scope: str = "changed",
             scope="full",
         )
 
-    # 5. Unity project without a configured runner → Unity-specific skip
+    # 3d. Unity project without a configured runner → Unity-specific skip
     if tooling == "unity":
         return _skip_test_result(
             "Unity project detected (Assets/ or ProjectSettings/ProjectVersion.txt) "
@@ -2485,7 +2614,7 @@ def run_tests(cwd: str, scope: str = "changed",
             tooling="unity",
         )
 
-    # 6. No tooling at all → generic skip
+    # 3e. No tooling at all → generic skip
     return _skip_test_result(
         "No test tooling detected (no pytest suite, no npm test script, no "
         "repo-local test runner) — skipping test step (no-op).",
