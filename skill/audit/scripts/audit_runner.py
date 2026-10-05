@@ -465,6 +465,50 @@ def _format_bytes(n: int) -> str:
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
 
+#: Default cap on the number of code-quality finding rows rendered into the
+#: human-readable audit report table. The report text is later passed to
+#: ``wl`` on the command line; an unbounded table (e.g. when a linter mis-
+#: parses non-matching files and emits hundreds of spurious findings) can
+#: exceed the OS argv limit and make persistence fail with ``E2BIG``
+#: (WL-0MSS55LFU00973S2). Blocking/closure logic always uses the FULL finding
+#: list — this cap is display-only. Overridable via
+#: ``AUDIT_MAX_FINDINGS_IN_REPORT``.
+MAX_FINDINGS_IN_REPORT_DEFAULT = 50
+MAX_FINDINGS_IN_REPORT_ENV = "AUDIT_MAX_FINDINGS_IN_REPORT"
+
+
+def _resolve_max_findings_in_report() -> int:
+    """Resolve the code-quality findings cap rendered in the audit report.
+
+    Precedence: ``AUDIT_MAX_FINDINGS_IN_REPORT`` environment variable
+    (positive integer) > :data:`MAX_FINDINGS_IN_REPORT_DEFAULT`. Invalid or
+    non-positive values fall back to the default with a warning (never block
+    the audit).
+    """
+    env_value = os.environ.get(MAX_FINDINGS_IN_REPORT_ENV)
+    if env_value is None or not env_value.strip():
+        return MAX_FINDINGS_IN_REPORT_DEFAULT
+    try:
+        parsed = int(env_value)
+    except ValueError:
+        print(
+            f"Warning: invalid {MAX_FINDINGS_IN_REPORT_ENV} value "
+            f"{env_value!r}; using the default "
+            f"({MAX_FINDINGS_IN_REPORT_DEFAULT}).",
+            file=sys.stderr,
+        )
+        return MAX_FINDINGS_IN_REPORT_DEFAULT
+    if parsed < 1:
+        print(
+            f"Warning: {MAX_FINDINGS_IN_REPORT_ENV} must be a positive "
+            f"integer, got {parsed}; using the default "
+            f"({MAX_FINDINGS_IN_REPORT_DEFAULT}).",
+            file=sys.stderr,
+        )
+        return MAX_FINDINGS_IN_REPORT_DEFAULT
+    return parsed
+
+
 CALL_PI_TIMEOUT = 1800
 """Internal timeout (seconds) for each Pi model subprocess call.
 
@@ -5495,21 +5539,35 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 "**Medium/low severity findings detected — "
                 "these are reported as warnings and do not block closure.**"
             )
+        findings_cap = _resolve_max_findings_in_report()
+        total_findings = len(cq_findings)
+        rendered_findings = cq_findings[:findings_cap]
         lines.append("")
         lines.append("| # | Severity | File | Line | Message | Linter | Code |")
         lines.append("|---|----------|------|------|---------|--------|------|")
-        for i, f in enumerate(cq_findings, 1):
+        for i, f in enumerate(rendered_findings, 1):
             lines.append(
                 f"| {i} | {f.get('severity', '?')} | "
                 f"{f.get('file', '?')} | {f.get('line', 0)} | "
                 f"{f.get('message', '')} | {f.get('linter', '?')} | "
                 f"{f.get('code', '')} |"
             )
+        if total_findings > findings_cap:
+            omitted = total_findings - findings_cap
+            lines.append("")
+            lines.append(
+                f"*{omitted} additional findings omitted for brevity "
+                f"(showing {findings_cap} of {total_findings}; "
+                f"cap: {findings_cap}).*"
+            )
 
         # False-positive screen section (SA-0MST01O4G002VPBR AC3/AC4):
         # per-finding classifications + justifications surface in the
         # human-readable report. Screen-failed runs annotate every entry.
+        # Capped to the same limit as the findings table so the rendered
+        # report stays bounded (WL-0MSS55LFU00973S2).
         if fp_results:
+            rendered_fp = fp_results[:findings_cap]
             lines.append("")
             lines.append("#### False-positive screen")
             lines.append("")
@@ -5522,13 +5580,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 lines.append("")
             lines.append("| # | File | Line | Code | Classification | Justification |")
             lines.append("|---|------|------|------|----------------|---------------|")
-            for e in fp_results:
+            for e in rendered_fp:
                 f = e.get("finding", {})
                 lines.append(
                     f"| {e.get('index', 0) + 1} | {f.get('file', '?')} | "
                     f"{f.get('line', 0)} | {f.get('code', '?')} | "
                     f"{e.get('classification', '?')} | "
                     f"{e.get('justification', '')} |"
+                )
+            if len(fp_results) > findings_cap:
+                fp_omitted = len(fp_results) - findings_cap
+                lines.append("")
+                lines.append(
+                    f"*{fp_omitted} additional false-positive screen entries "
+                    f"omitted for brevity (showing {findings_cap} of "
+                    f"{len(fp_results)}).*"
                 )
 
     # Remediation loop section (SA-0MST01OIN008MXYT / F2): applied
