@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 # Ensure the repo root is on sys.path so the shared status_lifecycle module
@@ -42,6 +45,72 @@ try:
     from shared.status_lifecycle import resolve_worklog_flags
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
+
+
+#: Maximum report size (bytes) passed INLINE on the ``wl`` command line.
+#: Reports larger than this are written to a temporary file and handed to
+#: ``wl`` via ``--audit-file`` so the argument list never trips the OS
+#: per-argument limit (``MAX_ARG_STRLEN``, 128 KiB on Linux) and fails with
+#: ``OSError [Errno 7] Argument list too long`` (WL-0MSS55LFU00973S2).
+#: Overridable via ``AUDIT_PERSIST_INLINE_SIZE_LIMIT``.
+PERSIST_INLINE_SIZE_LIMIT = 64 * 1024
+PERSIST_INLINE_SIZE_LIMIT_ENV = "AUDIT_PERSIST_INLINE_SIZE_LIMIT"
+
+
+def _resolve_inline_size_limit() -> int:
+    """Resolve the inline-report size threshold in bytes.
+
+    Precedence: ``AUDIT_PERSIST_INLINE_SIZE_LIMIT`` environment variable
+    (positive integer) > :data:`PERSIST_INLINE_SIZE_LIMIT`. Invalid or
+    non-positive values fall back to the default with a warning (never block
+    persistence).
+    """
+    env_value = os.environ.get(PERSIST_INLINE_SIZE_LIMIT_ENV)
+    if env_value is None or not env_value.strip():
+        return PERSIST_INLINE_SIZE_LIMIT
+    try:
+        parsed = int(env_value)
+    except ValueError:
+        print(
+            f"Warning: invalid {PERSIST_INLINE_SIZE_LIMIT_ENV} value "
+            f"{env_value!r}; using the default ({PERSIST_INLINE_SIZE_LIMIT}).",
+            file=sys.stderr,
+        )
+        return PERSIST_INLINE_SIZE_LIMIT
+    if parsed < 1:
+        print(
+            f"Warning: {PERSIST_INLINE_SIZE_LIMIT_ENV} must be a positive "
+            f"integer, got {parsed}; using the default "
+            f"({PERSIST_INLINE_SIZE_LIMIT}).",
+            file=sys.stderr,
+        )
+        return PERSIST_INLINE_SIZE_LIMIT
+    return parsed
+
+
+@contextmanager
+def _inline_or_file_flags(report_text: str, inline_flag: str):
+    """Yield the wl flag pair carrying *report_text*.
+
+    Small reports are passed inline (``<inline_flag> <text>``); reports over
+    :func:`_resolve_inline_size_limit` are written to a temporary ``.md``
+    file and yielded as ``--audit-file <path>`` so the command line stays
+    below the OS argv limit. The temporary file is removed when the context
+    exits.
+    """
+    if len(report_text.encode("utf-8")) <= _resolve_inline_size_limit():
+        yield [inline_flag, report_text]
+        return
+    fd, path = tempfile.mkstemp(prefix="audit-report-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(report_text)
+        yield ["--audit-file", path]
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _build_fallback_text(issue_id: str, ready: str) -> str:
@@ -452,16 +521,19 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     _maybe_lower_priority(issue_id, wl_bin, runner, worklog_dir, ready == "yes")
 
     # Build the command as an argv list to avoid shell quoting pitfalls.
-    cmd = [
-        wl_bin, "audit-set", issue_id,
-        "--ready-to-close", ready,
-        "--summary", summary,
-        "--raw-output", report_text,
-        "--json"
-    ]
-    cmd[1:1] = _worklog_flags(cmd, worklog_dir)
+    # Reports over the inline size limit are handed to wl via a temporary
+    # file (``--audit-file``) so the argv never trips the OS limit (E2BIG).
+    with _inline_or_file_flags(report_text, "--raw-output") as report_flags:
+        cmd = [
+            wl_bin, "audit-set", issue_id,
+            "--ready-to-close", ready,
+            "--summary", summary,
+            *report_flags,
+            "--json"
+        ]
+        cmd[1:1] = _worklog_flags(cmd, worklog_dir)
 
-    proc = runner(cmd, check=False, text=True, capture_output=True)
+        proc = runner(cmd, check=False, text=True, capture_output=True)
 
     # If wl returned non-zero, bubble up the failure and print diagnostics.
     if getattr(proc, "returncode", 1) != 0:
@@ -497,10 +569,11 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     # passed audits to show a stale icon (SA-0MTHC710X003ORZM).
 
     def _run_audit_text_update(text: str):
-        cmd = [wl_bin, "update", issue_id, "--audit-text", text]
-        cmd[1:1] = _worklog_flags(cmd, worklog_dir)
-        cmd.append("--json")
-        return runner(cmd, check=False, text=True, capture_output=True)
+        with _inline_or_file_flags(text, "--audit-text") as text_flags:
+            cmd = [wl_bin, "update", issue_id, *text_flags]
+            cmd[1:1] = _worklog_flags(cmd, worklog_dir)
+            cmd.append("--json")
+            return runner(cmd, check=False, text=True, capture_output=True)
 
     update_proc = _run_audit_text_update(report_text)
     if getattr(update_proc, "returncode", 1) != 0:
