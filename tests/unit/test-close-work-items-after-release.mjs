@@ -234,6 +234,8 @@ test('close-work-items: refuses to force-close a candidate with collateral desce
     ],
     // SA-PARENT has a descendant (SA-OTHER) outside the candidate set
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-CHILD', 'SA-OTHER'] : []),
+    // SA-OTHER is non-terminal, so it remains collateral.
+    getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
     runCloseCommand: (itemId) => { closed.push(itemId); },
   });
 
@@ -258,6 +260,75 @@ test('close-work-items: force-closes a candidate whose descendants are all candi
   assert.ok(closed.includes('SA-PARENT'), 'a fully in-set subtree is closed');
   assert.ok(closed.includes('SA-CHILD'));
   assert.equal(result.refusedCount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// AC4: terminal (done/deleted) descendants are not collateral
+// (SA-0MUR7Y3BJ004FGPP / defence-in-depth for SA-0MUJKPDAA002VVDP)
+// ---------------------------------------------------------------------------
+test('close-work-items: closes a parent whose descendants are all terminal', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) =>
+      (id === 'SA-PARENT' ? ['SA-DONE', 'SA-DELETED'] : []),
+    getItemLifecycleFn: (id) => {
+      if (id === 'SA-DONE') return { status: 'completed', stage: 'done' };
+      if (id === 'SA-DELETED') return { status: 'deleted', stage: 'done' };
+      return null;
+    },
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(closed, ['SA-PARENT'],
+    'a parent whose descendants are all terminal must be closed');
+  assert.equal(result.refusedCount, 0,
+    'terminal descendants must not be treated as collateral');
+  assert.deepEqual(result.refusedItems, []);
+});
+
+test('close-work-items: still refuses a parent with a non-terminal descendant', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-PLAN'] : []),
+    getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(closed, [],
+    'a genuinely non-terminal descendant must still refuse the close');
+  assert.equal(result.refusedCount, 1);
+  assert.deepEqual(result.refusedItems[0].collateral, ['SA-PLAN'],
+    'the refusal must name the non-terminal descendant');
+});
+
+test('close-work-items: mixed terminal/non-terminal refusal names only non-terminal', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) =>
+      (id === 'SA-PARENT' ? ['SA-DONE', 'SA-PLAN'] : []),
+    getItemLifecycleFn: (id) =>
+      (id === 'SA-DONE'
+        ? { status: 'completed', stage: 'done' }
+        : { status: 'open', stage: 'plan_complete' }),
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(closed, []);
+  assert.equal(result.refusedCount, 1);
+  assert.deepEqual(result.refusedItems[0].collateral, ['SA-PLAN'],
+    'only the non-terminal descendant is collateral');
 });
 
 // ---------------------------------------------------------------------------

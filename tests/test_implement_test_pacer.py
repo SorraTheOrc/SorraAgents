@@ -145,7 +145,7 @@ class TestCacheHitsDoNotConsumeSlot:
         """Building the runner must not touch the semaphore; only invoking
         the runner (a cache miss) acquires a slot — ``run_cached`` itself
         returns a cache hit without calling the runner."""
-        mod, captured = _capture_runner
+        mod, _captured = _capture_runner
         events: list[str] = []
         _patch_slot(monkeypatch, mod, _record_slot(events))
 

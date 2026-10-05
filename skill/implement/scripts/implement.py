@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+
+# <!-- REFACTOR-SA-0MUQ2OU12009Q8V5
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
+
+# <!-- REFACTOR-SA-0MUMEJX7G009PKO5
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `stdout` is never used
+# -->
 """Orchestration script for the implement skill workflow.
 
 Manages the deterministic lifecycle of an implementation work item: claim,
@@ -28,7 +40,7 @@ Exit codes:
   0 – success
   1 – error during execution (non-abort)
   2 – aborted
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 
@@ -75,9 +87,17 @@ try:
     from test.scripts.run_tests import (
         changed_scope_commands as _changed_scope_commands,
     )
+    from test.scripts.run_tests import (
+        extension_suite_commands as _extension_suite_commands,
+    )
+    from test.scripts.run_tests import (
+        full_suite_commands as _full_suite_commands,
+    )
     from test.scripts.run_tests import paced_runner as _test_paced_runner
 except ModuleNotFoundError:
     _changed_scope_commands = None  # type: ignore[assignment]
+    _extension_suite_commands = None  # type: ignore[assignment]
+    _full_suite_commands = None  # type: ignore[assignment]
     _test_paced_runner = None  # type: ignore[assignment]
 
     class _TestConcurrencyTimeout(RuntimeError):  # type: ignore[no-redef]
@@ -962,27 +982,103 @@ def git_commit(cwd: str, message: str) -> bool:
     return True
 
 
-def git_push_to_dev(cwd: str, branch: str) -> bool:
+class PushTimeoutError(RuntimeError):
+    """Raised when a push times out, carrying commit/branch info for recovery."""
+
+    def __init__(self, commit_hash: str, branch: str, timeout: int) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.timeout = timeout
+        super().__init__(
+            f"Push to dev timed out after {timeout}s. "
+            f"Commit {commit_hash} on branch {branch} is local. "
+            f"Push manually: git push origin {branch}:refs/heads/dev"
+        )
+
+
+def _kill_process_group(pid: int) -> None:
+    """Kill the entire process group rooted at *pid* (POSIX only).
+
+    Used to clean up orphaned children of a timed-out ``git push`` — the
+    pre-push hook spawns ``run_tests.py`` which may outlive the parent
+    process if the ``git push`` is killed.
+
+    Args:
+        pid: PID of the process to kill (typically the ``git`` process).
+    """
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        # The process may have already exited — best effort.
+        pass
+
+
+def git_push_to_dev(
+    cwd: str, branch: str, commit_hash: str | None = None, timeout: int | None = None,
+) -> bool:
     """Push the current branch into the dev branch on origin.
+
+    The push timeout is resolved from ``.pi/test-config.json``
+    (``timeoutPerCommand``) and defaults to 600 s.  On timeout the
+    pre-push hook's child processes are terminated via process-group
+    kill (AC2).  If the timeout expires a ``PushTimeoutError`` is raised
+    carrying the commit hash and branch so the caller can post a
+    manual-push comment and leave recoverable state (AC3).
 
     Args:
         cwd: Working directory (worktree root).
         branch: Local branch name to push.
+        commit_hash: The commit hash being pushed (used in recovery).
+        timeout: Override timeout in seconds (defaults to resolved config).
 
     Returns:
         True if the push succeeded.
+
+    Raises:
+        ``PushTimeoutError``: push timed out — carries commit_hash/branch
+            so the caller can produce a recovery comment.
     """
-    # Push to dev (refs/heads/dev target)
-    result = run_cmd(
-        ["git", "push", "origin", f"{branch}:refs/heads/dev"],
-        cwd=cwd,
-        check=False,
-        timeout=120,
-    )
-    if result.returncode != 0:
-        LOG.error("git push to dev failed: %s", result.stderr.strip())
+    if timeout is None:
+        timeout = _resolve_test_timeout(cwd)
+
+    # Spawn the push in its own process group so that a timeout kills the
+    # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
+    try:
+        proc = subprocess.Popen(
+            ["git", "push", "origin", f"{branch}:refs/heads/dev"],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,  # new process group
+            env={**os.environ},
+        )
+        try:
+            _stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill the entire process group so orphaned hook children don't
+            # survive and deadlock subsequent push attempts.
+            _kill_process_group(proc.pid)
+            proc.wait()
+            LOG.error(
+                "git push to dev timed out after %d s (pre-push hook still "
+                "running).",
+                timeout,
+            )
+            # Raise with recoverable-state info (AC3)
+            raise PushTimeoutError(
+                commit_hash or "unknown", branch, timeout,
+            ) from None
+        if proc.returncode != 0:
+            LOG.error(
+                "git push to dev failed: %s", stderr.decode(errors="replace").strip(),
+            )
+            return False
+        return True
+    except Exception as exc:
+        if isinstance(exc, PushTimeoutError):
+            raise
+        LOG.error("git push to dev error: %s", exc)
         return False
-    return True
 
 
 def git_get_commit_hash(cwd: str) -> str:
@@ -2123,6 +2219,172 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     return _finalize_test_result(run, tooling="pytest", scope="changed")
 
 
+def _run_commands(
+    commands: list[str], cwd: str, tooling: str, scope: str = "full"
+) -> dict[str, Any]:
+    """Run each command through the per-repo cache and combine the results.
+
+    Commands are resolved by the test skill's ``full_suite_commands`` /
+    ``changed_scope_commands`` (the single source of truth) and executed in
+    order through the paced cache runner. The first non-zero exit code is
+    reported, and stdout/stderr are concatenated so a multi-command suite
+    (e.g. pytest plus one command per node suite dir, or the declared
+    ``suiteCommands``) yields one aggregated result.
+
+    Args:
+        commands: Shell command strings to run in order.
+        cwd: Worktree root.
+        tooling: Tooling label recorded on the result.
+        scope: ``full`` or ``changed`` (recorded as cache/evidence metadata).
+
+    Returns:
+        A finalised test result dict.
+    """
+    exit_code = 0
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    for command in commands:
+        run = _run_cached_paced(
+            command,
+            cwd=cwd,
+            timeout=_resolve_test_timeout(cwd),
+            runner=lambda command, cwd_, timeout_: run_cmd(
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+            ),
+            scope=scope,
+        )
+        if run["exit_code"] != 0 and exit_code == 0:
+            exit_code = run["exit_code"]
+        if run.get("stdout"):
+            stdout_parts.append(run["stdout"])
+        if run.get("stderr"):
+            stderr_parts.append(run["stderr"])
+    return _finalize_test_result(
+        {
+            "exit_code": exit_code,
+            "stdout": "\n".join(stdout_parts),
+            "stderr": "\n".join(stderr_parts),
+        },
+        tooling=tooling,
+        scope=scope,
+    )
+
+
+def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
+    """Try to select a named test group from changed files and run it.
+
+    Uses the shared :func:`select_group_from_changed_files` to map touched
+    paths to the smallest sufficient group (SA-0MUJKF2HP001BR51).  When a
+    group is selected, its commands are executed through the cache.  Returns
+    None when no groups are defined or no group matches — the caller falls
+    back to the full suite.
+
+    This runs BEFORE the existing changed-file → test-file selector because
+    a group is a coarser but still targeted scope: an audit-skill change
+    triggers the ``audit`` group (not every test in the repo).
+    """
+    try:
+        import run_tests as _rt
+        from run_tests import (
+            group_commands as _group_cmds,
+        )
+        from run_tests import (
+            select_group_from_changed_files as _select_group,
+        )
+    except ImportError:
+        return None
+
+    changed = _rt.compute_changed_files(Path(cwd), base_ref=base_ref or "origin/dev")
+    if not changed:
+        return None
+
+    group_name = _select_group(changed, Path(cwd))
+    if group_name is None:
+        return None
+
+    group_cmds = _group_cmds(group_name, Path(cwd))
+    if group_cmds is None:
+        return None
+
+    return _run_commands(
+        group_cmds, cwd, tooling=f"group:{group_name}", scope="full"
+    )
+
+
+def _resolve_full_suite_commands(cwd: str) -> list[str] | None:
+    """Resolve the repo's full suite via the test skill's single source of truth.
+
+    Delegates to ``full_suite_commands`` (extension ``suiteCommands`` first,
+    then convention detection: pytest → node suites → npm-test). Returns
+    ``None`` when the test skill is unavailable (partial install) or the
+    repo has no suite at all, so the caller can fall back to implement.py's
+    legacy convention detection (which additionally supports repo-local
+    runner scripts and Unity). Returns ``[]`` only when the repo explicitly
+    declares an empty ``suiteCommands`` list — authoritative "no runnable
+    suite", never a convention fallback (F2 AC1).
+    """
+    if _full_suite_commands is None:
+        return None
+    root = Path(cwd).resolve()
+    try:
+        commands = list(_full_suite_commands(root))
+    except Exception as exc:  # noqa: BLE001 - degrade to convention detection
+        LOG.warning(
+            "Implement run_tests: full_suite_commands(%s) failed (%s) — "
+            "falling back to convention detection.",
+            root,
+            exc,
+        )
+        return None
+    if commands:
+        return commands
+    # Empty result: authoritative only when the extension file explicitly
+    # declares suiteCommands (including an empty list).
+    if _extension_suite_commands is not None:
+        try:
+            declared = _extension_suite_commands(root)
+        except Exception:  # noqa: BLE001 - treat as undeclared
+            declared = None
+        if declared is not None:
+            return []
+    return None
+
+
+def _run_resolved_suite(
+    cwd: str,
+    commands: list[str],
+    scope: str = "changed",
+    base_ref: str | None = None,
+) -> dict[str, Any]:
+    """Run a resolved full-suite command list, honouring changed scope.
+
+    ``scope="changed"`` first tries the test skill's changed-file selector
+    (named group, then file-level selection). When no subset is available
+    (custom ``suiteCommands``, no dev baseline, no matching tests, or a
+    node-only selection) it warns and runs the full command list so a scoped
+    run never silently skips testing.
+    """
+    if scope == "changed":
+        group_result = _run_group_from_changed_files(cwd, base_ref=base_ref)
+        if group_result is not None:
+            LOG.info(
+                "Implement run_tests: selected group '%s' from changed files in %s",
+                group_result.get("tooling", "unknown"),
+                cwd,
+            )
+            return group_result
+        scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
+        if scoped is not None:
+            return scoped
+        LOG.warning(
+            "Implement run_tests: changed-scope selection unavailable in "
+            "%s (no dev baseline, no changed tests, custom suiteCommands, "
+            "or node-only selection) — falling back to full scope.",
+            cwd,
+        )
+    return _run_commands(commands, cwd, tooling="suite", scope="full")
+
+
 def run_tests(cwd: str, scope: str = "changed",
               base_ref: str | None = None) -> dict[str, Any]:
     """Run the project test suite, routed through the per-repo run cache.
@@ -2131,11 +2393,15 @@ def run_tests(cwd: str, scope: str = "changed",
 
     - ``changed`` (default): run only the tests affected by the worktree's
       changes vs *base_ref* (``origin/dev`` default). Used by the finish
-      build/test/commit loop for fast iteration. When no subset can be
-      selected (no dev baseline, no changed files, only non-test changes,
-      custom ``suiteCommands``, or a non-pytest tooling), falls back to the
-      full suite with a logged warning — a scoped run must never silently
-      skip testing.
+      build/test/commit loop for fast iteration. Selection order:
+
+      1. Named group from ``.pi/test-config.json`` → mapped from changed
+         paths (SA-0MUJKF2HP001BR51).
+      2. Changed-file → test-file selector (existing behaviour).
+      3. Full suite (fallback when nothing is subsettable).
+
+      Falls back to the full suite with a logged warning when no subset can
+      be selected — a scoped run must never silently skip testing.
     - ``full``: the complete suite (populates/consumes the full-suite cache
       entry that audit and the pre-push hook rely on).
 
@@ -2145,24 +2411,24 @@ def run_tests(cwd: str, scope: str = "changed",
     ``skipped: True``) so finish proceeds to commit → push instead of
     aborting on ENOENT / ``Missing script: "test"``.
 
-    Detection order:
+    Suite resolution order (single source of truth, F2 AC4):
 
     1. ``IMPLEMENT_TEST_COMMAND`` env var — per-repo override; run as-is.
-    2. pytest — when the repo declares pytest (config markers or test files)
-       AND the module imports via ``python3``.
-    3. npm — when the root package.json defines a ``scripts.test`` entry.
-    4. repo-local runner — ``run_tests.sh`` / ``run_unity_tests.sh`` /
-       ``run_unity_tests.bat`` at the repo root.
-    5. Unity project (``Assets/`` or ``ProjectSettings/ProjectVersion.txt``)
-       without a configured runner → skipped with a Unity-specific message.
-    6. Otherwise → skipped with a generic no-tooling message.
+    2. The test skill's ``full_suite_commands`` — ``.pi/test-config.json``
+       ``suiteCommands`` first, then convention detection (pytest → node
+       suite dirs → npm-test). When ``suiteCommands`` is declared it is the
+       primary list and convention detection is skipped (F2 AC1).
+    3. Legacy convention detection (only when the test skill is unavailable
+       or resolved no suite): pytest → npm → repo-local runner → Unity →
+       skip. This preserves implement.py's superset support for repos the
+       test skill does not model (``run_tests.sh``, Unity projects).
 
-    Repos WITH tooling behave as before: the detected command runs (through
+    Repos WITH tooling behave as before: the resolved command(s) run through
     ``skill.test_cache.run_cached`` — a valid cached result for the same
-    worktree git state within the TTL is reused, see SA-0MSGN5OJ4002OZKY)
-    and a non-zero exit still blocks finish. When pytest is the detected
-    tooling, npm test remains the fallback if the repo also defines a
-    ``scripts.test`` entry.
+    worktree git state within the TTL is reused (SA-0MSGN5OJ4002OZKY) — and
+    a non-zero exit still blocks finish. Multiple resolved commands (e.g. a
+    declared ``suiteCommands`` list, or pytest plus node suite dirs) all run
+    and their results are combined.
 
     Args:
         cwd: Working directory (worktree root).
@@ -2174,8 +2440,8 @@ def run_tests(cwd: str, scope: str = "changed",
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
         ``exit_code`` (int), ``failures`` (list[str]), ``scope`` (str), plus
         ``skipped`` (bool — True when no tooling was found) and ``tooling``
-        (str | None — the detected runner: pytest/npm/repo-script/override/
-        unity).
+        (str | None — the resolved runner: ``suite`` (test-skill resolution),
+        pytest/npm/repo-script/override/unity).
     """
     # 1. Per-repo override (env var) — highest precedence
     override = os.environ.get("IMPLEMENT_TEST_COMMAND", "").strip()
@@ -2198,18 +2464,52 @@ def run_tests(cwd: str, scope: str = "changed",
             scope="full",
         )
 
+    # 2. Delegate to the test skill's single source of truth for suite
+    #    resolution (F2 AC4 / WL-0MUL6LCE00042MB0): ``suiteCommands`` first,
+    #    then convention detection (pytest → node suites → npm-test). This
+    #    ensures the finish gate exercises the repo's real full suite (e.g.
+    #    ContextHub's vitest commands) instead of implement.py's duplicate
+    #    pytest-first detection. ``None`` means the skill is unavailable or
+    #    no suite was resolved, so the legacy convention detection below
+    #    still handles repo-local runners / Unity / no-tooling repos.
+    resolved_suite = _resolve_full_suite_commands(cwd)
+    if resolved_suite is not None:
+        if not resolved_suite:
+            return _skip_test_result(
+                "No test suite declared or detected — skipping test step "
+                "(no-op).",
+                tooling=None,
+            )
+        return _run_resolved_suite(
+            cwd, resolved_suite, scope=scope, base_ref=base_ref
+        )
+
+    # 3. Legacy convention detection (test skill unavailable or no suite
+    #    resolved): preserve implement.py's superset support for repo-local
+    #    runner scripts and Unity projects.
     tooling = _detect_test_tooling(cwd)
 
-    # 2. pytest (with npm test fallback when the repo also has a test script)
+    # 3a. pytest (with npm test fallback when the repo also has a test script)
     if tooling == "pytest":
         if scope == "changed":
+            # Try named group selection first (SA-0MUJKF2HP001BR51):
+            # map changed files to the smallest sufficient group.
+            group_result = _run_group_from_changed_files(cwd, base_ref=base_ref)
+            if group_result is not None:
+                LOG.info(
+                    "Implement run_tests: selected group '%s' from changed files in %s",
+                    group_result.get("tooling", "unknown"),
+                    cwd,
+                )
+                return group_result
+            # Fall through to the existing changed-file → test-file selector.
             scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
             if scoped is not None:
                 return scoped
             LOG.warning(
                 "Implement run_tests: changed-scope selection unavailable in "
-                "%s (no dev baseline, no changed tests, or custom "
-                "suiteCommands) — falling back to full scope.",
+                "%s (no dev baseline, no changed tests, no matching groups, "
+                "or custom suiteCommands) — falling back to full scope.",
                 cwd,
             )
         pytest_run = _run_cached_paced(
@@ -2243,7 +2543,7 @@ def run_tests(cwd: str, scope: str = "changed",
             final_tooling = "npm"
         return _finalize_test_result(result, tooling=final_tooling, scope="full")
 
-    # 3. npm test script (no pytest suite)
+    # 3b. npm test script (no pytest suite)
     if tooling == "npm":
         if scope == "changed":
             LOG.warning(
@@ -2265,7 +2565,7 @@ def run_tests(cwd: str, scope: str = "changed",
             scope="full",
         )
 
-    # 4. Repo-local runner script
+    # 3c. Repo-local runner script
     if tooling == "repo-script":
         runner_script = _find_repo_test_runner(cwd)
         if runner_script is None:
@@ -2303,7 +2603,7 @@ def run_tests(cwd: str, scope: str = "changed",
             scope="full",
         )
 
-    # 5. Unity project without a configured runner → Unity-specific skip
+    # 3d. Unity project without a configured runner → Unity-specific skip
     if tooling == "unity":
         return _skip_test_result(
             "Unity project detected (Assets/ or ProjectSettings/ProjectVersion.txt) "
@@ -2314,7 +2614,7 @@ def run_tests(cwd: str, scope: str = "changed",
             tooling="unity",
         )
 
-    # 6. No tooling at all → generic skip
+    # 3e. No tooling at all → generic skip
     return _skip_test_result(
         "No test tooling detected (no pytest suite, no npm test script, no "
         "repo-local test runner) — skipping test step (no-op).",
@@ -2918,11 +3218,12 @@ def phase_finish(
     3. Build
     4. Test (with fix-and-re-run loop)
     5. Commit
-    6. Clean up worktree processes
-    7. Remove worktree
-    8. Push to dev
-    9. Sync local parent branch (post-push, AC1/AC2)
-    10. Mark in_review
+    6. Fast-forward dev in the main checkout (AC1 — context-budget fix)
+    7. Clean up worktree processes
+    8. Remove worktree
+    9. Push to dev
+    10. Sync local parent branch (post-push, AC1/AC2)
+    11. Mark in_review
 
     All implementation work MUST be done inside the worktree created by
     ``phase_start``. If the current directory is outside the worktree and the
@@ -3205,14 +3506,75 @@ def phase_finish(
             }
             LOG.info("Committed at %s", commit_hash)
 
-            # ── Step 5: Clean up worktree processes ────────────────────────
+            # ── Step 5: Fast-forward dev in the main checkout ──────────────
+            # Before removing the worktree, bring the main checkout's local
+            # dev branch up to the new commit (AC1).  This ensures that when
+            # the pre-push hook measures the working tree (which is the main
+            # checkout at push time), it sees the updated files — so
+            # context-budget compliant commits that modify AGENTS.md etc. no
+            # longer trigger the stale-checkout failure.
+            repo_root = (
+                state.repo_root
+                if state
+                else (_get_repo_root() or str(Path.cwd().resolve()))
+            )
+            try:
+                LOG.info(
+                    "Fast-forwarding dev in main checkout (%s) to %s ...",
+                    repo_root,
+                    commit_hash,
+                )
+                # 1. Fetch latest origin/dev so our local-tracking ref is current.
+                fetch_result = run_cmd(
+                    ["git", "fetch", "origin", "dev"], cwd=repo_root,
+                )
+                if fetch_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git fetch origin dev failed: {fetch_result.stderr.strip()}"
+                    )
+                # 2. Ensure the main checkout is on dev (and clean).
+                checkout_result = run_cmd(
+                    ["git", "checkout", "dev"], cwd=repo_root,
+                )
+                if checkout_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git checkout dev failed: {checkout_result.stderr.strip()}"
+                    )
+                # 3. Fast-forward origin/dev → local dev (synchronises with any
+                #    concurrent pushes before we merge our commit).
+                merge_origin_result = run_cmd(
+                    ["git", "merge", "--ff-only", "origin/dev"], cwd=repo_root,
+                )
+                if merge_origin_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git merge origin/dev failed (non-fast-forward or conflict): "
+                        f"{merge_origin_result.stderr.strip()}"
+                    )
+                # 4. Fast-forward our new commit onto dev.
+                merge_commit_result = run_cmd(
+                    ["git", "merge", "--ff-only", commit_hash], cwd=repo_root,
+                )
+                if merge_commit_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git merge --ff-only {commit_hash} failed: "
+                        f"{merge_commit_result.stderr.strip()}"
+                    )
+                LOG.info("Fast-forward to %s succeeded", commit_hash)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "Fast-forward dev failed (%s); push will proceed from the "
+                    "stale checkout — the context-budget gate may reject the push.",
+                    exc,
+                )
+
+            # ── Step 5b: Clean up worktree processes ───────────────────────
             LOG.info("Cleaning up worktree processes...")
             cleanup_result = cleanup_worktree_processes(worktree_path)
             report["steps"]["cleanup"] = cleanup_result
             if cleanup_result.get("warning"):
                 LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
 
-            # ── Step 6: Remove worktree ────────────────────────────────────
+            # ── Step 6: Remove worktree ───────────────────────────────────
             LOG.info("Removing worktree...")
             remove_state(worktree_path)
             if not _remove_worktree(
@@ -3223,22 +3585,29 @@ def phase_finish(
                 LOG.warning(msg)
                 report["steps"]["worktree_removed"] = False
 
-            # ── Step 7: Resolve repo_root for push & sync ──────────────────
-            repo_root = (
-                state.repo_root
-                if state
-                else (_get_repo_root() or str(Path.cwd().resolve()))
-            )
-
-            # ── Step 8: Push to dev ────────────────────────────────────────
+            # ── Step 7: Push to dev ────────────────────────────────────────
+            # repo_root was resolved in Step 5 (fast-forward) above.
             LOG.info("Pushing to dev...")
-            if not git_push_to_dev(repo_root, branch):
-                raise RuntimeError("git push to dev failed.")
+            try:
+                if not git_push_to_dev(repo_root, branch, commit_hash):
+                    raise RuntimeError("git push to dev failed.")
+            except PushTimeoutError as exc:
+                # AC3: recoverable state — commit is safe, branch info retained.
+                # Post a manual-push comment and re-raise so the outer handler
+                # resets status to open.
+                wl_add_comment(
+                    work_item_id,
+                    f"Push to dev timed out after {exc.timeout}s (pre-push hook "
+                    f"still running, likely the full test suite). Commit "
+                    f"{exc.commit_hash} is local on branch {exc.branch}.\n"
+                    f"Push manually: git push origin {exc.branch}:refs/heads/dev",
+                )
+                raise RuntimeError(f"git push to dev timed out: {exc}") from exc
 
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
 
-            # ── Step 9: Sync local parent branch (AC1 / AC2) ───────────────
+            # ── Step 8: Sync local parent branch (AC1 / AC2) ──────────────
             # After a successful push, bring the main checkout's local
             # parent branch (dev) up to date so the next child worktree
             # does not start from a stale base.
@@ -3262,11 +3631,15 @@ def phase_finish(
             StatusLifecycle.update_status(work_item_id, "open")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
-        if "git push to dev failed" in msg:
-            wl_add_comment(
-                work_item_id,
-                f"Push to dev failed. Commit {commit_hash} is local. "
-                f"Push manually: git push origin {branch}:refs/heads/dev",
+        if "git push to dev failed" in msg or "git push to dev timed out" in msg:
+            # Already posted a manual-push comment from the push handler;
+            # the commit hash and branch are in the comment already.
+            LOG.warning(
+                "Push %s. Commit %s on branch %s is local and can be "
+                "pushed manually.",
+                "timed out" if "timed out" in msg else "failed",
+                commit_hash,
+                branch,
             )
         elif "git commit failed" in msg:
             wl_add_comment(work_item_id, "Commit failed during finish phase.")
@@ -3276,7 +3649,7 @@ def phase_finish(
             LOG.error(msg)
         return report
 
-    #── Step 9: Add completion comment ─────────────────────────────
+    # ── Step 9: Add completion comment ─────────────────────────────
     wl_add_comment(
         work_item_id,
         f"Implementation complete.\n- Commit: {commit_hash}\n- Branch: {branch}\n- Worktree: {worktree_path}",

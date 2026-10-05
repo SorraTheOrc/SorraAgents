@@ -56,7 +56,9 @@ BASELINE_MEDIAN_S = 1324
 THRESHOLD_S = 0.70 * BASELINE_MEDIAN_S  # 927.0 s — >=30% reduction
 BENCHMARK_RUNS = 3
 
-_SLOT_STATUS_URL = "http://localhost:8000/llama/local/status"
+# The slot-status URL is resolved at call time via
+# ``audit_runner._default_slot_status_url()`` (derived from the proxy base URL,
+# SA-0MUV2UBMT008OE2E) so the skip probe follows the configured proxy host.
 _OPT_IN_ENV = "AUDIT_RUN_BENCHMARKS"
 
 # ---------------------------------------------------------------------------
@@ -145,7 +147,7 @@ def _proxy_status() -> dict | None:
     so the skip probe uses a 5s timeout.
     """
     try:
-        with urllib.request.urlopen(_SLOT_STATUS_URL, timeout=5) as resp:
+        with urllib.request.urlopen(audit_runner._default_slot_status_url(), timeout=5) as resp:
             if resp.status != 200:
                 return None
             data = json.loads(resp.read().decode("utf-8"))
@@ -165,7 +167,7 @@ def _skip_reason() -> str | None:
         return "pi binary not found on PATH"
     status = _proxy_status()
     if status is None:
-        return f"local proxy not reachable at {_SLOT_STATUS_URL}"
+        return f"local proxy not reachable at {audit_runner._default_slot_status_url()}"
     free = int(status.get("available_slots", 0) or 0)
     if free < 1:
         return (

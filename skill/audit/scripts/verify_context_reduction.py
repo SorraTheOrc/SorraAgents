@@ -392,13 +392,16 @@ def _parse_verdict(proc: subprocess.CompletedProcess) -> tuple[str | None, list[
 def _flag_off_runner_copy(runner_path: Path, repo_root: Path, tmp_dir: Path) -> Path:
     """Create a runner copy with the context-reduction flags removed.
 
-    Removes the ``cmd.extend(["--no-context-files", "--no-skills"])`` line
-    and pins the skills root to *repo_root* (the copy lives outside the repo
-    so the default resolve-from-file-depth would otherwise resolve wrong).
+    Removes the
+    ``cmd.extend(["--no-context-files", "--no-skills", "--no-extensions"])``
+    line (and the earlier two-flag variant), then pins the skills root to
+    *repo_root* (the copy lives outside the repo so the default
+    resolve-from-file-depth would otherwise resolve wrong).
     """
     src = runner_path.read_text(encoding="utf-8")
     src = re.sub(
-        r"cmd\.extend\(\[\"--no-context-files\", \"--no-skills\"\]\)\n",
+        r"cmd\.extend\(\[\"--no-context-files\", \"--no-skills\""
+        r"(?:, \"--no-extensions\")?\]\)\n",
         "",
         src,
     )

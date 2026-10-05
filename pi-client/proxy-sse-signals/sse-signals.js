@@ -139,6 +139,35 @@ export function createSignalExtractor() {
 // Fetch wrapper
 // ---------------------------------------------------------------------------
 
+/**
+ * Write a status line through a possibly-stale UI handle without ever
+ * throwing.
+ *
+ * `statusUi` is captured at `turn_start`; the capturing-fetch callback (and
+ * `turn_end`) may run after a session replacement/reload has invalidated the
+ * captured UI handle, at which point reading `ui.theme` or calling
+ * `ui.setStatus` throws `This extension ctx is stale ...`. Async callbacks run
+ * outside pi's try/catch, so an unguarded throw would crash pi
+ * (SA-0MUEIOGT2005IR7F). This helper renders dim-formatted `text` (or clears
+ * the status when `text` is `undefined`) and reports whether the write
+ * happened; a stale/absent handle is a silent no-op.
+ *
+ * @param {{ theme?: { fg: (style: string, text: string) => string }, setStatus: (key: string, value: string | undefined) => void } | null | undefined} ui
+ * @param {string} key footer status key
+ * @param {string | undefined} text signal text, or undefined to clear
+ * @returns {boolean} true when the status write was performed
+ */
+export function safeSetStatus(ui, key, text) {
+  if (!ui) return false;
+  try {
+    const value = text === undefined ? undefined : ui.theme.fg("dim", text);
+    ui.setStatus(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function safeCall(fn, ...args) {
   try {
     fn(...args);

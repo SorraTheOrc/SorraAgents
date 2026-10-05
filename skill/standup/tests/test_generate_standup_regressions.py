@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+
+# <!-- REFACTOR-SA-0MUMEJY2P009KWKS
+# smell: unknown
+# severity: medium
+# description: `datetime.datetime()` called without a `tzinfo` argument
+# -->
 """Tests: detect_regressions() must only flag slips that happened *inside* the window.
 
 Covers SA-0MUFNU2WM00049A9. The original predicate had an operator-precedence
@@ -11,7 +17,7 @@ behaviour:
   - an item completed+in_review before that slipped *outside* the window is NOT flagged;
   - an item still completed+in_review is NOT flagged;
   - an item that was never completed+in_review before is NOT flagged.
-"""  # noqa: EXE001
+"""
 from __future__ import annotations
 
 import importlib.util
@@ -26,8 +32,11 @@ _SKILLS_ROOT = REPO_ROOT / "skill"
 if str(_SKILLS_ROOT) not in sys.path:
     sys.path.insert(0, str(_SKILLS_ROOT))
 
-WINDOW_START = datetime(2026, 9, 23, 6, 0, 0)
-WINDOW_END = datetime(2026, 9, 24, 6, 0, 0)
+# Naive local datetimes intentionally match ``detect_regressions`` / the standup
+# window parser, which compare against naive ``datetime.fromisoformat`` values
+# parsed from ``updatedAt`` — aware values would raise TypeError on compare.
+WINDOW_START = datetime(2026, 9, 23, 6, 0, 0)  # noqa: DTZ001
+WINDOW_END = datetime(2026, 9, 24, 6, 0, 0)  # noqa: DTZ001
 
 # The canonical "full snapshot" marker lets the window be treated as valid.
 _BEFORE = ("completed", "in_review")

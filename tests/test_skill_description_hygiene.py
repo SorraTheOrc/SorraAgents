@@ -25,8 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MAX_DESC_BYTES = 140
 # 1800 B covered the original 17 skills; the 18th (report helper,
 # SA-0MSRFTP2Y008BH6L) adds at most one more ≤140 B description; the
-# shared interview skill (SA-0MUBVM6FR000NDI1) adds a further one.
-MAX_TOTAL_PROSE_BYTES = 2080
+# shared interview skill (SA-0MUBVM6FR000NDI1) adds a further one;
+# the machine-hygiene skill (WL-0MUJLCVRS0093EJJ) adds a 121 B one.
+MAX_TOTAL_PROSE_BYTES = 2220
 
 
 def _prose() -> dict[str, str]:
@@ -45,7 +46,7 @@ class TestDescriptionTemplate:
         # (SA-0MSN81W9G006K0K8); 17 after adding standup
         # (SA-0MTOMCML900254CI); 18 after adding the shared interview skill
         # (SA-0MUBVM6FR000NDI1).
-        assert len(prose) == 18, f"expected 18 skills, got {len(prose)}"
+        assert len(prose) == 19, f"expected 19 skills, got {len(prose)}"
 
     def test_each_description_within_140_chars(self):
         for name, desc in _prose().items():
@@ -80,10 +81,13 @@ class TestDescriptionTemplate:
         # (SA-0MSLK78W7009HIXC). The 18th skill (report) is new prose that
         # never existed at intake, so it cannot participate in the compaction
         # cut; its compactness is enforced by the ≤140 B per-description test
-        # and the total-prose budget. Exclude it to keep the AC anchored to
-        # the skills that were actually compacted.
+        # and the total-prose budget. The machine-hygiene skill
+        # (WL-0MUJLCVRS0093EJJ) is likewise new post-baseline prose and is
+        # excluded for the same reason. Exclude these to keep the AC anchored
+        # to the skills that were actually compacted.
         compacted_total = sum(
-            len(d) for k, d in prose.items() if k not in ("report", "interview")
+            len(d) for k, d in prose.items()
+            if k not in ("report", "interview", "machine-hygiene")
         )
         reduction = 1 - compacted_total / baseline
         assert reduction >= 0.48, (

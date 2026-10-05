@@ -453,6 +453,17 @@ class TestStatusLifecycleUnit:
         with pytest.raises(RuntimeError, match="must be in-progress"):
             StatusLifecycle.require_claimed("TEST-123")
 
+    def test_require_claimed_raises_claim_error_when_completed(self, mock_run):
+        """require_claimed raises ClaimError for a completed item (AC2).
+
+        A completed item is not claimable, so the guard must reject it just
+        as it rejects an open item (regression guard for the hyphen/
+        underscore comparison bug this work item fixes).
+        """
+        mock_run.side_effect = [_make_wl_show_proc(status="completed")]
+        with pytest.raises(ClaimError, match="must be in-progress"):
+            StatusLifecycle.require_claimed("TEST-123")
+
     def test_require_claimed_uses_runner(self, mock_run):
         """require_claimed honors an injected runner."""
         seen: list[list[str]] = []

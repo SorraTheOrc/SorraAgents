@@ -42,7 +42,38 @@ All scripts are internal implementation details — the only user-facing action 
 ```bash
 # Execute a release (dev → main merge)
 node $(skill_path ship)/scripts/run-release.js
+
+# Pre-flight only: refresh in_review audits, then exit (no merge, no Code Freeze)
+node $(skill_path ship)/scripts/run-release.js --refresh-audits
 ```
+
+### Pre-flight audit refresh (`--refresh-audits`)
+
+A large backlog of missing/stale audits can make the in-gate remediation
+(SA-0MUOO5V0P00461X8) slow even though it is bounded. Run the
+**pre-flight-only** refresh first:
+
+```bash
+node $(skill_path ship)/scripts/run-release.js --refresh-audits [--dry-run]
+```
+
+It refreshes the audits for `in_review` items (children included) using the
+same bounded remediation, then exits **without merging and without setting the
+Code Freeze marker** (SA-0MUOO5VMH005VF69). Exit code 0 when nothing remains;
+12 when items still need attention. `--dry-run` reports the plan without
+invoking the audit runner. After a successful refresh, run the normal release;
+the gates then find fresh audits and do little work.
+
+### Narrow audit bypass (`--skip-audit-remediation`)
+
+`node $(skill_path ship)/scripts/run-release.js --skip-audit-remediation` skips
+only the **in-gate** audit re-audit attempts (SA-0MUOO5WV0006D7UD). Every
+in-scope item must still have a passing audit (`readyToClose === true`), so a
+missing/stale/failing audit still blocks the release — with the offline-refresh
+guidance. Unlike `--skip-checks`, it does **not** bypass the unmerged-branches,
+critical-items, worklog-refs, producer-review, or final-validation gates. It is
+not forwarded to the merge script. Typical use: run `--refresh-audits` first,
+then `--skip-audit-remediation` for the release so no gate ever spawns an audit.
 
 For programmatic access to internal helpers (used by the implement workflow),
 import the modules from the skill directory resolved via `skill_path` (e.g.
@@ -63,11 +94,11 @@ isBranchBlocked('main');                       // → true
 The `release` action runs six gating checks before merging `dev` to `main`:
 
 1. **Unmerged branches check** — abort if feature branches pending; exit 3.
-2. **Audit readiness gate** — verifies **top-level** `in_review` items (`parentId == null`) pass audits; exit 6. Child items are covered by their parent's audit and never block. Missing/transient audits (timeout, provider error, FailureNotice) are **auto-remediated conservatively**: the gate re-runs `audit_runner.py issue <id>` and re-checks `wl audit-show`, blocking only if the item still fails after the re-run; successfully-remediated items are reported separately. Genuine "not ready to close" verdicts block immediately with **no** re-audit attempt. A remediation-runner failure is treated as blocking with the manual remediation command surfaced — never silently passed.
+2. **Audit readiness gate** — verifies **top-level** `in_review` items (`parentId == null`) pass audits; exit 6. Child items are covered by their parent's audit and never block. Missing/**stale**/transient audits (stale = the verdict predates the item's last update; transient = timeout, provider error, FailureNotice) are **auto-remediated conservatively**: the gate re-runs `audit_runner.py issue <id>` and re-checks `wl audit-show`, blocking only if the item still fails after the re-run; successfully-remediated items are reported separately. This applies the **same staleness semantics as the Step-3.7 final-validation sweep** (SA-0MUOO5UEB008RXBP) so a stale failing verdict can no longer kill the release at Step 2 before the staleness-aware sweep runs. Genuine (fresh) "not ready to close" verdicts block immediately with **no** re-audit attempt. A remediation-runner failure is treated as blocking with the manual remediation command surfaced — never silently passed. In-gate remediation is **bounded** (SA-0MUOO5V0P00461X8): per-item timeout `SHIP_AUDIT_REMEDIATION_TIMEOUT_MS` (default 30 min), total wall-clock `SHIP_AUDIT_REMEDIATION_BUDGET_MS` (default 30 min), and attempt cap `SHIP_AUDIT_REMEDIATION_MAX_ITEMS` (default 5). When the budget is exhausted the remaining items block with an offline-refresh instruction (`audit_runner.py batch`) instead of being reported as "not ready to close"; a remediation timeout is classified distinctly from a genuine verdict. Before re-auditing a time-stale item, the gate asks the audit runner **read-only** (`audit_runner.py check-freshness <id> --json`, SA-0MUOO5W8J001DYTI) whether the stored content fingerprint still matches: a content-unchanged audit is treated as fresh (no re-audit), while a content-changed or legacy (fingerprint-less) audit remains remediable.
 3. **Critical-items gate** — abort if non-terminal critical items exist; exit 7.
 4. **Worklog refs gate** — abort if worklog refs remain in merged code; exit 8.
 5. **Producer-review gate** — abort if **top-level** items need producer review; exit 9. Child items (covered by their parent's review) never block.
-6. **Final validation sweep** — exit 12. Sweeps **all** `in_review` items but resolves child scope first (SA-0MU2OY1N9000XL2H): a child is **covered** (skipped) when its nearest `in_review` ancestor has a passing audit (`readyToClose === true`), and **excluded** (skipped) when its parent is deleted or not `in_review` (out of the release scope). Uncovered children and top-level items are validated independently; blocking items are those with a missing/stale/failing audit or `needsProducerReview === true`. Missing/stale/transient audits are auto-remediated via `audit_runner.py issue <id>` and re-checked; genuine "not ready to close" verdicts block immediately. Covered and excluded children (with their parent ids) are reported.
+6. **Final validation sweep** — exit 12. Sweeps **all** `in_review` items but resolves child scope first (SA-0MU2OY1N9000XL2H): a child is **covered** (skipped) when its nearest `in_review` ancestor has a passing audit (`readyToClose === true`), and **excluded** (skipped) when its parent is deleted or not `in_review` (out of the release scope). Uncovered children and top-level items are validated independently; blocking items are those with a missing/stale/failing audit or `needsProducerReview === true`. Missing/stale/transient audits are auto-remediated via `audit_runner.py issue <id>` and re-checked; genuine "not ready to close" verdicts block immediately. Remediation is bounded by the same `SHIP_AUDIT_REMEDIATION_*` budget as Step 2 (SA-0MUOO5V0P00461X8); exhaustion blocks the remaining items with an offline-refresh instruction. Covered and excluded children (with their parent ids) are reported.
 
    **Child override / escalation (SA-0MUJLWPB10038Z8Q):** a child flagged `needsProducerReview=true` is resolved against its parent's readiness rather than blocking unconditionally. An **uncovered** child (no audit-ready `in_review` ancestor) **escalates**: the flag is set on the nearest `in_review` ancestor with a comment enumerating the child id(s), and the ancestor blocks this gate (exit 12) — so genuine producer attention still stops the release. A **covered** child is reported as a planned override; the close step (step 12) clears its flag (authorised by the parent's passing audit) and closes it. Escalation is never authorised by status alone. `--dry-run` reports the planned overrides/escalations without mutating the worklog.
 
@@ -86,7 +117,7 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 | 3 | Unmerged branches found |
 | 4 | PR merge failed |
 | 5 | Dev sync failed |
-| 6 | Audit gate failure — top-level `in_review` item(s) lack a passing audit after conservative auto-remediation (missing/transient audits are re-run automatically; genuine "not ready to close" verdicts block immediately) |
+| 6 | Audit gate failure — top-level `in_review` item(s) lack a passing audit after conservative auto-remediation (missing/stale/transient audits are re-run automatically; genuine "not ready to close" verdicts block immediately) |
 | 7 | Critical-items gate failure |
 | 8 | Worklog-ref gate failure |
 | 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
@@ -183,7 +214,10 @@ The release gate runs with ``--strict-git-env`` (SA-0MUIULX49001BWGG): it
 refuses to start (exit 2) when a repository-override variable such as
 ``GIT_DIR`` is present in the environment, because a leaked value can redirect
 real-git test fixtures at the live checkout. The pre-push hook applies the same
-``--strict-git-env`` flag for ``dev``/``main`` pushes. An operator can override
+``--strict-git-env`` flag for ``dev``/``main`` pushes. A **worktree-managed**
+``GIT_DIR`` (``<main>/.git/worktrees/<name>``, which git exports to hooks run
+from a linked worktree) is exempt — it is git's own hook environment, not a
+leak (SA-0MUMR3QPM002VK7M). An operator can override any genuine detection
 with ``RUN_TESTS_ALLOW_REPO_OVERRIDES=1`` (loud warning; not recommended) — the
 scrub is still applied either way.
 

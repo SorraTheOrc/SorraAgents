@@ -196,6 +196,22 @@ class TestFlagOffRunnerCopy:
         assert "--no-skills" not in text
         assert "print('done')" in text
 
+    def test_removes_extensions_variant_flags_line(self, tmp_path):
+        """SA-0MUEIOGT2005IR7F: the --no-extensions variant is stripped too."""
+        src = tmp_path / "audit_runner.py"
+        src.write_text(
+            'cmd.extend(["--no-context-files", "--no-skills", '
+            '"--no-extensions"])\n'
+            "print('done')\n",
+            encoding="utf-8",
+        )
+        copy = vcr._flag_off_runner_copy(src, Path("/repo"), tmp_path)
+        text = copy.read_text(encoding="utf-8")
+        assert "--no-context-files" not in text
+        assert "--no-skills" not in text
+        assert "--no-extensions" not in text
+        assert "print('done')" in text
+
     def test_pins_repo_root(self, tmp_path):
         src = tmp_path / "audit_runner.py"
         src.write_text(self.SAMPLE, encoding="utf-8")

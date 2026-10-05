@@ -49,6 +49,22 @@ test('check-final-validation: exports expected functions', async () => {
   assert.equal(typeof mod.resolveChildScope, 'function');
 });
 
+// ── shared audit-freshness module (SA-0MUOO5UEB008RXBP) ─────────────────────
+
+test('check-final-validation: re-exports the shared audit-freshness module', async () => {
+  const mod = await import(MODULE_PATH);
+  const freshnessPath = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-freshness.js');
+  assert.ok(existsSync(freshnessPath), 'shared audit-freshness.js should exist');
+  const fresh = await import(freshnessPath);
+  assert.equal(mod.isAuditStale, fresh.isAuditStale, 'isAuditStale must be the shared export');
+  assert.equal(mod.parseIsoUtc, fresh.parseIsoUtc, 'parseIsoUtc must be the shared export');
+  assert.equal(
+    mod.AUDIT_FRESHNESS_BUFFER_SECONDS,
+    fresh.AUDIT_FRESHNESS_BUFFER_SECONDS,
+    'freshness buffer constant must come from the shared module',
+  );
+});
+
 // ── parseIsoUtc ──────────────────────────────────────────────────────────────
 
 describe('parseIsoUtc', () => {
@@ -481,14 +497,15 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
   }
 
   /** Run the gate with a parent-map resolver and a per-id audit dispatcher. */
-  async function runScopedGate({ items, parents = {}, audits = {}, runAuditCommand } = {}) {
+  async function runScopedGate({ items, parents = {}, audits = {}, runAuditCommand, createRemediationBudgetFn, runAuditShow } = {}) {
     const mod = await import(MODULE_PATH);
     return mod.checkFinalValidation({
       getItemsFn: () => items,
       getItemByIdFn: (id) => (id in parents ? parents[id] : null),
-      runAuditShow: auditDispatch(audits),
+      runAuditShow: runAuditShow || auditDispatch(audits),
       runAuditCommand: runAuditCommand || (() => 'ok'),
       resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      ...(createRemediationBudgetFn ? { createRemediationBudgetFn } : {}),
     });
   }
 
@@ -530,6 +547,31 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
     assert.equal(report.hasBlockingItems, true);
     assert.equal(report.blockingItems[0].workItemId, 'SA-CHILD-1');
     assert.equal(report.coveredChildren.length, 0);
+  });
+
+  // Regression (SA-0MUOO5UEB008RXBP): now that a stale failing verdict is
+  // classified as non-blocking, coverage must NOT be granted by a stale
+  // failing parent — only a *passing* parent audit covers its children.
+  test('a stale failing parent audit does NOT cover the child', async () => {
+    const report = await runScopedGate({
+      items: [SCOPED_CHILD],
+      parents: { 'SA-P1': PARENT_IN_REVIEW },
+      audits: {
+        // readyToClose=false, auditedAt (08:00) well before parent updatedAt
+        // (09:00) → stale, non-passing → must not cover SA-CHILD-1.
+        'SA-P1': {
+          success: true,
+          audit: {
+            readyToClose: false,
+            auditedAt: '2026-09-04T08:00:00Z',
+            rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria not met.',
+          },
+        },
+        'SA-CHILD-1': AUDIT_PASSING, // child has its own fresh passing audit
+      },
+    });
+    assert.equal(report.coveredChildren.length, 0, 'stale failing parent must not cover the child');
+    assert.equal(report.hasBlockingItems, false, 'the child passes on its own fresh audit');
   });
 
   test('a child whose parent is not in_review is excluded (never blocks)', async () => {
@@ -658,6 +700,103 @@ describe('checkFinalValidation - remediation runner failure', () => {
     assert.equal(report.blockingItems.length, 1);
     assert.match(report.blockingItems[0].reason, /Audit remediation failed/);
     assert.ok(report.blockingItems[0].remediation.includes('audit_runner.py issue SA-1'));
+  });
+});
+
+describe('checkFinalValidation - bounded remediation budget', () => {
+  async function runGate({ items, runAuditCommand, createRemediationBudgetFn, runAuditShow } = {}) {
+    const mod = await import(MODULE_PATH);
+    return mod.checkFinalValidation({
+      getItemsFn: () => items,
+      getItemByIdFn: () => null,
+      runAuditShow,
+      runAuditCommand: runAuditCommand || (() => 'ok'),
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      ...(createRemediationBudgetFn ? { createRemediationBudgetFn } : {}),
+    });
+  }
+
+  test('stops at the attempt cap and blocks remaining items with offline guidance', async () => {
+    const budgetMod = await import(
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js'),
+    );
+    const items = [
+      { id: 'SA-T1', title: 'Top One', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      { id: 'SA-T2', title: 'Top Two', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+    ];
+    let remediationCalls = 0;
+    let t1Shows = 0;
+    const runAuditShow = (id) => {
+      if (id === 'SA-T1') {
+        t1Shows += 1;
+        return t1Shows === 1
+          ? JSON.stringify({ audit: null })
+          : JSON.stringify({ audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z' } });
+      }
+      return JSON.stringify({ audit: null });
+    };
+    const report = await runGate({
+      items,
+      runAuditShow,
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      createRemediationBudgetFn: () => new budgetMod.RemediationBudget({
+        maxItems: 1,
+        budgetMs: 1_000_000,
+      }),
+    });
+    assert.equal(remediationCalls, 1);
+    assert.equal(report.hasBlockingItems, true);
+    assert.equal(report.blockingItems.length, 1);
+    assert.equal(report.blockingItems[0].workItemId, 'SA-T2');
+    assert.match(report.blockingItems[0].reason, /budget exhausted/i);
+    assert.match(
+      report.blockingItems[0].remediation,
+      /audit_runner\.py batch/,
+      'offline-refresh guidance must be surfaced',
+    );
+    assert.equal(report.remediatedItems.length, 1);
+    assert.equal(report.remediatedItems[0].workItemId, 'SA-T1');
+  });
+});
+
+describe('checkFinalValidation - narrow --skip-audit-remediation bypass', () => {
+  test('skips in-gate remediation but still blocks a missing audit', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const report = await mod.checkFinalValidation({
+      skipRemediation: true,
+      getItemsFn: () => [
+        { id: 'SA-S', title: 'Skip', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      ],
+      runAuditShow: () => JSON.stringify({ audit: null }),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+    assert.equal(remediationCalls, 0, 'skip must not invoke the audit runner');
+    assert.equal(report.hasBlockingItems, true, 'readyToClose requirement is not relaxed');
+    assert.match(report.blockingItems[0].reason, /remediation skipped/);
+    assert.match(report.blockingItems[0].remediation, /audit_runner\.py batch/);
+  });
+});
+
+describe('checkFinalValidation - content-fingerprint fast path', () => {
+  test('treats a stale-passing fingerprint audit as fresh (no re-audit)', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const raw = 'Ready to close: Yes\nAudit content fingerprint: deadbeef';
+    const report = await mod.checkFinalValidation({
+      getItemsFn: () => [
+        { id: 'SA-CF', title: 'CF', needsProducerReview: false, parentId: null, updatedAt: '2026-09-05T10:00:00Z' },
+      ],
+      runAuditShow: () => JSON.stringify({
+        audit: { readyToClose: true, auditedAt: '2026-09-04T08:00:00Z', rawOutput: raw },
+      }),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+      queryContentFreshnessFn: () => ({ fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: null }),
+    });
+    assert.equal(remediationCalls, 0, 'content-fresh audit must not be re-audited');
+    assert.equal(report.hasBlockingItems, false);
   });
 });
 

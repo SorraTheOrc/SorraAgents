@@ -63,9 +63,23 @@ _OVERRIDE_VARS = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 )
 
+#: Every bypass switch ``.githooks/pre-push`` reads. An ambient value leaks
+#: into the hook subprocess and short-circuits a stage the wiring tests must
+#: exercise — e.g. an operator's ``WORKLOG_SKIP_PRE_PUSH=1`` (documented for
+#: worktree pushes) exits the hook *before* the git-identity guard
+#: (SA-0MUN83EXN004JBMW). Strip them so the ambient environment cannot change
+#: the test's behaviour; each test re-sets the switches it needs explicitly.
+_HOOK_BYPASS_VARS = (
+    "WORKLOG_SKIP_PRE_PUSH",
+    "BRANCH_POLICY_SKIP",
+    "CONTEXT_BUDGET_SKIP",
+    "TEST_SCOPE_SKIP",
+)
+
 
 def _env(home: Path) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in _OVERRIDE_VARS}
+    stripped = _OVERRIDE_VARS + _HOOK_BYPASS_VARS
+    env = {k: v for k, v in os.environ.items() if k not in stripped}
     env["HOME"] = str(home)
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env.pop("WORKLOG_EXPECTED_EMAIL", None)
@@ -391,6 +405,34 @@ class TestPrePushWiring:
         assert result.returncode == 0, result.stdout + result.stderr
         assert marker.exists(), result.stderr
         assert "sync" in marker.read_text(encoding="utf-8")
+
+    def test_ambient_hook_bypass_var_is_scrubbed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An exported ``WORKLOG_SKIP_PRE_PUSH`` must not reach the hook.
+
+        Reproduces the operator workflow this defect was reported from:
+        pushing from a worktree with the documented
+        ``WORKLOG_SKIP_PRE_PUSH=1`` bypass exported. ``_env()`` must scrub the
+        variable so the hook still reaches the identity guard, and the
+        mismatched-identity wiring must still skip ``wl sync``
+        (SA-0MUN83EXN004JBMW).
+        """
+        for name in _HOOK_BYPASS_VARS:
+            monkeypatch.setenv(name, "1")
+
+        probe_home = tmp_path / "probe-home"
+        probe_home.mkdir()
+        leaked = [name for name in _HOOK_BYPASS_VARS if name in _env(probe_home)]
+        assert not leaked, f"_env() must scrub hook-bypass vars, leaked: {leaked}"
+
+        repo, env, marker = self._setup_hook_repo(
+            tmp_path, local_email="t@t.com", global_email="agent@example.com",
+        )
+        result = self._run_hook(repo, env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "git identity mismatch" in result.stderr
+        assert not marker.exists(), "wl sync must be skipped on a mismatched identity"
 
 
 if __name__ == "__main__":  # pragma: no cover

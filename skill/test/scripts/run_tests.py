@@ -692,6 +692,174 @@ def suite_timeout_per_command(project_root: Path | None = None) -> int | None:
     return timeout if timeout > 0 else None
 
 
+# ---------------------------------------------------------------------------
+# Named test groups (SA-0MUJKF2HP001BR51)
+# ---------------------------------------------------------------------------
+#: Group definition schema: each group has "commands" (list[str]) and "paths"
+#: (list[str] — glob-like patterns that, when matched by changed files, cause
+#: this group to be selected).  The special group ``"full"`` is the fallback
+#: and is always present.
+_GROUP_SCHEMA = {"commands": list, "paths": list}
+
+
+def _read_groups(project_root: Path | None = None) -> dict[str, dict[str, list[str]]] | None:
+    """Return the project's named test groups, or None when absent.
+
+    Reads ``<project_root>/.pi/test-config.json`` → ``groups`` key.  The
+    ``full`` group is injected automatically (see :func:`full_group_commands`)
+    so callers never need to handle its absence.
+
+    Returns:
+        A dict mapping group name → ``{"commands": [...], "paths": [...]}``
+        when the config defines groups; ``None`` when absent.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    config = _read_test_config(root)
+    if config is None:
+        return None
+    raw_groups = config.get("groups")
+    if raw_groups is None or not isinstance(raw_groups, dict):
+        return None
+    groups: dict[str, dict[str, list[str]]] = {}
+    for name, spec in raw_groups.items():
+        if not isinstance(name, str) or not name:
+            continue
+        if (
+            isinstance(spec, dict)
+            and spec.get("commands")
+            and all(isinstance(c, str) and c.strip() for c in spec["commands"])
+            and spec.get("paths")
+            and all(isinstance(p, str) and p.strip() for p in spec["paths"])
+        ):
+            groups[name] = {
+                "commands": list(spec["commands"]),
+                "paths": list(spec["paths"]),
+            }
+    return groups if groups else None
+
+
+def _read_groups_with_full(project_root: Path | None = None) -> dict[str, dict[str, list[str]]] | None:
+    """Return named groups with ``full`` injected if missing.
+
+    The ``full`` group always exists implicitly: its commands are resolved
+    from :func:`full_suite_commands` at runtime.
+    """
+    groups = _read_groups(project_root)
+    if groups is None:
+        return None
+    if "full" not in groups:
+        # Inject a placeholder; commands are resolved at runtime.
+        groups["full"] = {"commands": [], "paths": ["**"]}
+    return groups
+
+
+def group_commands(name: str, project_root: Path | None = None) -> list[str] | None:
+    """Return the commands for a named group, or None when the group is unknown.
+
+    For the ``full`` group, commands are resolved from
+    :func:`full_suite_commands` at runtime.  Other groups return the commands
+    defined in the config.
+    """
+    groups = _read_groups_with_full(project_root)
+    if groups is None:
+        return None
+    spec = groups.get(name)
+    if spec is None:
+        return None
+    if name == "full":
+        return full_suite_commands(project_root)
+    return list(spec["commands"])
+
+
+def list_groups(project_root: Path | None = None) -> list[str] | None:
+    """Return the list of available group names, or None when no groups defined.
+
+    Always includes ``full`` when groups are available.
+    """
+    groups = _read_groups_with_full(project_root)
+    if groups is None:
+        return None
+    return sorted(groups.keys())
+
+
+def _paths_match_spec(changed_file: str, paths_spec: list[str]) -> bool:
+    """Return True when *changed_file* matches any pattern in *paths_spec*.
+
+    Patterns are simple glob-like strings:
+
+    - ``skill/audit/**`` — matches anything under ``skill/audit/``.
+    - ``**`` — matches everything.
+    - ``skill/test_cache.py`` — exact file match.
+
+    Uses :func:`fnmatch.fnmatchcase` for the matching.
+    """
+    import fnmatch
+
+    for pattern in paths_spec:
+        if fnmatch.fnmatchcase(changed_file, pattern):
+            return True
+    return False
+
+
+def select_group_from_changed_files(
+    changed_files: set[str] | None = None,
+    project_root: Path | None = None,
+) -> str | None:
+    """Select the smallest sufficient group from changed files.
+
+    Maps touched paths to groups via the ``paths`` spec in each group's
+    definition.  The **smallest** (most specific, fewest commands) group
+    wins.  When multiple groups match, the one with the fewest commands is
+    selected.  When no group matches, returns ``None`` so the caller falls
+    back to ``full``.
+
+    Args:
+        changed_files: Changed file set (default: computed from repo).
+        project_root: Project root.
+
+    Returns:
+        The selected group name (e.g. ``"audit"``), or ``None`` for the
+        ``full`` fallback.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    if changed_files is None:
+        changed_files = compute_changed_files(root)
+    if not changed_files:
+        return None
+
+    groups = _read_groups(root)
+    if groups is None:
+        return None
+
+    # Find all groups that match any changed file.
+    matching: dict[str, int] = {}
+    for changed_file in changed_files:
+        for group_name, spec in groups.items():
+            if group_name == "full":
+                continue
+            if _paths_match_spec(changed_file, spec["paths"]):
+                matching[group_name] = matching.get(group_name, 0) + len(spec["commands"])
+
+    if not matching:
+        return None
+
+    # Return the group with the fewest commands (most specific).
+    return min(matching, key=matching.get)
+
+
+def group_scope_commands(
+    group_name: str,
+    project_root: Path | None = None,
+) -> list[str] | None:
+    """Return the commands for a named group.
+
+    Returns None when the group is unknown or no groups are defined.
+    """
+    return group_commands(group_name, project_root)
+
+
+
+
 def _npm_test_command(project_root: Path) -> str | None:
     """The canonical ``npm --silent test`` command when the repo declares a
     package.json ``test`` script, else None (F2 AC2 npm-test convention)."""
@@ -1270,6 +1438,7 @@ def run_suite(
     scope: str = "full",
     base_ref: str = "origin/dev",
     test_type: str = DEFAULT_TEST_TYPE,
+    group: str | None = None,
 ) -> dict[str, Any]:
     """Run a single named suite and return structured results.
 
@@ -1307,12 +1476,28 @@ def run_suite(
     it. Only ``full`` populates the audit-accepted full-suite cache entry;
     other types use independent cache keys and record ``type`` in the result.
 
+    *group* selects a named test group from ``.pi/test-config.json``. When
+    provided, the group's commands override *name*-based and *test_type*-based
+    resolution (``commands`` is set to the group's commands). The group name
+    is recorded in ``type`` as ``"group:<name>"`` so cache keys remain distinct
+    (SA-0MUJKF2HP001BR51).
+
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
     ``cached``, ``scope``, ``type`` and (on missing binary) ``notice``.
     """
     cwd = cwd or REPO_ROOT
     resolvable_scope = "full"
     changed_files: set[str] = set()
+    # Group-based command resolution (SA-0MUJKF2HP001BR51): when a group is
+    # specified, use its commands directly and record the group in test_type.
+    if group is not None:
+        group_cmds = group_commands(group, cwd)
+        if group_cmds is None:
+            raise ValueError(f"Unknown group '{group}' — define it in .pi/test-config.json.")
+        commands = group_cmds
+        # Record the group name as the test_type for distinct cache keys.
+        test_type = f"group:{group}"
+        resolvable_scope = "full"
     if commands is None:
         if scope == "changed" and test_type == DEFAULT_TEST_TYPE:
             # Changed-file selection drives every suite name; the selection is
@@ -1459,6 +1644,7 @@ def run_all(
     base_ref: str = "origin/dev",
     commands: list[str] | None = None,
     test_type: str = DEFAULT_TEST_TYPE,
+    group: str | None = None,
 ) -> dict[str, Any]:
     """Run the selected suites and aggregate failures.
 
@@ -1475,6 +1661,9 @@ def run_all(
     *commands* / *test_type*: an explicit typed command profile (resolved by
     :func:`resolve_type_commands`) and the type name it belongs to. The type
     is recorded in each suite result and in the aggregate.
+
+    *group*: when set, runs the named test group instead of suite-based
+    resolution (SA-0MUJKF2HP001BR51).
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
@@ -1494,6 +1683,7 @@ def run_all(
                     scope=scope,
                     base_ref=base_ref,
                     test_type=test_type,
+                    group=group,
                 )
             results[name] = result
             resolved_scopes.append(result["scope"])
@@ -1625,6 +1815,7 @@ def build_parser() -> argparse.ArgumentParser:
         "cwd via git rev-parse --show-toplevel, falling back to the framework "
         "install location).",
     )
+
     parser.add_argument(
         "--scope",
         choices=("full", "changed"),
@@ -1634,6 +1825,19 @@ def build_parser() -> argparse.ArgumentParser:
         "feedback for feature-branch validation). 'changed' falls back to "
         "full when a subset cannot be resolved (custom suite commands, no "
         "changed files, no selectable tests).",
+    )
+    parser.add_argument(
+        "--group",
+        default=None,
+        metavar="NAME",
+        help="Run a named test group defined in .pi/test-config.json (e.g. "
+        "'audit', 'test', 'full'). Requires groups to be defined; falls "
+        "back to 'full' when no groups are configured.",
+    )
+    parser.add_argument(
+        "--list-groups",
+        action="store_true",
+        help="List available named test groups and exit.",
     )
     parser.add_argument(
         "--strict-git-env",
@@ -1661,6 +1865,7 @@ def run_summary(
     pattern: str | None = None,
     test_type: str = DEFAULT_TEST_TYPE,
     commands: list[str] | None = None,
+    group: str | None = None,
 ) -> dict[str, Any]:
     """Return summary lines for each suite from the cache, executing nothing.
 
@@ -1686,7 +1891,9 @@ def run_summary(
         "success": True,
     }
     for name in suites:
-        if commands is not None:
+        if group is not None:
+            suite_commands = group_commands(group, cwd) or full_suite_commands(cwd)
+        elif commands is not None:
             suite_commands = filter_commands_for_suite(name, commands)
         elif name == "pytest":
             suite_commands = [pytest_command()]
@@ -1773,43 +1980,89 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
 
-    # Validate the requested type against the allowed set (minimum set plus any
-    # locally-defined types) and report the full list on error (AC1/AC3).
-    try:
-        allowed_types = allowed_test_types(project_root)
-    except SkillExtensionError as exc:
-        print(f"run_tests: {exc}", file=sys.stderr)
-        return 2
-    if test_type not in allowed_types:
-        print(
-            f"run_tests: unknown test type '{test_type}'. Allowed types: "
-            f"{', '.join(allowed_types)}.",
-            file=sys.stderr,
-        )
-        return 2
+    # --list-groups: print available groups and exit
+    if args.list_groups:
+        groups = list_groups(project_root)
+        if groups is None:
+            print("No named test groups defined. Define them in .pi/test-config.json.")
+        else:
+            for g in groups:
+                print(g)
+        return 0
 
-    # Resolve the type's command profile once, failing fast with a clear
-    # diagnostic — never silently substituting the full suite (AC2/AC4).
-    try:
-        type_commands = resolve_type_commands(project_root, test_type)
-    except (TypeResolutionError, SkillExtensionError) as exc:
-        print(f"run_tests: {exc}", file=sys.stderr)
-        return 2
+    # --group: validate group name and route to group-based execution
+    group_name = args.group
+    if group_name is not None:
+        groups = list_groups(project_root)
+        if groups is None:
+            print(
+                f"run_tests: group '{group_name}' specified but no groups are "
+                "defined in .pi/test-config.json.",
+                file=sys.stderr,
+            )
+            return 2
+        if group_name not in groups:
+            print(
+                f"run_tests: unknown group '{group_name}'. Available groups: "
+                f"{', '.join(groups)}.",
+                file=sys.stderr,
+            )
+            return 2
+        # Resolve group commands and run them
+        group_cmds = group_commands(group_name, project_root)
+        if group_cmds is None:
+            print(f"run_tests: group '{group_name}' has no resolvable commands.", file=sys.stderr)
+            return 2
+        # Override test_type to indicate group mode
+        test_type = f"group:{group_name}"
+        override_commands = group_cmds
+    else:
+        override_commands = None
+
+    # When --group is used, skip type validation/resolution (group commands
+    # are already resolved above; test_type is "group:<name>" which is not in
+    # the allowed minimum types list).
+    if group_name is None:
+        # Validate the requested type against the allowed set (minimum set plus
+        # any locally-defined types) and report the full list on error (AC1/AC3).
+        try:
+            allowed_types = allowed_test_types(project_root)
+        except SkillExtensionError as exc:
+            print(f"run_tests: {exc}", file=sys.stderr)
+            return 2
+        if test_type not in allowed_types:
+            print(
+                f"run_tests: unknown test type '{test_type}'. Allowed types: "
+                f"{', '.join(allowed_types)}.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # Resolve the type's command profile once, failing fast with a clear
+        # diagnostic — never silently substituting the full suite (AC2/AC4).
+        try:
+            type_commands = resolve_type_commands(project_root, test_type)
+        except (TypeResolutionError, SkillExtensionError) as exc:
+            print(f"run_tests: {exc}", file=sys.stderr)
+            return 2
 
     # Legacy path (AC5): a full-type run with no local override lets run_suite
     # resolve by suite name exactly as before. Otherwise the resolved profile
     # is passed explicitly and narrowed to --suite.
+    # (When --group was used, override_commands is already set above.)
     if test_type == DEFAULT_TEST_TYPE and type_commands == full_suite_commands(project_root):
-        override_commands: list[str] | None = None
+        if override_commands is None:
+            override_commands = None
     else:
-        override_commands = filter_commands_for_suite(args.suite, type_commands)
-        if not override_commands:
-            print(
-                f"run_tests: test type '{test_type}' defines no commands for "
-                f"the '{args.suite}' suite.",
-                file=sys.stderr,
-            )
-            return 2
+        if override_commands is None:
+            override_commands = filter_commands_for_suite(args.suite, type_commands)
+            if not override_commands:
+                print(
+                    f"run_tests: test type '{test_type}' defines no commands for "
+                    f"the '{args.suite}' suite.",
+                    file=sys.stderr,
+                )
+                return 2
 
     # Per-command timeout: explicit --timeout wins, else the extension file's
     # timeoutPerCommand (F2 AC1), else the default 600.
@@ -1831,6 +2084,7 @@ def main(argv: list[str] | None = None) -> int:
                     pattern=args.summary_grep,
                     test_type=test_type,
                     commands=override_commands,
+                    group=group_name,
                 )
             if args.json:
                 summary["timing"] = _root_timer.to_dict()
@@ -1862,6 +2116,7 @@ def main(argv: list[str] | None = None) -> int:
                 base_ref=args.target_branch or "origin/dev",
                 commands=override_commands,
                 test_type=test_type,
+                group=group_name,
             )
         finally:
             if guard_active:

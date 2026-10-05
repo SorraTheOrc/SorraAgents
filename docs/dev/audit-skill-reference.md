@@ -114,7 +114,10 @@ run:
 
    A transient abort must **never demote** an `in_review` item to `open` —
    restore exactly what was captured (fall back to `open`/`plan_complete`
-   only when the pre-audit state could not be determined).
+   only when the pre-audit state could not be determined).  If the captured
+   (status, stage) pair is known to be invalid (e.g. `blocked`/`in_review`,
+   which `wl` rejects), coerce the stage to `plan_complete` while preserving
+   the status, so the restore succeeds (SA-0MUIVCJLW000RUC1).
 3. **Append a failure notice** to the run log with a progress summary:
    elapsed time, the last phase marker seen, and the trigger that caused the
    abort.
@@ -249,6 +252,29 @@ Skipping: audit still fresh
 
 No status lifecycle transitions occur, and no persistence is performed. An explicit ``Ready to close: No`` verdict in the stored report is returned verbatim — it is never masked by a freshness skip.
 
+### Read-only probe: ``check-freshness`` (SA-0MUOO5W8J001DYTI)
+
+Read-only consumers (e.g. the ship release gates) can query this freshness gate
+**without running an audit** via a dedicated subcommand:
+
+```bash
+python3 skill/audit/scripts/audit_runner.py check-freshness <id> --json
+```
+
+It prints one JSON object and always exits 0:
+
+```json
+{"workItemId": "<id>", "fresh": true, "hasFingerprint": true, "auditedAt": "...", "reason": "content fingerprint unchanged"}
+```
+
+``fresh`` is the same verdict :func:`_check_audit_freshness` computes (content
+fingerprint first, then the legacy time gate). It performs no status lifecycle
+transition, persists nothing, launches no ``pi`` call, and does not acquire the
+host audit slot. A lookup failure is reported as ``fresh: false`` with a
+``freshness check failed: ...`` reason so callers fail open to the conservative
+time gate. This lets the ship gates treat a time-stale but content-unchanged
+audit as fresh instead of spending the release window re-auditing it.
+
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). A child whose stored audit carries an unchanged fingerprint AND a parseable verdict is reused: its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
 
 ## Re-audit coordination check
@@ -342,6 +368,30 @@ window; `--json` emits a machine-readable summary), and
 Every window emits exactly one stderr line with
 `batch_start`, `batch_end`, `items_processed`, `queue_remaining`,
 `items_included` (ISO timestamps; including zero-item windows).
+
+## Descendant cascade on a passing parent audit (SA-0MUR7Y3BJ004FGPP)
+
+When a parent's audit verdict is `Ready to close: Yes` and the terminal
+transition has been **verified** (`wl show` readback, WL-0MSVVFBJ2003RRYK),
+`_apply_terminal_lifecycle` invokes `_cascade_descendants_terminal`:
+
+- **Helper:** `_cascade_descendants_terminal(parent_id, audit_timestamp, runner, worklog_dir, persist)` walks the full recursive subtree via `_iter_descendants_with_state` (`wl show <id> --children --json`). For each descendant that is not already terminal (`stage: done`) and not `deleted` it issues `wl update <id> --status completed --stage done --json`, then `wl comment add <id>` naming the authorising parent and the audit timestamp.
+- **Invocation point:** only the verified `ctx.audit_verdict == "yes"` advance branch (`cascade_authorised`), after the parent's own transition succeeds; never on the `No`, restore, fallback-tainted, or partially-applied branches.
+- **Authorisation:** a passing audit verdict is the sole authorisation — `status`/`stage` alone never triggers a cascade. A non-passing parent therefore still refuses to close over non-terminal descendants (SA-0MU2OY1N9000XL2H unchanged).
+- **Idempotence / `deleted`-safety:** already-terminal and `deleted` descendants are skipped before any update or comment, so re-auditing a passing parent produces no further mutations and no duplicate comments; nothing is ever re-opened or resurrected.
+- **Dry-run:** `--do-not-persist` suppresses the cascade entirely (the call site guards on `ctx.persist`, and the helper also early-returns).
+- **Non-fatal:** a per-child `wl` failure is caught, logged to stderr, and does not abort the audit; the next passing audit completes the remaining cascade.
+- **Worklog routing:** the helper reuses `_run_wl`, so `--worklog-dir` is resolved through the shared helpers and the cascade targets the item's own store regardless of cwd.
+
+### Ship-side terminal-descendant exclusion (AC4)
+
+`closeWorkItemsAfterRelease` computes `collateral` as descendants that are
+neither release candidates nor terminal (`stage: done` / `status: deleted`,
+resolved via the injected `getItemLifecycleFn`, default `getItemLifecycle`).
+A descendant whose lifecycle cannot be resolved is treated as non-terminal
+(fail-safe), preserving the SA-0MU2OY1N9000XL2H scope guard. This is
+defence-in-depth for the audit-side cascade above (SA-0MUR7Y3BJ004FGPP AC4,
+overlapping SA-0MUJKPDAA002VVDP).
 
 ## Scripts
 
@@ -455,7 +505,7 @@ The check operates at two points in Phase 1 child orchestration (the pre-pass an
 
 **Parent-first child pass-through (default):** item audits run a **full parent-only audit first** — Phase 1 screens parent ACs only (no child AC screening) and Phase 2 parent deep analysis completes before any child audit is considered (SA-0MSKB6VJA005N43F). The parent verdict then drives the child pass-through:
 
-- **Parent passes with no gaps** (all ACs `met`/`adjusted`, no blocking CQ findings) → all children **inherit passed** by virtue of the parent — zero child audits. Children whose own content changed (content-fingerprint mismatch, Feature 1) are never silently inherited-passed: they are audited.
+- **Parent passes with no gaps** (all ACs `met`/`adjusted`, no blocking CQ findings) → children already in `in_review`/`done` **inherit passed** by virtue of the parent (zero child audits for them). Children in a pre-review stage (`idea`/`intake_complete`/`plan_complete`) are **never** inherited — they are audited independently and block parent closure. Children whose own content changed (content-fingerprint mismatch, Feature 1) are likewise never silently inherited-passed: they are audited (SA-0MUA4Q431008HIH0).
 - **Parent has gaps** (`unmet`/`partial` ACs or blocking CQ findings) → only the child(ren) mapped to the gap files (via the Phase 1/2 file-scope manifest and child Key Files) receive full audits; unrelated children are not audited.
 - Inherited/not-audited children are marked **explicitly** in the report (`Inherited from parent pass` / `Not audited (unrelated to parent gaps)`) — never silent.
 - Verdict semantics are unchanged: a relevant not-ready child still blocks the parent (`Ready to close: No`).
@@ -471,6 +521,21 @@ python3 ./scripts/audit_runner.py issue SA-123 --audit-children
 - `--audit-children` forces the full per-child flow (override of the default parent-first pass-through): each child without a fresh audit is independently reviewed; children without fresh audits that stay not-ready block the parent, verdict semantics unchanged.
 - `--max-child-audits N` (env `AUDIT_MAX_CHILD_AUDITS`) bounds the number of child audits a single run may auto-trigger (default: `5`).
 - Children with a fresh valid audit (per-touched-file content fingerprint unchanged + verdict present, LP-0MSQ32MF200675AR, SA-0MSPZDALB000S18P) are **reused with zero pi calls** — no child Phase 1 screening, no child Phase 2 deep/batch entry — and their persisted verdict table appears in the parent report with a `Child verdict reused from <auditedAt>` marker. `--force` bypasses reuse: all children are re-audited. Children WITHOUT a fresh audit are audited exactly as before (cascade, cap, and verdict semantics unchanged); reused children are NOT re-persisted (their own audit is authoritative), and child audits persisted by the parent embed the content fingerprint so they stay reusable on future runs.
+
+**Child-exemption snapshot / no-side-effect demotion (SA-0MUJAPC680078396):** a parent audit over a child whose content changed can re-screen that child as a side effect of the parent run. Before the fix, that re-screen could persist a `Ready to close: No` child audit and demote an already-`in_review` child to `open`/`plan_complete` (or surface it as `blocked` via `wl` dependency state); the parent's own closure decision — evaluated at report-assembly time against the **post-re-audit** child stage — then reported `Ready to close: No` even when every parent AC was `met`.
+
+The runner now applies two jointly-required mechanisms:
+
+- **Snapshot at audit start.** Before `_phase_children` runs, `_capture_exempt_children_snapshot()` records every child whose `stage` is `in_review` or whose `status`/`stage` is `completed`/`done` into `ctx.snapshot_exempt_children`. The parent's closure decision — the markdown path (`_assemble_issue_report`), the `--json` path (`_build_issue_json`), and the Phase 2 gate (`_has_phase1_blocking_issues`) — consults the shared `_child_is_exempt(child, snapshot_exempt)` helper, so a child that was exempt when the audit began stays exempt even if the side-effect re-screen demotes it. A parent whose own ACs are all `met`/`adjusted` is therefore not blocked by children that were exempt at audit start (AC1). Because both verdict paths share one helper, the markdown report and the JSON payload cannot drift.
+- **No side-effect demotion.** The auto-triggered child process inherits the `AUDIT_CASCADE_AUDIT=1` marker (alongside `LIVE_REPO_GUARD_ACTIVE`). When such a cascade audit finishes with a `No` verdict **and** the child was already `in_review`/`done` at audit start, `_apply_terminal_lifecycle()` **restores** the captured pre-audit status/stage (assignee cleared) instead of demoting to `open`/`plan_complete` (AC2, AC4). A parent-triggered re-screen can never silently push completed/in-review work back into the actionable queue or cascade `blocked` states through the dependency chain.
+
+Genuine blocking is preserved (AC3):
+
+- A child that was pre-review (`idea`/`intake_complete`/`plan_complete`) at audit start is **not** in the snapshot and still blocks the parent's closure through the existing child-stage and child-verdict checks.
+- A cascade re-audit of an already-pre-review child still demotes it (the suppression only applies to `in_review`/`done` original stages).
+- An explicit, **independent** audit of an `in_review` child (no `AUDIT_CASCADE_AUDIT` marker) keeps the normal `No` → `open`/`plan_complete` demotion.
+
+The existing `in_review`/`done` exemption, `inherited_pass` pass-through, deleted-child handling, content-fingerprint freshness/reuse, `--audit-children` opt-in semantics, and `--max-child-audits` cap are unchanged. Regression coverage lives in `skill/audit/tests/test_audit_runner_review.py` (`TestChildExemptionSnapshot`, `TestCascadeNoSideEffectDemotion`).
 
 **Operator-attested green test run (`--green-run` / `AUDIT_GREEN_RUN`):** Some acceptance criteria are inherently execution-dependent — e.g. "Full project test suite passes with the new changes" — and the audit's read-only mandate forbids the runner (and its Phase 1/2 models) from executing the suite. Without external evidence such criteria can NEVER be verified inside the audit, so they always return `partial`. Operators should run the full suite via the [test skill](../../skill/test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) so the run is quiet-mode, triaged, and genuinely green. An operator who has verifiably run the full suite at the audited commit can then attest that fact and unblock those criteria:
 
@@ -518,7 +583,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 - **Fail-closed:** a non-green executed run (failures, non-zero exit, timeout, missing binary) yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict).
 - A green cache hit at the audited state short-circuits the invocation entirely (the suite is only executed when the cache cannot satisfy the evidence).
 
-**Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide (default: `AUDIT_MAX_CONCURRENCY` env var or 2). Each pi launch holds one audit slot; when the ceiling is saturated the launch **waits on a shared bounded priority queue** (SA-0MTG5RYH8005RQNM) instead of failing fast: it enqueues a ticket at its work item's priority (critical > high > medium > low; missing/unknown priority defaults to medium), and is admitted in priority order (FIFO within a tier) as slots free up. The total wait for admission + slot is bounded by `AUDIT_QUEUE_TIMEOUT` (default 90s); `AUDIT_LOCK_TIMEOUT` now bounds only each individual semaphore attempt inside the admission poll (default 0s = immediate retry). Log lines (`Audit slot acquired: queued_at=<ts> priority=<level> queue_position=<N> dequeued_at=<ts> wait_seconds=<N> ticket=<id>`) make queue behaviour observable from stderr (AC4). If the bound is exhausted the audit still completes gracefully with the `unmet` evidence "Audit concurrency limit reached" (bounded, never fail-fast). Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > 2 default.
+**Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide (default: `AUDIT_MAX_CONCURRENCY` env var or 2). Each pi launch holds one audit slot; when the ceiling is saturated the launch **waits on a shared bounded priority queue** (SA-0MTG5RYH8005RQNM) instead of failing fast: it enqueues a ticket at its work item's priority (critical > high > medium > low; missing/unknown priority defaults to medium), and is admitted in priority order (FIFO within a tier) as slots free up. The total wait for admission + slot is bounded by `AUDIT_QUEUE_TIMEOUT` (default 90s); `AUDIT_LOCK_TIMEOUT` now bounds only each individual semaphore attempt inside the admission poll (default 0s = immediate retry). Log lines (`Audit slot acquired: queued_at=<ts> priority=<level> queue_position=<N> dequeued_at=<ts> wait_seconds=<N> ticket=<id>`) make queue behaviour observable from stderr (AC4). If the bound is exhausted the audit still completes gracefully with the `unmet` evidence "Audit concurrency limit reached" (bounded, never fail-fast). Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > 2 default. Queue/admission and downtime-gate metrics are collected read-only by [`skill/shared/audit_gate_metrics.py`](../../skill/shared/audit_gate_metrics.py) (a pure-Python metrics collector); its host measurements and the keep-the-gate recommendation are recorded in [`downtime-idle-gate-evaluation.md`](downtime-idle-gate-evaluation.md) (SA-0MTG5UPBR0028K50).
 
 **Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
 
@@ -553,7 +618,7 @@ Per-call timing: issue_id=<id> context=phase2_deep elapsed_seconds=<seconds> inp
 
 Invalid values (0, negative, non-int) fail closed to the default with a warning (mirrors `_resolve_max_child_audits`). **Trade-off:** a smaller cap shortens deep analysis but narrows evidence breadth; the ≥1 file:line floor keeps every verdict substantiated. The benchmark `skill/audit/tests/test_audit_runner_phase2_benchmark.py` (`@pytest.mark.benchmark`, opt-in via `AUDIT_RUN_BENCHMARKS=1`) measures the median `phase2_deep` latency reduction against the 2026-08-12 baseline (median 1324 s of 1537/1324/903; threshold 927 s = 0.70×).
 
-**File-scope manifest (Phase 2):** Each Phase 2 prompt (parent `phase2_deep` and every child `phase2_child:<i>`) now includes a **FILE SCOPE** section built from the work item's **Key Files** section, the **git changed-file list** (`git diff --name-only HEAD` + `git status --porcelain`), **Phase 1 evidence file:line references** (so the model verifies named files rather than re-discovering them), and a lightweight **repository index** (top-level layout with file counts). The prompt instructs the model to read ONLY in-scope files and to avoid unbounded `find`/`grep -r`/`ls -R` exploration. This bounds the dominant Phase 2 cost (unbounded repo exploration) without changing verdict semantics. If git is unavailable, the manifest degrades gracefully to the Key Files/evidence/index entries that can still be determined. See `docs/dev/audit-phase2-performance-evaluation.md` (SA-0MSAHR63100415PM) for the underlying evaluation.
+**File-scope manifest (Phase 2):** Each Phase 2 prompt (parent `phase2_deep` and every child `phase2_child:<i>`) now includes a **FILE SCOPE** section built from the work item's **Key Files** section, the **git changed-file list** (`git diff --name-only HEAD` + `git status --porcelain`), the **item's committed touched files** (resolved via `_resolve_touched_files` — files in commits referencing the item id plus Key Files, SA-0MUJNZ5RN0078B5M), **Phase 1 evidence file:line references** (so the model verifies named files rather than re-discovering them), and a lightweight **repository index** (top-level layout with file counts). The committed-touched-files source is what keeps a fully-committed item on a clean checkout in scope: the working-tree diff is empty there, so without it the manifest omits the item's real changes and Phase 2 returns false "outside the manifest" verdicts. Paths are de-duplicated across the three file sections (each file is named once) and the combined listing is bounded by `_FILE_SCOPE_MAX_FILES`. The prompt instructs the model to read ONLY in-scope files and to avoid unbounded `find`/`grep -r`/`ls -R` exploration. This bounds the dominant Phase 2 cost (unbounded repo exploration) without changing verdict semantics. If git is unavailable, the manifest degrades gracefully to the Key Files/evidence/index entries that can still be determined. See `docs/dev/audit-phase2-performance-evaluation.md` (SA-0MSAHR63100415PM) for the underlying evaluation.
 
 **Low-risk/small-item skip (Phase 2, SA-0MSQ026T3009QY2L):** When a work item has `effort` ∈ {Extra Small, Small} **and** `risk` = Low (the first-class fields populated by the effort-and-risk skill), Phase 2 deep code analysis is skipped — Phase 1 verdicts stand unchanged (`met` remains `met`) and the AC evidence notes the skip reason (e.g. `Phase 2 deep analysis skipped (effort=Small, risk=Low): small, low-risk item per SA-0MSQ026T3009QY2L. Phase 1 verdict stands.`). The runner prints a diagnostic when the skip applies (e.g. `Skipping Phase 2 deep analysis: effort=Small, risk=Low. Phase 1 verdicts stand unchanged.`) and the report summary records the skip via `phase2_skip_note` instead of claiming deep analysis completed. Key semantics:
 
@@ -563,7 +628,7 @@ Invalid values (0, negative, non-int) fail closed to the default with a warning 
 
 **Child verdict reuse (Phase 2):** When a child's own fresh audit already produced a ready verdict (`child_audit_ready=True`), the parent Phase 2 **skips** the duplicated child deep-analysis call (`phase2_child:<i>`) and reuses the child's existing `ac_results`. The same skip applies to children whose own fresh audit returned an explicit **'not ready to close'** verdict (`child_audit_not_ready=True`, P12): their own pipeline already ran deep analysis on the same ACs, so the parent Phase 2 reuses the child's own persisted audit findings (parsed from the child's audit report AC table, falling back to the Phase 1 screening results when the table cannot be parsed). Children with no fresh audit verdict (stale / no audit) still get parent deep analysis. Freshness is decided by `_get_child_audit_verdict`: the content-fingerprint gate is the PRIMARY test (stored fingerprint vs the child's current state; unchanged + verdict present = fresh), with the legacy time gate as the floor for fingerprint-less reports (LP-0MSQ32MF200675AR); `--force` bypasses both. Because the reuse decision is made in the Phase 1 pre-pass (see below), a reused child costs ZERO pi calls across the whole run — no Phase 1 screening and no Phase 2 deep/batch entry — while a 'not ready' child still blocks the parent's Ready-to-close evaluation.
 
-**Parallel child deep analysis (Phase 2):** Independent child deep-analysis calls (`phase2_child:<i>`) run concurrently with a slot-aware dynamic ceiling (LP-0MSQ32S2M001EA74): the runner queries the local proxy status endpoint (`/llama/local/status` → `available_slots`/`total_slots`; `AUDIT_SLOT_STATUS_URL`, default `http://localhost:8000/llama/local/status`, short 1s timeout, fail-open) once per child-call batch dispatch and caps the ceiling at `min(free-slots, configured_max)` with a floor of 1. When the slot query fails, the runner degrades gracefully to the configured static ceiling — `AUDIT_MAX_CHILD_CONCURRENCY` env var (integer ≥1) or the `AUDIT_PARALLELISM` env var (default 2, set to `1` for strictly-sequential historical behavior); the static knob remains the floor/fallback. The parent deep-analysis call always runs first and is never parallelized. Child workers are exception-isolated: a failure or timeout in one child degrades that child to `partial` (or falls back to its existing ACs) without affecting the others; on persistent executor failure the runner falls back to sequential execution. This collapses Phase 2 wall-clock from N sequential calls to ~N/cap while preserving per-child verdict isolation and avoiding slot contention with sibling sessions.
+**Parallel child deep analysis (Phase 2):** Independent child deep-analysis calls (`phase2_child:<i>`) run concurrently with a slot-aware dynamic ceiling (LP-0MSQ32S2M001EA74): the runner queries the local proxy status endpoint (`/llama/local/status` → `available_slots`/`total_slots`; `AUDIT_SLOT_STATUS_URL` overrides verbatim, otherwise the endpoint is derived from `AUDIT_PROXY_BASE_URL` (default `http://192.168.0.199:8000`) plus `/llama/local/status` so it shares the proxy host; short 1s timeout, fail-open) once per child-call batch dispatch and caps the ceiling at `min(free-slots, configured_max)` with a floor of 1. When the slot query fails, the runner degrades gracefully to the configured static ceiling — `AUDIT_MAX_CHILD_CONCURRENCY` env var (integer ≥1) or the `AUDIT_PARALLELISM` env var (default 2, set to `1` for strictly-sequential historical behavior); the static knob remains the floor/fallback. The parent deep-analysis call always runs first and is never parallelized. Child workers are exception-isolated: a failure or timeout in one child degrades that child to `partial` (or falls back to its existing ACs) without affecting the others; on persistent executor failure the runner falls back to sequential execution. This collapses Phase 2 wall-clock from N sequential calls to ~N/cap while preserving per-child verdict isolation and avoiding slot contention with sibling sessions.
 
 **Child audits in the main LLM slot (SA-0MT2XRGEU0009QRE):** a config gate selects between two child-audit execution modes: env var `AUDIT_CHILD_IN_MAIN_SLOT` and CLI flag `--child-in-main-slot` (flag wins), **default `true` (in-main-slot mode)**; `--no-child-in-main-slot` / env `false` selects the separate-process path below, which remains fully retained.
 

@@ -53,16 +53,28 @@ import {
   buildProducerReviewRemediationCommand,
   resolveAuditRunner,
   attemptAuditRemediation,
+  queryContentFreshness,
+  hasContentFingerprint,
 } from './check-audit-gate.js';
+import {
+  RemediationBudget,
+  resolveRemediationTimeoutMs,
+  OFFLINE_AUDIT_REFRESH_HINT,
+} from './audit-remediation.js';
 
-// Freshness constants mirrored from the audit runner
-// (skill/audit/scripts/audit_runner.py) so the staleness heuristic matches
-// the runner's own freshness gate. Kept in sync deliberately: the runner is
-// the source of truth for freshness; this gate only needs a conservative
-// signal that a re-audit is worthwhile (a false "stale" merely triggers the
-// runner's fast, content-fingerprint freshness path).
-export const AUDIT_FRESHNESS_BUFFER_SECONDS = 60;
-export const AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30;
+// Shared audit-freshness heuristics (parseIsoUtc, isAuditStale) and the
+// freshness constants now live in ./audit-freshness.js so both this gate
+// (Step 3.7) and check-audit-gate.js (Step 2) apply identical staleness
+// semantics without an import cycle (check-final-validation already imports
+// from check-audit-gate). Re-exported here for backward compatibility —
+// existing consumers and unit tests import these from this module
+// (SA-0MUOO5UEB008RXBP).
+export {
+  AUDIT_FRESHNESS_BUFFER_SECONDS,
+  AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS,
+  parseIsoUtc,
+  isAuditStale,
+} from './audit-freshness.js';
 
 // ── shellQuote ───────────────────────────────────────────────────────────────
 
@@ -80,76 +92,6 @@ export function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-// ── parseIsoUtc ──────────────────────────────────────────────────────────────
-
-/**
- * Parse an ISO-8601 timestamp into a `Date`, treating a missing timezone as
- * UTC. Returns `null` for missing/unparseable values (fail open).
- *
- * @param {string|undefined|null} value - ISO-8601 timestamp.
- * @returns {Date|null}
- */
-export function parseIsoUtc(value) {
-  if (!value || typeof value !== 'string') {
-    return null;
-  }
-  // Normalise the trailing 'Z' for older runtimes while keeping full
-  // ISO-8601 support.
-  const normalised = value.replace(/Z$/, '+00:00');
-  const withZone = /[+-]\d{2}:?\d{2}$/.test(normalised) ? normalised : `${normalised}+00:00`;
-  const parsed = new Date(withZone);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-// ── isAuditStale ─────────────────────────────────────────────────────────────
-
-/**
- * Determine whether an existing audit is stale relative to its work item.
- *
- * Mirrors the audit runner's time-gate floor
- * (`_check_audit_freshness`, skill/audit/scripts/audit_runner.py): an audit
- * is fresh when its `auditedAt` is strictly more than
- * `AUDIT_FRESHNESS_BUFFER_SECONDS` after the item's `updatedAt`, or when the
- * item was updated within `AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS` **after**
- * the audit (the audit's own persistence writes bump `updatedAt`).
- * Everything else is stale.
- *
- * The runner's *primary* freshness signal is a content fingerprint (git
- * HEAD + description hash + Key Files + working tree). This gate cannot
- * recompute that fingerprint cheaply, so it uses the time gate as a
- * conservative signal: a false "stale" only causes a re-run, and the runner
- * short-circuits re-runs of unchanged content via its fingerprint fast path.
- *
- * @param {{ id: string, title: string, updatedAt?: string|null }} workItem -
- *   The work item (must carry `updatedAt` when available).
- * @param {object|null} auditData - Parsed `wl audit-show <id> --json` payload.
- * @returns {boolean} True when the audit exists but is stale; false when no
- *   audit exists, when freshness cannot be determined, or when the audit is
- *   fresh.
- */
-export function isAuditStale(workItem, auditData) {
-  if (!auditData || !auditData.audit) {
-    return false;
-  }
-  const auditTime = parseIsoUtc(auditData.audit.auditedAt);
-  const updateTime = parseIsoUtc(workItem && workItem.updatedAt);
-  if (!auditTime || !updateTime) {
-    return false; // Cannot determine — fail open, never falsely block.
-  }
-
-  const bufferMs = AUDIT_FRESHNESS_BUFFER_SECONDS * 1000;
-  if (auditTime.getTime() > updateTime.getTime() + bufferMs) {
-    return false; // Audit is newer than the item — fresh.
-  }
-
-  const writeDeltaMs = updateTime.getTime() - auditTime.getTime();
-  if (writeDeltaMs >= 0 && writeDeltaMs <= AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS * 1000) {
-    return false; // The item's own audit-persistence write — fresh.
-  }
-
-  return true;
-}
-
 // ── classifyAudit ────────────────────────────────────────────────────────────
 
 /**
@@ -158,13 +100,16 @@ export function isAuditStale(workItem, auditData) {
  * Precedence (first match wins):
  *   1. `missing`   — no audit record exists.
  *   2. `transient` — audit timed out / provider error / FailureNotice.
- *   3. `stale`     — audit exists but is outdated (see {@link isAuditStale}).
+ *   3. `stale`     — audit exists but is outdated (see
+ *      {@link module:audit-freshness.isAuditStale}).
  *   4. `failing`   — a fresh audit with a genuine "not ready to close" verdict.
  *   5. `passing`   — a fresh audit that is ready to close.
  *
  * Staleness takes precedence over the verdict: a stale verdict is not
  * trustworthy, so a stale "not ready to close" is remediated (and re-blocked
- * only if it still fails) rather than blocked immediately.
+ * only if it still fails) rather than blocked immediately. The classification
+ * is delegated to `getAuditStatus()` (shared with Step 2) so both release
+ * gates apply identical precedence (SA-0MUOO5UEB008RXBP).
  *
  * @param {{ id: string, title: string, updatedAt?: string|null }} workItem -
  *   The work item being checked.
@@ -180,7 +125,7 @@ export function classifyAudit(workItem, auditData) {
   if (status.transient) {
     return { kind: 'transient', reason: status.reason, summary: status.summary || null };
   }
-  if (isAuditStale(workItem, auditData)) {
+  if (status.stale) {
     return {
       kind: 'stale',
       reason: 'Audit is stale (performed before the work item was last updated)',
@@ -275,6 +220,43 @@ export function getItemById(itemId) {
       return null;
     }
     throw err;
+  }
+}
+
+// ── getItemLifecycle ─────────────────────────────────────────────────────────
+
+/**
+ * Resolve a single work item's lifecycle state (`status`/`stage`) by id.
+ *
+ * Used by the post-release close step to distinguish terminal descendants
+ * (`stage: done` or `status: deleted`) — which `wl close --force` may sweep
+ * harmlessly — from genuinely non-terminal descendants that must still refuse
+ * the close (SA-0MUR7Y3BJ004FGPP AC4). Returns `null` when the item cannot be
+ * resolved (missing/deleted/unreadable); callers treat an unresolved
+ * descendant as non-terminal (fail-safe, so the close is refused rather than
+ * silently sweeping unknown work).
+ *
+ * @param {string} itemId - Work item id.
+ * @returns {{id: string, status: string|null, stage: string|null}|null}
+ */
+export function getItemLifecycle(itemId) {
+  try {
+    const output = execSync(`wl show ${itemId} --json`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const parsed = JSON.parse(output);
+    if (!parsed || parsed.success === false || !parsed.workItem) {
+      return null;
+    }
+    const wi = parsed.workItem;
+    return {
+      id: wi.id || itemId,
+      status: wi.status !== undefined ? wi.status : null,
+      stage: wi.stage !== undefined ? wi.stage : null,
+    };
+  } catch (_err) {
+    return null;
   }
 }
 
@@ -398,7 +380,13 @@ export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
       };
     }
     const parentStatus = getAuditStatus(parentItem, auditData);
-    if (!parentStatus.isBlocking && !parentStatus.transient) {
+    // Coverage requires a *passing* parent audit (readyToClose === true). A
+    // stale/non-passing in_review ancestor does not cover the child — the walk
+    // continues up the chain. Using the explicit `passing` flag (rather than
+    // the old `!isBlocking && !transient` pair) keeps this correct now that
+    // getAuditStatus() classifies a stale failing audit as non-blocking
+    // (SA-0MUOO5UEB008RXBP).
+    if (parentStatus.passing) {
       return {
         outcome: 'covered',
         reason: `covered by passing parent audit ${ancestorId}`,
@@ -485,10 +473,15 @@ export async function checkFinalValidation(options = {}) {
     ),
     runAuditCommand = (runnerPath, workItemId) => execSync(
       `python3 "${runnerPath}" issue ${workItemId}`,
-      // Per-item timeout guard, consistent with the audit gate's 600s cap.
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 600000 },
+      // Per-item timeout guard, consistent with the audit gate's cap.
+      // Configurable via SHIP_AUDIT_REMEDIATION_TIMEOUT_MS
+      // (SA-0MUOO5V0P00461X8).
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveRemediationTimeoutMs() },
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
+    createRemediationBudgetFn = () => new RemediationBudget(),
+    skipRemediation = false,
+    queryContentFreshnessFn = queryContentFreshness,
     getItemByIdFn = getItemById,
     runCloseCommand = (itemId, args) => execSync(
       `wl ${args.map(shellQuote).join(' ')} --json`,
@@ -521,6 +514,7 @@ export async function checkFinalValidation(options = {}) {
   const coveredChildren = [];
   const excludedChildren = [];
   let passingCount = 0;
+  const budget = createRemediationBudgetFn();
 
   for (const item of items) {
     // ── Child scope: parent coverage / out-of-scope exclusion ───────────
@@ -634,7 +628,22 @@ export async function checkFinalValidation(options = {}) {
     }
 
     if (!queryFailed) {
-      const classification = classifyAudit(item, auditData);
+      let classification = classifyAudit(item, auditData);
+
+      // Content-fingerprint fast path (SA-0MUOO5W8J001DYTI): a time-stale audit
+      // whose stored content fingerprint still matches needs no re-audit. Ask
+      // the runner read-only: passing + content-fresh → fresh (no remediation);
+      // failing + content-fresh → the verdict is current, so block immediately.
+      if (classification.kind === 'stale' && hasContentFingerprint(auditData)) {
+        const freshness = queryContentFreshnessFn(item.id);
+        if (freshness.fresh) {
+          const status = getAuditStatus(item, auditData);
+          classification = status.passing
+            ? { kind: 'passing', reason: `Content fingerprint unchanged (${freshness.reason})`, summary: classification.summary }
+            : { kind: 'failing', reason: `Audit verdict: not ready to close (content-fresh: ${freshness.reason})`, summary: classification.summary };
+        }
+      }
+
       summary = classification.summary;
 
       const needsRemediation = classification.kind === 'missing'
@@ -642,24 +651,50 @@ export async function checkFinalValidation(options = {}) {
         || classification.kind === 'transient';
 
       if (needsRemediation) {
-        console.log(
-          `Final-validation gate: auto-remediating ${item.id} ` +
-          `(${classification.kind} audit)...`,
-        );
-        const remediation = await attemptAuditRemediation(item, {
-          runAuditShow,
-          runAuditCommand,
-          resolveAuditRunnerFn,
-        });
-        if (remediation.status === 'passing') {
-          console.log(`Final-validation gate: ${item.id} auto-remediated successfully.`);
-          remediated = true;
-          summary = remediation.summary || summary;
-        } else {
-          console.log(`Final-validation gate: ${item.id} still failing after remediation — blocking.`);
+        // Narrow bypass (SA-0MUOO5WV0006D7UD): do not re-audit in-gate if
+        // --skip-audit-remediation was requested; report the item blocking.
+        if (skipRemediation) {
+          console.log(
+            `Final-validation gate: skipping in-gate remediation for ${item.id} `
+            + '(--skip-audit-remediation) — blocking.',
+          );
           auditIssue = true;
-          reasons.push(remediation.reason);
-          summary = remediation.summary || summary;
+          reasons.push(`${classification.reason} (in-gate remediation skipped)`);
+          summary = classification.summary;
+        } else if (!budget.canAttempt()) {
+          // Bounded remediation (SA-0MUOO5V0P00461X8): once the budget is spent,
+          // stop re-auditing and report the item with an offline-refresh
+          // instruction instead of implying it is not ready to close.
+          console.log(
+            `Final-validation gate: remediation budget exhausted `
+            + `(${budget.describe()}) — skipping ${item.id}.`,
+          );
+          auditIssue = true;
+          reasons.push(
+            `Audit remediation budget exhausted (${budget.describe()}) — `
+            + 'audit needs refreshing offline',
+          );
+        } else {
+          console.log(
+            `Final-validation gate: auto-remediating ${item.id} ` +
+            `(${classification.kind} audit)...`,
+          );
+          const remediation = await attemptAuditRemediation(item, {
+            runAuditShow,
+            runAuditCommand,
+            resolveAuditRunnerFn,
+          });
+          budget.record();
+          if (remediation.status === 'passing') {
+            console.log(`Final-validation gate: ${item.id} auto-remediated successfully.`);
+            remediated = true;
+            summary = remediation.summary || summary;
+          } else {
+            console.log(`Final-validation gate: ${item.id} still failing after remediation — blocking.`);
+            auditIssue = true;
+            reasons.push(remediation.reason);
+            summary = remediation.summary || summary;
+          }
         }
       } else if (classification.kind === 'failing') {
         auditIssue = true;
@@ -673,7 +708,9 @@ export async function checkFinalValidation(options = {}) {
         remediationParts.push(buildProducerReviewRemediationCommand(item.id));
       }
       if (auditIssue) {
-        remediationParts.push(buildRemediationCommand(item.id));
+        remediationParts.push(
+          `${buildRemediationCommand(item.id)}\n  # ${OFFLINE_AUDIT_REFRESH_HINT}`,
+        );
       }
       blockingItems.push({
         workItemId: item.id,

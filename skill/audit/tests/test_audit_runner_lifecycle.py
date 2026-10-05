@@ -16,6 +16,78 @@ from audit.scripts import audit_runner
 from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
+class TestCoerceValidStatusStage:
+    """Unit tests for the _coerce_valid_status_stage helper.
+
+    Ensures the helper validates status/stage pairs against the
+    _STATUS_STAGE_COMPAT mapping and coerces invalid combinations to valid
+    defaults (preserving the captured status, adjusting only the stage).
+    """
+
+    def test_valid_combo_returns_unchanged(self):
+        """A valid (status, stage) pair is returned as-is."""
+        result = audit_runner._coerce_valid_status_stage("open", "plan_complete")
+        assert result == ("open", "plan_complete")
+
+        result = audit_runner._coerce_valid_status_stage("completed", "in_review")
+        assert result == ("completed", "in_review")
+
+        result = audit_runner._coerce_valid_status_stage("completed", "done")
+        assert result == ("completed", "done")
+
+    def test_none_status_defaults_to_open(self):
+        """None status defaults to 'open'."""
+        result = audit_runner._coerce_valid_status_stage(None, "plan_complete")
+        assert result == ("open", "plan_complete")
+
+    def test_none_stage_applies_default_logic(self):
+        """None stage uses the fallback: in_review for completed, plan_complete otherwise."""
+        result = audit_runner._coerce_valid_status_stage("completed", None)
+        assert result == ("completed", "in_review")
+
+        result = audit_runner._coerce_valid_status_stage("open", None)
+        assert result == ("open", "plan_complete")
+
+    def test_invalid_combo_blocked_in_review_coerces_to_plan_complete(self, capsys):
+        """blocked/in_review is invalid → coerced to blocked/plan_complete."""
+        result = audit_runner._coerce_valid_status_stage("blocked", "in_review")
+        assert result == ("blocked", "plan_complete")
+        err = capsys.readouterr().err
+        assert "Warning" in err
+        assert "blocked/in_review" in err
+        assert "coercing to (blocked/plan_complete)" in err
+
+    def test_invalid_combo_in_progress_in_review_coerces(self, capsys):
+        """in-progress/in_review is invalid → coerced to in-progress/plan_complete."""
+        result = audit_runner._coerce_valid_status_stage("in-progress", "in_review")
+        assert result == ("in-progress", "plan_complete")
+        err = capsys.readouterr().err
+        assert "Warning" in err
+
+    def test_invalid_combo_blocked_done_coerces(self, capsys):
+        """blocked/done is invalid → coerced to blocked/plan_complete."""
+        result = audit_runner._coerce_valid_status_stage("blocked", "done")
+        assert result == ("blocked", "plan_complete")
+        err = capsys.readouterr().err
+        assert "coercing to" in err
+
+    def test_all_valid_combinations(self):
+        """Every valid combo from the mapping is accepted unchanged."""
+        for status, valid_stages in audit_runner._STATUS_STAGE_COMPAT.items():
+            for stage in valid_stages:
+                result = audit_runner._coerce_valid_status_stage(status, stage)
+                assert result == (status, stage), (
+                    f"Expected ({status}, {stage}) to be valid"
+                )
+
+    def test_unknown_status_defaults_to_plan_complete(self, capsys):
+        """An unknown status falls back to plan_complete for the stage."""
+        result = audit_runner._coerce_valid_status_stage("unknown-status", "in_review")
+        assert result == ("unknown-status", "plan_complete")
+        err = capsys.readouterr().err
+        assert "Warning" in err
+
+
 @pytest.fixture(autouse=True)
 def _free_audit_slot():
     """Neutralize the host-wide audit semaphore for deterministic unit tests.
@@ -343,6 +415,42 @@ class TestVerdictDrivenStatusLifecycle:
         # Restored to the captured pre-audit state, assignee cleared
         assert "--status" in last and "completed" in last
         assert "--stage" in last and "in_review" in last
+        assert "--assignee" in last and "" in last
+
+    def test_failure_on_invalid_combo_blocked_in_review_coerces(self):
+        """AC1: A failure on an item whose captured state is invalid
+        (blocked/in_review) coerces to a valid combination (blocked/plan_complete)
+        instead of failing all restore attempts.
+
+        This is the regression case for SA-0MUIVCJLW000RUC1: when an item is
+        imported or refiled with an incompatible status/stage combo, the
+        restore path must still succeed by coercing the stage.
+        """
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes",
+            status="blocked", stage="in_review",
+            fail_children_show=True,
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "blocked" in last
+        assert "--stage" in last and "plan_complete" in last
+        assert "--assignee" in last and "" in last
+
+    def test_failure_on_invalid_combo_in_progress_in_review_coerces(self):
+        """AC1: in_progress/in_review is also invalid → coerced to
+        in_progress/plan_complete."""
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes",
+            status="in_progress", stage="in_review",
+            fail_children_show=True,
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "in_progress" in last
+        assert "--stage" in last and "plan_complete" in last
         assert "--assignee" in last and "" in last
 
     # ------------------------------------------------------------------
@@ -885,3 +993,135 @@ class TestLifecycleVerification:
             if s == "completed"
         ]
         assert terminal_updates == [("completed", "in_review")]
+
+
+class _LifecycleStateRunner:
+    """Minimal stateful ``wl`` runner for direct lifecycle calls.
+
+    Applies ``wl update`` mutations to a modelled status/stage so the
+    post-update readback verification (WL-0MSVVFBJ2003RRYK) passes, and
+    records every command for assertions.
+    """
+
+    def __init__(self, initial=("in_progress", "in_progress")):
+        self.status, self.stage = initial
+        self.commands = []
+        self.updates = []
+
+    def __call__(self, cmd):
+        cmd = list(cmd)
+        self.commands.append(cmd)
+        if "update" in cmd:
+            self.updates.append(cmd)
+            if "--status" in cmd:
+                self.status = cmd[cmd.index("--status") + 1]
+            if "--stage" in cmd:
+                self.stage = cmd[cmd.index("--stage") + 1]
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+        if "show" in cmd and "--children" not in cmd:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": "TEST-1", "status": self.status,
+                        "stage": self.stage,
+                    },
+                }),
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"success": True}), stderr="",
+        )
+
+
+class TestCascadeOnPassingParentAudit:
+    """AC1/AC3/AC5: the descendant cascade fires only on a verified passing
+    parent audit and is suppressed under dry-run.
+
+    These tests drive :func:`_apply_terminal_lifecycle` directly with a
+    constructed context, patching the cascade helper so the verdict/authorisation
+    gating is asserted in isolation from the cascade's own behaviour (covered
+    by ``test_audit_runner_children.py``).
+    """
+
+    def _ctx(self, runner, *, verdict="yes", persist=True, completed=True,
+             script_failure=None):
+        ctx = audit_runner._AuditContext(
+            issue_id="TEST-1", persist=persist, timeout=None,
+            parent_timeout=None, pi_bin="pi", model=None,
+            model_source="default", runner=runner, json_mode=False,
+            debug_log=None, force=True, worklog_dir=None, batch_phase2=False,
+            green_run=None, audit_children=False, max_child_audits=None,
+            run_tests=False,
+        )
+        ctx.audit_verdict = verdict
+        ctx.audit_completed = completed
+        ctx.script_failure = script_failure
+        ctx.original_status = "in_progress"
+        ctx.original_stage = "in_progress"
+        ctx.wi = {"id": "TEST-1", "parentId": None}
+        return ctx
+
+    def _apply(self, ctx):
+        with mock.patch.object(
+            audit_runner, "_cascade_descendants_terminal", return_value=0,
+        ) as cascade:
+            rc = audit_runner._apply_terminal_lifecycle(ctx)
+        return rc, cascade
+
+    def test_passing_parent_audit_triggers_cascade(self):
+        runner = _LifecycleStateRunner()
+        rc, cascade = self._apply(self._ctx(runner))
+        assert rc == 0
+        cascade.assert_called_once()
+        args, kwargs = cascade.call_args
+        assert args[0] == "TEST-1"
+        assert isinstance(args[1], str) and args[1]
+        assert kwargs["persist"] is True
+        assert kwargs["runner"] is runner
+
+    def test_dry_run_suppresses_cascade(self):
+        runner = _LifecycleStateRunner()
+        rc, cascade = self._apply(self._ctx(runner, persist=False))
+        assert rc == 0
+        cascade.assert_not_called()
+
+    def test_failing_parent_audit_does_not_cascade(self):
+        runner = _LifecycleStateRunner(("completed", "in_review"))
+        _rc, cascade = self._apply(self._ctx(runner, verdict="no"))
+        cascade.assert_not_called()
+        # Existing demotion behaviour is unchanged.
+        assert any(
+            "--status" in cmd and cmd[cmd.index("--status") + 1] == "open"
+            and "--stage" in cmd and cmd[cmd.index("--stage") + 1] == "plan_complete"
+            for cmd in runner.updates
+        )
+
+    def test_incomplete_run_does_not_cascade(self):
+        runner = _LifecycleStateRunner()
+        _rc, cascade = self._apply(
+            self._ctx(runner, verdict="yes", completed=False)
+        )
+        cascade.assert_not_called()
+
+    def test_script_failure_restore_does_not_cascade(self):
+        runner = _LifecycleStateRunner(("completed", "in_review"))
+        _rc, cascade = self._apply(
+            self._ctx(
+                runner, verdict="yes",
+                script_failure={"script": "x", "error": "boom"},
+            )
+        )
+        cascade.assert_not_called()
+
+    def test_cascade_failure_never_aborts_audit(self):
+        runner = _LifecycleStateRunner()
+        with mock.patch.object(
+            audit_runner, "_cascade_descendants_terminal",
+            side_effect=RuntimeError("cascade exploded"),
+        ):
+            rc = audit_runner._apply_terminal_lifecycle(self._ctx(runner))
+        assert rc == 0

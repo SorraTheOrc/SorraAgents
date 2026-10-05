@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // run-release.js — safe wrapper to invoke repository-level release script
-// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks] [--bump patch|minor|major]
+// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks] [--bump patch|minor|major] [--refresh-audits]
 //
 // The --bump flag is passed through to the canonical release script
 // (merge-dev-to-main.sh) and controls which part of the semver is
@@ -12,7 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
-import { checkFinalValidation, resolveChildScope, getItemById, shellQuote } from './check-final-validation.js';
+import { checkFinalValidation, resolveChildScope, getItemById, getItemLifecycle, shellQuote } from './check-final-validation.js';
+import { runRefreshAuditsAction } from './refresh-audits.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 import { sendReleaseNotification } from './discord-notify.js';
@@ -112,7 +113,7 @@ export function clearCodeFreezeMarker(projectRoot = resolveProjectRoot()) {
 // Flags consumed by run-release.js itself (e.g. gate bypass) and therefore
 // NEVER forwarded to the canonical merge script, which rejects unknown flags
 // with exit 2 ("Unknown arg: ..."). See SA-0MSKYGAWJ0009M3P.
-const WRAPPER_ONLY_FLAGS = new Set(['--skip-checks']);
+const WRAPPER_ONLY_FLAGS = new Set(['--skip-checks', '--refresh-audits', '--skip-audit-remediation']);
 
 /**
  * Compute the argument list to forward to the canonical merge script.
@@ -353,6 +354,12 @@ export function getDescendants(itemId) {
  * @param {(itemId: string) => string[]} [options.getDescendantsFn] -
  *   Descendant resolver (for candidate-set scoping); defaults to
  *   {@link getDescendants}.
+ * @param {(itemId: string) => ({status: string|null, stage: string|null}|null)} [options.getItemLifecycleFn] -
+ *   Lifecycle resolver for descendants; terminal descendants (`stage: done`
+ *   or `status: deleted`) are excluded from the collateral set so an
+ *   audit-approved parent with a fully-cascaded terminal subtree closes
+ *   without a false refusal (SA-0MUR7Y3BJ004FGPP AC4). Defaults to
+ *   {@link getItemLifecycle}.
  * @param {(item: object) => {outcome: string, ancestorId: string|null}} [options.getAncestorAuditFn] -
  *   Resolves whether a child is covered by an audit-ready `in_review`
  *   ancestor; defaults to {@link resolveCandidateCoverage}. Only a `covered`
@@ -374,6 +381,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
     getDescendantsFn = getDescendants,
+    getItemLifecycleFn = getItemLifecycle,
     getAncestorAuditFn = (item) => resolveCandidateCoverage(item),
     runOverrideCommand = (childId, ancestorId, reason) => {
       execSync(
@@ -530,7 +538,25 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       console.warn(`  ⚠ Could not resolve descendants for ${item.id}: ${err.message}`);
       descendants = [];
     }
-    const collateral = descendants.filter((id) => !candidateIds.has(id));
+    const collateral = descendants.filter((id) => {
+      if (candidateIds.has(id)) return false;
+      // Terminal descendants (`stage: done` or `status: deleted`) are NOT
+      // collateral: `wl close --force` may sweep them harmlessly, and an
+      // audit-approved parent routinely arrives with a fully-cascaded
+      // terminal subtree (SA-0MUR7Y3BJ004FGPP). Only descendants still in a
+      // non-terminal lifecycle state — or unresolvable ones (fail-safe) —
+      // refuse the close, preserving the scope guard SA-0MU2OY1N9000XL2H.
+      let lifecycle = null;
+      try {
+        lifecycle = getItemLifecycleFn(id);
+      } catch (err) {
+        console.warn(`  ⚠ Could not resolve lifecycle for descendant ${id}: ${err.message}`);
+        lifecycle = null;
+      }
+      const terminal = !!lifecycle
+        && (lifecycle.stage === 'done' || lifecycle.status === 'deleted');
+      return !terminal;
+    });
     if (collateral.length > 0) {
       const reason = `Refused: --force close would sweep descendant(s) outside the candidate set: ${collateral.join(', ')}`;
       console.log(`  ○ ${item.title || item.id} (${item.id}) — ${reason}`);
@@ -800,6 +826,13 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * @returns {number} Exit code (0 = success).
  */
 export async function runRelease(cliArgs = []) {
+  // Pre-flight-only audit refresh (SA-0MUOO5VMH005VF69): refresh the audits for
+  // in_review items and exit WITHOUT merging and WITHOUT setting the Code
+  // Freeze marker, so a large backlog never freezes the project.
+  if (cliArgs.includes('--refresh-audits')) {
+    return runRefreshAuditsAction(cliArgs);
+  }
+
   const projectRoot = resolveProjectRoot();
   setCodeFreezeMarker(projectRoot);
   try {
@@ -814,6 +847,10 @@ export async function runRelease(cliArgs = []) {
 async function runReleaseImpl(cliArgs = [], projectRoot) {
   const args = [...cliArgs];
   const skipChecks = args.includes('--skip-checks');
+  // Narrow audit bypass (SA-0MUOO5WV0006D7UD): skip only the in-gate audit
+  // *remediation* while still requiring every in-scope item to have a passing
+  // audit. Distinct from --skip-checks (which bypasses every gate).
+  const skipAuditRemediation = args.includes('--skip-audit-remediation');
   const isDryRun = args.includes('--dry-run');
   const isForce = args.includes('--force');
 
@@ -894,7 +931,7 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   // ── Step 2: Check audit readiness (gating step) ────────────────────────
   startStep('Step 2: audit readiness check');
   if (!skipChecks) {
-    const auditReport = await checkAuditReadyToClose();
+    const auditReport = await checkAuditReadyToClose({ skipRemediation: skipAuditRemediation });
     if (auditReport.hasBlockingItems) {
       console.error(
         '⚠️  Audit gate check failed — some work items are not ready to close:\n',
@@ -966,7 +1003,7 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   if (!skipChecks) {
     // `dryRun` is threaded through so a dry-run reports planned child
     // overrides / parent escalations without mutating the worklog (AC4).
-    const finalValidationReport = await checkFinalValidation({ dryRun: isDryRun });
+    const finalValidationReport = await checkFinalValidation({ dryRun: isDryRun, skipRemediation: skipAuditRemediation });
     if (finalValidationReport.hasBlockingItems) {
       console.error(
         '⚠️  Final-validation gate check failed — some in_review items have unresolved audit or producer-review issues:\n',

@@ -1,0 +1,75 @@
+# Machine-Hygiene Skill — Threshold Configuration
+#
+# This file defines the thresholds used to classify performance metrics
+# as low (green), warning (amber), or critical (red).
+#
+# All values are percentages or absolute numbers as noted.
+# Edit this file to customise thresholds for your environment.
+#
+# Usage: load via scripts/config.py::load_config()
+
+# ---------------------------------------------------------------------------
+# CPU Pressure (from /proc/pressure/cpu)
+#   Percentage of time the CPU group has been throttled (0–100%).
+# ---------------------------------------------------------------------------
+cpu_pressure:
+  low: 0
+  warning: 70     # >70% indicates moderate CPU contention
+  critical: 85    # >85% indicates severe CPU starvation
+
+# ---------------------------------------------------------------------------
+# Memory Pressure (from /proc/pressure/memory)
+#   Percentage of time memory operations were stalled (0–100%).
+# ---------------------------------------------------------------------------
+memory_usage:
+  low: 0
+  warning: 80     # >80% memory used — moderate pressure
+  critical: 95    # >95% memory used — imminent OOM risk
+
+# ---------------------------------------------------------------------------
+# I/O Pressure (from /proc/pressure/io)
+#   Percentage of time I/O operations were stalled (0–100%).
+# ---------------------------------------------------------------------------
+io_pressure:
+  low: 0
+  warning: 50     # >50% I/O stalled — noticeable slowdown
+  critical: 80    # >80% I/O stalled — near-dead system
+
+# ---------------------------------------------------------------------------
+# Load Average
+#   Multiplier against core count for classification.
+#   e.g. on a 16-core machine:
+#     warning  = cores * 0.7 = 11.2
+#     critical = cores * 1.5 = 24.0
+# ---------------------------------------------------------------------------
+load_average:
+  low: 0
+  warning_multiplier: 0.7   # warning = cores * 0.7
+  critical_multiplier: 1.5  # critical = cores * 1.5
+
+# ---------------------------------------------------------------------------
+# Zombie Processes
+#   Absolute count of zombie (defunct) processes.
+# ---------------------------------------------------------------------------
+zombie_processes:
+  low: 0
+  warning: 5    # >5 zombies — potential cleanup issue
+  critical: 20  # >20 zombies — process-tree problem
+
+# ---------------------------------------------------------------------------
+# Swap Usage (percentage of swap space in use)
+# ---------------------------------------------------------------------------
+swap_usage:
+  low: 0
+  warning: 30   # >30% swap used — moderate memory pressure
+  critical: 70  # >70% swap used — severe memory starvation
+
+# ---------------------------------------------------------------------------
+# Runnable Process Count
+#   Number of processes in D (uninterruptible sleep) or R (runnable) state.
+#   Warning when count exceeds core count * multiplier.
+# ---------------------------------------------------------------------------
+runnable_processes:
+  low: 0
+  warning_multiplier: 2.0   # warning = cores * 2
+  critical_multiplier: 4.0  # critical = cores * 4

@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+
+# <!-- REFACTOR-SA-0MUQ2OT8V009M5A3
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
+
+# <!-- REFACTOR-SA-0MUMEJVW00096MA8
+# smell: bug_risk
+# severity: medium
+# description: Function definition does not bind loop variable `calls`
+# -->
+
+# <!-- REFACTOR-SA-0MUMEJV3U001FBT4
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `result` is never used
+# -->
 """Audit JSON-contract tolerance and bounded re-ask tests (SA-0MU32TCFM003B78I).
 
 Covers:
@@ -14,7 +32,7 @@ Covers:
   back to the conservative ``partial``, never ``met``.
 
 All tests run offline with ``_call_pi_and_maybe_log`` mocked.
-"""  # noqa: EXE001
+"""
 from __future__ import annotations
 
 import json
@@ -27,7 +45,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from audit.scripts import audit_runner
-
 
 # ---------------------------------------------------------------------------
 # AC2: tolerant extraction
@@ -83,7 +100,7 @@ def _run_phase1_screen(first_text: str, reask_text: str | None):
     with mock.patch.object(
         audit_runner, "_call_pi_and_maybe_log", side_effect=fake
     ):
-        result, batch, raw = audit_runner._call_phase1_screen(
+        _result, batch, raw = audit_runner._call_phase1_screen(
             "SA-X", "parent", "screen these criteria", "test-model", "pi",
             None, None, None, lambda *a: None, "test screen",
         )
@@ -178,8 +195,8 @@ class TestCorpusReplay:
                 continue
             calls: list[str] = []
 
-            def fake(issue_id, context, prompt, _text=text, **kwargs):
-                calls.append(context)
+            def fake(issue_id, context, prompt, _text=text, _calls=calls, **kwargs):
+                _calls.append(context)
                 if context == "verdict_reask":
                     return {"extracted_text": _VALID_ARRAY}
                 return {"extracted_text": _text}
