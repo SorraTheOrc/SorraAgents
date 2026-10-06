@@ -11,7 +11,7 @@ EXECUTE immediately when invoked via /skill:audit. Do NOT ask permission or offe
 
 ## Overview
 
-Provide a concise, human-friendly summary of project status or a specific work item. Exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators such as Ralph.
+Provide a concise, human-friendly summary of project status or a specific work item. Exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators.
 
 ## When To Use
 
@@ -219,7 +219,7 @@ Phase 2 (model verifies code against each AC)
 - **Decision Gate:** blocking → all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, "Ready to close: No" — **FINAL**, MUST NOT be overridden. No blockers → proceed to Phase 2 (**MANDATORY**), **except** the narrow low-risk/small-item skip below.
 - **Phase 2 — Deep Code Analysis:** **MANDATORY when reached** — model reads actual implementation files, verifies each AC, provides file:line evidence. Never skipped once the gate passes, except for the single, unconditional exception in the next bullet.
 - **Defensive evidence handling (SA-0MSKM2LSP006L0K8):** models occasionally emit `evidence` as a structured JSON object (`{file, line, note}`) instead of the requested `path/file:line` string. All evidence consumers normalize through the shared `_evidence_text()` helper (dict/list → `json.dumps`, other scalars → `str()`), and Phase 2 merge sites normalize before writing into `ac_results` — so gap mapping, file-scope refs, infra-marker detection, and report assembly never crash or silently miss on non-string evidence. Verdict semantics and conservative fail-closed gap mapping are unchanged.
-- **Evidence-scope cap (LP-0MSQ32WM5000NCB7):** the Phase 2 deep prompts (parent `phase2_deep`, child `phase2_child`, batch `phase2_batch`) instruct the model to cite **at most N file:line references per criterion, minimum 1** — a prompt-level bound that shortens evidence-JSON generation (the dominant Phase 2 cost) without changing the model or verdict semantics. Default N is 5; resolve via `--max-citations-per-ac N` (highest), the `audit.max_citations_per_ac` key in the CWD `.ralph.json`/`ralph.config.json`, or the hardcoded default. Invalid values (0/negative/non-int) fail closed to the default with a warning. Parsed evidence/verdicts are never mutated — the canonical report format is preserved. Trade-off: fewer citations per AC shortens deep analysis but narrows evidence breadth; the ≥1 file:line floor keeps every verdict substantiated.
+- **Evidence-scope cap (LP-0MSQ32WM5000NCB7):** the Phase 2 deep prompts (parent `phase2_deep`, child `phase2_child`, batch `phase2_batch`) instruct the model to cite **at most N file:line references per criterion, minimum 1** — a prompt-level bound that shortens evidence-JSON generation (the dominant Phase 2 cost) without changing the model or verdict semantics. Default N is 5; resolve via `--max-citations-per-ac N` (highest) or the hardcoded default. Invalid values (0/negative/non-int) fail closed to the default with a warning. Parsed evidence/verdicts are never mutated — the canonical report format is preserved. Trade-off: fewer citations per AC shortens deep analysis but narrows evidence breadth; the ≥1 file:line floor keeps every verdict substantiated.
 - **Low-risk/small-item exception (SA-0MSQ026T3009QY2L):** when a work item has `effort` ∈ {Extra Small, Small} **and** `risk` = Low, Phase 2 deep analysis is skipped — Phase 1 verdicts stand unchanged (`met` remains `met`) and the report/evidence records the skip reason. The rule applies tree-wide: the parent and every child in the cascade are evaluated independently against the criterion. **Fail-closed:** missing/unknown `effort` or `risk` ⇒ Phase 2 runs as usual (never skip on absent data). No override flag or env var forces deep analysis for a qualifying node — the skip is unconditional.
 - **Final Verdict:** "met" only when BOTH phases confirm; disagreement → "partial".
 - **Ready-to-close criteria:** (1) all ACs `met`/`adjusted`, (2) all active children `in_review`/`done` (empty stage excluded) **or snapshot-exempt at audit start** (SA-0MUJAPC680078396), (3) no critical/high findings.
@@ -228,17 +228,15 @@ Phase 2 (model verifies code against each AC)
 
 ### Tiered Phase 1 model (SA-0MSKB697P000T3HG)
 
-Phase 1 parent + child AC screening can run on a fast/cheap model while Phase 2 deep analysis keeps the full model:
+Phase 1 parent + child AC screening runs on the resolved model by default; a distinct phase-1 model may be supplied programmatically (direct callers), in which case Phase 1 screens on it while Phase 2 deep analysis keeps the resolved model:
 
-- **Config key:** `model.audit_phase1` in the CWD `.ralph.json` / `ralph.config.json` (same resolution shape as `model.audit` — dotted, nested, or `model.remote.audit_phase1` / `model.local.audit_phase1` source-mapped).
-- **Default (safe):** when `model.audit_phase1` is absent, Phase 1 resolves to the full `model.audit` model — behavior is byte-for-byte identical to a single-model audit. The flag defaults OFF.
-- **Resolution order (Phase 1 model):** 1. `--phase1-model` CLI flag (explicit phase-1 override), 2. `--model` CLI flag, 3. `model.audit_phase1` config, 4. `model.audit` (full model), 5. `DEFAULT_MODEL` (`Local Proxy/plan`). Phase 2 always resolves via `model.audit` (1. `--model`, 2. config, 3. default).
+- **Default (safe):** with no distinct phase-1 model, Phase 1 uses the same resolved model as Phase 2 (`DEFAULT_MODEL`, `Local Proxy/plan`) — behaviour is byte-for-byte identical to a single-model audit.
 - **Wall-clock target:** Phase 1 per-call < **60s** on a healthy proxy when a fast model is configured (baseline: 1,348s avg / max 2,400s — see `docs/dev/audit-phase2-measured-report.md`). Per-call `Per-call timing:` stderr lines remain the observability surface.
-- **Safe runtime fallback (AC4):** when the fast Phase 1 model cannot produce reliable batched verdict JSON (unparseable output, provider error, or concurrency-limit timeout) AND a distinct full model is configured, the SAME Phase 1 screen is retried once with the full model before falling back to `partial` diagnostics. With the default config (`audit_phase1` absent) the retry is a no-op. An infra failure on the fast attempt that succeeds on the full-model retry keeps the conservative `ac_fallback_used` provenance (restore-not-demote).
+- **Safe runtime fallback (AC4):** when a distinct fast Phase 1 model cannot produce reliable batched verdict JSON (unparseable output, provider error, or concurrency-limit timeout), the SAME Phase 1 screen is retried once with the full model before falling back to `partial` diagnostics. With no distinct phase-1 model the retry is a no-op. An infra failure on the fast attempt that succeeds on the full-model retry keeps the conservative `ac_fallback_used` provenance (restore-not-demote).
 
 ### Model metadata line
 
-With ``--model``/``--model-source``, a metadata line goes after ``Ready to close:`` in issue/child reports (project reports NOT modified):
+With ``--model-source``, a metadata line goes after ``Ready to close:`` in issue/child reports (project reports NOT modified):
 
 - With model+source: ``Model: <model> (provider: <source>)`` (e.g. ``Model: Local Proxy/plan (provider: local)``, ``Model: gpt-4 (provider: remote)``)
 - Without: ``Model: manual (no provider)``
@@ -294,7 +292,7 @@ Synonym for "Acceptance Criteria"; **Acceptance Criteria** is canonical.
 
 ## Scripts
 
-- **Runner:** `$(skill_path audit)/scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project` / `audit_runner.py batch`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--child-in-main-slot` / `--no-child-in-main-slot`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model`, `--phase1-model`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`, `--checkpoint-dir DIR`, `--no-checkpoint`, `--batch-drain` / `--no-batch-drain` (issue), `--max-items N` / `--timeout S` (batch).
+- **Runner:** `$(skill_path audit)/scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project` / `audit_runner.py batch`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--child-in-main-slot` / `--no-child-in-main-slot`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`, `--checkpoint-dir DIR`, `--no-checkpoint`, `--batch-drain` / `--no-batch-drain` (issue), `--max-items N` / `--timeout S` (batch).
 - **Persister:** `$(skill_path audit)/scripts/persist_audit.py` — persist from stdin, file, or CLI string; cwd-independent — the worklog store is auto-resolved from the work-item id prefix (prefix-to-sibling scan, cwd-chain fallback) when `--worklog-dir` is omitted, so it persists to the item's own store from any cwd (SA-0MSKQERKH002IBLG).
 
 Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, test-cache auto-verification, `--run-tests`, batch/parallel Phase 2, tools-enabled invocation, bounded scanning, debug logs, file-scope manifest, child verdict reuse, phase-1/2 performance, phase checkpoints) are fully documented in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Execution-dependent ACs can also be verified via the [test skill](../test/SKILL.md) (`/skill:test`).
