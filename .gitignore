@@ -59,12 +59,6 @@ tmp/
 .env
 .venv/
 
-# Ralph event signals
-.ralph/event.pending
-
-# Ralph config with secrets
-.ralph.json
-
 # Implement skill state file (must never be tracked; it would cause
 # catastrophic project deletion if _discover_worktree() finds it in
 # the repo root instead of a worktree)
