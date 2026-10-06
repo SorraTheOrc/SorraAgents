@@ -25,6 +25,7 @@ import { runDoctor, formatDoctorReport } from "./doctor.js";
 import { createRecorder } from "./recorder.js";
 import { createWhisperClient } from "./whisper-client.js";
 import { createVoiceInputController } from "./controller.js";
+import { createHerdrShortcutRunner } from "./herdr-shortcuts.js";
 
 export default function voiceInputExtension(pi: ExtensionAPI): void {
   // Load config once at registration so the shortcut can be bound; the
@@ -33,6 +34,18 @@ export default function voiceInputExtension(pi: ExtensionAPI): void {
 
   /** @type {ReturnType<typeof createVoiceInputController> | null} */
   let controller: ReturnType<typeof createVoiceInputController> | null = null;
+
+  const buildShortcutRunner = (ctx: ExtensionContext) => {
+    if (!Array.isArray(config.shortcuts) || config.shortcuts.length === 0) return null;
+    return createHerdrShortcutRunner({
+      shortcuts: config.shortcuts,
+      targetPaneLabel: config.targetPaneLabel,
+      targetPaneId: config.targetPaneId,
+      workspaceId: process.env.HERDR_WORKSPACE_ID || "",
+      herdrBin: process.env.HERDR_BIN_PATH || "herdr",
+      notify: (message, level) => ctx.ui.notify(message, level),
+    });
+  };
 
   const ensureController = (ctx: ExtensionContext): ReturnType<typeof createVoiceInputController> => {
     if (controller) return controller;
@@ -45,6 +58,7 @@ export default function voiceInputExtension(pi: ExtensionAPI): void {
       createWhisperClient,
       ui: ctx.ui,
       sendUserMessage: (text, options) => pi.sendUserMessage(text, options),
+      sendShortcut: buildShortcutRunner(ctx),
       isIdle: () => ctx.isIdle(),
       checkDoctor: () => runDoctor({ config }),
     });

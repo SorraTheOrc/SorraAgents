@@ -36,6 +36,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   python: "python3",
   workerScript: "",
   startupTimeoutMs: 120000,
+  targetPaneLabel: "Work Items",
+  targetPaneId: "",
+  shortcuts: [],
 });
 
 /** Device values accepted by the worker. */
@@ -59,6 +62,9 @@ const ENV_KEYS = {
   python: "PI_VOICE_INPUT_PYTHON",
   workerScript: "PI_VOICE_INPUT_WORKER_SCRIPT",
   startupTimeoutMs: "PI_VOICE_INPUT_STARTUP_TIMEOUT_MS",
+  targetPaneLabel: "PI_VOICE_INPUT_TARGET_PANE_LABEL",
+  targetPaneId: "PI_VOICE_INPUT_TARGET_PANE_ID",
+  shortcuts: "PI_VOICE_INPUT_SHORTCUTS",
 };
 
 /** Approximate download sizes (MB) for the supported faster-whisper models. */
@@ -108,6 +114,16 @@ export function configFromEnv(env = {}) {
       }
       continue;
     }
+    if (key === "shortcuts") {
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) throw new Error("not an array");
+        partial[key] = parsed;
+      } catch {
+        warnings.push(`${envName} is not a JSON array; ignoring it.`);
+      }
+      continue;
+    }
     partial[key] = raw;
   }
   return { partial, warnings };
@@ -137,6 +153,33 @@ function coerce(key, raw, fallback) {
     return {
       value: fallback,
       warning: `${key} must be a boolean (true/false); using the default.`,
+    };
+  }
+
+  if (key === "shortcuts") {
+    if (!Array.isArray(raw)) {
+      return { value: fallback, warning: `${key} must be an array; using the default.` };
+    }
+    const cleaned = [];
+    const problems = [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object") {
+        problems.push("entries must be objects with a phrase and chord");
+        continue;
+      }
+      const phrase = typeof entry.phrase === "string" ? entry.phrase.trim() : "";
+      const chord = Array.isArray(entry.chord)
+        ? entry.chord.filter((key) => typeof key === "string" && key.length > 0)
+        : [];
+      if (!phrase || chord.length === 0) {
+        problems.push("each shortcut needs a non-empty phrase and chord");
+        continue;
+      }
+      cleaned.push({ phrase, chord });
+    }
+    return {
+      value: cleaned,
+      warning: problems.length ? `shortcuts: ${[...new Set(problems)].join("; ")}.` : null,
     };
   }
 

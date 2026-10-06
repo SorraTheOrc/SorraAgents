@@ -180,6 +180,35 @@ describe("voice controller state machine", () => {
     assert.equal(ui.statuses.at(-1)[1], undefined);
   });
 
+  test("a matched voice shortcut is sent instead of submitting to pi", async () => {
+    const shortcuts = [];
+    const { controller, ui, userMessages, clients } = harness({
+      sendShortcut: async (transcript) => {
+        shortcuts.push(transcript);
+        return true;
+      },
+    });
+    await controller.toggle();
+    clients[0].finalText = "producer interview";
+
+    await controller.toggle();
+
+    assert.deepEqual(shortcuts, ["producer interview"]);
+    assert.deepEqual(userMessages, []);
+    assert.equal(ui.setEditorCalls.at(-1), "");
+    assert.equal(controller.getState(), STATE.idle);
+  });
+
+  test("an unmatched transcript falls through to normal submission", async () => {
+    const { controller, userMessages, clients } = harness({ sendShortcut: async () => false });
+    await controller.toggle();
+    clients[0].finalText = "hello world";
+
+    await controller.toggle();
+
+    assert.deepEqual(userMessages, [{ text: "hello world", options: undefined }]);
+  });
+
   test("toggle while submitting is ignored", async () => {
     const { controller, clients, userMessages } = harness();
     await controller.toggle();

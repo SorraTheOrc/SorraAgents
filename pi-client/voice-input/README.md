@@ -112,6 +112,9 @@ Settings files (first found wins):
 | `python` | `PI_VOICE_INPUT_PYTHON` | `python3` | Python interpreter running the worker |
 | `workerScript` | `PI_VOICE_INPUT_WORKER_SCRIPT` | *(bundled)* | Override the worker path |
 | `startupTimeoutMs` | `PI_VOICE_INPUT_STARTUP_TIMEOUT_MS` | `120000` | Worker readiness timeout |
+| `shortcuts` | `PI_VOICE_INPUT_SHORTCUTS` | `[]` | Voice shortcuts: `[{ phrase, chord }]` sent to a Herdr pane |
+| `targetPaneLabel` | `PI_VOICE_INPUT_TARGET_PANE_LABEL` | `Work Items` | Pane label to target in the current Herdr workspace |
+| `targetPaneId` | `PI_VOICE_INPUT_TARGET_PANE_ID` | *(none)* | Explicit Herdr pane id (overrides the label) |
 
 Example `~/.pi/agent/voice-input.json`:
 
@@ -123,6 +126,33 @@ Example `~/.pi/agent/voice-input.json`:
   "computeType": "int8"
 }
 ```
+
+## Voice shortcuts (Herdr)
+
+Map a spoken phrase to a key chord that is injected into a Herdr pane — useful
+for driving keyboard-driven plugins (e.g. the ContextHub worklog pane):
+
+```json
+{
+  "targetPaneLabel": "Work Items",
+  "shortcuts": [
+    { "phrase": "producer interview", "chord": ["r", "i"] },
+    { "phrase": "producer review", "chord": ["r", "p"] }
+  ]
+}
+```
+
+When the final transcript matches a phrase (case/whitespace/punctuation
+insensitive) the extension sends the chord to the target pane with
+`herdr pane send-keys` instead of submitting the transcript to pi. The target
+pane is resolved by `targetPaneLabel` within the calling pane's workspace
+(`HERDR_WORKSPACE_ID`); set `targetPaneId` to pin a specific pane. A transcript
+that matches no phrase is submitted normally.
+
+This is an **explicit allowlist** — only configured phrases trigger a chord and
+no arbitrary shell command is ever run from speech. If Herdr is unavailable or
+no matching pane is found, the extension shows a notification and never crashes
+the session.
 
 ## Troubleshooting
 
@@ -157,6 +187,7 @@ cloud/network speech-to-text; the worker never opens a network connection.
 | `whisper_worker.py` | faster-whisper worker (model loaded once per session) |
 | `config.js` | settings resolution and validation |
 | `doctor.js` | faster-whisper / CUDA / capture / disk preflight checks |
+| `herdr-shortcuts.js` | voice phrase → Herdr key-chord dispatch (allowlist) |
 
 See [`docs/dev/voice-input.md`](../../docs/dev/voice-input.md) for the design
 and protocol reference.

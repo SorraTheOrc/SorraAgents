@@ -56,6 +56,9 @@ describe("config defaults", () => {
     assert.equal(config.beamSize, 5);
     assert.equal(config.vadFilter, false);
     assert.equal(config.initialPrompt, "");
+    assert.deepEqual(config.shortcuts, []);
+    assert.equal(config.targetPaneLabel, "Work Items");
+    assert.equal(config.targetPaneId, "");
   });
 });
 
@@ -177,6 +180,40 @@ describe("config validation", () => {
     const { config, warnings } = resolveConfig({ overrides: { model: "large-v3-turbo" } });
     assert.equal(config.model, "large-v3-turbo");
     assert.ok(!warnings.some((w) => /not a known faster-whisper size/.test(w)));
+  });
+
+  test("shortcuts are validated: invalid entries are dropped with a warning", () => {
+    const { config, warnings } = resolveConfig({
+      overrides: {
+        shortcuts: [
+          { phrase: "producer interview", chord: ["r", "i"] },
+          { phrase: "", chord: ["x"] },
+          { phrase: "no chord", chord: [] },
+          "not-an-object",
+        ],
+      },
+    });
+    assert.deepEqual(config.shortcuts, [{ phrase: "producer interview", chord: ["r", "i"] }]);
+    assert.ok(warnings.some((w) => /shortcuts:/.test(w)));
+  });
+
+  test("shortcuts and target pane can come from the environment (JSON)", () => {
+    const { config } = resolveConfig({
+      env: {
+        PI_VOICE_INPUT_SHORTCUTS: JSON.stringify([{ phrase: "open worklist", chord: ["o", "w"] }]),
+        PI_VOICE_INPUT_TARGET_PANE_LABEL: "Worklog",
+        PI_VOICE_INPUT_TARGET_PANE_ID: "w1:p1",
+      },
+    });
+    assert.deepEqual(config.shortcuts, [{ phrase: "open worklist", chord: ["o", "w"] }]);
+    assert.equal(config.targetPaneLabel, "Worklog");
+    assert.equal(config.targetPaneId, "w1:p1");
+  });
+
+  test("invalid shortcuts JSON in the environment is ignored with a warning", () => {
+    const { partial, warnings } = configFromEnv({ PI_VOICE_INPUT_SHORTCUTS: "not json" });
+    assert.equal(partial.shortcuts, undefined);
+    assert.ok(warnings.some((w) => /PI_VOICE_INPUT_SHORTCUTS is not a JSON array/.test(w)));
   });
 
   test("an out-of-range silence threshold is rejected", () => {

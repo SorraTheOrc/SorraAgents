@@ -44,6 +44,9 @@ export function statusText(state) {
  * @param {(options: object) => object} deps.createWhisperClient worker client factory
  * @param {object} deps.ui `{ setEditorText, getEditorText, setStatus, notify }`
  * @param {(text: string, options?: object) => void} deps.sendUserMessage
+ * @param {(transcript: string) => Promise<boolean>} [deps.sendShortcut] optional
+ *   Herdr shortcut dispatcher: returns true when the transcript matched a
+ *   configured phrase and was sent as a key chord instead of a prompt.
  * @param {() => boolean} [deps.isIdle] whether pi is idle (not streaming)
  * @param {() => object} [deps.checkDoctor] preflight check (run once on first start)
  * @param {object} [deps.logger]
@@ -54,6 +57,7 @@ export function createVoiceInputController({
   createWhisperClient,
   ui,
   sendUserMessage,
+  sendShortcut = null,
   isIdle = () => true,
   checkDoctor = null,
   logger = console,
@@ -186,6 +190,27 @@ export function createVoiceInputController({
         state = STATE.idle;
         emitter.emit("stopped", { submitted: false, transcript: "" });
         return;
+      }
+
+      // A configured voice shortcut sends a Herdr key chord instead of
+      // submitting the transcript as a prompt.
+      if (sendShortcut) {
+        let handled = false;
+        try {
+          handled = Boolean(await sendShortcut(transcript));
+        } catch (err) {
+          logger?.warn?.(
+            `voice-input shortcut failed: ${err && err.message ? err.message : err}`,
+          );
+        }
+        if (handled) {
+          lastPartial = transcript;
+          ui.setEditorText("");
+          state = STATE.idle;
+          ui.setStatus(STATUS_KEY, undefined);
+          emitter.emit("stopped", { submitted: true, transcript, shortcut: true });
+          return;
+        }
       }
 
       lastPartial = transcript;

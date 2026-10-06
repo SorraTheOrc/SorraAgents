@@ -170,9 +170,39 @@ faster-whisper unchanged.
 | `python` | `PI_VOICE_INPUT_PYTHON` | `python3` |
 | `workerScript` | `PI_VOICE_INPUT_WORKER_SCRIPT` | bundled `whisper_worker.py` |
 | `startupTimeoutMs` | `PI_VOICE_INPUT_STARTUP_TIMEOUT_MS` | `120000` |
+| `shortcuts` | `PI_VOICE_INPUT_SHORTCUTS` | `[]` |
+| `targetPaneLabel` | `PI_VOICE_INPUT_TARGET_PANE_LABEL` | `Work Items` |
+| `targetPaneId` | `PI_VOICE_INPUT_TARGET_PANE_ID` | *(none)* |
 
 Settings files are searched in order: `$PI_VOICE_INPUT_CONFIG`,
 `<project>/.pi/voice-input.json`, `~/.pi/agent/voice-input.json`.
+
+## Herdr voice shortcuts (`herdr-shortcuts.js`)
+
+`shortcuts` maps a spoken phrase to a Herdr key chord; `targetPaneLabel` (or
+`targetPaneId`) selects the pane. On the final transcript the controller asks
+`sendShortcut(transcript)` (injected from `herdr-shortcuts.js`); when it returns
+true the chord was sent and the transcript is **not** submitted to pi.
+
+Resolution and dispatch:
+
+1. `matchShortcut(shortcuts, transcript)` — normalises case, whitespace and
+trailing punctuation and returns the first phrase that matches exactly.
+2. `resolveTargetPane(panes, {targetPaneLabel, targetPaneId})` — an explicit id
+   wins; otherwise the pane whose `label` (or `terminal_title_stripped`) matches
+   the label is used.
+3. `herdr pane list --workspace $HERDR_WORKSPACE_ID` discovers panes and
+   `herdr pane send-keys <pane-id> <key>...` injects the chord. `HERDR_BIN_PATH`
+   overrides the binary.
+
+Safety: this is an explicit allowlist — only configured phrases trigger a chord,
+and no arbitrary command is run from speech. Discovery/send failures notify the
+operator and never throw; a matched phrase is still consumed (not submitted to
+pi) so a misheard command cannot leak into the prompt.
+
+The logic is dependency-free with an injectable `run`, so
+`tests/unit/test-voice-herdr-shortcuts.mjs` exercises it without a live Herdr
+session.
 
 ## Install wiring
 
@@ -193,7 +223,8 @@ Pure unit tests (no microphone, GPU or model download):
 | `tests/unit/test-voice-whisper-worker.mjs` | real Python worker against a stub `faster_whisper`: start/ready/feed/partial/finalise/stop, CUDA fallback, missing dependency, buffer reset |
 | `tests/unit/test-voice-config.mjs` | settings resolution/validation/precedence |
 | `tests/unit/test-voice-doctor.mjs` | preflight checks and severity aggregation |
-| `tests/unit/test-voice-controller.mjs` | state machine, toggle, partial replacement, submission, doctor gating, errors |
+| `tests/unit/test-voice-controller.mjs` | state machine, toggle, partial replacement, submission, shortcut dispatch, doctor gating, errors |
+| `tests/unit/test-voice-herdr-shortcuts.mjs` | phrase matching, target-pane resolution, chord dispatch, failure handling (injected herdr runner) |
 | `tests/unit/test-voice-input.mjs` | end-to-end wiring: controller → recorder → real worker → auto-submit |
 
 The worker tests inject a stub `faster_whisper` module via `PYTHONPATH`, so the
