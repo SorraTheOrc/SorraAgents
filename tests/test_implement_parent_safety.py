@@ -103,12 +103,26 @@ class ParentHarness:
     def _fake_wl_dep_blockers(self, child_id, **_):
         return list(self.blockers_map.get(child_id, []))
 
+    def _fake_invoke(self, action, child_id, **kwargs):
+        if action == "start":
+            result = self._fake_phase_start(child_id, **kwargs)
+            if not result.get("success", True):
+                return None
+            return result
+        if action == "finish":
+            self.calls.setdefault("phase_finish", []).append(child_id)
+            return {"success": True, "work_item_id": child_id}
+        raise AssertionError(f"unexpected action {action}")
+
     def run(self, parent_id: str = "SA-PARENT001") -> dict:
         with (
             mock.patch.object(self.mod, "wl_show", return_value={"id": parent_id, "title": "P"}),
             mock.patch.object(self.mod, "wl_show_children", return_value=self.children),
             mock.patch.object(self.mod, "wl_dep_blockers", side_effect=self._fake_wl_dep_blockers),
             mock.patch.object(self.mod, "phase_start", side_effect=self._fake_phase_start),
+            mock.patch.object(self.mod, "_invoke_implement", side_effect=self._fake_invoke),
+            mock.patch.object(self.mod, "_discover_worktree", return_value=None),
+            mock.patch.object(self.mod, "_has_worktree_changes", return_value=False),
             mock.patch.object(
                 self.mod.StatusLifecycle, "update_status", side_effect=self._fake_update_status
             ),

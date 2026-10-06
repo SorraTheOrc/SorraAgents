@@ -3752,6 +3752,88 @@ def phase_abort(
     return report
 
 
+def _build_implement_cmd(
+    action: str,
+    work_item_id: str,
+    extra_flags: list[str] | None = None,
+) -> list[str]:
+    """Build a subprocess command to invoke implement.py.
+
+    Args:
+        action: One of 'start', 'finish', 'abort', 'parent'.
+        work_item_id: The work item ID.
+        extra_flags: Additional flags (e.g. '--json', '--no-refactor').
+
+    Returns:
+        A command list suitable for ``subprocess.run``.
+    """
+    script_path = str(Path(__file__).resolve())
+    cmd = [sys.executable, script_path, action, work_item_id, "--json"]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    return cmd
+
+
+def _invoke_implement(
+    action: str,
+    work_item_id: str,
+    no_refactor: bool = False,
+    verbose: bool = False,
+) -> dict[str, Any] | None:
+    """Run an implement phase as a subprocess and parse JSON output.
+
+    Args:
+        action: One of 'start', 'finish', 'abort', 'parent'.
+        work_item_id: The work item ID.
+        no_refactor: If True, add ``--no-refactor`` flag.
+        verbose: If True, add ``-v`` flag.
+
+    Returns:
+        Parsed JSON result dict on success (exit code 0), or ``None``
+        if the subprocess failed (exit code non-zero).
+    """
+    flags: list[str] = []
+    if no_refactor:
+        flags.append("--no-refactor")
+    if verbose:
+        flags.append("-v")
+    cmd = _build_implement_cmd(action, work_item_id, extra_flags=flags)
+    LOG.debug("Subprocess: %s", " ".join(cmd))
+    repo_root = _get_repo_root() or str(Path.cwd())
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_resolve_test_timeout(repo_root),
+    )
+    if result.returncode != 0:
+        LOG.error(
+            "Subprocess failed (rc=%d): %s\nSTDERR: %s",
+            result.returncode,
+            result.stdout[:500],
+            result.stderr[:500],
+        )
+        return None
+    try:
+        return json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        LOG.error("Failed to parse subprocess JSON output: %s", exc)
+        return None
+
+
+def _has_worktree_changes(worktree_path: str) -> bool:
+    """Check if the worktree has uncommitted changes or commits ahead.
+
+    Args:
+        worktree_path: Absolute path to the worktree.
+
+    Returns:
+        True if the worktree is dirty or ahead of the parent branch.
+    """
+    return _git_path_has_changes(Path(worktree_path), DEFAULT_PARENT_BRANCH)
+
+
 def phase_parent(
     work_item_id: str,
     json_output: bool = False,
@@ -3907,71 +3989,187 @@ def phase_parent(
             print()
         return report
 
-    # ── Step 6: All children terminal → advance the parent ─────────
-    if all(c["action"] == "skip-terminal" for c in classifications):
-        parent_status = str(parent.get("status", ""))
-        already_terminal = _is_terminal_status(parent_status)
-        if not already_terminal:
-            try:
-                StatusLifecycle.update_status(
-                    work_item_id, "completed", stage="in_review"
-                )
-            except RuntimeError:
-                msg = f"Failed to advance parent {work_item_id}"
-                report["success"] = False
-                report["message"] = msg
-                if json_output:
-                    print(format_json_output(report))
-                else:
-                    LOG.error(msg)
-                return report
-        summary = "\n".join(
-            f"- {c['id']} ({c['status']})" for c in classifications
-        )
-        wl_add_comment(
-            work_item_id,
-            f"All children are in a terminal stage. Parent advanced to "
-            f"in_review.\n{summary}",
-        )
-        report["parent_advanced"] = True
-        report["message"] = (
-            f"All children of {work_item_id} are terminal; parent advanced "
-            f"to completed/in_review."
-        )
-        if already_terminal:
-            report["message"] = (
-                f"All children of {work_item_id} are terminal; parent is "
-                f"already in a terminal state ({parent_status})."
-            )
+    # ── Step 6: Loop over children — finish implemented, start new ─
+    # A single phase_parent invocation walks every child in dependency
+    # order, finishing those whose worktrees already contain changes and
+    # starting the next unimplemented child. Each child's start/finish runs
+    # in its own subprocess (``_invoke_implement``) — process isolation and
+    # serial ordering. When a child still needs implementation the loop
+    # returns to the caller; when every child is terminal it advances the
+    # parent.
+    child_results: list[dict[str, Any]] = []
+    child_ids = {str(c.get("id")) for c in children}
+    terminal_ids = {
+        str(c.get("id")) for c in children
+        if _is_terminal_status(str(c.get("status", "")))
+    }
+    pending_ids: list[str] = []
+    blocked_ids: list[str] = []
+
+    def _in_chain_blockers(child_id: str) -> list[str]:
+        return [
+            str(b.get("id"))
+            for b in blockers_map.get(child_id, [])
+            if str(b.get("id")) in child_ids
+        ]
+
+    def _report_implement_next(
+        cid: str, worktree_path: str, branch: str, message: str,
+    ) -> dict[str, Any]:
+        """Populate and return the report for a child awaiting implementation."""
+        report["next_child"] = cid
+        report["worktree_path"] = worktree_path
+        report["branch"] = branch
+        report["message"] = message
+        report["children_processed"] = child_results
         if json_output:
             print(format_json_output(report))
         else:
             print()
             print("=" * 60)
-            print(f"  ✅ Parent advanced: {work_item_id} → in_review")
+            print(f"  Implement child: {cid} (of {work_item_id})")
             print("=" * 60)
-            print(summary)
+            print(f"  Worktree: {worktree_path}")
+            if branch:
+                print(f"  Branch:   {branch}")
+            print()
+            print("  Next steps:")
+            print(f"  1. cd {worktree_path}")
+            print("  2. Write tests and implementation code")
+            print(f"  3. Re-run: python3 scripts/implement.py parent {work_item_id}")
             print()
         return report
 
-    # ── Step 7: Start the next child (claim + worktree) ────────────
-    next_child = _next_child_to_implement(ordered_children, blockers_map)
-    if next_child is None:
-        # No startable child: every remaining child is terminal, in progress
-        # elsewhere, or blocked by a non-terminal sibling.
-        blocked = [
-            c["id"]
-            for c in classifications
-            if c["action"] not in ("skip-terminal", "skip-in-progress")
-        ]
+    def _run_finish(cid: str, title: str = "") -> dict[str, Any] | None:
+        """Run the finish subprocess for *cid* (None on failure)."""
+        LOG.info("Child %s has changes — running finish subprocess...", cid)
+        finish_result = _invoke_implement(
+            "finish", cid, no_refactor=no_refactor, verbose=verbose,
+        )
+        if finish_result is None:
+            msg = f"Failed to finish child {cid}"
+            LOG.error(msg)
+            report["success"] = False
+            report["message"] = msg
+            report["next_child"] = cid
+            report["finishing_failed"] = True
+            report["children_processed"] = child_results
+            if json_output:
+                print(format_json_output(report))
+            else:
+                print(f"\n\u26a0\ufe0f {msg}\n")
+            return None
+        terminal_ids.add(cid)
+        child_results.append({
+            "id": cid, "title": title,
+            "action": "finished",
+            "status": "completed",
+        })
+        return finish_result
+
+    for child in ordered_children:
+        cid = str(child.get("id", ""))
+        title = child.get("title", "")
+        action = _classify_child(child)
+
+        if action == "skip-terminal":
+            child_results.append({
+                "id": cid, "title": title,
+                "action": "skipped-terminal",
+                "status": child.get("status", ""),
+            })
+            continue
+
+        worktree_path = _discover_worktree(cid)
+        has_changes = bool(
+            worktree_path and _has_worktree_changes(worktree_path)
+        )
+
+        if action == "skip-in-progress":
+            # A started child may be ours (worktree exists) or another
+            # agent's claim (no worktree → never clobbered).
+            if has_changes:
+                if _run_finish(cid, title) is None:
+                    return report
+            elif worktree_path:
+                return _report_implement_next(
+                    cid, worktree_path, "",
+                    f"Child {cid} is in progress. Implement in "
+                    f"{worktree_path}, then re-run "
+                    f"`implement.py parent {work_item_id}`.",
+                )
+            else:
+                pending_ids.append(cid)
+                child_results.append({
+                    "id": cid, "title": title,
+                    "action": "skipped-in-progress",
+                    "status": child.get("status", ""),
+                })
+            continue
+
+        # action == "implement" (child is open). A child is startable only
+        # when every in-chain blocker is already terminal (never before its
+        # blockers — AC-2).
+        if not all(b in terminal_ids for b in _in_chain_blockers(cid)):
+            pending_ids.append(cid)
+            blocked_ids.append(cid)
+            child_results.append({
+                "id": cid, "title": title,
+                "action": "blocked",
+                "status": child.get("status", ""),
+            })
+            continue
+
+        if has_changes:
+            if _run_finish(cid, title) is None:
+                return report
+            continue
+
+        if worktree_path:
+            return _report_implement_next(
+                cid, worktree_path, "",
+                f"Child {cid} worktree exists at {worktree_path}. "
+                f"Implement, then re-run "
+                f"`implement.py parent {work_item_id}`.",
+            )
+
+        # No worktree — start the child in its own subprocess.
+        LOG.info("Starting child %s of parent %s...", cid, work_item_id)
+        start_result = _invoke_implement(
+            "start", cid, no_refactor=no_refactor, verbose=verbose,
+        )
+        if start_result is None:
+            msg = f"Failed to start child {cid}"
+            LOG.error(msg)
+            report["success"] = False
+            report["message"] = msg
+            report["next_child"] = cid
+            report["start_failed"] = True
+            report["children_processed"] = child_results
+            if json_output:
+                print(format_json_output(report))
+            else:
+                print(f"\n\u26a0\ufe0f {msg}\n")
+            return report
+
+        wt = start_result.get("worktree_path", "")
+        return _report_implement_next(
+            cid, wt, start_result.get("branch", ""),
+            f"Started child {cid}. Implement in {wt}, then "
+            f"re-run `implement.py parent {work_item_id}`.",
+        )
+
+    # ── Step 7: Advance only when every child is terminal ──────────
+    if pending_ids:
         report["message"] = (
             f"No child of {work_item_id} is currently startable: "
             f"non-terminal children not in progress are blocked by "
-            f"non-terminal siblings or unavailable. Re-run this phase "
-            f"after one completes."
+            f"non-terminal siblings or another agent holds them. Re-run "
+            f"this phase after one completes."
         )
-        if blocked:
-            report["blocked_children"] = blocked
+        if blocked_ids:
+            report["blocked_children"] = blocked_ids
+        report["children_processed"] = child_results
         if json_output:
             print(format_json_output(report))
         else:
@@ -3982,57 +4180,57 @@ def phase_parent(
             print()
         return report
 
-    next_id = next_child.get("id", "")
-    LOG.info("Starting next child %s of parent %s...", next_id, work_item_id)
-    start_result = phase_start(
-        next_id,
-        json_output=False,
-        no_refactor=no_refactor,
-        parent_branch=parent_branch,
-        verbose=verbose,
+    parent_status = str(parent.get("status", ""))
+    already_terminal = _is_terminal_status(parent_status)
+    if not already_terminal:
+        try:
+            StatusLifecycle.update_status(
+                work_item_id, "completed", stage="in_review"
+            )
+        except RuntimeError:
+            msg = f"Failed to advance parent {work_item_id}"
+            report["success"] = False
+            report["message"] = msg
+            if json_output:
+                print(format_json_output(report))
+            else:
+                LOG.error(msg)
+            return report
+    summary = "\n".join(
+        f"- {c['id']} ({c['status']})" for c in classifications
     )
-    if not start_result.get("success"):
-        msg = (
-            f"Failed to start child {next_id}: "
-            f"{start_result.get('message', 'unknown error')}"
-        )
-        LOG.error(msg)
-        report["success"] = False
-        report["next_child"] = next_id
-        report["message"] = msg
-        if json_output:
-            print(format_json_output(report))
-        else:
-            print(f"\n⛔ {msg}\n")
-        return report
-
-    report["next_child"] = next_id
-    report["worktree_path"] = start_result.get("worktree_path", "")
-    report["branch"] = start_result.get("branch", "")
+    child_summary = "\n".join(
+        f"- {r.get('id', '?')}: {r.get('action', '?')} "
+        f"({r.get('status', '')})"
+        for r in child_results
+    )
+    wl_add_comment(
+        work_item_id,
+        f"All children of {work_item_id} are in a terminal stage. "
+        f"Parent advanced to in_review.\n\n"
+        f"Children processed:\n{child_summary}\n\n"
+        f"Per-child summary:\n{summary}",
+    )
+    report["parent_advanced"] = True
     report["message"] = (
-        f"Started child {next_id}. Implement it in "
-        f"{start_result.get('worktree_path', '')}, then run "
-        f"`implement.py finish {next_id}`, then re-run "
-        f"`implement.py parent {work_item_id}` for the next child."
+        f"All children of {work_item_id} are terminal; parent advanced "
+        f"to completed/in_review."
     )
-
+    if already_terminal:
+        report["message"] = (
+            f"All children of {work_item_id} are terminal; parent is "
+            f"already in a terminal state ({parent_status})."
+        )
+    report["children_processed"] = child_results
     if json_output:
         print(format_json_output(report))
     else:
         print()
         print("=" * 60)
-        print(f"  Implement child: {next_id} (of {work_item_id})")
+        print(f"  ✅ Parent advanced: {work_item_id} → in_review")
         print("=" * 60)
-        print(f"  Worktree: {report['worktree_path']}")
-        print(f"  Branch:   {report['branch']}")
+        print(summary)
         print()
-        print("  Next steps:")
-        print(f"  1. cd {report['worktree_path']}")
-        print("  2. Write tests and implementation code")
-        print(f"  3. Run: python3 scripts/implement.py finish {next_id}")
-        print(f"  4. Re-run: python3 scripts/implement.py parent {work_item_id}")
-        print()
-
     return report
 
 

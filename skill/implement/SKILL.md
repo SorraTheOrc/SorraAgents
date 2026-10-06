@@ -397,22 +397,35 @@ python3 $(skill_path implement)/scripts/implement.py parent <parent-id>
 - **All children terminal** (`in_review`/`completed`/`done`) → the parent is
   advanced to `completed`/`in_review` (existing Step 6.1 advancement
   retained) and a per-child summary (ids, statuses) is commented.
-- **Children remain** → the next child is claimed (`in_progress`), its own
-  worktree is created from `dev`, and the worktree path is reported.
+- **Children remain** → `phase_parent` walks **all** children in dependency
+  order in a single pass: it finishes every child whose worktree already
+  contains changes, and starts the next unimplemented child. The report
+  carries `children_processed` (per-child action/status), the started child
+  (`next_child` plus its `worktree_path`/`branch`), or the parent
+  advancement when every child is terminal.
 
-Then implement that child by recursing into this procedure (steps 1–8),
-run `implement.py finish <child-id>`, and re-run
-`implement.py parent <parent-id>` for the next child. Repeat until the
-parent reports all children terminal. Each child is implemented in its own
-worktree (never the main checkout); sequential children reuse/rotate the
+Then implement that child by recursing into this procedure (steps 1–8), and
+re-run `implement.py parent <parent-id>`. The parent phase **finishes the
+previous child for you** (`phase_finish` in its own subprocess) and starts
+the next one — do **not** call `implement.py finish` separately. Repeat until
+the parent reports all children terminal. Each child is implemented in its
+own worktree (never the main checkout); sequential children reuse/rotate the
 `.worklog/worktrees` machinery.
 
+**Single-pass, subprocess-isolated orchestration.** Every child's start and
+finish runs through `_invoke_implement` — a **separate `implement.py`
+subprocess** invoked serially, never a direct in-process call. The main
+agent process keeps a clean view of the chain: it emits a periodic per-child
+progress update and a final summary (`children_processed`), and advances the
+parent last. This reduces a run of *N* children to *N* `parent` invocations
+(plus the initial one) instead of *2N* `start`/`finish` invocations.
+
 **One session per child (session isolation).** Invoking `/skill:implement
-<parent-id>` on an epic starts a **new Pi session for each child** — do not
-implement every child in one accumulating session. Each child's session
+<parent-id>` on an epic may start a **new Pi session for each child** — do
+not implement every child in one accumulating session. Each child's session
 opens with a clean context window containing only that child's work-item
 description, acceptance criteria, and relevant context. Session isolation
-layers on top of the existing guarantees:
+layers on top of the subprocess-isolated orchestration above:
 
 - **Serial, dependency order.** Children are still implemented serially with
   blocking items first; the dependency, cycle, and blocked-child guards
@@ -438,8 +451,19 @@ Guards (deterministic, in `phase_parent`):
 - **Dependency order** — a child `blocked` by another item is implemented
   only after its blockers; the chain is resolved dependency-order correct.
 - **Terminal children are never re-implemented** (skipped, reported).
-- **In-progress by another agent** → skipped and reported, never clobbered.
+- **In-progress by another agent** (no worktree) → skipped and reported,
+  never clobbered. An in-progress child *we* started (worktree exists) is
+  finished when its worktree has changes, or returned to the agent for
+  implementation when it does not.
+- **Completed children are never restarted** — a finished child joins
+  `children_processed` and the loop moves on; already-completed siblings are
+  never regressed.
 - **Cycles fail fast** with a clear error (no infinite recursion).
+- **Blocked children wait** — a child is only started once every in-chain
+  blocker is terminal; otherwise it is reported in `blocked_children`.
+- **No premature parent advance** — if any non-terminal child remains
+  (in-progress elsewhere or blocked), the parent is not advanced; the phase
+  reports waiting instead.
 - **Abort/failure** in a child resets THAT child to `open` (StatusLifecycle
   abort semantics) and stops the chain with a report of what completed and
   what failed; already-completed siblings are not regressed.

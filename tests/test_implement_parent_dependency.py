@@ -236,6 +236,13 @@ class TestParentDependencyOrder:
                 "message": "Worktree created",
             }
 
+        def fake_invoke(action, child_id, **kwargs):
+            if action == "start":
+                return fake_phase_start(child_id, **kwargs)
+            if action == "finish":
+                return {"success": True, "work_item_id": child_id}
+            raise AssertionError(f"unexpected action {action}")
+
         def fake_update_status(work_item_id, status, stage=None, assignee=None, **kwargs):
             calls["update_status"].append((work_item_id, status, stage, assignee))
             return {"success": True, "workItem": {"id": work_item_id, "status": status}}
@@ -245,6 +252,9 @@ class TestParentDependencyOrder:
             mock.patch.object(mod, "wl_show_children", return_value=children),
             mock.patch.object(mod, "wl_dep_blockers", side_effect=fake_wl_dep_blockers),
             mock.patch.object(mod, "phase_start", side_effect=fake_phase_start),
+            mock.patch.object(mod, "_invoke_implement", side_effect=fake_invoke),
+            mock.patch.object(mod, "_discover_worktree", return_value=None),
+            mock.patch.object(mod, "_has_worktree_changes", return_value=False),
             mock.patch.object(mod.StatusLifecycle, "update_status", side_effect=fake_update_status),
             mock.patch.object(mod, "wl_add_comment", return_value=True),
             mock.patch.object(mod, "is_code_freeze_active", return_value=False),

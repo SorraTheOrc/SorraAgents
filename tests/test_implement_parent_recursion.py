@@ -100,13 +100,29 @@ def _run_parent(
             "message": "Worktree created",
         }
 
-    calls: dict = {"update_status": [], "phase_start": [], "comments": []}
+    calls: dict = {
+        "update_status": [], "phase_start": [], "comments": [],
+        "phase_finish": [],
+    }
 
     def fake_phase_start(child_id, **kwargs):
         calls["phase_start"].append(child_id)
         result = dict(phase_start_result)
         result["work_item_id"] = child_id
         return result
+
+    def fake_invoke(action, child_id, **kwargs):
+        if action == "start":
+            result = fake_phase_start(child_id, **kwargs)
+            # ``_invoke_implement`` returns None for a non-zero subprocess
+            # exit; emulate that for the injected failure result.
+            if not result.get("success", True):
+                return None
+            return result
+        if action == "finish":
+            calls["phase_finish"].append(child_id)
+            return {"success": True, "work_item_id": child_id}
+        raise AssertionError(f"unexpected action {action}")
 
     def fake_update_status(work_item_id, status, stage=None, assignee=None, **kwargs):
         calls["update_status"].append((work_item_id, status, stage, assignee))
@@ -121,6 +137,9 @@ def _run_parent(
         mock.patch.object(mod, "wl_show_children", return_value=children),
         mock.patch.object(mod, "wl_dep_blockers", return_value=[]),
         mock.patch.object(mod, "phase_start", side_effect=fake_phase_start),
+        mock.patch.object(mod, "_invoke_implement", side_effect=fake_invoke),
+        mock.patch.object(mod, "_discover_worktree", return_value=None),
+        mock.patch.object(mod, "_has_worktree_changes", return_value=False),
         mock.patch.object(mod.StatusLifecycle, "update_status", side_effect=fake_update_status),
         mock.patch.object(mod, "wl_add_comment", side_effect=fake_add_comment),
         mock.patch.object(mod, "is_code_freeze_active", return_value=freeze_active),
@@ -247,7 +266,9 @@ class TestStartNextChild:
         assert report["_calls"]["update_status"] == []
         assert report.get("next_child") == "SA-C1"
         assert "/wt/SA-PARENT001" in report.get("message", "")
-        assert "finish" in report.get("message", "")  # tells the agent next steps
+        # The message tells the agent to re-run `parent`, which finishes the
+        # child automatically (single-pass workflow).
+        assert "parent" in report.get("message", "")
 
     def test_parent_with_open_children_skips_terminal_siblings(self, implement_mod):
         """Terminal children are never re-implemented: only the first
