@@ -22,6 +22,7 @@ Usage:
   implement.py finish <work-item-id>         # Phase 2: build, test, commit, push, cleanup
   implement.py abort <work-item-id>          # Abort and cleanup
   implement.py parent <parent-id>            # Recurse into children (epic/parent items)
+  implement.py drive <parent-id>             # Drive ALL children to completion, one fresh session each
 
 Optional flags:
   --json                    JSON output for agents
@@ -31,10 +32,14 @@ Optional flags:
   --parent-branch <branch>  Override parent branch (default: dev)
   --worktree-path <path>    Override worktree path
   --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
+  --max-child-sessions N    Max fresh sessions per child when driving (default: 1)
+  --child-timeout N         Per-child session timeout in seconds (default: 3600)
   -v, --verbose             Verbose logging
 
 Environment:
   IMPLEMENT_TEST_COMMAND    Override the finish test-step command (shell string)
+  IMPLEMENT_DRIVE_PI_BIN    Pi executable used to spawn child sessions (default: pi)
+  IMPLEMENT_DRIVE_CHILD_TIMEOUT  Per-child session timeout in seconds
 
 Exit codes:
   0 – success
@@ -56,7 +61,7 @@ import subprocess
 import sys
 import time
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -131,6 +136,19 @@ REPO_ROOT = Path.cwd().resolve()
 DEFAULT_PARENT_BRANCH = "dev"
 DEFAULT_WORKTREE_DIR = ".worklog/worktrees"
 DEFAULT_MAX_RETRY = 3
+
+#: Max fresh sessions spawned per child by ``phase_drive`` before it stops.
+DEFAULT_MAX_CHILD_SESSIONS = 1
+#: Default per-child session timeout (seconds) used by ``phase_drive``.
+#: A child runs the whole implement workflow (changed-scope tests, full-suite
+#: gate, and the pre-push hook) so this is much larger than the per-command
+#: test timeout.
+DEFAULT_CHILD_SESSION_TIMEOUT = 3600
+#: Environment marker set on driven child sessions. When present,
+#: ``phase_drive`` refuses to run — a driven session implements its own work
+#: item with the leaf workflow and must never re-enter the driver.
+DRIVE_RECURSION_ENV = "IMPLEMENT_DRIVE_ACTIVE"
+
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
 
@@ -3113,25 +3131,35 @@ def phase_start(
     if refresh_result.get("warning"):
         LOG.info("Parent-branch refresh: %s", refresh_result["warning"])
 
-    # ── Step 7: Create worktree ────────────────────────────────────
+    # ── Step 7: Create (or resume) worktree ────────────────────────
     wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
     branch = branch_name_for(work_item_id, slug)
-
-    LOG.info("Creating worktree at %s from branch %s...", wt_path, parent_branch)
-    if not git_worktree_add(branch, wt_path, parent_branch):
-        msg = f"Failed to create worktree at {wt_path} from {parent_branch}"
-        LOG.error(msg)
-        report["success"] = False
-        report["message"] = msg
-        try:
-            StatusLifecycle.update_status(work_item_id, "open")
-        except RuntimeError:
-            LOG.error("Failed to reset work item %s status to open", work_item_id)
-        if json_output:
-            print(format_json_output(report))
-        return report
-
     abs_wt_path = str(Path(wt_path).resolve())
+    # Idempotent start (SA-0MUWNHKQH0034DW9): when the worktree already
+    # exists — e.g. the parent phase created it, or a driven session is
+    # resuming — reuse it instead of failing on `git worktree add`. This lets
+    # a fresh child session run the standard leaf workflow unchanged.
+    resumed = _is_worktree(Path(abs_wt_path))
+
+    if resumed:
+        LOG.info(
+            "Worktree already exists at %s — resuming implementation",
+            abs_wt_path,
+        )
+    else:
+        LOG.info("Creating worktree at %s from branch %s...", wt_path, parent_branch)
+        if not git_worktree_add(branch, wt_path, parent_branch):
+            msg = f"Failed to create worktree at {wt_path} from {parent_branch}"
+            LOG.error(msg)
+            report["success"] = False
+            report["message"] = msg
+            try:
+                StatusLifecycle.update_status(work_item_id, "open")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", work_item_id)
+            if json_output:
+                print(format_json_output(report))
+            return report
 
     # Auto-symlink the main checkout's node_modules into the worktree so
     # dist-spawning tests resolve dependencies without manual setup. Never
@@ -3153,9 +3181,14 @@ def phase_start(
         StatusLifecycle.update_status(work_item_id, "in_progress", stage="in_progress")
     except RuntimeError:
         LOG.warning("Failed to update stage for %s", work_item_id)
+    report["resumed"] = resumed
     wl_add_comment(
         work_item_id,
-        f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}",
+        (
+            f"Implementation resumed\n- Worktree: {abs_wt_path}\n- Branch: {branch}"
+            if resumed
+            else f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}"
+        ),
     )
 
     # ── Step 8: Register signal handlers ───────────────────────────
@@ -4234,6 +4267,379 @@ def phase_parent(
     return report
 
 
+def _child_session_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the environment for a driven child session.
+
+    Marks the session as driver-owned (recursion guard) and removes the
+    parent session's identity so the child starts its own clean session.
+
+    Args:
+        base: Base environment (defaults to ``os.environ``).
+
+    Returns:
+        A new environment mapping for the child process.
+    """
+    env = dict(base if base is not None else os.environ)
+    env[DRIVE_RECURSION_ENV] = "1"
+    env.pop("PI_SESSION_ID", None)
+    env.pop("PI_SESSION_FILE", None)
+    return env
+
+
+def _resolve_child_session_timeout() -> int:
+    """Resolve the per-child session timeout in seconds for ``phase_drive``.
+
+    ``IMPLEMENT_DRIVE_CHILD_TIMEOUT`` overrides the default. The test-command
+    timeout is not reused directly because a child session runs the whole
+    implement workflow (changed-scope tests, the full-suite gate, and the
+    pre-push hook) — several test runs, not one.
+
+    Returns:
+        Timeout in seconds.
+    """
+    raw = os.environ.get("IMPLEMENT_DRIVE_CHILD_TIMEOUT")
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            LOG.warning(
+                "Ignoring invalid IMPLEMENT_DRIVE_CHILD_TIMEOUT=%r", raw,
+            )
+    return DEFAULT_CHILD_SESSION_TIMEOUT
+
+
+def _resolve_pi_bin(env: dict[str, str] | None = None) -> str | None:
+    """Resolve the Pi executable used to spawn child sessions.
+
+    Args:
+        env: Environment mapping (defaults to ``os.environ``).
+
+    Returns:
+        Absolute path to the Pi executable, or ``None`` when unavailable.
+    """
+    env_map = env if env is not None else os.environ
+    configured = env_map.get("IMPLEMENT_DRIVE_PI_BIN") or "pi"
+    return shutil.which(configured, path=env_map.get("PATH"))
+
+
+def _tail_lines(text: str, count: int) -> str:
+    """Return the last *count* non-empty lines of *text*, joined by ' | '."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " | ".join(lines[-count:]) if lines else ""
+
+
+def _default_session_spawner(
+    child_id: str,
+    worktree_path: str,
+    timeout: int,
+    env: dict[str, str],
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Spawn a fresh Pi session to implement *child_id*.
+
+    Runs ``pi -p "/skill:implement <child_id>"`` as a separate process with a
+    clean context window, waits for it to exit, and reports success. The
+    child session runs the standard implement skill; its ``start`` phase is
+    idempotent so the pre-created worktree is resumed.
+
+    Args:
+        child_id: The child work item ID.
+        worktree_path: The child's pre-created worktree (process cwd).
+        timeout: Maximum seconds to wait for the child session.
+        env: Environment for the child process (already marked with the
+            recursion guard — see :func:`_child_session_env`).
+        verbose: Pass ``--verbose`` to the child Pi invocation.
+
+    Returns:
+        ``{"success": bool, "returncode": int | None, "reason": str}``.
+    """
+    result: dict[str, Any] = {
+        "success": False,
+        "returncode": None,
+        "reason": "",
+    }
+    pi_bin = _resolve_pi_bin(env)
+    if not pi_bin:
+        result["reason"] = (
+            "No Pi executable available (looked for 'pi' on PATH). Set "
+            "IMPLEMENT_DRIVE_PI_BIN to the Pi binary, or drive the children "
+            f"manually with `python3 {Path(__file__).resolve()} parent` and "
+            "`implement.py finish <child>`."
+        )
+        return result
+
+    cmd = [pi_bin, "-p", f"/skill:implement {child_id}", "--approve"]
+    if verbose:
+        cmd.append("--verbose")
+    LOG.info(
+        "Spawning child session for %s (cwd=%s): %s",
+        child_id, worktree_path, " ".join(cmd),
+    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=worktree_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        result["reason"] = (
+            f"Child session for {child_id} timed out after {timeout}s."
+        )
+        return result
+    except OSError as exc:
+        result["reason"] = (
+            f"Failed to spawn child session for {child_id}: {exc}"
+        )
+        return result
+
+    result["returncode"] = proc.returncode
+    if proc.returncode != 0:
+        tail = _tail_lines(proc.stderr or proc.stdout or "", 5)
+        result["reason"] = (
+            f"Child session for {child_id} exited with code "
+            f"{proc.returncode}: {tail}"
+        )
+        return result
+    result["success"] = True
+    return result
+
+
+def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
+    """Emit a drive report as JSON or a concise human summary."""
+    if json_output:
+        print(format_json_output(report))
+        return
+    print()
+    print("=" * 60)
+    if report.get("success"):
+        print(f"  ✅ Drive complete: {report.get('work_item_id')}")
+    else:
+        print(f"  ⚠  Drive stopped: {report.get('work_item_id')}")
+    print("=" * 60)
+    for entry in report.get("children_driven", []):
+        icon = "✅" if entry.get("result") == "ok" else "❌"
+        print(
+            f"  {icon} {entry.get('id')} "
+            f"(attempt {entry.get('attempt')}): {entry.get('result')}"
+        )
+        if entry.get("reason"):
+            print(f"     {entry['reason']}")
+    print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
+    print(f"  {report.get('message', '')}")
+    print()
+
+
+def phase_drive(
+    work_item_id: str,
+    json_output: bool = False,
+    no_refactor: bool = False,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    verbose: bool = False,
+    max_child_sessions: int = DEFAULT_MAX_CHILD_SESSIONS,
+    child_timeout: int | None = None,
+    spawn_session: Callable[..., dict[str, Any]] | None = None,
+    parent_runner: Callable[..., dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
+    """Phase: drive every child of a parent to a terminal state in one call.
+
+    Resolves SA-0MUWBHEEF002A6BO in line with the session-per-child rule
+    (SA-0MTLCCIPU0050Q52): instead of requiring the caller to re-run
+    ``parent`` and implement each child by hand, this phase loops over
+    ``phase_parent`` reports and, for every startable child, spawns a
+    **fresh Pi session** in that child's own worktree. Each session runs the
+    standard leaf implement workflow, so context isolation, worktree
+    isolation, dependency order and parent-advanced-last are all preserved.
+
+    The loop:
+
+    1. Run ``parent`` (subprocess-isolated): it finishes any changed child
+       and starts the next startable one.
+    2. If all children are terminal → parent advanced → done.
+    3. Otherwise spawn a fresh session for ``next_child`` in its worktree
+       and wait for it.
+    4. Repeat. A child is retried at most ``max_child_sessions`` times so a
+       session that never reaches a terminal state cannot loop forever.
+
+    Args:
+        work_item_id: The parent work item ID.
+        json_output: If True, emit JSON.
+        no_refactor: Passed through to ``parent``.
+        parent_branch: Parent branch for child worktrees.
+        verbose: Enable verbose logging (and child ``--verbose``).
+        max_child_sessions: Max fresh sessions per child before stopping.
+        child_timeout: Per-child session timeout in seconds (default from
+            :func:`_resolve_child_session_timeout`).
+        spawn_session: Injectable spawner (tests); defaults to
+            :func:`_default_session_spawner`.
+        parent_runner: Injectable ``parent`` runner (tests); defaults to
+            :func:`_invoke_implement`.
+
+    Returns:
+        Report dict with per-child results, sessions spawned, and whether the
+        parent was advanced.
+    """
+    report: dict[str, Any] = {
+        "phase": "drive",
+        "work_item_id": work_item_id,
+        "success": False,
+        "parent_advanced": False,
+        "sessions_spawned": 0,
+        "children_driven": [],
+        "message": "",
+    }
+
+    # ── Recursion guard: a driven child session must not drive again ──
+    if os.environ.get(DRIVE_RECURSION_ENV) == "1":
+        msg = (
+            "Refusing to drive from within a driven child session "
+            f"({DRIVE_RECURSION_ENV}=1). Driven sessions implement their own "
+            "work item with the leaf workflow and must not re-enter drive."
+        )
+        LOG.error(msg)
+        report["message"] = msg
+        report["recursion_blocked"] = True
+        _emit_phase_report(report, json_output)
+        return report
+
+    # ── Validate + fetch children ───────────────────────────────────
+    if not WORK_ITEM_ID_PATTERN.match(work_item_id):
+        report["message"] = (
+            f"Invalid work item ID format: {work_item_id}. "
+            "Expected pattern like SA-XXXXXXXXXXX"
+        )
+        _emit_phase_report(report, json_output)
+        return report
+
+    parent = wl_show(work_item_id)
+    if not parent:
+        report["message"] = (
+            f"Work item {work_item_id} not found or failed to fetch"
+        )
+        _emit_phase_report(report, json_output)
+        return report
+
+    children = wl_show_children(work_item_id)
+    if not children:
+        report["leaf"] = True
+        report["message"] = (
+            f"Work item {work_item_id} has no children — behave as a leaf "
+            "item: use `implement.py start/finish` as usual (nothing to drive)."
+        )
+        _emit_phase_report(report, json_output)
+        return report
+
+    runner = parent_runner or _invoke_implement
+    spawner = spawn_session or _default_session_spawner
+    timeout = child_timeout or _resolve_child_session_timeout()
+    max_child_sessions = max(1, int(max_child_sessions))
+
+    attempts: dict[str, int] = {}
+    driven: list[dict[str, Any]] = []
+    # Hard bound on the loop: each child may consume at most
+    # max_child_sessions spawns plus one terminal classification, and the
+    # final iteration advances the parent.
+    max_iterations = (len(children) * (max_child_sessions + 1)) + 1
+
+    for _ in range(max_iterations):
+        parent_report = runner(
+            "parent", work_item_id, no_refactor=no_refactor, verbose=verbose,
+        )
+        if parent_report is None:
+            report["message"] = (
+                f"`implement.py parent {work_item_id}` failed (see logs)."
+            )
+            break
+
+        if parent_report.get("parent_advanced"):
+            report["parent_advanced"] = True
+            report["success"] = True
+            report["message"] = parent_report.get(
+                "message",
+                f"All children of {work_item_id} are terminal; parent advanced.",
+            )
+            break
+
+        if parent_report.get("success") is False:
+            report["message"] = parent_report.get(
+                "message",
+                f"Phase parent reported a failure for {work_item_id}.",
+            )
+            report["failed_child"] = parent_report.get("next_child")
+            break
+
+        child_id = parent_report.get("next_child")
+        if not child_id:
+            report["message"] = parent_report.get(
+                "message",
+                "No startable child: remaining children are blocked or held "
+                "by another agent.",
+            )
+            if parent_report.get("blocked_children"):
+                report["blocked_children"] = parent_report["blocked_children"]
+            break
+
+        worktree_path = (
+            parent_report.get("worktree_path")
+            or _discover_worktree(child_id)
+            or ""
+        )
+        if not worktree_path:
+            report["message"] = (
+                f"No worktree path available for child {child_id}; cannot "
+                "spawn its implementation session."
+            )
+            report["failed_child"] = child_id
+            break
+
+        attempts[child_id] = attempts.get(child_id, 0) + 1
+        if attempts[child_id] > max_child_sessions:
+            report["message"] = (
+                f"Child {child_id} did not reach a terminal state after "
+                f"{max_child_sessions} session(s); stopping to avoid a loop."
+            )
+            report["failed_child"] = child_id
+            break
+
+        env = _child_session_env()
+        LOG.info(
+            "Driving child %s (session %d/%d) in %s",
+            child_id, attempts[child_id], max_child_sessions, worktree_path,
+        )
+        spawn_result = spawner(child_id, worktree_path, timeout, env)
+        report["sessions_spawned"] += 1
+        entry = {
+            "id": child_id,
+            "worktree_path": worktree_path,
+            "attempt": attempts[child_id],
+            "result": "ok" if spawn_result.get("success") else "failed",
+            "reason": spawn_result.get("reason", ""),
+        }
+        driven.append(entry)
+
+        if not spawn_result.get("success"):
+            report["message"] = (
+                f"Child session for {child_id} failed: "
+                f"{spawn_result.get('reason', 'unknown error')}"
+            )
+            report["failed_child"] = child_id
+            break
+    else:
+        report["message"] = (
+            f"Drive loop for {work_item_id} exceeded its iteration bound "
+            f"({max_iterations}) without completing the epic."
+        )
+
+    report["children_driven"] = driven
+    _emit_phase_report(report, json_output)
+    return report
+
+
 def _is_worktree(path: Path) -> bool:
     """Check if *path* is a git worktree (not the main working tree).
 
@@ -4406,7 +4812,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "action",
-        choices=["start", "finish", "abort", "parent"],
+        choices=["start", "finish", "abort", "parent", "drive"],
         help="Workflow phase to execute",
     )
     parser.add_argument(
@@ -4453,6 +4859,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--allow-orphaned-stashes",
         action="store_true",
         help="Acknowledge the orphaned-stash warning and proceed (fail-open gate)",
+    )
+    parser.add_argument(
+        "--max-child-sessions",
+        type=int,
+        default=DEFAULT_MAX_CHILD_SESSIONS,
+        help=(
+            "Max fresh sessions spawned per child when driving an epic "
+            f"(default: {DEFAULT_MAX_CHILD_SESSIONS})"
+        ),
+    )
+    parser.add_argument(
+        "--child-timeout",
+        type=int,
+        default=None,
+        help=(
+            "Per-child session timeout in seconds when driving an epic "
+            f"(default: {DEFAULT_CHILD_SESSION_TIMEOUT})"
+        ),
     )
     return parser.parse_args(argv)
 
@@ -4538,6 +4962,18 @@ def _main(argv: list[str] | None = None) -> int:
                 no_refactor=args.no_refactor,
                 parent_branch=args.parent_branch,
                 verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
+    elif args.action == "drive":
+        with Timer("implement") as _root_timer, Timer("phase_drive"):
+            result = phase_drive(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                no_refactor=args.no_refactor,
+                parent_branch=args.parent_branch,
+                verbose=args.verbose,
+                max_child_sessions=args.max_child_sessions,
+                child_timeout=args.child_timeout,
             )
             _emit_timing(_root_timer)
     else:

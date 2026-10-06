@@ -384,7 +384,27 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 
 6.1. Parent recursion (epic/parent items only)
 
-A parent invocation recurses into its children automatically. Run:
+**Preferred: drive every child in one invocation.** Run:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py drive <parent-id>
+```
+
+`phase_drive()` loops over `phase_parent` reports and, for every startable
+child, spawns a **fresh Pi session** (`pi -p "/skill:implement <child>"`) in
+that child's own worktree, waits for it to exit, then continues. A single
+`drive` call therefore completes every child and advances the parent, while
+each child keeps its own clean context window and its own worktree. Options:
+`--json` (machine-readable per-child report), `--max-child-sessions N`
+(default 1) to bound retries, `--child-timeout S` (default 3600). When no Pi
+executable is available it stops with actionable manual instructions rather
+than silently skipping a child (`IMPLEMENT_DRIVE_PI_BIN` overrides the
+binary). A driven session is marked `IMPLEMENT_DRIVE_ACTIVE=1` and refuses to
+re-enter `drive`.
+
+**Manual fallback: one `parent` invocation per child.** If you cannot spawn
+sessions (e.g. headless tooling), recurse manually. A parent invocation
+recurses into its children automatically. Run:
 
 ```bash
 python3 $(skill_path implement)/scripts/implement.py parent <parent-id>
@@ -410,7 +430,9 @@ previous child for you** (`phase_finish` in its own subprocess) and starts
 the next one — do **not** call `implement.py finish` separately. Repeat until
 the parent reports all children terminal. Each child is implemented in its
 own worktree (never the main checkout); sequential children reuse/rotate the
-`.worklog/worktrees` machinery.
+`.worklog/worktrees` machinery. (With `drive` this loop is performed for you;
+the driven child session may call `finish` for its own item — `start` resumes
+the pre-created worktree idempotently.)
 
 **Single-pass, subprocess-isolated orchestration.** Every child's start and
 finish runs through `_invoke_implement` — a **separate `implement.py`
