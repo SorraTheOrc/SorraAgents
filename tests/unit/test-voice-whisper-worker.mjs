@@ -42,7 +42,9 @@ class WhisperModel:
 
     def transcribe(self, audio, language=None, **kwargs):
         from types import SimpleNamespace
-        text = "[%s] %d samples" % (self.device, len(audio))
+        text = "[%s] %d samples beam=%s vad=%s prompt=%s" % (
+            self.device, len(audio), kwargs.get("beam_size"),
+            kwargs.get("vad_filter"), kwargs.get("initial_prompt"))
         return [SimpleNamespace(text=text)], SimpleNamespace()
 `;
 
@@ -213,6 +215,49 @@ describe("whisper worker protocol", () => {
     worker.send({ type: "feed", audio: pcm(9600).toString("base64") });
     const partial = await worker.waitFor("partial");
     assert.equal(partial.sequence, 1);
+
+    worker.send({ type: "stop" });
+    await worker.exit;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Accuracy options
+// ---------------------------------------------------------------------------
+
+describe("whisper worker accuracy options", () => {
+  test("forwards beam size, VAD filter and initial prompt to transcribe", async () => {
+    const worker = new WorkerHarness(["--device", "cpu"], { pythonPath: stubDir.stub });
+    worker.send({
+      type: "start",
+      device: "cpu",
+      beamSize: 8,
+      vadFilter: true,
+      initialPrompt: "technical vocabulary",
+    });
+    await worker.waitFor("ready");
+
+    worker.send({ type: "feed", audio: pcm(1600).toString("base64") });
+    worker.send({ type: "finalise" });
+    const final = await worker.waitFor("final");
+    assert.match(final.text, /beam=8 vad=True prompt=technical vocabulary/);
+
+    worker.send({ type: "stop" });
+    await worker.exit;
+  });
+
+  test("uses command-line accuracy defaults when the start message omits them", async () => {
+    const worker = new WorkerHarness(
+      ["--device", "cpu", "--beam-size", "3", "--vad-filter", "--initial-prompt", "hi"],
+      { pythonPath: stubDir.stub },
+    );
+    worker.send({ type: "start", device: "cpu" });
+    await worker.waitFor("ready");
+
+    worker.send({ type: "feed", audio: pcm(1600).toString("base64") });
+    worker.send({ type: "finalise" });
+    const final = await worker.waitFor("final");
+    assert.match(final.text, /beam=3 vad=True prompt=hi/);
 
     worker.send({ type: "stop" });
     await worker.exit;

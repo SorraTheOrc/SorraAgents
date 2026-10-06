@@ -53,6 +53,9 @@ describe("config defaults", () => {
     assert.equal(config.silenceMs, 3000);
     assert.equal(config.partialCadenceMs, 1000);
     assert.equal(config.captureCommand, "arecord");
+    assert.equal(config.beamSize, 5);
+    assert.equal(config.vadFilter, false);
+    assert.equal(config.initialPrompt, "");
   });
 });
 
@@ -87,6 +90,9 @@ describe("config precedence", () => {
       PI_VOICE_INPUT_DEVICE: "cpu",
       PI_VOICE_INPUT_COMPUTE_TYPE: "int8",
       PI_VOICE_INPUT_LANGUAGE: "en",
+      PI_VOICE_INPUT_BEAM_SIZE: "3",
+      PI_VOICE_INPUT_VAD_FILTER: "true",
+      PI_VOICE_INPUT_INITIAL_PROMPT: "technical vocabulary",
       PI_VOICE_INPUT_CAPTURE_COMMAND: "parecord",
       PI_VOICE_INPUT_CAPTURE_ARGS: '["--rate=16000"]',
       PI_VOICE_INPUT_PYTHON: "python3.12",
@@ -99,6 +105,9 @@ describe("config precedence", () => {
       device: "cpu",
       computeType: "int8",
       language: "en",
+      beamSize: "3",
+      vadFilter: "true",
+      initialPrompt: "technical vocabulary",
       captureCommand: "parecord",
       captureArgs: ["--rate=16000"],
       python: "python3.12",
@@ -139,6 +148,35 @@ describe("config validation", () => {
     const { config, warnings } = resolveConfig({ overrides: { partialCadenceMs: -1 } });
     assert.equal(config.partialCadenceMs, 1000);
     assert.ok(warnings.some((w) => /partialCadenceMs must not be negative/.test(w)));
+  });
+
+  test("beam size and boolean options are coerced from strings", () => {
+    const { config, warnings } = resolveConfig({
+      overrides: { beamSize: "8", vadFilter: "false" },
+    });
+    assert.equal(config.beamSize, 8);
+    assert.equal(config.vadFilter, false);
+    assert.deepEqual(warnings, []);
+  });
+
+  test("a non-positive or non-integer beam size falls back to the default", () => {
+    for (const invalid of [0, -2, 2.5, "many"]) {
+      const { config, warnings } = resolveConfig({ overrides: { beamSize: invalid } });
+      assert.equal(config.beamSize, 5, `beamSize ${invalid} should fall back`);
+      assert.ok(warnings.some((w) => /beamSize must be a positive integer/.test(w)));
+    }
+  });
+
+  test("an unrecognised vadFilter value falls back to the default", () => {
+    const { config, warnings } = resolveConfig({ overrides: { vadFilter: "maybe" } });
+    assert.equal(config.vadFilter, false);
+    assert.ok(warnings.some((w) => /vadFilter must be a boolean/.test(w)));
+  });
+
+  test("large-v3-turbo is a known model size (no unknown-model warning)", () => {
+    const { config, warnings } = resolveConfig({ overrides: { model: "large-v3-turbo" } });
+    assert.equal(config.model, "large-v3-turbo");
+    assert.ok(!warnings.some((w) => /not a known faster-whisper size/.test(w)));
   });
 
   test("an out-of-range silence threshold is rejected", () => {
@@ -188,27 +226,34 @@ describe("config file loading", () => {
 
   test("invalid JSON is ignored with a warning", () => {
     const cwd = mkdtempSync(join(tmpdir(), "voice-config-"));
+    const home = mkdtempSync(join(tmpdir(), "voice-home-"));
     mkdirSync(join(cwd, ".pi"));
     writeFileSync(join(cwd, ".pi", "voice-input.json"), "{ not json");
 
-    const { file, warnings } = readConfigFile({ cwd, env: {} });
+    const { file, warnings } = readConfigFile({ cwd, env: {}, home });
     assert.deepEqual(file, {});
     assert.ok(warnings.some((w) => /failed to read settings file/.test(w)));
   });
 
   test("non-object JSON is ignored with a warning", () => {
     const cwd = mkdtempSync(join(tmpdir(), "voice-config-"));
+    const home = mkdtempSync(join(tmpdir(), "voice-home-"));
     mkdirSync(join(cwd, ".pi"));
     writeFileSync(join(cwd, ".pi", "voice-input.json"), "[1,2,3]");
-    const { file, warnings } = readConfigFile({ cwd, env: {} });
+    const { file, warnings } = readConfigFile({ cwd, env: {}, home });
     assert.deepEqual(file, {});
     assert.ok(warnings.some((w) => /must contain a JSON object/.test(w)));
   });
 
   test("configFileCandidates prefers explicit, then project, then agent", () => {
-    const candidates = configFileCandidates({ cwd: "/proj", env: { PI_VOICE_INPUT_CONFIG: "/x.json" } });
+    const candidates = configFileCandidates({
+      cwd: "/proj",
+      env: { PI_VOICE_INPUT_CONFIG: "/x.json" },
+      home: "/home/test",
+    });
     assert.equal(candidates[0], "/x.json");
     assert.equal(candidates[1], join("/proj", ".pi", "voice-input.json"));
+    assert.equal(candidates[2], join("/home/test", ".pi", "agent", "voice-input.json"));
   });
 
   test("loadConfig/getConfig cache and combine file+env+defaults", () => {

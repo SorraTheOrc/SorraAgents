@@ -120,6 +120,9 @@ function harness(overrides = {}) {
       device: "cuda",
       computeType: "float16",
       language: "",
+      beamSize: 5,
+      vadFilter: false,
+      initialPrompt: "",
       workerScript: "",
     },
     createRecorder: (options) => {
@@ -200,6 +203,15 @@ describe("voice controller state machine", () => {
     assert.equal(clients.length, 1);
     assert.equal(clients[0].startCount, 1);
     assert.equal(clients[0].stopCount, 0);
+  });
+
+  test("forwards accuracy options to the whisper client", async () => {
+    const { controller, clients } = harness();
+    await controller.toggle();
+
+    assert.equal(clients[0].options.beamSize, 5);
+    assert.equal(clients[0].options.vadFilter, false);
+    assert.equal(clients[0].options.initialPrompt, "");
   });
 
   test("dispose stops the persistent worker", async () => {

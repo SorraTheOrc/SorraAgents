@@ -96,7 +96,7 @@ and writes responses to stdout.
 
 | Message | Purpose |
 |---|---|
-| `{"type":"start","model","device","computeType","partialIntervalMs"}` | Load the model (once) and report readiness. CLI args provide defaults. |
+| `{"type":"start","model","device","computeType","partialIntervalMs","beamSize","vadFilter","initialPrompt"}` | Load the model (once) and report readiness. CLI args provide defaults. |
 | `{"type":"feed","audio":"<base64 int16 PCM>"}` | Append PCM; may trigger a `partial`. |
 | `{"type":"finalise"}` | Transcribe all buffered audio, emit `final`, then clear the buffer. |
 | `{"type":"stop"}` | Acknowledge with `stopped` and exit cleanly. |
@@ -121,6 +121,11 @@ Notes:
   partials and the final transcript re-transcribe the whole utterance buffer so
   the live editor text stays cumulative. Prompt-length dictation is the target;
   a bounded sliding window can be layered on later if latency demands it.
+- `beamSize`, `vadFilter` and `initialPrompt` are forwarded to every
+  `transcribe()` call: widen the beam search, drop non-speech audio with VAD, or
+  bias the decoder with an initial prompt. `language` forces the source
+  language. For a 4 GB GPU, `large-v3-turbo` (~1.6 GB) is the accuracy upgrade
+  over the default `small`; `large-v3` (~3 GB) is too tight.
 - A missing `faster-whisper` install emits an actionable `error` and exits 1
   (the extension disables itself gracefully via the doctor instead of crashing).
 
@@ -154,6 +159,9 @@ faster-whisper unchanged.
 | `device` | `PI_VOICE_INPUT_DEVICE` | `cuda` |
 | `computeType` | `PI_VOICE_INPUT_COMPUTE_TYPE` | `float16` |
 | `language` | `PI_VOICE_INPUT_LANGUAGE` | *(auto)* |
+| `beamSize` | `PI_VOICE_INPUT_BEAM_SIZE` | `5` |
+| `vadFilter` | `PI_VOICE_INPUT_VAD_FILTER` | `false` |
+| `initialPrompt` | `PI_VOICE_INPUT_INITIAL_PROMPT` | *(none)* |
 | `silenceThreshold` | `PI_VOICE_INPUT_SILENCE_THRESHOLD` | `0.01` |
 | `silenceMs` | `PI_VOICE_INPUT_SILENCE_MS` | `3000` |
 | `partialCadenceMs` | `PI_VOICE_INPUT_PARTIAL_CADENCE_MS` | `1000` |

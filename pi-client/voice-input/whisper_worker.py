@@ -17,7 +17,8 @@ Protocol (one JSON object per line)
 Client -> worker::
 
     {"type": "start", "model": "small", "device": "cuda",
-     "computeType": "float16", "partialIntervalMs": 1000}
+     "computeType": "float16", "partialIntervalMs": 1000,
+     "beamSize": 5, "vadFilter": false, "initialPrompt": ""}
     {"type": "feed", "audio": "<base64 little-endian int16 mono 16 kHz PCM>"}
     {"type": "finalise"}
     {"type": "stop"}
@@ -31,9 +32,11 @@ Worker -> client::
     {"type": "error", "message": "…"}
 
 Model/device/compute-type come from the ``start`` command, with command-line
-arguments as defaults. If ``device=cuda`` cannot be initialised the worker
-transparently falls back to ``cpu`` + ``int8`` and reports the effective device
-in the ``ready`` message.
+arguments as defaults. The ``beamSize``, ``vadFilter`` and ``initialPrompt``
+options are forwarded to every ``WhisperModel.transcribe()`` call so accuracy
+can be traded for latency without code changes. If ``device=cuda`` cannot be
+initialised the worker transparently falls back to ``cpu`` + ``int8`` and
+reports the effective device in the ``ready`` message.
 
 Privacy: all transcription is local; the worker never opens a network
 connection.
@@ -117,10 +120,21 @@ class TranscriptionSession:
     demands it.
     """
 
-    def __init__(self, model: Any, partial_interval_samples: int, language: str | None = None):
+    def __init__(
+        self,
+        model: Any,
+        partial_interval_samples: int,
+        language: str | None = None,
+        beam_size: int = 5,
+        vad_filter: bool = False,
+        initial_prompt: str = "",
+    ):
         self.model = model
         self.partial_interval_samples = partial_interval_samples
         self.language = language
+        self.beam_size = beam_size
+        self.vad_filter = bool(vad_filter)
+        self.initial_prompt = initial_prompt
         self.buffer = bytearray()
         self.last_partial_bytes = 0
         self.sequence = 0
@@ -160,13 +174,41 @@ class TranscriptionSession:
         if len(self.buffer) == 0:
             return ""
         audio = pcm_to_float32(bytes(self.buffer))
-        segments, _info = self.model.transcribe(audio, language=self.language)
+        segments, _info = self.model.transcribe(
+            audio,
+            language=self.language,
+            beam_size=self.beam_size,
+            vad_filter=self.vad_filter,
+            initial_prompt=self.initial_prompt or None,
+        )
         return " ".join(_segment_text(segment) for segment in segments).strip()
 
 
 def _segment_text(segment: Any) -> str:
     text = getattr(segment, "text", "")
     return str(text).strip()
+
+
+def _coerce_int(value: Any, fallback: int, minimum: int = 0) -> int:
+    """Parse *value* as an int, returning *fallback* when invalid or too small."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed >= minimum else fallback
+
+
+def _coerce_bool(value: Any, fallback: bool) -> bool:
+    """Parse *value* as a boolean, returning *fallback* when unrecognised."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalised = value.strip().lower()
+        if normalised in {"true", "1", "yes", "on"}:
+            return True
+        if normalised in {"false", "0", "no", "off"}:
+            return False
+    return fallback
 
 
 def handle_command(
@@ -215,6 +257,9 @@ def handle_command(
             partial_ms = args.partial_interval_ms
         partial_samples = max(0, partial_ms) * SAMPLE_RATE // 1000
         language = args.language or None
+        beam_size = _coerce_int(message.get("beamSize", args.beam_size), args.beam_size, minimum=1)
+        vad_filter = _coerce_bool(message.get("vadFilter", args.vad_filter), args.vad_filter)
+        initial_prompt = str(message.get("initialPrompt", args.initial_prompt) or "")
         emit(
             {
                 "type": "ready",
@@ -223,7 +268,14 @@ def handle_command(
                 "computeType": compute_type,
             }
         )
-        return TranscriptionSession(model, partial_samples, language=language)
+        return TranscriptionSession(
+            model,
+            partial_samples,
+            language=language,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            initial_prompt=initial_prompt,
+        )
 
     if kind == "feed":
         if session is None:
@@ -270,6 +322,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--compute-type", default="float16")
     parser.add_argument("--partial-interval-ms", type=int, default=1000)
     parser.add_argument("--language", default="")
+    parser.add_argument("--beam-size", type=int, default=5)
+    parser.add_argument("--vad-filter", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--initial-prompt", default="")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     signal.signal(signal.SIGTERM, _handle_signal)

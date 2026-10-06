@@ -31,7 +31,21 @@ extensions.
 | WSL2 audio | Requires **WSLg/PulseAudio** (or an ALSA→Pulse bridge); see *Troubleshooting* |
 
 The default model is `small` + `cuda` + `float16`, which fits comfortably in
-the 4 GB VRAM of an RTX 3050. `large-v3` may OOM; use `medium`/`small` instead.
+the 4 GB VRAM of an RTX 3050. For higher accuracy, use **`large-v3-turbo`**
+(~1.6 GB, near `large-v3` quality at `medium` size); `large-v3` (~3 GB) is
+too tight for 4 GB. Set `language` to `en` to skip language detection when you
+always speak English.
+
+```json
+{
+  "model": "large-v3-turbo",
+  "language": "en",
+  "device": "cuda",
+  "computeType": "float16",
+  "beamSize": 5,
+  "vadFilter": true
+}
+```
 
 ## Installation
 
@@ -87,6 +101,9 @@ Settings files (first found wins):
 | `device` | `PI_VOICE_INPUT_DEVICE` | `cuda` | `cuda`, `cpu` or `auto` |
 | `computeType` | `PI_VOICE_INPUT_COMPUTE_TYPE` | `float16` | e.g. `float16`, `int8` |
 | `language` | `PI_VOICE_INPUT_LANGUAGE` | *(auto)* | Force a language, e.g. `en` |
+| `beamSize` | `PI_VOICE_INPUT_BEAM_SIZE` | `5` | Beam search width; higher can improve accuracy at the cost of latency |
+| `vadFilter` | `PI_VOICE_INPUT_VAD_FILTER` | `false` | Drop non-speech audio with faster-whisper's VAD filter |
+| `initialPrompt` | `PI_VOICE_INPUT_INITIAL_PROMPT` | *(none)* | Prompt to bias transcription (e.g. domain vocabulary) |
 | `silenceThreshold` | `PI_VOICE_INPUT_SILENCE_THRESHOLD` | `0.01` | Normalised RMS below which a frame is silent |
 | `silenceMs` | `PI_VOICE_INPUT_SILENCE_MS` | `3000` | Silence before auto-submit (ms) |
 | `partialCadenceMs` | `PI_VOICE_INPUT_PARTIAL_CADENCE_MS` | `1000` | Live-partial / pause cadence (ms) |

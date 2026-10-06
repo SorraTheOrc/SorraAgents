@@ -273,6 +273,9 @@ export function createVoiceInputController({
       computeType: config.computeType,
       language: config.language || null,
       partialIntervalMs: config.partialCadenceMs,
+      beamSize: config.beamSize,
+      vadFilter: config.vadFilter,
+      initialPrompt: config.initialPrompt,
     };
     if (config.workerScript) options.workerScript = config.workerScript;
     return options;
