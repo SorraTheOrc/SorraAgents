@@ -13,6 +13,13 @@ forms and that their normalized cache keys are identical to the test skill's
 canonical commands, so cached runs are shared full-suite evidence. The tooling
 detection (dev's ``_detect_test_tooling``) is stubbed to ``pytest``/``npm`` so
 the test exercises the command-routing branches without needing a real repo.
+
+They target the **legacy** convention-detection path (used when the test skill
+is unavailable or resolves no suite), so they disable the primary
+``full_suite_commands`` resolution explicitly and use hermetic ``tmp_path``
+repos — never the shared ``/tmp`` — so ambient files (stray ``test_*.py`` left
+by concurrent agents) cannot change the resolution
+(SA-0MUWCVFLL006VXT3).
 """
 from __future__ import annotations
 
@@ -54,9 +61,22 @@ def _canned_run(exit_code: int, stdout: str = "") -> dict:
     }
 
 
-def test_run_tests_passes_canonical_pytest_command(monkeypatch: pytest.MonkeyPatch) -> None:
+def _force_legacy_mode(mod: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable the test-skill suite resolution so the legacy path runs.
+
+    ``run_tests`` first delegates to ``full_suite_commands``; this pins the
+    item under test to the legacy fallback regardless of the ambient
+    filesystem (SA-0MUWCVFLL006VXT3).
+    """
+    monkeypatch.setattr(mod, "_full_suite_commands", None)
+
+
+def test_run_tests_passes_canonical_pytest_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """run_tests() must call run_cached with the canonical pytest command."""
     mod = _load_implement()
+    _force_legacy_mode(mod, monkeypatch)
     captured: list[str] = []
 
     monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
@@ -66,7 +86,7 @@ def test_run_tests_passes_canonical_pytest_command(monkeypatch: pytest.MonkeyPat
         return _canned_run(exit_code=0)
 
     monkeypatch.setattr(mod, "run_cached", fake_run_cached)
-    result = mod.run_tests("/tmp")
+    result = mod.run_tests(str(tmp_path), scope="full")
 
     assert result["exit_code"] == 0
     assert result["success"] is True
@@ -76,9 +96,12 @@ def test_run_tests_passes_canonical_pytest_command(monkeypatch: pytest.MonkeyPat
     assert normalize_test_command(mod.PYTEST_CMD) == "pytest -q -r a --disable-warnings"
 
 
-def test_run_tests_pytest_failure_falls_back_to_canonical_npm(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_tests_pytest_failure_falls_back_to_canonical_npm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """On pytest failure with an npm script, the fallback uses canonical npm."""
     mod = _load_implement()
+    _force_legacy_mode(mod, monkeypatch)
     captured: list[str] = []
 
     monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
@@ -91,7 +114,7 @@ def test_run_tests_pytest_failure_falls_back_to_canonical_npm(monkeypatch: pytes
         return _canned_run(exit_code=0)
 
     monkeypatch.setattr(mod, "run_cached", fake_run_cached)
-    result = mod.run_tests("/tmp")
+    result = mod.run_tests(str(tmp_path), scope="full")
 
     assert result["exit_code"] == 0
     assert result["success"] is True
@@ -100,9 +123,12 @@ def test_run_tests_pytest_failure_falls_back_to_canonical_npm(monkeypatch: pytes
     assert normalize_test_command(mod.NPM_TEST_CMD) == "npm --silent test"
 
 
-def test_run_tests_npm_only_uses_canonical_npm(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_tests_npm_only_uses_canonical_npm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A repo with only an npm test script routes through canonical npm."""
     mod = _load_implement()
+    _force_legacy_mode(mod, monkeypatch)
     captured: list[str] = []
 
     monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "npm")
@@ -112,7 +138,7 @@ def test_run_tests_npm_only_uses_canonical_npm(monkeypatch: pytest.MonkeyPatch) 
         return _canned_run(exit_code=0)
 
     monkeypatch.setattr(mod, "run_cached", fake_run_cached)
-    result = mod.run_tests("/tmp")
+    result = mod.run_tests(str(tmp_path), scope="full")
 
     assert result["exit_code"] == 0
     assert result["success"] is True
@@ -140,7 +166,9 @@ def test_run_tests_cache_keys_match_test_skill_canonical_commands(
     )
 
 
-def test_run_tests_uses_shlex_safe_split(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_tests_uses_shlex_safe_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The canonical commands must be split into clean argv lists (no quoting).
 
     The subprocess boundary (``mod.run_cmd``) is stubbed so the test does not
@@ -149,6 +177,7 @@ def test_run_tests_uses_shlex_safe_split(monkeypatch: pytest.MonkeyPatch) -> Non
     failed this test with FileNotFoundError (SA-0MSOMWTXV008BVA8).
     """
     mod = _load_implement()
+    _force_legacy_mode(mod, monkeypatch)
     argv_calls: list[list[str]] = []
 
     monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
@@ -169,6 +198,6 @@ def test_run_tests_uses_shlex_safe_split(monkeypatch: pytest.MonkeyPatch) -> Non
         return _canned_run(exit_code=0)
 
     monkeypatch.setattr(mod, "run_cached", fake_run_cached)
-    mod.run_tests("/tmp")
+    mod.run_tests(str(tmp_path), scope="full")
 
     assert argv_calls == [["pytest", "-q", "-r", "a", "--disable-warnings"]]
