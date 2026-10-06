@@ -13,7 +13,7 @@
  * fetchFn — the suite never touches the live home config or the network.
  */
 
-import { test, describe } from 'node:test';
+import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -629,5 +629,228 @@ describe('discord-notify: documentation (AC6)', () => {
       /gitignor/i.test(content),
       'SKILL.md should state the private file is gitignored',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SA-0MUVWL09T001N5P4 — project pitch + release focus composition
+// ---------------------------------------------------------------------------
+
+/** A fetch stub returning a fixed assistant message (injected LLM boundary). */
+function stubLlmFetch(content) {
+  return async () => ({
+    ok: true,
+    json: async () => ({ choices: [{ message: { content } }] }),
+  });
+}
+
+/** Write a config with a webhook and an optional projectDescription. */
+function writeCompositionConfig(path, { webhookUrl = WEBHOOK_PROJECT, description } = {}) {
+  mkdirSync(dirname(path), { recursive: true });
+  let yaml = `projectName: Test Project\nprefix: TP\ndiscord:\n  webhook_url: ${webhookUrl}\n`;
+  if (description) yaml += `projectDescription: ${description}\n`;
+  writeFileSync(path, yaml);
+}
+
+describe('discord-notify: project description + pitch (SA-0MUVWL09T001N5P4)', () => {
+  let savedKey;
+  beforeEach(() => { savedKey = process.env.DEEPSEEK_API_KEY; });
+  afterEach(() => {
+    if (savedKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = savedKey;
+  });
+
+  test('extractReadmePitch returns the leading prose before the first ## heading', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const readme = '# Project\n\nA great tool for testing.\n\n## Install\n\nnpm i\n';
+    assert.equal(mod.extractReadmePitch(readme), '# Project\n\nA great tool for testing.');
+  });
+
+  test('extractReadmePitch caps the prose at ~1000 characters', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    assert.equal(mod.extractReadmePitch('a'.repeat(5000)).length, 1000);
+  });
+
+  test('resolveProjectDescription uses the same precedence as projectName', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    const globalDir = makeTempProject();
+    writeFileSync(join(globalDir, 'config.yaml'), 'projectDescription: global desc\n');
+    const globalPath = join(globalDir, 'config.yaml');
+
+    assert.equal(mod.resolveProjectDescription(dir, { globalConfigPath: globalPath }), 'global desc');
+
+    writeFileSync(join(dir, '.worklog', 'config.yaml'), 'projectDescription: project desc\n');
+    assert.equal(mod.resolveProjectDescription(dir, { globalConfigPath: globalPath }), 'project desc');
+
+    writeFileSync(join(dir, '.worklog', 'config.private.yaml'), 'projectDescription: private desc\n');
+    assert.equal(mod.resolveProjectDescription(dir, { globalConfigPath: globalPath }), 'private desc');
+  });
+
+  test('resolveProjectDescription returns null when unset everywhere', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    assert.equal(mod.resolveProjectDescription(dir, { globalConfigPath: join(dir, 'none.yaml') }), null);
+  });
+
+  test('resolveProjectPitch prefers the configured description over README generation', async () => {
+    process.env.DEEPSEEK_API_KEY = 'test-key';
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    writeFileSync(join(dir, '.worklog', 'config.yaml'), 'projectDescription: A configured pitch.\n');
+    const pitch = await mod.resolveProjectPitch(dir, {
+      globalConfigPath: join(dir, 'none.yaml'),
+      readmeContent: '# X\n\nsome readme prose',
+      llmFetchFn: stubLlmFetch('Should not be used.'),
+    });
+    assert.equal(pitch, 'A configured pitch.');
+  });
+
+  test('resolveProjectPitch generates the pitch from README prose when unset', async () => {
+    process.env.DEEPSEEK_API_KEY = 'test-key';
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    const pitch = await mod.resolveProjectPitch(dir, {
+      globalConfigPath: join(dir, 'none.yaml'),
+      readmeContent: '# Project\n\nA tool for testing releases.',
+      llmFetchFn: stubLlmFetch('Project is a tool for testing releases.'),
+    });
+    assert.equal(pitch, 'Project is a tool for testing releases.');
+  });
+
+  test('resolveProjectPitch clamps an over-long generated pitch to three sentences', async () => {
+    process.env.DEEPSEEK_API_KEY = 'test-key';
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    const pitch = await mod.resolveProjectPitch(dir, {
+      globalConfigPath: join(dir, 'none.yaml'),
+      readmeContent: '# Project\n\nProse.',
+      llmFetchFn: stubLlmFetch('One. Two. Three. Four.'),
+    });
+    assert.equal(pitch, 'One. Two. Three.');
+  });
+
+  test('resolveProjectPitch omits the pitch when generation is unavailable', async () => {
+    delete process.env.DEEPSEEK_API_KEY;
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    const pitch = await mod.resolveProjectPitch(dir, {
+      globalConfigPath: join(dir, 'none.yaml'),
+      readmeContent: '# Project\n\nA tool.',
+      llmFetchFn: stubLlmFetch('never'),
+    });
+    assert.equal(pitch, null);
+  });
+
+  test('resolveProjectPitch omits the pitch when there is no README prose', async () => {
+    process.env.DEEPSEEK_API_KEY = 'test-key';
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    const pitch = await mod.resolveProjectPitch(dir, {
+      globalConfigPath: join(dir, 'none.yaml'),
+      readmePath: join(dir, 'missing.md'),
+    });
+    assert.equal(pitch, null);
+  });
+});
+
+describe('discord-notify: release focus extraction (SA-0MUVWL09T001N5P4)', () => {
+  test('extracts the marker and removes it from the body', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const text = '> **Release focus:** Co-op mode lands.\n### Features\n- A\n';
+    const { focus, body } = mod.extractReleaseFocus(text);
+    assert.equal(focus, 'Co-op mode lands.');
+    assert.ok(!body.includes('Release focus'), 'marker must be removed from the body');
+    assert.ok(body.includes('### Features'), 'the rest of the section is preserved');
+  });
+
+  test('returns null focus and an unchanged body when the marker is absent', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const { focus, body } = mod.extractReleaseFocus('### Features\n- A\n');
+    assert.equal(focus, null);
+    assert.equal(body, '### Features\n- A');
+  });
+});
+
+describe('discord-notify: ordered description composition (SA-0MUVWL09T001N5P4)', () => {
+  test('orders paragraphs pitch → focus → project/version line → changelog', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const payload = mod.buildDiscordPayload({
+      version: '1.2.3', projectName: 'TestProject',
+      pitch: 'Pitch line.', focus: 'Focus line.',
+      changelog: '### Features\n- A',
+    });
+    const d = payload.embeds[0].description;
+    assert.ok(d.indexOf('Pitch line.') < d.indexOf('Focus line.'));
+    assert.ok(d.indexOf('Focus line.') < d.indexOf('**TestProject v1.2.3**'));
+    assert.ok(d.indexOf('**TestProject v1.2.3**') < d.indexOf('### Features'));
+  });
+
+  test('omits pitch and focus paragraphs when absent', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const d = mod.buildDiscordPayload({ version: '1.2.3', projectName: 'P', changelog: '### Features' })
+      .embeds[0].description;
+    assert.ok(d.startsWith('**P v1.2.3**'), 'no leading paragraphs when pitch/focus are absent');
+  });
+
+  test('truncates the composed description to ≤ 4096 characters', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const d = mod.buildDiscordPayload({
+      version: '1.2.3', projectName: 'P', pitch: 'pitch', focus: 'focus',
+      changelog: 'x'.repeat(9000),
+    }).embeds[0].description;
+    assert.ok(d.length <= 4096, 'composed description must respect the Discord limit');
+  });
+});
+
+describe('discord-notify: notification composition integration (SA-0MUVWL09T001N5P4)', () => {
+  test('includes the configured pitch and extracts the focus from the changelog section', async () => {
+    const dir = makeTempProject();
+    writeCompositionConfig(join(dir, '.worklog', 'config.yaml'), { description: 'A config pitch.' });
+    writeFileSync(
+      join(dir, 'CHANGELOG.md'),
+      '# Changelog\n\n## v1.2.3 (2026-01-15)\n> **Release focus:** Co-op mode lands.\n### Features\n- Added something\n',
+    );
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    let body = null;
+    const result = await mod.sendReleaseNotification(
+      { version: '1.2.3', projectRoot: dir },
+      {
+        fetchFn: async (_url, opts) => { body = JSON.parse(opts.body); return { ok: true }; },
+        globalConfigPath: join(dir, 'none.yaml'),
+        readmePath: join(dir, 'none.md'),
+      },
+    );
+
+    assert.equal(result.notified, true);
+    const d = body.embeds[0].description;
+    assert.ok(d.includes('A config pitch.'), 'configured pitch included');
+    assert.ok(d.includes('Co-op mode lands.'), 'focus included');
+    assert.ok(!d.includes('Release focus'), 'marker must not be duplicated');
+    assert.ok(d.indexOf('A config pitch.') < d.indexOf('Co-op mode lands.'));
+    assert.ok(d.indexOf('Co-op mode lands.') < d.indexOf('Added something'));
+  });
+
+  test('omits pitch and focus when unavailable and still sends the changelog', async () => {
+    const dir = makeTempProject();
+    writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
+    writeFileSync(join(dir, 'CHANGELOG.md'), SAMPLE_CHANGELOG);
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    let body = null;
+    const result = await mod.sendReleaseNotification(
+      { version: '1.2.3', projectRoot: dir },
+      {
+        fetchFn: async (_url, opts) => { body = JSON.parse(opts.body); return { ok: true }; },
+        globalConfigPath: join(dir, 'none.yaml'),
+        readmePath: join(dir, 'none.md'),
+      },
+    );
+
+    assert.equal(result.notified, true);
+    const d = body.embeds[0].description;
+    assert.ok(d.includes('Added something (SA-ABC1)'));
+    assert.ok(!d.includes('Release focus'));
   });
 });
