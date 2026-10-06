@@ -27,6 +27,11 @@ import { resolve } from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+// Shared LLM caller, extracted so discord-notify.js can reuse it without
+// importing this module (which runs `git rev-parse` at import time)
+// (SA-0MUVV6DK0002ISW4).
+import { callLlm } from '../llm.js';
+
 // ── Resolve repo root ──────────────────────────────────────────────────────
 const REPO_ROOT = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8' }).trim();
 const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
@@ -137,50 +142,6 @@ function escapeForPrompt(str) {
     .replace(/\\/g, '\\\\')
     .replace(/\n/g, '\\n')
     .replace(/"/g, '\\"');
-}
-
-/**
- * Shared LLM chat-completion caller (DeepSeek, OpenAI-compatible API).
- *
- * Returns the assistant message content, or null when no API key is
- * configured or the call fails. Callers fall back to their non-LLM
- * behaviour in that case, so the script stays backward-compatible
- * when no key is present.
- *
- * @param {Array<{role:string, content:string}>} messages
- * @param {{maxTokens?:number, temperature?:number}} opts
- * @returns {Promise<string|null>}
- */
-async function callLlm(messages, opts = {}) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) return null;
-
-  try {
-    const response = await fetch('https://api.deepseek.com/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages,
-        max_tokens: opts.maxTokens ?? 120,
-        temperature: opts.temperature ?? 0.3,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!response.ok) {
-      throw new Error(`API error: ${response.status} ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content ?? null;
-  } catch (err) {
-    console.error(`[LLM] ${err.message}`);
-    return null;
-  }
 }
 
 // ── Miscategorization keywords ─────────────────────────────────────────────
