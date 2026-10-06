@@ -854,3 +854,23 @@ describe('discord-notify: notification composition integration (SA-0MUVWL09T001N
     assert.ok(!d.includes('Release focus'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// SA-0MUVWL0SY005MEWS — projectDescription documentation
+// ---------------------------------------------------------------------------
+describe('docs: projectDescription documented (SA-0MUVWL0SY005MEWS)', () => {
+  test('ship references document projectDescription and its README/LLM fallback', () => {
+    for (const path of [REFERENCE_PATH, SHIP_REFERENCE_PATH]) {
+      const content = readFileSync(path, 'utf-8');
+      assert.ok(content.includes('projectDescription'), `${path} should document projectDescription`);
+      assert.ok(/README/i.test(content), `${path} should document the README pitch fallback`);
+    }
+  });
+
+  test('SKILL.md documents projectDescription and the description ordering', () => {
+    const content = readFileSync(SKILL_MD_PATH, 'utf-8');
+    assert.ok(content.includes('projectDescription'), 'SKILL.md should document projectDescription');
+    assert.ok(/README/i.test(content), 'SKILL.md should document the README pitch fallback');
+    assert.ok(/Release focus/i.test(content), 'SKILL.md should document the release-focus paragraph');
+  });
+});
