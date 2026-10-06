@@ -8761,8 +8761,16 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry (verdict-driven on exit)
     # ------------------------------------------------------------------
-    _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"],
-            worklog_dir=worklog_dir)
+    # A completed/done item is already terminal and cannot be claimed with
+    # the `in-progress` status: the worklog rejects `in-progress`/`done` as
+    # an incompatible status/stage pair, which previously made re-auditing a
+    # terminal item fail before the pipeline started. There is nothing to
+    # claim for a done item, so skip the claim and let the verdict-driven
+    # terminal lifecycle keep/restore `done` (SA-0MUWKGW9W004QXQZ).
+    if original_stage != "done":
+        _run_wl(runner,
+                ["wl", "update", issue_id, "--status", "in_progress", "--json"],
+                worklog_dir=worklog_dir)
 
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
