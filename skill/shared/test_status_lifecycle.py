@@ -170,6 +170,54 @@ class TestStatusLifecycleUnit:
         assert "--stage" in calls[2]
         assert "in_review" in calls[2]
 
+    # ------------------------------------------------------------------
+    # Stage validation (SA-0MUY9PMB7001ENMP): fail fast before invoking wl
+    # ------------------------------------------------------------------
+
+    def test_update_status_rejects_invalid_stage_before_wl(self, mock_run):
+        """An invalid stage raises ValueError and never invokes ``wl``.
+
+        ``in_progress`` is a status, not a stage; wl applies status and
+        stage atomically, so letting the invalid stage reach wl would cancel
+        the status change. Validation must fail fast (SA-0MUY9PMB7001ENMP).
+        """
+        with pytest.raises(ValueError, match="in_progress"):
+            StatusLifecycle.update_status("TEST-123", "in-progress", stage="in_progress")
+
+        # The wl CLI must not have been invoked at all.
+        assert mock_run.call_count == 0
+
+    def test_update_status_invalid_stage_lists_valid_stages(self, mock_run):
+        """The validation error enumerates the valid wl stages."""
+        with pytest.raises(ValueError) as excinfo:
+            StatusLifecycle.update_status("TEST-123", "in-progress", stage="bogus")
+
+        message = str(excinfo.value)
+        for stage in ("idea", "intake_complete", "plan_complete", "in_review", "done"):
+            assert stage in message
+        assert mock_run.call_count == 0
+
+    def test_update_status_accepts_valid_stage(self, mock_run):
+        """A valid stage is forwarded to ``wl update`` unchanged."""
+        mock_run.side_effect = [_make_wl_update_proc()]
+
+        StatusLifecycle.update_status("TEST-123", "completed", stage="in_review")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0] == [
+            "wl", "update", "TEST-123", "--status", "completed",
+            "--json", "--stage", "in_review",
+        ]
+
+    def test_update_status_omits_stage_when_none(self, mock_run):
+        """When no stage is supplied, no ``--stage`` flag is emitted."""
+        mock_run.side_effect = [_make_wl_update_proc()]
+
+        StatusLifecycle.update_status("TEST-123", "in-progress")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert "--stage" not in calls[0]
+
     def test_assignee_on_entry(self, mock_run):
         """Entry with assignee sets assignee, success does NOT clear."""
         mock_run.side_effect = [

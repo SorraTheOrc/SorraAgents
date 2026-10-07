@@ -3029,17 +3029,21 @@ def phase_start(
         return report
 
     # ── Step 3: Claim the work item via shared helper ─────────────
+    # Status-only claim: the workflow stage must NOT be advanced here.
+    # `in_progress` is a status, not a stage; passing it as a stage made `wl`
+    # reject the whole atomic update and (previously) left the item unclaimed
+    # while the failure was swallowed as a warning (SA-0MUY9PMB7001ENMP).
     LOG.info("Claiming work item %s...", work_item_id)
     try:
         StatusLifecycle.update_status(work_item_id, "in_progress")
-    except RuntimeError:
-        msg = f"Failed to claim work item {work_item_id}"
+    except RuntimeError as exc:
+        msg = f"Failed to claim work item {work_item_id}: {exc}"
         report["success"] = False
         report["message"] = msg
+        # Surface a genuine claim failure loudly, regardless of output mode.
+        LOG.error(msg)
         if json_output:
             print(format_json_output(report))
-        else:
-            LOG.error(msg)
         return report
 
     # ── Step 4: Safety gate (dirty working tree) ───────────────────
@@ -3209,11 +3213,10 @@ def phase_start(
     # do this automatically). Best-effort: a warning on failure, never fatal.
     _ensure_submodules(abs_wt_path, _get_repo_root())
 
-    # Update status with stage via shared helper
-    try:
-        StatusLifecycle.update_status(work_item_id, "in_progress", stage="in_progress")
-    except RuntimeError:
-        LOG.warning("Failed to update stage for %s", work_item_id)
+    # The work item was already claimed (status-only) in Step 3; the stage
+    # must be left untouched here. There is deliberately no second
+    # status/stage update — passing the retired `in_progress` stage to `wl`
+    # failed atomically and was only logged as a warning (SA-0MUY9PMB7001ENMP).
     report["resumed"] = resumed
     wl_add_comment(
         work_item_id,

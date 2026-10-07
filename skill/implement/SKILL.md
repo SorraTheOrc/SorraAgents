@@ -187,8 +187,11 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 1. Set status and safety gate
 
-- **Before any other step**, claim the work item:
-  `StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")` (or `implement.py start`)
+- **Before any other step**, claim the work item with a **status-only** update:
+  `StatusLifecycle.update_status(<work-item-id>, "in_progress", assignee="<AGENT>")` (or `implement.py start`).
+  Do **not** pass `stage="in_progress"` — `in_progress` is a status, not a stage;
+  `wl` applies status and stage atomically and would reject the whole update. The
+  claim leaves the existing stage unchanged (`in_progress` is never a stage).
 
 > **Code Freeze gate:** `implement.py start <id>` checks the Code Freeze marker
 > (`.worklog/code-freeze.json`, contract WL-0MSBU4KMA004PKSR) **before**
@@ -649,7 +652,7 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 
 | Phase | Mechanism | Status | Stage |
 |-------|-----------|--------|-------|
-| Claim (Step 1) | `update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` / `phase_start()` | in_progress | in_progress |
+| Claim (Step 1) | `update_status(id, "in_progress", assignee="<AGENT>")` / `phase_start()` (status-only; stage unchanged) | in_progress | unchanged |
 | Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review")` | completed | in_review |
 | Final (Step 9) | `with StatusLifecycle(id, target_stage="in_review"):` / `phase_finish()` | completed | in_review |
 | Abort (dirty/gate/user/error/termination) | `update_status(id, "open")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
