@@ -116,7 +116,11 @@ Notes:
 
 - Model/device/compute-type come from the `start` command, with CLI arguments
   as defaults. If `device=cuda` cannot initialise, the worker falls back to
-  `cpu` + `int8` and reports the effective device in `ready`.
+  `cpu` + `int8` and reports the effective device in `ready`. Because
+  ctranslate2 loads CUDA libraries lazily, a CUDA failure can also surface on
+  the first `transcribe()` (e.g. a missing `libcublas.so.12`); the worker then
+  emits a `warning`, reloads the model on `cpu`/`int8` and retries the
+  transcription transparently.
 - Partials are emitted once per `partialIntervalMs` of *new* audio, and both
   partials and the final transcript re-transcribe the whole utterance buffer so
   the live editor text stays cumulative. Prompt-length dictation is the target;

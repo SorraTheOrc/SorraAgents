@@ -32,15 +32,21 @@ const PYTHON = process.env.PYTHON || "python3";
 
 /** Deterministic stub replacement for faster-whisper (no CUDA, no model). */
 const STUB = `
+import os
+
 class WhisperModel:
     def __init__(self, model_size, device="cpu", compute_type="int8", **kwargs):
-        if device == "cuda":
+        if device == "cuda" and not os.environ.get("VOICE_STUB_CUDA_TRANSCRIBE_FAILS"):
             raise RuntimeError("CUDA driver not available in test stub")
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
 
     def transcribe(self, audio, language=None, **kwargs):
+        if self.device == "cuda" and os.environ.get("VOICE_STUB_CUDA_TRANSCRIBE_FAILS"):
+            raise RuntimeError("Library libcublas.so.12 is not found or cannot be loaded")
+        if self.device == "cpu" and os.environ.get("VOICE_STUB_CPU_TRANSCRIBE_FAILS"):
+            raise RuntimeError("CPU transcription exploded")
         from types import SimpleNamespace
         text = "[%s] %d samples beam=%s vad=%s prompt=%s" % (
             self.device, len(audio), kwargs.get("beam_size"),
@@ -76,8 +82,8 @@ after(() => {
 
 /** Spawn the real worker and expose a message queue. */
 class WorkerHarness {
-  constructor(args = [], { pythonPath } = {}) {
-    const env = { ...process.env };
+  constructor(args = [], { pythonPath, env: extraEnv } = {}) {
+    const env = { ...process.env, ...(extraEnv || {}) };
     if (pythonPath !== undefined) env.PYTHONPATH = pythonPath;
     this.child = spawn(PYTHON, [WORKER, ...args], {
       env,
@@ -281,6 +287,48 @@ describe("whisper worker CUDA fallback", () => {
     const ready = await worker.waitFor("ready");
     assert.equal(ready.device, "cpu");
     assert.equal(ready.computeType, "int8");
+
+    worker.send({ type: "stop" });
+    await worker.exit;
+  });
+
+  test("falls back to CPU int8 when CUDA fails lazily during transcription", async () => {
+    const worker = new WorkerHarness(
+      ["--model", "small", "--device", "cuda", "--compute-type", "float16"],
+      { pythonPath: stubDir.stub, env: { VOICE_STUB_CUDA_TRANSCRIBE_FAILS: "1" } },
+    );
+    worker.send({ type: "start", model: "small", device: "cuda", computeType: "float16" });
+
+    // The model constructs successfully on CUDA; the failure happens later.
+    const ready = await worker.waitFor("ready");
+    assert.equal(ready.device, "cuda");
+
+    worker.send({ type: "feed", audio: pcm(1600).toString("base64") });
+    worker.send({ type: "finalise" });
+
+    const warning = await worker.waitFor("warning");
+    assert.match(warning.message, /falling back to CPU int8/);
+
+    const final = await worker.waitFor("final");
+    assert.match(final.text, /\[cpu\] 1600 samples/);
+
+    worker.send({ type: "stop" });
+    await worker.exit;
+  });
+
+  test("a transcribe failure on CPU is surfaced as an error (no retry)", async () => {
+    const worker = new WorkerHarness(
+      ["--device", "cpu"],
+      { pythonPath: stubDir.stub, env: { VOICE_STUB_CPU_TRANSCRIBE_FAILS: "1" } },
+    );
+    worker.send({ type: "start", device: "cpu" });
+    await worker.waitFor("ready");
+
+    worker.send({ type: "feed", audio: pcm(1600).toString("base64") });
+    worker.send({ type: "finalise" });
+
+    const error = await worker.waitFor("error");
+    assert.match(error.message, /transcription failed: CPU transcription exploded/);
 
     worker.send({ type: "stop" });
     await worker.exit;

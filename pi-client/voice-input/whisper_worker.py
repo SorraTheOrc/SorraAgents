@@ -102,6 +102,16 @@ def load_model_with_fallback(
     return load_model(model_size, "cpu", "int8"), "cpu", "int8"
 
 
+def load_model_for_cpu(model_size: str) -> Any:
+    """Reload a model on CPU int8.
+
+    Used as the transcribe-time fallback: ctranslate2 loads CUDA libraries
+    lazily, so a model constructed with ``device=cuda`` can still fail on the
+    first ``transcribe()`` (e.g. a missing ``libcublas.so.12``).
+    """
+    return load_model(model_size, "cpu", "int8")
+
+
 def pcm_to_float32(pcm: bytes) -> Any:
     """Convert little-endian int16 mono PCM to a normalised float32 array."""
     import numpy as np
@@ -128,6 +138,10 @@ class TranscriptionSession:
         beam_size: int = 5,
         vad_filter: bool = False,
         initial_prompt: str = "",
+        model_size: str = "",
+        device: str = "cpu",
+        compute_type: str = "int8",
+        reload_model: Any = None,
     ):
         self.model = model
         self.partial_interval_samples = partial_interval_samples
@@ -135,6 +149,10 @@ class TranscriptionSession:
         self.beam_size = beam_size
         self.vad_filter = bool(vad_filter)
         self.initial_prompt = initial_prompt
+        self.model_size = model_size
+        self.device = device
+        self.compute_type = compute_type
+        self.reload_model = reload_model
         self.buffer = bytearray()
         self.last_partial_bytes = 0
         self.sequence = 0
@@ -174,14 +192,34 @@ class TranscriptionSession:
         if len(self.buffer) == 0:
             return ""
         audio = pcm_to_float32(bytes(self.buffer))
-        segments, _info = self.model.transcribe(
+        try:
+            segments, _info = self._run_transcribe(audio)
+        except Exception as exc:  # noqa: BLE001 - CUDA can fail lazily at transcribe time
+            if self.device != "cuda" or self.reload_model is None:
+                raise
+            emit(
+                {
+                    "type": "warning",
+                    "message": (
+                        f"CUDA transcription failed ({exc}); "
+                        "falling back to CPU int8 inference."
+                    ),
+                }
+            )
+            self.model = self.reload_model(self.model_size)
+            self.device = "cpu"
+            self.compute_type = "int8"
+            segments, _info = self._run_transcribe(audio)
+        return " ".join(_segment_text(segment) for segment in segments).strip()
+
+    def _run_transcribe(self, audio: Any) -> Any:
+        return self.model.transcribe(
             audio,
             language=self.language,
             beam_size=self.beam_size,
             vad_filter=self.vad_filter,
             initial_prompt=self.initial_prompt or None,
         )
-        return " ".join(_segment_text(segment) for segment in segments).strip()
 
 
 def _segment_text(segment: Any) -> str:
@@ -275,6 +313,10 @@ def handle_command(
             beam_size=beam_size,
             vad_filter=vad_filter,
             initial_prompt=initial_prompt,
+            model_size=model_size,
+            device=device,
+            compute_type=compute_type,
+            reload_model=load_model_for_cpu,
         )
 
     if kind == "feed":
