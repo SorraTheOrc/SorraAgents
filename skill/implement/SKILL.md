@@ -402,6 +402,13 @@ than silently skipping a child (`IMPLEMENT_DRIVE_PI_BIN` overrides the
 binary). A driven session is marked `IMPLEMENT_DRIVE_ACTIVE=1` and refuses to
 re-enter `drive`.
 
+> **Child sessions run extensions-disabled.** The spawner builds
+> `pi -p "/skill:implement <child>" --approve --no-extensions` so a globally
+> installed `turn_end` extension cannot trip Pi core's
+> `_dispatchTurnEndBoundary` and flood the child's captured stderr
+> (SA-0MUY9PYBD009Y7J5). Rationale, root cause and scope limits:
+> [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#why-driven-child-sessions-run-with-extensions-disabled-sa-0muy9pybd009y7j5).
+
 **Manual fallback: one `parent` invocation per child.** If you cannot spawn
 sessions (e.g. headless tooling), recurse manually. A parent invocation
 recurses into its children automatically. Run:

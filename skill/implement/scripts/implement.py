@@ -4339,10 +4339,15 @@ def _default_session_spawner(
 ) -> dict[str, Any]:
     """Spawn a fresh Pi session to implement *child_id*.
 
-    Runs ``pi -p "/skill:implement <child_id>"`` as a separate process with a
-    clean context window, waits for it to exit, and reports success. The
-    child session runs the standard implement skill; its ``start`` phase is
-    idempotent so the pre-created worktree is resumed.
+    Runs ``pi -p "/skill:implement <child_id>" --approve --no-extensions`` as
+    a separate process with a clean context window, waits for it to exit, and
+    reports success. The child session runs the standard implement skill; its
+    ``start`` phase is idempotent so the pre-created worktree is resumed.
+
+    ``--no-extensions`` disables extension discovery in the child so a
+    globally installed ``turn_end`` handler cannot trip Pi core's boundary
+    dispatch — see the inline comment below and
+    ``docs/dev/implement-skill-reference.md``.
 
     Args:
         child_id: The child work item ID.
@@ -4370,7 +4375,32 @@ def _default_session_spawner(
         )
         return result
 
-    cmd = [pi_bin, "-p", f"/skill:implement {child_id}", "--approve"]
+    # ``--no-extensions`` keeps extension-provided ``turn_end`` handlers out of
+    # the headless child session. ``ExtensionRunner.hasHandlers("turn_end")``
+    # is *global across all loaded extensions*, and two installed extensions
+    # register one (SorraAgents ``pi-client/proxy-sse-signals`` and the
+    # ContextHub ``Worklog`` recovery extension), so guarding a single handler
+    # cannot silence the problem. When Pi core's
+    # ``AgentSession._dispatchTurnEndBoundary`` cannot resolve the finishing
+    # assistant message to a persisted session entry while any ``turn_end``
+    # handler exists, it emits ``Extension error (<boundary>): turn_end could
+    # not resolve the persisted assistant entry ID`` on the child's stderr.
+    # In the ``tce-main-street`` epic (MS-0MUXW90YE009L4DQ) a single driven
+    # child emitted 191 identical boundary lines and nothing else, drowning
+    # the captured output that ``drive`` uses for failure diagnosis. The
+    # identity mismatch itself is a Pi-core bug (no fixed release to upgrade
+    # to) and cannot be patched from this repo. ``audit_runner.py`` already
+    # runs every headless audit ``pi`` call with ``--no-extensions`` for the
+    # same reason (SA-0MUEIOGT2005IR7F) — this mirrors that precedent
+    # (SA-0MUY9PYBD009Y7J5). ``--no-extensions`` does not affect skills, which
+    # load via ``--no-skills``, so ``/skill:implement`` still expands.
+    cmd = [
+        pi_bin,
+        "-p",
+        f"/skill:implement {child_id}",
+        "--approve",
+        "--no-extensions",
+    ]
     if verbose:
         cmd.append("--verbose")
     LOG.info(
