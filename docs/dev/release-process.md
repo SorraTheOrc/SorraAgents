@@ -236,6 +236,13 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
      SA-0MUJKPDAA002VVDP). An audit-approved parent therefore closes without
      a false `--force` collateral refusal; only descendants still in a
      genuinely non-terminal state are named in a refusal.
+   - **The refusal names its real cause.** A descendant held back solely
+     because `needsProducerReview = true` is reported with a distinct
+     `Refused: descendant(s) need producer review: …` reason (also exposed on
+     `refusedItems[].needsProducerReview`) instead of being lumped under the
+     generic "outside the candidate set" collateral list
+     (SA-0MUJKPDAA002VVDP AC2). The parent is still refused, so the scope
+     guard is unchanged; a mixed subtree reports both causes.
 4. Version numbering, tagging, and tag pushing are **now automated** as part
    of the merge script (`merge-dev-to-main.sh`). Before merging, the script:
    - Increments the version in `package.json` (default: patch bump).

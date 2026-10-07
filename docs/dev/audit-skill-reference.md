@@ -383,7 +383,7 @@ transition has been **verified** (`wl show` readback, WL-0MSVVFBJ2003RRYK),
 - **Non-fatal:** a per-child `wl` failure is caught, logged to stderr, and does not abort the audit; the next passing audit completes the remaining cascade.
 - **Worklog routing:** the helper reuses `_run_wl`, so `--worklog-dir` is resolved through the shared helpers and the cascade targets the item's own store regardless of cwd.
 
-### Ship-side terminal-descendant exclusion (AC4)
+### Ship-side terminal-descendant exclusion and producer-review reporting (AC2/AC4)
 
 `closeWorkItemsAfterRelease` computes `collateral` as descendants that are
 neither release candidates nor terminal (`stage: done` / `status: deleted`,
@@ -392,6 +392,15 @@ A descendant whose lifecycle cannot be resolved is treated as non-terminal
 (fail-safe), preserving the SA-0MU2OY1N9000XL2H scope guard. This is
 defence-in-depth for the audit-side cascade above (SA-0MUR7Y3BJ004FGPP AC4,
 overlapping SA-0MUJKPDAA002VVDP).
+
+When a refused parent's collateral includes a descendant held back solely
+because `needsProducerReview === true` (a candidate skipped with the flag still
+set), that descendant is classified separately and the refusal reason names the
+producer-review cause — `Refused: descendant(s) need producer review: …`, or
+appended to the generic out-of-scope message for a mixed subtree — rather than
+being lumped under the generic collateral list. The classification is exposed
+as `refusedItems[].needsProducerReview`; the parent is still refused, so the
+scope guard is not weakened (SA-0MUJKPDAA002VVDP AC2).
 
 ## Scripts
 

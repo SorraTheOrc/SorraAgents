@@ -376,7 +376,7 @@ export function getDescendants(itemId) {
  *   followed by `wl comment add <child>` (AC1/AC4).
  * @param {boolean} [options.dryRun=false] - When true, intended child
  *   overrides are reported but no `wl` mutation is performed (AC4).
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[]}> }}
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -533,6 +533,11 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   }
 
   const candidateIds = new Set(toClose.map((item) => item.id));
+  // Full candidate set keyed by id. Used to classify a non-candidate,
+  // non-terminal descendant that is held back solely because
+  // `needsProducerReview === true` separately from generic out-of-scope
+  // collateral (SA-0MUJKPDAA002VVDP AC2).
+  const candidateItemsById = new Map(items.map((item) => [item.id, item]));
   const refusedItems = [];
   const closable = [];
   for (const item of toClose) {
@@ -562,10 +567,35 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
         && (lifecycle.stage === 'done' || lifecycle.status === 'deleted');
       return !terminal;
     });
+    // AC2: a descendant held back solely because `needsProducerReview=true`
+    // (a candidate skipped with its producer-review flag still set) must be
+    // reported with a distinct reason rather than lumped under the generic
+    // collateral message. The parent is still refused either way — this
+    // classifies the cause, it does not weaken the scope guard (AC3).
+    const needsProducerReview = collateral.filter((id) => {
+      const candidate = candidateItemsById.get(id);
+      return !!candidate && candidate.needsProducerReview === true;
+    });
+    const needsProducerReviewIds = new Set(needsProducerReview);
+    const outsideSetCollateral = collateral.filter((id) => !needsProducerReviewIds.has(id));
     if (collateral.length > 0) {
-      const reason = `Refused: --force close would sweep descendant(s) outside the candidate set: ${collateral.join(', ')}`;
+      let reason;
+      if (outsideSetCollateral.length > 0) {
+        reason = `Refused: --force close would sweep descendant(s) outside the candidate set: ${outsideSetCollateral.join(', ')}`;
+        if (needsProducerReview.length > 0) {
+          reason += `; descendant(s) need producer review: ${needsProducerReview.join(', ')}`;
+        }
+      } else {
+        reason = `Refused: descendant(s) need producer review: ${needsProducerReview.join(', ')}`;
+      }
       console.log(`  ○ ${item.title || item.id} (${item.id}) — ${reason}`);
-      refusedItems.push({ id: item.id, title: item.title, reason, collateral });
+      refusedItems.push({
+        id: item.id,
+        title: item.title,
+        reason,
+        collateral,
+        needsProducerReview,
+      });
     } else {
       closable.push(item);
     }
@@ -573,7 +603,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
 
   if (closable.length === 0) {
     const message = `No work items to close (${skippedItems.length} skipped, needs producer review; `
-      + `${refusedItems.length} refused, collateral descendants outside candidate set).`;
+      + `${refusedItems.length} refused, descendants outside the candidate set or needing producer review).`;
     console.log(message);
     return {
       success: true,

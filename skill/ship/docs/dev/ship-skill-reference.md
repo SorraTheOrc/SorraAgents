@@ -357,6 +357,11 @@ force-closed. Such candidates are **refused** and reported in `refusedItems`
 (an explicit, reversible exclusion decision) rather than swept; only
 collateral-free candidates are closed. `getDescendants(itemId)` resolves the
 subtree recursively via `wl show <id> --children --json` (cycle-bounded).
+Terminal descendants (`stage: done` / `status: deleted`) are excluded from the
+collateral set, and a non-terminal descendant held back solely by
+`needsProducerReview === true` is reported with a distinct producer-review
+refusal reason (and `refusedItems[].needsProducerReview`) rather than the
+generic collateral list (SA-0MUJKPDAA002VVDP AC2).
 
 ## Remediation: test-spuriously-closed items
 
