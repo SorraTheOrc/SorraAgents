@@ -23,6 +23,59 @@ export const STATE = Object.freeze({
 /** Footer status key used for the recording indicator. */
 export const STATUS_KEY = "voice-input";
 
+/**
+ * Notification level for each feedback transition (SA-0MUXZBHX0006IXNZ).
+ * State/success transitions use `info`; the empty-capture outcome (and the
+ * existing failure paths) use `warning`/`error`.
+ */
+export const FEEDBACK_LEVELS = Object.freeze({
+  start: "info",
+  stop: "info",
+  sending: "info",
+  empty: "warning",
+});
+
+/**
+ * Build the one-line message for a feedback transition.
+ *
+ * Wording is intentionally centralised here so it can be tuned without
+ * changing the feedback contract; tests assert the presence, level and state
+ * named by each message rather than its exact string.
+ *
+ * @param {string} kind one of `start` | `stop` | `sending` | `empty`
+ * @param {object} [details]
+ * @returns {string|null}
+ */
+export function feedbackMessage(kind, details = {}) {
+  switch (kind) {
+    case "start":
+      return "🎙 Voice input enabled — listening… (Ctrl+Space to stop)";
+    case "stop":
+      return "🔇 Voice input disabled — processing…";
+    case "sending": {
+      const preview = previewTranscript(details.transcript);
+      return preview
+        ? `📤 Voice input: sending “${preview}”`
+        : "📤 Voice input: sending transcript…";
+    }
+    case "empty":
+      return "Voice input: nothing captured — nothing was sent.";
+    default:
+      return null;
+  }
+}
+
+/** Truncate a transcript to its first few words for a one-line notification. */
+export function previewTranscript(text, maxWords = 6) {
+  const words = String(text ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length === 0) return "";
+  const head = words.slice(0, maxWords).join(" ");
+  return words.length > maxWords ? `${head}…` : head;
+}
+
 /** Render the footer indicator for a state (undefined clears it). */
 export function statusText(state) {
   switch (state) {
@@ -49,6 +102,9 @@ export function statusText(state) {
  *   configured phrase and was sent as a key chord instead of a prompt.
  * @param {() => boolean} [deps.isIdle] whether pi is idle (not streaming)
  * @param {() => object} [deps.checkDoctor] preflight check (run once on first start)
+ * @param {() => void} [deps.playSound] audible-cue hook (terminal bell);
+ *   injected so it is testable and suppressible. Only fired when
+ *   `config.feedbackSound` is not `false`.
  * @param {object} [deps.logger]
  */
 export function createVoiceInputController({
@@ -60,6 +116,7 @@ export function createVoiceInputController({
   sendShortcut = null,
   isIdle = () => true,
   checkDoctor = null,
+  playSound = null,
   logger = console,
 } = {}) {
   const emitter = new EventEmitter();
@@ -69,6 +126,24 @@ export function createVoiceInputController({
   let originalEditorText = "";
   let lastPartial = "";
   let doctorResult = null;
+
+  /**
+   * Emit exactly one acknowledgement for a transition: a non-blocking
+   * notification plus an optional, injected audible cue. Never throws, so a
+   * failing cue can never break a recording transition.
+   */
+  function feedback(kind, details = {}) {
+    const message = feedbackMessage(kind, details);
+    if (!message) return;
+    ui.notify(message, FEEDBACK_LEVELS[kind] ?? "info");
+    if (config?.feedbackSound !== false && typeof playSound === "function") {
+      try {
+        playSound();
+      } catch (err) {
+        logger?.warn?.(`voice-input sound cue failed: ${err && err.message ? err.message : err}`);
+      }
+    }
+  }
 
   const controller = {
     on(event, handler) {
@@ -152,6 +227,7 @@ export function createVoiceInputController({
         await controller.abort(`failed to start audio capture: ${message}`, "error");
         return;
       }
+      feedback("start");
       emitter.emit("started");
     },
 
@@ -160,6 +236,7 @@ export function createVoiceInputController({
       if (state !== STATE.recording) return;
       state = STATE.submitting;
       ui.setStatus(STATUS_KEY, statusText(state));
+      feedback("stop");
 
       const activeRecorder = recorder;
       const activeClient = client;
@@ -186,7 +263,7 @@ export function createVoiceInputController({
         // Nothing recognised: do not submit; restore the pre-recording editor.
         ui.setEditorText(originalEditorText);
         ui.setStatus(STATUS_KEY, undefined);
-        ui.notify("Voice input: no speech detected — nothing was sent.", "warning");
+        feedback("empty");
         state = STATE.idle;
         emitter.emit("stopped", { submitted: false, transcript: "" });
         return;
@@ -208,6 +285,7 @@ export function createVoiceInputController({
           ui.setEditorText("");
           state = STATE.idle;
           ui.setStatus(STATUS_KEY, undefined);
+          feedback("sending", { transcript });
           emitter.emit("stopped", { submitted: true, transcript, shortcut: true });
           return;
         }
@@ -215,6 +293,7 @@ export function createVoiceInputController({
 
       lastPartial = transcript;
       ui.setEditorText(transcript);
+      feedback("sending", { transcript });
       submit(transcript);
 
       state = STATE.idle;

@@ -21,6 +21,20 @@ extensions.
 4. Errors (missing dependency, no microphone, busy worker) are shown as
    notifications; the pi session is never crashed.
 
+Every transition is acknowledged so a mis-press or a swallowed shortcut can
+never be mistaken for a successful dictation — with a one-line notification and
+the footer indicator:
+
+| Transition | Acknowledgement |
+|---|---|
+| Recording starts (enabled) | `🎙 Voice input enabled — listening… (Ctrl+Space to stop)` |
+| Recording stops (disabled) | `🔇 Voice input disabled — processing…` |
+| Transcript submitted | `📤 Voice input: sending "<first words>"` |
+| Nothing captured | warning: nothing captured — nothing was sent (no submission) |
+
+A short terminal-bell cue accompanies each transition (`feedbackSound`, default
+`true`); see [Configuration](#configuration).
+
 ## Prerequisites
 
 | Requirement | Notes |
@@ -74,7 +88,13 @@ pi --extension ./pi-client/voice-input
 Submission behaves like typing the text and pressing Enter: a normal user
 message that honours pi's current steering/follow-up mode (when pi is busy the
 transcript is delivered as a steering message). An empty transcript is never
-submitted.
+submitted — it is reported explicitly instead.
+
+Feedback on each transition is visual (a one-line notification plus the footer
+indicator) with an optional terminal-bell cue controlled by `feedbackSound`
+(default `true`). Set it to `false` in the settings file or via
+`PI_VOICE_INPUT_FEEDBACK_SOUND=false` to silence the bell while keeping the
+visual acknowledgement.
 
 ### Ctrl+Space conflicts
 
@@ -104,6 +124,7 @@ Settings files (first found wins):
 | `beamSize` | `PI_VOICE_INPUT_BEAM_SIZE` | `5` | Beam search width; higher can improve accuracy at the cost of latency |
 | `vadFilter` | `PI_VOICE_INPUT_VAD_FILTER` | `false` | Drop non-speech audio with faster-whisper's VAD filter |
 | `initialPrompt` | `PI_VOICE_INPUT_INITIAL_PROMPT` | *(none)* | Prompt to bias transcription (e.g. domain vocabulary) |
+| `feedbackSound` | `PI_VOICE_INPUT_FEEDBACK_SOUND` | `true` | Emit a short terminal-bell cue on each feedback transition (start/stop/outcome) |
 | `silenceThreshold` | `PI_VOICE_INPUT_SILENCE_THRESHOLD` | `0.01` | Normalised RMS below which a frame is silent |
 | `silenceMs` | `PI_VOICE_INPUT_SILENCE_MS` | `3000` | Silence before auto-submit (ms) |
 | `partialCadenceMs` | `PI_VOICE_INPUT_PARTIAL_CADENCE_MS` | `1000` | Live-partial / pause cadence (ms) |

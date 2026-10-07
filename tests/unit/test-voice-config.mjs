@@ -56,6 +56,7 @@ describe("config defaults", () => {
     assert.equal(config.beamSize, 5);
     assert.equal(config.vadFilter, false);
     assert.equal(config.initialPrompt, "");
+    assert.equal(config.feedbackSound, true);
     assert.deepEqual(config.shortcuts, []);
     assert.equal(config.targetPaneLabel, "Work Items");
     assert.equal(config.targetPaneId, "");
@@ -96,6 +97,7 @@ describe("config precedence", () => {
       PI_VOICE_INPUT_BEAM_SIZE: "3",
       PI_VOICE_INPUT_VAD_FILTER: "true",
       PI_VOICE_INPUT_INITIAL_PROMPT: "technical vocabulary",
+      PI_VOICE_INPUT_FEEDBACK_SOUND: "false",
       PI_VOICE_INPUT_CAPTURE_COMMAND: "parecord",
       PI_VOICE_INPUT_CAPTURE_ARGS: '["--rate=16000"]',
       PI_VOICE_INPUT_PYTHON: "python3.12",
@@ -111,6 +113,7 @@ describe("config precedence", () => {
       beamSize: "3",
       vadFilter: "true",
       initialPrompt: "technical vocabulary",
+      feedbackSound: "false",
       captureCommand: "parecord",
       captureArgs: ["--rate=16000"],
       python: "python3.12",
@@ -174,6 +177,42 @@ describe("config validation", () => {
     const { config, warnings } = resolveConfig({ overrides: { vadFilter: "maybe" } });
     assert.equal(config.vadFilter, false);
     assert.ok(warnings.some((w) => /vadFilter must be a boolean/.test(w)));
+  });
+
+  test("feedbackSound defaults to true", () => {
+    const { config, warnings } = resolveConfig();
+    assert.equal(config.feedbackSound, true);
+    assert.deepEqual(warnings, []);
+  });
+
+  test("feedbackSound booleans are coerced from env strings", () => {
+    const cases = [
+      ["true", true],
+      ["1", true],
+      ["on", true],
+      ["yes", true],
+      ["false", false],
+      ["0", false],
+      ["off", false],
+      ["no", false],
+    ];
+    for (const [raw, expected] of cases) {
+      const { config, warnings } = resolveConfig({ env: { PI_VOICE_INPUT_FEEDBACK_SOUND: raw } });
+      assert.equal(config.feedbackSound, expected, `feedbackSound env ${raw}`);
+      assert.deepEqual(warnings, []);
+    }
+  });
+
+  test("an invalid feedbackSound value falls back to the default with a warning", () => {
+    const { config, warnings } = resolveConfig({ overrides: { feedbackSound: "maybe" } });
+    assert.equal(config.feedbackSound, true);
+    assert.ok(warnings.some((w) => /feedbackSound must be a boolean/.test(w)));
+  });
+
+  test("a settings file can disable feedback sound", () => {
+    const { config, warnings } = resolveConfig({ file: { feedbackSound: false } });
+    assert.equal(config.feedbackSound, false);
+    assert.deepEqual(warnings, []);
   });
 
   test("large-v3-turbo is a known model size (no unknown-model warning)", () => {

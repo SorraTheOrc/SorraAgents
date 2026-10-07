@@ -28,6 +28,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   beamSize: 5,
   vadFilter: false,
   initialPrompt: "",
+  feedbackSound: true,
   silenceThreshold: 0.01,
   silenceMs: 3000,
   partialCadenceMs: 1000,
@@ -54,6 +55,7 @@ const ENV_KEYS = {
   beamSize: "PI_VOICE_INPUT_BEAM_SIZE",
   vadFilter: "PI_VOICE_INPUT_VAD_FILTER",
   initialPrompt: "PI_VOICE_INPUT_INITIAL_PROMPT",
+  feedbackSound: "PI_VOICE_INPUT_FEEDBACK_SOUND",
   silenceThreshold: "PI_VOICE_INPUT_SILENCE_THRESHOLD",
   silenceMs: "PI_VOICE_INPUT_SILENCE_MS",
   partialCadenceMs: "PI_VOICE_INPUT_PARTIAL_CADENCE_MS",
@@ -143,7 +145,7 @@ function coerce(key, raw, fallback) {
     key === "startupTimeoutMs" ||
     key === "beamSize";
 
-  if (key === "vadFilter") {
+  if (key === "vadFilter" || key === "feedbackSound") {
     if (typeof raw === "boolean") return { value: raw, warning: null };
     if (typeof raw === "string") {
       const normalised = raw.trim().toLowerCase();

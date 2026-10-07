@@ -73,6 +73,34 @@ Design rules:
 - Partials are ignored outside `recording`, so late worker messages cannot
   clobber a submitted editor.
 
+### Feedback events (SA-0MUXZBHX0006IXNZ)
+
+The controller funnels every acknowledgement through a single
+`feedback(kind, details)` helper so each transition emits **exactly one**
+non-blocking notification and (optionally) one audible cue.
+
+| Transition (`kind`) | Level | Message (indicative) |
+|---|---|---|
+| `start` — recording begins | `info` | `🎙 Voice input enabled — listening… (Ctrl+Space to stop)` |
+| `stop` — recording ends | `info` | `🔇 Voice input disabled — processing…` |
+| `sending` — non-empty transcript submitted | `info` | `📤 Voice input: sending "<first words>…"` (truncated) |
+| `empty` — nothing captured | `warning` | `Voice input: nothing captured — nothing was sent.` |
+
+The `stop` acknowledgement fires once because `stop()` is state-guarded, so a
+manual stop racing the silence auto-stop cannot double-acknowledge. `abort()`
+keeps its existing single `error`/`warning` notification (no extra stop
+acknowledgement) and clears the footer.
+
+The wording lives in `feedbackMessage()` and is centralised so it can be tuned
+without changing the contract; tests assert the presence, level and named state
+of each notification rather than exact strings.
+
+When `config.feedbackSound` is not `false`, each feedback event also calls the
+injected `playSound` hook (the `index.ts` adapter writes the terminal bell
+`\x07`). The hook is injectable so it is unit-testable and fully suppressible,
+and a throwing hook is caught and logged so it can never break a transition.
+The bell is never relied on for correctness.
+
 ## Capture and silence detection (`recorder.js`)
 
 - Spawns a configurable capture command; the default `arecord -f S16_LE -r
@@ -166,6 +194,7 @@ faster-whisper unchanged.
 | `beamSize` | `PI_VOICE_INPUT_BEAM_SIZE` | `5` |
 | `vadFilter` | `PI_VOICE_INPUT_VAD_FILTER` | `false` |
 | `initialPrompt` | `PI_VOICE_INPUT_INITIAL_PROMPT` | *(none)* |
+| `feedbackSound` | `PI_VOICE_INPUT_FEEDBACK_SOUND` | `true` |
 | `silenceThreshold` | `PI_VOICE_INPUT_SILENCE_THRESHOLD` | `0.01` |
 | `silenceMs` | `PI_VOICE_INPUT_SILENCE_MS` | `3000` |
 | `partialCadenceMs` | `PI_VOICE_INPUT_PARTIAL_CADENCE_MS` | `1000` |
@@ -225,9 +254,9 @@ Pure unit tests (no microphone, GPU or model download):
 | `tests/unit/test-voice-recorder.mjs` | RMS, PCM framing, silence/pause timing, capture errors, SIGINT shutdown |
 | `tests/unit/test-voice-whisper-client.mjs` | worker lifecycle, JSON protocol, partials, finalise, stop, crash handling |
 | `tests/unit/test-voice-whisper-worker.mjs` | real Python worker against a stub `faster_whisper`: start/ready/feed/partial/finalise/stop, CUDA fallback, missing dependency, buffer reset |
-| `tests/unit/test-voice-config.mjs` | settings resolution/validation/precedence |
+| `tests/unit/test-voice-config.mjs` | settings resolution/validation/precedence (incl. `feedbackSound`) |
 | `tests/unit/test-voice-doctor.mjs` | preflight checks and severity aggregation |
-| `tests/unit/test-voice-controller.mjs` | state machine, toggle, partial replacement, submission, shortcut dispatch, doctor gating, errors |
+| `tests/unit/test-voice-controller.mjs` | state machine, toggle, partial replacement, submission, shortcut dispatch, doctor gating, feedback transitions, sound on/off, stop-race, errors |
 | `tests/unit/test-voice-herdr-shortcuts.mjs` | phrase matching, target-pane resolution, chord dispatch, failure handling (injected herdr runner) |
 | `tests/unit/test-voice-input.mjs` | end-to-end wiring: controller → recorder → real worker → auto-submit |
 

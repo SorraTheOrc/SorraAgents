@@ -61,6 +61,11 @@ export default function voiceInputExtension(pi: ExtensionAPI): void {
       sendShortcut: buildShortcutRunner(ctx),
       isIdle: () => ctx.isIdle(),
       checkDoctor: () => runDoctor({ config }),
+      playSound: () => {
+        // Terminal bell: the audible feedback cue, suppressible via
+        // `feedbackSound`. Never relied on for correctness.
+        process.stdout.write("\x07");
+      },
     });
     return controller;
   };

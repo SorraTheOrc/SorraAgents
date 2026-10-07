@@ -107,6 +107,7 @@ function harness(overrides = {}) {
     },
   };
   const userMessages = [];
+  const { config: configOverrides, ...rest } = overrides;
 
   const controller = createVoiceInputController({
     config: {
@@ -124,6 +125,7 @@ function harness(overrides = {}) {
       vadFilter: false,
       initialPrompt: "",
       workerScript: "",
+      ...(configOverrides || {}),
     },
     createRecorder: (options) => {
       const recorder = new MockRecorder(options);
@@ -139,7 +141,7 @@ function harness(overrides = {}) {
     },
     ui,
     sendUserMessage: (text, options) => userMessages.push({ text, options }),
-    ...overrides,
+    ...rest,
   });
 
   return { controller, ui, userMessages, recorders, clients };
@@ -328,7 +330,9 @@ describe("voice controller submission", () => {
     assert.deepEqual(userMessages, []);
     assert.equal(ui.editorText, "pre-existing draft");
     assert.equal(controller.getState(), STATE.idle);
-    assert.ok(ui.notifications.some((n) => /no speech detected/.test(n.message)));
+    assert.ok(
+      ui.notifications.some((n) => n.level === "warning" && /nothing captured/.test(n.message)),
+    );
   });
 
   test("a busy pi receives the transcript as a steering message", async () => {
@@ -367,6 +371,178 @@ describe("voice controller silence auto-stop", () => {
     assert.equal(controller.getState(), STATE.idle);
     assert.equal(recorders[0].stopCount, 1);
     assert.deepEqual(userMessages, [{ text: "auto submitted", options: undefined }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feedback acknowledgements (SA-0MUXZBHX0006IXNZ)
+// ---------------------------------------------------------------------------
+
+describe("voice controller feedback", () => {
+  test("start emits exactly one info acknowledgement and sets the footer", async () => {
+    const { controller, ui } = harness();
+
+    await controller.start();
+
+    const startNoise = ui.notifications.filter((n) => /enabled|listening/i.test(n.message));
+    assert.equal(startNoise.length, 1);
+    assert.equal(startNoise[0].level, "info");
+    assert.deepEqual(ui.statuses.at(-1), [STATUS_KEY, statusText(STATE.recording)]);
+  });
+
+  test("stop emits exactly one acknowledgement and updates the footer", async () => {
+    const { controller, ui, clients } = harness();
+    await controller.start();
+    clients[0].finalText = "hello world";
+
+    await controller.stop();
+
+    const stopNoise = ui.notifications.filter((n) => /disabled|stopped/i.test(n.message));
+    assert.equal(stopNoise.length, 1);
+    assert.equal(stopNoise[0].level, "info");
+    // The footer showed the transcribing indicator, then cleared.
+    assert.ok(ui.statuses.some(([, text]) => /Transcribing/.test(text ?? "")));
+    assert.equal(ui.statuses.at(-1)[1], undefined);
+  });
+
+  test("a non-empty capture is acknowledged as sending and submitted exactly once", async () => {
+    const { controller, ui, userMessages, clients } = harness();
+    await controller.start();
+    clients[0].finalText = "remember the milk";
+
+    await controller.stop();
+
+    const sendNoise = ui.notifications.filter((n) => n.level === "info" && /sending/i.test(n.message));
+    assert.equal(sendNoise.length, 1);
+    assert.match(sendNoise[0].message, /remember the milk/);
+    assert.equal(userMessages.length, 1);
+    assert.equal(ui.editorText, "");
+  });
+
+  test("sending feedback truncates a long transcript to its first words", async () => {
+    const { controller, ui, clients } = harness();
+    await controller.start();
+    clients[0].finalText = "one two three four five six seven eight";
+
+    await controller.stop();
+
+    const sendNoise = ui.notifications.find((n) => /sending/i.test(n.message));
+    assert.ok(sendNoise, "expected a sending acknowledgement");
+    assert.match(sendNoise.message, /one two three four five six/);
+    assert.match(sendNoise.message, /…/);
+  });
+
+  test("an empty capture warns that nothing was captured and submits nothing", async () => {
+    const { controller, ui, userMessages, clients } = harness();
+    ui.editorText = "draft";
+    await controller.start();
+    clients[0].finalText = "";
+
+    await controller.stop();
+
+    const emptyNoise = ui.notifications.filter(
+      (n) => n.level === "warning" && /nothing captured/i.test(n.message),
+    );
+    assert.equal(emptyNoise.length, 1);
+    assert.deepEqual(userMessages, []);
+    assert.equal(ui.editorText, "draft");
+  });
+
+  test("silence auto-stop emits the stop acknowledgement exactly once", async () => {
+    const { controller, ui, recorders, clients } = harness();
+    await controller.start();
+    clients[0].finalText = "auto";
+    const before = ui.notifications.length;
+
+    recorders[0].emit("silence", { at: 3000, silentMs: 3000 });
+    await flush();
+
+    const stopNoise = ui.notifications
+      .slice(before)
+      .filter((n) => /disabled|stopped/i.test(n.message));
+    assert.equal(stopNoise.length, 1);
+  });
+
+  test("a manual stop racing the silence auto-stop acknowledges each transition once", async () => {
+    const { controller, ui, userMessages, recorders, clients } = harness();
+    await controller.start();
+    clients[0].finalText = "race";
+    const before = ui.notifications.length;
+
+    // Silence auto-stop and a manual stop race; the state guard must collapse
+    // them into a single stop acknowledgement and a single outcome.
+    recorders[0].emit("silence", { at: 3000, silentMs: 3000 });
+    await controller.stop();
+    await flush();
+
+    const during = ui.notifications.slice(before);
+    const stopNoise = during.filter((n) => /disabled|stopped/i.test(n.message));
+    const sendNoise = during.filter((n) => /sending/i.test(n.message));
+    assert.equal(stopNoise.length, 1);
+    assert.equal(sendNoise.length, 1);
+    assert.equal(userMessages.length, 1);
+  });
+
+  test("abort emits exactly one notification and clears the footer", async () => {
+    const { controller, ui } = harness();
+    await controller.start();
+    const before = ui.notifications.length;
+
+    await controller.abort("audio capture failed: boom", "error");
+
+    const abortNoise = ui.notifications.slice(before);
+    assert.equal(abortNoise.length, 1);
+    assert.equal(abortNoise[0].level, "error");
+    assert.equal(ui.statuses.at(-1)[1], undefined);
+    assert.equal(controller.getState(), STATE.idle);
+  });
+
+  test("feedbackSound emits one cue per transition when enabled", async () => {
+    const cues = [];
+    const { controller, clients } = harness({
+      config: { feedbackSound: true },
+      playSound: () => cues.push(1),
+    });
+    await controller.start();
+    clients[0].finalText = "send this";
+
+    await controller.stop();
+
+    // start + stop + sending
+    assert.equal(cues.length, 3);
+  });
+
+  test("feedbackSound suppresses every cue when disabled", async () => {
+    const cues = [];
+    const { controller, clients } = harness({
+      config: { feedbackSound: false },
+      playSound: () => cues.push(1),
+    });
+    await controller.start();
+    clients[0].finalText = "send this";
+
+    await controller.stop();
+
+    assert.deepEqual(cues, []);
+  });
+
+  test("a throwing playSound never breaks a transition", async () => {
+    const warnings = [];
+    const { controller, ui, clients } = harness({
+      config: { feedbackSound: true },
+      playSound: () => {
+        throw new Error("no tty");
+      },
+      logger: { warn: (message) => warnings.push(message) },
+    });
+    await controller.start();
+    clients[0].finalText = "still works";
+
+    await controller.stop();
+
+    assert.ok(ui.notifications.some((n) => /sending/i.test(n.message)));
+    assert.equal(controller.getState(), STATE.idle);
+    assert.ok(warnings.some((w) => /sound cue failed/.test(w)));
   });
 });
 
