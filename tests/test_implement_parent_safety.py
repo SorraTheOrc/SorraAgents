@@ -51,7 +51,11 @@ def implement_mod():
 
 
 def _child(
-    work_item_id: str, status: str = "open", assignee: str = "", sort_index: int = 1000
+    work_item_id: str,
+    status: str = "open",
+    assignee: str = "",
+    sort_index: int = 1000,
+    deleted_by: str = "",
 ) -> dict:
     return {
         "id": work_item_id,
@@ -61,6 +65,7 @@ def _child(
         "assignee": assignee,
         "priority": "high",
         "sortIndex": sort_index,
+        "deletedBy": deleted_by,
     }
 
 
@@ -186,6 +191,64 @@ class TestMixedStatuses:
         h.run()
         assert h.calls["phase_start"] == ["SA-C1"]
         assert "SA-PARENT001" not in h.calls["phase_start"]
+
+
+# ===========================================================================
+# Soft-deleted siblings count as terminal for in-chain blocker gating
+# (AC3, SA-0MUTWB8BA003J0V6)
+# ===========================================================================
+
+
+class TestSoftDeletedBlockerGating:
+    def test_child_blocked_only_by_soft_deleted_sibling_is_startable(self, implement_mod):
+        """A real child blocked only by a soft-deleted sibling must still be
+        startable: soft-deleted children count as terminal when gating
+        in-chain blockers (terminal determination must match
+        _classify_child, not status alone)."""
+        children = [
+            _child("SA-D", status="open", sort_index=1, deleted_by="plan"),
+            _child("SA-B", status="blocked", sort_index=2),
+        ]
+        blockers_map = {"SA-B": [{"id": "SA-D", "direction": "depends-on"}]}
+        h = ParentHarness(implement_mod, children, blockers_map=blockers_map)
+        report = h.run()
+
+        assert report["success"] is True
+        # SA-D is soft-deleted → skip-terminal; SA-B's only blocker is
+        # terminal, so SA-B is startable rather than being blocked forever.
+        assert h.calls["phase_start"] == ["SA-B"]
+        assert report.get("blocked_children") is None
+        assert report.get("parent_advanced") is None or report.get("parent_advanced") is False
+
+    def test_next_child_to_implement_treats_soft_deleted_blocker_as_terminal(
+        self, implement_mod
+    ):
+        """Unit-level: _next_child_to_implement must compute terminal_ids
+        with the same soft-delete-aware rule as _classify_child, so a child
+        blocked only by a soft-deleted sibling is returned as startable."""
+        children = [
+            _child("SA-D", status="open", sort_index=1, deleted_by="plan"),
+            _child("SA-B", status="blocked", sort_index=2),
+        ]
+        blockers_map = {"SA-B": [{"id": "SA-D", "direction": "depends-on"}]}
+        nxt = implement_mod._next_child_to_implement(children, blockers_map)
+        assert nxt is not None
+        assert nxt["id"] == "SA-B"
+
+    def test_soft_deleted_child_does_not_prevent_parent_advancement(self, implement_mod):
+        """A parent whose non-terminal children are all soft-deleted (mixed
+        with terminal siblings) must advance rather than loop forever."""
+        children = [
+            _child("SA-T", status="completed"),
+            _child("SA-D", status="open", deleted_by="plan"),
+        ]
+        h = ParentHarness(implement_mod, children)
+        report = h.run()
+
+        assert report["success"] is True
+        assert report.get("parent_advanced") is True
+        assert h.calls["phase_start"] == []
+        assert h.calls["update_status"] == [("SA-PARENT001", "completed", "in_review", None)]
 
 
 # ===========================================================================

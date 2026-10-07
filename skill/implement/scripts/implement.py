@@ -749,6 +749,27 @@ def _is_terminal_status(status: str) -> bool:
     return status in TERMINAL_STATUSES
 
 
+def _is_terminal_child(child: dict[str, Any]) -> bool:
+    """Whether a child work item is terminal for parent-recursion purposes.
+
+    A child is terminal when either its status is terminal
+    (:func:`_is_terminal_status`) or it has been soft-deleted
+    (``deletedBy`` set). ``wl delete`` sets ``deletedBy`` and may leave the
+    status untouched (e.g. ``open``); such items can never be implemented,
+    so they must be skipped and must never block parent advancement
+    (SA-0MUTWB8BA003J0V6).
+
+    Args:
+        child: A child work-item dict from ``wl show --children``.
+
+    Returns:
+        True if the child is terminal.
+    """
+    if str(child.get("deletedBy", "") or "").strip():
+        return True
+    return _is_terminal_status(str(child.get("status", "")))
+
+
 def _classify_child(child: dict[str, Any]) -> str:
     """Classify a child for the parent-recursion plan.
 
@@ -764,7 +785,7 @@ def _classify_child(child: dict[str, Any]) -> str:
         The classification string.
     """
     status = str(child.get("status", ""))
-    if _is_terminal_status(status):
+    if _is_terminal_child(child):
         return "skip-terminal"
     if status in ("in-progress", "in_progress"):
         return "skip-in-progress"
@@ -869,7 +890,7 @@ def _next_child_to_implement(
     terminal_ids = {
         str(c.get("id"))
         for c in children
-        if _is_terminal_status(str(c.get("status", "")))
+        if _is_terminal_child(c)
     }
     for child in children:
         action = _classify_child(child)
@@ -4085,7 +4106,7 @@ def phase_parent(
     child_ids = {str(c.get("id")) for c in children}
     terminal_ids = {
         str(c.get("id")) for c in children
-        if _is_terminal_status(str(c.get("status", "")))
+        if _is_terminal_child(c)
     }
     pending_ids: list[str] = []
     blocked_ids: list[str] = []

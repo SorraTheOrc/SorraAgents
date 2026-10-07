@@ -56,7 +56,12 @@ def implement_mod():
     return mod
 
 
-def _child(work_item_id: str, status: str = "open", assignee: str = "") -> dict:
+def _child(
+    work_item_id: str,
+    status: str = "open",
+    assignee: str = "",
+    deleted_by: str = "",
+) -> dict:
     """Build a canned child dict as returned by ``wl show --children``."""
     return {
         "id": work_item_id,
@@ -66,6 +71,7 @@ def _child(work_item_id: str, status: str = "open", assignee: str = "") -> dict:
         "assignee": assignee,
         "priority": "high",
         "sortIndex": 1000,
+        "deletedBy": deleted_by,
     }
 
 
@@ -391,6 +397,58 @@ class TestDeletedChildren:
         assert implement_mod._classify_child(_child("SA-C1", status="deleted")) == "skip-terminal"
         assert implement_mod._classify_child(_child("SA-C2", status="completed")) == "skip-terminal"
         assert implement_mod._classify_child(_child("SA-C3", status="open")) == "implement"
+
+
+# ===========================================================================
+# Soft-deleted children (deletedBy set, status still open) are treated as
+# terminal — never claimed, never given a worktree, never block the parent
+# (SA-0MUTWB8BA003J0V6)
+# ===========================================================================
+
+
+class TestSoftDeletedChildren:
+    def test_classify_child_soft_deleted_is_skip_terminal(self, implement_mod):
+        """Unit-level: a child with deletedBy set must be classified
+        skip-terminal even though its status is still 'open'."""
+        child = _child("SA-C1", status="open", deleted_by="plan")
+        assert implement_mod._classify_child(child) == "skip-terminal"
+
+    def test_soft_deleted_child_is_not_started(self, implement_mod):
+        """A soft-deleted child (status open, deletedBy set) must never be
+        claimed or given a worktree by phase_parent."""
+        children = [_child("SA-C1", status="open", deleted_by="plan")]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        actions = {c["id"]: c["action"] for c in report.get("children", [])}
+        assert actions["SA-C1"] == "skip-terminal"
+        assert report["_calls"]["phase_start"] == []
+
+    def test_parent_with_only_soft_deleted_children_advances(self, implement_mod):
+        """A parent whose only children are soft-deleted must advance to
+        completed/in_review — they can never be implemented."""
+        children = [_child("SA-C1", status="open", deleted_by="plan")]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        assert report["success"] is True
+        assert report.get("parent_advanced") is True
+        assert report["_calls"]["update_status"] == [
+            ("SA-PARENT001", "completed", "in_review", None)
+        ]
+        assert report["_calls"]["phase_start"] == []
+
+    def test_soft_deleted_child_skipped_when_open_siblings_remain(self, implement_mod):
+        """A soft-deleted child never hides genuinely open siblings: the
+        next startable open child is still implemented."""
+        children = [
+            _child("SA-C1", status="open", deleted_by="plan"),
+            _child("SA-C2", status="open"),
+        ]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        assert report["success"] is True
+        assert report.get("parent_advanced") is None or report.get("parent_advanced") is False
+        assert report["_calls"]["phase_start"] == ["SA-C2"]
+        assert report.get("next_child") == "SA-C2"
 
 
 # ===========================================================================
