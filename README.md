@@ -63,6 +63,11 @@ cache entry. See [`skill/test/SKILL.md`](skill/test/SKILL.md),
 
 ### For Release Managers
 
+Running a release does not require a work item — the `/skill:ship release`
+action is work-item-exempt, so do **not** create a work item for the release.
+This is separate from the automatic closure of `in_review` work items once the
+release lands on `main` (Release Process step 12).
+
 The canonical release script lives under the ship skill at
 `skill/ship/scripts/release/merge-dev-to-main.sh` and is invoked via
 `node skill/ship/scripts/run-release.js` (see [skill/ship/SKILL.md](skill/ship/SKILL.md)).

@@ -15,6 +15,14 @@ Provide a single, deterministic release workflow: `dev` is promoted to `main` vi
 
 Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "ship", "release", "promote dev", "merge dev to main", "release the changes" — all map to `release`.
 
+> **No work item is required for a release.** Running `/skill:ship release` is
+> a work-item-exempt maintenance action: invoke it directly and do **not**
+> create a release work item (nor ask the operator to create one). This is
+> distinct from the automatic **closure** of `in_review`/`completed` work items
+> performed after a verified release (Release Process step 12,
+> `closeWorkItemsAfterRelease`) — that closure happens with no release work
+> item existing.
+
 ## How Agents Invoke This Skill
 
 ```

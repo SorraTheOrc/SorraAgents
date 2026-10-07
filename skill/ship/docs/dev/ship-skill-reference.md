@@ -6,6 +6,16 @@ The ship skill automates the `dev` → `main` release workflow and provides
 related tooling (`pushToDev`, audit gate, branch checks).  All scripts are
 internal — the only user-facing action is `release`.
 
+## Work-item exemption
+
+**No work item is required for a release.** Running a release
+(`/skill:ship release`, `run-release.js`) is a work-item-exempt maintenance
+action: do **not** create a release work item (nor ask the operator to create
+one). This is distinct from the automatic **closure** of `in_review` work items
+after a verified release (Release Process step 12, `closeWorkItemsAfterRelease`),
+which needs no release work item to exist. See
+[SKILL.md](../../SKILL.md#when-to-use).
+
 ## Configuration Schema
 
 ### Per-project configuration (`<project>/.worklog/config.yaml`)

@@ -39,6 +39,12 @@ they clean up the worktree and return to the main checkout.
 - A human reviewer inspects local test results and triggers the merge from `dev` → `main`.
 - `main` must always be releasable.
 
+> **No work item is required for a release.** The `/skill:ship release` action is
+> work-item-exempt: do **not** create a work item for the release. The automatic
+> **closure** of `in_review`/`completed` items after a verified release
+> (see [Post-merge Steps](#post-merge-steps)) is a separate step that needs no
+> release work item to exist.
+
 ## Pre-merge Checklist
 
 Before merging `dev` into `main`, the Release Manager **must** verify:

@@ -6,6 +6,16 @@ operational brief; this document preserves the full implementation reference
 for maintainers and release operators. Workflow semantics are unchanged —
 every command/flag documented here is still valid.
 
+## Work-item exemption
+
+**No work item is required for a release.** Running a release
+(`/skill:ship release`, `run-release.js`) is a work-item-exempt maintenance
+action: do **not** create a release work item (nor ask the operator to create
+one). This is distinct from the automatic **closure** of `in_review` work items
+after a verified release (Release Process step 12, `closeWorkItemsAfterRelease`),
+which needs no release work item to exist. See
+[skill/ship/SKILL.md](../../skill/ship/SKILL.md#when-to-use).
+
 ## Internal Scripts and Modules
 
 All scripts below are internal implementation details — they are not exposed as user-facing actions. The only user-facing action is `release`.
