@@ -148,6 +148,10 @@ DEFAULT_CHILD_SESSION_TIMEOUT = 3600
 #: ``phase_drive`` refuses to run — a driven session implements its own work
 #: item with the leaf workflow and must never re-enter the driver.
 DRIVE_RECURSION_ENV = "IMPLEMENT_DRIVE_ACTIVE"
+#: Absolute path to the driven child's worktree, injected into its environment
+#: so the child can verify its worktree root before its first edit — ``cwd``
+#: alone does not confine an agent (it can ``cd`` to the main checkout).
+WORKTREE_ENV = "IMPLEMENT_WORKTREE_PATH"
 
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
@@ -942,6 +946,35 @@ def git_has_dirty_files(status_output: str | None = None) -> bool:
         if line.strip():
             return True
     return False
+
+
+def _main_checkout_offending_paths(repo_root: str) -> list[str]:
+    """Return the non-``.worklog/`` dirty paths in a checkout.
+
+    Used by the implementation-placement gates to name the offending files
+    when work landed in the main checkout instead of a worktree.
+
+    Args:
+        repo_root: Absolute path to the main checkout root.
+
+    Returns:
+        Sorted, de-duplicated list of paths (relative to *repo_root*) that are
+        dirty outside ``.worklog/``. Empty when the checkout is clean.
+    """
+    status_output = git_status(cwd=repo_root)
+    paths: list[str] = []
+    for line in status_output.splitlines():
+        if line.startswith("##") or not line.strip():
+            continue
+        # Porcelain v1: ``XY <path>`` — the path starts at column 4. Renames
+        # are rendered as ``XY <old> -> <new>``; report the destination.
+        file_path = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in file_path:
+            file_path = file_path.split(" -> ", 1)[1].strip()
+        if not file_path or file_path.startswith(".worklog/"):
+            continue
+        paths.append(file_path)
+    return sorted(set(paths))
 
 
 def git_worktree_add(
@@ -3812,6 +3845,7 @@ def _invoke_implement(
     work_item_id: str,
     no_refactor: bool = False,
     verbose: bool = False,
+    parse_on_failure: bool = False,
 ) -> dict[str, Any] | None:
     """Run an implement phase as a subprocess and parse JSON output.
 
@@ -3820,10 +3854,17 @@ def _invoke_implement(
         work_item_id: The work item ID.
         no_refactor: If True, add ``--no-refactor`` flag.
         verbose: If True, add ``-v`` flag.
+        parse_on_failure: If True, return the parsed JSON report even when the
+            subprocess exits non-zero (so an actionable failure — e.g. the
+            worktree-placement guard — is surfaced to the caller instead of a
+            generic error). Callers that gate on the ``None`` sentinel (start,
+            finish) must leave this ``False``.
 
     Returns:
         Parsed JSON result dict on success (exit code 0), or ``None``
-        if the subprocess failed (exit code non-zero).
+        if the subprocess failed (exit code non-zero). When
+        *parse_on_failure* is set, a parseable non-zero-exit report is returned
+        instead of ``None``.
     """
     flags: list[str] = []
     if no_refactor:
@@ -3847,6 +3888,13 @@ def _invoke_implement(
             result.stdout[:500],
             result.stderr[:500],
         )
+        if parse_on_failure:
+            try:
+                parsed = json.loads(result.stdout)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
         return None
     try:
         return json.loads(result.stdout)
@@ -4073,6 +4121,31 @@ def phase_parent(
             print()
         return report
 
+    def _fail_placement(cid: str, violation: str) -> dict[str, Any]:
+        """Fail closed when a child's work landed in the main checkout.
+
+        A non-terminal child whose worktree is clean at the parent HEAD while
+        the main checkout is dirty means the child wrote outside its worktree
+        (``cwd`` is not sufficient). Report the offending paths and stop
+        instead of silently proceeding or advancing the parent.
+        """
+        LOG.error(violation)
+        report["success"] = False
+        report["message"] = violation
+        report["next_child"] = cid
+        report["placement_violation"] = True
+        report["children_processed"] = child_results
+        wl_add_comment(
+            work_item_id,
+            "Parent phase refused: a child session wrote to the main "
+            f"checkout instead of its worktree.\n```\n{violation}\n```",
+        )
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n\u26d4 {violation}\n")
+        return report
+
     def _run_finish(cid: str, title: str = "") -> dict[str, Any] | None:
         """Run the finish subprocess for *cid* (None on failure)."""
         LOG.info("Child %s has changes — running finish subprocess...", cid)
@@ -4125,6 +4198,11 @@ def phase_parent(
                 if _run_finish(cid, title) is None:
                     return report
             elif worktree_path:
+                violation = _child_main_checkout_violation(
+                    cid, worktree_path, parent_branch
+                )
+                if violation:
+                    return _fail_placement(cid, violation)
                 return _report_implement_next(
                     cid, worktree_path, "",
                     f"Child {cid} is in progress. Implement in "
@@ -4159,6 +4237,11 @@ def phase_parent(
             continue
 
         if worktree_path:
+            violation = _child_main_checkout_violation(
+                cid, worktree_path, parent_branch
+            )
+            if violation:
+                return _fail_placement(cid, violation)
             return _report_implement_next(
                 cid, worktree_path, "",
                 f"Child {cid} worktree exists at {worktree_path}. "
@@ -4267,14 +4350,21 @@ def phase_parent(
     return report
 
 
-def _child_session_env(base: dict[str, str] | None = None) -> dict[str, str]:
+def _child_session_env(
+    base: dict[str, str] | None = None,
+    worktree_path: str | None = None,
+) -> dict[str, str]:
     """Build the environment for a driven child session.
 
-    Marks the session as driver-owned (recursion guard) and removes the
-    parent session's identity so the child starts its own clean session.
+    Marks the session as driver-owned (recursion guard), removes the
+    parent session's identity so the child starts its own clean session,
+    and (when *worktree_path* is given) injects ``IMPLEMENT_WORKTREE_PATH``
+    so the child can verify its worktree root before its first edit.
 
     Args:
         base: Base environment (defaults to ``os.environ``).
+        worktree_path: Absolute path to the child's worktree. When provided,
+            exported as ``IMPLEMENT_WORKTREE_PATH``.
 
     Returns:
         A new environment mapping for the child process.
@@ -4283,6 +4373,8 @@ def _child_session_env(base: dict[str, str] | None = None) -> dict[str, str]:
     env[DRIVE_RECURSION_ENV] = "1"
     env.pop("PI_SESSION_ID", None)
     env.pop("PI_SESSION_FILE", None)
+    if worktree_path:
+        env[WORKTREE_ENV] = worktree_path
     return env
 
 
@@ -4564,7 +4656,17 @@ def phase_drive(
         _emit_phase_report(report, json_output)
         return report
 
-    runner = parent_runner or _invoke_implement
+    if parent_runner is None:
+        def runner(action, wid, no_refactor=False, verbose=False):
+            # parse_on_failure surfaces the worktree-placement guard's
+            # actionable failure (parsed from --json stdout) instead of the
+            # generic "parent failed" message.
+            return _invoke_implement(
+                action, wid, no_refactor=no_refactor, verbose=verbose,
+                parse_on_failure=True,
+            )
+    else:
+        runner = parent_runner
     spawner = spawn_session or _default_session_spawner
     timeout = child_timeout or _resolve_child_session_timeout()
     max_child_sessions = max(1, int(max_child_sessions))
@@ -4636,7 +4738,7 @@ def phase_drive(
             report["failed_child"] = child_id
             break
 
-        env = _child_session_env()
+        env = _child_session_env(worktree_path=worktree_path)
         LOG.info(
             "Driving child %s (session %d/%d) in %s",
             child_id, attempts[child_id], max_child_sessions, worktree_path,
@@ -4763,6 +4865,73 @@ def _git_path_has_changes(path: Path, parent_branch: str) -> bool:
     if head.returncode == 0 and parent.returncode == 0:
         return head.stdout.strip() != parent.stdout.strip()
     return True  # cannot compare; fail open
+
+
+def _child_main_checkout_violation(
+    child_id: str,
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    repo_root: str | None = None,
+) -> str | None:
+    """Detect a child session that wrote to the main checkout, not its worktree.
+
+    A driven child session receives ``cwd=<worktree>`` (and
+    ``IMPLEMENT_WORKTREE_PATH``), but ``cwd`` is only a hint: an agent can
+    prefix commands with ``cd <main-checkout> && ...`` and write there. This
+    guard detects that failure after the fact so ``phase_parent``/``phase_drive``
+    fail closed instead of silently proceeding. A violation exists only when
+    ALL of:
+
+    1. the child is non-terminal (the caller enforces this),
+    2. the main checkout holds uncommitted changes outside ``.worklog/``, and
+    3. the child's worktree holds NO changes (clean and at the parent branch
+       HEAD) — so the work did not land in the worktree.
+
+    Condition 3 keeps the guard precise: pre-existing/unrelated dirt in the
+    main checkout does not block a child whose work legitimately lives in its
+    worktree. This mirrors :func:`_worktree_placement_violation`, minus the
+    cwd-sensitive check that only applies to ``phase_finish``.
+
+    Args:
+        child_id: The child work item ID (named in the message).
+        worktree_path: Absolute path to the child's worktree.
+        parent_branch: Branch the worktree forked from (default: ``dev``).
+        repo_root: Main checkout root (defaults to discovery from the
+            worktree).
+
+    Returns:
+        An actionable error message naming the offending main-checkout paths,
+        or ``None`` when there is no violation.
+    """
+    wt = Path(worktree_path)
+    if not wt.exists():
+        return None
+
+    repo_root_str = repo_root or _get_repo_root(str(wt))
+    if not repo_root_str:
+        return None
+    root = Path(repo_root_str).resolve()
+
+    offending = _main_checkout_offending_paths(str(root))
+    if not offending:
+        return None  # main checkout clean
+
+    if _git_path_has_changes(wt, parent_branch):
+        return None  # work lives in the worktree; main-checkout dirt is unrelated
+
+    listing = "\n".join(f"  - {p}" for p in offending[:20])
+    if len(offending) > 20:
+        listing += f"\n  … and {len(offending) - 20} more"
+    return (
+        f"Child {child_id} produced changes in the main checkout at {root} "
+        f"instead of its worktree {wt}. The worktree has no changes (clean at "
+        f"{parent_branch} HEAD), so the child's work did not land in its own "
+        f"worktree — `cwd` is not sufficient. Offending main-checkout paths:\n"
+        f"{listing}\n"
+        f"Move these changes into {wt} (or discard them), then re-run. A "
+        f"driven child MUST run every write/edit with a path that resolves "
+        f"inside its worktree."
+    )
 
 
 def _discover_worktree(work_item_id: str) -> str | None:

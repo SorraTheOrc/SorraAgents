@@ -350,6 +350,27 @@ proceed to Step 5.
 > main checkout. `implement.py finish` refuses if it detects changes outside
 > the worktree; `implement.py start` creates it for you — `cd` into it and do
 > all work there.
+>
+> **`cwd` is not sufficient.** Before your first write, verify you are
+> *operating in* the worktree and that every write/edit path resolves inside
+> it:
+>
+> ```bash
+> expected="$(pwd)"   # after `cd` into .worklog/worktrees/wl-<WIP-id>-<slug>
+> test "$(git rev-parse --show-toplevel)" = "$expected" \
+>   || { echo "REFUSING: not inside the worktree"; exit 1; }
+> # Driven child sessions can assert the injected root instead:
+> test "$(git rev-parse --show-toplevel)" = "$IMPLEMENT_WORKTREE_PATH" || exit 1
+> ```
+>
+> Never edit through an absolute path under the main checkout (e.g.
+> `/…/main-checkout/src/…`) — `cwd` is only a hint an agent can override per
+> command. `phase_parent`/`drive` detect a driven child whose work landed in
+> the main checkout and fail closed, naming the offending paths. See
+> [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md) for
+> the `wl`-vs-edits split (run `wl` from inside the worktree with
+> `wl --worklog-dir <main-checkout>/.worklog …`; never `cd` to the main
+> checkout to edit).
 
 ```bash
 git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-id>-<short-slug> dev
@@ -462,6 +483,13 @@ layers on top of the subprocess-isolated orchestration above:
 - **Worktree isolation preserved.** Every child is still implemented in its
   own worktree created by `phase_start`; session and worktree isolation are
   independent and both apply.
+- **Verify the worktree root before the first edit.** A driven child is
+  spawned with `cwd=<child worktree>` and `IMPLEMENT_WORKTREE_PATH=<child
+  worktree>`, but `cwd` is not sufficient — before writing, assert
+  `test "$(git rev-parse --show-toplevel)" = "$IMPLEMENT_WORKTREE_PATH"` and
+  keep every write/edit path inside that root. A child that writes to the main
+  checkout is detected by the worktree placement guard below and fails closed.
+  See [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md).
 - **Session logging.** Each new session comments on the child work item with
   its session id (`<agent_action> - Session ID: <pi_session_id> -
   <path_to_sessions_log>`), per the AGENTS.md session-logging convention.
@@ -499,6 +527,10 @@ Guards (deterministic, in `phase_parent`):
 - **No orphaned `in_progress`** — a child start failure or abort leaves no
   in-progress state behind; re-run the parent phase after resolving the
   blocker to continue the chain.
+- **Worktree placement guard** — a non-terminal child whose worktree is clean
+  at the parent-HEAD while the main checkout is dirty outside `.worklog/` has
+  written to the main checkout; the phase fails closed with the offending
+  paths (and does not advance the parent) instead of silently proceeding.
 - A parent with no children or all-terminal children behaves as today.
 
 Worktree isolation per child is preserved: every child is implemented in

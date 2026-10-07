@@ -91,3 +91,25 @@ class TestStep61Alignment:
         step = _step()
         assert "AGENTS_GLOBAL.md" in step
         assert "one session per child" in step
+
+
+# ── Worktree-root verification (SA-0MUY9PSRS003V5CM, AC1) ────────────────────
+
+
+class TestStep61WorktreeRootVerification:
+    """AC1: Step 6.1 repeats the verify-before-first-write requirement."""
+
+    def test_verify_worktree_root_documented(self) -> None:
+        step = _step()
+        assert "Verify the worktree root before the first edit" in step
+        assert "git rev-parse --show-toplevel" in step
+        assert "IMPLEMENT_WORKTREE_PATH" in step
+
+    def test_worktree_placement_guard_documented(self) -> None:
+        step = _step()
+        assert "Worktree placement guard" in step
+        assert "main checkout" in step
+
+    def test_links_to_worktree_isolation_doc(self) -> None:
+        step = _step()
+        assert "docs/dev/worktree-isolation.md" in step
