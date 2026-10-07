@@ -18,6 +18,8 @@ import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 import { sendReleaseNotification } from './discord-notify.js';
 import { Timer } from './timing.js';
+import { tmpdir } from 'node:os';
+import { mkdtempSync } from 'node:fs';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -26,6 +28,9 @@ const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
 // Skill layout: <skill-dir>/scripts/release/merge-dev-to-main.sh
 const skillDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const SKILL_RELEASE_SCRIPT = join(skillDir, 'scripts', 'release', 'merge-dev-to-main.sh');
+
+// Path to the cleanup scripts (relative to repository root)
+const SKILL_CLEANUP_DIR = join(skillDir, '..', 'cleanup', 'scripts');
 
 // Timeout (ms) for the release-script subprocess. A hung git/gh operation
 // must fail the release loudly after a bounded time instead of blocking
@@ -658,6 +663,208 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   };
 }
 
+// ── runPostReleaseCleanup ─────────────────────────────────────────────────────
+
+/**
+ * Run post-release branch cleanup (non-blocking).
+ *
+ * Invokes the cleanup scripts to prune merged local branches and delete
+ * stale remote branches after a successful release.
+ *
+ * Steps:
+ *   1. Run `summarize_branches.py --report` to enumerate branches.
+ *   2. Extract merged branch names from the report.
+ *   3. Write the branch list to a temporary JSON file.
+ *   4. Run `prune_local_branches.py --branches-file <file> --yes`
+ *      (with `--dry-run` when the release was invoked with `--dry-run`).
+ *   5. Run `delete_remote_branches.py --days 14 --yes`
+ *      (with `--dry-run` when the release was invoked with `--dry-run`).
+ *   6. Log results to the release output.
+ *
+ * Non-blocking: failures are logged as warnings and never change the release
+ * exit code (AC3).
+ *
+ * @param {object} [options] - Optional parameters.
+ * @param {boolean} [options.dryRun=false] - When true, cleanup runs in dry-run mode.
+ * @returns {{ success: boolean, message: string, summary: object, dryRun: boolean }}
+ */
+export function runPostReleaseCleanup(options = {}) {
+  const { dryRun = false } = options;
+  const tempDir = tmpdir();
+  let cleanupTmpDir = null;
+
+  try {
+    // Step 1: Run summarize_branches.py to get the branch list
+    console.log('\nPost-release cleanup: enumerating branches...');
+
+    const summaryResult = spawnSync(
+      'python3',
+      [
+        join(SKILL_CLEANUP_DIR, 'summarize_branches.py'),
+        '--report',
+        `${tempDir}/cleanup-summary.json`,
+        '--quiet',
+      ],
+      {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 30000,
+      },
+    );
+
+    if (summaryResult.status !== 0) {
+      const errorMsg = summaryResult.stderr?.toString()?.trim() || summaryResult.stdout?.toString()?.trim() || 'summarize_branches.py failed';
+      console.warn(`  ⚠ Branch enumeration failed: ${errorMsg}`);
+      return {
+        success: false,
+        message: `Branch enumeration failed: ${errorMsg}`,
+        summary: {},
+        dryRun,
+      };
+    }
+
+    // Step 2: Read the summarize report and extract merged branches
+    let reportData = null;
+    try {
+      const reportContent = readFileSync(
+        `${tempDir}/cleanup-summary.json`,
+        'utf-8',
+      );
+      reportData = JSON.parse(reportContent);
+    } catch (_err) {
+      console.warn('  ⚠ Failed to read summarize report; skipping local cleanup.');
+      reportData = { branches: [] };
+    }
+
+    // Extract branches that are merged into the default branch
+    const mergedBranches = [];
+    if (reportData?.branches) {
+      for (const branch of reportData.branches) {
+        if (branch.merged_into_default && !branch.protected) {
+          mergedBranches.push(branch.branch);
+        }
+      }
+    }
+
+    // Step 3: Write branch list to temp file
+    cleanupTmpDir = mkdtempSync(join(tempDir, 'cleanup-branches-'));
+    const branchesFile = join(cleanupTmpDir, 'branches-to-delete.json');
+    writeFileSync(branchesFile, JSON.stringify(mergedBranches));
+
+    console.log(`Found ${mergedBranches.length} merged local branch(es) to clean up.`);
+
+    // Step 4: Prune local branches
+    const pruneArgs = [
+      join(SKILL_CLEANUP_DIR, 'prune_local_branches.py'),
+      '--branches-file',
+      branchesFile,
+      '--yes',
+    ];
+    if (dryRun) {
+      pruneArgs.push('--dry-run');
+    }
+
+    console.log('\nPost-release cleanup: pruning local branches...');
+    const pruneResult = spawnSync('python3', pruneArgs, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 60000,
+    });
+
+    let pruneSummary = {};
+    if (pruneResult.status === 0) {
+      try {
+        const pruneReport = JSON.parse(
+          pruneResult.stdout || '{}',
+        );
+        pruneSummary = pruneReport?.summary || {};
+        const deleted = pruneSummary.deleted || 0;
+        console.log(`  Pruned ${deleted} local branch(es)${dryRun ? ' (dry-run)' : ''}.`);
+      } catch (_err) {
+        console.log(`  Local branch prune completed${dryRun ? ' (dry-run)' : ''}.`);
+      }
+    } else {
+      const errorMsg = pruneResult.stderr?.toString()?.trim() || pruneResult.stdout?.toString()?.trim() || 'prune_local_branches.py failed';
+      console.warn(`  ⚠ Local branch pruning failed: ${errorMsg}`);
+    }
+
+    // Step 5: Delete remote branches (older than 14 days)
+    console.log('\nPost-release cleanup: pruning remote branches...');
+    const remoteArgs = [
+      join(SKILL_CLEANUP_DIR, 'delete_remote_branches.py'),
+      '--days',
+      '14',
+      '--yes',
+    ];
+    if (dryRun) {
+      remoteArgs.push('--dry-run');
+    }
+
+    const remoteResult = spawnSync('python3', remoteArgs, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 60000,
+    });
+
+    let remoteSummary = {};
+    if (remoteResult.status === 0) {
+      try {
+        const remoteReport = JSON.parse(remoteResult.stdout || '{}');
+        remoteSummary = remoteReport?.summary || {};
+        const deleted = remoteSummary.deleted || 0;
+        console.log(`  Deleted ${deleted} remote branch(es)${dryRun ? ' (dry-run)' : ''}.`);
+      } catch (_err) {
+        console.log(`  Remote branch pruning completed${dryRun ? ' (dry-run)' : ''}.`);
+      }
+    } else {
+      const errorMsg = remoteResult.stderr?.toString()?.trim() || remoteResult.stdout?.toString()?.trim() || 'delete_remote_branches.py failed';
+      console.warn(`  ⚠ Remote branch pruning failed: ${errorMsg}`);
+    }
+
+    // Step 6: Produce summary report
+    const summary = {
+      localDeleted: pruneSummary.deleted || 0,
+      localSkipped: pruneSummary.skip || 0,
+      remoteDeleted: remoteSummary.deleted || 0,
+      remoteSkipped: remoteSummary.skip || 0,
+    };
+
+    console.log('\nPost-release cleanup summary:');
+    console.log(`  Local branches pruned: ${summary.localDeleted}`);
+    console.log(`  Remote branches deleted: ${summary.remoteDeleted}`);
+    if (dryRun) {
+      console.log('  (dry-run mode — no branches were actually removed)');
+    }
+
+    return {
+      success: true,
+      message: 'Branch cleanup completed successfully.',
+      summary,
+      dryRun,
+    };
+  } catch (err) {
+    console.warn(
+      `  ⚠ Branch cleanup failed with error: ${err.message}`,
+    );
+    return {
+      success: false,
+      message: `Branch cleanup failed: ${err.message}`,
+      summary: {},
+      dryRun,
+    };
+  } finally {
+    // Clean up temporary files
+    if (cleanupTmpDir) {
+      try {
+        rmSync(cleanupTmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // best-effort cleanup
+      }
+    }
+  }
+}
+
+
 // ── syncDevWithMain ──────────────────────────────────────────────────────────
 
 /**
@@ -821,6 +1028,8 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * 8. Verify the release merge landed on main (gating, exit code 11)
  * 8.5. Post-release Discord notification (non-blocking)
  * 9. Close work items shipped in this release (non-blocking)
+ * 10. Post-release branch cleanup — prune merged local branches and stale
+ *     remote branches (non-blocking)
  *
  * @param {string[]} [cliArgs=[]] - Command-line arguments.
  * @returns {number} Exit code (0 = success).
@@ -1145,6 +1354,21 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
       console.warn(`\n⚠ Non-critical: ${closeResult.message}`);
     }
     stepTimers['Step 9: close work items'].stop();
+
+    // ── Step 10: Post-release branch cleanup (non-blocking) ─────────────
+    // Automatically prune merged local branches and stale remote branches
+    // after a successful release. Failures are logged as warnings and never
+    // change the release exit code (AC3).
+    startStep('Step 10: post-release cleanup');
+    try {
+      const cleanupResult = runPostReleaseCleanup({ dryRun: isDryRun });
+      if (!cleanupResult.success) {
+        console.warn(`\n⚠ Post-release cleanup failed: ${cleanupResult.message}`);
+      }
+    } catch (err) {
+      console.warn(`\n⚠ Post-release cleanup threw an error: ${err.message}`);
+    }
+    stepTimers['Step 10: post-release cleanup'].stop();
   } else {
     stepTimers['Step 8: verify release merge'].stop();
   }
