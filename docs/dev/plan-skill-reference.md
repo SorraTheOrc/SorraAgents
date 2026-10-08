@@ -75,6 +75,19 @@ from skill.plan.plan_helpers import (
   )
   ```
 
+## Plan-approval gate semantics
+
+`should_request_plan_approval(work_item)` implements an **AND** gate: the plan
+skill asks the producer to approve a proposed feature plan only when the work
+item is both the largest and the highest-risk — effort t-shirt **Extra Large**
+(`PLAN_APPROVAL_EFFORT`) **AND** risk **High** or **Severe**
+(`PLAN_APPROVAL_RISK`). Every other effort/risk combination proceeds directly
+to the automated review stages without an approval pause. Absent effort and/or
+risk values default conservatively to requesting approval, so a human
+checkpoint is never silently skipped. The returned `reason` names both the
+effort scale and the risk level that triggered the gate
+(SA-0MUYG0HE6001YTEM).
+
 ## Appendix: Clarifying questions & answers (must include)
 
 Every planning session must produce an auditable Appendix of questions asked and answers received, appended to the plan content in the parent work item (description or comment).

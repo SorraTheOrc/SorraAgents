@@ -133,16 +133,18 @@ python3 ./plan_helpers.py plan-approval-gate <work-item-id>
 ```
 
 Expected keys: `request_approval` (`true`/`false`) and `reason`. The gate
-requests approval when effort is Medium/Large/Extra Large **OR** risk is
-High or higher (High/Severe, the top of the `wl` risk scale); it skips when
-effort is Extra Small/Small **AND** risk is Low/Medium. Absent effort/risk →
+requests approval only for the largest and highest-risk work items — effort
+**Extra Large** **AND** risk **High or higher** (High/Severe, the top of the
+`wl` risk scale). Every other combination (e.g. Extra Large with Low/Medium
+risk, or High/Severe risk with smaller effort) skips the approval pause and
+proceeds directly to the automated review stages. Absent effort/risk →
 default conservatively to requesting approval (a human checkpoint is never
 silently skipped).
 
 - **`request_approval == true`**: present the plan and ask the user to
   accept, edit, reorder, or split/merge — iterating until approved. State
   the reason explicitly (e.g. "This plan requires your confirmation because
-  its effort is Large scale and its risk is High.").
+  its effort is Extra Large scale and its risk is High.").
 - **`request_approval == false`**: do NOT ask; proceed directly to step 5
   (vertical slice verification) and step 6 (automated review stages).
 
@@ -266,7 +268,7 @@ Then output a summary of what each stage checked/found.
    Produce a draft plan (guide: 3-12 features) where each feature includes: **Short Title** (≤7 words) | **Summary** (one sentence) | **Acceptance Criteria** (2-6 measurable bullets) | **Minimal Implementation** (2-6 bullets, smallest end-to-end slice) | **Prototype/Experiment** (optional; success thresholds) | **Dependencies** | **Deliverables**.
 
    - **Test-first ordering**: test/verification features before implementation features.
-   - **Approval gate**: run the approval-gate check first (see **Plan-approval gate**). When approval IS requested, state the reason explicitly and iterate until approved. When NOT warranted (effort Extra Small/Small AND risk Low), proceed directly to steps 5-6 without an approval pause. **On any approval resume, re-claim first:** `StatusLifecycle.ensure_claimed(<id>)` + `StatusLifecycle.require_claimed(<id>)` before steps 5-7; downtime dispatch with no approver holds `in_progress` or aborts — never releases to `open`.
+   - **Approval gate**: run the approval-gate check first (see **Plan-approval gate**). When approval IS requested, state the reason explicitly and iterate until approved. When NOT warranted (anything other than Extra Large effort **AND** High/Severe risk), proceed directly to steps 5-6 without an approval pause. **On any approval resume, re-claim first:** `StatusLifecycle.ensure_claimed(<id>)` + `StatusLifecycle.require_claimed(<id>)` before steps 5-7; downtime dispatch with no approver holds `in_progress` or aborts — never releases to `open`.
 
 5. Verify vertical slice phasing (agent responsibility)
 
