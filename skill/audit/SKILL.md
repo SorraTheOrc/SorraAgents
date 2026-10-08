@@ -87,18 +87,27 @@ wl update <id> --status in_progress --json
 # Fail: wl update <id> --status "$ORIG_STATUS" --assignee "" --json
 ```
 
-## Fail-Fast Launch Contract
+## Launch Context and Per-Audit Scope
 
-An audit MUST be launched from the project root that owns the work item
-(LP-0MSQ32HNR007AI6B). Before any phase runs — and before any pi/model call —
-the runner verifies the launch context:
+An audit targets the project root that owns the work item
+(LP-0MSQ32HNR007AI6B, revised by SA-0MSRLECW2001AA15). Before any phase
+runs — and before any pi/model call — the runner resolves the launch
+context and the **per-audit target root**:
 
-1. **Owning project check:** the work item's id prefix is resolved to its
-   owning project via the worklog prefix-to-sibling scan (explicit
+1. **Owning project resolution:** the work item's id prefix is resolved to
+   its owning project via the worklog prefix-to-sibling scan (explicit
    `--worklog-dir` takes precedence: its parent is the expected project).
-   If the launch cwd's git root (`TARGET_PROJECT_ROOT`) does not own the
-   item, the run aborts with `Error: Audit launch-context error: ...` and a
-   non-zero exit — zero pi calls, no status lifecycle, no persisted report.
+   The resolved owner becomes the **per-audit target root**, read by every
+   scope-sensitive consumer (git-derived content, code-quality scan,
+   remediation loop, repo-index fallback, debug-log directory, and the F3
+   suite-execution cwd). Launching from a different, **determinable** cwd
+   is no longer fatal: the run proceeds against the owning project and
+   emits a one-line stderr warning naming the launch and owning roots.
+   Only **undeterminable** ownership (no `--worklog-dir`, unknown prefix,
+   no sibling match) aborts with `Error: Undeterminable project scope: ...`
+   and a non-zero exit — zero pi calls, no status lifecycle, no persisted
+   report. The warning channel is stderr only, so it never perturbs the
+   persisted report or the `--json` output (SA-0MSRLECW2001AA15).
 2. **FILE SCOPE manifest check:** before Phase 1 and again before Phase 2,
    the FILE SCOPE manifest must reference the item repository's files. A
    manifest built from the audit skill's own tree (or lacking the item
@@ -114,10 +123,11 @@ the runner verifies the launch context:
    misleading. `PERSIST_CONTENT_INVALID` (fallback notice persisted) stays
    a warning; the child audit is usable.
 
-A mis-scoped audit is indistinguishable from a failed audit, so it MUST fail
-fast (seconds, no pi calls) rather than waste model time. To re-launch
-correctly, cd into the owning project root (a worktree of the owning project
-counts as owning).
+A mis-scoped audit is indistinguishable from a failed audit, so an
+**undeterminable** launch MUST fail fast (seconds, no pi calls) rather than
+waste model time. To launch with zero ambiguity, cd into the owning project
+root (a worktree of the owning project counts as owning) or pass
+`--worklog-dir <owning>/.worklog`.
 
 **Git scope follows the worklog (SA-0MSLLGDW00098UCC).** The runner's
 git-derived content — the file-scope manifest (changed-file list + repo
@@ -131,7 +141,11 @@ silent fallback to the launch cwd's repo). Launching from inside the
 owning project — or a worktree of it (same git repository) — keeps git
 resolving to that checkout, so worktree-only changes and the worktree
 branch HEAD stay correct. The remaining `TARGET_PROJECT_ROOT` consumers
-(code-quality scan and debug-log path) are still launch-cwd-bound.
+(code-quality scan, remediation loop, `_repo_index` fallback, debug-log
+path, and the F3 suite-execution cwd) now read the **per-audit target
+root** (SA-0MULGDABC001T11L), so a foreign-cwd launch never scopes them to
+the launch directory. The module-level `TARGET_PROJECT_ROOT` is retained
+only as the cwd-derived fallback for direct/unit callers.
 
 ## Monitored Run Execution
 

@@ -457,36 +457,38 @@ standalone `persist_audit.py` CLI, which resolves the store itself when no
    git root, or nearest ancestor.
 4. No flag — `wl` resolves from cwd.
 
-**Fail-fast launch context (LP-0MSQ32HNR007AI6B):** the *project scope* has
-two independent axes. The **launch-context guard** still checks the launch
-cwd: ``TARGET_PROJECT_ROOT`` (the git root of the launch cwd) must own the
-item or be a worktree of the owning project. But the runner's **git-derived
-content now follows the worklog** (SA-0MSLLGDW00098UCC): the file-scope
-manifest (changed-file list + repo index), HEAD attestations, working-tree
-hashes, and ``--green-run`` evidence resolve against the worklog-derived
-owning project root (``--worklog-dir`` parent, else prefix-to-sibling
-scan) — NOT the launch cwd. Before any phase runs (and before any pi/model
-call) the runner verifies:
+**Launch context and per-audit scope (LP-0MSQ32HNR007AI6B, revised by
+SA-0MSRLECW2001AA15):** the *project scope* is resolved from the
+worklog-derived owner into a **per-audit target root** used by every
+scope-sensitive consumer. The runner's git-derived content follows the
+worklog (SA-0MSLLGDW00098UCC) and — since SA-0MSRLECW2001AA15 — so do the
+former launch-cwd-bound consumers. Before any phase runs (and before any
+pi/model call) the runner verifies:
 
 1. **Owning project** — the item's id prefix resolves to its owning project
    via the prefix-to-sibling scan (explicit ``--worklog-dir`` takes
    precedence: its parent is the expected project). A launch from a
-   non-owning checkout aborts with `Error: Audit launch-context error:` and
-   a non-zero exit — zero pi calls, no status lifecycle. A worktree of the
-   owning project counts as owning (same git repository). When the owning
-   project root cannot be determined (no ``--worklog-dir``, unknown item
-   prefix, no sibling match), the run aborts with `Error: Undeterminable
-   project scope: ...` before any phase runs — never a silent fallback to
-   the launch cwd's repository for git-derived content.
-2. **Git scope follows the worklog** — every git command issued by the
+   **determinable** non-owning cwd is no longer fatal: the run proceeds
+   against the owning project and emits a one-line **stderr** warning naming
+   the launch and owning roots (never in the report or ``--json`` output).
+   A worktree of the owning project counts as owning (same git repository).
+   When the owning project root cannot be determined (no ``--worklog-dir``,
+   unknown item prefix, no sibling match), the run aborts with `Error:
+   Undeterminable project scope: ...` before any phase runs — never a silent
+   fallback to the launch cwd's repository for git-derived content.
+2. **Git scope and per-audit consumers** — every git command issued by the
    runner targets the worklog-derived owning root (`git -C <owning_root>`
    when it differs from the launch root), so launching from any cwd audits
    the owning project's repository. A launch from the owning project — or a
    worktree of it (same git repository) — keeps git resolving to that
    checkout (byte-identical commands), so worktree-only changes and the
-   worktree branch HEAD stay correct. The remaining ``TARGET_PROJECT_ROOT``
-   consumers (code-quality scan and debug-log path) are still
-   launch-cwd-bound.
+   worktree branch HEAD stay correct. The residual ``TARGET_PROJECT_ROOT``
+   consumers — code-quality scan, remediation loop, ``_repo_index``
+   fallback, debug-log directory, and the F3 suite-execution cwd — now read
+   the **per-audit target root** (stored on ``_AuditContext`` and published
+   for deep helpers), so a foreign-cwd launch never scopes them to the
+   launch directory. ``TARGET_PROJECT_ROOT`` itself is retained only as the
+   cwd-derived fallback for direct/unit callers.
 3. **FILE SCOPE manifest** — before Phase 1 and again before Phase 2, the
    manifest must reference the item repository's files; a manifest built
    from the audit skill's own tree (or lacking the item repo) aborts with
@@ -507,10 +509,10 @@ python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NV
 The runner is cwd-independent for both `wl` resolution and git-derived
 content: launching from any directory (e.g. the skill install dir) with
 `--worklog-dir` pointing at the audited project audits that project's
-repository. Only the remaining `TARGET_PROJECT_ROOT` consumers (code-quality
-scan, debug-log path) stay launch-cwd-bound. If auto-resolution cannot
-determine the target store while launching from the owning project root,
-pass an explicit dir:
+repository, and every per-audit consumer (code-quality scan, debug-log path,
+repo-index fallback, F3 suite-execution cwd) now targets the owning project
+too. If auto-resolution cannot determine the target store while launching
+from the owning project root, pass an explicit dir:
 
 ```bash
 python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \
@@ -527,7 +529,7 @@ worklog left on the host. The shared autouse fixture
 `tests/conftest.py`) therefore redirects `SIBLING_SCAN_ROOT` to an empty
 isolated directory for the duration of each flow test, so a leftover
 `TEST`-prefixed worklog (e.g. `/tmp/wlfields-test`) can never hijack the
-synthetic id and trip the launch-context guard. Tests that exercise ownership
+synthetic id and mis-resolve the per-audit target root. Tests that exercise ownership
 resolution (the launch-context suite) override the scan root and resolver with
 their own patches.
 
@@ -809,9 +811,10 @@ Runner performs code quality checks before AC verification (invokes `../code_rev
   cwd-chain fallback, so `persist_audit.py` can be launched from any directory
   (e.g. the skill install dir) and still persist to the item's own store
   (SA-0MSKQERKH002IBLG). An explicit `--worklog-dir` keeps highest precedence.
-  Note: the repo-scope facet of the skill-dir launch pattern
-  (`TARGET_PROJECT_ROOT` code-quality scan / debug-log consumers) remains
-  launch-cwd-bound — tracked in SA-0MSRLECW2001AA15.
+  The repo-scope facet of the skill-dir launch pattern is now cwd-independent
+  too: the code-quality scan, remediation loop, `_repo_index` fallback,
+  debug-log directory, and F3 suite-execution cwd all read the **per-audit
+  target root** resolved from the worklog owner (SA-0MSRLECW2001AA15).
 
 **Unique report file naming convention:**
 
@@ -907,8 +910,10 @@ surgical ruff config change, then re-scanned:
 
 1. **Locate/create the config** (`locate_ruff_config` in
    `skill/code_review/scripts/linter_runner.py`): existing `ruff.toml`, else the
-   `pyproject.toml` `[tool.ruff]` section, else a new `ruff.toml` created in
-   `TARGET_PROJECT_ROOT`.
+   `pyproject.toml` `[tool.ruff]` section, else a new `ruff.toml` created in the
+   **per-audit target project root** (the worklog-derived owner; launched from
+   the owning project this is `TARGET_PROJECT_ROOT`). The runner passes the
+   resolved root as `project_root` to `run_code_quality` (SA-0MULGDABC001T11L).
 2. **Minimal edit** (`apply_ruff_remediation`): `per-file-ignores` entries for the
    flagged file+rule pairs only — no sweeping rule changes, no inline source
    suppressions, no `_RUFF_SEVERITY_MAP` / `_classify_ruff` edits.
