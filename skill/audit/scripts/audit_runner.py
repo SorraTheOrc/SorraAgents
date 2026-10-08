@@ -1367,8 +1367,36 @@ TARGET_PROJECT_ROOT: Path = _detect_project_root()
 
 Defaults to the git root (or ``Path.cwd()`` as fallback) at import time.
 This may differ from ``REPO_ROOT`` when the audit runner's framework
-repository is not the working directory.
+repository is not the working directory. Retained as the **cwd-derived
+fallback** for residual consumers: the per-audit target root published in
+``_ACTIVE_AUDIT_ROOT`` (see below) takes precedence during a run
+(SA-0MULGDABC001T11L).
 """
+
+
+_ACTIVE_AUDIT_ROOT: Path | None = None
+"""Per-audit target project root, published for deep helpers.
+
+Resolved once in ``_phase_gate`` (SA-0MULGDABC001T11L) as the worklog-derived
+owning root (or the launch cwd when it is the same git repository — the
+own-project or worktree checkout) and stored on
+``_AuditContext.per_audit_project_root``. Deep Phase 1/2 helpers reached
+without an ``_AuditContext`` read it from here so a foreign-cwd launch still
+targets the audited project. ``None`` outside a run, where the cwd-derived
+``TARGET_PROJECT_ROOT`` remains the fallback. Reset by ``cmd_issue`` when the
+run completes so it never leaks across audits.
+"""
+
+
+def _audit_target_root(project_root: Path | None = None) -> Path:
+    """Resolve the target project root for a residual consumer.
+
+    Returns *project_root* when supplied, else the active per-audit root
+    published by ``_phase_gate``, else the cwd-derived
+    ``TARGET_PROJECT_ROOT`` (launch-root fallback retained for direct unit
+    callers and the existing test suite).
+    """
+    return project_root or _ACTIVE_AUDIT_ROOT or TARGET_PROJECT_ROOT
 
 
 SIBLING_SCAN_ROOT: Path = SHARED_SIBLING_SCAN_ROOT
@@ -4595,7 +4623,8 @@ def _git_changed_files(runner: Runner) -> list[str]:
 
 
 def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
-                max_root_files: int = _FILE_SCOPE_MAX_FILES) -> list[str]:
+                max_root_files: int = _FILE_SCOPE_MAX_FILES,
+                project_root: Path | None = None) -> list[str]:
     """Return a lightweight repo index (top-level entries with file counts).
 
     Uses ``git ls-files`` to count files per top-level path and returns the
@@ -4605,7 +4634,8 @@ def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
     remote, ...``) so repos whose distinctive top-level markers are all
     root-level files stay verifiable by the file-scope manifest check
     (SA-0MSUBX8PP0087OEA). On git failure, falls back to a best-effort
-    listing of ``TARGET_PROJECT_ROOT``'s top-level entries.
+    listing of *project_root*'s top-level entries (defaulting to the
+    cwd-derived ``TARGET_PROJECT_ROOT``).
     """
     buckets: dict[str, int] = {}
     root_files: list[str] = []
@@ -4624,9 +4654,10 @@ def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
         pass
 
     if not buckets:
-        # Best-effort fallback: list top-level entries of TARGET_PROJECT_ROOT
+        # Best-effort fallback: list top-level entries of the per-audit
+        # target project root (defaults to the cwd-derived launch root).
         try:
-            root = TARGET_PROJECT_ROOT
+            root = _audit_target_root(project_root)
             for entry in sorted(root.iterdir()):
                 if entry.name.startswith("."):
                     continue
@@ -4674,7 +4705,8 @@ def _phase1_evidence_refs(ac_results: list[dict],
 
 
 def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
-                               runner: Runner | None = None) -> str:
+                               runner: Runner | None = None,
+                               project_root: Path | None = None) -> str:
     """Build the file-scope manifest injected into the Phase 2 prompt.
 
     Combines the work item's Key Files, the git changed-file list, the
@@ -4740,7 +4772,7 @@ def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
         ref_lines = "\n".join(f"- `{f}`" for f in refs)
         sections.append(f"Phase 1 evidence file:line references:\n{ref_lines}")
 
-    index = _repo_index(runner)
+    index = _repo_index(runner, project_root=project_root)
     if index:
         index_lines = "\n".join(f"- {f}" for f in index)
         sections.append(f"Repository index (top-level layout):\n{index_lines}")
@@ -5568,19 +5600,25 @@ def _assemble_project_report(summary: str, recommendation: str) -> str:
 # Debug / debug-log helpers
 # ---------------------------------------------------------------------------
 
-def _debug_log_dir() -> Path:
+def _debug_log_dir(project_root: Path | None = None) -> Path:
     """Return the debug-log scratch directory (outside .worklog/ and repo).
 
     Defaults to ``~/.audit_debug/<project-slug>/`` so debug files never sit in
     scanned paths (the 9.5 GB .worklog audit_debug dump was a scan trap).
-    The directory is created lazily by callers via ``_write_debug_log``.
+    The slug is derived from *project_root* — the per-audit target project
+    root — so debug artefacts are attributable to the audited project even
+    when the runner was launched from a foreign cwd (SA-0MULGDABC001T11L).
+    When *project_root* is omitted the cwd-derived ``TARGET_PROJECT_ROOT`` is
+    used. The directory is created lazily by callers via ``_write_debug_log``.
     """
     home = Path.home()
-    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in TARGET_PROJECT_ROOT.name)
+    root = _audit_target_root(project_root)
+    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in root.name)
     return home / ".audit_debug" / (slug or "project")
 
 
-def _default_debug_log_path(issue_id: str, context: str) -> Path:
+def _default_debug_log_path(issue_id: str, context: str,
+                            project_root: Path | None = None) -> Path:
     """Return a sensible default path for debug logs.
 
     Tests monkeypatch this helper so callers should use it rather than
@@ -5589,7 +5627,7 @@ def _default_debug_log_path(issue_id: str, context: str) -> Path:
     tree) so recursive greps never walk them, and are swept by
     ``cleanup_debug_logs.py``.
     """
-    p = _debug_log_dir() / f"audit_debug_{issue_id}.jsonl"
+    p = _debug_log_dir(project_root) / f"audit_debug_{issue_id}.jsonl"
     return p
 
 
@@ -5599,7 +5637,8 @@ def _write_debug_log(path: Path, entry: dict) -> None:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def _remove_debug_log(debug_log: str | None, issue_id: str, *contexts: str) -> None:
+def _remove_debug_log(debug_log: str | None, issue_id: str, *contexts: str,
+                      project_root: Path | None = None) -> None:
     """Remove a run's debug log file after a successful audit run.
 
     Debug logs are transient forensics: a successful run leaves nothing
@@ -5617,7 +5656,8 @@ def _remove_debug_log(debug_log: str | None, issue_id: str, *contexts: str) -> N
             target = Path(debug_log)
         else:
             candidates = [
-                _default_debug_log_path(issue_id, ctx) for ctx in (contexts or ("parent",))
+                _default_debug_log_path(issue_id, ctx, project_root=project_root)
+                for ctx in (contexts or ("parent",))
             ]
             target = candidates[0] if len(set(candidates)) == 1 else None
             if target is None:
@@ -5643,7 +5683,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            child_screen: bool = False,
                            ac_count: int | None = None,
                            json_expected: bool = False,
-                           priority: int | None = None) -> dict:
+                           priority: int | None = None,
+                           project_root: Path | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -5770,7 +5811,9 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             reason = "call_trace" if parse_ok else "parse_failure"
         else:
             reason = "call_trace"
-        target = _default_debug_log_path(issue_id, context)
+        target = _default_debug_log_path(
+            issue_id, context, project_root=project_root,
+        )
 
     if reason and target:
         entry = {
@@ -7670,6 +7713,27 @@ class _AuditContext:
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
+    per_audit_project_root: str = ""
+    """Per-audit target project root (SA-0MULGDABC001T11L).
+
+    Resolved once in ``_phase_gate``: the worklog-derived owning root by
+    default, or the launch cwd's ``TARGET_PROJECT_ROOT`` when the launch is
+    the same git repository (an owning-project or worktree checkout). The
+    residual ``TARGET_PROJECT_ROOT`` consumers (code-quality scan, remediation
+    loop, ``_repo_index`` fallback, debug-log dir slug, and the F3
+    suite-execution cwd) read it so a foreign-cwd launch still targets the
+    audited project. Empty when ``_phase_gate`` has not run; the module-level
+    ``TARGET_PROJECT_ROOT`` remains the cwd-derived fallback.
+    """
+
+    @property
+    def per_audit_root(self) -> Path:
+        """Per-audit target root as a ``Path`` (cwd fallback when unset)."""
+        return (
+            Path(self.per_audit_project_root)
+            if self.per_audit_project_root else TARGET_PROJECT_ROOT
+        )
+
     resolved_model: str = DEFAULT_MODEL
     resolved_phase1_model: str = DEFAULT_MODEL
     green_run_block: str | None = None
@@ -8548,6 +8612,12 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     git_root = owning_root
     if _same_git_repository(TARGET_PROJECT_ROOT, owning_root):
         git_root = TARGET_PROJECT_ROOT
+    # Per-audit target project root (SA-0MULGDABC001T11L): same resolution as
+    # the git root — the owning root by default, the launch cwd when it is the
+    # same git repository (owning or worktree checkout). Consumed by the
+    # residual TARGET_PROJECT_ROOT consumers below (F3 suite-execution cwd) and
+    # by later phases (code-quality scan, remediation, debug-log slug).
+    per_audit_root = git_root
     runner = _cwd_aware_runner(git_root, runner)
     ctx.runner = runner
 
@@ -8575,7 +8645,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     test_skill_run_sha = None
     if green_run_sha is None:
         auto_block, auto_sha, auto_status = _auto_green_run_outcome(
-            runner, cwd=str(TARGET_PROJECT_ROOT),
+            runner, cwd=str(per_audit_root),
         )
         if auto_sha is not None:
             green_run_block = auto_block
@@ -8613,7 +8683,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             else:
                 head_sha = _resolve_audited_head(runner)
                 test_run = _run_tests_via_test_skill(
-                    cwd=TARGET_PROJECT_ROOT,
+                    cwd=per_audit_root,
                     parent_work_item_id=issue_id,
                     head_sha=head_sha,
                 )
@@ -8774,6 +8844,11 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
 
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
+    ctx.per_audit_project_root = str(per_audit_root)
+    # Publish the per-audit root for deep Phase 1/2 helpers reached without a
+    # context (SA-0MULGDABC001T11L). Reset by ``cmd_issue`` at run end.
+    global _ACTIVE_AUDIT_ROOT
+    _ACTIVE_AUDIT_ROOT = per_audit_root
     ctx.resolved_model = resolved_model
     ctx.resolved_phase1_model = phase1_model
     ctx.green_run_block = green_run_block
@@ -8907,7 +8982,8 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
                           pi_bin: str, resolved_model: str,
                           debug_log: str | None, timeout: int | None,
                           ac_fallback_used: threading.Event,
-                          priority: int | None = None) -> list[dict]:
+                          priority: int | None = None,
+                          project_root: Path | None = None) -> list[dict]:
     """Model-judged false-positive screen over ruff findings (F1 scope).
 
     Classifies each ruff finding via one or more batched Pi calls
@@ -8983,6 +9059,7 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
                 ac_fallback_used=ac_fallback_used, child_screen=True,
                 json_expected=True,
                 priority=priority,
+                project_root=project_root,
             )
         except RuntimeError as exc:
             screen_failed = True
@@ -9453,6 +9530,12 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     json_mode = ctx.json_mode
     runner = ctx.runner
     worklog_dir = ctx.worklog_dir
+    # Per-audit target project root (SA-0MULGDABC001T11L); the cwd-derived
+    # constant remains the fallback so direct/legacy callers keep working.
+    per_audit_root = (
+        Path(ctx.per_audit_project_root)
+        if ctx.per_audit_project_root else TARGET_PROJECT_ROOT
+    )
 
     try:
         data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"],
@@ -9530,7 +9613,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         # git scan is issued here.
         cq_scope_files = _git_changed_files(runner)
         cq_result = run_code_quality(
-            project_root=TARGET_PROJECT_ROOT, runner=runner, fix=False,
+            project_root=per_audit_root, runner=runner, fix=False,
             files=cq_scope_files or None,
         )
         if cq_result.get("success", False):
@@ -9564,6 +9647,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
             timeout=ctx.timeout,
             ac_fallback_used=ctx.ac_fallback_used,
             priority=_resolve_audit_priority(ctx.work_item),
+            project_root=per_audit_root,
         )
     except Exception as exc:  # noqa: BLE001 -- the screen must never crash the audit
         ctx.record_script_failure("false-positive screen", exc)
@@ -9599,7 +9683,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         debug_log=ctx.debug_log,
         timeout=ctx.timeout,
         ac_fallback_used=ctx.ac_fallback_used,
-        project_root=TARGET_PROJECT_ROOT,
+        project_root=per_audit_root,
         worklog_dir=worklog_dir,
         work_item=work_item,
         content_fingerprint=content_fingerprint,
@@ -10038,7 +10122,9 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     ac_results = []
     if acs and acs[0] != "No acceptance criteria defined.":
         ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
-        file_scope = _build_file_scope_manifest(work_item, [], runner=runner)
+        file_scope = _build_file_scope_manifest(
+            work_item, [], runner=runner, project_root=ctx.per_audit_root,
+        )
         # Validate the FILE SCOPE manifest covers the item repository
         # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
         # (e.g. the audit skill's own tree) would emit misleading
@@ -11874,7 +11960,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # forensic record of the failed evaluation.
     # ------------------------------------------------------------------
     if ctx.audit_completed and ctx.script_failure is None and not fallback_tainted:
-        _remove_debug_log(ctx.debug_log, ctx.issue_id)
+        _remove_debug_log(
+            ctx.debug_log, ctx.issue_id, project_root=ctx.per_audit_root,
+        )
 
     if restore_cmd is None:
         # Defensive: every branch above assigns restore_cmd; a future edit
@@ -12350,6 +12438,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
         lifecycle_rc = _apply_terminal_lifecycle(ctx)
         if lifecycle_rc != 0:
             rc = lifecycle_rc
+        # Release the per-audit root published for deep helpers
+        # (SA-0MULGDABC001T11L) now that the run — including debug-log
+        # cleanup — is complete, so it never leaks into a later audit.
+        global _ACTIVE_AUDIT_ROOT
+        _ACTIVE_AUDIT_ROOT = None
     if rc == 0 and ctx.checkpoint is not None:
         if ctx.checkpoint.budget_exceeded_children():
             # Budget-exceeded children remain unverified: KEEP the checkpoint

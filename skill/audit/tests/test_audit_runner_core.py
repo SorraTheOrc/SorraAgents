@@ -247,7 +247,7 @@ class TestCodeQualityUsesTargetProjectRoot:
 
         mock_cq.assert_called_once()
         _args, kwargs = mock_cq.call_args
-        assert kwargs["project_root"] is audit_runner.TARGET_PROJECT_ROOT
+        assert kwargs["project_root"] == audit_runner.TARGET_PROJECT_ROOT
 
 class TestCallPiEnableTools:
     """Tests for _call_pi() enable_tools parameter (AC1-AC5)."""
