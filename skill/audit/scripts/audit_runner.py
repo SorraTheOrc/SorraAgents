@@ -1483,22 +1483,35 @@ def _same_git_repository(root_a: Path, root_b: Path) -> bool:
 
 def _verify_launch_context(issue_id: str,
                            worklog_dir: str | None = None) -> str | None:
-    """Return a fatal error message when the launch context does not own *issue_id*.
+    """Return a fatal error only when the item's owner is undeterminable.
 
     The launch context is the cwd-derived ``TARGET_PROJECT_ROOT`` — the
-    repository that Phase 1/2 would target. The owning project is resolved
-    from the worklog (explicit ``--worklog-dir`` parent, else
-    prefix-to-sibling scan). A mismatch (e.g. an LP item audited from the
-    SorraAgents checkout) means the run would scope its FILE SCOPE manifest
-    to the wrong repository and emit misleading 'unmet' verdicts — fail
-    fast with zero pi calls.
+    repository that a legacy launch would target. The owning project is
+    resolved from the worklog (explicit ``--worklog-dir`` parent, else
+    prefix-to-sibling scan).
 
-    Returns ``None`` when the context is correct (or ownership cannot be
-    determined — fail open).
+    SA-0MSRLECW2001AA15 inverted the guard: a **determinable** non-owning
+    launch no longer aborts. The audit now resolves a per-audit target root
+    from the worklog-derived owner (``_phase_gate``), so a foreign-cwd launch
+    proceeds against the owning project with a one-line stderr warning naming
+    the launch and owning roots. Only **undeterminable** ownership aborts —
+    with no ``--worklog-dir``, an unknown prefix, and no sibling match there
+    is no per-audit root to resolve and falling back to the launch cwd's
+    repository would silently scope the audit to the wrong project.
+
+    Returns ``None`` when the context is correct, the launch is the owning
+    project (or a worktree of it), or ownership is determinable; returns the
+    fatal error string when ownership cannot be determined.
     """
     owning_root = _resolve_owning_project_root(issue_id, worklog_dir=worklog_dir)
     if owning_root is None:
-        return None
+        return (
+            f"Undeterminable project scope for work item {issue_id}: no "
+            f"--worklog-dir, unknown item prefix, and no sibling match. "
+            f"Refusing to fall back to the launch cwd's repository for "
+            f"git-derived content. Re-launch from the owning project or "
+            f"pass --worklog-dir."
+        )
     launch_root = TARGET_PROJECT_ROOT.resolve()
     if launch_root == owning_root.resolve():
         return None
@@ -1510,15 +1523,16 @@ def _verify_launch_context(issue_id: str,
     # <owning>/.worklog/worktrees/ — same repository as the owning project.
     if (owning_root / ".worklog" / "worktrees") in launch_root.parents:
         return None
-    return (
-        f"Audit launch-context error: work item {issue_id} is owned by "
-        f"project {owning_root} (resolved from the worklog prefix scan), "
-        f"but this run was launched from project {launch_root}. The audit "
-        f"would target the wrong repository and waste model time. Re-launch "
-        f"from {owning_root} — the project that owns the item. Note: "
-        f"--worklog-dir does not change the project scope; only the launch "
-        f"directory does."
+    # Determinable non-owning launch (SA-0MSRLECW2001AA15): proceed against
+    # the owning project with a one-line stderr warning naming the launch and
+    # owning roots. The warning is deliberately written to stderr (never the
+    # persisted report or JSON output) so it cannot perturb a verdict (AC3).
+    print(
+        f"Warning: audit launched from {launch_root} but work item "
+        f"{issue_id} is owned by {owning_root}; auditing the owning project.",
+        file=sys.stderr,
     )
+    return None
 
 
 def _project_top_levels(project_root: Path) -> list[str]:
@@ -7133,7 +7147,8 @@ def _run_phase2_deep_analysis(
     parent qualifies.
 
     *owning_root* is the project root that owns the audited item (resolved
-    by the launch-context guard); when omitted it is re-resolved from the
+    from the worklog owner by the launch-context resolution); when omitted it
+    is re-resolved from the
     issue id. The FILE SCOPE manifest is validated against it and an
     ``AuditScopeError`` is raised when the manifest lacks the item repo
     (LP-0MSQ32HNR007AI6B) — the caller aborts instead of emitting 'unmet'
@@ -8535,7 +8550,7 @@ def _build_merge_gate_failure_report(ctx: _AuditContext) -> str:
 
 
 def _phase_gate(ctx: _AuditContext) -> int | None:
-    """Phase 1 — launch-context guard, model/green-run resolution, original
+    """Phase 1 — launch-context resolution, model/green-run resolution, original
     status capture, freshness gates, and the in_progress claim.
 
     Returns an exit code for early-abort paths (fresh-skip, pre-flight
