@@ -12,6 +12,17 @@ Related work item: SA-0MSLRVQIF0040GAM
 """
 
 import json
+import sys
+from pathlib import Path
+
+# Make the shared helpers importable regardless of how pytest is invoked
+# (the changed-scope gate runs this file directly, without tests/conftest.py).
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT_FOR_TESTS = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
+    sys.path.append(str(_SKILLS_ROOT_FOR_TESTS))
 
 from shared.tree_coverage import (
     compute_coverage,
@@ -43,7 +54,7 @@ def _build_runner(
     child_descriptions = child_descriptions or {}
 
     def runner(cmd):
-        if "--children" in cmd:
+        if "--children" in cmd or "--parent" in cmd:
             payload = json.dumps({
                 "success": True,
                 "children": children_data or [],

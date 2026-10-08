@@ -85,19 +85,17 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 
 If the work item already has children, run intake on each child before proceeding:
 
-- Run `wl show <work-item-id> --children --json` to fetch existing children.
+- Run `wl list --parent <work-item-id> --json` to fetch existing children (`wl show --children` returns the full descendant set, not direct children).
 - Order children by dependency edges using `wl dep list <id> --json` (topological order, ties broken by listed order).
 - For each child, run the intake process on it (steps 1–11, recursing if the child has its own children).
-- Use the shared tree-coverage helper to verify AC coverage across existing children:
+- Use the shared tree-coverage helper to review and apply AC coverage across existing children:
   ```python
-  from skill.shared.tree_coverage import run_coverage_review
-  review = run_coverage_review(<work-item-id>)
+  from skill.shared.tree_coverage import apply_coverage_review
+  result = apply_coverage_review(<work-item-id>, target_stage="intake_complete")
   ```
-- If the coverage review returns `recommendation: "stop"` with unresolvable conflicts,
-  record the conflicts as a comment and stop — leave the item `open`.
-- If the coverage review returns `recommendation: "auto_close"`, apply the auto-closed gaps
-  and note them in a comment.
-- If the coverage review returns `recommendation: "proceed"`, continue to Step 1.
+- If `result["action"] == "stop"` with unresolvable conflicts, the helper records the conflicts as a comment and does not advance — leave the item `open`.
+- If `result["action"] == "auto_close"`, the helper creates covering children and notes them in a comment.
+- If `result["action"] == "proceed"`, continue to Step 1.
 - Idempotence: re-running must not create duplicate children or duplicate comments.
 
 ### 1. Evaluate whether intake is required (agent responsibility)
@@ -202,15 +200,15 @@ Write the final draft to the work item description:
 python3 $(skill_path intake)/scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
 ```
 
-**AC coverage verification:** After updating the description, run the AC coverage review:
+**AC coverage verification:** After updating the description, run and apply the AC coverage review:
 
 ```python
-from skill.shared.tree_coverage import run_coverage_review
-review = run_coverage_review(<work-item-id>)
+from skill.shared.tree_coverage import apply_coverage_review
+result = apply_coverage_review(<work-item-id>, target_stage="intake_complete")
 ```
 
-- If ``recommendation == "proceed"`` or ``"auto_close"`` → mark `intake_complete`.
-- If ``recommendation == "stop"`` → **do NOT advance the stage**. Leave the item `open` with a comment describing the conflicts.
+- `result["action"]` in (`"proceed"`, `"auto_close"`) → the stage is set to `intake_complete`.
+- `result["action"] == "stop"` → **do NOT advance the stage**. The item is left `open` with a comment describing the conflicts.
 
 Then advance the stage:
 
