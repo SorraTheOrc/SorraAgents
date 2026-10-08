@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.1.20 (2026-10-08)
+### Features
+- Child sessions now stay inside their own worktree, so your work no longer leaks into the main checkout. (SA-0MUY9PSRS003V5CM)
+- Releases no longer require creating a work item, keeping your worklog clean. (SA-0MUVUK458009F6RZ)
+- Voice input now clearly confirms when it starts, stops, and sends your words. (SA-0MUXZBHX0006IXNZ)
+- Releases now automatically clean up merged branches, so you get a tidier repo without extra steps. (SA-0MUV2W2P7004HVIG)
+- Speak a set phrase to trigger plugin shortcuts hands-free, no keyboard needed. (SA-0MUX9Y4LX000KF3P)
+- You can now tune voice transcription for better accuracy on your hardware. (SA-0MUX9Y37W002T849)
+- Running the implement skill on an epic now completes all its children in one go. (SA-0MUWNHKQH0034DW9)
+- Release announcements now explain what the game is and what's new before the changelog. (SA-0MUU45U8Q008MKGK)
+- Implementing a parent task now handles all its subtasks automatically. (SA-0MUWBHEEF002A6BO)
+- Dictate prompts with Ctrl+Space and have them sent automatically. (SA-0MUFEVYAF002GD3A)
+### Bug Fixes
+- Deleted tasks no longer block your progress or get started by mistake. (SA-0MUTWB8BA003J0V6)
+- Audits now correctly recognize committed work, so finished tasks no longer fail review. (SA-0MUJNZ5RN0078B5M)
+- Work items now correctly show as in progress while being worked on. (SA-0MUY9PMB7001ENMP)
+- Driven child sessions now show real progress and errors instead of repeated internal noise. (SA-0MUY9PYBD009Y7J5)
+- Released work items now close correctly after a release instead of being left stuck in review. (SA-0MUJKPDAA002VVDP)
+- Standup reports no longer falsely flag released items as regressions. (SA-0MUMHR0BT007IKAL)
+- Planning sessions now correctly report as complete and ready for implementation. (SA-0MUYADP50005EYA2)
+- Voice input now works even without CUDA libraries, falling back to CPU automatically. (SA-0MUX8SCG6004VYUN)
+### Other
+- Improved game stability by cleaning up test code. (SA-0MUMEJX7G009PKO5)
+- Removed outdated config references so audits run more reliably. (SA-0MUQ0I0YY000JCB5)
+
 ## v0.1.19 (2026-10-05)
 ### Features
 - Run only the tests that matter for each change, so updates ship faster and more reliably. (SA-0MUJKF2HP001BR51)
