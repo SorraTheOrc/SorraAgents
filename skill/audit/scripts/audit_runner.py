@@ -3579,37 +3579,98 @@ def _query_proxy_mode(base_url: str | None = None,
         return None
 
 
+def _explicit_parallelism_request() -> int | None:
+    """Return the explicitly requested child concurrency, or ``None``.
+
+    Mirrors :func:`_resolve_parallelism`'s precedence
+    (``AUDIT_PARALLELISM`` then legacy ``AUDIT_PHASE2_PARALLELISM``). Invalid
+    (non-integer) values are ignored so a misconfigured environment cannot be
+    mistaken for an explicit request. Used by
+    :func:`_apply_proxy_mode_serialization` to keep a dispatcher-issued
+    request authoritative in cheap mode.
+    """
+    for var in (AUDIT_PARALLELISM_ENV, AUDIT_PHASE2_PARALLELISM_ENV_LEGACY):
+        raw = os.environ.get(var)
+        if not raw:
+            continue
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            continue
+    return None
+
+
 def _apply_proxy_mode_serialization() -> None:
-    """Serialize parallelism when the proxy is in ``cheap`` mode.
+    """Serialize parallelism in ``cheap`` mode only when there is no headroom.
 
-    Called once at runner start (before any pi call). When the proxy reports
-    mode exactly ``"cheap"`` (case-sensitive), this run's pi launches are
-    capped to one at a time by setting both ``AUDIT_PARALLELISM=1`` and
-    ``AUDIT_MAX_CONCURRENCY=1`` in this process's environment — so the
-    audit does not race the proxy's single-slot cheap-mode pool.
+    Called once at runner start (before any pi call). The historical rule
+    serialized *every* cheap-mode run to concurrency 1 on the (now-stale)
+    assumption that the cheap pool held a single slot. The cheap pool is
+    configured with ``session_slot_pool_size: 3``
+    (``proxy/config-cheap.yaml``), so a blanket cap defeats the dispatcher's
+    mode-aware parallel Phase 2 (WL-0MT50S9JW001DHME / SA-0MUZEIAD0008LUFN).
 
-    Fail-open: any other mode (including ``"fast"``) or a failed query
-    (unreachable / timeout / non-200 / unparseable) leaves all parallelism
-    settings unchanged; a warning is logged to stderr only on query
-    failure. The change is per-process (``os.environ``) — it affects only
-    this run's spawned pi subprocesses, never other processes or audits.
+    The rule now consults the explicit request and the live slot headroom:
+
+    - an explicit ``AUDIT_PARALLELISM`` / ``AUDIT_PHASE2_PARALLELISM``
+      request is authoritative and is never overwritten;
+    - otherwise, if the slot-status query reports >= 2 free slots, the run
+      stays parallel (bounded by the slot-aware ceiling in
+      :func:`_resolve_child_concurrency`);
+    - a failed slot query is fail-open — the configured static ceiling is
+      left unchanged rather than forcing serialization;
+    - otherwise (fewer than two free slots) the run is serialized to one pi
+      call at a time so it cannot race a saturated pool.
+
+    Any non-``cheap`` mode, or a failed proxy-mode query, leaves all
+    parallelism settings unchanged; a warning is logged to stderr only on a
+    failed proxy-mode query. All changes are per-process (``os.environ``) —
+    they affect only this run's spawned pi subprocesses, never other
+    processes or audits.
     """
     mode = _query_proxy_mode()
-    if mode == "cheap":
-        os.environ[AUDIT_PARALLELISM_ENV] = "1"
-        os.environ[ENV_MAX_WORKERS] = "1"
+    if mode != "cheap":
+        if mode is None:
+            print(
+                "Warning: could not determine proxy mode (fail-open — "
+                "parallelism settings unchanged).",
+                file=sys.stderr,
+            )
+        # Any other reported mode (e.g. "fast") → unchanged, no log noise.
+        return
+
+    explicit = _explicit_parallelism_request()
+    if explicit is not None:
         print(
-            "Proxy mode is 'cheap' — serializing audit pi calls "
-            "(AUDIT_PARALLELISM=1, AUDIT_MAX_CONCURRENCY=1).",
+            "Proxy mode is 'cheap' — honouring explicit parallelism request "
+            f"({explicit}); serialization skipped.",
             file=sys.stderr,
         )
-    elif mode is None:
+        return
+
+    available, _total = _query_slot_status()
+    if available is None:
         print(
-            "Warning: could not determine proxy mode (fail-open — "
+            "Proxy mode is 'cheap' — slot status unavailable (fail-open — "
             "parallelism settings unchanged).",
             file=sys.stderr,
         )
-    # Any other reported mode (e.g. "fast") → unchanged, no log noise.
+        return
+    if int(available) >= 2:
+        print(
+            "Proxy mode is 'cheap' — second slot free "
+            f"({available} available); serialization skipped.",
+            file=sys.stderr,
+        )
+        return
+
+    os.environ[AUDIT_PARALLELISM_ENV] = "1"
+    os.environ[ENV_MAX_WORKERS] = "1"
+    print(
+        "Proxy mode is 'cheap' — no second slot free; serializing audit pi "
+        "calls (AUDIT_PARALLELISM=1, AUDIT_MAX_CONCURRENCY=1).",
+        file=sys.stderr,
+    )
 
 
 def _resolve_max_child_concurrency() -> int:
@@ -13168,9 +13229,13 @@ def main(argv: list[str] | None = None) -> int:
         os.environ[ENV_PI_SESSION_DIR] = session_dir
 
     # Detect proxy 'cheap' mode before any pi call and serialize this run's
-    # parallelism (AUDIT_PARALLELISM=1 + AUDIT_MAX_CONCURRENCY=1) so the
-    # audit does not race the proxy's single-slot pool (SA-0MSN04X2S006ONH0).
-    # Fail-open: a failed query or any other mode leaves settings unchanged.
+    # parallelism (AUDIT_PARALLELISM=1 + AUDIT_MAX_CONCURRENCY=1) ONLY when
+    # there is no explicit request and the cheap pool has no free second slot
+    # — the pool is configured with session_slot_pool_size: 3
+    # (proxy/config-cheap.yaml), so a blanket cap would defeat the dispatcher's
+    # mode-aware parallel Phase 2 (SA-0MSN04X2S006ONH0 /
+    # SA-0MUZEIAD0008LUFN). Fail-open: a failed query or any other mode
+    # leaves settings unchanged.
     _apply_proxy_mode_serialization()
 
     if args.command == "issue":

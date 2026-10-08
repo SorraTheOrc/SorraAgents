@@ -3362,9 +3362,16 @@ class TestProxyModeSerialization:
         with self._mock_mode_response('{"mode": 5}'):
             assert audit_runner._query_proxy_mode("http://x") is None
 
-    def test_apply_serialization_cheap_sets_both_env_and_logs(self, capsys):
-        """Mode 'cheap' → AUDIT_PARALLELISM=1 and AUDIT_MAX_CONCURRENCY=1 + stderr line."""
+    @staticmethod
+    def _mock_slot(available, total):
+        return mock.patch.object(
+            audit_runner, "_query_slot_status", return_value=(available, total),
+        )
+
+    def test_apply_serialization_cheap_saturated_serializes(self, capsys):
+        """Cheap + no explicit request + no free second slot → serialized."""
         with mock.patch.object(audit_runner, "_query_proxy_mode", return_value="cheap"), \
+             self._mock_slot(1, 3), \
              mock.patch.dict(audit_runner.os.environ, {}, clear=True):
             audit_runner._apply_proxy_mode_serialization()
             assert audit_runner.os.environ[audit_runner.AUDIT_PARALLELISM_ENV] == "1"
@@ -3372,6 +3379,71 @@ class TestProxyModeSerialization:
         err = capsys.readouterr().err
         assert "cheap" in err
         assert "AUDIT_PARALLELISM=1" in err
+
+    def test_apply_serialization_cheap_explicit_legacy_override_preserved(self, capsys):
+        """AC1: an explicit AUDIT_PHASE2_PARALLELISM=2 is authoritative in cheap mode."""
+        with mock.patch.object(audit_runner, "_query_proxy_mode", return_value="cheap"), \
+             self._mock_slot(1, 3), \
+             mock.patch.dict(
+                 audit_runner.os.environ,
+                 {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV_LEGACY: "2"},
+                 clear=True,
+             ):
+            audit_runner._apply_proxy_mode_serialization()
+            assert audit_runner.AUDIT_PARALLELISM_ENV not in audit_runner.os.environ
+            assert audit_runner.os.environ.get(audit_runner.ENV_MAX_WORKERS) != "1"
+            assert audit_runner._resolve_parallelism() == 2
+        assert "explicit" in capsys.readouterr().err.lower()
+
+    def test_apply_serialization_cheap_explicit_new_name_preserved(self):
+        """AC1: an explicit AUDIT_PARALLELISM=2 is authoritative in cheap mode."""
+        with mock.patch.object(audit_runner, "_query_proxy_mode", return_value="cheap"), \
+             self._mock_slot(1, 3), \
+             mock.patch.dict(
+                 audit_runner.os.environ,
+                 {audit_runner.AUDIT_PARALLELISM_ENV: "2"},
+                 clear=True,
+             ):
+            audit_runner._apply_proxy_mode_serialization()
+            assert audit_runner.os.environ[audit_runner.AUDIT_PARALLELISM_ENV] == "2"
+            assert audit_runner._resolve_parallelism() == 2
+
+    def test_apply_serialization_cheap_free_slot_skips_serialization(self, capsys):
+        """AC2/AC3: a genuinely free second slot keeps cheap mode parallel."""
+        with mock.patch.object(audit_runner, "_query_proxy_mode", return_value="cheap"), \
+             self._mock_slot(2, 3), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            audit_runner._apply_proxy_mode_serialization()
+            assert audit_runner.AUDIT_PARALLELISM_ENV not in audit_runner.os.environ
+            assert audit_runner.ENV_MAX_WORKERS not in audit_runner.os.environ
+            # Slot-aware ceiling reaches 2 in cheap mode (AC3).
+            assert audit_runner._resolve_child_concurrency() == 2
+        assert "free" in capsys.readouterr().err.lower()
+
+    def test_apply_serialization_cheap_slot_query_failure_fail_open(self, capsys):
+        """AC4: a failed slot query leaves the static ceiling unchanged (fail-open)."""
+        with mock.patch.object(audit_runner, "_query_proxy_mode", return_value="cheap"), \
+             self._mock_slot(None, None), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            # Must not raise, stall, or abort.
+            audit_runner._apply_proxy_mode_serialization()
+            assert audit_runner.AUDIT_PARALLELISM_ENV not in audit_runner.os.environ
+            assert audit_runner.ENV_MAX_WORKERS not in audit_runner.os.environ
+            assert audit_runner._resolve_parallelism() == audit_runner._PARALLELISM_DEFAULT
+        assert capsys.readouterr().err != ""
+
+    def test_apply_serialization_cheap_invalid_explicit_ignored(self):
+        """An invalid explicit value is ignored → a saturated cheap run serializes."""
+        with mock.patch.object(audit_runner, "_query_proxy_mode", return_value="cheap"), \
+             self._mock_slot(0, 3), \
+             mock.patch.dict(
+                 audit_runner.os.environ,
+                 {audit_runner.AUDIT_PARALLELISM_ENV: "banana"},
+                 clear=True,
+             ):
+            audit_runner._apply_proxy_mode_serialization()
+            assert audit_runner.os.environ[audit_runner.AUDIT_PARALLELISM_ENV] == "1"
+            assert audit_runner.os.environ[audit_runner.ENV_MAX_WORKERS] == "1"
 
     def test_apply_serialization_fast_leaves_env_unchanged(self, capsys):
         """Mode 'fast' → no env mutation, no log output."""
