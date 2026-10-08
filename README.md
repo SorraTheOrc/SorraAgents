@@ -1,10 +1,13 @@
 # Workflow & Skills Repository
 
-A lightweight collection of workflow guides, command patterns, and skill templates for building and operating small automation agents.
+SorraAgents provides agent skills and workflows for software development,
+orchestrated by [ContextHub](https://github.com/TheWizardsCode/ContextHub) (a sister project). The skills can be used with other orchestration systems —
+including humans — but they are optimised for ContextHub.
 
 ## Purpose
 
-- Centralize documentation and reusable "skills" for agent development and operational workflows.
+- Provide agent skills and workflows for software development: planning, implementation, testing, auditing, and release.
+- Support orchestration by ContextHub (a sister project), while remaining usable with other orchestration systems.
 - Provide templates and checklists to guide feature implementation, testing, and release.
 
 ## Terminology Policy
