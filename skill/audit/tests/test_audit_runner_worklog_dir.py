@@ -328,10 +328,11 @@ class TestSiblingScanBaseCwdIndependence:
 class TestStatusLifecycleFromOwningProjectRoot:
     """Status lifecycle completes from the owning project root.
 
-    The launch-context guard (LP-0MSQ32HNR007AI6B) makes launches from a
-    non-owning cwd fatal, so the lifecycle is exercised from the owning
-    project root — the wl commands still carry the resolved ``--worklog-dir``
-    pointing at the owning project's store.
+    Since SA-0MSRLECW2001AA15 a determinable non-owning launch proceeds with
+    a stderr warning (only undeterminable ownership aborts), and the per-audit
+    target root follows the worklog owner. The lifecycle is exercised from the
+    owning project root — the wl commands still carry the resolved
+    ``--worklog-dir`` pointing at the owning project's store.
     """
 
     def _make_lifecycle_runner(self, recorded: list[list[str]]):

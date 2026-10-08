@@ -972,6 +972,171 @@ class TestGitResolutionFromNonOwningCwd:
             )
 
 
+class TestPerAuditRootConsumers:
+    """The per-audit target root is consumed by every residual
+    ``TARGET_PROJECT_ROOT`` reader (SA-0MULGDABC001T11L).
+
+    A foreign-cwd launch with a determinable owner resolves the per-audit
+    root to the owning project, so the code-quality scan, the repo-index
+    fallback, the debug-log slug, and the F3 suite-execution cwd all target
+    the audited project — never the launch cwd. A worktree launch keeps
+    resolving to the worktree checkout (same git repository).
+    """
+
+    def test_foreign_cwd_code_quality_targets_owning_root(self, tmp_path):
+        """The code-quality scan receives the owning project as
+        ``project_root``, not the launch cwd.
+        """
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+        mock_cq = mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+        with (
+            patcher,
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality", mock_cq
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(),
+                worklog_dir=str(target),
+            )
+
+        assert rc == 0
+        mock_cq.assert_called_once()
+        assert mock_cq.call_args.kwargs["project_root"] == target_root
+
+    def test_foreign_cwd_suite_execution_cwd_targets_owning_root(
+        self, tmp_path
+    ):
+        """The F3 auto-green / test-skill suite-execution cwd is the owning
+        project, not the launch cwd.
+        """
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+
+        with (
+            patcher,
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root),
+            mock.patch.object(
+                audit_runner, "_auto_green_run_outcome",
+                return_value=(None, None, audit_runner._FULL_SUITE_CACHE_MISS),
+            ) as auto_mock,
+            mock.patch.object(
+                audit_runner, "_run_tests_via_test_skill",
+                return_value={"success": False},
+            ) as run_mock,
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(),
+                worklog_dir=str(target),
+                run_tests=True,
+            )
+
+        assert rc == 0
+        auto_mock.assert_called_once()
+        assert auto_mock.call_args.kwargs["cwd"] == str(target_root)
+        run_mock.assert_called_once()
+        assert run_mock.call_args.kwargs["cwd"] == target_root
+
+    def test_foreign_cwd_debug_log_dir_targets_owning_root(self, tmp_path):
+        """The debug-log directory slug is derived from the owning project,
+        so debug artefacts are attributable to the audited project.
+        """
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+
+        with (
+            patcher,
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root),
+            mock.patch.object(
+                audit_runner, "_debug_log_dir",
+                wraps=audit_runner._debug_log_dir,
+            ) as debug_dir_spy,
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(),
+                worklog_dir=str(target),
+            )
+
+        assert rc == 0
+        assert debug_dir_spy.called
+        roots = [
+            (call.args[0] if call.args else call.kwargs.get("project_root"))
+            for call in debug_dir_spy.call_args_list
+        ]
+        assert any(root == target_root for root in roots), roots
+        assert all(root != launch_root for root in roots), roots
+
+    def test_repo_index_fallback_uses_per_audit_root(self, tmp_path):
+        """When ``git ls-files`` fails, ``_repo_index`` lists the per-audit
+        target root's top-level entries (not the launch cwd's).
+        """
+        _target, target_root, _patcher = _make_sibling_projects(tmp_path)
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+        (launch_root / "launch-only").mkdir()
+
+        def failing_git_runner(cmd):
+            if cmd and cmd[0] == "git":
+                return SimpleNamespace(returncode=1, stdout="", stderr="fatal")
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        with mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root):
+            index = audit_runner._repo_index(
+                failing_git_runner, project_root=target_root
+            )
+
+        assert any("src" in entry for entry in index), index
+        assert not any("launch-only" in entry for entry in index), index
+
+    def test_worktree_launch_per_audit_root_is_worktree(self, tmp_path):
+        """A worktree launch keeps the per-audit root at the worktree
+        checkout (same git repository), not the --worklog-dir parent.
+        """
+        (worklog_dir, _owning_root, worktree_path, _main_head,
+         _worktree_head) = _make_real_git_project_with_worktree(tmp_path)
+        mock_cq = mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+        with (
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", worktree_path
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality", mock_cq
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(git_cwd=worktree_path),
+                worklog_dir=str(worklog_dir),
+            )
+
+        assert rc == 0
+        assert mock_cq.call_args.kwargs["project_root"] == worktree_path
+
+
 # ===========================================================================
 # SA-0MSRM7KIF003E0B2: worktree-launch git regression — a launch from a
 # worktree of the owning project keeps git resolving to the WORKTREE
