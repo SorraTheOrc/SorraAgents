@@ -324,6 +324,46 @@ export function getDescendants(itemId) {
   return found;
 }
 
+// ── getParentAudit ──────────────────────────────────────────────────────────
+
+/**
+ * Resolve a work item's own audit readiness.
+ *
+ * Used by the fallback cascade (SA-0MUR7Y3BJ004FGPP recurrence): when a
+ * release candidate parent is audit-ready (`readyToClose === true`) but its
+ * descendants are still non-terminal, the close step cascades the descendants
+ * before closing the parent. This is the situation produced when the audit was
+ * recorded outside the audit runner (manual `wl audit-set` / manual approval),
+ * which bypasses the runner's own descendant cascade and would otherwise leave
+ * the audit-ready parent refused and stuck `in_review` after a release.
+ *
+ * Read-only and fail-safe: a failed/unparseable `wl audit-show` resolves to
+ * `readyToClose: false`, so the cascade is never authorised without a verified
+ * passing verdict.
+ *
+ * @param {string} itemId - Work item id.
+ * @returns {{readyToClose: boolean, auditedAt: string|null}}
+ */
+export function getParentAudit(itemId) {
+  try {
+    const output = execSync(`wl audit-show ${itemId} --json`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const parsed = JSON.parse(output);
+    const audit = (parsed && parsed.audit) || null;
+    if (!audit) {
+      return { readyToClose: false, auditedAt: null };
+    }
+    return {
+      readyToClose: audit.readyToClose === true,
+      auditedAt: audit.auditedAt || audit.time || null,
+    };
+  } catch (_err) {
+    return { readyToClose: false, auditedAt: null };
+  }
+}
+
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
@@ -374,9 +414,19 @@ export function getDescendants(itemId) {
  *   Clears the child's `needsProducerReview` flag and records the explanatory
  *   comment; defaults to `wl update <child> --needs-producer-review false`
  *   followed by `wl comment add <child>` (AC1/AC4).
+ * @param {(itemId: string) => ({readyToClose: boolean, auditedAt: string|null}|null)} [options.getParentAuditFn] -
+ *   Resolves a candidate's own audit readiness. When a candidate has
+ *   non-terminal collateral descendants AND its audit is passing
+ *   (`readyToClose === true`), the descendants are cascaded to
+ *   `completed`/`done` before the parent is closed (SA-0MUR7Y3BJ004FGPP
+ *   recurrence). Defaults to {@link getParentAudit}.
+ * @param {(childId: string, parentId: string, auditTimestamp: string|null) => void} [options.runCascadeCommand] -
+ *   Cascades one descendant to `status=completed, stage=done` and records the
+ *   explanatory comment; defaults to `wl update` + `wl comment add`.
  * @param {boolean} [options.dryRun=false] - When true, intended child
- *   overrides are reported but no `wl` mutation is performed (AC4).
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
+ *   overrides and cascades are reported but no `wl` mutation is performed
+ *   (AC4).
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -398,6 +448,21 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       );
     },
+    getParentAuditFn = getParentAudit,
+    runCascadeCommand = (childId, parentId, auditTimestamp) => {
+      execSync(
+        `wl update ${childId} --status completed --stage done --json`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      const when = auditTimestamp ? ` (audit ${auditTimestamp})` : '';
+      const comment = `Cascaded to completed/done by audit-ready parent `
+        + `${parentId}${when}: the parent audit passed, so all its descendants `
+        + 'are considered complete.';
+      execSync(
+        `wl comment add ${childId} --comment ${shellQuote(comment)} --author ship --json`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+    },
     dryRun = false,
   } = options;
 
@@ -411,6 +476,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       skippedItems: [],
       overriddenCount: 0,
       overriddenItems: [],
+      cascadedCount: 0,
+      cascadedItems: [],
       refusedCount: 0,
       refusedItems: [],
       dryRun,
@@ -433,6 +500,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       skippedItems: [],
       overriddenCount: 0,
       overriddenItems: [],
+      cascadedCount: 0,
+      cascadedItems: [],
       refusedCount: 0,
       refusedItems: [],
       dryRun,
@@ -540,6 +609,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   const candidateItemsById = new Map(items.map((item) => [item.id, item]));
   const refusedItems = [];
   const closable = [];
+  const cascadedItems = [];
   for (const item of toClose) {
     let descendants = [];
     try {
@@ -548,7 +618,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       console.warn(`  ⚠ Could not resolve descendants for ${item.id}: ${err.message}`);
       descendants = [];
     }
-    const collateral = descendants.filter((id) => {
+    let collateral = descendants.filter((id) => {
       if (candidateIds.has(id)) return false;
       // Terminal descendants (`stage: done` or `status: deleted`) are NOT
       // collateral: `wl close --force` may sweep them harmlessly, and an
@@ -567,6 +637,65 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
         && (lifecycle.stage === 'done' || lifecycle.status === 'deleted');
       return !terminal;
     });
+
+    // Fallback cascade (SA-0MUR7Y3BJ004FGPP recurrence): a candidate whose
+    // audit is passing terminalises its non-terminal descendants before the
+    // close. This covers audits recorded OUTSIDE the audit runner (manual
+    // `wl audit-set` / manual approval), which bypass the runner's own
+    // descendant cascade and would otherwise leave this audit-ready parent
+    // refused and stuck `in_review` forever after a release. Authorised by the
+    // passing audit verdict ONLY — never by status/stage (AC2/AC3). A failed
+    // per-child cascade leaves that child as collateral, so a partially
+    // cascaded subtree is still refused rather than force-closed.
+    if (collateral.length > 0) {
+      let parentAudit = null;
+      try {
+        parentAudit = getParentAuditFn(item.id);
+      } catch (err) {
+        console.warn(`  ⚠ Could not resolve audit for ${item.id}: ${err.message}`);
+        parentAudit = null;
+      }
+      if (parentAudit && parentAudit.readyToClose === true) {
+        const auditTimestamp = parentAudit.auditedAt || null;
+        if (dryRun) {
+          console.log(
+            `  ○ ${item.title || item.id} (${item.id}) — dry-run: would cascade `
+            + `${collateral.length} non-terminal descendant(s) via passing audit`,
+          );
+          for (const childId of collateral) {
+            cascadedItems.push({
+              id: childId,
+              ancestorId: item.id,
+              auditTimestamp,
+            });
+          }
+          collateral = [];
+        } else {
+          const remaining = [];
+          for (const childId of collateral) {
+            try {
+              runCascadeCommand(childId, item.id, auditTimestamp);
+              cascadedItems.push({
+                id: childId,
+                ancestorId: item.id,
+                auditTimestamp,
+              });
+              console.log(
+                `  ✓ ${childId} — cascaded to completed/done `
+                + `(parent ${item.id} audit passed)`,
+              );
+            } catch (err) {
+              console.warn(
+                `  ⚠ Failed to cascade descendant ${childId} of `
+                + `${item.id}: ${err.message}`,
+              );
+              remaining.push(childId);
+            }
+          }
+          collateral = remaining;
+        }
+      }
+    }
     // AC2: a descendant held back solely because `needsProducerReview=true`
     // (a candidate skipped with its producer-review flag still set) must be
     // reported with a distinct reason rather than lumped under the generic
@@ -614,6 +743,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       skippedItems,
       overriddenCount: overriddenItems.length,
       overriddenItems,
+      cascadedCount: cascadedItems.length,
+      cascadedItems,
       refusedCount: refusedItems.length,
       refusedItems,
       dryRun,
@@ -670,6 +801,9 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   if (overriddenItems.length > 0) {
     summary += ` ${overriddenItems.length} child(ren) overridden (parent audit authorises flag clear).`;
   }
+  if (cascadedItems.length > 0) {
+    summary += ` ${cascadedItems.length} descendant(s) cascaded via passing parent audit.`;
+  }
   if (refusedItems.length > 0) {
     summary += ` ${refusedItems.length} item(s) refused (collateral descendants outside candidate set).`;
   }
@@ -687,6 +821,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     skippedItems,
     overriddenCount: overriddenItems.length,
     overriddenItems,
+    cascadedCount: cascadedItems.length,
+    cascadedItems,
     refusedCount: refusedItems.length,
     refusedItems,
     dryRun,
