@@ -15,6 +15,14 @@ Provide a single, deterministic release workflow: `dev` is promoted to `main` vi
 
 Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "ship", "release", "promote dev", "merge dev to main", "release the changes" — all map to `release`.
 
+> **No work item is required for a release.** Running `/skill:ship release` is
+> a work-item-exempt maintenance action: invoke it directly and do **not**
+> create a release work item (nor ask the operator to create one). This is
+> distinct from the automatic **closure** of `in_review`/`completed` work items
+> performed after a verified release (Release Process step 12,
+> `closeWorkItemsAfterRelease`) — that closure happens with no release work
+> item existing.
+
 ## How Agents Invoke This Skill
 
 ```
@@ -145,7 +153,7 @@ node $(skill_path ship)/scripts/run-release.js
 9. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push. Release ops run from **main checkout**, not worktrees.
 10. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): close only after the release landed on main — tag `v<version>` exists on origin AND is an ancestor of `origin/main`; else exit 11, no items closed.
 11. **Discord notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` posts version, tag (`vX.Y.Z`), release date, PR URL, and the new version's changelog section from `CHANGELOG.md` to a configured Discord channel via webhook. Runs only after merge verification (never on `--dry-run` or failed releases). Failure (network, HTTP error, timeout) logs a warning and never changes the release exit code. See [Discord release notification](#discord-release-notification).
-12. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items with `needsProducerReview === false`. A child flagged `needsProducerReview=true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared via `wl update <child> --needs-producer-review false`, an explanatory comment naming the authorising parent is added, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3); items with `null`/`undefined` flags, or `true`-but-uncovered, are skipped + logged. A candidate whose `--force` close would sweep descendants **outside** the candidate set is refused and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override or close mutation is performed; the planned actions are reported.
+12. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items with `needsProducerReview === false`. A child flagged `needsProducerReview=true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared via `wl update <child> --needs-producer-review false`, an explanatory comment naming the authorising parent is added, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3); items with `null`/`undefined` flags, or `true`-but-uncovered, are skipped + logged. A candidate whose `--force` close would sweep descendants **outside** the candidate set is refused and reported (SA-0MU2OY1N9000XL2H AC9/AC10); a descendant held back solely by `needsProducerReview=true` is reported with a distinct `descendant(s) need producer review` reason rather than the generic collateral list (SA-0MUJKPDAA002VVDP AC2). Under `--dry-run` no override or close mutation is performed; the planned actions are reported.
 
 ### Discord release notification
 
@@ -171,10 +179,17 @@ discord:
   webhook_url: https://discord.com/api/webhooks/<id>/<token>
 ```
 
+```yaml
+# <project>/.worklog/config.yaml (tracked, optional) — project elevator pitch
+projectDescription: A short 2–3 sentence summary of what the project is.
+```
+
 - **Precedence (AC2):** per-project `.worklog/config.private.yaml` (gitignored secret) first; then `.worklog/config.yaml` (tracked); then global `~/.pi/agent/config.yaml` fallback. The first file that defines `discord.webhook_url` wins. Neither set → the step is skipped with an info log and the release completes normally (no error).
+- **Project pitch (`projectDescription`):** an optional top-level scalar resolved with the **same private → project → global precedence as `projectName`**. When unset, a 2–3 sentence pitch is generated via the shared DeepSeek LLM caller from the leading `README.md` prose (the block before the first `##` heading, capped at ~1000 characters). When generation is unavailable — no API key, LLM/network error, or missing/unreadable README — the pitch paragraph is omitted and the notification still sends. The pitch is generated on the fly and never written back to `config.yaml`.
 - **Gitignored private file:** `.worklog/config.private.yaml` is explicitly gitignored (see `.gitignore`). An example template is provided at `.worklog/config.private.yaml.example` — copy it and fill in your webhook URL.
 - **Non-blocking (AC3):** a failed or slow webhook POST logs a warning and does not change the release exit code; an already-landed release is never failed by a notification failure.
-- **Discord limits (AC4):** the embed description (changelog) is truncated to ≤ 4096 chars with an ellipsis marker.
+- **Description composition:** the embed description is composed of paragraphs in this order: (a) the project elevator pitch, (b) the release focus (extracted from the `> **Release focus:** …` marker generated under the version heading by `generate-changelog.js`), (c) the `**<projectName> v<version>**` line, and (d) the changelog section. Absent pitch/focus paragraphs are omitted, and the focus marker line is removed from the changelog body so the text is not duplicated.
+- **Discord limits (AC4):** the fully-composed embed description is truncated to ≤ 4096 chars with an ellipsis marker.
 - **Secret:** the webhook URL contains an auth token — do **not** commit it to a repository. The recommended location is `.worklog/config.private.yaml` (per-project, gitignored); the global `~/.pi/agent/config.yaml` is also supported as a fallback. Never store the webhook in `.worklog/config.yaml` (tracked).
 - **Migration:** an existing global `discord.webhook_url` in `~/.pi/agent/config.yaml` can be moved to `.worklog/config.private.yaml` for per-project isolation; the global fallback remains supported.
 

@@ -332,6 +332,91 @@ test('close-work-items: mixed terminal/non-terminal refusal names only non-termi
 });
 
 // ---------------------------------------------------------------------------
+// AC2/AC4(c): a descendant held back solely by needsProducerReview=true is
+// reported with a distinct refusal reason, not lumped under the generic
+// collateral list (SA-0MUJKPDAA002VVDP)
+// ---------------------------------------------------------------------------
+test('close-work-items: npr descendant refusal reports a distinct producer-review reason', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      {
+        id: 'SA-NPR',
+        title: 'Needs Review Child',
+        needsProducerReview: true,
+        parentId: 'SA-PARENT',
+      },
+    ],
+    // The npr child is not covered by an audit-ready ancestor, so it stays
+    // skipped rather than being overridden/closed.
+    getAncestorAuditFn: () => ({ outcome: 'uncovered', ancestorId: null }),
+    getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-NPR'] : []),
+    getItemLifecycleFn: () => ({ status: 'in_progress', stage: 'in_review' }),
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(closed, [], 'the parent must still be refused');
+  assert.equal(result.refusedCount, 1);
+  assert.equal(result.refusedItems[0].id, 'SA-PARENT');
+  assert.ok(
+    result.refusedItems[0].reason.includes('producer review'),
+    `reason should name the producer-review cause, got: ${result.refusedItems[0].reason}`,
+  );
+  assert.ok(
+    !result.refusedItems[0].reason.includes('outside the candidate set'),
+    `reason must not be lumped under the generic collateral message, got: ${result.refusedItems[0].reason}`,
+  );
+  assert.deepEqual(
+    result.refusedItems[0].needsProducerReview,
+    ['SA-NPR'],
+    'the refusal should name the producer-review descendant(s) separately',
+  );
+});
+
+test('close-work-items: mixed generic/npr collateral reports both causes distinctly', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      {
+        id: 'SA-NPR',
+        title: 'Needs Review Child',
+        needsProducerReview: true,
+        parentId: 'SA-PARENT',
+      },
+    ],
+    getAncestorAuditFn: () => ({ outcome: 'uncovered', ancestorId: null }),
+    getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-NPR', 'SA-PLAN'] : []),
+    getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(closed, [], 'the parent must still be refused');
+  assert.equal(result.refusedCount, 1);
+  assert.deepEqual(
+    result.refusedItems[0].collateral,
+    ['SA-NPR', 'SA-PLAN'],
+    'the full collateral list is preserved for callers',
+  );
+  assert.deepEqual(
+    result.refusedItems[0].needsProducerReview,
+    ['SA-NPR'],
+    'the producer-review descendant is classified separately',
+  );
+  assert.ok(
+    result.refusedItems[0].reason.includes('SA-PLAN'),
+    'the generic descendant is still named',
+  );
+  assert.ok(
+    result.refusedItems[0].reason.includes('producer review'),
+    'the npr cause is also named',
+  );
+});
+
+// ---------------------------------------------------------------------------
 // 8. Release Process docs are updated with auto-close mention
 // ---------------------------------------------------------------------------
 test('close-work-items: Post-merge section mentions auto-close', () => {

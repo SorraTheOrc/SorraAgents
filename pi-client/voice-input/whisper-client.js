@@ -8,7 +8,7 @@
  * thin adapter, matching the `proxy-sse-signals` convention.
  *
  * Protocol (see `whisper_worker.py` for the full spec):
- *   -> {"type":"start","model","device","computeType","partialIntervalMs"}
+ *   -> {"type":"start","model","device","computeType","partialIntervalMs","beamSize","vadFilter","initialPrompt"}
  *   <- {"type":"ready","model","device","computeType"}
  *   -> {"type":"feed","audio":"<base64 int16 PCM>"}
  *   <- {"type":"partial","text","sequence"}
@@ -52,6 +52,9 @@ export class WhisperClient {
     computeType = "float16",
     partialIntervalMs = 1000,
     language = null,
+    beamSize = 5,
+    vadFilter = false,
+    initialPrompt = "",
     spawn = nodeSpawn,
     startupTimeoutMs = 120000,
     finaliseTimeoutMs = 60000,
@@ -64,6 +67,9 @@ export class WhisperClient {
     this.computeType = computeType;
     this.partialIntervalMs = partialIntervalMs;
     this.language = language;
+    this.beamSize = beamSize;
+    this.vadFilter = Boolean(vadFilter);
+    this.initialPrompt = initialPrompt;
     this.spawn = spawn;
     this.startupTimeoutMs = startupTimeoutMs;
     this.finaliseTimeoutMs = finaliseTimeoutMs;
@@ -115,6 +121,9 @@ export class WhisperClient {
       String(this.partialIntervalMs),
     ];
     if (this.language) args.push("--language", this.language);
+    args.push("--beam-size", String(this.beamSize));
+    args.push(this.vadFilter ? "--vad-filter" : "--no-vad-filter");
+    if (this.initialPrompt) args.push("--initial-prompt", this.initialPrompt);
 
     try {
       this.child = this.spawn(this.python, args, { stdio: ["pipe", "pipe", "pipe"] });
@@ -161,6 +170,9 @@ export class WhisperClient {
       device: this.device,
       computeType: this.computeType,
       partialIntervalMs: this.partialIntervalMs,
+      beamSize: this.beamSize,
+      vadFilter: this.vadFilter,
+      initialPrompt: this.initialPrompt,
     });
     return ready.then((info) => {
       this.readyInfo = info;

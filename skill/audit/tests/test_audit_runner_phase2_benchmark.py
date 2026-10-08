@@ -225,10 +225,7 @@ def test_phase2_deep_latency_citation_cap() -> None:
     if reason is not None:
         pytest.skip(f"Benchmark skipped: {reason}")
 
-    resolved_model = audit_runner._resolve_model_for_phase(
-        audit_runner.AUDIT_PHASE, audit_runner._load_config(),
-        audit_runner.DEFAULT_MODEL_SOURCE,
-    )
+    resolved_model = audit_runner.DEFAULT_MODEL
     worktree_root = REPO_ROOT
 
     elapsed_list: list[float] = []

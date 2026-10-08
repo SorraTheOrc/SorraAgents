@@ -52,10 +52,22 @@ def _canned_run(exit_code: int, stdout: str = "") -> dict:
     }
 
 
+def _force_legacy_mode(mod: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable the test-skill suite resolution so the legacy path runs.
+
+    ``run_tests`` first delegates to ``full_suite_commands``; these tests
+    stub ``_detect_test_tooling`` (legacy-only), so the resolution is
+    disabled explicitly rather than depending on the ambient filesystem
+    (SA-0MUWCVFLL006VXT3).
+    """
+    monkeypatch.setattr(mod, "_full_suite_commands", None)
+
+
 def _make_mod(monkeypatch: pytest.MonkeyPatch, tooling: str = "pytest") -> object:
     """Load implement.py with tooling detection stubbed and a recording
     run_cached; returns (mod, captured)."""
     mod = _load_implement()
+    _force_legacy_mode(mod, monkeypatch)
     monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: tooling)
     captured: list[str] = []
 
@@ -68,19 +80,21 @@ def _make_mod(monkeypatch: pytest.MonkeyPatch, tooling: str = "pytest") -> objec
 
 
 class TestChangedScopeWorktreeLoop:
-    def test_changed_scope_runs_selected_tests(self, monkeypatch: pytest.MonkeyPatch):
+    def test_changed_scope_runs_selected_tests(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """AC1: scope=changed invokes the scoped pytest command, not the
         full PYTEST_CMD, and records scope=changed."""
         mod, captured = _make_mod(monkeypatch)
         monkeypatch.setattr(mod, "_changed_scope_commands", lambda *a, **k: [SCOPED_CMD])
 
-        result = mod.run_tests("/tmp", scope="changed")
+        result = mod.run_tests(str(tmp_path), scope="changed")
 
         assert captured == [SCOPED_CMD], f"got {captured}"
         assert result["scope"] == "changed"
 
     def test_changed_scope_unavailable_falls_back_to_full(
-        self, monkeypatch: pytest.MonkeyPatch, caplog
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
     ):
         """AC4: selection unavailable (None) → warn + fall back to full with
         scope=full in the result."""
@@ -88,7 +102,7 @@ class TestChangedScopeWorktreeLoop:
         monkeypatch.setattr(mod, "_changed_scope_commands", lambda *a, **k: None)
 
         with caplog.at_level("WARNING"):
-            result = mod.run_tests("/tmp", scope="changed")
+            result = mod.run_tests(str(tmp_path), scope="changed")
 
         assert captured == [mod.PYTEST_CMD], f"got {captured}"
         assert result["scope"] == "full"
@@ -96,7 +110,7 @@ class TestChangedScopeWorktreeLoop:
                    for r in caplog.records)
 
     def test_changed_scope_node_only_selection_falls_back(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """A selection that resolves only to node commands falls back to full
         (implement's pytest channel cannot run node --test)."""
@@ -105,14 +119,16 @@ class TestChangedScopeWorktreeLoop:
             mod, "_changed_scope_commands", lambda *a, **k: ['node --test x.mjs']
         )
 
-        result = mod.run_tests("/tmp", scope="changed")
+        result = mod.run_tests(str(tmp_path), scope="changed")
 
         assert captured == [mod.PYTEST_CMD]
         assert result["scope"] == "full"
 
 
 class TestFullScopeGate:
-    def test_full_scope_skips_changed_selection(self, monkeypatch: pytest.MonkeyPatch):
+    def test_full_scope_skips_changed_selection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """AC2: scope=full must bypass the changed selector entirely."""
         mod, captured = _make_mod(monkeypatch)
         calls: list[str] = []
@@ -121,7 +137,7 @@ class TestFullScopeGate:
             lambda *a, **k: calls.append("selector") or [SCOPED_CMD],
         )
 
-        result = mod.run_tests("/tmp", scope="full")
+        result = mod.run_tests(str(tmp_path), scope="full")
 
         assert captured == [mod.PYTEST_CMD], f"got {captured}"
         assert calls == []
@@ -129,22 +145,25 @@ class TestFullScopeGate:
 
 
 class TestScopeMetadata:
-    def test_results_carry_scope(self, monkeypatch: pytest.MonkeyPatch):
+    def test_results_carry_scope(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """AC3: every result path carries a scope key."""
         mod = _load_implement()
+        _force_legacy_mode(mod, monkeypatch)
         monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: None)
-        result = mod.run_tests("/tmp", scope="changed")
+        result = mod.run_tests(str(tmp_path), scope="changed")
         assert result["skipped"] is True
         assert result["scope"] == "full"  # skipped no-op records no partial evidence
 
     def test_npm_tooling_changed_scope_warns_and_runs_full(
-        self, monkeypatch: pytest.MonkeyPatch, caplog
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
     ):
         """npm tooling is not subsettable — warn + run full scope."""
         mod, captured = _make_mod(monkeypatch, tooling="npm")
 
         with caplog.at_level("WARNING"):
-            result = mod.run_tests("/tmp", scope="changed")
+            result = mod.run_tests(str(tmp_path), scope="changed")
 
         assert captured == [mod.NPM_TEST_CMD]
         assert result["scope"] == "full"
@@ -162,7 +181,7 @@ class TestDeletedPathImplementGate:
     pytest exit code 4; it should fall back to full scope."""
 
     def test_deletion_only_change_falls_back_to_full_not_fail(
-        self, monkeypatch: pytest.MonkeyPatch, caplog
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
     ):
         """When changed-scope pytest returns exit code 4 (file not found /
         no tests collected because the only test was deleted), the gate must
@@ -173,6 +192,7 @@ class TestDeletedPathImplementGate:
         file reached pytest (exit 4).
         """
         mod = _load_implement()
+        _force_legacy_mode(mod, monkeypatch)
         monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
         # Simulate the selector returning a command that references a
         # deleted file — exactly what the unfixed run_tests.py emits.
@@ -194,7 +214,7 @@ class TestDeletedPathImplementGate:
         monkeypatch.setattr(mod, "run_cached", fake_run_cached)
 
         with caplog.at_level("WARNING"):
-            result = mod.run_tests("/tmp", scope="changed")
+            result = mod.run_tests(str(tmp_path), scope="changed")
 
         # BUG: currently this assertion FAILS because the gate returns the
         # exit-4 scoped result directly and never falls back to full scope.
@@ -208,12 +228,13 @@ class TestDeletedPathImplementGate:
         assert result["success"] is True
 
     def test_scoped_failure_exit_1_still_blocks(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """A genuine test failure (exit 1) must remain a hard failure — the
         exit-4 fallback must not swallow real failures.
         """
         mod = _load_implement()
+        _force_legacy_mode(mod, monkeypatch)
         monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
         monkeypatch.setattr(
             mod, "_changed_scope_commands",
@@ -227,7 +248,7 @@ class TestDeletedPathImplementGate:
             return _canned_run(exit_code=1, stdout="1 failed")
 
         monkeypatch.setattr(mod, "run_cached", fake_run_cached)
-        result = mod.run_tests("/tmp", scope="changed")
+        result = mod.run_tests(str(tmp_path), scope="changed")
 
         # Exit 1 remains a scoped failure — no full-scope fallback.
         assert captured == [SCOPED_CMD], f"got {captured}"

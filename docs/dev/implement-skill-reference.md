@@ -6,6 +6,92 @@ operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged — every command/flag
 documented here is still valid.
 
+## Why driven child sessions run with extensions disabled (SA-0MUY9PYBD009Y7J5)
+
+The ``implement.py drive`` child spawner (``_default_session_spawner``) builds
+its command as:
+
+```
+pi -p "/skill:implement <child-id>" --approve --no-extensions [--verbose]
+```
+
+``--no-extensions`` is **load-bearing**, not cosmetic. Without it, a driven
+child's captured stderr can be flooded with repeated Pi-internal errors:
+
+```
+Extension error (<boundary>): turn_end could not resolve the persisted assistant entry ID
+```
+
+### Root cause (Pi core, not fixed from this repo)
+
+``AgentSession._dispatchTurnEndBoundary`` (``@earendil-works/pi-coding-agent``,
+``dist/core/agent-session.js``) resolves the finishing assistant message to a
+persisted session entry via ``_findPersistedMessageEntryId``. When that returns
+``undefined`` **and** ``ExtensionRunner.hasHandlers("turn_end")`` is true, it
+emits the error and returns ``false`` (non-fatal). The identity mismatch is a
+Pi-core bug; SorraAgents cannot patch it, and ``npm view
+@earendil-works/pi-coding-agent version`` reports the installed ``1.0.4`` as
+also the latest release, so no fixed version is available to upgrade to.
+
+### Why guarding a single handler is not enough
+
+``hasHandlers("turn_end")`` (``dist/core/extensions/runner.js:520``) is
+**global across all loaded extensions**. Two installed extensions register a
+``turn_end`` handler:
+
+- SorraAgents ``pi-client/proxy-sse-signals/index.ts:48``
+- ContextHub ``packages/tui/extensions/Worklog/lib/recovery/register-recovery.ts:94``
+
+So removing or guarding the ``proxy-sse-signals`` handler alone cannot silence
+the error. ``proxy-sse-signals`` is **intentionally left unchanged** — it
+remains functional in interactive sessions (its SSE signal markers and
+status-clearing behaviour must stay intact, SA-0MSHAKSEA001LQ6T / SA-0MUJASR2K0012DYS).
+The only reliable SorraAgents-side lever is to stop loading extensions in the
+headless driven child process entirely.
+
+### Precedent
+
+``skill/audit/scripts/audit_runner.py`` already runs every headless ``pi`` call
+with ``--no-extensions`` for the same class of problem (stale ``ExtensionContext``
+callbacks crashing the process after a session replacement, SA-0MUEIOGT2005IR7F;
+see the Isolation note in ``skill/audit/SKILL.md``). This change mirrors that
+accepted precedent for driven child sessions.
+
+### Recorded reproduction
+
+Recorded before the fix (``tce-main-street`` epic ``MS-0MUXW90YE009L4DQ``, child
+``MS-0MUXWGT7G009THBO``): a single driven child emitted **191** identical
+boundary-error lines and nothing else — ``/tmp/child1-session.log`` was exactly
+191 lines, all boundary errors — so ``implement.py drive``'s captured
+subprocess output was useless for progress/failure diagnosis. The same noise
+was the only content in a timed-out child's failure reason in ``AI_Hell``
+(``.worklog/logs/drive-AH-0MUX6S20F002GHPF.log``), and the ``tce-main-street``
+epic had to abandon ``drive`` for a manual per-child workaround.
+
+After the fix, ``drive`` constructs the child command with ``--no-extensions``,
+so ``--no-extensions`` disables extension discovery entirely — no extension
+loads, ``hasHandlers("turn_end")`` is ``false``, and the code path that emits
+the boundary error is never entered. Because the underlying Pi-core identity
+mismatch is intermittent (it depends on a message not resolving to a persisted
+entry, e.g. after a session replacement), the regression guard is the
+deterministic command-construction unit test rather than an e2e assertion:
+
+```bash
+pytest -q skill/implement/tests/test_drive_child_session.py
+```
+
+### Scope limits
+
+- No Pi-core patching (``node_modules`` is out of scope).
+- No change to the ContextHub ``Worklog`` extension (different repository).
+- No upstream issue filed (producer decision, Q2-B); the root cause is
+documented locally only.
+- ``--no-extensions`` also excludes the ContextHub ``Worklog`` recovery
+extension from driven children, removing its provider-error auto-retry/notify
+path. This is accepted because driven children are headless, the same exclusion
+is already accepted for audit calls, and the implement skill manages its own
+loop.
+
 ## Build step for repos without a build script
 
 The `implement.py finish` build step (`run_build()`) is tolerant of repos

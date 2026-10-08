@@ -18,6 +18,7 @@ Non-work-item skills (speak) must remain unwired.
 """
 from __future__ import annotations
 
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -32,6 +33,14 @@ if str(_MEASURE_DIR) not in sys.path:
     sys.path.insert(0, str(_MEASURE_DIR))
 
 import measure_context as mc
+
+# Load the report renderer by path (same technique as the measurement module)
+# so the regression test can render the ACs the plan skill documents.
+_REPORT_SCRIPTS = REPO_ROOT / "skill" / "report" / "scripts"
+if str(_REPORT_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_REPORT_SCRIPTS))
+
+import render_report as report_renderer
 
 # Skills whose flow creates/updates work items and must end with the
 # standardized report. git-management and owner-inference were retired
@@ -103,6 +112,107 @@ class TestEveryWorkItemSkillWired:
             "report: invocation contract does not require pasting output "
             "into the final response"
         )
+
+
+# ─── Plan skill: skill-session ACs vs work-item feature ACs ────────────────
+#
+# Regression guard for the operator finding that `/skill:plan` ended with
+# "Plan session for <id> (<title>) is incomplete. Requires attention
+# (implement)." even though planning completed and implement is simply the
+# next phase (SA-0MUYADP50005EYA2). The renderer derives session status from
+# the supplied `--ac` verdicts, so the plan skill must pass its *own*
+# planning-phase deliverables (all `met`), not the work item's feature ACs.
+
+_FINAL_STEP_SECTION_RE = re.compile(
+    r"## Final step: standardized end-of-session report(.*)\Z", re.DOTALL,
+)
+_PLACEHOLDER_AC_RE = re.compile(r'--ac\s+"<AC# description>')
+_AC_LINE_RE = re.compile(r'--ac\s+"([^"]+)"')
+
+
+def _final_step_section(skill_name: str) -> str:
+    """Return the text from the final-step heading to end of SKILL.md."""
+    match = _FINAL_STEP_SECTION_RE.search(_read(skill_name))
+    assert match, f"{skill_name}: no final-step section found"
+    return match.group(1)
+
+
+def _documented_acs(section: str) -> list[tuple[str, str, str]]:
+    """Parse the `--ac "desc|metric|verdict"` lines from a section."""
+    parsed = []
+    for match in _AC_LINE_RE.finditer(section):
+        value = match.group(1)
+        parts = [p.strip() for p in value.split("|")]
+        assert len(parts) == 3, (
+            f"malformed --ac value (expected desc|metric|verdict): {value!r}"
+        )
+        parsed.append((parts[0], parts[1], parts[2]))
+    return parsed
+
+
+class TestPlanSkillPassesPlanningPhaseAcs:
+    def test_final_step_has_no_placeholder_ac(self):
+        """A generic `<AC# description>` placeholder lets agents pass the
+        work item's feature ACs, which render the report as incomplete."""
+        section = _final_step_section("plan")
+        assert not _PLACEHOLDER_AC_RE.search(section), (
+            "plan: final step still uses placeholder --ac values; pass concrete "
+            "planning-phase ACs so a completed plan never renders as incomplete"
+        )
+
+    def test_final_step_passes_concrete_met_acs(self):
+        section = _final_step_section("plan")
+        acs = _documented_acs(section)
+        assert len(acs) >= 3, (
+            f"plan: expected >=3 concrete planning-phase ACs, found {len(acs)}"
+        )
+        for desc, metric, verdict in acs:
+            assert desc and metric, f"plan: empty AC field in {desc!r}/{metric!r}"
+            assert verdict == "met", (
+                f"plan: AC {desc!r} must be documented as 'met' on a successful "
+                f"plan, got {verdict!r}"
+            )
+
+    def test_final_step_distinguishes_skill_session_from_feature_acs(self):
+        section = _final_step_section("plan").lower()
+        assert "skill session" in section, (
+            "plan: final step must state that --ac records the skill session's "
+            "own deliverables"
+        )
+        assert "feature acceptance criteria" in section or "feature acs" in section, (
+            "plan: final step must warn against passing the work item's feature ACs"
+        )
+
+    def test_documented_planning_phase_acs_render_as_completed(self):
+        """The ACs the skill tells agents to pass must render as a completed
+        plan — this is the operator-visible behaviour under test."""
+        acs = _documented_acs(_final_step_section("plan"))
+        criteria = [
+            (str(i), desc, metric, verdict)
+            for i, (desc, metric, verdict) in enumerate(acs, start=1)
+        ]
+        metadata = {
+            "Type": "feature",
+            "Priority": "medium",
+            "Status": "open",
+            "Stage": "plan_complete",
+            "Risk": "medium",
+            "Effort": "M",
+            "Children": "3",
+            "Audit": "not run",
+        }
+        report = report_renderer.render_report(
+            skill_name="plan",
+            work_item_id="SA-0EXAMPLE00000",
+            title="Example plan",
+            headline="Produced the feature breakdown.",
+            acceptance_criteria=criteria,
+            metadata=metadata,
+            next_action="implement",
+        )
+        assert report.startswith("# Completed plan")
+        assert "Ready for implement." in report
+        assert "incomplete" not in report.lower()
 
 
 class TestNonWorkItemSkillsUnwired:

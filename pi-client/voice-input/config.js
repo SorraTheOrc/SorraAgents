@@ -25,6 +25,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   device: "cuda",
   computeType: "float16",
   language: "",
+  beamSize: 5,
+  vadFilter: false,
+  initialPrompt: "",
+  feedbackSound: true,
   silenceThreshold: 0.01,
   silenceMs: 3000,
   partialCadenceMs: 1000,
@@ -33,6 +37,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   python: "python3",
   workerScript: "",
   startupTimeoutMs: 120000,
+  targetPaneLabel: "Work Items",
+  targetPaneId: "",
+  shortcuts: [],
 });
 
 /** Device values accepted by the worker. */
@@ -45,6 +52,10 @@ const ENV_KEYS = {
   device: "PI_VOICE_INPUT_DEVICE",
   computeType: "PI_VOICE_INPUT_COMPUTE_TYPE",
   language: "PI_VOICE_INPUT_LANGUAGE",
+  beamSize: "PI_VOICE_INPUT_BEAM_SIZE",
+  vadFilter: "PI_VOICE_INPUT_VAD_FILTER",
+  initialPrompt: "PI_VOICE_INPUT_INITIAL_PROMPT",
+  feedbackSound: "PI_VOICE_INPUT_FEEDBACK_SOUND",
   silenceThreshold: "PI_VOICE_INPUT_SILENCE_THRESHOLD",
   silenceMs: "PI_VOICE_INPUT_SILENCE_MS",
   partialCadenceMs: "PI_VOICE_INPUT_PARTIAL_CADENCE_MS",
@@ -53,6 +64,9 @@ const ENV_KEYS = {
   python: "PI_VOICE_INPUT_PYTHON",
   workerScript: "PI_VOICE_INPUT_WORKER_SCRIPT",
   startupTimeoutMs: "PI_VOICE_INPUT_STARTUP_TIMEOUT_MS",
+  targetPaneLabel: "PI_VOICE_INPUT_TARGET_PANE_LABEL",
+  targetPaneId: "PI_VOICE_INPUT_TARGET_PANE_ID",
+  shortcuts: "PI_VOICE_INPUT_SHORTCUTS",
 };
 
 /** Approximate download sizes (MB) for the supported faster-whisper models. */
@@ -68,6 +82,8 @@ export const MODEL_SIZES_MB = Object.freeze({
   "large-v1": 3090,
   "large-v2": 3090,
   "large-v3": 3090,
+  "large-v3-turbo": 1620,
+  turbo: 1620,
   "distil-small.en": 332,
   "distil-medium.en": 789,
   "distil-large-v3": 1510,
@@ -100,6 +116,16 @@ export function configFromEnv(env = {}) {
       }
       continue;
     }
+    if (key === "shortcuts") {
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) throw new Error("not an array");
+        partial[key] = parsed;
+      } catch {
+        warnings.push(`${envName} is not a JSON array; ignoring it.`);
+      }
+      continue;
+    }
     partial[key] = raw;
   }
   return { partial, warnings };
@@ -116,7 +142,48 @@ function coerce(key, raw, fallback) {
     key === "silenceThreshold" ||
     key === "silenceMs" ||
     key === "partialCadenceMs" ||
-    key === "startupTimeoutMs";
+    key === "startupTimeoutMs" ||
+    key === "beamSize";
+
+  if (key === "vadFilter" || key === "feedbackSound") {
+    if (typeof raw === "boolean") return { value: raw, warning: null };
+    if (typeof raw === "string") {
+      const normalised = raw.trim().toLowerCase();
+      if (["true", "1", "yes", "on"].includes(normalised)) return { value: true, warning: null };
+      if (["false", "0", "no", "off"].includes(normalised)) return { value: false, warning: null };
+    }
+    return {
+      value: fallback,
+      warning: `${key} must be a boolean (true/false); using the default.`,
+    };
+  }
+
+  if (key === "shortcuts") {
+    if (!Array.isArray(raw)) {
+      return { value: fallback, warning: `${key} must be an array; using the default.` };
+    }
+    const cleaned = [];
+    const problems = [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object") {
+        problems.push("entries must be objects with a phrase and chord");
+        continue;
+      }
+      const phrase = typeof entry.phrase === "string" ? entry.phrase.trim() : "";
+      const chord = Array.isArray(entry.chord)
+        ? entry.chord.filter((key) => typeof key === "string" && key.length > 0)
+        : [];
+      if (!phrase || chord.length === 0) {
+        problems.push("each shortcut needs a non-empty phrase and chord");
+        continue;
+      }
+      cleaned.push({ phrase, chord });
+    }
+    return {
+      value: cleaned,
+      warning: problems.length ? `shortcuts: ${[...new Set(problems)].join("; ")}.` : null,
+    };
+  }
 
   if (key === "captureArgs") {
     if (!Array.isArray(raw) || raw.some((item) => typeof item !== "string")) {
@@ -127,6 +194,12 @@ function coerce(key, raw, fallback) {
 
   if (isNumeric) {
     const num = typeof raw === "number" ? raw : Number(raw);
+    if (key === "beamSize") {
+      if (!Number.isInteger(num) || num < 1) {
+        return { value: fallback, warning: "beamSize must be a positive integer; using the default." };
+      }
+      return { value: num, warning: null };
+    }
     if (!Number.isFinite(num)) {
       return { value: fallback, warning: `${key} must be a finite number; using the default.` };
     }
@@ -196,18 +269,18 @@ export function resolveConfig({ file = {}, env = {}, overrides = {} } = {}) {
 }
 
 /** Candidate settings-file paths, most specific first. */
-export function configFileCandidates({ cwd = process.cwd(), env = {} } = {}) {
+export function configFileCandidates({ cwd = process.cwd(), env = {}, home = homedir() } = {}) {
   const candidates = [];
   if (env.PI_VOICE_INPUT_CONFIG) candidates.push(env.PI_VOICE_INPUT_CONFIG);
   if (cwd) candidates.push(join(cwd, ".pi", "voice-input.json"));
-  candidates.push(join(homedir(), ".pi", "agent", "voice-input.json"));
+  candidates.push(join(home, ".pi", "agent", "voice-input.json"));
   return candidates;
 }
 
 /** Read the first existing settings file. @returns {{file: object, path: string|null, warnings: string[]}} */
-export function readConfigFile({ cwd = process.cwd(), env = {} } = {}) {
+export function readConfigFile({ cwd = process.cwd(), env = {}, home = homedir() } = {}) {
   const warnings = [];
-  for (const path of configFileCandidates({ cwd, env })) {
+  for (const path of configFileCandidates({ cwd, env, home })) {
     if (!path || !existsSync(path)) continue;
     try {
       const parsed = JSON.parse(readFileSync(path, "utf8"));
@@ -231,8 +304,8 @@ let currentWarnings = [];
  * @param {object} [options]
  * @returns {{ config: object, warnings: string[], path: string|null }}
  */
-export function loadConfig({ cwd = process.cwd(), env = process.env, overrides = {} } = {}) {
-  const { file, path, warnings: fileWarnings } = readConfigFile({ cwd, env });
+export function loadConfig({ cwd = process.cwd(), env = process.env, overrides = {}, home = homedir() } = {}) {
+  const { file, path, warnings: fileWarnings } = readConfigFile({ cwd, env, home });
   const { config, warnings } = resolveConfig({ file, env, overrides });
   currentConfig = config;
   currentWarnings = [...fileWarnings, ...warnings];

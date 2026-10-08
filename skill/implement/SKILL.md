@@ -187,8 +187,11 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 1. Set status and safety gate
 
-- **Before any other step**, claim the work item:
-  `StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")` (or `implement.py start`)
+- **Before any other step**, claim the work item with a **status-only** update:
+  `StatusLifecycle.update_status(<work-item-id>, "in_progress", assignee="<AGENT>")` (or `implement.py start`).
+  Do **not** pass `stage="in_progress"` — `in_progress` is a status, not a stage;
+  `wl` applies status and stage atomically and would reject the whole update. The
+  claim leaves the existing stage unchanged (`in_progress` is never a stage).
 
 > **Code Freeze gate:** `implement.py start <id>` checks the Code Freeze marker
 > (`.worklog/code-freeze.json`, contract WL-0MSBU4KMA004PKSR) **before**
@@ -350,6 +353,27 @@ proceed to Step 5.
 > main checkout. `implement.py finish` refuses if it detects changes outside
 > the worktree; `implement.py start` creates it for you — `cd` into it and do
 > all work there.
+>
+> **`cwd` is not sufficient.** Before your first write, verify you are
+> *operating in* the worktree and that every write/edit path resolves inside
+> it:
+>
+> ```bash
+> expected="$(pwd)"   # after `cd` into .worklog/worktrees/wl-<WIP-id>-<slug>
+> test "$(git rev-parse --show-toplevel)" = "$expected" \
+>   || { echo "REFUSING: not inside the worktree"; exit 1; }
+> # Driven child sessions can assert the injected root instead:
+> test "$(git rev-parse --show-toplevel)" = "$IMPLEMENT_WORKTREE_PATH" || exit 1
+> ```
+>
+> Never edit through an absolute path under the main checkout (e.g.
+> `/…/main-checkout/src/…`) — `cwd` is only a hint an agent can override per
+> command. `phase_parent`/`drive` detect a driven child whose work landed in
+> the main checkout and fail closed, naming the offending paths. See
+> [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md) for
+> the `wl`-vs-edits split (run `wl` from inside the worktree with
+> `wl --worklog-dir <main-checkout>/.worklog …`; never `cd` to the main
+> checkout to edit).
 
 ```bash
 git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-id>-<short-slug> dev
@@ -384,7 +408,34 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 
 6.1. Parent recursion (epic/parent items only)
 
-A parent invocation recurses into its children automatically. Run:
+**Preferred: drive every child in one invocation.** Run:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py drive <parent-id>
+```
+
+`phase_drive()` loops over `phase_parent` reports and, for every startable
+child, spawns a **fresh Pi session** (`pi -p "/skill:implement <child>"`) in
+that child's own worktree, waits for it to exit, then continues. A single
+`drive` call therefore completes every child and advances the parent, while
+each child keeps its own clean context window and its own worktree. Options:
+`--json` (machine-readable per-child report), `--max-child-sessions N`
+(default 1) to bound retries, `--child-timeout S` (default 3600). When no Pi
+executable is available it stops with actionable manual instructions rather
+than silently skipping a child (`IMPLEMENT_DRIVE_PI_BIN` overrides the
+binary). A driven session is marked `IMPLEMENT_DRIVE_ACTIVE=1` and refuses to
+re-enter `drive`.
+
+> **Child sessions run extensions-disabled.** The spawner builds
+> `pi -p "/skill:implement <child>" --approve --no-extensions` so a globally
+> installed `turn_end` extension cannot trip Pi core's
+> `_dispatchTurnEndBoundary` and flood the child's captured stderr
+> (SA-0MUY9PYBD009Y7J5). Rationale, root cause and scope limits:
+> [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#why-driven-child-sessions-run-with-extensions-disabled-sa-0muy9pybd009y7j5).
+
+**Manual fallback: one `parent` invocation per child.** If you cannot spawn
+sessions (e.g. headless tooling), recurse manually. A parent invocation
+recurses into its children automatically. Run:
 
 ```bash
 python3 $(skill_path implement)/scripts/implement.py parent <parent-id>
@@ -397,22 +448,37 @@ python3 $(skill_path implement)/scripts/implement.py parent <parent-id>
 - **All children terminal** (`in_review`/`completed`/`done`) → the parent is
   advanced to `completed`/`in_review` (existing Step 6.1 advancement
   retained) and a per-child summary (ids, statuses) is commented.
-- **Children remain** → the next child is claimed (`in_progress`), its own
-  worktree is created from `dev`, and the worktree path is reported.
+- **Children remain** → `phase_parent` walks **all** children in dependency
+  order in a single pass: it finishes every child whose worktree already
+  contains changes, and starts the next unimplemented child. The report
+  carries `children_processed` (per-child action/status), the started child
+  (`next_child` plus its `worktree_path`/`branch`), or the parent
+  advancement when every child is terminal.
 
-Then implement that child by recursing into this procedure (steps 1–8),
-run `implement.py finish <child-id>`, and re-run
-`implement.py parent <parent-id>` for the next child. Repeat until the
-parent reports all children terminal. Each child is implemented in its own
-worktree (never the main checkout); sequential children reuse/rotate the
-`.worklog/worktrees` machinery.
+Then implement that child by recursing into this procedure (steps 1–8), and
+re-run `implement.py parent <parent-id>`. The parent phase **finishes the
+previous child for you** (`phase_finish` in its own subprocess) and starts
+the next one — do **not** call `implement.py finish` separately. Repeat until
+the parent reports all children terminal. Each child is implemented in its
+own worktree (never the main checkout); sequential children reuse/rotate the
+`.worklog/worktrees` machinery. (With `drive` this loop is performed for you;
+the driven child session may call `finish` for its own item — `start` resumes
+the pre-created worktree idempotently.)
+
+**Single-pass, subprocess-isolated orchestration.** Every child's start and
+finish runs through `_invoke_implement` — a **separate `implement.py`
+subprocess** invoked serially, never a direct in-process call. The main
+agent process keeps a clean view of the chain: it emits a periodic per-child
+progress update and a final summary (`children_processed`), and advances the
+parent last. This reduces a run of *N* children to *N* `parent` invocations
+(plus the initial one) instead of *2N* `start`/`finish` invocations.
 
 **One session per child (session isolation).** Invoking `/skill:implement
-<parent-id>` on an epic starts a **new Pi session for each child** — do not
-implement every child in one accumulating session. Each child's session
+<parent-id>` on an epic may start a **new Pi session for each child** — do
+not implement every child in one accumulating session. Each child's session
 opens with a clean context window containing only that child's work-item
 description, acceptance criteria, and relevant context. Session isolation
-layers on top of the existing guarantees:
+layers on top of the subprocess-isolated orchestration above:
 
 - **Serial, dependency order.** Children are still implemented serially with
   blocking items first; the dependency, cycle, and blocked-child guards
@@ -420,6 +486,13 @@ layers on top of the existing guarantees:
 - **Worktree isolation preserved.** Every child is still implemented in its
   own worktree created by `phase_start`; session and worktree isolation are
   independent and both apply.
+- **Verify the worktree root before the first edit.** A driven child is
+  spawned with `cwd=<child worktree>` and `IMPLEMENT_WORKTREE_PATH=<child
+  worktree>`, but `cwd` is not sufficient — before writing, assert
+  `test "$(git rev-parse --show-toplevel)" = "$IMPLEMENT_WORKTREE_PATH"` and
+  keep every write/edit path inside that root. A child that writes to the main
+  checkout is detected by the worktree placement guard below and fails closed.
+  See [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md).
 - **Session logging.** Each new session comments on the child work item with
   its session id (`<agent_action> - Session ID: <pi_session_id> -
   <path_to_sessions_log>`), per the AGENTS.md session-logging convention.
@@ -438,14 +511,29 @@ Guards (deterministic, in `phase_parent`):
 - **Dependency order** — a child `blocked` by another item is implemented
   only after its blockers; the chain is resolved dependency-order correct.
 - **Terminal children are never re-implemented** (skipped, reported).
-- **In-progress by another agent** → skipped and reported, never clobbered.
+- **In-progress by another agent** (no worktree) → skipped and reported,
+  never clobbered. An in-progress child *we* started (worktree exists) is
+  finished when its worktree has changes, or returned to the agent for
+  implementation when it does not.
+- **Completed children are never restarted** — a finished child joins
+  `children_processed` and the loop moves on; already-completed siblings are
+  never regressed.
 - **Cycles fail fast** with a clear error (no infinite recursion).
+- **Blocked children wait** — a child is only started once every in-chain
+  blocker is terminal; otherwise it is reported in `blocked_children`.
+- **No premature parent advance** — if any non-terminal child remains
+  (in-progress elsewhere or blocked), the parent is not advanced; the phase
+  reports waiting instead.
 - **Abort/failure** in a child resets THAT child to `open` (StatusLifecycle
   abort semantics) and stops the chain with a report of what completed and
   what failed; already-completed siblings are not regressed.
 - **No orphaned `in_progress`** — a child start failure or abort leaves no
   in-progress state behind; re-run the parent phase after resolving the
   blocker to continue the chain.
+- **Worktree placement guard** — a non-terminal child whose worktree is clean
+  at the parent-HEAD while the main checkout is dirty outside `.worklog/` has
+  written to the main checkout; the phase fails closed with the offending
+  paths (and does not advance the parent) instead of silently proceeding.
 - A parent with no children or all-terminal children behaves as today.
 
 Worktree isolation per child is preserved: every child is implemented in
@@ -564,7 +652,7 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 
 | Phase | Mechanism | Status | Stage |
 |-------|-----------|--------|-------|
-| Claim (Step 1) | `update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` / `phase_start()` | in_progress | in_progress |
+| Claim (Step 1) | `update_status(id, "in_progress", assignee="<AGENT>")` / `phase_start()` (status-only; stage unchanged) | in_progress | unchanged |
 | Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review")` | completed | in_review |
 | Final (Step 9) | `with StatusLifecycle(id, target_stage="in_review"):` / `phase_finish()` | completed | in_review |
 | Abort (dirty/gate/user/error/termination) | `update_status(id, "open")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |

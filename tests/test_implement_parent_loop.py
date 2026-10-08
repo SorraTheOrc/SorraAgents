@@ -105,6 +105,14 @@ class ChainSimulator:
             "message": "Worktree created",
         }
 
+    def _invoke(self, action, child_id, **kwargs):
+        if action == "start":
+            return self._phase_start(child_id, **kwargs)
+        if action == "finish":
+            self.status[child_id] = "completed"
+            return {"success": True, "work_item_id": child_id}
+        raise AssertionError(f"unexpected action {action}")
+
     def _update_status(self, work_item_id, status, stage=None, assignee=None, **kwargs):
         if work_item_id == "SA-PARENT001":
             self.parent_status = status
@@ -128,6 +136,9 @@ class ChainSimulator:
             mock.patch.object(self.mod, "wl_show_children", side_effect=lambda *a, **k: self._children()),
             mock.patch.object(self.mod, "wl_dep_blockers", side_effect=self._dep_blockers),
             mock.patch.object(self.mod, "phase_start", side_effect=self._phase_start),
+            mock.patch.object(self.mod, "_invoke_implement", side_effect=self._invoke),
+            mock.patch.object(self.mod, "_discover_worktree", return_value=None),
+            mock.patch.object(self.mod, "_has_worktree_changes", return_value=False),
             mock.patch.object(
                 self.mod.StatusLifecycle, "update_status", side_effect=self._update_status
             ),

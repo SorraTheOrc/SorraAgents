@@ -27,6 +27,11 @@ import { resolve } from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+// Shared LLM caller, extracted so discord-notify.js can reuse it without
+// importing this module (which runs `git rev-parse` at import time)
+// (SA-0MUVV6DK0002ISW4).
+import { callLlm } from '../llm.js';
+
 // ── Resolve repo root ──────────────────────────────────────────────────────
 const REPO_ROOT = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8' }).trim();
 const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
@@ -137,50 +142,6 @@ function escapeForPrompt(str) {
     .replace(/\\/g, '\\\\')
     .replace(/\n/g, '\\n')
     .replace(/"/g, '\\"');
-}
-
-/**
- * Shared LLM chat-completion caller (DeepSeek, OpenAI-compatible API).
- *
- * Returns the assistant message content, or null when no API key is
- * configured or the call fails. Callers fall back to their non-LLM
- * behaviour in that case, so the script stays backward-compatible
- * when no key is present.
- *
- * @param {Array<{role:string, content:string}>} messages
- * @param {{maxTokens?:number, temperature?:number}} opts
- * @returns {Promise<string|null>}
- */
-async function callLlm(messages, opts = {}) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) return null;
-
-  try {
-    const response = await fetch('https://api.deepseek.com/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages,
-        max_tokens: opts.maxTokens ?? 120,
-        temperature: opts.temperature ?? 0.3,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!response.ok) {
-      throw new Error(`API error: ${response.status} ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content ?? null;
-  } catch (err) {
-    console.error(`[LLM] ${err.message}`);
-    return null;
-  }
 }
 
 // ── Miscategorization keywords ─────────────────────────────────────────────
@@ -405,22 +366,98 @@ export async function categorizeItems(items) {
   return { features, bugFixes, other };
 }
 
+// ── Release focus generation ───────────────────────────────────────────────
+
+/** Maximum number of sentences in the generated release focus (focus AC2). */
+export const RELEASE_FOCUS_MAX_SENTENCES = 3;
+
+/**
+ * Clamp *text* to at most *max* sentences (sentence boundaries are
+ * whitespace following `.`, `!` or `?`), so an over-long LLM response can
+ * never bloat the changelog.
+ *
+ * @param {string} text
+ * @param {number} [max=RELEASE_FOCUS_MAX_SENTENCES]
+ * @returns {string}
+ */
+function clampSentences(text, max = RELEASE_FOCUS_MAX_SENTENCES) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return '';
+  const sentences = trimmed.split(/(?<=[.!?])\s+/).filter(Boolean);
+  return sentences.slice(0, max).join(' ').trim();
+}
+
+/**
+ * Generate a 1–3 sentence summary of the release's main focus from the
+ * categorised work items.
+ *
+ * The focus is persisted by the caller as a `> **Release focus:** …` marker
+ * directly under the version heading so discord-notify.js can extract it.
+ * Returns null when there are no items, no LLM API key is configured, or the
+ * call fails — callers then omit the marker and produce the section as before
+ * (focus AC3).
+ *
+ * @param {{features:string[], bugFixes:string[], other:string[]}} categorized
+ * @param {{fetchFn?:Function, maxTokens?:number, temperature?:number}} [opts]
+ *   Injectable LLM boundary and sampling overrides (used by unit tests).
+ * @returns {Promise<string|null>}
+ */
+export async function generateReleaseFocus(categorized, opts = {}) {
+  const entries = [
+    ...(categorized.features || []),
+    ...(categorized.bugFixes || []),
+    ...(categorized.other || []),
+  ].filter(Boolean);
+
+  if (entries.length === 0) return null;
+
+  const content = await callLlm([
+    {
+      role: 'system',
+      content: 'You are a release-notes editor. Respond with a single plain-text ' +
+        'paragraph of one to three sentences summarising the main focus of the ' +
+        'release. No markdown, no bullets, no quotes.',
+    },
+    {
+      role: 'user',
+      content: `Release notes:\n${entries.map((e) => `- ${e}`).join('\n')}\n\n` +
+        'Release focus (1-3 sentences):',
+    },
+  ], { maxTokens: 200, temperature: 0.3, ...opts });
+
+  if (content === null) return null;
+
+  const cleaned = clampSentences(
+    content.trim().replace(/^"|"$/g, '').replace(/^'|'$/g, ''),
+  );
+  return cleaned || null;
+}
+
 // ── Markdown generation ────────────────────────────────────────────────────
 
 /**
  * Generate the Markdown section for a single release.
  *
+ * When *focus* is provided it is emitted as a `> **Release focus:** …`
+ * marker on the first line directly under the version heading (focus AC2).
+ *
  * @param {string} version  e.g. "0.2.0"
  * @param {string} date     e.g. "2026-07-08"
  * @param {{features:string[], bugFixes:string[], other:string[]}} categorized
+ * @param {string|null} [focus]  1–3 sentence release focus, or null to omit.
  * @returns {string}
  */
-function generateReleaseSection(version, date, categorized) {
+export function generateReleaseSection(version, date, categorized, focus = null) {
   const lines = [];
   const push = (s) => { if (s !== '') lines.push(s); };
 
   push(`## v${version} (${date})`);
   push('');
+
+  if (focus) {
+    push(`> **Release focus:** ${focus}`);
+    push('');
+  }
 
   if (categorized.features.length > 0) {
     push('### Features');
@@ -535,7 +572,14 @@ async function main() {
     `${categorized.other.length} other`,
   );
 
-  const newSection = generateReleaseSection(version, date, categorized);
+  const focus = await generateReleaseFocus(categorized);
+  if (focus) {
+    console.error(`Release focus: ${focus}`);
+  } else {
+    console.error('Release focus omitted (LLM unavailable or no work items).');
+  }
+
+  const newSection = generateReleaseSection(version, date, categorized, focus);
   updateChangelog(newSection);
 
   console.error(`CHANGELOG.md updated at ${CHANGELOG_PATH}`);

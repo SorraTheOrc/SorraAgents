@@ -256,18 +256,17 @@ class TestPhase2CitationCapPromptInjection:
         assert self._cap_instruction(audit_runner._DEFAULT_MAX_CITATIONS_PER_AC) in prompt
         assert "(minimum 1)" in prompt
 
-    def test_configured_cap_value_reflected_in_prompt(self):
-        """AC1/AC2: a configured cap value flows into the injected instruction."""
+    def test_supplied_cap_value_reflected_in_prompt(self):
+        """AC1/AC2: a caller-supplied cap value flows into the injected instruction."""
         issue = self._make_issue()
         acs = [self._make_ac(0)]
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log",
             return_value={"extracted_text": "[]"},
-        ) as mock_call, mock.patch.object(
-            audit_runner, "_load_config",
-            return_value={"audit.max_citations_per_ac": 3},
-        ):
-            audit_runner._run_phase2_deep_analysis(issue, acs, [], "test-model")
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model", max_citations_per_ac=3,
+            )
         prompt = mock_call.call_args.args[2]
         assert self._cap_instruction(3) in prompt
 

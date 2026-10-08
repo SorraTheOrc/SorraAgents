@@ -192,7 +192,7 @@ describe("voice-input end-to-end", () => {
 
     assert.deepEqual(userMessages, []);
     assert.equal(ui.editorText, "my draft");
-    assert.ok(ui.notifications.some((n) => /no speech detected/.test(n.message)));
+    assert.ok(ui.notifications.some((n) => n.level === "warning" && /nothing captured/.test(n.message)));
 
     await controller.dispose();
   });

@@ -185,3 +185,71 @@ test('ship skill: has a clearly stated purpose or goal', () => {
     'SKILL.md should have a clearly stated purpose or goal',
   );
 });
+
+// ---------------------------------------------------------------------------
+// 11. Release is work-item-exempt (SA-0MUVUK458009F6RZ)
+// ---------------------------------------------------------------------------
+const WORK_ITEM_EXEMPTION_PHRASE = 'No work item is required for a release';
+
+/** Strip Markdown emphasis/blockquote markers so prose assertions are robust. */
+function stripEmphasis(content) {
+  return content.replace(/\*\*/g, '').replace(/^>[ \t]?/gm, '');
+}
+
+test('ship skill: states that a release does not require a work item', () => {
+  const plain = stripEmphasis(readFileSync(SHIP_SKILL_PATH, 'utf-8'));
+
+  // AC1: explicit statement that no work item is required for a release.
+  assert.ok(
+    plain.includes(WORK_ITEM_EXEMPTION_PHRASE),
+    `SKILL.md should state "${WORK_ITEM_EXEMPTION_PHRASE}"`,
+  );
+
+  // AC1: agents must not create a release work item.
+  assert.ok(
+    /do\s+not\s+create\s+a\s+release\s+work\s+item|never\s+create\s+a\s+release\s+work\s+item/i.test(plain),
+    'SKILL.md should instruct agents NOT to create a release work item',
+  );
+
+  // AC1: the statement is prominent — it appears in/next to "When To Use" /
+  // "Prerequisites", i.e. before the deep "Internal Scripts and Modules" section.
+  const statementIndex = plain.indexOf(WORK_ITEM_EXEMPTION_PHRASE);
+  const internalScriptsIndex = plain.indexOf('## Internal Scripts and Modules');
+  assert.ok(
+    statementIndex !== -1 &&
+      internalScriptsIndex !== -1 &&
+      statementIndex < internalScriptsIndex,
+    'The "no work item required" statement should appear before "Internal Scripts and Modules"',
+  );
+
+  // AC2: distinguish release-time auto-closure of in_review items from
+  // creating a release work item. The distinction must sit with the statement.
+  const statementWindow = plain.slice(statementIndex, statementIndex + 700);
+  assert.ok(
+    /\bclos(e|ure|ing|ed)\b/i.test(statementWindow),
+    'The exemption note should mention the automatic closure of work items',
+  );
+  assert.ok(
+    /closeWorkItemsAfterRelease|step 12|in_review/i.test(statementWindow),
+    'The exemption note should distinguish automatic post-release closure from creating a release work item',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 12. Ship reference docs mirror the work-item exemption (consistency)
+// ---------------------------------------------------------------------------
+test('ship skill: reference docs mirror the release work-item exemption', () => {
+  const paths = [
+    join(REPO_ROOT, 'docs', 'dev', 'ship-skill-reference.md'),
+    join(REPO_ROOT, 'skill', 'ship', 'docs', 'dev', 'ship-skill-reference.md'),
+  ];
+
+  for (const path of paths) {
+    assert.ok(existsSync(path), `${path} should exist`);
+    const plain = stripEmphasis(readFileSync(path, 'utf-8'));
+    assert.ok(
+      plain.includes(WORK_ITEM_EXEMPTION_PHRASE),
+      `${path} should mirror "${WORK_ITEM_EXEMPTION_PHRASE}"`,
+    );
+  }
+});

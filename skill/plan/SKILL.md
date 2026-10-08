@@ -367,14 +367,22 @@ Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../re
 
 ```bash
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
-  --skill-name <skill_name> \
+  --skill-name plan \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
-  --ac "<...>|<...>|unmet" \
+  --ac "Plan decomposition complete — features and implementation tasks defined | wl show --children | met" \
+  --ac "Child work items created in test-first dependency order | wl dep list | met" \
+  --ac "Six automated review stages completed | stage outputs recorded | met" \
+  --ac "Acceptance-criteria coverage verified | tree_coverage review | met" \
   [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```
+
+> **Note:** The AC table records the **plan skill session's** own deliverables — not the
+> work item's feature acceptance criteria. Passing the feature ACs (which are
+> unmet until the feature is built) would incorrectly render the plan session as
+> "incomplete" ("Requires attention (implement)") even though planning completed
+> successfully and `implement` is simply the next phase.
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the

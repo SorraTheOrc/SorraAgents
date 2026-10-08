@@ -73,6 +73,34 @@ Design rules:
 - Partials are ignored outside `recording`, so late worker messages cannot
   clobber a submitted editor.
 
+### Feedback events (SA-0MUXZBHX0006IXNZ)
+
+The controller funnels every acknowledgement through a single
+`feedback(kind, details)` helper so each transition emits **exactly one**
+non-blocking notification and (optionally) one audible cue.
+
+| Transition (`kind`) | Level | Message (indicative) |
+|---|---|---|
+| `start` — recording begins | `info` | `🎙 Voice input enabled — listening… (Ctrl+Space to stop)` |
+| `stop` — recording ends | `info` | `🔇 Voice input disabled — processing…` |
+| `sending` — non-empty transcript submitted | `info` | `📤 Voice input: sending "<first words>…"` (truncated) |
+| `empty` — nothing captured | `warning` | `Voice input: nothing captured — nothing was sent.` |
+
+The `stop` acknowledgement fires once because `stop()` is state-guarded, so a
+manual stop racing the silence auto-stop cannot double-acknowledge. `abort()`
+keeps its existing single `error`/`warning` notification (no extra stop
+acknowledgement) and clears the footer.
+
+The wording lives in `feedbackMessage()` and is centralised so it can be tuned
+without changing the contract; tests assert the presence, level and named state
+of each notification rather than exact strings.
+
+When `config.feedbackSound` is not `false`, each feedback event also calls the
+injected `playSound` hook (the `index.ts` adapter writes the terminal bell
+`\x07`). The hook is injectable so it is unit-testable and fully suppressible,
+and a throwing hook is caught and logged so it can never break a transition.
+The bell is never relied on for correctness.
+
 ## Capture and silence detection (`recorder.js`)
 
 - Spawns a configurable capture command; the default `arecord -f S16_LE -r
@@ -96,7 +124,7 @@ and writes responses to stdout.
 
 | Message | Purpose |
 |---|---|
-| `{"type":"start","model","device","computeType","partialIntervalMs"}` | Load the model (once) and report readiness. CLI args provide defaults. |
+| `{"type":"start","model","device","computeType","partialIntervalMs","beamSize","vadFilter","initialPrompt"}` | Load the model (once) and report readiness. CLI args provide defaults. |
 | `{"type":"feed","audio":"<base64 int16 PCM>"}` | Append PCM; may trigger a `partial`. |
 | `{"type":"finalise"}` | Transcribe all buffered audio, emit `final`, then clear the buffer. |
 | `{"type":"stop"}` | Acknowledge with `stopped` and exit cleanly. |
@@ -116,11 +144,20 @@ Notes:
 
 - Model/device/compute-type come from the `start` command, with CLI arguments
   as defaults. If `device=cuda` cannot initialise, the worker falls back to
-  `cpu` + `int8` and reports the effective device in `ready`.
+  `cpu` + `int8` and reports the effective device in `ready`. Because
+  ctranslate2 loads CUDA libraries lazily, a CUDA failure can also surface on
+  the first `transcribe()` (e.g. a missing `libcublas.so.12`); the worker then
+  emits a `warning`, reloads the model on `cpu`/`int8` and retries the
+  transcription transparently.
 - Partials are emitted once per `partialIntervalMs` of *new* audio, and both
   partials and the final transcript re-transcribe the whole utterance buffer so
   the live editor text stays cumulative. Prompt-length dictation is the target;
   a bounded sliding window can be layered on later if latency demands it.
+- `beamSize`, `vadFilter` and `initialPrompt` are forwarded to every
+  `transcribe()` call: widen the beam search, drop non-speech audio with VAD, or
+  bias the decoder with an initial prompt. `language` forces the source
+  language. For a 4 GB GPU, `large-v3-turbo` (~1.6 GB) is the accuracy upgrade
+  over the default `small`; `large-v3` (~3 GB) is too tight.
 - A missing `faster-whisper` install emits an actionable `error` and exits 1
   (the extension disables itself gracefully via the doctor instead of crashing).
 
@@ -154,6 +191,10 @@ faster-whisper unchanged.
 | `device` | `PI_VOICE_INPUT_DEVICE` | `cuda` |
 | `computeType` | `PI_VOICE_INPUT_COMPUTE_TYPE` | `float16` |
 | `language` | `PI_VOICE_INPUT_LANGUAGE` | *(auto)* |
+| `beamSize` | `PI_VOICE_INPUT_BEAM_SIZE` | `5` |
+| `vadFilter` | `PI_VOICE_INPUT_VAD_FILTER` | `false` |
+| `initialPrompt` | `PI_VOICE_INPUT_INITIAL_PROMPT` | *(none)* |
+| `feedbackSound` | `PI_VOICE_INPUT_FEEDBACK_SOUND` | `true` |
 | `silenceThreshold` | `PI_VOICE_INPUT_SILENCE_THRESHOLD` | `0.01` |
 | `silenceMs` | `PI_VOICE_INPUT_SILENCE_MS` | `3000` |
 | `partialCadenceMs` | `PI_VOICE_INPUT_PARTIAL_CADENCE_MS` | `1000` |
@@ -162,9 +203,39 @@ faster-whisper unchanged.
 | `python` | `PI_VOICE_INPUT_PYTHON` | `python3` |
 | `workerScript` | `PI_VOICE_INPUT_WORKER_SCRIPT` | bundled `whisper_worker.py` |
 | `startupTimeoutMs` | `PI_VOICE_INPUT_STARTUP_TIMEOUT_MS` | `120000` |
+| `shortcuts` | `PI_VOICE_INPUT_SHORTCUTS` | `[]` |
+| `targetPaneLabel` | `PI_VOICE_INPUT_TARGET_PANE_LABEL` | `Work Items` |
+| `targetPaneId` | `PI_VOICE_INPUT_TARGET_PANE_ID` | *(none)* |
 
 Settings files are searched in order: `$PI_VOICE_INPUT_CONFIG`,
 `<project>/.pi/voice-input.json`, `~/.pi/agent/voice-input.json`.
+
+## Herdr voice shortcuts (`herdr-shortcuts.js`)
+
+`shortcuts` maps a spoken phrase to a Herdr key chord; `targetPaneLabel` (or
+`targetPaneId`) selects the pane. On the final transcript the controller asks
+`sendShortcut(transcript)` (injected from `herdr-shortcuts.js`); when it returns
+true the chord was sent and the transcript is **not** submitted to pi.
+
+Resolution and dispatch:
+
+1. `matchShortcut(shortcuts, transcript)` — normalises case, whitespace and
+trailing punctuation and returns the first phrase that matches exactly.
+2. `resolveTargetPane(panes, {targetPaneLabel, targetPaneId})` — an explicit id
+   wins; otherwise the pane whose `label` (or `terminal_title_stripped`) matches
+   the label is used.
+3. `herdr pane list --workspace $HERDR_WORKSPACE_ID` discovers panes and
+   `herdr pane send-keys <pane-id> <key>...` injects the chord. `HERDR_BIN_PATH`
+   overrides the binary.
+
+Safety: this is an explicit allowlist — only configured phrases trigger a chord,
+and no arbitrary command is run from speech. Discovery/send failures notify the
+operator and never throw; a matched phrase is still consumed (not submitted to
+pi) so a misheard command cannot leak into the prompt.
+
+The logic is dependency-free with an injectable `run`, so
+`tests/unit/test-voice-herdr-shortcuts.mjs` exercises it without a live Herdr
+session.
 
 ## Install wiring
 
@@ -183,9 +254,10 @@ Pure unit tests (no microphone, GPU or model download):
 | `tests/unit/test-voice-recorder.mjs` | RMS, PCM framing, silence/pause timing, capture errors, SIGINT shutdown |
 | `tests/unit/test-voice-whisper-client.mjs` | worker lifecycle, JSON protocol, partials, finalise, stop, crash handling |
 | `tests/unit/test-voice-whisper-worker.mjs` | real Python worker against a stub `faster_whisper`: start/ready/feed/partial/finalise/stop, CUDA fallback, missing dependency, buffer reset |
-| `tests/unit/test-voice-config.mjs` | settings resolution/validation/precedence |
+| `tests/unit/test-voice-config.mjs` | settings resolution/validation/precedence (incl. `feedbackSound`) |
 | `tests/unit/test-voice-doctor.mjs` | preflight checks and severity aggregation |
-| `tests/unit/test-voice-controller.mjs` | state machine, toggle, partial replacement, submission, doctor gating, errors |
+| `tests/unit/test-voice-controller.mjs` | state machine, toggle, partial replacement, submission, shortcut dispatch, doctor gating, feedback transitions, sound on/off, stop-race, errors |
+| `tests/unit/test-voice-herdr-shortcuts.mjs` | phrase matching, target-pane resolution, chord dispatch, failure handling (injected herdr runner) |
 | `tests/unit/test-voice-input.mjs` | end-to-end wiring: controller → recorder → real worker → auto-submit |
 
 The worker tests inject a stub `faster_whisper` module via `PYTHONPATH`, so the

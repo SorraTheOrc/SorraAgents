@@ -96,6 +96,8 @@ describe("whisper client startup", () => {
       "--device", "cuda",
       "--compute-type", "float16",
       "--partial-interval-ms", "1500",
+      "--beam-size", "5",
+      "--no-vad-filter",
     ]);
 
     await flush();
@@ -106,6 +108,9 @@ describe("whisper client startup", () => {
         device: "cuda",
         computeType: "float16",
         partialIntervalMs: 1500,
+        beamSize: 5,
+        vadFilter: false,
+        initialPrompt: "",
       },
     ]);
 
@@ -118,8 +123,38 @@ describe("whisper client startup", () => {
   test("passes a configured language through to the worker", async () => {
     const { client, worker, calls } = harness({ language: "en" });
     const ready = client.start();
-    assert.ok(calls[0].args.includes("--language"));
-    assert.equal(calls[0].args.at(-1), "en");
+    const languageIndex = calls[0].args.indexOf("--language");
+    assert.ok(languageIndex > 0);
+    assert.equal(calls[0].args[languageIndex + 1], "en");
+    worker.respond({ type: "ready", model: "small", device: "cpu", computeType: "int8" });
+    await ready;
+  });
+
+  test("passes accuracy options to the worker (CLI defaults and start message)", async () => {
+    const { client, worker, calls } = harness({
+      beamSize: 8,
+      vadFilter: true,
+      initialPrompt: "technical vocabulary",
+    });
+    const ready = client.start();
+
+    const args = calls[0].args;
+    assert.equal(args[args.indexOf("--beam-size") + 1], "8");
+    assert.ok(args.includes("--vad-filter"));
+    assert.equal(args[args.indexOf("--initial-prompt") + 1], "technical vocabulary");
+
+    await flush();
+    assert.deepEqual(worker.commands[0], {
+      type: "start",
+      model: "small",
+      device: "cuda",
+      computeType: "float16",
+      partialIntervalMs: 1000,
+      beamSize: 8,
+      vadFilter: true,
+      initialPrompt: "technical vocabulary",
+    });
+
     worker.respond({ type: "ready", model: "small", device: "cpu", computeType: "int8" });
     await ready;
   });
