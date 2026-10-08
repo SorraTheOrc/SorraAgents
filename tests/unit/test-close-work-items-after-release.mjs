@@ -236,6 +236,8 @@ test('close-work-items: refuses to force-close a candidate with collateral desce
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-CHILD', 'SA-OTHER'] : []),
     // SA-OTHER is non-terminal, so it remains collateral.
     getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    // No passing parent audit here, so the fallback cascade must not fire.
+    getParentAuditFn: () => ({ readyToClose: false, auditedAt: null }),
     runCloseCommand: (itemId) => { closed.push(itemId); },
   });
 
@@ -299,6 +301,7 @@ test('close-work-items: still refuses a parent with a non-terminal descendant', 
     ],
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-PLAN'] : []),
     getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    getParentAuditFn: () => ({ readyToClose: false, auditedAt: null }),
     runCloseCommand: (itemId) => { closed.push(itemId); },
   });
 
@@ -322,6 +325,7 @@ test('close-work-items: mixed terminal/non-terminal refusal names only non-termi
       (id === 'SA-DONE'
         ? { status: 'completed', stage: 'done' }
         : { status: 'open', stage: 'plan_complete' }),
+    getParentAuditFn: () => ({ readyToClose: false, auditedAt: null }),
     runCloseCommand: (itemId) => { closed.push(itemId); },
   });
 
@@ -354,6 +358,7 @@ test('close-work-items: npr descendant refusal reports a distinct producer-revie
     getAncestorAuditFn: () => ({ outcome: 'uncovered', ancestorId: null }),
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-NPR'] : []),
     getItemLifecycleFn: () => ({ status: 'in_progress', stage: 'in_review' }),
+    getParentAuditFn: () => ({ readyToClose: false, auditedAt: null }),
     runCloseCommand: (itemId) => { closed.push(itemId); },
   });
 
@@ -391,6 +396,7 @@ test('close-work-items: mixed generic/npr collateral reports both causes distinc
     getAncestorAuditFn: () => ({ outcome: 'uncovered', ancestorId: null }),
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-NPR', 'SA-PLAN'] : []),
     getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    getParentAuditFn: () => ({ readyToClose: false, auditedAt: null }),
     runCloseCommand: (itemId) => { closed.push(itemId); },
   });
 
@@ -414,6 +420,154 @@ test('close-work-items: mixed generic/npr collateral reports both causes distinc
     result.refusedItems[0].reason.includes('producer review'),
     'the npr cause is also named',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Fallback cascade: an audit-ready parent terminalises its non-terminal
+// descendants before the close (SA-0MUR7Y3BJ004FGPP recurrence). This covers
+// audits recorded OUTSIDE the audit runner (manual `wl audit-set`), which
+// bypass the runner's own descendant cascade and would otherwise leave the
+// parent refused and stuck in_review after a release.
+// --------------------------------------------------------------------------
+const NOT_AUDIT_READY = () => ({ readyToClose: false, auditedAt: null });
+const AUDIT_READY = (auditedAt = '2026-10-08T12:00:00.000Z') =>
+  () => ({ readyToClose: true, auditedAt });
+
+test('close-work-items: cascades non-terminal descendants of an audit-ready parent', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const cascaded = [];
+  const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) =>
+      (id === 'SA-PARENT' ? ['SA-OPEN', 'SA-BLOCKED'] : []),
+    getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    getParentAuditFn: AUDIT_READY('2026-10-08T09:30:00.000Z'),
+    runCascadeCommand: (childId, parentId, auditTimestamp) => {
+      cascaded.push({ childId, parentId, auditTimestamp });
+    },
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(
+    cascaded.map((c) => c.childId).sort(),
+    ['SA-BLOCKED', 'SA-OPEN'],
+    'every non-terminal descendant must be cascaded',
+  );
+  assert.ok(
+    cascaded.every((c) => c.parentId === 'SA-PARENT'),
+    'each cascade must name the authorising parent',
+  );
+  assert.ok(
+    cascaded.every((c) => c.auditTimestamp === '2026-10-08T09:30:00.000Z'),
+    'each cascade must name the authorising audit timestamp',
+  );
+  assert.deepEqual(closed, ['SA-PARENT'],
+    'the parent must be closed after its descendants are cascaded');
+  assert.equal(result.refusedCount, 0);
+  assert.equal(result.cascadedCount, 2);
+  assert.equal(result.cascadedItems.length, 2);
+});
+
+test('close-work-items: does not cascade when the parent audit is not passing', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const cascaded = [];
+  const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-OPEN'] : []),
+    getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    getParentAuditFn: NOT_AUDIT_READY,
+    runCascadeCommand: (childId) => { cascaded.push(childId); },
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(cascaded, [],
+    'no cascade is authorised without a passing parent audit');
+  assert.deepEqual(closed, [], 'the parent must still be refused');
+  assert.equal(result.refusedCount, 1);
+  assert.deepEqual(result.refusedItems[0].collateral, ['SA-OPEN']);
+  assert.equal(result.cascadedCount, 0);
+});
+
+test('close-work-items: dry-run reports the cascade without mutating descendants', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const cascaded = [];
+  const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-OPEN'] : []),
+    getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    getParentAuditFn: AUDIT_READY(),
+    runCascadeCommand: (childId) => { cascaded.push(childId); },
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+    dryRun: true,
+  });
+
+  assert.deepEqual(cascaded, [], 'dry-run must not cascade descendants');
+  assert.deepEqual(closed, [], 'dry-run must not close the parent');
+  assert.equal(result.refusedCount, 0,
+    'a dry-run cascade means the parent is not refused');
+  assert.equal(result.dryRun, true);
+  assert.equal(result.cascadedCount, 1,
+    'the dry-run cascade is still reported');
+});
+
+test('close-work-items: a cascade failure leaves that child as collateral and refuses the parent', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) =>
+      (id === 'SA-PARENT' ? ['SA-OPEN', 'SA-STUCK'] : []),
+    getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
+    getParentAuditFn: AUDIT_READY(),
+    runCascadeCommand: (childId) => {
+      if (childId === 'SA-STUCK') throw new Error('wl unavailable');
+    },
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(closed, [],
+    'a partially-cascaded subtree must not be force-closed');
+  assert.equal(result.refusedCount, 1);
+  assert.deepEqual(result.refusedItems[0].collateral, ['SA-STUCK'],
+    'only the child whose cascade failed remains collateral');
+  assert.equal(result.cascadedCount, 1);
+});
+
+test('close-work-items: already-terminal descendants are never cascaded', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const cascaded = [];
+  const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) =>
+      (id === 'SA-PARENT' ? ['SA-DONE', 'SA-DELETED'] : []),
+    getItemLifecycleFn: (id) => {
+      if (id === 'SA-DONE') return { status: 'completed', stage: 'done' };
+      if (id === 'SA-DELETED') return { status: 'deleted', stage: 'done' };
+      return null;
+    },
+    getParentAuditFn: AUDIT_READY(),
+    runCascadeCommand: (childId) => { cascaded.push(childId); },
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+  });
+
+  assert.deepEqual(cascaded, [],
+    'terminal descendants must never be cascaded or commented on');
+  assert.deepEqual(closed, ['SA-PARENT']);
+  assert.equal(result.cascadedCount, 0);
 });
 
 // ---------------------------------------------------------------------------

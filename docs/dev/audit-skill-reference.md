@@ -383,6 +383,17 @@ transition has been **verified** (`wl show` readback, WL-0MSVVFBJ2003RRYK),
 - **Non-fatal:** a per-child `wl` failure is caught, logged to stderr, and does not abort the audit; the next passing audit completes the remaining cascade.
 - **Worklog routing:** the helper reuses `_run_wl`, so `--worklog-dir` is resolved through the shared helpers and the cascade targets the item's own store regardless of cwd.
 
+> **Audits recorded outside the runner.** The audit-side cascade above fires
+> only on the runner's verified `Ready to close: Yes` path. An audit recorded
+> manually / via `wl audit-set` (in the worklog CLI, outside this repository)
+> bypasses it, so an audit-ready parent can reach the ship close step with a
+> non-terminal subtree. The ship close step's **fallback cascade**
+> (SA-0MUR7Y3BJ004FGPP recurrence) covers that gap: it cascades a passing
+> parent's non-terminal descendants to `completed`/`done` before closing the
+> parent. See
+> [release-process.md](release-process.md#3-work-items-are-automatically-closed)
+> and the ship-side section below.
+
 ### Ship-side terminal-descendant exclusion and producer-review reporting (AC2/AC4)
 
 `closeWorkItemsAfterRelease` computes `collateral` as descendants that are
@@ -401,6 +412,28 @@ appended to the generic out-of-scope message for a mixed subtree — rather than
 being lumped under the generic collateral list. The classification is exposed
 as `refusedItems[].needsProducerReview`; the parent is still refused, so the
 scope guard is not weakened (SA-0MUJKPDAA002VVDP AC2).
+
+### Ship-side fallback cascade for an audit-ready parent (recurrence)
+
+When a candidate has non-terminal collateral descendants but its own audit is
+passing (`getParentAuditFn` → `readyToClose === true`, default
+`getParentAudit` = `wl audit-show <id> --json`), `closeWorkItemsAfterRelease`
+cascades each non-terminal descendant to `status: completed, stage: done` via
+the injected `runCascadeCommand` (default `wl update` + `wl comment add` naming
+the parent and audit timestamp), then closes the parent. The cascade is
+**authorised by the passing audit verdict only** — a missing/non-passing audit
+leaves the descendant in the collateral set, so the parent is still refused and
+the scope guard is preserved. A per-child cascade failure is caught, logged,
+and that child stays collateral (a partially-cascaded subtree is refused, never
+force-closed). Under `--dry-run` the planned cascade is reported and
+`cascadedItems` is populated, but no `wl` mutation is performed. The cascade is
+idempotent for terminal (`stage: done`) / `deleted` descendants, which are
+already excluded from the collateral set before the cascade.
+
+This closes the gap left by audits recorded **outside** the audit runner
+(`wl audit-set` / manual approval), which bypass the audit-side cascade above.
+Result/return fields: `cascadedCount` and `cascadedItems`
+(`{id, ancestorId, auditTimestamp}`).
 
 ## Scripts
 
