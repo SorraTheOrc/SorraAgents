@@ -86,6 +86,8 @@ describe('discord-notify: module exports', () => {
       'resolveDiscordWebhookUrl',
       'readProjectNameFromConfig',
       'resolveProjectName',
+      'readCtaFromConfig',
+      'resolveCta',
       'extractChangelogSection',
       'truncateForDiscord',
       'buildDiscordPayload',
@@ -872,5 +874,213 @@ describe('docs: projectDescription documented (SA-0MUVWL0SY005MEWS)', () => {
     assert.ok(content.includes('projectDescription'), 'SKILL.md should document projectDescription');
     assert.ok(/README/i.test(content), 'SKILL.md should document the README pitch fallback');
     assert.ok(/Release focus/i.test(content), 'SKILL.md should document the release-focus paragraph');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SA-0MUWCIFU2006K39K — project call-to-action (CTA) in the release report
+// ---------------------------------------------------------------------------
+
+/** Reproduces AI_Hell/.worklog/config.yaml (WL-0MUWCGF670087GAS). */
+const AI_HELL_CTA =
+  '[Play the alpha release](https://sorratheorc.github.io/AI_Hell/). ' +
+  'Provide feedback in [Discord](https://discord.gg/gUKQTFkzQ4)';
+
+/** Write a config with a webhook and an optional CTA. */
+function writeCtaConfig(path, { webhookUrl = WEBHOOK_PROJECT, cta } = {}) {
+  mkdirSync(dirname(path), { recursive: true });
+  let yaml = `projectName: Test Project\nprefix: TP\ndiscord:\n  webhook_url: ${webhookUrl}\n`;
+  if (cta !== undefined) yaml += `cta: "${cta}"\n`;
+  writeFileSync(path, yaml);
+}
+
+describe('discord-notify: CTA config resolution (SA-0MUWCIFU2006K39K AC1)', () => {
+  test('exports readCtaFromConfig and resolveCta', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    assert.equal(typeof mod.readCtaFromConfig, 'function');
+    assert.equal(typeof mod.resolveCta, 'function');
+  });
+
+  test('readCtaFromConfig returns the top-level cta scalar verbatim (markdown preserved)', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    const path = join(dir, '.worklog', 'config.yaml');
+    writeCtaConfig(path, { cta: AI_HELL_CTA });
+    assert.equal(mod.readCtaFromConfig(path), AI_HELL_CTA);
+  });
+
+  test('readCtaFromConfig returns null for missing file, absent/empty key and unreadable path', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    assert.equal(mod.readCtaFromConfig(join(dir, 'missing.yaml')), null);
+
+    const path = join(dir, '.worklog', 'config.yaml');
+    writeFileSync(path, 'projectName: Test Project\n');
+    assert.equal(mod.readCtaFromConfig(path), null);
+
+    writeFileSync(path, 'cta: "   "\n');
+    assert.equal(mod.readCtaFromConfig(path), null);
+
+    // A directory cannot be read as a file — treated as absent (AC3).
+    assert.equal(mod.readCtaFromConfig(join(dir, '.worklog')), null);
+  });
+
+  test('resolveCta uses the same three-layer precedence as projectName', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    const globalDir = makeTempProject();
+    writeCtaConfig(join(globalDir, 'config.yaml'), { cta: 'global cta' });
+    const globalPath = join(globalDir, 'config.yaml');
+
+    assert.equal(mod.resolveCta(dir, { globalConfigPath: globalPath }), 'global cta');
+
+    writeCtaConfig(join(dir, '.worklog', 'config.yaml'), { cta: 'project cta' });
+    assert.equal(mod.resolveCta(dir, { globalConfigPath: globalPath }), 'project cta');
+
+    writeCtaConfig(join(dir, '.worklog', 'config.private.yaml'), { cta: 'private cta' });
+    assert.equal(mod.resolveCta(dir, { globalConfigPath: globalPath }), 'private cta');
+  });
+
+  test('resolveCta returns null when unset everywhere and for a malformed cta key', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const dir = makeTempProject();
+    assert.equal(mod.resolveCta(dir, { globalConfigPath: join(dir, 'none.yaml') }), null);
+
+    // A nested (non-scalar) cta is malformed — omitted, not thrown (AC3).
+    writeFileSync(join(dir, '.worklog', 'config.yaml'), 'cta:\n  nested: value\n');
+    assert.equal(mod.resolveCta(dir, { globalConfigPath: join(dir, 'none.yaml') }), null);
+  });
+});
+
+describe('discord-notify: CTA embed composition (SA-0MUWCIFU2006K39K AC2/AC4)', () => {
+  test('places the CTA after pitch/focus/version and immediately before the changelog', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const d = mod.buildDiscordPayload({
+      version: '1.2.3', projectName: 'AI Hell',
+      pitch: 'Pitch line.', focus: 'Focus line.',
+      cta: AI_HELL_CTA,
+      changelog: '### Features\n- A',
+    }).embeds[0].description;
+
+    assert.ok(d.indexOf('Pitch line.') < d.indexOf('Focus line.'));
+    assert.ok(d.indexOf('Focus line.') < d.indexOf('**AI Hell v1.2.3**'));
+    assert.ok(d.indexOf('**AI Hell v1.2.3**') < d.indexOf(AI_HELL_CTA));
+    assert.ok(d.indexOf(AI_HELL_CTA) < d.indexOf('### Features'));
+  });
+
+  test('preserves the markdown link syntax of the configured CTA verbatim', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const d = mod.buildDiscordPayload({ version: '1.2.3', cta: AI_HELL_CTA, changelog: 'x' })
+      .embeds[0].description;
+    assert.ok(d.includes('[Play the alpha release](https://sorratheorc.github.io/AI_Hell/)'));
+    assert.ok(d.includes(AI_HELL_CTA));
+  });
+
+  test('omits the CTA paragraph when absent, leaving the embed unchanged', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const base = mod.buildDiscordPayload({
+      version: '1.2.3', projectName: 'P', pitch: 'pitch', focus: 'focus', changelog: '### Features',
+    }).embeds[0].description;
+    const withNull = mod.buildDiscordPayload({
+      version: '1.2.3', projectName: 'P', pitch: 'pitch', focus: 'focus', changelog: '### Features', cta: null,
+    }).embeds[0].description;
+
+    assert.equal(withNull, base);
+    assert.ok(!base.includes('Play the alpha release'));
+  });
+
+  test('truncates the composed description including a long CTA to ≤ 4096 characters', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    const d = mod.buildDiscordPayload({
+      version: '1.2.3', projectName: 'P',
+      cta: 'cta '.repeat(2000),
+      changelog: 'x'.repeat(9000),
+    }).embeds[0].description;
+    assert.ok(d.length <= 4096, 'composed description must respect the Discord limit');
+    assert.ok(d.endsWith('…'), 'truncated description uses the ellipsis marker');
+  });
+});
+
+describe('discord-notify: CTA notification integration (SA-0MUWCIFU2006K39K AC3/AC6)', () => {
+  test('posts the AI_Hell-configured CTA in the composed embed description (AC6)', async () => {
+    const dir = makeTempProject();
+    // Reproduces AI_Hell/.worklog/config.yaml verbatim.
+    writeFileSync(
+      join(dir, '.worklog', 'config.yaml'),
+      `projectName: AI Hell\nprefix: AH\nautoSync: false\ncta: "${AI_HELL_CTA}"\n`,
+    );
+    writeFileSync(
+      join(dir, 'CHANGELOG.md'),
+      '# Changelog\n\n## v1.0.0 (2026-01-15)\n### Features\n- Added something\n',
+    );
+    // AI_Hell keeps its webhook outside the tracked project config; inject one
+    // so the simulated release actually sends (the CTA still comes from the
+    // reproduced project config above).
+    const globalPath = join(dir, 'global-config.yaml');
+    writeFileSync(globalPath, `discord:\n  webhook_url: ${WEBHOOK_PROJECT}\n`);
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    let body = null;
+    const result = await mod.sendReleaseNotification(
+      { version: '1.0.0', projectRoot: dir },
+      {
+        fetchFn: async (_url, opts) => { body = JSON.parse(opts.body); return { ok: true }; },
+        globalConfigPath: globalPath,
+        readmePath: join(dir, 'none.md'),
+      },
+    );
+
+    assert.equal(result.notified, true);
+    const d = body.embeds[0].description;
+    assert.ok(d.includes('[Play the alpha release](https://sorratheorc.github.io/AI_Hell/)'));
+    assert.ok(d.includes(AI_HELL_CTA), 'the full AI_Hell CTA is present verbatim');
+    assert.ok(d.indexOf('**AI Hell v1.0.0**') < d.indexOf(AI_HELL_CTA));
+    assert.ok(d.indexOf(AI_HELL_CTA) < d.indexOf('Added something'));
+  });
+
+  test('still sends and omits the CTA when the config is malformed (non-blocking, AC3)', async () => {
+    const dir = makeTempProject();
+    writeFileSync(
+      join(dir, '.worklog', 'config.yaml'),
+      `discord:\n  webhook_url: ${WEBHOOK_PROJECT}\ncta:\n  nested: value\n`,
+    );
+    writeFileSync(join(dir, 'CHANGELOG.md'), SAMPLE_CHANGELOG);
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    let body = null;
+    const result = await mod.sendReleaseNotification(
+      { version: '1.2.3', projectRoot: dir },
+      {
+        fetchFn: async (_url, opts) => { body = JSON.parse(opts.body); return { ok: true }; },
+        globalConfigPath: join(dir, 'none.yaml'),
+        readmePath: join(dir, 'none.md'),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.notified, true);
+    assert.ok(!body.embeds[0].description.includes('nested'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SA-0MUWCIFU2006K39K AC7 — cta documented in the ship skill + references
+// ---------------------------------------------------------------------------
+describe('docs: cta documented (SA-0MUWCIFU2006K39K AC7)', () => {
+  test('ship references document the cta key, precedence and placement', () => {
+    for (const path of [REFERENCE_PATH, SHIP_REFERENCE_PATH]) {
+      const content = readFileSync(path, 'utf-8');
+      assert.ok(/cta/i.test(content), `${path} should document the cta config key`);
+      assert.ok(
+        /call-to-action/i.test(content),
+        `${path} should describe the cta as a call-to-action`,
+      );
+    }
+  });
+
+  test('SKILL.md documents the cta key and its placement in the embed', () => {
+    const content = readFileSync(SKILL_MD_PATH, 'utf-8');
+    assert.ok(/cta/i.test(content), 'SKILL.md should document the cta config key');
+    assert.ok(/call-to-action/i.test(content), 'SKILL.md should describe the cta');
   });
 });

@@ -242,6 +242,59 @@ export function resolveProjectDescription(projectRoot, options = {}) {
   return readProjectDescriptionFromConfig(globalConfigPath);
 }
 
+// ── Project call-to-action (CTA) resolution ─────────────────────────────────
+
+/**
+ * Read the top-level `cta` scalar from a YAML config file, or null if the file
+ * is missing, unreadable or the key is absent/empty. Markdown link syntax in
+ * the value is preserved verbatim.
+ *
+ * @param {string} configPath - Absolute path to a YAML config file.
+ * @returns {string|null} The configured CTA, or null.
+ */
+export function readCtaFromConfig(configPath) {
+  if (!configPath || !existsSync(configPath)) return null;
+  try {
+    const parsed = parseSimpleYaml(readFileSync(configPath, 'utf-8'));
+    const cta = parsed.cta;
+    return typeof cta === 'string' && cta.trim() !== '' ? cta.trim() : null;
+  } catch {
+    // A corrupt/unreadable config must never break the release — skip quietly.
+    return null;
+  }
+}
+
+/**
+ * Resolve the project call-to-action with the same three-layer precedence as
+ * the webhook URL, project name and project description (AC2):
+ *   1. <project>/.worklog/config.private.yaml  (project private)
+ *   2. <project>/.worklog/config.yaml          (project, tracked)
+ *   3. ~/.pi/agent/config.yaml                 (global fallback)
+ * The first file that defines the top-level `cta` key wins.
+ *
+ * @param {string} [projectRoot] - Project root (default: process.cwd()).
+ * @param {object} [options] - Injectable paths (used by unit tests).
+ * @param {string} [options.privateConfigPath] - Default <root>/.worklog/config.private.yaml.
+ * @param {string} [options.projectConfigPath] - Default <root>/.worklog/config.yaml.
+ * @param {string} [options.globalConfigPath] - Default ~/.pi/agent/config.yaml.
+ * @returns {string|null} The resolved CTA, or null when unset.
+ */
+export function resolveCta(projectRoot, options = {}) {
+  const {
+    privateConfigPath = join(projectRoot || process.cwd(), '.worklog', 'config.private.yaml'),
+    projectConfigPath = join(projectRoot || process.cwd(), '.worklog', 'config.yaml'),
+    globalConfigPath = join(homedir(), '.pi', 'agent', 'config.yaml'),
+  } = options;
+
+  const privateCta = readCtaFromConfig(privateConfigPath);
+  if (privateCta) return privateCta;
+
+  const projectCta = readCtaFromConfig(projectConfigPath);
+  if (projectCta) return projectCta;
+
+  return readCtaFromConfig(globalConfigPath);
+}
+
 // ── Changelog extraction (AC1) ──────────────────────────────────────────────
 
 /**
@@ -445,8 +498,9 @@ export async function resolveProjectPitch(projectRoot, options = {}) {
  *
  * Description paragraphs are composed in this order (composition AC5):
  * (a) the project elevator pitch, (b) the release focus, (c) the
- * project/version line, and (d) the changelog section — absent paragraphs are
- * omitted. The composed description is truncated to the Discord limit.
+ * project/version line, (d) the project call-to-action, and (e) the changelog
+ * section — absent paragraphs are omitted. The composed description is
+ * truncated to the Discord limit.
  *
  * @param {object} details
  * @param {string} [details.version] - Released semver version.
@@ -457,10 +511,11 @@ export async function resolveProjectPitch(projectRoot, options = {}) {
  * @param {string} [details.projectName] - Project name (read from worklog config).
  * @param {string|null} [details.pitch] - Project elevator pitch (2–3 sentences).
  * @param {string|null} [details.focus] - Release focus (1–3 sentences).
+ * @param {string|null} [details.cta] - Project call-to-action (markdown preserved).
  * @returns {{ embeds: Array<object> }} Discord webhook payload.
  */
 export function buildDiscordPayload({
-  version, tag, date, prUrl, changelog, projectName, pitch, focus,
+  version, tag, date, prUrl, changelog, projectName, pitch, focus, cta,
 } = {}) {
   const versionText = version || 'unknown';
   const tagText = tag || (version ? `v${version}` : 'unknown');
@@ -475,6 +530,8 @@ export function buildDiscordPayload({
   if (pitch) paragraphs.push(pitch);
   if (focus) paragraphs.push(focus);
   if (projectName) paragraphs.push(`**${projectName} v${versionText}**`);
+  // CTA follows the intro block and sits immediately before the changelog.
+  if (cta) paragraphs.push(cta);
   paragraphs.push(
     changelog ? changelog : `No changelog available for v${versionText}.`,
   );
@@ -563,6 +620,10 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
   // Resolve the project name (AC1, AC2, AC3 — same precedence as webhook URL).
   const projectName = resolveProjectName(projectRoot, { privateConfigPath, projectConfigPath, globalConfigPath });
 
+  // Resolve the project call-to-action (same precedence as projectName).
+  // Non-blocking: a missing/malformed/unreadable CTA is simply omitted.
+  const cta = resolveCta(projectRoot, { privateConfigPath, projectConfigPath, globalConfigPath });
+
   // Resolve the project pitch: configured projectDescription wins; otherwise
   // generate it from README prose. Non-blocking — any failure omits it.
   let pitch = null;
@@ -608,6 +669,7 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
     projectName,
     pitch,
     focus,
+    cta,
   });
 
   try {

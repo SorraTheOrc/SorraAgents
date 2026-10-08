@@ -78,6 +78,20 @@ generation is unavailable (no API key, LLM/network error, missing/unreadable
 README) the pitch paragraph is **omitted** and the notification still sends. The
 pitch is never persisted to `config.yaml`.
 
+### Call-to-action (`cta`, SA-0MUWCIFU2006K39K)
+
+The optional top-level `cta` scalar is resolved with the **same precedence as
+`projectName`/`projectDescription`** (project private → project → global). When
+set, it is rendered as its own embed paragraph placed **after** the intro block
+(pitch → focus → `**<projectName> v<version>**` line) and **immediately before**
+the changelog, so the audience can act on the release (play the alpha, join
+Discord, etc.). Markdown link syntax in the value is preserved verbatim.
+
+When `cta` is unset, empty, or the config is malformed/unreadable, the
+paragraph is simply omitted and the notification still sends — a bad CTA never
+fails the release. The value is read verbatim; it is never rewritten or
+re-generated.
+
 ### Non-blocking semantics (AC3)
 
 A notification failure (network error, HTTP error, timeout) logs a warning and
@@ -86,8 +100,9 @@ failed by a notification failure.
 
 ### Discord embed limits (AC4)
 
-The changelog section in the embed description is truncated to 4 096
-characters with an ellipsis marker (`…`) when it exceeds the limit.
+The fully-composed embed description — including the pitch, focus, project
+line, `cta` and changelog — is truncated to 4 096 characters with an ellipsis
+marker (`…`) when it exceeds the limit.
 
 ## Release Workflow
 
@@ -253,9 +268,10 @@ await sendReleaseNotification({ version, prUrl, projectRoot });
 - Only runs on successful, non-dry-run releases (after merge verification).
 - Resolves the webhook URL per AC2 precedence.
 - Resolves the project pitch: `projectDescription` wins; otherwise README/LLM; otherwise omitted.
+- Resolves the project call-to-action (`cta`): project config value wins; otherwise omitted when unset/malformed.
 - Extracts the released version's changelog section from `CHANGELOG.md`.
 - Extracts and removes the `> **Release focus:** …` marker from the section (no duplication).
-- Composes the embed description as pitch → focus → project/version line → changelog, truncated to 4 096 chars.
+- Composes the embed description as pitch → focus → project/version line → `cta` → changelog, truncated to 4 096 chars.
 - Builds a Discord embed payload (version, tag, date, PR URL, composed description).
 - POSTs to the webhook via built-in `fetch` (10s timeout).
 - On failure: logs a warning, returns `{ success: true, notified: false }`.
@@ -299,6 +315,18 @@ Resolve the Discord webhook URL with precedence (AC2): private → project → g
 ### `resolveProjectDescription(projectRoot, options)`
 
 Resolve the project elevator pitch text with the same precedence as `projectName`: private → project → global (top-level `projectDescription` scalar).
+
+**Returns:** `string | null`
+
+### `readCtaFromConfig(configPath)`
+
+Read the top-level `cta` scalar from a YAML config file. Returns `null` when the file is missing/unreadable or the key is absent/empty; markdown link syntax is preserved verbatim.
+
+**Returns:** `string | null`
+
+### `resolveCta(projectRoot, options)`
+
+Resolve the project call-to-action with the same precedence as `projectName`: private → project → global (top-level `cta` scalar). Non-blocking — a malformed/unreadable config yields `null`.
 
 **Returns:** `string | null`
 
