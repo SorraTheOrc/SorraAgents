@@ -100,6 +100,25 @@ def _normalise_status(status: object) -> str:
     return status.replace("_", "-")
 
 
+# Valid workflow stages accepted by the ``wl`` CLI (default schema).
+#
+# Kept in sync with the worklog CLI's default stage configuration
+# (``config.stages``: idea, intake_complete, plan_complete, in_review, done)
+# and mirrored by ``wl update --stage`` validation. ``update_status`` checks
+# this set *before* invoking ``wl`` so an invalid stage (e.g. the retired
+# ``in_progress`` value) can never silently cancel an otherwise-valid status
+# change — ``wl`` applies status and stage atomically
+# (SA-0MUY9PMB7001ENMP). Projects that customise ``stages`` in their
+# ``.worklog/config.yaml`` must extend this set in tandem.
+VALID_STAGES: tuple[str, ...] = (
+    "idea",
+    "intake_complete",
+    "plan_complete",
+    "in_review",
+    "done",
+)
+
+
 # Type alias for an injectable command runner.
 # Takes a command list, returns a CompletedProcess (like subprocess.run).
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
@@ -595,7 +614,18 @@ class StatusLifecycle:
 
         Raises:
             RuntimeError: If the ``wl`` command fails.
+            ValueError: If ``stage`` is not one of :data:`VALID_STAGES`.
+                Validation happens *before* ``wl`` is invoked so an invalid
+                stage (which ``wl`` would reject atomically, cancelling the
+                status change) can never silently swallow the update.
         """
+        if stage is not None and stage not in VALID_STAGES:
+            raise ValueError(
+                f"Invalid stage {stage!r} for work item {work_item_id}. "
+                f"Valid stages: {', '.join(VALID_STAGES)}. "
+                f"Note: 'in_progress' is a status, not a stage — use "
+                f"update_status({work_item_id!r}, 'in-progress') for a claim."
+            )
         cmd = ["wl", "update", work_item_id, "--status", status, "--json"]
         if stage is not None:
             cmd.extend(["--stage", stage])

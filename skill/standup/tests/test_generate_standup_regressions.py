@@ -7,16 +7,16 @@
 # -->
 """Tests: detect_regressions() must only flag slips that happened *inside* the window.
 
-Covers SA-0MUFNU2WM00049A9. The original predicate had an operator-precedence
-bug (``and`` binds tighter than ``or``), so the ``in_window()`` gate was
-bypassed and every item that had ever been completed+in_review was reported as
-a regression, regardless of when it slipped. These tests pin the correct
-behaviour:
+Covers SA-0MUFNU2WM00049A9 (operator-precedence bug) and
+SA-0MUMHR0BT007IKAL (release-transition false-positive bug).  The predicate
+must distinguish a genuine backward slip from the forward release transition
+``completed/in_review`` → ``completed/done``:
 
   - an item completed+in_review before that slipped *inside* the window IS flagged;
   - an item completed+in_review before that slipped *outside* the window is NOT flagged;
   - an item still completed+in_review is NOT flagged;
-  - an item that was never completed+in_review before is NOT flagged.
+  - an item that was never completed+in_review before is NOT flagged;
+  - an item released (``completed/done``) inside the window is NOT flagged.
 """
 from __future__ import annotations
 
@@ -110,6 +110,17 @@ class TestNoFalsePositives:
         assert out == []
 
 
+class TestReleaseTransitionNotRegressed:
+    """SA-0MUMHR0BT007IKAL: completed/in_review → completed/done must NOT be flagged."""
+
+    def test_released_item_not_flagged(self):
+        """Forward release transition (in_review → done) is NOT a regression."""
+        mod = _reload_standup()
+        item = _item("R", "completed", "done", "2026-09-23T12:00:00")
+        out = _run(mod, {"R": _BEFORE}, [item])
+        assert out == []
+
+
 class TestMixedSet:
     def test_only_in_window_slips_reported(self):
         """Regression guard for the precedence bug: C (outside) must not appear."""
@@ -132,3 +143,19 @@ class TestMixedSet:
         }
         out = _run(mod, before, current)
         assert {r["id"] for r in out} == {"B", "D", "E"}
+
+    def test_mixed_set_includes_release_not_regression(self):
+        """R (released) must not appear alongside B,D,E (true regressions)."""
+        mod = _reload_standup()
+        current = [
+            _item("A", "completed", "in_review", "2026-09-24T02:00:00"),  # unchanged
+            _item("B", "open", "plan_complete", "2026-09-23T12:00:00"),  # in window -> flag
+            _item("R", "completed", "done", "2026-09-23T12:00:00"),  # released → no
+        ]
+        before = {
+            "A": _BEFORE,
+            "B": _BEFORE,
+            "R": _BEFORE,
+        }
+        out = _run(mod, before, current)
+        assert {r["id"] for r in out} == {"B"}

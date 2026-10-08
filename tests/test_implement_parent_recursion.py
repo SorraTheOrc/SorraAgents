@@ -56,7 +56,12 @@ def implement_mod():
     return mod
 
 
-def _child(work_item_id: str, status: str = "open", assignee: str = "") -> dict:
+def _child(
+    work_item_id: str,
+    status: str = "open",
+    assignee: str = "",
+    deleted_by: str = "",
+) -> dict:
     """Build a canned child dict as returned by ``wl show --children``."""
     return {
         "id": work_item_id,
@@ -66,6 +71,7 @@ def _child(work_item_id: str, status: str = "open", assignee: str = "") -> dict:
         "assignee": assignee,
         "priority": "high",
         "sortIndex": 1000,
+        "deletedBy": deleted_by,
     }
 
 
@@ -100,13 +106,29 @@ def _run_parent(
             "message": "Worktree created",
         }
 
-    calls: dict = {"update_status": [], "phase_start": [], "comments": []}
+    calls: dict = {
+        "update_status": [], "phase_start": [], "comments": [],
+        "phase_finish": [],
+    }
 
     def fake_phase_start(child_id, **kwargs):
         calls["phase_start"].append(child_id)
         result = dict(phase_start_result)
         result["work_item_id"] = child_id
         return result
+
+    def fake_invoke(action, child_id, **kwargs):
+        if action == "start":
+            result = fake_phase_start(child_id, **kwargs)
+            # ``_invoke_implement`` returns None for a non-zero subprocess
+            # exit; emulate that for the injected failure result.
+            if not result.get("success", True):
+                return None
+            return result
+        if action == "finish":
+            calls["phase_finish"].append(child_id)
+            return {"success": True, "work_item_id": child_id}
+        raise AssertionError(f"unexpected action {action}")
 
     def fake_update_status(work_item_id, status, stage=None, assignee=None, **kwargs):
         calls["update_status"].append((work_item_id, status, stage, assignee))
@@ -121,6 +143,9 @@ def _run_parent(
         mock.patch.object(mod, "wl_show_children", return_value=children),
         mock.patch.object(mod, "wl_dep_blockers", return_value=[]),
         mock.patch.object(mod, "phase_start", side_effect=fake_phase_start),
+        mock.patch.object(mod, "_invoke_implement", side_effect=fake_invoke),
+        mock.patch.object(mod, "_discover_worktree", return_value=None),
+        mock.patch.object(mod, "_has_worktree_changes", return_value=False),
         mock.patch.object(mod.StatusLifecycle, "update_status", side_effect=fake_update_status),
         mock.patch.object(mod, "wl_add_comment", side_effect=fake_add_comment),
         mock.patch.object(mod, "is_code_freeze_active", return_value=freeze_active),
@@ -247,7 +272,9 @@ class TestStartNextChild:
         assert report["_calls"]["update_status"] == []
         assert report.get("next_child") == "SA-C1"
         assert "/wt/SA-PARENT001" in report.get("message", "")
-        assert "finish" in report.get("message", "")  # tells the agent next steps
+        # The message tells the agent to re-run `parent`, which finishes the
+        # child automatically (single-pass workflow).
+        assert "parent" in report.get("message", "")
 
     def test_parent_with_open_children_skips_terminal_siblings(self, implement_mod):
         """Terminal children are never re-implemented: only the first
@@ -370,6 +397,58 @@ class TestDeletedChildren:
         assert implement_mod._classify_child(_child("SA-C1", status="deleted")) == "skip-terminal"
         assert implement_mod._classify_child(_child("SA-C2", status="completed")) == "skip-terminal"
         assert implement_mod._classify_child(_child("SA-C3", status="open")) == "implement"
+
+
+# ===========================================================================
+# Soft-deleted children (deletedBy set, status still open) are treated as
+# terminal — never claimed, never given a worktree, never block the parent
+# (SA-0MUTWB8BA003J0V6)
+# ===========================================================================
+
+
+class TestSoftDeletedChildren:
+    def test_classify_child_soft_deleted_is_skip_terminal(self, implement_mod):
+        """Unit-level: a child with deletedBy set must be classified
+        skip-terminal even though its status is still 'open'."""
+        child = _child("SA-C1", status="open", deleted_by="plan")
+        assert implement_mod._classify_child(child) == "skip-terminal"
+
+    def test_soft_deleted_child_is_not_started(self, implement_mod):
+        """A soft-deleted child (status open, deletedBy set) must never be
+        claimed or given a worktree by phase_parent."""
+        children = [_child("SA-C1", status="open", deleted_by="plan")]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        actions = {c["id"]: c["action"] for c in report.get("children", [])}
+        assert actions["SA-C1"] == "skip-terminal"
+        assert report["_calls"]["phase_start"] == []
+
+    def test_parent_with_only_soft_deleted_children_advances(self, implement_mod):
+        """A parent whose only children are soft-deleted must advance to
+        completed/in_review — they can never be implemented."""
+        children = [_child("SA-C1", status="open", deleted_by="plan")]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        assert report["success"] is True
+        assert report.get("parent_advanced") is True
+        assert report["_calls"]["update_status"] == [
+            ("SA-PARENT001", "completed", "in_review", None)
+        ]
+        assert report["_calls"]["phase_start"] == []
+
+    def test_soft_deleted_child_skipped_when_open_siblings_remain(self, implement_mod):
+        """A soft-deleted child never hides genuinely open siblings: the
+        next startable open child is still implemented."""
+        children = [
+            _child("SA-C1", status="open", deleted_by="plan"),
+            _child("SA-C2", status="open"),
+        ]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        assert report["success"] is True
+        assert report.get("parent_advanced") is None or report.get("parent_advanced") is False
+        assert report["_calls"]["phase_start"] == ["SA-C2"]
+        assert report.get("next_child") == "SA-C2"
 
 
 # ===========================================================================

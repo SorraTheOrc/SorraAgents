@@ -19,7 +19,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
   - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
   - [skill/report/SKILL.md](skill/report/SKILL.md): the **report helper** — canonical end-of-session report format (Acceptance Criteria table, Meta-Data with ContextHub icons, Producer Actions, Notes, Conclusion) that every work-item skill renders as its final step.
 - plugins/: local agent framework plugins used by this repository.
-- docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)). For setting up a new project: [skills-script-paths.md](docs/dev/skills-script-paths.md#initializing-a-new-project-global-install) (global skills install via `scripts/install_pi.sh` — project repos need no `skill/` and must not receive copies of skill scripts). New projects get a project-local `AGENTS.md` reference structure (never a copy of the global file) via `scripts/init_project_agents.py` — see [project-agents-md.md](docs/dev/project-agents-md.md).
+- docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md), [worktree-isolation.md](docs/dev/worktree-isolation.md)). For setting up a new project: [skills-script-paths.md](docs/dev/skills-script-paths.md#initializing-a-new-project-global-install) (global skills install via `scripts/install_pi.sh` — project repos need no `skill/` and must not receive copies of skill scripts). New projects get a project-local `AGENTS.md` reference structure (never a copy of the global file) via `scripts/init_project_agents.py` — see [project-agents-md.md](docs/dev/project-agents-md.md).
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
 
@@ -62,6 +62,11 @@ cache entry. See [`skill/test/SKILL.md`](skill/test/SKILL.md),
 [`docs/dev/release-tests.md`](docs/dev/release-tests.md).
 
 ### For Release Managers
+
+Running a release does not require a work item — the `/skill:ship release`
+action is work-item-exempt, so do **not** create a work item for the release.
+This is separate from the automatic closure of `in_review` work items once the
+release lands on `main` (Release Process step 12).
 
 The canonical release script lives under the ship skill at
 `skill/ship/scripts/release/merge-dev-to-main.sh` and is invoked via

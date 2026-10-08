@@ -99,3 +99,49 @@ class TestErrorIsolation:
         assert "failure" in section
         assert "does not affect" in section
         assert "succeeded and which failed" in section
+
+
+# ── Worktree-root verification (SA-0MUY9PSRS003V5CM, AC2) ────────────────────
+
+_WORKTREE_REQUIREMENT = "**MANDATORY — worktree requirement:**"
+_WORKTREE_REQUIREMENT_END = "**Worktree hygiene:**"
+
+
+def _worktree_requirement() -> str:
+    """The MANDATORY worktree-requirement paragraph (whitespace-normalised)."""
+    content = _content()
+    start = content.find(_WORKTREE_REQUIREMENT)
+    assert start != -1, (
+        f"{_AGENTS_GLOBAL.name} must contain {_WORKTREE_REQUIREMENT!r}"
+    )
+    end = content.find(_WORKTREE_REQUIREMENT_END, start)
+    assert end != -1 and end > start, (
+        "worktree requirement must precede the worktree-hygiene note"
+    )
+    return " ".join(content[start:end].split())
+
+
+class TestWorktreeRootVerification:
+    """AC2: cwd is not sufficient; the worktree root must be verified."""
+
+    def test_cwd_not_sufficient(self) -> None:
+        req = _worktree_requirement()
+        assert "`cwd` is not sufficient" in req
+
+    def test_verify_worktree_root_documented(self) -> None:
+        req = _worktree_requirement()
+        assert "verify its worktree root" in req
+        assert "git rev-parse --show-toplevel" in req
+        assert "IMPLEMENT_WORKTREE_PATH" in req
+
+    def test_edits_must_resolve_inside_worktree(self) -> None:
+        req = _worktree_requirement()
+        assert "absolute path under the main checkout" in req
+
+    def test_wl_worktree_safe_invocation_documented(self) -> None:
+        req = _worktree_requirement()
+        assert "worklog-dir" in req
+
+    def test_links_to_worktree_isolation_doc(self) -> None:
+        req = _worktree_requirement()
+        assert "docs/dev/worktree-isolation.md" in req

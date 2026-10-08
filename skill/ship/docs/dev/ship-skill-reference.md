@@ -6,6 +6,16 @@ The ship skill automates the `dev` → `main` release workflow and provides
 related tooling (`pushToDev`, audit gate, branch checks).  All scripts are
 internal — the only user-facing action is `release`.
 
+## Work-item exemption
+
+**No work item is required for a release.** Running a release
+(`/skill:ship release`, `run-release.js`) is a work-item-exempt maintenance
+action: do **not** create a release work item (nor ask the operator to create
+one). This is distinct from the automatic **closure** of `in_review` work items
+after a verified release (Release Process step 12, `closeWorkItemsAfterRelease`),
+which needs no release work item to exist. See
+[SKILL.md](../../SKILL.md#when-to-use).
+
 ## Configuration Schema
 
 ### Per-project configuration (`<project>/.worklog/config.yaml`)
@@ -14,6 +24,9 @@ internal — the only user-facing action is `release`.
 # Required keys (set once per project):
 projectName: MyProject       # Human-readable project name
 prefix: LP                   # Worklog item prefix
+
+# Optional:
+projectDescription: A short 2–3 sentence summary of what the project is.
 ```
 
 This file is version-controlled and must contain **only non-secret settings**.
@@ -51,6 +64,19 @@ discord:
 The first file that defines `discord.webhook_url` wins. The existing global
 value can be migrated to `.worklog/config.private.yaml` for per-project
 isolation; the global fallback remains supported.
+
+### Project description / pitch (`projectDescription`)
+
+The optional top-level `projectDescription` scalar is resolved with the **same
+precedence as `projectName`** (project private → project → global) and is used
+verbatim as the leading pitch paragraph of the embed description.
+
+When unset, the pitch is generated from the leading prose of `README.md` (the
+block before the first `##` heading, capped at ~1000 characters) via the shared
+DeepSeek LLM caller (`scripts/llm.js`), summarised into 2–3 sentences. When
+generation is unavailable (no API key, LLM/network error, missing/unreadable
+README) the pitch paragraph is **omitted** and the notification still sends. The
+pitch is never persisted to `config.yaml`.
 
 ### Non-blocking semantics (AC3)
 
@@ -226,8 +252,11 @@ await sendReleaseNotification({ version, prUrl, projectRoot });
 
 - Only runs on successful, non-dry-run releases (after merge verification).
 - Resolves the webhook URL per AC2 precedence.
+- Resolves the project pitch: `projectDescription` wins; otherwise README/LLM; otherwise omitted.
 - Extracts the released version's changelog section from `CHANGELOG.md`.
-- Builds a Discord embed payload (version, tag, date, PR URL, changelog).
+- Extracts and removes the `> **Release focus:** …` marker from the section (no duplication).
+- Composes the embed description as pitch → focus → project/version line → changelog, truncated to 4 096 chars.
+- Builds a Discord embed payload (version, tag, date, PR URL, composed description).
 - POSTs to the webhook via built-in `fetch` (10s timeout).
 - On failure: logs a warning, returns `{ success: true, notified: false }`.
 - The release exit code is **never** changed by notification failure.
@@ -248,10 +277,14 @@ Post-release Discord notification (non-blocking).
 | `release.prUrl` | `string` | No | Release PR URL |
 | `release.projectRoot` | `string` | No | Project root (default: `process.cwd()`) |
 | `options.fetchFn` | `Function` | No | Injected `fetch` for testing |
+| `options.llmFetchFn` | `Function` | No | Injected LLM `fetch` for pitch generation (testing) |
+| `options.privateConfigPath` | `string` | No | Override private config path |
 | `options.projectConfigPath` | `string` | No | Override project config path |
 | `options.globalConfigPath` | `string` | No | Override global config path |
 | `options.changelogPath` | `string` | No | Override `CHANGELOG.md` path |
 | `options.changelogContent` | `string` | No | Pre-read changelog content |
+| `options.readmePath` | `string` | No | Override `README.md` path (pitch fallback) |
+| `options.readmeContent` | `string` | No | Pre-read README content |
 | `options.now` | `Function` | No | Date provider for fallback date |
 | `options.timeoutMs` | `number` | No | Webhook POST timeout (default: 10 000) |
 
@@ -263,11 +296,29 @@ Resolve the Discord webhook URL with precedence (AC2): private → project → g
 
 **Returns:** `string | null`
 
+### `resolveProjectDescription(projectRoot, options)`
+
+Resolve the project elevator pitch text with the same precedence as `projectName`: private → project → global (top-level `projectDescription` scalar).
+
+**Returns:** `string | null`
+
+### `resolveProjectPitch(projectRoot, options)`
+
+Resolve the pitch paragraph (async): the configured `projectDescription` wins; otherwise generate from the leading README prose via the shared LLM caller; otherwise `null` (paragraph omitted). Options include `readmePath`, `readmeContent`, `llmFetchFn`.
+
+**Returns:** `Promise<string | null>`
+
 ### `extractChangelogSection(changelog, version)`
 
 Extract the changelog section for a given version from `CHANGELOG.md`.
 
 **Returns:** `{ date: string, text: string } | null`
+
+### `extractReleaseFocus(sectionText)`
+
+Extract the `> **Release focus:** …` marker from a changelog section body and return the remaining body with the marker line removed.
+
+**Returns:** `{ focus: string | null, body: string }`
 
 ### `truncateForDiscord(text, maxLength)`
 
@@ -275,11 +326,23 @@ Truncate text to Discord embed description limit (4 096 chars).
 
 **Returns:** `string`
 
+### `extractReadmePitch(readmeContent, maxLength)`
+
+Return the leading README prose before the first `##` heading, capped at ~1000 characters.
+
+**Returns:** `string`
+
+### `generatePitch(readmeProse, options)`
+
+Generate a 2–3 sentence elevator pitch from README prose via the shared LLM caller (`llm.js`). Returns `null` when the prose is empty or the LLM is unavailable.
+
+**Returns:** `Promise<string | null>`
+
 ### `buildDiscordPayload(details)`
 
 Build the Discord webhook embed payload.
 
-**Parameters:** `version`, `tag`, `date`, `prUrl`, `changelog`
+**Parameters:** `version`, `tag`, `date`, `prUrl`, `changelog`, `projectName`, `pitch`, `focus`
 
 **Returns:** `{ embeds: Array<object> }`
 
@@ -304,6 +367,11 @@ force-closed. Such candidates are **refused** and reported in `refusedItems`
 (an explicit, reversible exclusion decision) rather than swept; only
 collateral-free candidates are closed. `getDescendants(itemId)` resolves the
 subtree recursively via `wl show <id> --children --json` (cycle-bounded).
+Terminal descendants (`stage: done` / `status: deleted`) are excluded from the
+collateral set, and a non-terminal descendant held back solely by
+`needsProducerReview === true` is reported with a distinct producer-review
+refusal reason (and `refusedItems[].needsProducerReview`) rather than the
+generic collateral list (SA-0MUJKPDAA002VVDP AC2).
 
 ## Remediation: test-spuriously-closed items
 

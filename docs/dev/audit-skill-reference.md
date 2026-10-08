@@ -383,7 +383,7 @@ transition has been **verified** (`wl show` readback, WL-0MSVVFBJ2003RRYK),
 - **Non-fatal:** a per-child `wl` failure is caught, logged to stderr, and does not abort the audit; the next passing audit completes the remaining cascade.
 - **Worklog routing:** the helper reuses `_run_wl`, so `--worklog-dir` is resolved through the shared helpers and the cascade targets the item's own store regardless of cwd.
 
-### Ship-side terminal-descendant exclusion (AC4)
+### Ship-side terminal-descendant exclusion and producer-review reporting (AC2/AC4)
 
 `closeWorkItemsAfterRelease` computes `collateral` as descendants that are
 neither release candidates nor terminal (`stage: done` / `status: deleted`,
@@ -393,9 +393,18 @@ A descendant whose lifecycle cannot be resolved is treated as non-terminal
 defence-in-depth for the audit-side cascade above (SA-0MUR7Y3BJ004FGPP AC4,
 overlapping SA-0MUJKPDAA002VVDP).
 
+When a refused parent's collateral includes a descendant held back solely
+because `needsProducerReview === true` (a candidate skipped with the flag still
+set), that descendant is classified separately and the refusal reason names the
+producer-review cause — `Refused: descendant(s) need producer review: …`, or
+appended to the generic out-of-scope message for a mixed subtree — rather than
+being lumped under the generic collateral list. The classification is exposed
+as `refusedItems[].needsProducerReview`; the parent is still refused, so the
+scope guard is not weakened (SA-0MUJKPDAA002VVDP AC2).
+
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--phase1-model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
@@ -613,8 +622,7 @@ Per-call timing: issue_id=<id> context=phase2_deep elapsed_seconds=<seconds> inp
 **Evidence-scope cap (Phase 2, LP-0MSQ32WM5000NCB7):** the parent/child/batch deep prompts instruct the model to cite **at most N file:line references per criterion, minimum 1** (prompt-level only; parsed evidence/verdicts are never mutated, so verdict semantics and the canonical report format are unchanged). This bounds evidence-JSON generation — the dominant Phase 2 cost (Phase 2 is 66% of audit model time on inputs of only ~0.5–2.5K tokens) — without changing the model. Resolution precedence (config contract):
 
 1. `--max-citations-per-ac N` CLI flag (issue and project subcommands; highest)
-2. `audit.max_citations_per_ac` key in the CWD `.ralph.json` / `ralph.config.json` (dotted form, or nested `audit: {max_citations_per_ac: N}`)
-3. hardcoded default `_DEFAULT_MAX_CITATIONS_PER_AC` = 5
+2. hardcoded default `_DEFAULT_MAX_CITATIONS_PER_AC` = 5
 
 Invalid values (0, negative, non-int) fail closed to the default with a warning (mirrors `_resolve_max_child_audits`). **Trade-off:** a smaller cap shortens deep analysis but narrows evidence breadth; the ≥1 file:line floor keeps every verdict substantiated. The benchmark `skill/audit/tests/test_audit_runner_phase2_benchmark.py` (`@pytest.mark.benchmark`, opt-in via `AUDIT_RUN_BENCHMARKS=1`) measures the median `phase2_deep` latency reduction against the 2026-08-12 baseline (median 1324 s of 1537/1324/903; threshold 927 s = 0.70×).
 
@@ -977,7 +985,7 @@ python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit
 Every pi subprocess the audit skill spawns carries a descriptive
 `--session-id`, so a session file can be traced back to the work item and
 phase that produced it and resumed with `pi --session <id>` / `/resume`.
-The convention follows the Ralph session-per-call precedent
+The convention follows the session-per-call precedent
 (SA-0MQ6E8NCG003STJB): unique per call, dash-separated, and conservatively
 prefix-scoped for cleanup.
 
@@ -1011,7 +1019,7 @@ subfolders as `<timestamp>_<session-id>.jsonl`. After every completed
 
 - **Scope:** only files whose session-id segment starts with `audit-`
   (`_is_audit_session_filename`). Every other pi session — `herdr-*`,
-  `ralph-*`, ad-hoc sessions — is never touched.
+  `legacy-*`, ad-hoc sessions — is never touched.
 - **Age:** files modified more than the retention period ago are removed;
   newer files are kept.
 - **Recursion:** the scan walks the session root recursively to reach the

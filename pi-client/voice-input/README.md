@@ -21,6 +21,20 @@ extensions.
 4. Errors (missing dependency, no microphone, busy worker) are shown as
    notifications; the pi session is never crashed.
 
+Every transition is acknowledged so a mis-press or a swallowed shortcut can
+never be mistaken for a successful dictation — with a one-line notification and
+the footer indicator:
+
+| Transition | Acknowledgement |
+|---|---|
+| Recording starts (enabled) | `🎙 Voice input enabled — listening… (Ctrl+Space to stop)` |
+| Recording stops (disabled) | `🔇 Voice input disabled — processing…` |
+| Transcript submitted | `📤 Voice input: sending "<first words>"` |
+| Nothing captured | warning: nothing captured — nothing was sent (no submission) |
+
+A short terminal-bell cue accompanies each transition (`feedbackSound`, default
+`true`); see [Configuration](#configuration).
+
 ## Prerequisites
 
 | Requirement | Notes |
@@ -31,7 +45,21 @@ extensions.
 | WSL2 audio | Requires **WSLg/PulseAudio** (or an ALSA→Pulse bridge); see *Troubleshooting* |
 
 The default model is `small` + `cuda` + `float16`, which fits comfortably in
-the 4 GB VRAM of an RTX 3050. `large-v3` may OOM; use `medium`/`small` instead.
+the 4 GB VRAM of an RTX 3050. For higher accuracy, use **`large-v3-turbo`**
+(~1.6 GB, near `large-v3` quality at `medium` size); `large-v3` (~3 GB) is
+too tight for 4 GB. Set `language` to `en` to skip language detection when you
+always speak English.
+
+```json
+{
+  "model": "large-v3-turbo",
+  "language": "en",
+  "device": "cuda",
+  "computeType": "float16",
+  "beamSize": 5,
+  "vadFilter": true
+}
+```
 
 ## Installation
 
@@ -60,7 +88,13 @@ pi --extension ./pi-client/voice-input
 Submission behaves like typing the text and pressing Enter: a normal user
 message that honours pi's current steering/follow-up mode (when pi is busy the
 transcript is delivered as a steering message). An empty transcript is never
-submitted.
+submitted — it is reported explicitly instead.
+
+Feedback on each transition is visual (a one-line notification plus the footer
+indicator) with an optional terminal-bell cue controlled by `feedbackSound`
+(default `true`). Set it to `false` in the settings file or via
+`PI_VOICE_INPUT_FEEDBACK_SOUND=false` to silence the bell while keeping the
+visual acknowledgement.
 
 ### Ctrl+Space conflicts
 
@@ -87,6 +121,10 @@ Settings files (first found wins):
 | `device` | `PI_VOICE_INPUT_DEVICE` | `cuda` | `cuda`, `cpu` or `auto` |
 | `computeType` | `PI_VOICE_INPUT_COMPUTE_TYPE` | `float16` | e.g. `float16`, `int8` |
 | `language` | `PI_VOICE_INPUT_LANGUAGE` | *(auto)* | Force a language, e.g. `en` |
+| `beamSize` | `PI_VOICE_INPUT_BEAM_SIZE` | `5` | Beam search width; higher can improve accuracy at the cost of latency |
+| `vadFilter` | `PI_VOICE_INPUT_VAD_FILTER` | `false` | Drop non-speech audio with faster-whisper's VAD filter |
+| `initialPrompt` | `PI_VOICE_INPUT_INITIAL_PROMPT` | *(none)* | Prompt to bias transcription (e.g. domain vocabulary) |
+| `feedbackSound` | `PI_VOICE_INPUT_FEEDBACK_SOUND` | `true` | Emit a short terminal-bell cue on each feedback transition (start/stop/outcome) |
 | `silenceThreshold` | `PI_VOICE_INPUT_SILENCE_THRESHOLD` | `0.01` | Normalised RMS below which a frame is silent |
 | `silenceMs` | `PI_VOICE_INPUT_SILENCE_MS` | `3000` | Silence before auto-submit (ms) |
 | `partialCadenceMs` | `PI_VOICE_INPUT_PARTIAL_CADENCE_MS` | `1000` | Live-partial / pause cadence (ms) |
@@ -95,6 +133,9 @@ Settings files (first found wins):
 | `python` | `PI_VOICE_INPUT_PYTHON` | `python3` | Python interpreter running the worker |
 | `workerScript` | `PI_VOICE_INPUT_WORKER_SCRIPT` | *(bundled)* | Override the worker path |
 | `startupTimeoutMs` | `PI_VOICE_INPUT_STARTUP_TIMEOUT_MS` | `120000` | Worker readiness timeout |
+| `shortcuts` | `PI_VOICE_INPUT_SHORTCUTS` | `[]` | Voice shortcuts: `[{ phrase, chord }]` sent to a Herdr pane |
+| `targetPaneLabel` | `PI_VOICE_INPUT_TARGET_PANE_LABEL` | `Work Items` | Pane label to target in the current Herdr workspace |
+| `targetPaneId` | `PI_VOICE_INPUT_TARGET_PANE_ID` | *(none)* | Explicit Herdr pane id (overrides the label) |
 
 Example `~/.pi/agent/voice-input.json`:
 
@@ -106,6 +147,33 @@ Example `~/.pi/agent/voice-input.json`:
   "computeType": "int8"
 }
 ```
+
+## Voice shortcuts (Herdr)
+
+Map a spoken phrase to a key chord that is injected into a Herdr pane — useful
+for driving keyboard-driven plugins (e.g. the ContextHub worklog pane):
+
+```json
+{
+  "targetPaneLabel": "Work Items",
+  "shortcuts": [
+    { "phrase": "producer interview", "chord": ["r", "i"] },
+    { "phrase": "producer review", "chord": ["r", "p"] }
+  ]
+}
+```
+
+When the final transcript matches a phrase (case/whitespace/punctuation
+insensitive) the extension sends the chord to the target pane with
+`herdr pane send-keys` instead of submitting the transcript to pi. The target
+pane is resolved by `targetPaneLabel` within the calling pane's workspace
+(`HERDR_WORKSPACE_ID`); set `targetPaneId` to pin a specific pane. A transcript
+that matches no phrase is submitted normally.
+
+This is an **explicit allowlist** — only configured phrases trigger a chord and
+no arbitrary shell command is ever run from speech. If Herdr is unavailable or
+no matching pane is found, the extension shows a notification and never crashes
+the session.
 
 ## Troubleshooting
 
@@ -140,6 +208,7 @@ cloud/network speech-to-text; the worker never opens a network connection.
 | `whisper_worker.py` | faster-whisper worker (model loaded once per session) |
 | `config.js` | settings resolution and validation |
 | `doctor.js` | faster-whisper / CUDA / capture / disk preflight checks |
+| `herdr-shortcuts.js` | voice phrase → Herdr key-chord dispatch (allowlist) |
 
 See [`docs/dev/voice-input.md`](../../docs/dev/voice-input.md) for the design
 and protocol reference.

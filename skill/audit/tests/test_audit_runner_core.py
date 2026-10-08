@@ -728,8 +728,8 @@ class TestPruneAuditSessions:
         """Non-audit-* files are never removed."""
         session_dir = self._make_fake_dir(tmp_path)
         # Create a non-audit file with old mtime
-        other_file = session_dir / "ralph-SA-XXX-run-00112233"
-        other_file.write_text("ralph session")
+        other_file = session_dir / "legacy-SA-XXX-run-00112233"
+        other_file.write_text("legacy session")
         old_time = time.time() - (200 * 86400)
         os.utime(other_file, (old_time, old_time))
 
@@ -740,14 +740,14 @@ class TestPruneAuditSessions:
         assert other_file.exists()
 
     def test_does_not_touch_non_audit_timestamped_files(self, tmp_path):
-        """Timestamped non-audit sessions (e.g. herdr/ralph) are preserved."""
+        """Timestamped non-audit sessions (e.g. herdr/legacy) are preserved."""
         session_dir = self._make_fake_dir(tmp_path)
         cwd_subdir = session_dir / "--home-user-projects-repo--"
         cwd_subdir.mkdir()
         other_file = cwd_subdir / (
-            "2026-01-01T10-00-00-000Z_ralph-SA-XXX-run-00112233.jsonl"
+            "2026-01-01T10-00-00-000Z_legacy-SA-XXX-run-00112233.jsonl"
         )
-        other_file.write_text("ralph session")
+        other_file.write_text("legacy session")
         old_time = time.time() - (200 * 86400)
         os.utime(other_file, (old_time, old_time))
 
@@ -814,7 +814,7 @@ class TestPruneAuditSessions:
             "2026-01-01T10-00-00-000Z_herdr-123-456.jsonl"
         )
         assert not audit_runner._is_audit_session_filename(
-            "2026-01-01T10-00-00-000Z_ralph-SA-XXX-run-abcdef12.jsonl"
+            "2026-01-01T10-00-00-000Z_legacy-SA-XXX-run-abcdef12.jsonl"
         )
         assert not audit_runner._is_audit_session_filename("random.jsonl")
 
@@ -1633,76 +1633,34 @@ class TestMaxCitationsPerACResolution:
     """Tests for the Phase-2 evidence citation-cap resolution (F1-AC1/AC5).
 
     The max-citations-per-AC cap resolves as ``--max-citations-per-ac`` CLI
-    flag > ``audit.max_citations_per_ac`` CWD config key > hardcoded default
-    5, with invalid values failing closed to the default with a warning
-    (LP-0MSQ32WM5000NCB7 AC1).
+    flag > hardcoded default 5, with invalid values failing closed to the
+    default with a warning (LP-0MSQ32WM5000NCB7 AC1).
     """
 
     def test_default_constant_is_five(self):
         """AC1: The hardcoded default cap is 5 file:line refs per AC."""
         assert audit_runner._DEFAULT_MAX_CITATIONS_PER_AC == 5
 
-    def test_resolver_returns_default_with_no_config(self):
-        """AC1: No CLI flag or config key -> default 5."""
-        with mock.patch.object(audit_runner, "_load_config", return_value={}):
-            assert audit_runner._resolve_max_citations_per_ac(None) == 5
+    def test_resolver_returns_default_with_no_flag(self):
+        """AC1: No CLI flag -> default 5."""
+        assert audit_runner._resolve_max_citations_per_ac(None) == 5
 
-    def test_config_dotted_key_overrides_default(self):
-        """AC1: the audit.max_citations_per_ac CWD config key overrides the default."""
-        with mock.patch.object(
-            audit_runner, "_load_config",
-            return_value={"audit.max_citations_per_ac": 3},
-        ):
-            assert audit_runner._resolve_max_citations_per_ac(None) == 3
-
-    def test_config_nested_key_overrides_default(self):
-        """AC1: the nested audit: {max_citations_per_ac} form is also honored."""
-        with mock.patch.object(
-            audit_runner, "_load_config",
-            return_value={"audit": {"max_citations_per_ac": 4}},
-        ):
-            assert audit_runner._resolve_max_citations_per_ac(None) == 4
-
-    def test_cli_flag_overrides_config(self):
-        """AC1: --max-citations-per-ac CLI flag beats the config key."""
-        with mock.patch.object(
-            audit_runner, "_load_config",
-            return_value={"audit.max_citations_per_ac": 3},
-        ):
-            assert audit_runner._resolve_max_citations_per_ac(2) == 2
+    def test_cli_flag_overrides_default(self):
+        """AC1: --max-citations-per-ac CLI flag beats the default."""
+        assert audit_runner._resolve_max_citations_per_ac(2) == 2
 
     def test_invalid_cli_fails_closed_with_warning(self, capsys):
         """AC5: a non-positive --max-citations-per-ac falls back to the default."""
-        with mock.patch.object(audit_runner, "_load_config", return_value={}):
-            assert audit_runner._resolve_max_citations_per_ac(0) == 5
+        assert audit_runner._resolve_max_citations_per_ac(0) == 5
         captured = capsys.readouterr()
         assert "Warning" in captured.err
         assert str(audit_runner._DEFAULT_MAX_CITATIONS_PER_AC) in captured.err
-
-    def test_invalid_config_value_fails_closed_with_warning(self, capsys):
-        """AC5: a non-int audit.max_citations_per_ac value falls back to the default."""
-        with mock.patch.object(
-            audit_runner, "_load_config",
-            return_value={"audit.max_citations_per_ac": "bogus"},
-        ):
-            assert audit_runner._resolve_max_citations_per_ac(None) == 5
-        assert "Warning" in capsys.readouterr().err
-
-    def test_negative_config_fails_closed_with_warning(self, capsys):
-        """AC5: a negative config value falls back to the default."""
-        with mock.patch.object(
-            audit_runner, "_load_config",
-            return_value={"audit.max_citations_per_ac": -3},
-        ):
-            assert audit_runner._resolve_max_citations_per_ac(None) == 5
-        assert "Warning" in capsys.readouterr().err
 
     def test_main_passes_cli_cap_to_cmd_issue(self):
         """AC1: main() resolves --max-citations-per-ac and passes it to cmd_issue."""
         with (
             mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
             mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
-            mock.patch.object(audit_runner, "_load_config", return_value={}),
         ):
             audit_runner.main(
                 ["issue", "SA-123", "--do-not-persist", "--max-citations-per-ac", "4"]
@@ -1711,11 +1669,10 @@ class TestMaxCitationsPerACResolution:
             assert kwargs["max_citations_per_ac"] == 4
 
     def test_main_defaults_cap_for_cmd_issue(self):
-        """AC1: main() resolves the default cap when no flag/config is present."""
+        """AC1: main() resolves the default cap when no flag is present."""
         with (
             mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
             mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
-            mock.patch.object(audit_runner, "_load_config", return_value={}),
         ):
             audit_runner.main(["issue", "SA-123", "--do-not-persist"])
             _args, kwargs = mock_cmd.call_args
@@ -2934,10 +2891,6 @@ class TestCmdProjectPiOutputWiring:
 
     def _run_project_capture(self, pi_result, json_mode=True, capsys=None):
         with (
-            mock.patch.object(audit_runner, "_load_config", return_value={}),
-            mock.patch.object(
-                audit_runner, "_resolve_model_for_phase", return_value="test-model"
-            ),
             mock.patch.object(
                 audit_runner,
                 "_run_wl",
@@ -2984,10 +2937,6 @@ class TestCmdProjectPiOutputWiring:
     def test_fallback_on_pi_runtime_error(self, capsys):
         """Pi failure (RuntimeError) preserves locally computed values."""
         with (
-            mock.patch.object(audit_runner, "_load_config", return_value={}),
-            mock.patch.object(
-                audit_runner, "_resolve_model_for_phase", return_value="test-model"
-            ),
             mock.patch.object(
                 audit_runner,
                 "_run_wl",

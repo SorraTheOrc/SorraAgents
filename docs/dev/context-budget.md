@@ -193,6 +193,16 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > new measured surface with justification rather than compacting the safety
 > text (SA-0MUN83EAF000G903 AC3).
 >
+> **Worktree-isolation guidance bump (2026-10-07, SA-0MUY9PSRS003V5CM):**
+> strengthening the "MANDATORY — worktree requirement" in `AGENTS_GLOBAL.md`
+> (stating that `cwd` is not sufficient, that a child/driven session must
+> verify its worktree root before the first edit, and the worktree-safe
+> `wl --worklog-dir <main-checkout>/.worklog …` invocation) added ~779 B
+> (`global_agents 11053` → `11832`; `total 16427` → `17206`; `project_agents`
+> and `skills_prose` unchanged). The addition is deliberate isolation-safety
+> guidance applied to every project, so the thresholds were regenerated to the
+> new measured surface with justification rather than dropping the guidance.
+>
 > ### Enforcement (committed gate)
 >
 > The regression gate is enforced in two places:

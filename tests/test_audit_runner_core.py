@@ -85,7 +85,6 @@ class TestCLIParsing:
         args = parser.parse_args(["issue", "SA-123"])
         assert args.do_not_persist is False
         assert args.pi_bin == "pi"
-        assert args.model is None
         assert args.model_source == DEFAULT_MODEL_SOURCE
 
     def test_issue_do_not_persist_flag(self):
@@ -97,11 +96,6 @@ class TestCLIParsing:
         parser = build_parser()
         args = parser.parse_args(["issue", "SA-123", "--pi-bin", "/usr/local/bin/pi"])
         assert args.pi_bin == "/usr/local/bin/pi"
-
-    def test_issue_model_flag(self):
-        parser = build_parser()
-        args = parser.parse_args(["issue", "SA-123", "--model", "custom/model"])
-        assert args.model == "custom/model"
 
     def test_issue_debug_log_flag(self):
         parser = build_parser()
@@ -117,18 +111,12 @@ class TestCLIParsing:
         parser = build_parser()
         args = parser.parse_args(["project"])
         assert args.pi_bin == "pi"
-        assert args.model is None
         assert args.model_source == DEFAULT_MODEL_SOURCE
 
     def test_project_pi_bin_flag(self):
         parser = build_parser()
         args = parser.parse_args(["project", "--pi-bin", "/opt/pi"])
         assert args.pi_bin == "/opt/pi"
-
-    def test_project_model_flag(self):
-        parser = build_parser()
-        args = parser.parse_args(["project", "--model", "other/model"])
-        assert args.model == "other/model"
 
     def test_project_debug_log_flag(self):
         parser = build_parser()

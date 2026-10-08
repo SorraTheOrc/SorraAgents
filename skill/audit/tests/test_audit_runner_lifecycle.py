@@ -716,6 +716,164 @@ class TestVerdictDrivenStatusLifecycle:
         self._assert_restored_completed_in_review(updates)
 
 
+class _CompatWlRunner:
+    """Stateful ``wl`` runner modelling the worklog's status/stage validation.
+
+    Real ``wl update`` rejects ``in-progress`` paired with a stage outside the
+    audit-runner transitional whitelist (idea, intake_complete, plan_complete,
+    in_review). A completed item sits at ``completed``/``done``, so a bare
+    ``--status in_progress`` claim fails with an incompatible-combination
+    error — exactly the failure this regression pins (SA-0MUWKGW9W004QXQZ).
+    """
+
+    _IN_PROGRESS_STAGES = frozenset(
+        {"idea", "intake_complete", "plan_complete", "in_review"}
+    )
+
+    def __init__(self, status="completed", stage="done", fail_children=False):
+        self.status = status
+        self.stage = stage
+        self.fail_children = fail_children
+        self.commands = []
+        self.updates = []
+
+    def __call__(self, cmd):
+        cmd = list(cmd)
+        self.commands.append(cmd)
+        cmd_str = " ".join(cmd)
+
+        if "update" in cmd:
+            self.updates.append(cmd)
+            new_status = self.status
+            new_stage = self.stage
+            if "--status" in cmd:
+                new_status = cmd[cmd.index("--status") + 1]
+            if "--stage" in cmd:
+                new_stage = cmd[cmd.index("--stage") + 1]
+            if (
+                new_status in ("in_progress", "in-progress")
+                and new_stage not in self._IN_PROGRESS_STAGES
+            ):
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr=(
+                        "Invalid status/stage combination: status "
+                        f'"{new_status}" is not compatible with stage '
+                        f'"{new_stage}".'
+                    ),
+                )
+            self.status, self.stage = new_status, new_stage
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+
+        if "--children" in cmd_str:
+            if self.fail_children:
+                return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": "TEST-1", "description": "",
+                        "status": self.status, "stage": self.stage,
+                    },
+                    "children": [],
+                }),
+                stderr="",
+            )
+
+        if "show" in cmd_str and "--json" in cmd_str:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": "TEST-1", "status": self.status,
+                        "stage": self.stage,
+                    },
+                }),
+                stderr="",
+            )
+
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"success": True}), stderr=""
+        )
+
+
+class TestDoneItemReaudit:
+    """Re-auditing a terminal completed/done item (SA-0MUWKGW9W004QXQZ).
+
+    Before the fix, ``cmd_issue`` unconditionally claimed the item with
+    ``wl update <id> --status in_progress``. For a ``completed``/``done``
+    item the worklog rejects ``in-progress``/``done`` as an incompatible
+    status/stage pair, so a terminal item could never be re-audited unless
+    it was reopened. A done item is already terminal — there is nothing to
+    claim — so the runner must run the audit and let the verdict-driven
+    terminal lifecycle keep/restore ``done``.
+    """
+
+    def _run_issue(self, runner, verdict_report):
+        with (
+            mock.patch.object(
+                audit_runner, "_assemble_issue_report",
+                return_value=verdict_report,
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=runner,
+            )
+
+    def test_done_item_audit_does_not_issue_invalid_claim(self):
+        """A completed/done item is never claimed in-progress (invalid combo)."""
+        runner = _CompatWlRunner(status="completed", stage="done")
+        rc = self._run_issue(
+            runner, "Ready to close: Yes\n\n## Summary\nAll met.",
+        )
+        assert rc == 0, "re-auditing a done item must not fail at the claim"
+        invalid_claims = [
+            cmd for cmd in runner.updates
+            if "--status" in cmd
+            and cmd[cmd.index("--status") + 1] in ("in_progress", "in-progress")
+        ]
+        assert invalid_claims == [], (
+            "a done item must not be claimed in-progress; "
+            f"got {invalid_claims}"
+        )
+
+    def test_done_item_yes_verdict_keeps_done_stage(self):
+        """Ready to close: Yes on a done item keeps completed/done."""
+        runner = _CompatWlRunner(status="completed", stage="done")
+        rc = self._run_issue(
+            runner, "Ready to close: Yes\n\n## Summary\nAll met.",
+        )
+        assert rc == 0
+        assert (runner.status, runner.stage) == ("completed", "done")
+
+    def test_done_item_no_verdict_demotes_to_plan_complete(self):
+        """An explicit Ready to close: No demotes a done item for rework."""
+        runner = _CompatWlRunner(status="completed", stage="done")
+        rc = self._run_issue(
+            runner, "Ready to close: No\n\n## Summary\n2 unmet.",
+        )
+        assert rc == 0
+        assert (runner.status, runner.stage) == ("open", "plan_complete")
+
+    def test_done_item_failure_restores_done(self):
+        """An infra failure restores the pre-audit completed/done state."""
+        runner = _CompatWlRunner(
+            status="completed", stage="done", fail_children=True,
+        )
+        self._run_issue(
+            runner, "Ready to close: Yes\n\n## Summary\nAll met.",
+        )
+        assert (runner.status, runner.stage) == ("completed", "done")
+
 
 class TestLifecycleVerification:
     """Post-update lifecycle readback verification (WL-0MSVVFBJ2003RRYK).

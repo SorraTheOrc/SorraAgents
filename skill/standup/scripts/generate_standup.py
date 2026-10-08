@@ -746,7 +746,13 @@ def load_snapshot_map(snapshot_hash):
 
 
 def detect_regressions(window_start, window_end):
-    """Items that were completed/in_review before window_start but moved back during window."""
+    """Items that were completed/in_review before window_start and have
+    since slipped to a non-terminal state (status != completed, or stage
+    not in in_review/done).
+
+    The forward release transition completed/in_review → completed/done
+    (``completed``/``done``) is NOT a regression.
+    """
     if window_start is None or window_end is None:
         return []
     snapshot_hash = get_snapshot_before(window_start)
@@ -769,7 +775,11 @@ def detect_regressions(window_start, window_end):
         if prev_status == "completed" and prev_stage == "in_review":
             cur_status = item.get("status")
             cur_stage = item.get("stage")
-            is_regressed = not (cur_status == "completed" and cur_stage == "in_review")
+            # Terminal states for a completed item: awaiting-release (in_review)
+            # or released (done).  Any transition away from these is a regression
+            # (backward slip).  The forward release transition
+            # completed/in_review → completed/done must NOT be flagged.
+            is_regressed = (cur_status != "completed") or (cur_stage not in ("in_review", "done"))
             if is_regressed and in_window(item, window_start, window_end):
                     regs.append(item)
     seen = set()

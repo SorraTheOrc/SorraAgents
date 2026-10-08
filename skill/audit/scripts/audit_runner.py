@@ -18,8 +18,8 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--phase1-model <name>] [--run-tests] [--no-execute]
-  audit_runner.py project [--pi-bin pi] [--model <name>]
+  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--run-tests] [--no-execute]
+  audit_runner.py project [--pi-bin pi]
 
 Verdicts:
   met       – acceptance criterion fully satisfied
@@ -1114,17 +1114,10 @@ _CLOSING_NOT_READY = (
     "would you like me to address the gaps in the audit?"
 )
 
-# Model / config constants (following Ralph's pattern)
-ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "ralph" / "assets" / ".ralph.json"
+# Model constants
 DEFAULT_MODEL = "Local Proxy/plan"
 DEFAULT_MODEL_SOURCE = "local"
 MODEL_SOURCES = frozenset({"remote", "local"})
-RALPH_CONFIG_FILES = [
-    Path(".ralph.json"),
-    Path("ralph.config.json"),
-]
-AUDIT_PHASE = "audit"
-AUDIT_PHASE1 = "audit_phase1"
 
 # ---------------------------------------------------------------------------
 # Types
@@ -2144,58 +2137,6 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# Config loading (following Ralph's _load_config / _deep_merge pattern)
-# ---------------------------------------------------------------------------
-
-
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Deep-merge override into base, returning a new dict."""
-    result = dict(base)
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-
-def _load_asset_config() -> dict:
-    """Load the shipped default config from skill/ralph/assets/.ralph.json."""
-    try:
-        with open(ASSET_CONFIG_PATH) as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
-
-
-def _load_config() -> dict:
-    """Load config merging asset defaults with CWD config file.
-
-    Asset defaults from skill/ralph/assets/.ralph.json are the base.
-    A .ralph.json or ralph.config.json in the current working directory
-    overrides those values. CLI flags take highest precedence downstream.
-    """
-    config = _load_asset_config()
-
-    for path in RALPH_CONFIG_FILES:
-        if not path.exists():
-            continue
-        if path.suffix == ".json":
-            try:
-                with open(path) as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    config = _deep_merge(config, data)
-            except (json.JSONDecodeError, OSError):
-                pass
-
-    return config
-
-
 def _default_parent_timeout(n_children: int) -> int:
     """Compute the default cumulative elapsed-time guard (seconds).
 
@@ -2380,13 +2321,10 @@ def _resolve_max_citations_per_ac(cli_value: int | None = None) -> int:
 
     Precedence:
       1. ``--max-citations-per-ac`` CLI flag (explicit override)
-      2. ``audit.max_citations_per_ac`` key in the CWD ``.ralph.json`` /
-         ``ralph.config.json`` (dotted form first, then the nested
-         ``audit: {max_citations_per_ac: N}`` form)
-      3. ``_DEFAULT_MAX_CITATIONS_PER_AC`` (5)
+      2. ``_DEFAULT_MAX_CITATIONS_PER_AC`` (5)
 
     An invalid value (non-positive integer) fails closed to the default with
-    a warning so a misconfigured config cannot break the audit run (mirrors
+    a warning so a bad value cannot break the audit run (mirrors
     ``_resolve_max_child_audits``; LP-0MSQ32WM5000NCB7 AC1/AC6).
     """
     if cli_value is not None:
@@ -2398,25 +2336,6 @@ def _resolve_max_citations_per_ac(cli_value: int | None = None) -> int:
             )
             return _DEFAULT_MAX_CITATIONS_PER_AC
         return cli_value
-    config = _load_config()
-    config_value = config.get("audit.max_citations_per_ac")
-    if config_value is None:
-        audit_section = config.get("audit")
-        if isinstance(audit_section, dict):
-            config_value = audit_section.get("max_citations_per_ac")
-    if config_value is not None:
-        try:
-            parsed = int(config_value)
-            if parsed < 1:
-                raise ValueError
-            return parsed
-        except (ValueError, TypeError):
-            print(
-                f"Warning: invalid audit.max_citations_per_ac value "
-                f"{config_value!r}; using the default cap "
-                f"({_DEFAULT_MAX_CITATIONS_PER_AC})",
-                file=sys.stderr,
-            )
     return _DEFAULT_MAX_CITATIONS_PER_AC
 
 
@@ -3809,163 +3728,8 @@ def _normalize_model_source(source: str | None) -> str:
     return DEFAULT_MODEL_SOURCE
 
 
-def _coerce_model_str(value: object) -> str | None:
-    """Extract a non-empty trimmed string from *value*, or None."""
-    if isinstance(value, str):
-        trimmed = value.strip()
-        if trimmed:
-            return trimmed
-    return None
-
-
-def _resolve_phase_model_value(value: object, model_source: str) -> str | None:
-    """Resolve a model value that may be a string or source-mapped dict.
-
-    If *value* is a plain string, return it directly.
-    If *value* is a dict with keys matching *model_source* (remote|local),
-    return the corresponding value.
-    """
-    direct = _coerce_model_str(value)
-    if direct:
-        return direct
-    if isinstance(value, dict):
-        source_value = _coerce_model_str(value.get(model_source))
-        if source_value:
-            return source_value
-    return None
-
-
-def _extract_phase_model_config(config: dict) -> dict[str, object]:
-    """Extract per-phase model config from the loaded .ralph.json.
-
-    Checks these locations (in order):
-      - model.<phase>  (nested key)
-      - model.remote.<phase> / model.local.<phase>  (source-mapped)
-      - model[phase]   (dict access)
-      - model[remote|local][phase]  (source-mapped dict access)
-    """
-    phase_config: dict[str, object] = {}
-    model_root = config.get("model")
-
-    for phase in (AUDIT_PHASE, AUDIT_PHASE1):
-        # Check dotted keys first (model.audit, model.remote.audit, etc.)
-        dotted_key = config.get(f"model.{phase}")
-        if dotted_key is not None:
-            phase_config[phase] = dotted_key
-            continue
-
-        direct_remote = config.get(f"model.remote.{phase}")
-        direct_local = config.get(f"model.local.{phase}")
-        if direct_remote is not None or direct_local is not None:
-            source_map: dict[str, object] = {}
-            if direct_remote is not None:
-                source_map["remote"] = direct_remote
-            if direct_local is not None:
-                source_map["local"] = direct_local
-            phase_config[phase] = source_map
-            continue
-
-        if isinstance(model_root, dict):
-            if phase in model_root:
-                phase_config[phase] = model_root[phase]
-                continue
-
-            remote_map = model_root.get("remote")
-            local_map = model_root.get("local")
-            if isinstance(remote_map, dict) or isinstance(local_map, dict):
-                source_map = {}
-                if isinstance(remote_map, dict) and phase in remote_map:
-                    source_map["remote"] = remote_map[phase]
-                if isinstance(local_map, dict) and phase in local_map:
-                    source_map["local"] = local_map[phase]
-                if source_map:
-                    phase_config[phase] = source_map
-
-    return phase_config
-
-
-def _resolve_model_for_phase(phase: str, config: dict,
-                              model_source: str,
-                              cli_model: str | None = None) -> str:
-    """Resolve the model for *phase* with the resolution chain:
-
-    1. --model CLI flag (explicit override, highest priority)
-    2. Config-driven: phase model from .ralph.json resolved via model_source
-    3. Hardcoded fallback: DEFAULT_MODEL
-
-    This mirrors Ralph's _resolve_model_for_phase pattern.
-    """
-    # 1. CLI override
-    explicit = _coerce_model_str(cli_model)
-    if explicit:
-        return explicit
-
-    # 2. Config-driven resolution
-    phase_config = _extract_phase_model_config(config)
-    config_value = phase_config.get(phase)
-    resolved = _resolve_phase_model_value(config_value, model_source)
-    if resolved:
-        return resolved
-
-    # 3. Hardcoded fallback
-    return DEFAULT_MODEL
-
-
-def _resolve_phase1_model(config: dict, model_source: str,
-                         cli_model: str | None = None,
-                         cli_phase1_model: str | None = None,
-                         full_model: str | None = None) -> str:
-    """Resolve the Phase 1 (fast/cheap screening) model.
-
-    Resolution chain:
-      1. ``--phase1-model`` CLI flag (explicit phase-1 override, highest)
-      2. ``--model`` CLI flag (explicit full-audit override)
-      3. Config-driven: ``model.audit_phase1`` from .ralph.json resolved via
-         model_source (falls back to ``model.audit`` — the full model — when
-         the phase-1 key is absent; SA-0MSKB697P000T3HG AC1)
-      4. Hardcoded fallback: DEFAULT_MODEL
-
-    Phase 1 (parent + child AC screening) runs on the fast/cheap model while
-    Phase 2 deep analysis keeps the full ``model.audit`` model.
-
-    The *full_model* argument is the already-resolved full audit model
-    (``_resolve_model_for_phase(AUDIT_PHASE, ...)``); when ``model.audit_phase1``
-    is absent the screening falls back to exactly that value, so a config with
-    only ``model.audit`` behaves byte-for-byte like today.
-    """
-    # 1. Explicit phase-1 CLI override
-    explicit = _coerce_model_str(cli_phase1_model)
-    if explicit:
-        return explicit
-
-    # 2. CLI override (applies to the whole audit)
-    explicit = _coerce_model_str(cli_model)
-    if explicit:
-        return explicit
-
-    # 3. Config-driven resolution: model.audit_phase1, falling back to
-    # the full model (model.audit) when the phase-1 key is absent.
-    phase_config = _extract_phase_model_config(config)
-    config_value = phase_config.get(AUDIT_PHASE1)
-    resolved = _resolve_phase_model_value(config_value, model_source)
-    if resolved:
-        return resolved
-
-    # AC1: no model.audit_phase1 → fall back to model.audit (full model).
-    # The caller usually passes the already-resolved full model; when absent
-    # (standalone resolution), resolve model.audit from the config directly.
-    if full_model is None:
-        full_value = phase_config.get(AUDIT_PHASE)
-        full_model = _resolve_phase_model_value(full_value, model_source)
-    if full_model:
-        return full_model
-
-    # 4. Hardcoded fallback
-    return DEFAULT_MODEL
-
-
 # ---------------------------------------------------------------------------
-# Pi integration (duplicated from ralph for now – see OQ-1)
+# Pi integration
 # ---------------------------------------------------------------------------
 
 def _resolve_call_timeout(timeout: int | None, child_screen: bool = False) -> int:
@@ -4145,7 +3909,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     (SA-0MSISKM8F004NW1U AC2). This function returns at minimum
     ``{"verdict": <met|unmet|partial|adjusted>, "evidence": <text>}``.
 
-    Uses the same JSON-stream protocol as ralph (``pi -p --mode json``).
+    Uses the JSON-stream protocol (``pi -p --mode json``).
     Uses ``communicate()`` to avoid pipe-buffer deadlocks. In-process
     stall detection (LP-0MSQ32S2M001EA74 AC2) aborts a call that produces
     no output for ``AUDIT_STALL_TIMEOUT`` seconds (default 600) well
@@ -6303,7 +6067,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
     """Phase 1 child AC review worker (P7, parallel-safe).
 
     Runs the batched Phase 1 acceptance-criteria screening for one child on
-    the fast Phase 1 model (*phase1_model*, ``model.audit_phase1``) and
+    the fast Phase 1 model (*phase1_model*) and
     returns ``(ci, child_ac_results)``. The prompt includes the file-scope
     manifest and SCANNING block, and the call runs with read-only tools
     (``enable_tools=True``) — mirroring the Phase 2 performance pattern.
@@ -8724,7 +8488,6 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     green_run = ctx.green_run
     run_tests = ctx.run_tests
     model = ctx.model
-    model_source = ctx.model_source
 
     launch_error = _verify_launch_context(issue_id, worklog_dir=worklog_dir)
     if launch_error:
@@ -8758,19 +8521,15 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             print(f"Error: {error}", file=sys.stderr)
         return 1
 
-    # Resolve the effective model from config + CLI
-    config = _load_config()
-    resolved_model = _resolve_model_for_phase(
-        AUDIT_PHASE, config, model_source, cli_model=model,
-    )
-    # Tiered Phase 1 model (SA-0MSKB697P000T3HG): Phase 1 parent + child AC
-    # screening resolves model.audit_phase1 (fast/cheap), falling back to the
-    # full audit model when absent; Phase 2 deep analysis keeps model.audit.
-    phase1_model = _resolve_phase1_model(
-        config, model_source, cli_model=model,
-        cli_phase1_model=ctx.phase1_model,
-        full_model=resolved_model,
-    )
+    # Model selection is a single hardcoded default: the legacy config-file
+    # system that once supplied per-phase overrides was removed in
+    # SA-0MUQ0I0YY000JCB5.
+    resolved_model = model or DEFAULT_MODEL
+    # Tiered Phase 1 model (SA-0MSKB697P000T3HG): when a distinct phase-1
+    # model is supplied it screens Phase 1 (parent + child AC screening)
+    # while Phase 2 deep analysis keeps the full model; otherwise both phases
+    # share the resolved model.
+    phase1_model = ctx.phase1_model or resolved_model
 
     if runner is None:
         runner = _default_runner
@@ -9002,8 +8761,16 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry (verdict-driven on exit)
     # ------------------------------------------------------------------
-    _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"],
-            worklog_dir=worklog_dir)
+    # A completed/done item is already terminal and cannot be claimed with
+    # the `in-progress` status: the worklog rejects `in-progress`/`done` as
+    # an incompatible status/stage pair, which previously made re-auditing a
+    # terminal item fail before the pipeline started. There is nothing to
+    # claim for a done item, so skip the claim and let the verdict-driven
+    # terminal lifecycle keep/restore `done` (SA-0MUWKGW9W004QXQZ).
+    if original_stage != "done":
+        _run_wl(runner,
+                ["wl", "update", issue_id, "--status", "in_progress", "--json"],
+                worklog_dir=worklog_dir)
 
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
@@ -10319,13 +10086,13 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             failure_label="parent AC review", enable_tools=True,
             priority=_resolve_audit_priority(ctx.work_item),
         )
-        # AC4 safe fallback (SA-0MSKB697P000T3HG): when a fast Phase 1 model
-        # is configured and it cannot produce reliable batched verdict JSON
+        # AC4 safe fallback (SA-0MSKB697P000T3HG): when a distinct Phase 1
+        # model is supplied and it cannot produce reliable batched verdict JSON
         # (unparseable output, provider error, or concurrency-limit timeout),
         # retry the SAME Phase 1 screen with the full audit model before
-        # falling back to 'partial' diagnostics. The default (no
-        # model.audit_phase1 key) resolves phase1_model == resolved_model, so
-        # this retry is a no-op for legacy configs — zero behavior change.
+        # falling back to 'partial' diagnostics. When no distinct phase-1
+        # model is supplied, phase1_model == resolved_model and this retry
+        # is a no-op — zero behavior change.
         if not batch and phase1_model != ctx.resolved_model:
             print(
                 "Warning: fast Phase 1 model produced unparseable output — "
@@ -10811,18 +10578,9 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                         "issue",
                                         child["id"],
                                         "--pi-bin", pi_bin,
-                                        "--model", resolved_model,
                                         "--model-source", model_source,
                                         "--force",  # Bypass freshness gate
                                     ]
-                                    # Thread the tiered Phase 1 model into the
-                                    # child audit so its Phase 1 screening uses the
-                                    # fast/cheap model too (SA-0MSKB697P000T3HG AC2)
-                                    # — only when tiering is actually configured.
-                                    if ctx.resolved_phase1_model != resolved_model:
-                                        audit_cmd.extend([
-                                            "--phase1-model", ctx.resolved_phase1_model,
-                                        ])
                                     if timeout is not None:
                                         audit_cmd.extend(["--timeout", str(timeout)])
                                     if parent_timeout is not None:
@@ -12383,20 +12141,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
     The resolved model name and source are included as a metadata line
     in the audit report output (issue-level and child reports).
 
-    Model resolution order (highest first):
-      1. --model CLI flag (explicit override)
-      2. Config-driven: model.audit from .ralph.json resolved via model_source
-      3. Hardcoded fallback: DEFAULT_MODEL
+    Model selection uses a single hardcoded default (``DEFAULT_MODEL``); the
+    legacy config-file system that once supplied per-phase overrides was
+    removed. An explicit *model* may still be passed by direct callers.
 
-    Phase 1 model resolution (tiered, SA-0MSKB697P000T3HG):
-      1. --phase1-model CLI flag (explicit phase-1 override)
-      2. --model CLI flag
-      3. Config-driven: model.audit_phase1 from .ralph.json resolved via
-         model_source, falling back to model.audit (full model)
-      4. Hardcoded fallback: DEFAULT_MODEL
-
-    Phase 1 (parent + child AC screening) runs on the resolved phase-1
-    model; Phase 2 deep analysis keeps the full model.
+    Phase 1 (parent + child AC screening) runs on *phase1_model* when
+    supplied, otherwise the resolved model; Phase 2 deep analysis keeps the
+    resolved model.
 
     When *force* is ``True``, the freshness gate is bypassed and a full
     audit pipeline is always run, even if a recent audit already exists.
@@ -12714,10 +12465,9 @@ def cmd_project(timeout: int | None = None,
                 max_citations_per_ac: int | None = None) -> int:
     """Audit the overall project.
 
-    Model resolution order (highest first):
-      1. --model CLI flag (explicit override)
-      2. Config-driven: model.audit from .ralph.json resolved via model_source
-      3. Hardcoded fallback: DEFAULT_MODEL
+    Model selection uses a single hardcoded default (``DEFAULT_MODEL``); the
+    legacy config-file system that once supplied overrides was removed. An
+    explicit *model* may still be passed by direct callers.
 
     *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
     auto-resolution for every wl call made by this run (see
@@ -12728,11 +12478,10 @@ def cmd_project(timeout: int | None = None,
     the cap is validated upstream in ``main()`` and unused here
     (LP-0MSQ32WM5000NCB7).
     """
-    # Resolve the effective model from config + CLI
-    config = _load_config()
-    resolved_model = _resolve_model_for_phase(
-        AUDIT_PHASE, config, model_source, cli_model=model,
-    )
+    # Model selection is a single hardcoded default (the legacy config-file
+    # system was removed in SA-0MUQ0I0YY000JCB5); explicit *model* overrides
+    # are still honoured for direct callers.
+    resolved_model = model or DEFAULT_MODEL
 
     if runner is None:
         runner = _default_runner
@@ -13064,14 +12813,6 @@ def build_parser() -> argparse.ArgumentParser:
                              "flag to persist the full report"
                          ))
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
-    p_issue.add_argument("--model", default=None,
-                         help="Pi model to use for review (default: resolved from .ralph.json)")
-    p_issue.add_argument("--phase1-model", default=None,
-                         help=(
-                             "Pi model for Phase 1 parent + child AC screening "
-                             "(fast/cheap tier; default: resolved from "
-                             "model.audit_phase1, falling back to model.audit)"
-                         ))
     p_issue.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
                          choices=sorted(MODEL_SOURCES),
                          help="Model source: remote or local (default: local)")
@@ -13212,10 +12953,6 @@ def build_parser() -> argparse.ArgumentParser:
                              "persist the full reports"
                          ))
     p_batch.add_argument("--pi-bin", default="pi", help="Path to the pi binary")
-    p_batch.add_argument("--model", default=None,
-                         help="Pi model to use for review")
-    p_batch.add_argument("--phase1-model", default=None,
-                         help="Pi model for Phase 1 AC screening")
     p_batch.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
                          choices=sorted(MODEL_SOURCES),
                          help="Model source: remote or local (default: local)")
@@ -13244,8 +12981,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_project.add_argument("--timeout", type=int, default=None,
                            help="Override the per-call Pi model timeout in seconds")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
-    p_project.add_argument("--model", default=None,
-                           help="Pi model to use for review (default: resolved from .ralph.json)")
     p_project.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
                            choices=sorted(MODEL_SOURCES),
                            help="Model source: remote or local (default: local)")
@@ -13361,8 +13096,7 @@ def main(argv: list[str] | None = None) -> int:
             _rc = cmd_batch(max_items=args.max_items,
                             timeout=args.timeout,
                             persist=not args.do_not_persist,
-                            pi_bin=args.pi_bin, model=args.model,
-                            phase1_model=args.phase1_model,
+                            pi_bin=args.pi_bin,
                             model_source=args.model_source, json_mode=args.json,
                             debug_log=args.debug_log,
                             force=args.force,
@@ -13376,7 +13110,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "project":
         with SharedTimer("audit_runner_project") as _root_timer:
             _rc = cmd_project(timeout=_resolve_effective_timeout(args.timeout),
-                              pi_bin=args.pi_bin, model=args.model,
+                              pi_bin=args.pi_bin,
                               model_source=args.model_source, json_mode=args.json,
                               debug_log=args.debug_log,
                               worklog_dir=args.worklog_dir,
@@ -13433,8 +13167,7 @@ def _run_issue_command(args) -> int:
             _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
                         timeout=_resolve_effective_timeout(args.timeout),
                         parent_timeout=_resolve_parent_timeout(args.parent_timeout),
-                        pi_bin=args.pi_bin, model=args.model,
-                        phase1_model=getattr(args, "phase1_model", None),
+                        pi_bin=args.pi_bin,
                         model_source=args.model_source, json_mode=args.json,
                         debug_log=args.debug_log,
                         force=args.force,
