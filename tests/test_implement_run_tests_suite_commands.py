@@ -68,22 +68,51 @@ def _write_suite_commands(repo: Path, commands: list[str]) -> None:
 
 
 def _record_runs(mod: object, monkeypatch: pytest.MonkeyPatch, codes=None) -> list[str]:
-    """Patch run_cached to record commands and optionally return exit codes.
+    """Patch the canonical guard-owning runner and record the commands it runs.
 
-    ``codes`` may be an int (same code for every call) or a callable taking
-    the call index. Default is exit code 0 for every call.
+    ``run_tests()`` now delegates suite execution to the test skill's
+    ``guarded_run_all`` (SA-0MUH1MJL6003767Q), so the delegation boundary —
+    not ``run_cached`` — is the observable seam for the test-skill path.
+    This stub records the flat command list the delegation was asked to run
+    and returns a canned ``run_all``-shaped result.
+
+    ``codes`` may be an int (same code for the whole run) or a callable
+    taking the recorded command index. Default is exit code 0.
     """
     captured: list[str] = []
 
-    def fake_run_cached(command: str, **kwargs) -> dict:
-        captured.append(command)
-        if codes is None:
-            return _canned_run(0)
-        if callable(codes):
-            return _canned_run(codes(len(captured) - 1))
-        return _canned_run(codes)
+    def fake_guarded_run_all(
+        cwd=None,
+        timeout=600,
+        *,
+        commands=None,
+        scope="full",
+        base_ref="origin/dev",
+        use_cache=True,
+        **kwargs,
+    ) -> dict:
+        cmds = list(commands or [])
+        captured.extend(cmds)
+        exit_code = 0
+        if codes is not None:
+            exit_code = codes(len(captured) - 1) if callable(codes) else codes
+        return {
+            "success": exit_code == 0,
+            "suites": {
+                "all": {
+                    "returncode": exit_code,
+                    "success": exit_code == 0,
+                    "failures": [],
+                }
+            },
+            "failures": [],
+            "notices": [],
+            "scope": scope,
+            "type": "full",
+            "resolved_scopes": [scope],
+        }
 
-    monkeypatch.setattr(mod, "run_cached", fake_run_cached)
+    monkeypatch.setattr(mod, "_guarded_run_all", fake_guarded_run_all)
     return captured
 
 
@@ -257,7 +286,13 @@ class TestGracefulDegradation:
         mod = _load_implement()
         monkeypatch.setattr(mod, "_full_suite_commands", None)
         monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
-        captured = _record_runs(mod, monkeypatch)
+        captured: list[str] = []
+
+        def fake_run_cached(command: str, **kwargs) -> dict:
+            captured.append(command)
+            return _canned_run(0)
+
+        monkeypatch.setattr(mod, "run_cached", fake_run_cached)
 
         result = mod.run_tests(str(repo), scope="full")
 

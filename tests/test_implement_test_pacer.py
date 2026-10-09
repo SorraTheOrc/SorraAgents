@@ -84,8 +84,16 @@ def _record_slot(events: list[str]):
 
 @pytest.fixture
 def _capture_runner(monkeypatch, tmp_path):
-    """Patch implement.py's run_cached to capture the runner it was given."""
+    """Patch implement.py's run_cached to capture the runner it was given.
+
+    The test-skill path delegates suite execution to the canonical
+    ``guarded_run_all`` (which owns pacing internally, SA-0MUH1MJL6003767Q),
+    so the ``run_cached`` seam only exists on the direct/legacy path. The
+    test skill is disabled here to exercise that direct path; the delegation
+    boundary is covered by ``test_implement_guard_ownership.py``.
+    """
     mod = _load_implement()
+    monkeypatch.setattr(mod, "_full_suite_commands", None)
     monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
     captured: dict = {}
 
@@ -159,6 +167,7 @@ class TestConcurrencyTimeoutIsActionable:
 
     def test_timeout_returns_failed_result(self, monkeypatch, tmp_path, caplog):
         mod = _load_implement()
+        monkeypatch.setattr(mod, "_full_suite_commands", None)
         monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
 
         @contextlib.contextmanager
@@ -206,6 +215,7 @@ class TestNoUnguardedExecutionPath:
         self, monkeypatch, tmp_path, tooling, scope, override_cmd
     ):
         mod = _load_implement()
+        monkeypatch.setattr(mod, "_full_suite_commands", None)
         monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: tooling)
         if scope == "changed":
             monkeypatch.setattr(

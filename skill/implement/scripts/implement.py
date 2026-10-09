@@ -103,11 +103,15 @@ try:
     from test.scripts.run_tests import (
         full_suite_commands as _full_suite_commands,
     )
+    from test.scripts.run_tests import (
+        guarded_run_all as _guarded_run_all,
+    )
     from test.scripts.run_tests import paced_runner as _test_paced_runner
 except ModuleNotFoundError:
     _changed_scope_commands = None  # type: ignore[assignment]
     _extension_suite_commands = None  # type: ignore[assignment]
     _full_suite_commands = None  # type: ignore[assignment]
+    _guarded_run_all = None  # type: ignore[assignment]
     _test_paced_runner = None  # type: ignore[assignment]
 
     class _TestConcurrencyTimeout(RuntimeError):  # type: ignore[no-redef]
@@ -2382,6 +2386,103 @@ def _run_cached_paced(command: str, **kwargs: Any) -> dict[str, Any]:
         }
 
 
+def _guarded_exit_code(guarded: dict[str, Any]) -> int:
+    """Extract the aggregate exit code from a ``guarded_run_all`` result.
+
+    ``run_all`` aggregates per-suite results but does not expose a top-level
+    ``returncode``; the first non-zero suite returncode is the run's exit
+    code (0 when every suite passed). Falls back to ``success`` when no
+    per-suite returncode is available.
+    """
+    suites = guarded.get("suites") or {}
+    if isinstance(suites, dict):
+        for result in suites.values():
+            if not isinstance(result, dict):
+                continue
+            returncode = result.get("returncode")
+            if returncode:
+                return int(returncode)
+    return 0 if guarded.get("success") else 1
+
+
+def _adapt_guarded_result(
+    guarded: dict[str, Any], tooling: str | None, scope: str
+) -> dict[str, Any]:
+    """Adapt a ``guarded_run_all`` result to implement.py's result contract.
+
+    ``run_all`` reports structured failure dicts and an aggregate
+    ``success``; implement.py's finish loop expects a flat ``failures`` list
+    of strings, an ``exit_code``, ``skipped`` and ``tooling``. The
+    ``live_repo_mutation`` key (set by the canonical outer guard) is carried
+    through so a mutated checkout always fails the gate.
+    """
+    failures: list[str] = []
+    for failure in guarded.get("failures", []):
+        if isinstance(failure, dict):
+            failures.append(str(failure.get("test_name") or failure))
+        else:
+            failures.append(str(failure))
+    exit_code = _guarded_exit_code(guarded)
+    result: dict[str, Any] = {
+        "success": bool(guarded.get("success")) and exit_code == 0,
+        "stdout": "",
+        "stderr": "",
+        "exit_code": exit_code,
+        "failures": failures,
+        "skipped": False,
+        "tooling": tooling,
+        "scope": guarded.get("scope", scope),
+    }
+    mutation = guarded.get("live_repo_mutation")
+    if mutation:
+        result["live_repo_mutation"] = mutation
+        result["success"] = False
+    return result
+
+
+def _run_guarded_suite(
+    commands: list[str],
+    cwd: str,
+    scope: str,
+    base_ref: str | None,
+    tooling: str | None,
+) -> dict[str, Any]:
+    """Execute *commands* through the canonical guard-owning runner.
+
+    Delegates to ``run_tests.guarded_run_all`` (the single source of truth
+    for live-repo guard ownership, SA-0MUH1MJL6003767Q) so implement.py's
+    finish gate is guarded by the same outer snapshot guard as the test
+    skill's CLI — even when ``LIVE_REPO_GUARD_ACTIVE`` is already set in the
+    environment (a nested run): ``guarded_run_all`` then stands down because
+    the outer guard already owns the checkout.
+
+    When the test skill is unavailable (partial install), or the delegation
+    raises, falls back to the direct ``_run_commands_direct`` path (the
+    inner conftest guard remains armed), preserving graceful degradation.
+    """
+    if _guarded_run_all is None or _full_suite_commands is None:
+        # Partial install, or the legacy convention path: only the inner
+        # conftest guard is armed, so run directly (no delegation).
+        return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+    try:
+        guarded = _guarded_run_all(
+            cwd=Path(cwd),
+            timeout=_resolve_test_timeout(cwd),
+            commands=commands,
+            scope=scope,
+            base_ref=base_ref or "origin/dev",
+            use_cache=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade to the direct path
+        LOG.warning(
+            "Implement run_tests: guarded_run_all failed (%s) — falling "
+            "back to the direct cached runner (inner guard only).",
+            exc,
+        )
+        return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+    return _adapt_guarded_result(guarded, tooling=tooling, scope=scope)
+
+
 def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
     """Run only the tests affected by the worktree's changes vs *base_ref*.
 
@@ -2413,14 +2514,12 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     pytest_cmds = [c for c in commands if c.startswith("pytest")]
     if not pytest_cmds:
         return None
-    run = _run_cached_paced(
-        pytest_cmds[0],
-        cwd=cwd,
-        timeout=_resolve_test_timeout(cwd),
-        runner=lambda command, cwd_, timeout_: run_cmd(
-            shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
-        ),
+    run = _run_guarded_suite(
+        [pytest_cmds[0]],
+        cwd,
         scope="changed",
+        base_ref=base_ref,
+        tooling="pytest",
     )
     # pytest exit 4 is a *usage* error: "file or directory not found" (or a
     # similar no-valid-items condition). It means the selection referenced a
@@ -2437,10 +2536,27 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
             cwd,
         )
         return None
-    return _finalize_test_result(run, tooling="pytest", scope="changed")
+    return run
 
 
 def _run_commands(
+    commands: list[str], cwd: str, tooling: str, scope: str = "full"
+) -> dict[str, Any]:
+    """Execute *commands* through the canonical guard-owning runner.
+
+    Delegates to :func:`_run_guarded_suite` (which routes through the test
+    skill's ``guarded_run_all``) so the canonical outer live-repo guard owns
+    the checkout for every finish-gate suite (SA-0MUH1MJL6003767Q). Falls
+    back to :func:`_run_commands_direct` when the test skill is unavailable.
+    """
+    if _guarded_run_all is not None and _full_suite_commands is not None:
+        return _run_guarded_suite(
+            commands, cwd, scope=scope, base_ref=None, tooling=tooling
+        )
+    return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+
+
+def _run_commands_direct(
     commands: list[str], cwd: str, tooling: str, scope: str = "full"
 ) -> dict[str, Any]:
     """Run each command through the per-repo cache and combine the results.
@@ -2451,6 +2567,10 @@ def _run_commands(
     reported, and stdout/stderr are concatenated so a multi-command suite
     (e.g. pytest plus one command per node suite dir, or the declared
     ``suiteCommands``) yields one aggregated result.
+
+    This is the direct (non-delegating) path used only when the test skill's
+    guard-owning ``guarded_run_all`` is unavailable — a partial skill install
+    where only the inner conftest guard is armed.
 
     Args:
         commands: Shell command strings to run in order.
@@ -2650,6 +2770,16 @@ def run_tests(cwd: str, scope: str = "changed",
     a non-zero exit still blocks finish. Multiple resolved commands (e.g. a
     declared ``suiteCommands`` list, or pytest plus node suite dirs) all run
     and their results are combined.
+
+    Guard ownership (SA-0MUH1MJL6003767Q): when the test skill is available,
+    execution is delegated to the canonical ``run_tests.guarded_run_all``
+    (the single source of truth for the outer live-repo guard) instead of
+    arming a second guard here. That keeps the finish gate guarded by the
+    same snapshot guard as the test skill's CLI, even when
+    ``LIVE_REPO_GUARD_ACTIVE`` is already set in the environment (a nested
+    run): ``guarded_run_all`` then stands down because an outer guard already
+    owns the checkout. When the test skill is unavailable (a partial install),
+    the direct cached path runs and the inner conftest guard remains armed.
 
     Args:
         cwd: Working directory (worktree root).
