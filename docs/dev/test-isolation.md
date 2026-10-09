@@ -458,15 +458,52 @@ SA-0MUMR3QPM002VK7M), and
 (ambient hook-bypass variables scrubbed from the hook subprocess env; see
 §9.6, SA-0MUN83EXN004JBMW).
 
-### 9.3 Residual risk — the external launcher
+### 9.3 Residual risk — the external launcher (resolved at source)
 
-The variable that exported `GIT_DIR` originated **outside** the `skill/` tree
-(no setter exists in the repository) and could not be recovered from the
-overwritten evidence. The layers above neutralise the *effect* at every
-in-repo execution path, but a launcher can still export an override variable
-into the **pre-scrub** environment of a process that spawns `git` directly
-(bypassing `git_sandbox`). Tracking item:
-**SA-0MUIZSXEY008NGR8** (investigate the external launcher).
+The 2026-09-26 leak was **architectural**: an override variable was forwarded
+by a launcher **outside** the `skill/` tree. The investigation
+(**SA-0MUIZSXEY008NGR8**, evidence child **SA-0MV0G9BF7008S01K**) confirmed the
+propagation boundary in the herdr launcher (ContextHub):
+
+- `buildDowntimeSpawnOptions` in
+  `packages/herdr/src/downtime-worker.ts` built the spawned pane environment as
+  `{ ...process.env, HERDR_RESOLVED_CWD, AUDIT_PHASE2_PARALLELISM }`. Any
+  `GIT_DIR` / `GIT_WORK_TREE` / `GIT_CONFIG*` / `GIT_OBJECT_DIRECTORY` /
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES` already present in the herdr process was
+  forwarded to every pane and from there to `send-to-pi.sh` →
+  `run-pi-agent.sh` → `pi` → test subprocesses. Git honours `GIT_DIR` over
+  `cwd`, so a leaked value could redirect a `git` command into the live
+  checkout — the in-repo scrub was the only thing standing between the export
+  and the tests.
+- Git exports `GIT_EXEC_PATH` and an empty `GIT_PREFIX` to `post-checkout`
+  hook subprocesses (the incident's signature); a hook that forwards its
+  environment carries that context further down the process tree.
+
+A reproducible, non-destructive tracer,
+`docs/dev/trace_git_env_propagation.py`, demonstrates the forwarding
+(`spawn_forwards_overrides: true`), captures the hook signature, and dumps a
+controlled fresh session. Evidence child **SA-0MV0G9BVW008M8AT** shows the
+end-to-end state was clean at investigation time (live `/proc/<pid>/environ`
+and `--session-env` both report no override), i.e. the forwarding was a latent
+risk rather than an active leak — but it was still the mechanism by which any
+future upstream export would have reached a session.
+
+**Fix at the source** (cross-repo, per the incident's Q1 = A decision):
+ContextHub **`WL-0MV0TZEWZ003ZXEB`** (commit `daa7d2a9`) —
+
+- `buildDowntimeSpawnOptions` now forwards
+  `{ ...scrubRepositoryOverrides(process.env), ... }`, dropping every
+  repository-override variable before the spawn; and
+- `send-to-pi.sh` / `run-pi-agent.sh` `unset` the same variables as a
+  shell-side defence layer (so even a herdr path that bypasses the TS helper
+  cannot forward them).
+
+The §9.2 layers remain as defence-in-depth; with the export removed at the
+launcher, the in-repo scrub is no longer the only protection. The SorraAgents
+in-repo boundary is regression-tested by
+`tests/test_repository_override_isolation.py` and
+`skill/shared/tests/test_git_sandbox.py` (child **SA-0MV0G9CD1007A0IC**); the
+ContextHub boundary by `packages/herdr/src/downtime-worker.test.ts`.
 
 ### 9.4 Recovery playbook for a recurrence
 
