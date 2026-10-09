@@ -242,10 +242,10 @@ Phase 2 (model verifies code against each AC)
 
 ### Tiered Phase 1 model (SA-0MSKB697P000T3HG)
 
-Phase 1 parent + child AC screening runs on the resolved model by default; a distinct phase-1 model may be supplied programmatically (direct callers), in which case Phase 1 screens on it while Phase 2 deep analysis keeps the resolved model:
+Phase 1 parent + child AC screening runs on the resolved model by default; a distinct phase-1 model may be supplied programmatically (direct callers) via `cmd_issue(..., phase1_model=...)` / `_AuditContext.phase1_model`, in which case Phase 1 screens on it while Phase 2 deep analysis keeps the resolved model. There is no config-file or CLI flag for this (the config system was removed in SA-0MUQ0I0YY000JCB5):
 
 - **Default (safe):** with no distinct phase-1 model, Phase 1 uses the same resolved model as Phase 2 (`DEFAULT_MODEL`, `Local Proxy/plan`) — behaviour is byte-for-byte identical to a single-model audit.
-- **Wall-clock target:** Phase 1 per-call < **60s** on a healthy proxy when a fast model is configured (baseline: 1,348s avg / max 2,400s — see `docs/dev/audit-phase2-measured-report.md`). Per-call `Per-call timing:` stderr lines remain the observability surface.
+- **Wall-clock target:** Phase 1 per-call < **60s** on a healthy proxy when a fast model is configured (baseline: 1,348s avg / max 2,400s — see `docs/dev/audit-phase2-measured-report.md`). Per-call `Per-call timing:` stderr lines remain the observability surface; each line appends `model=<name>` so the serving model is visible per call.
 - **Safe runtime fallback (AC4):** when a distinct fast Phase 1 model cannot produce reliable batched verdict JSON (unparseable output, provider error, or concurrency-limit timeout), the SAME Phase 1 screen is retried once with the full model before falling back to `partial` diagnostics. With no distinct phase-1 model the retry is a no-op. An infra failure on the fast attempt that succeeds on the full-model retry keeps the conservative `ac_fallback_used` provenance (restore-not-demote).
 
 ### Model metadata line
