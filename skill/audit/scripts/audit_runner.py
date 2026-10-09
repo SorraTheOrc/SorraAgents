@@ -168,6 +168,39 @@ inherit the guard and cannot cascade further.
 """
 
 
+def _has_build_script(cwd: str) -> bool:
+    """Check whether the repo root package.json defines a ``build`` script.
+
+    A repo without a ``scripts.build`` entry (e.g. docs-only projects)
+    has nothing to build: ``npm run build`` would exit 1 with
+    ``Missing script: "build"`` and block the merge gate for every
+    implementation. Reads the root ``package.json`` directly so the
+    check works without npm.
+
+    Malformed JSON, a non-object ``scripts`` value, or a missing file
+    counts as "no build script" (fail-open — never block the merge gate
+    on a broken manifest).
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True if the root package.json exists and contains a non-empty
+        ``scripts.build`` entry.
+    """
+    package_json = Path(cwd) / "package.json"
+    if not package_json.exists():
+        return False
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return False
+    return bool(scripts.get("build"))
+
+
 def _suite_run_in_progress() -> bool:
     """Return True when an outer test-suite run owns the checkout.
 
@@ -8187,9 +8220,10 @@ def _integrate_into_dev(ctx: _AuditContext,
     2. Integrate the commits: if a feature branch exists and is not empty,
        replay it onto origin/dev (merge --no-ff of the branch). Otherwise
        cherry-pick each candidate commit (or the amalgamated diff).
-    3. Build the project (matching the implement skill's build step), run
-       the project test suite (via the test skill's runner), then push
-       ``HEAD:refs/heads/dev``.
+    3. Build the project (matching the implement skill's build step;
+       skipped when the repo has no ``scripts.build`` entry —
+       SA-0MT9607Q5009JA2V), run the project test suite (via the test
+       skill's runner), then push ``HEAD:refs/heads/dev``.
 
     Returns ``(ok, evidence)``. On any failure the audit does NOT proceed
     past Phase 1 (the caller emits "Ready to close: No").
@@ -8275,17 +8309,22 @@ def _integrate_into_dev(ctx: _AuditContext,
                 evidence.append("node_modules symlinked into integration worktree")
             except OSError as exc:
                 evidence.append(f"node_modules symlink failed: {exc} (best-effort)")
-        build_cmd = ["npm", "run", "build"]
-        try:
-            proc = ctx.runner(["bash", "-lc", "cd " + str(worktree_path) + " && " + " ".join(build_cmd)])
-        except Exception as exc:  # noqa: BLE001
-            evidence.append(f"build error: {exc}")
-            return False, "\n".join(evidence) + "\nIntegration failed: build error."
-        if proc.returncode != 0:
-            evidence.append(f"npm run build -> rc={proc.returncode}")
-            evidence.append(proc.stderr[-2000:])
-            return False, "\n".join(evidence) + "\nIntegration failed: build failed."
-        evidence.append("npm run build -> rc=0")
+        # Conditional build: skip if no package.json or no build script
+        # (docs-only repos, AC1/AC2).  Fail-open on malformed manifest.
+        if _has_build_script(str(worktree_path)):
+            build_cmd = ["npm", "run", "build"]
+            try:
+                proc = ctx.runner(["bash", "-lc", "cd " + str(worktree_path) + " && " + " ".join(build_cmd)])
+            except Exception as exc:  # noqa: BLE001
+                evidence.append(f"build error: {exc}")
+                return False, "\n".join(evidence) + "\nIntegration failed: build error."
+            if proc.returncode != 0:
+                evidence.append(f"npm run build -> rc={proc.returncode}")
+                evidence.append(proc.stderr[-2000:])
+                return False, "\n".join(evidence) + "\nIntegration failed: build failed."
+            evidence.append("npm run build -> rc=0")
+        else:
+            evidence.append("No build script (package.json missing or no scripts.build) — skipped")
 
         try:
             from test.scripts.run_tests import run_suite

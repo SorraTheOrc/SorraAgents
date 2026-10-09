@@ -1043,3 +1043,164 @@ class TestRealRepoHelpersAreHermetic:
             owning, ["rev-parse", "--show-toplevel"], check=True
         ).stdout.strip()
         assert Path(toplevel).resolve() == owning.resolve()
+
+
+# ---------------------------------------------------------------------------
+# _has_build_script — conditional build detection (AC1/AC2/AC4)
+# ---------------------------------------------------------------------------
+
+
+class TestHasBuildScript:
+    """Verify _has_build_script correctly detects build scripts in
+    package.json (AC1/AC4 — consistent with implement skill pattern)."""
+
+    def test_no_package_json_returns_false(self, tmp_path: Path) -> None:
+        assert audit_runner._has_build_script(str(tmp_path)) is False
+
+    def test_empty_package_json_returns_false(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        assert audit_runner._has_build_script(str(tmp_path)) is False
+
+    def test_package_json_with_no_scripts_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "package.json").write_text(
+            json.dumps({"name": "test"}), encoding="utf-8"
+        )
+        assert audit_runner._has_build_script(str(tmp_path)) is False
+
+    def test_package_json_with_scripts_but_no_build_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": {"lint": "eslint ."}}), encoding="utf-8"
+        )
+        assert audit_runner._has_build_script(str(tmp_path)) is False
+
+    def test_package_json_with_build_script_returns_true(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": {"build": "tsc"}}), encoding="utf-8"
+        )
+        assert audit_runner._has_build_script(str(tmp_path)) is True
+
+    def test_malformed_package_json_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "package.json").write_text("{not json", encoding="utf-8")
+        assert audit_runner._has_build_script(str(tmp_path)) is False
+
+    def test_scripts_not_a_dict_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": "not-a-dict"}), encoding="utf-8"
+        )
+        assert audit_runner._has_build_script(str(tmp_path)) is False
+
+    def test_empty_build_script_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": {"build": ""}}), encoding="utf-8"
+        )
+        assert audit_runner._has_build_script(str(tmp_path)) is False
+
+
+# ---------------------------------------------------------------------------
+# _integrate_into_dev — no-build-script case (AC1/AC2)
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrateNoBuildScript:
+    """Docs-only repos pass Phase 1: build step skipped, integration
+    succeeds (AC1); repos with a build script still run it (AC2)."""
+
+    @staticmethod
+    def _recording_runner(cwd: Path):
+        """Real-git runner that records every command it executes."""
+        calls: list[list[str]] = []
+        git_run = _git_runner(cwd)
+
+        def _run(cmd):
+            calls.append([str(c) for c in cmd])
+            return git_run(cmd)
+
+        return calls, _run
+
+    @staticmethod
+    def _add_package_json_to_dev(owning: Path, content: dict) -> None:
+        """Commit *content* as package.json on dev and push it."""
+        (owning / "package.json").write_text(
+            json.dumps(content), encoding="utf-8"
+        )
+        run_git(owning, ["add", "package.json"], check=True)
+        run_git(owning, ["commit", "-m", "add package.json"], check=True)
+        run_git(owning, ["push", "origin", "dev"], check=True)
+
+    def test_no_package_json_skips_build_and_integrates(self, tmp_path):
+        """No package.json at all → build skipped, integration succeeds
+        (AC1: docs-only repos pass Phase 1)."""
+        _wl, owning, _shas = _make_real_repo(tmp_path)
+        calls, runner = self._recording_runner(owning)
+        ctx = _make_ctx(owning_root=str(owning), runner=runner)
+        branch = "wl-WL-0MSI4TAT70058921-rename-tab"
+        with mock.patch(
+            "test.scripts.run_tests.run_suite",
+            return_value={"success": True, "returncode": 0},
+        ):
+            ok, evidence = audit_runner._integrate_into_dev(ctx, [], branch)
+        assert ok is True
+        assert "No build script" in evidence
+        assert not any("npm run build" in " ".join(c) for c in calls)
+
+    def test_package_json_without_build_script_skips_build(self, tmp_path):
+        """package.json present but no scripts.build → build skipped and
+        integration succeeds (AC1: Python-only / docs-only repos)."""
+        _wl, owning, _shas = _make_real_repo(tmp_path)
+        self._add_package_json_to_dev(owning, {"scripts": {"lint": "flake8 ."}})
+        calls, runner = self._recording_runner(owning)
+        ctx = _make_ctx(owning_root=str(owning), runner=runner)
+        branch = "wl-WL-0MSI4TAT70058921-rename-tab"
+        with mock.patch(
+            "test.scripts.run_tests.run_suite",
+            return_value={"success": True, "returncode": 0},
+        ):
+            ok, evidence = audit_runner._integrate_into_dev(ctx, [], branch)
+        assert ok is True
+        assert "No build script" in evidence
+        assert not any("npm run build" in " ".join(c) for c in calls)
+
+    def test_present_build_script_runs_and_passes(self, tmp_path):
+        """package.json WITH a build script → build runs (AC2, AC4).
+
+        The script is ``true`` so the build exits 0: this proves the build
+        step is *invoked* (not skipped) when a build script exists, while
+        keeping the integration green."""
+        _wl, owning, _shas = _make_real_repo(tmp_path)
+        self._add_package_json_to_dev(owning, {"scripts": {"build": "true"}})
+        calls, runner = self._recording_runner(owning)
+        ctx = _make_ctx(owning_root=str(owning), runner=runner)
+        branch = "wl-WL-0MSI4TAT70058921-rename-tab"
+        with mock.patch(
+            "test.scripts.run_tests.run_suite",
+            return_value={"success": True, "returncode": 0},
+        ):
+            ok, evidence = audit_runner._integrate_into_dev(ctx, [], branch)
+        assert ok is True
+        assert "npm run build -> rc=0" in evidence
+        assert any("npm run build" in " ".join(c) for c in calls)
+
+    def test_failing_build_script_blocks_integration(self, tmp_path):
+        """package.json WITH a failing build script → build fails and the
+        merge gate blocks (AC2: build repos still fail on error)."""
+        _wl, owning, _shas = _make_real_repo(tmp_path)
+        self._add_package_json_to_dev(owning, {"scripts": {"build": "false"}})
+        calls, runner = self._recording_runner(owning)
+        ctx = _make_ctx(owning_root=str(owning), runner=runner)
+        branch = "wl-WL-0MSI4TAT70058921-rename-tab"
+        ok, evidence = audit_runner._integrate_into_dev(ctx, [], branch)
+        assert ok is False
+        assert "Integration failed: build failed" in evidence
+        assert any("npm run build" in " ".join(c) for c in calls)
