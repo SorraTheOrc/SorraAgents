@@ -134,6 +134,97 @@ export function releaseScriptForwardArgs(cliArgs) {
   return (cliArgs || []).filter((arg) => !WRAPPER_ONLY_FLAGS.has(arg));
 }
 
+// ── parseReleaseArgs / WRAPPER_USAGE ─────────────────────────────────────────
+
+/**
+ * Wrapper usage text, printed for `--help`/`-h` and on an invalid argument.
+ *
+ * `run-release.js` invoked with an unsupported flag must fail fast instead of
+ * forwarding the flag to the canonical merge script (which printed its own
+ * usage and exited 0 without merging) — the 2026-10-09 incident where the
+ * wrapper's post-release tail then closed work items against a stale tag
+ * (SA-0MV0PZYMI004SUFR).
+ *
+ * @type {string}
+ */
+export const WRAPPER_USAGE = [
+  'Usage: node run-release.js [options]',
+  '',
+  'Options:',
+  '  -h, --help                  Show this help and exit',
+  '  --dry-run                   Run the merge script without post-release actions',
+  '  --force                     Skip the PR status-check wait',
+  '  --work-item-id <id>         Associate the release with a work item',
+  '  --bump <patch|minor|major>  Semver part to increment (default: patch)',
+  '  --skip-checks               Bypass the pre-merge gating checks',
+  '  --refresh-audits            Pre-flight only: refresh in_review audits, then exit',
+  '  --skip-audit-remediation    Skip in-gate audit remediation (audits still required)',
+].join('\n');
+
+// Boolean wrapper flags mapped to their parsed property name.
+const BOOLEAN_FLAGS = {
+  '--dry-run': 'dryRun',
+  '--force': 'force',
+  '--skip-checks': 'skipChecks',
+  '--refresh-audits': 'refreshAudits',
+  '--skip-audit-remediation': 'skipAuditRemediation',
+};
+
+// Value-taking wrapper flags mapped to their parsed property name.
+const VALUE_FLAGS = {
+  '--work-item-id': 'workItemId',
+  '--bump': 'bump',
+};
+
+/**
+ * Strictly parse the wrapper's CLI arguments.
+ *
+ * Returns one of:
+ *   - `{ action: 'help' }` — `--help`/`-h` was given.
+ *   - `{ action: 'error', message }` — an unknown flag or a missing value.
+ *   - `{ action: 'run', flags }` — the validated flag set.
+ *
+ * Unknown flags are NEVER accepted: they are rejected here so they can never
+ * be silently forwarded to the merge script (SA-0MV0PZYMI004SUFR).
+ *
+ * @param {string[]} [argv] - CLI arguments (defaults to an empty list).
+ * @returns {{action: 'help'} | {action: 'error', message: string} | {action: 'run', flags: object}}
+ */
+export function parseReleaseArgs(argv = []) {
+  const flags = {
+    dryRun: false,
+    force: false,
+    skipChecks: false,
+    refreshAudits: false,
+    skipAuditRemediation: false,
+    workItemId: null,
+    bump: null,
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      return { action: 'help' };
+    }
+    if (Object.prototype.hasOwnProperty.call(BOOLEAN_FLAGS, arg)) {
+      flags[BOOLEAN_FLAGS[arg]] = true;
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(VALUE_FLAGS, arg)) {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('-')) {
+        return { action: 'error', message: `Missing value for ${arg}` };
+      }
+      flags[VALUE_FLAGS[arg]] = value;
+      i += 1;
+      continue;
+    }
+    return { action: 'error', message: `Unknown argument: ${arg}` };
+  }
+
+  return { action: 'run', flags };
+}
+
 // ── parsePRUrl ───────────────────────────────────────────────────────────────
 
 /**
@@ -147,6 +238,30 @@ export function parsePRUrl(output) {
   if (!output) return null;
   const match = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/);
   return match ? match[0] : null;
+}
+
+// ── snapshotReleaseTags ──────────────────────────────────────────────────────
+
+/**
+ * Snapshot the git tags that exist before the merge script runs.
+ *
+ * Used by the newly-created-tag gate: after the merge, the released version is
+ * only trusted when its tag was absent from this snapshot. Returns `null` when
+ * the tag list cannot be read so the caller can fail closed
+ * (SA-0MV0PZYMI004SUFR).
+ *
+ * @returns {Set<string>|null} Tag names (e.g. `v0.2.0`), or null on error.
+ */
+export function snapshotReleaseTags() {
+  try {
+    const output = execSync('git tag --list', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    return new Set(output ? output.split('\n').map((t) => t.trim()).filter(Boolean) : []);
+  } catch {
+    return null;
+  }
 }
 
 // ── verifyReleaseMerge ───────────────────────────────────────────────────────
@@ -1201,10 +1316,24 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * @returns {number} Exit code (0 = success).
  */
 export async function runRelease(cliArgs = []) {
+  // Fail-fast argument handling (SA-0MV0PZYMI004SUFR): `--help`/`-h` print the
+  // wrapper usage and exit 0, and an unrecognised flag exits non-zero with
+  // usage. This runs BEFORE the Code Freeze marker, project-root resolution
+  // and every gate so a mistaken/exploratory invocation is completely inert.
+  const parsed = parseReleaseArgs(cliArgs);
+  if (parsed.action === 'help') {
+    process.stdout.write(`${WRAPPER_USAGE}\n`);
+    return 0;
+  }
+  if (parsed.action === 'error') {
+    process.stderr.write(`${parsed.message}\n\n${WRAPPER_USAGE}\n`);
+    return 13;
+  }
+
   // Pre-flight-only audit refresh (SA-0MUOO5VMH005VF69): refresh the audits for
   // in_review items and exit WITHOUT merging and WITHOUT setting the Code
   // Freeze marker, so a large backlog never freezes the project.
-  if (cliArgs.includes('--refresh-audits')) {
+  if (parsed.flags.refreshAudits) {
     return runRefreshAuditsAction(cliArgs);
   }
 
@@ -1394,6 +1523,11 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   startStep('Step 5: execute release script');
   console.log('Executing release script...\n');
 
+  // Snapshot the tags that exist BEFORE the merge runs so Step 8 can prove
+  // *this* run created the release tag (SA-0MV0PZYMI004SUFR). A null snapshot
+  // means the state could not be read; post-release steps then fail closed.
+  const preRunTags = snapshotReleaseTags();
+
   // Wrapper-only flags (e.g. --skip-checks) must not reach the merge script,
   // which rejects unknown arguments (SA-0MSKYGAWJ0009M3P).
   const forwardedArgs = releaseScriptForwardArgs(args);
@@ -1492,6 +1626,22 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   }
 
   if (version) {
+    // Newly-created-tag gate (SA-0MV0PZYMI004SUFR): the version read from
+    // `git describe` is only trustworthy when its tag did not already exist
+    // before this run. An already-present tag means the merge script exited 0
+    // without producing a release (the 2026-10-09 spurious-close incident), so
+    // refuse every post-release step instead of closing against a stale tag.
+    if (preRunTags === null) {
+      console.error('\n⚠️  Could not read the pre-run git tag snapshot — cannot prove a new release tag was created.');
+      console.error('Refusing to close work items (exit code 14).');
+      return finish(14);
+    }
+    if (preRunTags.has(`v${version}`)) {
+      console.error(`\n⚠️  Release tag v${version} already existed before this run — no new release tag was created.`);
+      console.error('Refusing to close work items (exit code 14).');
+      return finish(14);
+    }
+
     const mergeVerification = verifyReleaseMerge(version);
     if (!mergeVerification.success) {
       console.error(`\n⚠️  ${mergeVerification.message}`);
