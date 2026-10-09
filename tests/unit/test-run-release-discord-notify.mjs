@@ -47,15 +47,19 @@ const PR_URL = 'https://github.com/example/repo/pull/42';
 // the arguments it receives (as JSON lines) to $DISCORD_NOTIFY_LOG, or throws
 // when $DISCORD_MODE=throw so callers can verify the non-blocking contract.
 
-const MOCK_DISCORD_NOTIFY = `export async function sendReleaseNotification({ version, prUrl, projectRoot } = {}) {
+const MOCK_DISCORD_NOTIFY = `export async function sendReleaseNotification({ version, prUrl, projectRoot } = {}, options = {}) {
   const logPath = process.env.DISCORD_NOTIFY_LOG;
   if (logPath) {
     const { appendFileSync } = await import('node:fs');
+    const preRunTags = options && options.preRunTags instanceof Set
+      ? Array.from(options.preRunTags)
+      : (options && options.preRunTags ? Array.from(options.preRunTags) : null);
     appendFileSync(logPath, JSON.stringify({
       version,
       prUrl,
       projectRoot,
       projectRootDefined: typeof projectRoot !== 'undefined' && projectRoot !== null && projectRoot !== '',
+      preRunTags,
     }) + '\\n');
   }
   if (process.env.DISCORD_MODE === 'throw') {
@@ -75,9 +79,14 @@ const MOCK_DISCORD_NOTIFY = `export async function sendReleaseNotification({ ver
  *
  * @param {object} [opts]
  * @param {'record'|'throw'} [opts.discordMode] - mock notifier behaviour.
+ * @param {string} [opts.gitTags] - Newline-separated `git tag --list` output
+ *   (the pre-run snapshot). Defaults to empty (no pre-existing tags).
+ * @param {string} [opts.gitDescribe] - `git describe --tags --abbrev=0` output.
+ *   Defaults to `v9.9.9`.
  * @returns {object} { res, notifyLog, tmpDir }
  */
-function runReleaseWithDiscordMock(discordMode = 'record') {
+function runReleaseWithDiscordMock(discordMode = 'record', opts = {}) {
+  const { gitTags = '', gitDescribe = 'v9.9.9' } = opts;
   const tmpDir = mkdtempSync(join(tmpdir(), 'run-release-discord-test-'));
   const skillScriptDir = join(tmpDir, 'skill', 'ship', 'scripts');
   mkdirSync(skillScriptDir, { recursive: true });
@@ -121,7 +130,8 @@ case "$1" in
   checkout) exit 0 ;;
   merge) exit 0 ;;
   push) exit 0 ;;
-  describe) echo "v9.9.9" ;;
+  describe) echo "$GIT_DESCRIBE" ;;
+  tag) echo "$GIT_TAGS" ;;
   ls-remote) echo "abcd1234abcd1234abcd1234abcd1234abcd1234\trefs/tags/v9.9.9" ;;
   merge-base) exit 0 ;;
 esac
@@ -165,6 +175,8 @@ esac
       DISCORD_MODE: discordMode,
       DISCORD_NOTIFY_LOG: notifyLog,
       WL_CLOSE_LOG: closeLog,
+      GIT_DESCRIBE: gitDescribe,
+      GIT_TAGS: gitTags,
     },
   });
 
@@ -178,6 +190,15 @@ function readNotifyCalls(notifyLog) {
     return raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   } catch {
     return [];
+  }
+}
+
+/** Read a side-effect log, returning '' when the file was never created. */
+function readLog(path) {
+  try {
+    return readFileSync(path, 'utf-8').trim();
+  } catch {
+    return '';
   }
 }
 
@@ -217,5 +238,48 @@ describe('run-release Step 8.5 Discord notification wiring', () => {
     // work items) still ran and the release completed.
     const closeLines = readFileSync(closeLog, 'utf-8').trim().split('\n').filter(Boolean);
     assert.equal(closeLines.length, 1, `expected Step 9 to run after the notifier failure, got: ${closeLines}`);
+  });
+
+  // ── SA-0MV0QEI3Q0063KH3: provenance gating ────────────────────────────────
+  test('AC5: forwards the pre-run tag snapshot to sendReleaseNotification', () => {
+    const { res, notifyLog } = runReleaseWithDiscordMock('record', {
+      gitTags: 'v9.9.8',
+      gitDescribe: 'v9.9.9',
+    });
+    assert.equal(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+
+    const calls = readNotifyCalls(notifyLog);
+    assert.equal(calls.length, 1, 'a genuinely new tag must still trigger one notification call');
+    assert.deepEqual(
+      calls[0].preRunTags,
+      ['v9.9.8'],
+      'the notifier must receive the pre-run tag snapshot for its provenance guard',
+    );
+  });
+
+  test('AC4: a merge-script exit 0 without a new tag performs no Discord POST', () => {
+    // The resolved tag (v9.9.9) already existed before the run — the same
+    // shape as the 2026-10-09 incident. The wrapper must refuse every
+    // post-release step, and no Discord notification may be attempted.
+    const { res, notifyLog, closeLog } = runReleaseWithDiscordMock('record', {
+      gitTags: 'v9.9.9\nv9.9.8',
+      gitDescribe: 'v9.9.9',
+    });
+    const out = `${res.stdout}\n${res.stderr}`;
+
+    assert.notEqual(res.status, 0, `a stale tag must exit non-zero, got ${res.status}\n${out}`);
+    assert.match(
+      out,
+      /already existed|newly created|no new release/i,
+      `expected a newly-created-tag diagnostic, got:\n${out}`,
+    );
+
+    const calls = readNotifyCalls(notifyLog);
+    assert.equal(calls.length, 0, 'no Discord POST may be performed when no new tag was created');
+    assert.equal(
+      readLog(closeLog),
+      '',
+      'no work items may be closed against a stale tag',
+    );
   });
 });

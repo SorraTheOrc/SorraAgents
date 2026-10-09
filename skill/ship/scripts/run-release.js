@@ -1671,9 +1671,13 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     // (SA-0MSQ6K7Z1002H14Z). Runs only after the release merge is verified
     // (never on --dry-run or failed releases). Notification failures are
     // logged as warnings and never change the release exit code.
+    //
+    // The pre-run tag snapshot is forwarded so the notifier can independently
+    // refuse to announce a stale tag (SA-0MV0QEI3Q0063KH3 AC5 defence in
+    // depth) — a second layer beneath the Step 8 newly-created-tag gate.
     startStep('Step 8.5: discord notification');
     try {
-      await sendReleaseNotification({ version, prUrl, projectRoot });
+      await sendReleaseNotification({ version, prUrl, projectRoot }, { preRunTags });
     } catch (err) {
       console.warn(`\n⚠ Discord notification step failed: ${err.message} (non-blocking).`);
     }

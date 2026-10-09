@@ -565,6 +565,46 @@ function toISODate(d) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+// ── Release provenance guard (SA-0MV0QEI3Q0063KH3 AC5) ──────────────────────
+
+/**
+ * Decide whether a release's version tag was newly created by the current run.
+ *
+ * Defence in depth for the 2026-10-09 incident (SA-0MV0QEI3Q0063KH3): the
+ * notifier must never announce a release whose version tag already existed
+ * before the run. The caller supplies the pre-run tag snapshot captured before
+ * the merge script ran (`preRunTags`) and/or an explicit `tagCreatedByThisRun`
+ * flag. The guard is conservative — any signal that the tag is stale wins:
+ *
+ *   - `tagCreatedByThisRun === false` → not this run's tag.
+ *   - `preRunTags === null` → the snapshot could not be read; fail closed.
+ *   - `preRunTags` (Set/array) contains `v<version>` → the tag pre-existed.
+ *   - otherwise → proven new by this run.
+ *
+ * When neither option is supplied the guard is not applicable (legacy callers
+ * and unit tests that predate the provenance check) and returns true; the
+ * production caller (`run-release.js`) always supplies `preRunTags`.
+ *
+ * @param {string} version - Released semver version (e.g. "1.2.3").
+ * @param {object} [provenance]
+ * @param {Set<string>|string[]|null} [provenance.preRunTags] - Tags present
+ *   before the run; `null` means the snapshot could not be read.
+ * @param {boolean} [provenance.tagCreatedByThisRun] - Explicit provenance flag.
+ * @returns {boolean} True only when the tag is proven new by this run.
+ */
+export function isVersionTagNew(version, { preRunTags, tagCreatedByThisRun } = {}) {
+  if (!version) return false;
+  if (tagCreatedByThisRun === false) return false;
+  if (preRunTags === null) return false;
+  if (preRunTags !== undefined) {
+    const tags = preRunTags instanceof Set
+      ? preRunTags
+      : new Set(typeof preRunTags === 'string' ? [preRunTags] : preRunTags);
+    if (tags.has(`v${version}`)) return false;
+  }
+  return true;
+}
+
 /**
  * Send the post-release Discord notification (non-blocking).
  *
@@ -574,6 +614,11 @@ function toISODate(d) {
  * and returns `{ success: true, notified: false }` so the release exit code
  * is never changed (AC3). When no webhook is configured the step is skipped
  * with an info log and the release completes normally (AC2).
+ *
+ * Provenance guard (SA-0MV0QEI3Q0063KH3 AC5): before the webhook is resolved
+ * or a payload is built the notifier independently refuses to send when the
+ * resolved version's tag was not created by the current run (see
+ * {@link isVersionTagNew}).
  *
  * @param {object} release
  * @param {string} release.version - Released semver version (e.g. "1.2.3").
@@ -591,6 +636,10 @@ function toISODate(d) {
  * @param {string} [options.changelogContent] - Pre-read changelog content.
  * @param {() => Date} [options.now] - Date provider for the date fallback.
  * @param {number} [options.timeoutMs=10000] - Webhook POST timeout.
+ * @param {Set<string>|string[]|null} [options.preRunTags] - Git tags that
+ *   existed before the run (provenance guard, AC5). `null` fails closed.
+ * @param {boolean} [options.tagCreatedByThisRun] - Explicit provenance flag
+ *   (provenance guard, AC5).
  * @returns {Promise<{success: boolean, notified: boolean, skipped?: boolean, reason?: string, error?: string}>}
  */
 export async function sendReleaseNotification({ version, prUrl, projectRoot }, options = {}) {
@@ -606,7 +655,25 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
     changelogContent,
     now = () => new Date(),
     timeoutMs = 10000,
+    preRunTags,
+    tagCreatedByThisRun,
   } = options;
+
+  // Provenance guard (AC5): independently refuse to announce a release whose
+  // version tag was not created by this run. This runs BEFORE the webhook is
+  // resolved and before any payload is built, so no POST is ever attempted.
+  if (!isVersionTagNew(version, { preRunTags, tagCreatedByThisRun })) {
+    console.log(
+      `Discord release notification skipped: version tag v${version} was not ` +
+      'created by this run.',
+    );
+    return {
+      success: true,
+      notified: false,
+      skipped: true,
+      reason: 'version tag not created by this run',
+    };
+  }
 
   const webhookUrl = resolveDiscordWebhookUrl(projectRoot, { privateConfigPath, projectConfigPath, globalConfigPath });
   if (!webhookUrl) {

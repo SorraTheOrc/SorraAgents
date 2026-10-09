@@ -260,12 +260,15 @@ All command boundaries (`getItemsFn`, `getItemByIdFn`, `runAuditShow`,
 After `verifyReleaseMerge()` succeeds, `sendReleaseNotification()` is called:
 
 ```javascript
-await sendReleaseNotification({ version, prUrl, projectRoot });
+await sendReleaseNotification({ version, prUrl, projectRoot }, { preRunTags });
 ```
+
+`preRunTags` is the pre-run `git tag --list` snapshot captured by the wrapper before the merge script ran. The notifier uses it as an independent provenance guard: when the resolved version's tag already existed before the run (or the snapshot is `null`), it refuses to send before resolving the webhook or building a payload (SA-0MV0QEI3Q0063KH3 AC5, defence in depth beneath the Step 8 newly-created-tag gate).
 
 **Behaviour:**
 
 - Only runs on successful, non-dry-run releases (after merge verification).
+- **Provenance guard (AC5):** refuses to send (no webhook resolution, no payload, no POST) unless the version tag was newly created by this run.
 - Resolves the webhook URL per AC2 precedence.
 - Resolves the project pitch: `projectDescription` wins; otherwise README/LLM; otherwise omitted.
 - Resolves the project call-to-action (`cta`): project config value wins; otherwise omitted when unset/malformed.
@@ -299,12 +302,16 @@ Post-release Discord notification (non-blocking).
 | `options.globalConfigPath` | `string` | No | Override global config path |
 | `options.changelogPath` | `string` | No | Override `CHANGELOG.md` path |
 | `options.changelogContent` | `string` | No | Pre-read changelog content |
+| `options.preRunTags` | `Set<string>\|string[]\|null` | No | Pre-run `git tag --list` snapshot; presence of `v<version>` (or `null`) refuses the send (AC5). `undefined` = legacy caller, guard not applicable |
+| `options.tagCreatedByThisRun` | `boolean` | No | Explicit provenance flag; `false` refuses the send (AC5) |
 | `options.readmePath` | `string` | No | Override `README.md` path (pitch fallback) |
 | `options.readmeContent` | `string` | No | Pre-read README content |
 | `options.now` | `Function` | No | Date provider for fallback date |
 | `options.timeoutMs` | `number` | No | Webhook POST timeout (default: 10 000) |
 
 **Returns:** `Promise<{ success: boolean, notified: boolean, skipped?: boolean, reason?: string, error?: string }>`
+
+When the provenance guard refuses, the result is `{ success: true, notified: false, skipped: true, reason: 'version tag not created by this run' }`.
 
 ### `resolveDiscordWebhookUrl(projectRoot, options)`
 

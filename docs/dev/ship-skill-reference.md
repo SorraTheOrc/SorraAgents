@@ -237,6 +237,8 @@ After a successful, verified release (`verifyReleaseMerge` passed, Step 9), `run
 
 **Hook point:** in `run-release.js`, inside the `if (version)` block after `verifyReleaseMerge(version)` succeeds, wrapped in its own `try/catch` — a defect in the notification module can never fail the release.
 
+**Provenance guard (AC5, SA-0MV0QEI3Q0063KH3):** the wrapper forwards the pre-run `git tag --list` snapshot (`preRunTags`) captured before the merge script ran. Before resolving the webhook or building a payload, `sendReleaseNotification` independently refuses to send when the resolved version's tag already existed before the run (or the snapshot could not be read) — returning `{ success: true, notified: false, skipped: true, reason: 'version tag not created by this run' }`. This is defence in depth beneath the wrapper's newly-created-tag gate (Step 8), so the project channel is never told a release shipped when none did (the 2026-10-09 incident).
+
 **Config schema** (key: `discord.webhook_url`):
 
 | Priority | File | Notes |

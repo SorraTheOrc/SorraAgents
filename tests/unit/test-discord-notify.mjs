@@ -1084,3 +1084,147 @@ describe('docs: cta documented (SA-0MUWCIFU2006K39K AC7)', () => {
     assert.ok(/call-to-action/i.test(content), 'SKILL.md should describe the cta');
   });
 });
+
+// ---------------------------------------------------------------------------
+// SA-0MV0QEI3Q0063KH3 AC5 — release provenance guard (defence in depth)
+// ---------------------------------------------------------------------------
+
+/**
+ * The 2026-10-09 incident: `run-release.js` treated a merge-script exit 0 as a
+ * completed release, resolved the newest *reachable* tag (`v0.1.18`, already
+ * shipped on 2026-10-06) via `git describe`, verified it (it genuinely exists
+ * on `origin/main`) and announced it. AC5 requires the notifier itself to
+ * independently refuse to send unless the version tag was newly created by
+ * this run — a second guard beneath the wrapper's newly-created-tag gate.
+ */
+describe('discord-notify: release provenance guard (SA-0MV0QEI3Q0063KH3 AC5)', () => {
+  test('exports the isVersionTagNew helper', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    assert.equal(typeof mod.isVersionTagNew, 'function');
+  });
+
+  test('isVersionTagNew: a pre-existing tag is never "new"', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    assert.equal(mod.isVersionTagNew('0.1.18', { preRunTags: new Set(['v0.1.18', 'v0.1.17']) }), false);
+    assert.equal(mod.isVersionTagNew('0.1.18', { preRunTags: ['v0.1.18'] }), false);
+    assert.equal(mod.isVersionTagNew('0.2.0', { preRunTags: new Set(['v0.1.18', 'v0.1.17']) }), true);
+    assert.equal(mod.isVersionTagNew('0.2.0', { preRunTags: ['v0.1.18'] }), true);
+  });
+
+  test('isVersionTagNew: explicit flag and fail-closed snapshot semantics', async () => {
+    const mod = await import(DISCORD_NOTIFY_PATH);
+    assert.equal(mod.isVersionTagNew('0.2.0', { tagCreatedByThisRun: false }), false);
+    assert.equal(mod.isVersionTagNew('0.2.0', { tagCreatedByThisRun: true }), true);
+    // `null` snapshot means provenance could not be read — fail closed.
+    assert.equal(mod.isVersionTagNew('0.2.0', { preRunTags: null }), false);
+    // No provenance information supplied → guard not applicable (legacy callers).
+    assert.equal(mod.isVersionTagNew('0.2.0'), true);
+    // A stale snapshot wins over an optimistic explicit flag (conservative).
+    assert.equal(
+      mod.isVersionTagNew('0.1.18', { preRunTags: new Set(['v0.1.18']), tagCreatedByThisRun: true }),
+      false,
+    );
+    // A missing/falsey version is never new.
+    assert.equal(mod.isVersionTagNew(null, { preRunTags: new Set() }), false);
+  });
+
+  test('refuses to send (no fetch) when the version tag pre-existed the run', async () => {
+    const dir = makeTempProject();
+    writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
+    writeFileSync(join(dir, 'CHANGELOG.md'), SAMPLE_CHANGELOG);
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    let fetchCalls = 0;
+    const result = await mod.sendReleaseNotification(
+      { version: '0.1.18', prUrl: 'https://github.com/o/r/pull/1', projectRoot: dir },
+      {
+        preRunTags: new Set(['v0.1.18', 'v0.1.17']),
+        fetchFn: async () => { fetchCalls += 1; return { ok: true }; },
+      },
+    );
+
+    assert.equal(result.success, true, 'a refused notification is not a failure');
+    assert.equal(result.notified, false);
+    assert.equal(result.skipped, true);
+    assert.equal(result.reason, 'version tag not created by this run');
+    assert.equal(fetchCalls, 0, 'no Discord POST may be attempted for a stale tag');
+  });
+
+  test('refuses before resolving the webhook (reason is provenance, not "no webhook configured")', async () => {
+    // No webhook is configured anywhere, so the only way to observe the guard
+    // ordering is the returned reason: the provenance guard must fire first.
+    const dir = makeTempProject();
+    writeFileSync(join(dir, '.worklog', 'config.yaml'), 'projectName: Test\nprefix: TP\n');
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    const result = await mod.sendReleaseNotification(
+      { version: '0.1.18', projectRoot: dir },
+      {
+        preRunTags: new Set(['v0.1.18']),
+        globalConfigPath: join(dir, 'no-global.yaml'),
+        fetchFn: async () => { throw new Error('fetch must not be called'); },
+      },
+    );
+
+    assert.equal(result.notified, false);
+    assert.equal(result.reason, 'version tag not created by this run');
+    assert.notEqual(result.reason, 'no webhook configured');
+  });
+
+  test('refuses when tagCreatedByThisRun is false', async () => {
+    const dir = makeTempProject();
+    writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    let fetchCalls = 0;
+    const result = await mod.sendReleaseNotification(
+      { version: '0.2.0', projectRoot: dir },
+      {
+        tagCreatedByThisRun: false,
+        fetchFn: async () => { fetchCalls += 1; return { ok: true }; },
+      },
+    );
+
+    assert.equal(result.notified, false);
+    assert.equal(result.reason, 'version tag not created by this run');
+    assert.equal(fetchCalls, 0);
+  });
+
+  test('fails closed when the pre-run snapshot could not be read (null)', async () => {
+    const dir = makeTempProject();
+    writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    let fetchCalls = 0;
+    const result = await mod.sendReleaseNotification(
+      { version: '0.2.0', projectRoot: dir },
+      {
+        preRunTags: null,
+        fetchFn: async () => { fetchCalls += 1; return { ok: true }; },
+      },
+    );
+
+    assert.equal(result.notified, false);
+    assert.equal(result.reason, 'version tag not created by this run');
+    assert.equal(fetchCalls, 0);
+  });
+
+  test('sends normally when the version tag is absent from the pre-run snapshot', async () => {
+    const dir = makeTempProject();
+    writeWebhookConfig(join(dir, '.worklog', 'config.yaml'), WEBHOOK_PROJECT);
+    writeFileSync(join(dir, 'CHANGELOG.md'), SAMPLE_CHANGELOG);
+    const mod = await import(DISCORD_NOTIFY_PATH);
+
+    let fetchCalls = 0;
+    const result = await mod.sendReleaseNotification(
+      { version: '1.2.3', prUrl: 'https://github.com/o/r/pull/1', projectRoot: dir },
+      {
+        preRunTags: new Set(['v1.2.2', 'v1.2.1']),
+        fetchFn: async () => { fetchCalls += 1; return { ok: true }; },
+      },
+    );
+
+    assert.equal(result.notified, true);
+    assert.equal(fetchCalls, 1, 'a genuinely new tag must still be announced');
+  });
+});
