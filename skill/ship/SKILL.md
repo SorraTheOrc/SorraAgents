@@ -51,9 +51,30 @@ All scripts are internal implementation details — the only user-facing action 
 # Execute a release (dev → main merge)
 node $(skill_path ship)/scripts/run-release.js
 
+# Print wrapper usage and exit (no gates, no merge, no side effects)
+node $(skill_path ship)/scripts/run-release.js --help
+
 # Pre-flight only: refresh in_review audits, then exit (no merge, no Code Freeze)
 node $(skill_path ship)/scripts/run-release.js --refresh-audits
 ```
+
+### Fail-fast argument handling
+
+The wrapper strictly validates its own arguments **before** the Code Freeze
+marker, project-root resolution and every gate (SA-0MV0PZYMI004SUFR):
+
+- `--help` / `-h` print the wrapper usage and exit **0** without invoking any
+  gate, merge script, `wl`, git mutation, Discord notification, or close
+  command.
+- An unrecognised flag (or a value-taking flag with a missing value) exits
+  **13** with usage text and runs nothing. Unknown flags are **never**
+  forwarded to the canonical merge script.
+
+This closes the 2026-10-09 incident where `--help` was forwarded to
+`merge-dev-to-main.sh` (which printed its usage and exited 0 without merging)
+and the wrapper's post-release tail then closed 98 work items against the
+already-shipped `v0.1.18` tag. See the [newly-created-tag gate](#newly-created-tag-gate-exit-14)
+below for the second layer of protection.
 
 ### Pre-flight audit refresh (`--refresh-audits`)
 
@@ -132,8 +153,22 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 | 10 | Release script timed out (`SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
 | 11 | Release merge verification failed (no verified dev→main merge) |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
+| 13 | Invalid argument — an unrecognised flag or a missing value; wrapper usage printed and nothing executed (no gate, merge, `wl`, git mutation or notification) |
+| 14 | No newly-created release tag — the released version tag already existed before this run (or the pre-run tag snapshot could not be read); all post-release steps refused |
 
 **Missing-script fail-fast (SA-0MUIVIJFT0009ZNV):** `run-release.js` resolves the canonical release script **before** the gating checks. When no script exists it exits 2 immediately and runs no git or live-`wl` gate commands — keeping the missing-script safety path cheap, deterministic, and free of worklog side effects.
+
+### Newly-created-tag gate (exit 14)
+
+Before the merge script runs, the wrapper snapshots the existing git tags
+(`snapshotReleaseTags()`). After the merge, the released version (read from
+`git describe --tags --abbrev=0`) is trusted **only** when its tag was absent
+from that snapshot; otherwise the wrapper exits **14** and runs no post-release
+step (no Discord notification, no `closeWorkItemsAfterRelease`, no branch
+cleanup). An unreadable snapshot also fails closed with exit 14. This is
+strictly additional to `verifyReleaseMerge` (exit 11): both the newly-created
+tag and the origin/ancestor checks must hold before any item is closed
+(SA-0MV0PZYMI004SUFR).
 
 ## Release Process
 
@@ -151,7 +186,7 @@ node $(skill_path ship)/scripts/run-release.js
 7. **Status check wait & merge** — if the PR has status checks, wait for them (default 10 min), then `gh pr merge --merge --delete-branch`; no checks → merge immediately; `--force` skips the wait.
 8. **Audit logging** — record merge hash, PR URL in worklog.
 9. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push. Release ops run from **main checkout**, not worktrees.
-10. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): close only after the release landed on main — tag `v<version>` exists on origin AND is an ancestor of `origin/main`; else exit 11, no items closed.
+10. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): close only after the release landed on main — tag `v<version>` exists on origin AND is an ancestor of `origin/main`; else exit 11, no items closed. **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** the version tag must additionally be absent from the pre-run `git tag --list` snapshot — a tag that already existed (e.g. `v0.1.18` read by `git describe`) means this run produced no release, so all post-release steps are refused with exit 14.
 11. **Discord notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` posts version, tag (`vX.Y.Z`), release date, PR URL, the configured call-to-action (`cta`), and the new version's changelog section from `CHANGELOG.md` to a configured Discord channel via webhook. Runs only after merge verification (never on `--dry-run` or failed releases). Failure (network, HTTP error, timeout) logs a warning and never changes the release exit code. See [Discord release notification](#discord-release-notification).
 12. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items with `needsProducerReview === false`. A child flagged `needsProducerReview=true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared via `wl update <child> --needs-producer-review false`, an explanatory comment naming the authorising parent is added, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3); items with `null`/`undefined` flags, or `true`-but-uncovered, are skipped + logged. A candidate whose `--force` close would sweep descendants **outside** the candidate set is refused and reported (SA-0MU2OY1N9000XL2H AC9/AC10); a descendant held back solely by `needsProducerReview=true` is reported with a distinct `descendant(s) need producer review` reason rather than the generic collateral list (SA-0MUJKPDAA002VVDP AC2). **Fallback cascade (SA-0MUR7Y3BJ004FGPP recurrence):** a candidate whose audit is passing (`readyToClose === true`) but whose subtree still holds non-terminal descendants — the case produced when the audit was recorded outside the runner via `wl audit-set` — is **cascade-closed**: each non-terminal descendant is set to `completed`/`done` with a comment naming the authorising parent + audit timestamp, then the parent is closed. Authorised by the passing audit verdict only; a candidate without a passing audit is still refused, and a per-child cascade failure leaves that child as collateral so a partial subtree is not force-closed. Under `--dry-run` no override, cascade, or close mutation is performed; the planned actions are reported.
 

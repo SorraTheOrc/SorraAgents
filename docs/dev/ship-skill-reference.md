@@ -68,8 +68,14 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 10 | Release script timed out (killed after `SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
 | 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
+| 13 | Invalid argument — an unrecognised flag or a missing value; wrapper usage printed and nothing executed |
+| 14 | No newly-created release tag — the released tag already existed before this run (or the pre-run tag snapshot could not be read); all post-release steps refused |
 
 **Missing-script fail-fast (SA-0MUIVIJFT0009ZNV):** `run-release.js` resolves the canonical release script **before** the gating checks. When no script exists it exits 2 immediately and runs no git or live-`wl` gate commands — keeping the missing-script safety path cheap, deterministic, and free of worklog side effects.
+
+**Argument fail-fast (SA-0MV0PZYMI004SUFR):** `parseReleaseArgs(argv)` validates the wrapper's CLI arguments before the Code Freeze marker, project-root resolution and every gate. `--help`/`-h` print `WRAPPER_USAGE` and exit 0; an unknown flag or a missing value exits 13 with usage. Documented wrapper flags (`--dry-run`, `--force`, `--work-item-id`, `--bump`, `--skip-checks`, `--refresh-audits`, `--skip-audit-remediation`) keep working, and an unknown flag can never be forwarded to `merge-dev-to-main.sh`.
+
+**Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** `snapshotReleaseTags()` records `git tag --list` immediately before the merge script runs. At the verification step the released version is accepted only when `v<version>` was absent from that snapshot (`isNewlyCreatedTag(version, preRunTags)`); otherwise the wrapper exits 14 without running any post-release step. A `null` snapshot (unreadable git tags) fails closed. This is strictly additive to `verifyReleaseMerge` — both gates must pass before work items are closed.
 
 ## Audit & Producer-Review Gates
 
@@ -184,6 +190,7 @@ node ./skill/ship/scripts/run-release.js
 Steps:
 
 0. **Locate the release script (fail-fast, SA-0MUIVIJFT0009ZNV)** — resolves the canonical release script (skill-level or repository-level) **before** the gating checks and exits 2 immediately if absent; no git or live-`wl` gate commands run.
+0.5. **Parse wrapper arguments (fail-fast, SA-0MV0PZYMI004SUFR)** — `parseReleaseArgs()` runs before the Code Freeze marker and every gate. `--help`/`-h` print usage and exit 0; an unknown flag exits 13. Nothing is executed for either path.
 1. **Unmerged branches check** — aborts with report if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verifies `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — aborts with exit 7 if non-terminal critical items exist.
@@ -198,6 +205,7 @@ Steps:
    - the released version tag `v<version>` exists on origin (`git ls-remote`), and
    - the tag commit is an ancestor of `origin/main` (`git merge-base --is-ancestor`).
    If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
+   **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** before this step, `snapshotReleaseTags()` captures the pre-run tag list; `isNewlyCreatedTag(version, preRunTags)` requires `v<version>` to be absent from it. A stale tag (or an unreadable snapshot) aborts with **exit code 14** and runs no post-release step, so an old reachable tag read by `git describe` can never trigger a close.
 10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
 11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures.
 
