@@ -264,6 +264,24 @@ export function snapshotReleaseTags() {
   }
 }
 
+/**
+ * Whether the released version's tag was newly created by this run.
+ *
+ * Pure decision helper for the post-release gate (SA-0MV0PZYMI004SUFR): the
+ * version read from `git describe` is only trustworthy when its tag was
+ * absent from the pre-run snapshot. A missing version or an unreadable
+ * snapshot (`null`) fails closed by returning `false`.
+ *
+ * @param {string|null} version - Released semver (e.g. "0.2.0").
+ * @param {Set<string>|null} preRunTags - Tags present before the merge.
+ * @returns {boolean} True only when `v<version>` is absent from the snapshot.
+ */
+export function isNewlyCreatedTag(version, preRunTags) {
+  if (!version) return false;
+  if (!(preRunTags instanceof Set)) return false;
+  return !preRunTags.has(`v${version}`);
+}
+
 // ── verifyReleaseMerge ───────────────────────────────────────────────────────
 
 /**
@@ -1631,13 +1649,11 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     // before this run. An already-present tag means the merge script exited 0
     // without producing a release (the 2026-10-09 spurious-close incident), so
     // refuse every post-release step instead of closing against a stale tag.
-    if (preRunTags === null) {
-      console.error('\n⚠️  Could not read the pre-run git tag snapshot — cannot prove a new release tag was created.');
-      console.error('Refusing to close work items (exit code 14).');
-      return finish(14);
-    }
-    if (preRunTags.has(`v${version}`)) {
-      console.error(`\n⚠️  Release tag v${version} already existed before this run — no new release tag was created.`);
+    if (!isNewlyCreatedTag(version, preRunTags)) {
+      const detail = preRunTags === null
+        ? 'Could not read the pre-run git tag snapshot — cannot prove a new release tag was created.'
+        : `Release tag v${version} already existed before this run — no new release tag was created.`;
+      console.error(`\n⚠️  ${detail}`);
       console.error('Refusing to close work items (exit code 14).');
       return finish(14);
     }

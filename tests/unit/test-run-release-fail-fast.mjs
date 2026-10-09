@@ -30,7 +30,7 @@ import { join, dirname } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { parseReleaseArgs, WRAPPER_USAGE } from '../../skill/ship/scripts/run-release.js';
+import { parseReleaseArgs, WRAPPER_USAGE, isNewlyCreatedTag } from '../../skill/ship/scripts/run-release.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
@@ -242,6 +242,24 @@ describe('run-release: parseReleaseArgs', () => {
   test('exports a non-empty usage string', () => {
     assert.equal(typeof WRAPPER_USAGE, 'string');
     assert.match(WRAPPER_USAGE, /--help/);
+  });
+});
+
+// ── Unit tests: isNewlyCreatedTag ────────────────────────────────────────────
+
+describe('run-release: isNewlyCreatedTag', () => {
+  test('accepts a version whose tag is absent from the snapshot', () => {
+    assert.equal(isNewlyCreatedTag('0.2.0', new Set(['v0.1.18'])), true);
+  });
+
+  test('rejects a version whose tag already existed', () => {
+    assert.equal(isNewlyCreatedTag('0.1.18', new Set(['v0.1.18'])), false);
+  });
+
+  test('fails closed on a missing version or an unreadable snapshot', () => {
+    assert.equal(isNewlyCreatedTag(null, new Set(['v0.1.18'])), false);
+    assert.equal(isNewlyCreatedTag('0.2.0', null), false);
+    assert.equal(isNewlyCreatedTag('0.2.0', undefined), false);
   });
 });
 
