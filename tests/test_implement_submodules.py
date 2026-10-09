@@ -259,7 +259,7 @@ def _phase_start_runner(repo_root: Path, wt_override: Path) -> str:
 
         mod.StatusLifecycle = _FakeLifecycle
         mod.git_status = lambda cwd=None: ""
-        mod.git_has_dirty_files = lambda status_output=None: False
+        mod.git_has_dirty_files = lambda status_output=None, expected_dirty=(): False
         mod.wl_show = lambda i: {{"id": i, "title": "Test item"}}
         mod.wl_add_comment = lambda *a, **k: True
 

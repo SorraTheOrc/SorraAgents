@@ -62,6 +62,29 @@ with `StatusLifecycle.require_claimed(<id>)` before any mutation; on any
 in-session resume, re-claim first via `StatusLifecycle.ensure_claimed(<id>)`
 (idempotent).
 
+## Project-local extensions
+
+The implement skill consumes the project-local extension convention
+(`.pi/skills_extensions/implement/`, contract SA-0MSQ7MQEJ0064ZB0):
+
+- **`SKILL_PREFIX.md`** is surfaced by `implement.py start` after the gating
+  steps and before the first actionable step; `SKILL_POSTFIX.md` is surfaced
+  by `implement.py finish` after the final step. Both are recorded in the JSON
+  report (`extension.prefix_prose` / `extension.postfix_prose`).
+- **`extension.json`** may declare `ignoreDirtyPaths` — a list (or single
+  string) of repository-relative path prefixes that are *expected* to be dirty
+  and therefore do **not** hard-fail the dirty-tree gate or the worktree
+  placement gate, e.g. `{"ignoreDirtyPaths": [".llm-wiki/"]}`.
+
+The declaration is project-scoped, explicit and additive: it can only relax
+`git_has_dirty_files()` for the named prefixes, never for the rest of the
+checkout, and never for the `.worklog/` or build → test → commit gates.
+Absence is a no-op (byte-for-byte unchanged behaviour). A malformed extension
+is a loud failure: `implement.py start` refuses with an actionable message and
+releases the work item (status → `open`). Uncommitted expected-dirty paths are
+never stashed, committed or reverted. See
+[docs/dev/skill-extensions.md](../../docs/dev/skill-extensions.md).
+
 ## Test Anti-Patterns
 
 Review the shared [Test Writing Guidelines](../shared/test-writing-guidelines.md)
@@ -217,6 +240,11 @@ abort); act only after the operator explicitly chooses.
   dirty files (may be stale) and create a worktree for isolation without
   touching the user's changes; if dirty files prevent worktree creation, stop
   and ask the operator (act only on their explicit choice).
+- **Project-declared expected-dirty paths** (e.g. `.llm-wiki/`, declared via
+  `.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`) do
+  not stop the gate. Treat them as read-only background state: never stash,
+  commit or revert them. Any dirty path outside the declaration still stops
+  the workflow (see [Project-local extensions](#project-local-extensions)).
 
 On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 

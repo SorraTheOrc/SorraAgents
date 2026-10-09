@@ -6,6 +6,46 @@ operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged — every command/flag
 documented here is still valid.
 
+## Project-local extensions and expected-dirty paths (SA-0MUYEV5AO006V0HK)
+
+`implement.py` loads the project-local extension for the `implement` skill via
+the shared `load_extension()` helper (`skill/shared/skill_extensions.py`,
+contract SA-0MSQ7MQEJ0064ZB0). Discovery is repo-root scoped:
+`<project_root>/.pi/skills_extensions/implement/`. An absent extension is a
+no-op.
+
+Two components are consumed:
+
+- **Prose hooks.** `phase_start` surfaces `SKILL_PREFIX.md` after the gating
+  steps and before the first actionable step; `phase_finish` surfaces
+  `SKILL_POSTFIX.md` after the final step. Both are recorded in the JSON
+  report (`extension.prefix_prose` / `extension.postfix_prose`) and printed as
+a delimited block in human mode.
+
+- **Machine-readable data.** `extension.json` may declare
+  `ignoreDirtyPaths`, a list of repository-relative path prefixes (a single
+  string is accepted) that are expected to be dirty:
+
+  ```json
+  {"ignoreDirtyPaths": [".llm-wiki/"]}
+  ```
+
+  - `git_has_dirty_files(status_output, expected_dirty=...)` skips a dirty
+    path matching a declared prefix. It defaults to no exemption, so callers
+    that do not opt in keep the original behaviour.
+  - `phase_start` passes the project's declaration to the dirty-tree safety
+    gate; `_worktree_placement_violation()` and `_child_main_checkout_violation()`
+    pass it to the placement gates (via `_main_checkout_offending_paths()` and
+    `_git_path_has_changes()`).
+  - The declaration cannot relax the `.worklog/` skip, the stash hygiene
+    gate, or the build → test → commit order. Any unexpected dirty path still
+    stops the workflow.
+  - A malformed `extension.json` or a malformed `ignoreDirtyPaths` value
+    raises `SkillExtensionError` naming the file; `phase_start` reports the
+    failure and resets the work item to `open` instead of silently changing
+    the gate. `phase_finish` treats a malformed extension as best-effort for
+    the postfix hook (already-successful pushes are never failed by prose).
+
 ## Why driven child sessions run with extensions disabled (SA-0MUY9PYBD009Y7J5)
 
 The ``implement.py drive`` child spawner (``_default_session_spawner``) builds
