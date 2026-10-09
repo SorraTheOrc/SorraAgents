@@ -90,6 +90,12 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
     # imports is_code_freeze_active from it at module load.
     real_cf = (_REPO_ROOT / "skill" / "shared" / "code_freeze.py").read_text()
     (skill_pkg / "shared" / "code_freeze.py").write_text(real_cf)
+    # Provide the skill_extensions module (SA-0MUYEV5AO006V0HK) — implement.py
+    # imports load_extension / SkillExtensionError from it at module load.
+    real_se = (
+        _REPO_ROOT / "skill" / "shared" / "skill_extensions.py"
+    ).read_text()
+    (skill_pkg / "shared" / "skill_extensions.py").write_text(real_se)
     # Provide the timing module (SA-0MT319YGQ002E801) — implement.py imports
     # ``Timer`` from it at module load for timing instrumentation.
     real_timing = (_REPO_ROOT / "skill" / "shared" / "timing.py").read_text()

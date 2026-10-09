@@ -77,6 +77,11 @@ from import_guard import guard_shared_import
 
 try:
     from shared.code_freeze import is_code_freeze_active
+    from shared.skill_extensions import (
+        SkillExtension,
+        SkillExtensionError,
+        load_extension,
+    )
     from shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
     from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
@@ -945,14 +950,100 @@ def git_status(cwd: str | None = None) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def git_has_dirty_files(status_output: str | None = None) -> bool:
+IMPLEMENT_SKILL_NAME = "implement"
+#: ``extension.json`` key holding the project's expected-dirty path prefixes.
+EXPECTED_DIRTY_KEY = "ignoreDirtyPaths"
+
+
+def load_implement_extension(
+    project_root: str | Path | None = None,
+) -> SkillExtension | None:
+    """Load the project-local ``implement`` skill extension.
+
+    Discovery follows the shared convention
+    (``<project_root>/.pi/skills_extensions/implement/``, contract
+    SA-0MSQ7MQEJ0064ZB0): the project root defaults to the invoking git root,
+    falling back to the cwd. Absence is a no-op and returns ``None``; a
+    present-but-malformed ``extension.json`` raises
+    :class:`SkillExtensionError` (the loader's loud-failure contract).
+    """
+    extension = load_extension(IMPLEMENT_SKILL_NAME, project_root)
+    return extension if extension.present else None
+
+
+def _parse_expected_dirty(extension: SkillExtension | None) -> tuple[str, ...]:
+    """Parse the expected-dirty declaration from a loaded extension.
+
+    The declaration is a list of repository-relative path prefixes under the
+    ``ignoreDirtyPaths`` key. A trailing ``/`` is ignored so ``.llm-wiki/`` and
+    ``.llm-wiki`` are equivalent. A non-string or empty entry is a project
+    configuration error and raises :class:`SkillExtensionError` naming the
+    file — a malformed declaration must never silently change the dirty-tree
+    gate.
+    """
+    if extension is None:
+        return ()
+    raw = extension.data.get(EXPECTED_DIRTY_KEY)
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        entries: list[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        entries = list(raw)
+    else:
+        raise SkillExtensionError(
+            f"Invalid '{EXPECTED_DIRTY_KEY}' in {extension.data_path}: "
+            "expected a string or a list of strings."
+        )
+    paths: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            raise SkillExtensionError(
+                f"Invalid '{EXPECTED_DIRTY_KEY}' entry {entry!r} in "
+                f"{extension.data_path}: every entry must be a non-empty string."
+            )
+        paths.append(entry.strip())
+    return tuple(paths)
+
+
+def expected_dirty_paths(
+    project_root: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Return the project-declared expected-dirty path prefixes.
+
+    Loads (and validates) the implement extension for *project_root*. Returns
+    an empty tuple when no extension — or no ``ignoreDirtyPaths`` declaration —
+    is present, so an absent extension is a no-op.
+    """
+    return _parse_expected_dirty(load_implement_extension(project_root))
+
+
+def _path_is_expected_dirty(file_path: str, expected_dirty: tuple[str, ...]) -> bool:
+    """True when *file_path* matches a declared expected-dirty prefix."""
+    for prefix in expected_dirty:
+        normalised = prefix.rstrip("/")
+        if not normalised:
+            continue
+        if file_path == normalised or file_path.startswith(normalised + "/"):
+            return True
+    return False
+
+
+def git_has_dirty_files(
+    status_output: str | None = None,
+    expected_dirty: tuple[str, ...] = (),
+) -> bool:
     """Check if there are uncommitted changes outside .worklog/.
 
     Args:
         status_output: Optional pre-fetched git status output.
+        expected_dirty: Project-declared path prefixes that are expected to be
+            dirty and therefore do not count (e.g. ``.llm-wiki/``). Empty by
+            default, so callers that do not opt in keep the original
+            behaviour byte-for-byte.
 
     Returns:
-        True if any non-.worklog files are dirty.
+        True if any non-.worklog, non-expected-dirty file is dirty.
     """
     if status_output is None:
         status_output = git_status()
@@ -964,12 +1055,66 @@ def git_has_dirty_files(status_output: str | None = None) -> bool:
         file_path = line[3:].strip() if len(line) > 3 else ""
         if file_path.startswith(".worklog/"):
             continue
+        # Skip project-declared expected-dirty paths (never a hard-fail).
+        if _path_is_expected_dirty(file_path, expected_dirty):
+            continue
         if line.strip():
             return True
     return False
 
 
-def _main_checkout_offending_paths(repo_root: str) -> list[str]:
+def _surface_extension_prose(
+    extension: SkillExtension | None,
+    which: str,
+    json_output: bool,
+    report: dict[str, Any],
+) -> str | None:
+    """Surface a project-local prose hook and record it in the report.
+
+    Called with ``which="prefix"`` before the skill's first actionable step
+    and ``which="postfix"`` after its final step. Returns the prose text (or
+    ``None`` when absent) and prints a delimited human-readable block when not
+    emitting JSON. The JSON report always carries the text so a driving agent
+    can consume it either way.
+    """
+    if extension is None:
+        return None
+    text = extension.prefix if which == "prefix" else extension.postfix
+    if not text:
+        return None
+    report.setdefault("extension", {})[f"{which}_prose"] = text
+    if not json_output:
+        print()
+        print("=" * 60)
+        print(f"  Project extension ({which})")
+        print("=" * 60)
+        print(text.rstrip("\n"))
+        print("=" * 60)
+        print()
+    return text
+
+
+def _surface_postfix_prose(
+    project_root: str | Path | None,
+    json_output: bool,
+    report: dict[str, Any],
+) -> str | None:
+    """Load the extension and surface its postfix hook (best-effort).
+
+    A malformed extension is logged and never fails an already-successful
+    finish.
+    """
+    try:
+        extension = load_implement_extension(project_root)
+    except SkillExtensionError as exc:  # pragma: no cover - defensive
+        LOG.warning("Could not load implement extension for postfix prose: %s", exc)
+        return None
+    return _surface_extension_prose(extension, "postfix", json_output, report)
+
+
+def _main_checkout_offending_paths(
+    repo_root: str, expected_dirty: tuple[str, ...] = ()
+) -> list[str]:
     """Return the non-``.worklog/`` dirty paths in a checkout.
 
     Used by the implementation-placement gates to name the offending files
@@ -977,10 +1122,12 @@ def _main_checkout_offending_paths(repo_root: str) -> list[str]:
 
     Args:
         repo_root: Absolute path to the main checkout root.
+        expected_dirty: Project-declared path prefixes to exclude.
 
     Returns:
         Sorted, de-duplicated list of paths (relative to *repo_root*) that are
-        dirty outside ``.worklog/``. Empty when the checkout is clean.
+        dirty outside ``.worklog/`` and not expected-dirty. Empty when the
+        checkout is clean or only expected-dirty paths are modified.
     """
     status_output = git_status(cwd=repo_root)
     paths: list[str] = []
@@ -993,6 +1140,8 @@ def _main_checkout_offending_paths(repo_root: str) -> list[str]:
         if " -> " in file_path:
             file_path = file_path.split(" -> ", 1)[1].strip()
         if not file_path or file_path.startswith(".worklog/"):
+            continue
+        if _path_is_expected_dirty(file_path, expected_dirty):
             continue
         paths.append(file_path)
     return sorted(set(paths))
@@ -3068,9 +3217,35 @@ def phase_start(
         return report
 
     # ── Step 4: Safety gate (dirty working tree) ───────────────────
+    # Load the project-local extension first: it supplies both the prose
+    # hooks and the project-scoped expected-dirty declaration honoured by the
+    # gate below (SA-0MUYEV5AO006V0HK). Absence is a no-op; malformed data
+    # fails loudly rather than silently changing the gate.
+    repo_root = _get_repo_root() or str(Path.cwd().resolve())
+    try:
+        extension = load_implement_extension(repo_root)
+        expected_dirty = _parse_expected_dirty(extension)
+    except SkillExtensionError as exc:
+        msg = f"Invalid implement skill extension: {exc}"
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        report["extension_error"] = True
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        return report
+    report["extension"] = {
+        "present": extension is not None,
+        "expected_dirty_paths": list(expected_dirty),
+    }
+
     LOG.info("Checking git working tree...")
     status_output = git_status()
-    is_dirty = git_has_dirty_files(status_output)
+    is_dirty = git_has_dirty_files(status_output, expected_dirty=expected_dirty)
 
     if is_dirty:
         msg = (
@@ -3130,6 +3305,10 @@ def phase_start(
         LOG.info("All %d stash(es) matched to open work items — no orphaned stashes.", stash_result["total_stashes"])
     else:
         LOG.info("No stashes found.")
+
+    # Surface the project-local prose hook before the first actionable step
+    # (worktree implementation), after all gating steps have passed.
+    _surface_extension_prose(extension, "prefix", json_output, report)
 
     # ── Step 6: Fetch work item details ────────────────────────────
     LOG.info("Fetching work item %s...", work_item_id)
@@ -3760,6 +3939,9 @@ def phase_finish(
         print(f"  Branch: {branch}")
         print("  Status: in_review")
         print()
+
+    # Surface the project-local prose hook after the final step.
+    _surface_postfix_prose(repo_root, json_output, report)
 
     return report
 
@@ -4850,10 +5032,15 @@ def _worktree_placement_violation(
         return None  # already inside the worktree
 
     root = Path(repo_root or _get_repo_root(cur) or cur).resolve()
-    if not git_has_dirty_files(git_status(cwd=str(root))):
+    root_expected = expected_dirty_paths(str(root))
+    if not git_has_dirty_files(
+        git_status(cwd=str(root)), expected_dirty=root_expected
+    ):
         return None  # main checkout clean; work must be in the worktree
 
-    if _git_path_has_changes(wt, parent_branch):
+    if _git_path_has_changes(
+        wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
+    ):
         return None  # work lives in the worktree; main-checkout dirt is unrelated
 
     return (
@@ -4865,7 +5052,11 @@ def _worktree_placement_violation(
     )
 
 
-def _git_path_has_changes(path: Path, parent_branch: str) -> bool:
+def _git_path_has_changes(
+    path: Path,
+    parent_branch: str,
+    expected_dirty: tuple[str, ...] = (),
+) -> bool:
     """True when the git directory at *path* contains implementation changes.
 
     Detects both uncommitted changes and commits ahead of *parent_branch*.
@@ -4873,12 +5064,15 @@ def _git_path_has_changes(path: Path, parent_branch: str) -> bool:
     Args:
         path: Directory to check (e.g. the worktree root).
         parent_branch: Branch the directory forked from (e.g. ``dev``).
+        expected_dirty: Project-declared path prefixes to exclude.
 
     Returns:
         True if the directory is dirty or its HEAD differs from the parent
         branch; False only when it is clean AND at the parent branch HEAD.
     """
-    if git_has_dirty_files(git_status(cwd=str(path))):
+    if git_has_dirty_files(
+        git_status(cwd=str(path)), expected_dirty=expected_dirty
+    ):
         return True
     head = run_cmd(
         ["git", "rev-parse", "HEAD"], cwd=str(path), check=False, capture=True
@@ -4936,11 +5130,15 @@ def _child_main_checkout_violation(
         return None
     root = Path(repo_root_str).resolve()
 
-    offending = _main_checkout_offending_paths(str(root))
+    offending = _main_checkout_offending_paths(
+        str(root), expected_dirty=expected_dirty_paths(str(root))
+    )
     if not offending:
-        return None  # main checkout clean
+        return None  # main checkout clean (or only expected-dirty paths)
 
-    if _git_path_has_changes(wt, parent_branch):
+    if _git_path_has_changes(
+        wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
+    ):
         return None  # work lives in the worktree; main-checkout dirt is unrelated
 
     listing = "\n".join(f"  - {p}" for p in offending[:20])
