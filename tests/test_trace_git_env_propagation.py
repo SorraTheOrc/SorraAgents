@@ -123,3 +123,48 @@ def test_cli_json_confirms_propagation_against_throwaway_repos():
     git_dir = report["spawned_child_overrides"]["GIT_DIR"]
     assert "SorraAgents" not in git_dir
     assert not Path(git_dir).resolve().is_relative_to(REPO_ROOT)
+
+
+def test_capture_fresh_child_env_forwards_repository_override():
+    """A fresh child spawned with a forwarded env sees the override.
+
+    This is the controlled-dump contract (SA-0MV0G9BVW008M8AT): forwarding
+    the parent environment — the launcher's spawn semantics — carries a
+    repository-override variable into the child unchanged.
+    """
+    observed = tracer.capture_fresh_child_env(
+        {"PATH": "/usr/bin:/bin", "GIT_DIR": "/somewhere/.git"}
+    )
+
+    assert observed.get("GIT_DIR") == "/somewhere/.git"
+    assert tracer.repository_overrides_in_env(observed) == ("GIT_DIR",)
+
+
+def test_capture_fresh_child_env_is_clean_without_overrides():
+    """A fresh child of a clean environment reports no overrides."""
+    observed = tracer.capture_fresh_child_env({"PATH": "/usr/bin:/bin"})
+
+    assert tracer.repository_overrides_in_env(observed) == ()
+
+
+def test_cli_session_env_json_reports_clean_session():
+    """The controlled dump exits 0 when the live session is clean.
+
+    Repository-override variables must not be present in the agent/test
+    session that runs this probe; a leak fails the check (non-zero exit).
+    """
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--session-env", "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    report = json.loads(result.stdout)
+    assert report["clean"] is (result.returncode == 0)
+    if report["clean"]:
+        assert report["session_overrides"] == []
+        assert report["fresh_child_overrides"] == []
+    else:
+        assert report["session_overrides"] or report["fresh_child_overrides"]

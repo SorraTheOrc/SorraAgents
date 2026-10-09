@@ -42,10 +42,12 @@ tree. The ``/proc`` scan is read-only.
 Usage
 -----
     python3 docs/dev/trace_git_env_propagation.py [--json]
+    python3 docs/dev/trace_git_env_propagation.py --session-env [--json]
 
 Exit codes:
     0  both propagation facts were demonstrated (the expected outcome);
-    1  a fact was NOT demonstrated — investigate before trusting the finding.
+       with ``--session-env``, the session and a fresh child are clean;
+    1  a fact was NOT demonstrated, or an override was present.
 """
 from __future__ import annotations
 
@@ -104,12 +106,8 @@ def _read_environ(path: Path) -> dict[str, str]:
     return env
 
 
-def _read_env_dump(path: Path) -> dict[str, str]:
-    """Read ``env``-style (newline-separated) output into a mapping."""
-    try:
-        text = path.read_text()
-    except OSError:
-        return {}
+def _parse_env_text(text: str) -> dict[str, str]:
+    """Parse ``env``-style (newline-separated) output into a mapping."""
     env: dict[str, str] = {}
     for line in text.splitlines():
         if "=" not in line:
@@ -117,6 +115,37 @@ def _read_env_dump(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         env[key] = value
     return env
+
+
+def _read_env_dump(path: Path) -> dict[str, str]:
+    """Read ``env``-style (newline-separated) output into a mapping."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    return _parse_env_text(text)
+
+
+def capture_fresh_child_env(
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Capture the environment a freshly spawned child process inherits.
+
+    Spawns ``env`` (no ``git`` performed) with an environment built by
+    forwarding *env* (default :data:`os.environ`) — the same
+    ``{ ...parent_env }`` forwarding the herdr launcher uses — and returns
+    the mapping the child observed. A fresh child of a clean session reports
+    no repository-override variables.
+    """
+    source = dict(os.environ if env is None else env)
+    proc = subprocess.run(
+        ["env"],
+        env=source,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return _parse_env_text(proc.stdout)
 
 
 def scan_proc_environ(
@@ -265,7 +294,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--json", action="store_true", help="emit the report as JSON"
     )
+    parser.add_argument(
+        "--session-env",
+        action="store_true",
+        help=(
+            "capture the current session environment and a freshly spawned "
+            "child (no git) and report repository-override variables; exits 1 "
+            "when any override is present"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.session_env:
+        session_env = dict(os.environ)
+        child_env = capture_fresh_child_env(session_env)
+        session_overrides = repository_overrides_in_env(session_env)
+        child_overrides = repository_overrides_in_env(child_env)
+        session_report: dict[str, object] = {
+            "session_overrides": list(session_overrides),
+            "fresh_child_overrides": list(child_overrides),
+            "clean": not session_overrides and not child_overrides,
+        }
+        if args.json:
+            print(json.dumps(session_report, indent=2, sort_keys=True))
+        else:
+            print("Controlled fresh-session environment dump")
+            print("=" * 60)
+            print(
+                "current session repository-override vars: "
+                + (", ".join(session_overrides) if session_overrides else "(none)")
+            )
+            print(
+                "fresh child repository-override vars:    "
+                + (", ".join(child_overrides) if child_overrides else "(none)")
+            )
+        return 0 if session_report["clean"] else 1
 
     with tempfile.TemporaryDirectory(prefix="git-env-probe-") as tmp:
         tmp_path = Path(tmp)
