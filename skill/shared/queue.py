@@ -61,6 +61,7 @@ API
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -245,6 +246,7 @@ class PriorityQueue:
         self._queue_dir = _default_lock_dir() / self.name
         self.timeout = timeout
         self._lock_fd: int | None = None
+        self._deadline: float | None = None  # monotonic deadline for lock acquisition
 
         # Resolve max_depth
         if max_depth is not None:
@@ -272,15 +274,39 @@ class PriorityQueue:
     def _acquire_lock(self) -> None:
         """Take an exclusive flock on the queue directory.
 
-        The lock is held for the duration of operations that mutate the
-        directory (enqueue/dequeue).  flock guarantees are released on
-        process exit, so no stale locks after a crash.
+        Uses non-blocking ``LOCK_EX | LOCK_NB`` with a short retry loop
+        bounded by ``self._deadline`` (a monotonic timestamp set by the
+        caller).  This prevents indefinite blocking when another process
+        holds the lock — the same pattern used by ``Semaphore``
+        (SA-0MUV4C6RZ006GN5Z).
+
+        On deadline expiry, raises ``TimeoutError``.
         """
+        if self._lock_fd is not None:
+            # Re-entrant: already held by this instance — no-op.
+            return
         lock_path = self._queue_dir / ".lock"
         lock_path.touch(exist_ok=True)
         fd = os.open(str(lock_path), os.O_RDWR)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        self._lock_fd = fd
+        deadline = self._deadline
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    # Lock held by another process — sleep and retry
+                    if deadline is not None and time.monotonic() >= deadline:
+                        os.close(fd)
+                        raise TimeoutError(
+                            f"queue '{self.name}': lock contention timeout "
+                            f"(held by another process)"
+                        ) from exc
+                    time.sleep(_RETRY_DELAY_SECONDS)
+                    continue
+                os.close(fd)
+                raise
+            self._lock_fd = fd
+            break
 
     def _release_lock(self) -> None:
         """Release the directory lock.  Idempotent."""
@@ -293,6 +319,7 @@ class PriorityQueue:
                 os.close(self._lock_fd)
             finally:
                 self._lock_fd = None
+                self._deadline = None
 
     # ------------------------------------------------------------------
     # TTL / Stale entry cleanup
@@ -384,6 +411,7 @@ class PriorityQueue:
             deadline = time.monotonic() + float(effective_timeout)
 
         while True:
+            self._deadline = deadline
             with self._locked():
                 entries = self._list_entries()
 
@@ -440,16 +468,21 @@ class PriorityQueue:
 
         # Fail fast (timeout <= 0): check once, return None if empty.
         if effective_timeout is not None and float(effective_timeout) <= 0:
-            with self._locked():
-                entries = self._list_entries()
-                if entries:
-                    winner = entries[0]
-                    entry_file = self._queue_dir / _queue_file(winner.item_id)
-                    try:
-                        entry_file.unlink(missing_ok=True)
-                    except OSError:
-                        pass  # race: another process grabbed it
-                    return winner
+            self._deadline = time.monotonic()  # immediate deadline → fail-fast
+            try:
+                with self._locked():
+                    entries = self._list_entries()
+                    if entries:
+                        winner = entries[0]
+                        entry_file = self._queue_dir / _queue_file(winner.item_id)
+                        try:
+                            entry_file.unlink(missing_ok=True)
+                        except OSError:
+                            pass  # race: another process grabbed it
+                        return winner
+            except TimeoutError:
+                # Lock contention — dequeue returns None on timeout.
+                return None
             return None
 
         deadline = (
@@ -459,17 +492,22 @@ class PriorityQueue:
         )
 
         while True:
-            with self._locked():
-                entries = self._list_entries()
-                if entries:
-                    # Remove the first entry (highest priority, earliest)
-                    winner = entries[0]
-                    entry_file = self._queue_dir / _queue_file(winner.item_id)
-                    try:
-                        entry_file.unlink(missing_ok=True)
-                    except OSError:
-                        pass  # race: another process grabbed it
-                    return winner
+            self._deadline = deadline
+            try:
+                with self._locked():
+                    entries = self._list_entries()
+                    if entries:
+                        # Remove the first entry (highest priority, earliest)
+                        winner = entries[0]
+                        entry_file = self._queue_dir / _queue_file(winner.item_id)
+                        try:
+                            entry_file.unlink(missing_ok=True)
+                        except OSError:
+                            pass  # race: another process grabbed it
+                        return winner
+            except TimeoutError:
+                # Lock contention — dequeue returns None on timeout.
+                return None
 
             # Queue is empty — wait a little, then return None on deadline
             if deadline is not None and time.monotonic() >= deadline:
@@ -499,15 +537,20 @@ class PriorityQueue:
             deadline = time.monotonic() + float(effective_timeout)
 
         while True:
-            with self._locked():
-                entries = self._list_entries()
-                if entries:
-                    return entries[0]
+            self._deadline = deadline
+            try:
+                with self._locked():
+                    entries = self._list_entries()
+                    if entries:
+                        return entries[0]
+            except TimeoutError:
+                # Lock contention — peek returns None on timeout.
+                return None
             if deadline is not None and time.monotonic() >= deadline:
                 return None
             time.sleep(_RETRY_DELAY_SECONDS)
 
-    def remove(self, item_id: str) -> QueueEntry | None:
+    def remove(self, item_id: str, timeout: float | None = None) -> QueueEntry | None:
         """Remove a specific item by id, returning it (or ``None``).
 
         Idempotent: removing an item that is not present (or was already
@@ -515,7 +558,16 @@ class PriorityQueue:
         This lets an admitted waiter take its OWN ticket out of the queue
         even when a higher-priority ticket arrived during admission — the
         head is never stolen (SA-0MTG5RYH8005RQNM admission safety).
+
+        Args:
+            item_id: Id of the entry to remove.
+            timeout: Optional bound (seconds) on directory-lock
+                acquisition.  ``None`` = wait indefinitely (historical
+                behaviour); ``0`` = fail fast.  Lock-contention timeout
+                raises ``TimeoutError`` (SA-0MUV4C6RZ006GN5Z).
         """
+        if timeout is not None:
+            self._deadline = time.monotonic() + float(timeout)
         with self._locked():
             entries = self._list_entries()
             for entry in entries:
@@ -528,7 +580,7 @@ class PriorityQueue:
                     return entry
         return None
 
-    def rank(self, item_id: str) -> int | None:
+    def rank(self, item_id: str, timeout: float | None = None) -> int | None:
         """Return the 1-based position of an item in the current ordering.
 
         The head of the line is position 1. Items are ranked by
@@ -536,7 +588,16 @@ class PriorityQueue:
         ``rank`` reports an exact "queue_position" for logging
         (SA-0MTG5RYH8005RQNM AC4). Returns ``None`` when the item is not
         present.
+
+        Args:
+            item_id: Id of the entry to rank.
+            timeout: Optional bound (seconds) on directory-lock
+                acquisition.  ``None`` = wait indefinitely (historical
+                behaviour); ``0`` = fail fast.  Lock-contention timeout
+                raises ``TimeoutError`` (SA-0MUV4C6RZ006GN5Z).
         """
+        if timeout is not None:
+            self._deadline = time.monotonic() + float(timeout)
         with self._locked():
             for position, entry in enumerate(self._list_entries(), start=1):
                 if entry.item_id == item_id:

@@ -3105,7 +3105,9 @@ def _log_audit_slot(priority: int, position: int | None, ticket: str,
     )
 
 
-def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
+def _prune_dead_audit_tickets(
+    queue: PriorityQueue, timeout: float | None = None
+) -> int:
     """Remove audit queue tickets whose owning process is no longer alive.
 
     Ticket ids have the shape ``audit:{issue_id}:{pid}:{counter}``. A
@@ -3115,13 +3117,26 @@ def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
     audit times out with "audit concurrency queue saturated", even though
     no audit is actually running (the observed failure mode).
 
-    Returns the number of tickets pruned. Never raises: a malformed id or
-    a transient ``remove`` race is ignored (the caller retries the poll).
+    Args:
+        queue: The audit priority queue to prune.
+        timeout: Optional bound (seconds) on directory-lock acquisition so
+            a peer holding the lock cannot block admission indefinitely
+            (SA-0MUV4C6RZ006GN5Z).  ``None`` preserves the historical
+            unbounded behaviour.
+
+    Returns the number of tickets pruned. Never raises: a malformed id, a
+    lock-contention timeout, or a transient ``remove`` race is ignored
+    (the caller retries the poll).
     """
     try:
+        queue._deadline = (
+            None if timeout is None else time.monotonic() + float(timeout)
+        )
         entries = queue._list_entries()
-    except OSError:
+    except (OSError, TimeoutError):
         return 0
+    finally:
+        queue._deadline = None
     pruned = 0
     for entry in entries:
         parts = entry.item_id.split(":")
@@ -3136,13 +3151,33 @@ def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            # Owner is gone — safe to drop the stale ticket.
-            if queue.remove(entry.item_id) is not None:
-                pruned += 1
+            # Owner is gone — safe to drop the stale ticket. Fail-fast on
+            # the lock so a contended directory cannot hang the prune.
+            try:
+                if queue.remove(entry.item_id, timeout=0) is not None:
+                    pruned += 1
+            except TimeoutError:
+                continue
         except PermissionError:
             # Process exists but is not ours — not stale.
             continue
     return pruned
+
+
+def _try_queue_depth(queue: PriorityQueue) -> int:
+    """Best-effort queue depth that fails fast on directory-lock contention.
+
+    Used only for the timeout diagnostic message; a peer holding the lock
+    must not turn the error path into another unbounded wait
+    (SA-0MUV4C6RZ006GN5Z). Returns 0 when the depth cannot be read.
+    """
+    queue._deadline = time.monotonic()  # immediate fail-fast deadline
+    try:
+        return len(queue)
+    except TimeoutError:
+        return 0
+    finally:
+        queue._deadline = None
 
 
 def _acquire_audit_slot(issue_id: str = "",
@@ -3191,19 +3226,28 @@ def _acquire_audit_slot(issue_id: str = "",
         f"audit:{issue_id or 'anon'}:{os.getpid()}:"
         f"{next(_AUDIT_TICKET_COUNTER)}"
     )
+    queue_timeout = _audit_queue_timeout()
+    # A single admission deadline bounds EVERY lock-taking step below, so a
+    # peer holding the queue's directory lock cannot block slot acquisition
+    # past AUDIT_QUEUE_TIMEOUT (SA-0MUV4C6RZ006GN5Z).
+    admission_deadline = time.monotonic() + queue_timeout
+
+    def _remaining() -> float:
+        return max(0.0, admission_deadline - time.monotonic())
+
     # Stale-ticket hygiene: remove tickets whose owning PID is no longer
     # alive (crashed/timed-out audits would otherwise leave them until the
     # 24h TTL prune, accumulating and saturating the queue for all
-    # subsequent audits).
-    _prune_dead_audit_tickets(queue)
-    queue_timeout = _audit_queue_timeout()
+    # subsequent audits). Bounded by the shared admission deadline.
+    _prune_dead_audit_tickets(queue, timeout=_remaining())
     queued_wall = time.time()
     queued_mono = time.monotonic()
     last_prune_mono = queued_mono
-    # Bounded enqueue: a full queue waits up to queue_timeout (AC3).
-    queue.enqueue(ticket, priority, timeout=queue_timeout)
-    position = queue.rank(ticket)
-    deadline = time.monotonic() + queue_timeout
+    # Bounded enqueue: a full queue waits up to queue_timeout (AC3); a held
+    # directory lock times out within the same bound.
+    queue.enqueue(ticket, priority, timeout=_remaining())
+    position = queue.rank(ticket, timeout=_remaining())
+    deadline = admission_deadline
     while True:
         head = queue.peek(timeout=0)
         if head is not None and head.item_id == ticket:
@@ -3212,7 +3256,15 @@ def _acquire_audit_slot(issue_id: str = "",
             except TimeoutError:
                 pass  # all slots busy — hold position and retry
             else:
-                if queue.remove(ticket) is not None:
+                try:
+                    removed = queue.remove(ticket, timeout=0)
+                except TimeoutError:
+                    # Directory lock contended — retry the poll without
+                    # holding the slot (SA-0MUV4C6RZ006GN5Z).
+                    sem.release()
+                    time.sleep(AUDIT_QUEUE_POLL_SECONDS)
+                    continue
+                if removed is not None:
                     _log_audit_slot(priority, position, ticket, queued_wall)
                     return sem
                 # Ticket vanished between peek and remove (unexpected):
@@ -3220,18 +3272,23 @@ def _acquire_audit_slot(issue_id: str = "",
                 sem.release()
         # Slow-path stale prune (~every 5s) so peers that crashed while we
         # waited do not keep the queue saturated; keep it off the hot path
-        # to avoid per-poll lock churn.
+        # to avoid per-poll lock churn. Fail-fast on the lock so a
+        # contended directory cannot hang the wait.
         now_mono = time.monotonic()
         if now_mono - last_prune_mono >= 5.0:
-            _prune_dead_audit_tickets(queue)
+            _prune_dead_audit_tickets(queue, timeout=0)
             last_prune_mono = now_mono
         if now_mono >= deadline:
             elapsed = time.monotonic() - queued_mono
-            queue_depth = len(queue)
+            queue_depth = _try_queue_depth(queue)
             retry_seconds = max(1, int(queue_timeout / 3))
             # Remove OUR OWN ticket before raising so a timed-out audit does
             # not leave a stale ticket behind (they accumulate and saturate).
-            queue.remove(ticket)
+            # Fail-fast on the lock: the shared deadline already expired.
+            try:
+                queue.remove(ticket, timeout=0)
+            except TimeoutError:
+                pass
             raise TimeoutError(
                 f"audit concurrency queue '{AUDIT_QUEUE_NAME}' saturated: "
                 f"no slot within {queue_timeout:.0f}s (waited {elapsed:.1f}s, "
