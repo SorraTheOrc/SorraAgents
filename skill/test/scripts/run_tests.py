@@ -30,6 +30,16 @@ served without executing and never block on the semaphore
 Emits structured per-failure records (test_name, stdout_excerpt, stack_trace)
 compatible with the triage skill's check_or_create.py input.
 
+Live-repo guard ownership: :func:`guarded_run_all` is the **single source of
+truth** for the outer snapshot guard (snapshot → run → mutation check) and
+the ``LIVE_REPO_GUARD_ACTIVE`` recursion marker. The CLI (:func:`main`) and
+``implement.py``'s finish-gate test step both delegate to it, so no entry
+point is left unguarded and no second guard implementation can diverge. When
+the marker is already set by an outer guard, :func:`guarded_run_all` stands
+down (the outermost guard stays the single owner). See also the repo-root
+``conftest.py`` / ``skill/shared/live_repo_guard.py`` inner guard, which this
+outer guard stands down (SA-0MUG30J5F001L57H, SA-0MUH1MJL6003767Q).
+
 Usage:
   run_tests.py [--suite pytest|node|all] [--json] [--parent-work-item-id ID] [--rerun-failures]
   run_tests.py --summary [--summary-grep PATTERN]   (read cached summary lines, no execution)
@@ -1539,10 +1549,12 @@ def run_suite(
                     )
             resolvable_scope = "full"
     else:
-        # Explicit command override (a resolved type profile, or a test): a
-        # changed subset cannot be derived from an opaque override, so the run
-        # is full-profile and honestly reports scope=full.
-        resolvable_scope = "full"
+        # Explicit command override (a resolved type profile, or a
+        # changed-scope selection by implement.py): the caller has already
+        # selected the command set, so the passed scope is authoritative.
+        # Recording a changed-scope selection as "full" would mislabel a
+        # partial run as full-suite evidence (SA-0MUH1MJL6003767Q).
+        resolvable_scope = scope if scope in ("full", "changed") else "full"
     command = " && ".join(commands)
 
     all_failures: list[dict[str, str]] = []
@@ -1947,6 +1959,99 @@ def _detect_live_repo_mutation(
     )
 
 
+def guarded_run_all(
+    cwd: Path | None = None,
+    timeout: int = 600,
+    *,
+    suites: tuple[str, ...] = ("all",),
+    use_cache: bool = True,
+    force: bool = False,
+    no_cache: bool = False,
+    scope: str = "full",
+    base_ref: str = "origin/dev",
+    commands: list[str] | None = None,
+    test_type: str = DEFAULT_TEST_TYPE,
+    group: str | None = None,
+) -> dict[str, Any]:
+    """Run the selected suites under the canonical live-repo guard ownership.
+
+    This is the **single source of truth** for outer guard ownership
+    (SA-0MUG30J5F001L57H, SA-0MUH1MJL6003767Q). Both the ``run_tests.py`` CLI
+    (via :func:`main`) and ``implement.py``'s finish-gate test step call this
+    function rather than arming their own guards, so there is exactly one
+    implementation and no path is left unguarded.
+
+    Ownership contract:
+
+    - When the recursion marker ``LIVE_REPO_GUARD_ACTIVE`` is **already set**
+      an outer guard owns the checkout (a nested/cascaded run): this call
+      stands down — it neither snapshots nor sets/clears the marker.
+    - When the marker is **not set**, this call owns the checkout: it
+      snapshots the repo before the run, sets the marker for the duration of
+      :func:`run_all` (so the inner conftest guard stands down and nested
+      pytest invocations do not double-report), clears it in a ``finally``
+      block, then detects any mutation and fails the run if the checkout
+      changed.
+
+    The result is the same dict shape as :func:`run_all`, plus a
+    ``live_repo_mutation`` key when the owning guard detected a mutation.
+
+    Args:
+        cwd: Project root to run/cache against (default ``REPO_ROOT``).
+        timeout: Per-command timeout in seconds.
+        suites: Suite names to run (default ``("all",)``).
+        use_cache: Whether to serve/store results from the per-repo cache.
+        force: Bypass cache lookup (still stores).
+        no_cache: Bypass cache lookup and storage.
+        scope: ``"full"`` or ``"changed"``.
+        base_ref: Base ref for changed-file detection.
+        commands: Explicit command override (resolved type/group profile).
+        test_type: Command profile name (``full`` default).
+        group: Named test group from ``.pi/test-config.json``.
+
+    Returns:
+        The :func:`run_all` result dict, with ``success=False`` and
+        ``live_repo_mutation`` set when the owned guard detected a mutation.
+    """
+    project_root = Path(cwd or REPO_ROOT).resolve()
+
+    # Stand down when an outer guard already owns the checkout (nested run).
+    guard_active = not os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV)
+    snapshot_before = snapshot_repo_state(project_root) if guard_active else None
+
+    if guard_active:
+        os.environ[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
+    try:
+        result = run_all(
+            suites=suites,
+            cwd=project_root,
+            timeout=timeout,
+            use_cache=use_cache,
+            force=force,
+            no_cache=no_cache,
+            scope=scope,
+            base_ref=base_ref,
+            commands=commands,
+            test_type=test_type,
+            group=group,
+        )
+    finally:
+        # Only clear the marker we set — a nested call must not clear an
+        # outer guard's marker.
+        if guard_active:
+            os.environ.pop(LIVE_REPO_GUARD_ACTIVE_ENV, None)
+
+    # Detect-only: fail the run when the checkout mutated, so a corrupted
+    # checkout can never be reported (or pushed) as green. Armed on
+    # cache-served runs too (nothing executes, but the delta is verified).
+    if guard_active:
+        mutation = _detect_live_repo_mutation(project_root, snapshot_before)
+        if mutation is not None:
+            result = {**result, "success": False, "live_repo_mutation": mutation}
+
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     suites = (args.suite,)
@@ -2068,13 +2173,6 @@ def main(argv: list[str] | None = None) -> int:
     # timeoutPerCommand (F2 AC1), else the default 600.
     timeout = args.timeout or suite_timeout_per_command(project_root) or 600
 
-    # Live-repo mutation guard (F4, SA-0MUG30J5F001L57H): snapshot the checkout
-    # before the suite and fail the run if it changed. Stand down when an outer
-    # guard already owns this checkout (recursion marker), so nested runs do not
-    # double-report. No-op for non-git roots.
-    guard_active = not os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV)
-    snapshot_before = snapshot_repo_state(project_root) if guard_active else None
-
     with Timer("run_tests") as _root_timer:
         if args.summary:
             with Timer("run_summary"):
@@ -2102,36 +2200,25 @@ def main(argv: list[str] | None = None) -> int:
                 print(_root_timer.render(), file=sys.stderr)
             return 0 if summary["success"] else 1
 
-        if guard_active:
-            os.environ[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
-        try:
-            result = run_all(
-                suites=suites,
-                cwd=project_root,
-                timeout=timeout,
-                use_cache=not args.no_cache,
-                force=args.force,
-                no_cache=args.no_cache,
-                scope=args.scope,
-                base_ref=args.target_branch or "origin/dev",
-                commands=override_commands,
-                test_type=test_type,
-                group=group_name,
-            )
-        finally:
-            if guard_active:
-                os.environ.pop(LIVE_REPO_GUARD_ACTIVE_ENV, None)
-
-        # Live-repo mutation guard (F4, SA-0MUG30J5F001L57H). Detect-only:
-        # snapshot the checkout before and after the suite and fail the run if
-        # refs, local config or the working tree changed. This is the outer net
-        # for the pre-push release gate, which discards stdout/stderr and relies
-        # on the exit code. It is armed on cache-served runs too (nothing
-        # executes, but the delta is still verified).
-        if guard_active:
-            mutation = _detect_live_repo_mutation(project_root, snapshot_before)
-            if mutation is not None:
-                result = {**result, "success": False, "live_repo_mutation": mutation}
+        # Live-repo guard ownership is centralised in ``guarded_run_all``
+        # (SA-0MUH1MJL6003767Q): it snapshots the checkout, sets the recursion
+        # marker so the inner conftest guard stands down, runs the suites, then
+        # fails the run if the checkout mutated. Delegating here keeps the CLI
+        # and ``implement.py``'s finish gate on exactly one guard
+        # implementation (no double-guard, no path left unguarded).
+        result = guarded_run_all(
+            project_root,
+            timeout=timeout,
+            suites=suites,
+            use_cache=not args.no_cache,
+            force=args.force,
+            no_cache=args.no_cache,
+            scope=args.scope,
+            base_ref=args.target_branch or "origin/dev",
+            commands=override_commands,
+            test_type=test_type,
+            group=group_name,
+        )
 
         if args.rerun_failures and result["failures"]:
             with Timer("rerun_failures"):
