@@ -382,6 +382,30 @@ Minimal YAML parser for config files (top-level keys + one nesting level).
 
 ## Test Isolation
 
+### Tests never emit real release notifications (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL)
+
+Release integration harnesses run the **real** `run-release.js`, which reaches
+Step 8.5 (`sendReleaseNotification`). A harness builds its temp project root
+with no `.worklog/` config, so the **real** `discord-notify.js` would fall back
+to the operator's global `~/.pi/agent/config.yaml` and POST a real release
+notification (e.g. `Release v9.9.9`) on every test run. Tests must never emit
+real outbound notifications.
+
+Every harness that executes `run-release.js` **must** substitute a recording
+stub for `discord-notify.js` (never copy the real module):
+
+- `tests/unit/test-run-release-merge-guard.mjs` — writes `MOCK_DISCORD_NOTIFY`
+  into the temp skill layout, and pins this with assertions that Step 8.5 was
+  served by the stub (`stubbed: true`) and that **no** notification is emitted
+  before the merge is verified;
+- `tests/unit/test-run-release-discord-notify.mjs` — the reference pattern:
+  records `sendReleaseNotification` arguments without sending.
+
+Production behaviour is unchanged: real releases still post the Discord
+notification.
+
+### Worklog isolation
+
 Close-work-items tests must **never mutate the live worklog** (SA-0MSJ2XMQL006CVQS):
 
 - `closeWorkItemsAfterRelease` accepts injectable `getCandidateItemsFn` /

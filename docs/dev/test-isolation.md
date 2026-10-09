@@ -578,3 +578,25 @@ rather than inheriting them. The production hook's documented
 (pollutes the parent environment, asserts `_env()` omits every bypass switch,
 and asserts the mismatched-identity case still reports `git identity mismatch`
 and skips `wl sync`).
+
+## 10. Tests never emit real release notifications (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL)
+
+A test run must be side-effect free with respect to external services. The
+release integration harnesses run the **real** `run-release.js`, which reaches
+Step 8.5 (`sendReleaseNotification`). A harness's temp project root has no
+`.worklog/` config, so the **real** `discord-notify.js` would fall back to the
+operator's global `~/.pi/agent/config.yaml` and POST a real Discord release
+notification (e.g. `Release v9.9.9`) on every run.
+
+The rule:
+
+- Every test harness that executes `run-release.js` must **substitute a
+  recording stub for `discord-notify.js`** instead of copying the real module;
+- `tests/unit/test-run-release-merge-guard.mjs` writes a recording stub and
+  pins this: Step 8.5 must be served by the stub (`stubbed: true`) and no
+  notification may be emitted before the merge is verified;
+- `tests/unit/test-run-release-discord-notify.mjs` is the reference pattern.
+
+Production behaviour is unchanged — real releases still post the Discord
+notification. The ship-skill detail lives in
+[`skill/ship/docs/dev/ship-skill-reference.md`](../../skill/ship/docs/dev/ship-skill-reference.md#test-isolation).
