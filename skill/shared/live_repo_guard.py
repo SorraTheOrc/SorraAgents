@@ -29,6 +29,19 @@ Safety / no-false-positive rules (F5 AC2/AC5/AC6/AC7):
   the authoritative diff before a test is failed, so excluded-set churn
   (worktree registered/removed mid-run) cannot fail a clean run with
   ``(no differences)`` (SA-0MUINEW6X0034C65).
+
+Guard-ownership contract (SA-0MUH1MJL6003767Q)
+----------------------------------------------
+
+There is exactly one **outer** guard implementation: ``guarded_run_all`` in
+``skill/test/scripts/run_tests.py``. Both the ``run_tests.py`` CLI and
+``implement.py``'s finish-gate test step delegate to it, so no entry point is
+left unguarded and no path can diverge into a second implementation. The
+outer guard owns the checkout (snapshot → run → mutation check) and sets
+``LIVE_REPO_GUARD_ACTIVE`` for the duration of the run, which makes this
+inner plugin stand down. When an outer guard has already set the marker (a
+nested/cascaded run), ``guarded_run_all`` stands down in turn and the
+outermost guard remains the single owner — never both, never neither.
 """
 
 from __future__ import annotations
