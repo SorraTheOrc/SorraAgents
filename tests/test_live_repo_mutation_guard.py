@@ -298,8 +298,6 @@ class TestGuardedRunAllOwnership:
 
     def test_marker_set_during_owned_run(self, tmp_path, monkeypatch):
         """Marker unset → set for the duration of run_all (inner guard down)."""
-        from test.scripts import run_tests as _rt
-
         repo = _init_guard_repo(tmp_path, "owned")
         (repo / ".pi").mkdir()
         (repo / ".pi" / "test-config.json").write_text(

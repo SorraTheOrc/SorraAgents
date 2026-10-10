@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Tests for machine-hygiene table rendering and the approval gate.
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Integration tests for the machine-hygiene skill.
 
@@ -185,9 +184,8 @@ class TestImportSideEffects(unittest.TestCase):
             for name, obj in vars(module).items():
                 if name.startswith("_"):
                     continue
-                if callable(obj) and getattr(obj, "__module__", None) == module.__name__:
-                    if not (obj.__doc__ or "").strip():
-                        missing.append(f"{module.__name__}.{name}")
+                if callable(obj) and getattr(obj, "__module__", None) == module.__name__ and not (obj.__doc__ or "").strip():
+                    missing.append(f"{module.__name__}.{name}")
         self.assertEqual(missing, [], f"public functions missing docstrings: {missing}")
 
     def test_modules_have_docstrings(self):

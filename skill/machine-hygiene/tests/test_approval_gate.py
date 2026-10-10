@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Approval-gate refusal-path tests.
 

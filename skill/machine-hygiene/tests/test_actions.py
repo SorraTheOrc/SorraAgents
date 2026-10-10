@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Tests for machine-hygiene action execution and the evaluate.py orchestrator.
 

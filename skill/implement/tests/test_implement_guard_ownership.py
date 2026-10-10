@@ -25,7 +25,7 @@ if str(REPO_ROOT) in sys.path:
     sys.path.remove(str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT))
 
-from skill.implement.scripts import implement  # noqa: E402
+from skill.implement.scripts import implement
 
 
 def _guarded_result(commands, scope="full", *, success=True, mutation=None, failures=None):
