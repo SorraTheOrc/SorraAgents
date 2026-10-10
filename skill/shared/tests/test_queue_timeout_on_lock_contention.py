@@ -25,7 +25,7 @@ _SKILLS_ROOT_FOR_TESTS = REPO_ROOT / "skill"
 if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
     sys.path.append(str(_SKILLS_ROOT_FOR_TESTS))
 
-from shared.queue import ENV_LOCK_DIR, Priority, PriorityQueue, _queue_file
+from shared.queue import ENV_LOCK_DIR, Priority, PriorityQueue
 
 # ---------------------------------------------------------------------------
 # Fixtures
