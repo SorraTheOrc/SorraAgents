@@ -46,6 +46,32 @@ a delimited block in human mode.
     the gate. `phase_finish` treats a malformed extension as best-effort for
     the postfix hook (already-successful pushes are never failed by prose).
 
+## Key-Files-aware dirty-tree gate (SA-0MV0NSOGE000OSMR)
+
+`phase_start` defers its dirty-tree safety gate until after it has fetched the
+work item, so the relevance of a dirty **main checkout** can be judged against
+the description's Key Files section.
+
+- `classify_dirty_tree_relevance(status_output, description, expected_dirty=...)`
+  parses the Key Files section (any of `## Key Files`, `## Key Files
+  (predicted)` or `**Key Files:**`) and compares each dirty path against it.
+- A dirty path is treated as **relevant** when it equals, is a directory-prefix
+  ancestor/descendant of, or shares a basename with any Key Files entry
+  (`dirty_file_matches_key_files`). Matching errs toward relevant.
+- When the checkout is dirty and **no** dirty file is relevant, `phase_start`
+  proceeds, creates the worktree from `HEAD`, leaves the dirty files untouched,
+  records the decision and the exact paths in a work-item comment, and reports
+  `dirty_worktree: false` plus `dirty_worktree_left_behind`.
+- When any dirty file is relevant — or the description has **no** Key Files
+  section, so relevance cannot be judged — the gate keeps the original
+  abort-and-ask behaviour (`dirty_worktree: true`, exit code 2, status reset to
+  `open`).
+- The gate is **skipped entirely** when `phase_start` is invoked from inside a
+  linked worktree (detected by `_current_checkout_is_linked_worktree()`), e.g.
+  resuming a driven child: the dirty files there are the agent's own
+  in-progress work.
+- No stash, commit, or revert is ever performed on the dirty files.
+
 ## Why driven child sessions run with extensions disabled (SA-0MUY9PYBD009Y7J5)
 
 The ``implement.py drive`` child spawner (``_default_session_spawner``) builds

@@ -225,6 +225,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 2. Safety gate: handle dirty working tree
 
+`implement.py start` performs this gate automatically, after it fetches the
+work item; the agent does not need to create the worktree manually.
+
 - Run `git rev-parse --is-inside-work-tree` (worktree?) and
   `git status --porcelain=v1 -b` (uncommitted changes?).
 
@@ -234,11 +237,32 @@ without asking can strand that work and is forbidden. When uncommitted changes
 exist, STOP and ask the operator how to proceed (commit, stash, revert, or
 abort); act only after the operator explicitly chooses.
 
-- **Inside a worktree:** `.worklog/`-only → carry forward; otherwise stop and
-  ask the operator; never stash/commit/revert unilaterally.
-- **Main checkout:** `.worklog/`-only → carry forward; otherwise report the
-  dirty files (may be stale) and create a worktree for isolation without
-  touching the user's changes; if dirty files prevent worktree creation, stop
+`implement.py start` implements this rule as a **Key-Files-aware dirty-tree
+gate** (SA-0MV0NSOGE000OSMR). After fetching the work item it parses the
+description's Key Files section (any of `## Key Files`, `## Key Files
+(predicted)` or `**Key Files:**`) and compares every dirty path against those
+paths:
+
+- **Dirty files demonstrably irrelevant** (no overlap with Key Files): the
+  script proceeds, creates a clean worktree from `HEAD`, leaves the dirty
+  files untouched in the main checkout, logs the decision and the exact paths
+  left behind in a work-item comment, and reports `dirty_worktree: false`.
+  No operator intervention is required.
+- **Any dirty file overlaps Key Files, or no Key Files section is present**
+  (relevance cannot be judged): the script aborts with the original
+  operator-ask behaviour, resets the work item to `open`, and creates no
+  worktree. The agent must stop and ask the operator.
+
+The gate protects the **main checkout** only. When `implement.py start` is
+invoked from inside a linked worktree (e.g. resuming a driven child), the
+gate is skipped: any dirty files there are the agent's own in-progress work.
+
+- **Inside a worktree:** `.worklog/`-only → carry forward; otherwise resume
+  normally (the main-checkout gate is skipped); never stash/commit/revert
+  unilaterally.
+- **Main checkout:** `.worklog/`-only → carry forward; otherwise rely on the
+  Key-Files-aware gate above — it creates the worktree for isolation without
+  touching the user's changes. If dirty files prevent worktree creation, stop
   and ask the operator (act only on their explicit choice).
 - **Project-declared expected-dirty paths** (e.g. `.llm-wiki/`, declared via
   `.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`) do

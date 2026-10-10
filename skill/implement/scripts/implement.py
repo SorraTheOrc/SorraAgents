@@ -1067,6 +1067,201 @@ def git_has_dirty_files(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Dirty-tree relevance helpers (SA-0MV0NSOGE000OSMR)
+# ---------------------------------------------------------------------------
+
+
+def dirty_paths_from_status(
+    status_output: str,
+    expected_dirty: tuple[str, ...] = (),
+) -> list[str]:
+    """Return the dirty paths from porcelain status, excluding ``.worklog/``.
+
+    Mirrors the filtering used by :func:`git_has_dirty_files` so the paths
+    reported to the operator are exactly the ones that caused the gate to
+    trip. Renames are reduced to their destination path and project-declared
+    expected-dirty prefixes are ignored.
+    """
+    paths: list[str] = []
+    for line in status_output.splitlines():
+        if line.startswith("##") or not line.strip():
+            continue
+        file_path = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in file_path:
+            file_path = file_path.split(" -> ", 1)[1].strip()
+        if not file_path or file_path.startswith(".worklog/"):
+            continue
+        if _path_is_expected_dirty(file_path, expected_dirty):
+            continue
+        paths.append(file_path)
+    return paths
+
+
+# Matches ``## Key Files``, ``## Key Files (predicted)`` and the plan
+# helper's ``**Key Files:**`` form (SA-0MV0NSOGE000OSMR).
+_KEY_FILES_HEADING_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*Key Files.*|\*\*Key Files:?\*\*.*)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def extract_key_files_from_description(description: str) -> list[str]:
+    """Extract file paths from a work item description's Key Files section.
+
+    Handles the heading variants seen across real work items — ``## Key
+    Files``, ``## Key Files (predicted)`` and the plan helper's
+    ``**Key Files:**`` form. Returns an empty list when no Key Files section
+    is present; callers treat that as "relevance cannot be judged" and stay
+    conservative (SA-0MV0NSOGE000OSMR).
+    """
+    if not description:
+        return []
+    match = _KEY_FILES_HEADING_RE.search(description)
+    if not match:
+        return []
+    files: list[str] = []
+    for line in description[match.end():].splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # A further markdown heading, or a standalone bold section marker,
+        # ends the Key Files list.
+        if re.match(r"^#{1,6}\s", stripped) or (
+            stripped.startswith("**") and not stripped.startswith("- ")
+        ):
+            break
+        backtick = re.search(r"`([^`]+)`", stripped)
+        if backtick:
+            candidate = backtick.group(1).strip()
+        else:
+            bullet = re.match(r"^[-*]\s+(\S+)", stripped)
+            candidate = bullet.group(1) if bullet else ""
+        if candidate:
+            files.append(candidate)
+    return files
+
+
+def dirty_file_matches_key_files(dirty_path: str, key_files: list[str]) -> bool:
+    """True when *dirty_path* plausibly overlaps one of *key_files*.
+
+    Matching is deliberately generous (errs toward *relevant*, which keeps
+    the conservative abort) — equality, directory-prefix containment in
+    either direction, or a matching basename. This is agent-discretion
+    encoded as a simple, deterministic overlap check; it is not a whitelist
+    (SA-0MV0NSOGE000OSMR).
+    """
+    dirty = dirty_path.strip().lstrip("./")
+    if not dirty:
+        return False
+    dirty_base = os.path.basename(dirty.rstrip("/"))
+    for key in key_files:
+        candidate = key.strip().lstrip("./")
+        if not candidate:
+            continue
+        if dirty == candidate:
+            return True
+        if dirty.startswith(candidate.rstrip("/") + "/"):
+            return True
+        if candidate.startswith(dirty.rstrip("/") + "/"):
+            return True
+        if dirty_base and os.path.basename(candidate.rstrip("/")) == dirty_base:
+            return True
+    return False
+
+
+def classify_dirty_tree_relevance(
+    status_output: str,
+    description: str,
+    expected_dirty: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Decide whether a dirty main checkout can be safely left behind.
+
+    The start phase may proceed past the dirty-tree safety gate only when the
+    work item's description exposes a Key Files section *and* none of the
+    dirty files overlap those paths. When there is no Key Files section the
+    relevance of the dirty files cannot be judged, so the caller keeps the
+    conservative abort-and-ask behaviour (SA-0MV0NSOGE000OSMR).
+
+    Returns a dict with keys:
+        ``dirty`` (bool), ``dirty_files`` (list), ``key_files`` (list),
+        ``relevant_files`` (list), ``can_proceed`` (bool) and ``reason``
+        (human-readable explanation).
+    """
+    dirty_files = dirty_paths_from_status(status_output, expected_dirty)
+    key_files = extract_key_files_from_description(description)
+    relevant = [
+        path for path in dirty_files
+        if dirty_file_matches_key_files(path, key_files)
+    ]
+
+    if not dirty_files:
+        return {
+            "dirty": False,
+            "dirty_files": [],
+            "key_files": key_files,
+            "relevant_files": [],
+            "can_proceed": True,
+            "reason": "clean working tree",
+        }
+    if not key_files:
+        return {
+            "dirty": True,
+            "dirty_files": dirty_files,
+            "key_files": [],
+            "relevant_files": [],
+            "can_proceed": False,
+            "reason": (
+                "no Key Files section in the work item description — "
+                "cannot judge dirty-file relevance"
+            ),
+        }
+    if relevant:
+        return {
+            "dirty": True,
+            "dirty_files": dirty_files,
+            "key_files": key_files,
+            "relevant_files": relevant,
+            "can_proceed": False,
+            "reason": (
+                "dirty file(s) overlap the work item's Key Files: "
+                + ", ".join(relevant)
+            ),
+        }
+    return {
+        "dirty": True,
+        "dirty_files": dirty_files,
+        "key_files": key_files,
+        "relevant_files": [],
+        "can_proceed": True,
+        "reason": (
+            "dirty files do not overlap the work item's Key Files — "
+            "left untouched in the main checkout"
+        ),
+    }
+
+
+def _current_checkout_is_linked_worktree(cwd: str | None = None) -> bool:
+    """True when the current working tree is a linked git worktree.
+
+    A linked worktree has ``.git`` as a file (a gitdir pointer) rather than a
+    directory. The dirty-tree safety gate protects the *main checkout* — the
+    dirty files it leaves behind when forking a worktree — so it is skipped
+    when ``phase_start`` is invoked from inside a worktree (e.g. resuming a
+    driven child), where any dirty files are the agent's own in-progress work
+    (SA-0MV0NSOGE000OSMR).
+    """
+    result = run_cmd(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    return _is_worktree(Path(result.stdout.strip()))
+
+
 def _surface_extension_prose(
     extension: SkillExtension | None,
     which: str,
@@ -3346,11 +3541,12 @@ def phase_start(
             print(format_json_output(report))
         return report
 
-    # ── Step 4: Safety gate (dirty working tree) ───────────────────
-    # Load the project-local extension first: it supplies both the prose
-    # hooks and the project-scoped expected-dirty declaration honoured by the
-    # gate below (SA-0MUYEV5AO006V0HK). Absence is a no-op; malformed data
-    # fails loudly rather than silently changing the gate.
+    # ── Step 4: Load project-local extension ───────────────────────
+    # The extension supplies both the prose hooks and the project-scoped
+    # expected-dirty declaration honoured by the deferred dirty-tree safety
+    # gate below (SA-0MUYEV5AO006V0HK, SA-0MV0NSOGE000OSMR). Absence is a
+    # no-op; malformed data fails loudly rather than silently changing the
+    # gate.
     repo_root = _get_repo_root() or str(Path.cwd().resolve())
     try:
         extension = load_implement_extension(repo_root)
@@ -3372,39 +3568,6 @@ def phase_start(
         "present": extension is not None,
         "expected_dirty_paths": list(expected_dirty),
     }
-
-    LOG.info("Checking git working tree...")
-    status_output = git_status()
-    is_dirty = git_has_dirty_files(status_output, expected_dirty=expected_dirty)
-
-    if is_dirty:
-        msg = (
-            f"Dirty working tree detected. Uncommitted changes exist outside .worklog/.\n"
-            f"Do NOT stash, commit, or revert the user's uncommitted changes.\n"
-            f"STOP and ask the operator how to proceed (commit, stash, revert, or abort)\n"
-            f"— never touch the user's working tree without explicit permission.\n"
-            f"\nTo abort and release the work item, run:\n"
-            f"  python3 {Path(__file__).resolve()} abort {work_item_id}\n"
-            f"\nGit status:\n{status_output}"
-        )
-        LOG.warning("Dirty working tree:\n%s", status_output)
-        if not json_output:
-            print("\n⚠  Dirty working tree detected")
-            print("=" * 60)
-            print(status_output)
-            print("=" * 60)
-            print("Ask the operator how to proceed — do not stash, commit, or revert user changes without permission.\n")
-        report["success"] = False
-        report["message"] = msg
-        report["dirty_worktree"] = True
-        wl_add_comment(work_item_id, f"Start phase aborted: dirty working tree detected.\n```\n{status_output}\n```")
-        try:
-            StatusLifecycle.update_status(work_item_id, "open")
-        except RuntimeError:
-            LOG.error("Failed to reset work item %s status to open", work_item_id)
-        if json_output:
-            print(format_json_output(report))
-        return report
 
     # ── Step 5: Stash hygiene gate (warn on orphaned stashes) ─────
     LOG.info("Checking for orphaned stashes...")
@@ -3459,6 +3622,104 @@ def phase_start(
 
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
+
+    # ── Step 6.05: Safety gate (dirty working tree, Key-Files-aware) ──
+    # Deferred until after the work item is fetched so a dirty main checkout
+    # can be judged against the description's Key Files section
+    # (SA-0MV0NSOGE000OSMR). When the checkout is dirty but every dirty path
+    # is demonstrably irrelevant to those Key Files, proceed to create a
+    # clean worktree from HEAD and leave the dirty files untouched in the
+    # main checkout. Anything uncertain — no Key Files section, or any
+    # overlap — keeps the original abort-and-ask behaviour. The gate protects
+    # the main checkout only: when invoked from inside a linked worktree
+    # (e.g. resuming a driven child) it is skipped.
+    if _current_checkout_is_linked_worktree():
+        LOG.info(
+            "Inside a linked worktree — skipping the main-checkout dirty-tree gate."
+        )
+        status_output = ""
+        dirty_decision = {
+            "dirty": False,
+            "dirty_files": [],
+            "key_files": [],
+            "relevant_files": [],
+            "can_proceed": True,
+            "reason": "inside a linked worktree",
+        }
+    else:
+        LOG.info("Checking git working tree...")
+        status_output = git_status()
+        dirty_decision = classify_dirty_tree_relevance(
+            status_output,
+            work_item.get("description", ""),
+            expected_dirty=expected_dirty,
+        )
+    report["dirty_decision"] = {
+        "dirty": dirty_decision["dirty"],
+        "dirty_files": dirty_decision["dirty_files"],
+        "key_files": dirty_decision["key_files"],
+        "relevant_files": dirty_decision["relevant_files"],
+        "can_proceed": dirty_decision["can_proceed"],
+        "reason": dirty_decision["reason"],
+    }
+
+    if dirty_decision["dirty"] and not dirty_decision["can_proceed"]:
+        msg = (
+            f"Dirty working tree detected. Uncommitted changes exist outside .worklog/.\n"
+            f"Do NOT stash, commit, or revert the user's uncommitted changes.\n"
+            f"STOP and ask the operator how to proceed (commit, stash, revert, or abort)\n"
+            f"— never touch the user's working tree without explicit permission.\n"
+            f"Reason: {dirty_decision['reason']}.\n"
+            f"\nTo abort and release the work item, run:\n"
+            f"  python3 {Path(__file__).resolve()} abort {work_item_id}\n"
+            f"\nGit status:\n{status_output}"
+        )
+        LOG.warning("Dirty working tree:\n%s", status_output)
+        if not json_output:
+            print("\n⚠  Dirty working tree detected")
+            print("=" * 60)
+            print(status_output)
+            print("=" * 60)
+            print("Ask the operator how to proceed — do not stash, commit, or revert user changes without permission.\n")
+        report["success"] = False
+        report["message"] = msg
+        report["dirty_worktree"] = True
+        wl_add_comment(work_item_id, f"Start phase aborted: dirty working tree detected.\n```\n{status_output}\n```")
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        return report
+
+    if dirty_decision["dirty"]:
+        # Irrelevant dirty files: record the decision and the untouched paths
+        # for auditability, then continue to create a clean worktree from HEAD
+        # (AC1/AC4). No stash, commit, or revert is performed.
+        LOG.warning(
+            "Dirty working tree left untouched (files will not affect this work): %s",
+            ", ".join(dirty_decision["dirty_files"]),
+        )
+        if not json_output:
+            print("\nℹ  Dirty working tree left untouched — proceeding with a clean worktree")
+            print("=" * 60)
+            for path in dirty_decision["dirty_files"]:
+                print(f"  • {path}")
+            print(f"  Reason: {dirty_decision['reason']}")
+            print("=" * 60)
+        report["dirty_worktree"] = False
+        report["dirty_worktree_left_behind"] = dirty_decision["dirty_files"]
+        dirty_list = "\n".join(
+            f"- `{path}`" for path in dirty_decision["dirty_files"]
+        )
+        wl_add_comment(
+            work_item_id,
+            "Start phase: dirty main checkout left untouched — proceeding to "
+            "create a clean worktree from HEAD.\n"
+            f"Reason: {dirty_decision['reason']}\n"
+            f"Dirty files left behind in the main checkout:\n{dirty_list}",
+        )
 
     # ── Step 6.1: Check risk/effort estimates — evaluate if missing ────
     # (SA-0MTTSWHQE0072N9J) plan_complete items without risk/effort now
