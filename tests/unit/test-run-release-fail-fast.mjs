@@ -24,7 +24,8 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
@@ -61,10 +62,23 @@ const DEP_FILES = [
  *
  * @returns {{ tmpDir: string, runReleasePath: string, logs: object }}
  */
-function buildLayout() {
+function buildLayout(opts = {}) {
   const tmpDir = mkdtempSync(join(tmpdir(), 'run-release-failfast-'));
   const skillScriptDir = join(tmpDir, 'skill', 'ship', 'scripts');
   mkdirSync(skillScriptDir, { recursive: true });
+
+  // Point the resolved Discord webhook at a caller-supplied loopback URL so a
+  // test can observe whether a notification POST is attempted. Written to
+  // <projectRoot>/.worklog/config.yaml — the second of the three layers
+  // resolveDiscordWebhookUrl() consults (after config.private.yaml).
+  if (opts.webhookUrl) {
+    const worklogDir = join(tmpDir, '.worklog');
+    mkdirSync(worklogDir, { recursive: true });
+    writeFileSync(
+      join(worklogDir, 'config.yaml'),
+      `discord:\n  webhook_url: ${opts.webhookUrl}\n`,
+    );
+  }
 
   writeFileSync(join(skillScriptDir, 'run-release.js'), readFileSync(join(SKILL_SCRIPTS, 'run-release.js'), 'utf8'));
   for (const dep of DEP_FILES) {
@@ -145,7 +159,7 @@ esac
  * @returns {{ status: number|null, stdout: string, stderr: string, read: Function }}
  */
 function runWrapper(args, opts = {}) {
-  const { tmpDir, runReleasePath, binDir, logs } = buildLayout();
+  const { tmpDir, runReleasePath, binDir, logs } = buildLayout(opts);
   const res = spawnSync(process.execPath, [runReleasePath, ...args], {
     cwd: tmpDir,
     encoding: 'utf-8',
@@ -176,6 +190,84 @@ function runWrapper(args, opts = {}) {
 }
 
 const combined = (res) => `${res.stdout}\n${res.stderr}`;
+
+/**
+ * Start a throwaway loopback HTTP server that records every request it
+ * receives, standing in for the Discord webhook endpoint.
+ *
+ * Notification tests must use the async `runWrapperAsync` spawner rather than
+ * `runWrapper`: `spawnSync` blocks the event loop, so an in-process server
+ * could never accept a request (a real POST would look like a miss).
+ *
+ * @returns {Promise<{url: string, hits: object[], close: Function}>}
+ */
+function startNotifyServer() {
+  const hits = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      hits.push({ method: req.method, url: req.url, body });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      resolve({
+        url: `http://127.0.0.1:${port}/webhook`,
+        hits,
+        close: () => new Promise((done) => server.close(done)),
+      });
+    });
+  });
+}
+
+/**
+ * Async sibling of `runWrapper` that spawns the wrapper without blocking the
+ * event loop, so an in-process webhook server can record notification POSTs.
+ *
+ * @param {string[]} args - CLI args passed to run-release.js.
+ * @param {object} [opts] - Same options as `runWrapper`, plus `webhookUrl`.
+ * @returns {Promise<object>} `{ status, stdout, stderr, readGit, ... }`.
+ */
+function runWrapperAsync(args, opts = {}) {
+  const { tmpDir, runReleasePath, binDir, logs } = buildLayout(opts);
+  const child = spawn(process.execPath, [runReleasePath, ...args], {
+    cwd: tmpDir,
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH}`,
+      MOCK_TOPLVL: tmpDir,
+      GIT_LOG: logs.git,
+      WL_LOG: logs.wl,
+      WL_CLOSE_LOG: logs.close,
+      MERGE_LOG: logs.merge,
+      GIT_DESCRIBE: opts.gitDescribe || 'v0.1.18',
+      GIT_TAGS: opts.gitTags || '',
+      GIT_TAG_LIST_FAIL: opts.tagListFails ? '1' : '',
+    },
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  return new Promise((resolve) => {
+    child.on('close', (status) => {
+      const read = (path) => (existsSync(path) ? readFileSync(path, 'utf-8').trim() : '');
+      resolve({
+        status,
+        stdout,
+        stderr,
+        readGit: () => read(logs.git),
+        readWl: () => read(logs.wl),
+        readClose: () => read(logs.close),
+        readMerge: () => read(logs.merge),
+      });
+    });
+  });
+}
 
 // ── Unit tests: parseReleaseArgs ─────────────────────────────────────────────
 
@@ -347,5 +439,120 @@ describe('run-release: post-release gated on a newly created tag', () => {
     });
     assert.notEqual(res.status, 0, 'an unavailable tag snapshot must not exit 0');
     assert.equal(res.readClose(), '', 'no work items may be closed without a tag snapshot');
+  });
+});
+
+// ── Integration: fail-fast paths never reach the Discord notification ────────
+// Parent AC4 (SA-0MV0PZYMI004SUFR): with `--help` and with a bogus flag the
+// wrapper must produce zero side effects, explicitly including *no*
+// `sendReleaseNotification` call. These tests drive the real wrapper (with a
+// mocked git/wl/gh and a recording merge script) against a live loopback
+// webhook server and assert on the POSTs it actually receives — so a
+// regression that reconnects the post-release tail after a fail-fast path is
+// caught, not merely inferred from logs.
+
+describe('run-release: fail-fast paths do not notify Discord', () => {
+  test('a genuinely new release POSTs to the webhook (positive control)', async () => {
+    const server = await startNotifyServer();
+    try {
+      const res = await runWrapperAsync(['--skip-checks'], {
+        gitTags: 'v0.1.18\nv0.1.17',
+        gitDescribe: 'v0.2.0',
+        webhookUrl: server.url,
+      });
+      assert.equal(res.status, 0, `expected a clean exit, got ${res.status}\n${combined(res)}`);
+      assert.equal(
+        server.hits.length,
+        1,
+        'a genuine release must POST exactly one Discord notification',
+      );
+      assert.match(
+        res.stdout,
+        /Discord release notification sent for v0\.2\.0/,
+        `expected a notification-sent log, got:\n${combined(res)}`,
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('--help never POSTs to the Discord webhook', async () => {
+    const server = await startNotifyServer();
+    try {
+      const res = await runWrapperAsync(['--help'], { webhookUrl: server.url });
+      assert.equal(res.status, 0, `expected exit 0, got ${res.status}\n${combined(res)}`);
+      assert.match(res.stdout, /Usage:/);
+      assert.equal(
+        server.hits.length,
+        0,
+        'no Discord notification may be sent for --help',
+      );
+      assert.doesNotMatch(
+        combined(res),
+        /Discord release notification/,
+        'sendReleaseNotification must not even be attempted for --help',
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('-h never POSTs to the Discord webhook', async () => {
+    const server = await startNotifyServer();
+    try {
+      const res = await runWrapperAsync(['-h'], { webhookUrl: server.url });
+      assert.equal(res.status, 0, `expected exit 0, got ${res.status}\n${combined(res)}`);
+      assert.equal(
+        server.hits.length,
+        0,
+        'no Discord notification may be sent for -h',
+      );
+      assert.doesNotMatch(
+        combined(res),
+        /Discord release notification/,
+        'sendReleaseNotification must not even be attempted for -h',
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('a bogus flag never POSTs to the Discord webhook', async () => {
+    const server = await startNotifyServer();
+    try {
+      const res = await runWrapperAsync(['--nope'], { webhookUrl: server.url });
+      assert.notEqual(res.status, 0, 'bogus flag must exit non-zero');
+      assert.equal(
+        server.hits.length,
+        0,
+        'no Discord notification may be sent for a bogus flag',
+      );
+      assert.doesNotMatch(
+        combined(res),
+        /Discord release notification/,
+        'sendReleaseNotification must not even be attempted for a bogus flag',
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('a stale tag never POSTs to the Discord webhook', async () => {
+    const server = await startNotifyServer();
+    try {
+      const res = await runWrapperAsync(['--skip-checks'], {
+        gitTags: 'v0.1.18\nv0.1.17',
+        gitDescribe: 'v0.1.18',
+        webhookUrl: server.url,
+      });
+      assert.notEqual(res.status, 0, 'stale tag must not exit 0');
+      assert.equal(
+        server.hits.length,
+        0,
+        'no Discord notification may be sent for a stale tag',
+      );
+    } finally {
+      await server.close();
+    }
   });
 });
