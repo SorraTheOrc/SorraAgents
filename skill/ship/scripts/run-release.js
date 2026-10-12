@@ -497,6 +497,42 @@ export function getParentAudit(itemId) {
   }
 }
 
+// ── close-state verification helpers (SA-0MUXA5ZNZ0019QY5) ──────────────────
+
+/**
+ * Terminal lifecycle for a closed work item: `status === "completed"` and
+ * `stage === "done"`.
+ *
+ * @param {{status: string|null, stage: string|null}|null} lifecycle
+ * @returns {boolean}
+ */
+function isTerminalCloseState(lifecycle) {
+  return !!lifecycle
+    && lifecycle.status === 'completed'
+    && lifecycle.stage === 'done';
+}
+
+/**
+ * Read a just-closed item's persisted lifecycle via the injectable verification
+ * boundary.
+ *
+ * Fail-safe: a throwing boundary or a `null` result resolves to `null`, which
+ * {@link isTerminalCloseState} treats as unverified/unclosed — the close step
+ * never counts an unreadable item as closed (SA-0MUXA5ZNZ0019QY5).
+ *
+ * @param {(itemId: string) => ({status: string|null, stage: string|null}|null)} getCloseStateFn
+ * @param {string} itemId
+ * @returns {{status: string|null, stage: string|null}|null}
+ */
+function readCloseState(getCloseStateFn, itemId) {
+  try {
+    return getCloseStateFn(itemId);
+  } catch (err) {
+    console.warn(`  ⚠ Could not verify close state for ${itemId}: ${err.message}`);
+    return null;
+  }
+}
+
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
@@ -519,7 +555,8 @@ export function getParentAudit(itemId) {
  * Test-isolation note (SA-0MSJ2XMQL006CVQS): callers MUST NOT invoke this
  * function with the default worklog boundary unless a real, verified release
  * is in progress — the release flow gates the call behind `verifyReleaseMerge()`
- * (Step 8). Unit tests inject `getCandidateItemsFn`/`runCloseCommand` so the
+ * (Step 8). Unit tests inject `getCandidateItemsFn`/`runCloseCommand`/
+ * `getCloseStateFn` so the
  * test suite never mutates the live worklog.
  *
  * @param {string|null} version - The released semver version (e.g., "0.2.0").
@@ -556,10 +593,17 @@ export function getParentAudit(itemId) {
  * @param {(childId: string, parentId: string, auditTimestamp: string|null) => void} [options.runCascadeCommand] -
  *   Cascades one descendant to `status=completed, stage=done` and records the
  *   explanatory comment; defaults to `wl update` + `wl comment add`.
+ * @param {(itemId: string) => ({status: string|null, stage: string|null}|null)} [options.getCloseStateFn] -
+ *   Post-close verification read boundary. After each attempted close the
+ *   item's persisted lifecycle is re-read and the item is counted as closed
+ *   ONLY when `status === "completed"` AND `stage === "done"`; an item that
+ *   exits 0 but did not persist is retried once and then reported in
+ *   `unclosedItems` (SA-0MUXA5ZNZ0019QY5). Defaults to {@link getItemLifecycle}.
+ *   A throwing/`null` read is fail-safe: the item is treated as unclosed.
  * @param {boolean} [options.dryRun=false] - When true, intended child
  *   overrides and cascades are reported but no `wl` mutation is performed
  *   (AC4).
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, unclosedCount: number, unclosedItems: Array<{id: string, title: string, reason: string}>, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -570,6 +614,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     ),
     getDescendantsFn = getDescendants,
     getItemLifecycleFn = getItemLifecycle,
+    getCloseStateFn = getItemLifecycle,
     getAncestorAuditFn = (item) => resolveCandidateCoverage(item),
     runOverrideCommand = (childId, ancestorId, reason) => {
       execSync(
@@ -605,6 +650,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       message: 'No version provided; skipping close work items step.',
       closedCount: 0,
       errorCount: 0,
+      unclosedCount: 0,
+      unclosedItems: [],
       skippedCount: 0,
       skippedItems: [],
       overriddenCount: 0,
@@ -629,6 +676,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       message,
       closedCount: 0,
       errorCount: 0,
+      unclosedCount: 0,
+      unclosedItems: [],
       skippedCount: 0,
       skippedItems: [],
       overriddenCount: 0,
@@ -872,6 +921,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       message,
       closedCount: 0,
       errorCount: 0,
+      unclosedCount: 0,
+      unclosedItems: [],
       skippedCount: skippedItems.length,
       skippedItems,
       overriddenCount: overriddenItems.length,
@@ -889,6 +940,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   let closedCount = 0;
   let errorCount = 0;
   const errors = [];
+  const unclosedItems = [];
 
   for (const item of closable) {
     if (dryRun) {
@@ -899,8 +951,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       );
       continue;
     }
+    const reason = `Shipped in v${version}`;
     try {
-      const reason = `Shipped in v${version}`;
       // --force: the audit gate (Step 2) already verified audit readiness for
       // every candidate, so the close step may bypass the per-item stage/audit
       // re-check. Without it, a parent whose descendant is stuck in a
@@ -908,24 +960,76 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       // to close recursively, leaving items dangling after the release
       // (SA-0MSAL2NQV0008HY5).
       runCloseCommand(item.id, reason);
-      console.log(`  ✓ ${item.title || item.id} — closed with reason: "${reason}"`);
-      closedCount++;
     } catch (err) {
       const errorMsg = err.stderr?.toString()?.trim() || err.message;
       console.warn(`  ⚠ Failed to close ${item.id} (${item.title}): ${errorMsg}`);
       errors.push({ id: item.id, title: item.title, error: errorMsg });
       errorCount++;
+      continue;
+    }
+
+    // Verify the close persisted (SA-0MUXA5ZNZ0019QY5). A `wl close` can exit
+    // 0 yet lose the update to the concurrent-`wl sync` lost-update race
+    // (WL-0MUXA5RI2009EUTJ); only a re-read of persisted state proves the item
+    // reached the terminal `completed`/`done` lifecycle.
+    let lifecycle = readCloseState(getCloseStateFn, item.id);
+    if (!isTerminalCloseState(lifecycle)) {
+      // Bounded retry (exactly one): a transient lost close is re-issued and
+      // re-verified before being reported unclosed.
+      console.warn(
+        `  ↻ Close of ${item.id} did not persist `
+        + `(status=${lifecycle?.status ?? 'null'}, stage=${lifecycle?.stage ?? 'null'}); retrying once...`,
+      );
+      try {
+        runCloseCommand(item.id, reason);
+      } catch (err) {
+        const errorMsg = err.stderr?.toString()?.trim() || err.message;
+        console.warn(`  ⚠ Retry failed to close ${item.id} (${item.title}): ${errorMsg}`);
+        errors.push({ id: item.id, title: item.title, error: errorMsg });
+        errorCount++;
+        continue;
+      }
+      lifecycle = readCloseState(getCloseStateFn, item.id);
+    }
+
+    if (isTerminalCloseState(lifecycle)) {
+      console.log(`  ✓ ${item.title || item.id} — closed with reason: "${reason}"`);
+      closedCount++;
+    } else {
+      // Fail-safe: never count an unverified close as closed. Report the item
+      // by id so a lost close is visible instead of silently claimed.
+      const detail = lifecycle
+        ? `status=${lifecycle.status}, stage=${lifecycle.stage}`
+        : 'state unreadable';
+      const unclosedReason = `Attempted close did not persist (${detail})`;
+      console.warn(`  ⚠ ${item.title || item.id} (${item.id}) — ${unclosedReason}`);
+      unclosedItems.push({
+        id: item.id,
+        title: item.title,
+        reason: unclosedReason,
+      });
     }
   }
 
+  const unclosedCount = unclosedItems.length;
   let summary;
   if (dryRun) {
     summary = `Dry-run: ${closable.length} work item(s) would be closed`
       + ` (${overriddenItems.length} child override(s) planned).`;
-  } else if (errorCount === 0) {
+  } else if (errorCount === 0 && unclosedCount === 0) {
     summary = `All ${closedCount} work item(s) closed successfully.`;
   } else {
-    summary = `Closed ${closedCount} work item(s); ${errorCount} error(s) (non-fatal).`;
+    const parts = [`Closed ${closedCount} work item(s)`];
+    if (errorCount > 0) {
+      parts.push(`${errorCount} error(s) (non-fatal)`);
+    }
+    if (unclosedCount > 0) {
+      parts.push(
+        `${unclosedCount} attempted close(s) did not persist `
+        + `(unclosed: ${unclosedItems.map((i) => i.id).join(', ')})`,
+      );
+    }
+    summary = `${parts.join('; ')}.`;
   }
 
   if (skippedItems.length > 0) {
@@ -944,12 +1048,14 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   console.log(`\n${summary}`);
 
   return {
-    success: errorCount === 0,
+    success: errorCount === 0 && unclosedCount === 0,
     message: errors.length > 0
       ? `${summary}\nErrors: ${errors.map(e => `${e.id}: ${e.error}`).join('; ')}`
       : summary,
     closedCount,
     errorCount,
+    unclosedCount,
+    unclosedItems,
     skippedCount: skippedItems.length,
     skippedItems,
     overriddenCount: overriddenItems.length,
@@ -1686,7 +1792,8 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     // ── Step 9: Close work items shipped in this release (non-blocking) ──
     startStep('Step 9: close work items');
     const closeResult = closeWorkItemsAfterRelease(version, { dryRun: isDryRun });
-    if (!closeResult.success && closeResult.errorCount > 0) {
+    if (!closeResult.success
+        && (closeResult.errorCount > 0 || closeResult.unclosedCount > 0)) {
       console.warn(`\n⚠ Non-critical: ${closeResult.message}`);
     }
     stepTimers['Step 9: close work items'].stop();

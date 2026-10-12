@@ -326,6 +326,9 @@ describe('closeWorkItemsAfterRelease - child override', () => {
         overrides.push({ childId, ancestorId, reason });
       },
       runCloseCommand: (itemId) => { closes.push(itemId); },
+      // Verification boundary injected so the suite never hits the live
+      // worklog (SA-0MUXA5ZNZ0019QY5 / SA-0MSJ2XMQL006CVQS).
+      getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
     });
 
     assert.deepEqual(
@@ -359,6 +362,7 @@ describe('closeWorkItemsAfterRelease - child override', () => {
       getAncestorAuditFn: () => ({ outcome: 'uncovered', ancestorId: 'SA-P1' }),
       runOverrideCommand: (childId) => { overrides.push(childId); },
       runCloseCommand: (itemId) => { closes.push(itemId); },
+      getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
     });
 
     assert.equal(overrides.length, 0, 'no override may be performed without a passing parent audit');

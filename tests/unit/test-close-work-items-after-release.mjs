@@ -118,6 +118,7 @@ test('close-work-items: closes only needsProducerReview=false candidates', async
       closed.push({ itemId, reason });
     },
     getDescendantsFn: () => [],
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
   });
 
   assert.deepEqual(
@@ -155,6 +156,7 @@ test('close-work-items: reports close failures without aborting the sweep', asyn
       }
     },
     getDescendantsFn: () => [],
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
   });
 
   assert.equal(result.closedCount, 1);
@@ -239,6 +241,7 @@ test('close-work-items: refuses to force-close a candidate with collateral desce
     // No passing parent audit here, so the fallback cascade must not fire.
     getParentAuditFn: () => ({ readyToClose: false, auditedAt: null }),
     runCloseCommand: (itemId) => { closed.push(itemId); },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
   });
 
   assert.deepEqual(closed, ['SA-CHILD'], 'only the collateral-free candidate is closed');
@@ -257,6 +260,7 @@ test('close-work-items: force-closes a candidate whose descendants are all candi
     ],
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-CHILD'] : []),
     runCloseCommand: (itemId) => { closed.push(itemId); },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
   });
 
   assert.ok(closed.includes('SA-PARENT'), 'a fully in-set subtree is closed');
@@ -283,6 +287,7 @@ test('close-work-items: closes a parent whose descendants are all terminal', asy
       return null;
     },
     runCloseCommand: (itemId) => { closed.push(itemId); },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
   });
 
   assert.deepEqual(closed, ['SA-PARENT'],
@@ -449,6 +454,7 @@ test('close-work-items: cascades non-terminal descendants of an audit-ready pare
       cascaded.push({ childId, parentId, auditTimestamp });
     },
     runCloseCommand: (itemId) => { closed.push(itemId); },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
   });
 
   assert.deepEqual(
@@ -562,6 +568,7 @@ test('close-work-items: already-terminal descendants are never cascaded', async 
     getParentAuditFn: AUDIT_READY(),
     runCascadeCommand: (childId) => { cascaded.push(childId); },
     runCloseCommand: (itemId) => { closed.push(itemId); },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
   });
 
   assert.deepEqual(cascaded, [],
@@ -673,6 +680,12 @@ case "$1" in
       echo '{"success":true,"workItems":[]}'
     fi
     ;;
+  show)
+    # getDescendants() reads children; the close-state verification reads the
+    # persisted lifecycle. Report every mock item as terminal so a successful
+    # wl close verifies without triggering a retry (SA-0MUXA5ZNZ0019QY5).
+    echo '{"success":true,"workItem":{"id":"'"$2"'","status":"completed","stage":"done"},"children":[]}'
+    ;;
   close)
     echo "$@" >> "$WL_CLOSE_LOG"
     echo '{"success":true}'
@@ -711,4 +724,172 @@ console.log(JSON.stringify(result));
       `wl close should include --force (single-pass close, AC3), got: ${line}`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// SA-0MUXA5ZNZ0019QY5: verify persisted close state, bounded retry, and report
+// unclosed items. A `wl close` can exit 0 yet lose the update to the
+// concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ), so the close
+// step re-reads persisted state via the injectable `getCloseStateFn` boundary
+// instead of trusting the exit code. Every test here injects the boundary so
+// the suite never touches the live worklog.
+// ---------------------------------------------------------------------------
+const CLOSED_STATE = () => ({ status: 'completed', stage: 'done' });
+const UNCLOSED_STATE = () => ({ status: 'completed', stage: 'in_review' });
+
+test('close-verify: all closes persist -> success with no unclosed items', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closes = [];
+  const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-A', title: 'A', needsProducerReview: false },
+      { id: 'SA-B', title: 'B', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: (itemId) => { closes.push(itemId); },
+    getCloseStateFn: CLOSED_STATE,
+  });
+
+  assert.deepEqual(closes.slice().sort(), ['SA-A', 'SA-B'], 'each candidate is closed once');
+  assert.equal(result.closedCount, 2);
+  assert.equal(result.unclosedCount, 0);
+  assert.deepEqual(result.unclosedItems, []);
+  assert.equal(result.success, true);
+  assert.match(result.message, /All 2 work item\(s\) closed successfully/);
+});
+
+test('close-verify: a no-op close (exit 0, state unchanged) is retried then reported unclosed', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closes = [];
+  const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-OK', title: 'OK', needsProducerReview: false },
+      { id: 'SA-LOST', title: 'Lost', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: (itemId) => { closes.push(itemId); },
+    getCloseStateFn: (id) => (id === 'SA-OK'
+      ? { status: 'completed', stage: 'done' }
+      : { status: 'completed', stage: 'in_review' }),
+  });
+
+  assert.equal(
+    closes.filter((id) => id === 'SA-LOST').length,
+    2,
+    'the lost close must be retried exactly once',
+  );
+  assert.equal(
+    closes.filter((id) => id === 'SA-OK').length,
+    1,
+    'a persisted close must not be retried',
+  );
+  assert.equal(result.closedCount, 1);
+  assert.equal(result.unclosedCount, 1);
+  assert.equal(result.unclosedItems[0].id, 'SA-LOST');
+  assert.equal(result.success, false);
+  assert.ok(result.message.includes('SA-LOST'), 'message must name the unclosed item');
+  assert.ok(
+    !/All \d+ work item\(s\) closed successfully/.test(result.message),
+    'must never claim blanket success when a close did not persist',
+  );
+});
+
+test('close-verify: a retry that re-persists reports the item closed', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closes = [];
+  let reads = 0;
+  const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-FLAKY', title: 'Flaky', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: (itemId) => { closes.push(itemId); },
+    getCloseStateFn: () => {
+      reads++;
+      // First verification is a lost read; the post-retry read is terminal.
+      return reads === 1
+        ? { status: 'in_review', stage: 'in_review' }
+        : { status: 'completed', stage: 'done' };
+    },
+  });
+
+  assert.equal(closes.length, 2, 'the close must be retried once');
+  assert.equal(result.closedCount, 1);
+  assert.equal(result.unclosedCount, 0);
+  assert.equal(result.success, true);
+});
+
+test('close-verify: an unreadable/null verification state is unclosed (fail-safe)', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-UNREADABLE', title: 'Unreadable', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: () => {},
+    getCloseStateFn: () => null,
+  });
+
+  assert.equal(result.closedCount, 0);
+  assert.equal(result.unclosedCount, 1);
+  assert.equal(result.success, false);
+  assert.equal(result.unclosedItems[0].id, 'SA-UNREADABLE');
+});
+
+test('close-verify: a throwing verification boundary is unclosed (fail-safe)', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-THROW', title: 'Throw', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: () => {},
+    getCloseStateFn: () => { throw new Error('wl show timeout'); },
+  });
+
+  assert.equal(result.closedCount, 0);
+  assert.equal(result.unclosedCount, 1);
+  assert.equal(result.success, false);
+});
+
+test('close-verify: dry-run neither closes nor verifies', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closes = [];
+  let verified = 0;
+  const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    dryRun: true,
+    getCandidateItemsFn: () => [
+      { id: 'SA-DRY', title: 'Dry', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: () => { closes.push('x'); },
+    getCloseStateFn: () => { verified++; return { status: 'completed', stage: 'done' }; },
+  });
+
+  assert.equal(closes.length, 0, 'dry-run must not close');
+  assert.equal(verified, 0, 'dry-run must not verify');
+  assert.equal(result.unclosedCount, 0);
+  assert.equal(result.dryRun, true);
+});
+
+test('close-verify: unclosed items never contribute to closedCount', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    getCandidateItemsFn: () => [
+      { id: 'SA-P1', title: 'Persists', needsProducerReview: false },
+      { id: 'SA-L1', title: 'Lost One', needsProducerReview: false },
+      { id: 'SA-L2', title: 'Lost Two', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: () => {},
+    getCloseStateFn: (id) => (id === 'SA-P1' ? CLOSED_STATE() : UNCLOSED_STATE()),
+  });
+
+  assert.equal(result.closedCount, 1, 'only the persisted close counts as closed');
+  assert.equal(result.unclosedCount, 2);
+  assert.deepEqual(
+    result.unclosedItems.map((i) => i.id).sort(),
+    ['SA-L1', 'SA-L2'],
+    'every unclosed item is listed by id',
+  );
 });

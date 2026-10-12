@@ -207,7 +207,7 @@ Steps:
    If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
    **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** before this step, `snapshotReleaseTags()` captures the pre-run tag list; `isNewlyCreatedTag(version, preRunTags)` requires `v<version>` to be absent from it. A stale tag (or an unreadable snapshot) aborts with **exit code 14** and runs no post-release step, so an old reachable tag read by `git describe` can never trigger a close.
 10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
-11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures.
+11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures. **Close verification (SA-0MUXA5ZNZ0019QY5):** every attempted close is re-read through the injectable `getCloseStateFn` boundary (default `getItemLifecycle`); an item is counted as closed only when the persisted lifecycle is `status: completed` **and** `stage: done`. A close that exits 0 but does not persist — the concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried exactly once and re-verified; if still not terminal (or the read throws/returns `null` — fail-safe) the item is listed in `unclosedCount`/`unclosedItems`, `success` is `false`, and the summary never claims blanket success. The step remains non-blocking.
 
 ### Child producer-review override (close step)
 
@@ -225,11 +225,19 @@ boundaries (all hermetic-test friendly):
   posts the explanatory comment (defaults to `wl update <child>
   --needs-producer-review false` + `wl comment add <child> ...`).
 - `runCloseCommand(itemId, reason)` — closes a candidate.
+- `getCloseStateFn(itemId)` — post-close verification boundary; re-reads the
+  item's persisted `{status, stage}` and defaults to `getItemLifecycle` (a live
+  `wl show`). An item counts as closed only when `status === "completed"` and
+  `stage === "done"`; an exit-0-but-unpersisted close is retried once, then
+  reported in `unclosedItems` (SA-0MUXA5ZNZ0019QY5). A throwing/`null` read is
+  fail-safe (treated as unclosed). Tests must inject this boundary so the suite
+  never reads the live worklog.
 - `dryRun` — when true, planned overrides/closes are reported but no mutation
   is performed.
 
 The result includes `overriddenCount` / `overriddenItems` so the planned
-overrides are auditable.
+overrides are auditable, and `unclosedCount` / `unclosedItems` so a close that
+failed to persist is visible by id rather than silently counted as a success.
 
 ### Discord release notification
 

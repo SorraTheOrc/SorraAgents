@@ -436,6 +436,19 @@ This closes the gap left by audits recorded **outside** the audit runner
 Result/return fields: `cascadedCount` and `cascadedItems`
 (`{id, ancestorId, auditTimestamp}`).
 
+### Ship-side close verification (SA-0MUXA5ZNZ0019QY5)
+
+The close step does not trust the `wl close` exit code. After each attempted
+close it re-reads the item's persisted lifecycle through the injectable
+`getCloseStateFn` boundary (default `getItemLifecycle`, a live `wl show`) and
+counts the item as closed only when `status === "completed"` **and**
+`stage === "done"`. A close that exits 0 but does not persist — the
+concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried
+exactly once and re-verified; if it is still not terminal (or the state read
+throws/returns `null` — fail-safe) the item is reported in `unclosedCount` /
+`unclosedItems` (`{id, title, reason}`) by id and `success` is `false`, so the
+release summary never claims blanket success. The step remains non-blocking.
+
 ## Scripts
 
 - **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`

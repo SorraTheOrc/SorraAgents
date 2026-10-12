@@ -148,6 +148,12 @@ case "$1" in
       echo '{"success":true,"workItems":[]}'
     fi
     ;;
+  show)
+    # getDescendants() reads children; the close-state verification reads the
+    # persisted lifecycle. Report every mock item as terminal so a successful
+    # wl close verifies without a retry (SA-0MUXA5ZNZ0019QY5).
+    echo '{"success":true,"workItem":{"id":"'"$2"'","status":"completed","stage":"done"},"children":[]}'
+    ;;
   close)
     echo "$@" >> "$WL_CLOSE_LOG"
     echo '{"success":true}'
