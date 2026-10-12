@@ -144,6 +144,59 @@ that must never overlap another suite's browser stage should set
 file). Slot-file pruning beyond the ceiling is tracked separately
 (ContextHub WL-0MUL1DSEF004IJU9).
 
+### 0.6. Nested-run isolation (SA-0MUY6U05F008RG86)
+
+A full-suite run holds a host-wide `"test"` semaphore slot for its whole
+duration. Any test running inside it that invokes `run_tests.py` again —
+in-process (`rt.main(...)`) or as a subprocess — is a **nested run**. If the
+nested run acquires the same host-wide namespace, it queues behind the very
+slot its own outer run holds; with two concurrent full suites and
+`TEST_MAX_CONCURRENCY=2`, no slot can ever free and the nested acquire waits
+out the whole `TEST_LOCK_TIMEOUT` (observed 2700s hangs in `implement.py
+finish` and the pre-push gate). The observed offenders were
+`tests/test_live_repo_mutation_guard.py::TestRunTestsGuardFires::*` and
+`tests/test_pytest_path_resolution.py::test_run_tests_spawns_resolved_pytest_when_missing`.
+
+**Contract:** a fixture that spawns (or calls) a nested runner sets
+`PI_SEMAPHORE_DIR` to a per-test isolated directory for that invocation. The
+nested run then bounds itself in its own namespace and never contends for the
+host-wide pool. Top-level runs never do this, so the host-wide ceiling
+(`TEST_MAX_CONCURRENCY`) and the bounded-wait semantics are unchanged for
+genuine parallel suites — **only nested child runs are isolated.**
+
+Use `nested_semaphore_dir()` from `skill/shared/process_semaphore.py` to name
+the directory (re-exported by `run_tests.py`):
+
+```python
+from test.scripts.run_tests import nested_semaphore_dir
+
+@pytest.fixture(autouse=True)
+def _isolated_nested_semaphore(tmp_path, monkeypatch):
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
+```
+
+For a **subprocess** invocation, pass the overridden value in the child
+environment (e.g. `_child_env()` in `tests/test_live_repo_mutation_guard.py`):
+`env["PI_SEMAPHORE_DIR"] = os.environ["PI_SEMAPHORE_DIR"]`. For an
+**in-process** call (`rt.main(...)` with the runner stubbed), set it on the
+test process with `monkeypatch.setenv` before the call
+(`tests/test_run_tests_cache.py` and `tests/test_pytest_path_resolution.py`).
+
+Keep the isolated directory **outside** every fixture repository: slot files
+newly created under the guarded checkout would otherwise be reported as a
+live-repo mutation. `nested_semaphore_dir(tmp_path)` places it beside the
+repo, not inside it.
+
+**Suite-wide safety net.** The repo-root `conftest.py` additionally installs an
+autouse fixture that points `PI_SEMAPHORE_DIR` at a fresh per-test directory for
+**every** test in the session. That covers in-process runners whose file has no
+bespoke override (e.g. `tests/test_run_tests_cache.py::test_strict_git_env_*`,
+which was observed waiting ~287s for a host slot), so no test can leak a nested
+acquire into the host-wide pool. The explicit fixture injections above stay as
+the documented contract at the call sites; tests that exercise the semaphore
+directly (`test_test_skill_semaphore.py`, the audit concurrency suites) override
+`ENV_LOCK_DIR` themselves and are unaffected.
+
 ### 1. Suite-command resolution order (F2, SA-0MSTMYE79006NA61)
 
 The full suite is `full_suite_commands(project_root)`, resolved in this

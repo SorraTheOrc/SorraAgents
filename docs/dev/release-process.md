@@ -242,6 +242,22 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
      SA-0MUJKPDAA002VVDP). An audit-approved parent therefore closes without
      a false `--force` collateral refusal; only descendants still in a
      genuinely non-terminal state are named in a refusal.
+   - **Fallback cascade for audits recorded outside the runner.** The
+     audit-side cascade above only fires on the audit runner's verified
+     `Ready to close: Yes` path. An audit recorded manually / via
+     `wl audit-set` (which lives in the worklog CLI, outside this repository)
+     bypasses it, so an audit-ready parent (`readyToClose = true`) can still
+     arrive at the close step with non-terminal descendants. The close step
+     now cascades those descendants itself — setting each non-terminal
+     descendant to `completed`/`done` with a comment naming the authorising
+     parent and audit timestamp — and then closes the parent. This is
+     authorised by the passing audit verdict **only**: a candidate whose audit
+     is missing or not passing is still refused over its non-terminal
+     descendants, preserving the scope guard. A per-child cascade failure
+     leaves that child in the collateral set, so a partially-cascaded subtree
+     is refused rather than force-closed. Under `--dry-run` the planned
+     cascade is reported but no mutation occurs (SA-0MUR7Y3BJ004FGPP
+     recurrence).
    - **The refusal names its real cause.** A descendant held back solely
      because `needsProducerReview = true` is reported with a distinct
      `Refused: descendant(s) need producer review: …` reason (also exposed on
@@ -249,6 +265,16 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
      generic "outside the candidate set" collateral list
      (SA-0MUJKPDAA002VVDP AC2). The parent is still refused, so the scope
      guard is unchanged; a mixed subtree reports both causes.
+   - **Closes are verified, not assumed.** After each `wl close`, the item's
+     persisted lifecycle is re-read via the injectable `getCloseStateFn`
+     boundary (default `getItemLifecycle`); an item counts as closed only when
+     `status: completed` **and** `stage: done`. A close that exits 0 but does
+     not persist — the concurrent-`wl sync` lost-update race
+     (WL-0MUXA5RI2009EUTJ) — is retried once and re-verified. If it is still
+     not terminal (or the read throws/returns `null` — fail-safe), the item is
+     listed in `unclosedCount`/`unclosedItems` by id, `success` is `false`, and
+     the summary never claims blanket success. The step remains non-blocking
+     (SA-0MUXA5ZNZ0019QY5).
 4. Version numbering, tagging, and tag pushing are **now automated** as part
    of the merge script (`merge-dev-to-main.sh`). Before merging, the script:
    - Increments the version in `package.json` (default: patch bump).
@@ -279,8 +305,9 @@ v0.1.11"); v1.0.0/v1.2.3 never existed as release tags.
 **Fixes (SA-0MSJ2XMQL006CVQS).**
 
 1. **Test isolation** — the close function now accepts injectable
-   `getCandidateItemsFn`/`runCloseCommand` boundaries; the unit tests inject
-   fakes, so running the test suite has zero effect on the worklog.
+   `getCandidateItemsFn`/`runCloseCommand`/`getCloseStateFn` boundaries; the
+   unit tests inject fakes, so running the test suite has zero effect on the
+   worklog.
 2. **Merge-verification guard** — `run-release.js` Step 8 calls
    `verifyReleaseMerge(version)` (tag exists on origin + tag commit is an
    ancestor of `origin/main`) before closing anything; failure aborts with exit

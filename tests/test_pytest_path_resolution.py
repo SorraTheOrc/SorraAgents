@@ -180,6 +180,13 @@ def cache_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "init")
 
+    # Isolate the semaphore namespace for the in-process nested run in
+    # ``test_run_tests_spawns_resolved_pytest_when_missing``: this suite's
+    # outer run already holds a host-wide "test" slot, so the nested runner
+    # must not contend for it (SA-0MUY6U05F008RG86). The directory is a
+    # sibling of ``repo`` so it never counts as a live-repo mutation.
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(rt.nested_semaphore_dir(tmp_path)))
+
     monkeypatch.setattr(rt, "detect_project_root", lambda: repo)
     return repo
 

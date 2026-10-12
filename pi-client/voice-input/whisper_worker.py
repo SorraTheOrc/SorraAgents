@@ -194,7 +194,7 @@ class TranscriptionSession:
         audio = pcm_to_float32(bytes(self.buffer))
         try:
             segments, _info = self._run_transcribe(audio)
-        except Exception as exc:  # noqa: BLE001 - CUDA can fail lazily at transcribe time
+        except Exception as exc:
             if self.device != "cuda" or self.reload_model is None:
                 raise
             emit(

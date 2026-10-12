@@ -133,16 +133,18 @@ python3 ./plan_helpers.py plan-approval-gate <work-item-id>
 ```
 
 Expected keys: `request_approval` (`true`/`false`) and `reason`. The gate
-requests approval when effort is Medium/Large/Extra Large **OR** risk is
-High or higher (High/Severe, the top of the `wl` risk scale); it skips when
-effort is Extra Small/Small **AND** risk is Low/Medium. Absent effort/risk →
+requests approval only for the largest and highest-risk work items — effort
+**Extra Large** **AND** risk **High or higher** (High/Severe, the top of the
+`wl` risk scale). Every other combination (e.g. Extra Large with Low/Medium
+risk, or High/Severe risk with smaller effort) skips the approval pause and
+proceeds directly to the automated review stages. Absent effort/risk →
 default conservatively to requesting approval (a human checkpoint is never
 silently skipped).
 
 - **`request_approval == true`**: present the plan and ask the user to
   accept, edit, reorder, or split/merge — iterating until approved. State
   the reason explicitly (e.g. "This plan requires your confirmation because
-  its effort is Large scale and its risk is High.").
+  its effort is Extra Large scale and its risk is High.").
 - **`request_approval == false`**: do NOT ask; proceed directly to step 5
   (vertical slice verification) and step 6 (automated review stages).
 
@@ -176,16 +178,18 @@ Review stages:
    vague criteria where intent is clear.
 6. **Polish & handoff review** — description clear, well formatted, actionable.
 
-After all six stages, run the AC coverage review:
+After all six stages, run and apply the AC coverage review. `apply_coverage_review`
+performs the review and the resulting mutation in one deterministic step
+(creating covering children, commenting, and advancing the stage):
 
 ```python
-from skill.shared.tree_coverage import run_coverage_review
-review = run_coverage_review(<work-item-id>)
+from skill.shared.tree_coverage import apply_coverage_review
+result = apply_coverage_review(<work-item-id>, target_stage="plan_complete")
 ```
 
-- If ``recommendation == "proceed"`` → mark `plan_complete`.
-- If ``recommendation == "auto_close"`` → close gaps, record comment, mark `plan_complete`.
-- If ``recommendation == "stop"`` → **do NOT mark `plan_complete`**; leave the item `open` with a comment describing conflicts.
+- `result["action"] == "proceed"` → coverage complete; the stage is set to `plan_complete`.
+- `result["action"] == "auto_close"` → unambiguous gaps were closed by creating covering children; the stage is set to `plan_complete`.
+- `result["action"] == "stop"` → unresolvable conflicts were recorded in a comment; the stage is **not** advanced and the item is left `open`.
 
 Then output a summary of what each stage checked/found.
 
@@ -195,7 +199,7 @@ Then output a summary of what each stage checked/found.
 
    If the work item already has children, iterate the entire subtree **before** any other processing:
 
-   - Run `wl show <work-item-id> --children --json` to fetch existing children.
+   - Run `wl list --parent <work-item-id> --json` to fetch existing children (`wl show --children` returns the full descendant set, not direct children).
    - Order children by dependency edges using `wl dep list <id> --json` (topological order, ties broken by listed order).
    - For each child (in dependency order), recurse: if that child has its own children, process them first.
    - Use the shared tree-coverage helper from `../shared/tree_coverage.py`:
@@ -264,7 +268,7 @@ Then output a summary of what each stage checked/found.
    Produce a draft plan (guide: 3-12 features) where each feature includes: **Short Title** (≤7 words) | **Summary** (one sentence) | **Acceptance Criteria** (2-6 measurable bullets) | **Minimal Implementation** (2-6 bullets, smallest end-to-end slice) | **Prototype/Experiment** (optional; success thresholds) | **Dependencies** | **Deliverables**.
 
    - **Test-first ordering**: test/verification features before implementation features.
-   - **Approval gate**: run the approval-gate check first (see **Plan-approval gate**). When approval IS requested, state the reason explicitly and iterate until approved. When NOT warranted (effort Extra Small/Small AND risk Low), proceed directly to steps 5-6 without an approval pause. **On any approval resume, re-claim first:** `StatusLifecycle.ensure_claimed(<id>)` + `StatusLifecycle.require_claimed(<id>)` before steps 5-7; downtime dispatch with no approver holds `in_progress` or aborts — never releases to `open`.
+   - **Approval gate**: run the approval-gate check first (see **Plan-approval gate**). When approval IS requested, state the reason explicitly and iterate until approved. When NOT warranted (anything other than Extra Large effort **AND** High/Severe risk), proceed directly to steps 5-6 without an approval pause. **On any approval resume, re-claim first:** `StatusLifecycle.ensure_claimed(<id>)` + `StatusLifecycle.require_claimed(<id>)` before steps 5-7; downtime dispatch with no approver holds `in_progress` or aborts — never releases to `open`.
 
 5. Verify vertical slice phasing (agent responsibility)
 
@@ -285,16 +289,16 @@ Then output a summary of what each stage checked/found.
 
    **AC coverage review (final step):**
 
-   After the six review stages, run the AC coverage review using the shared helper:
+   After the six review stages, run and apply the AC coverage review with the shared helper:
 
    ```python
-   from skill.shared.tree_coverage import run_coverage_review
-   review = run_coverage_review(<work-item-id>)
+   from skill.shared.tree_coverage import apply_coverage_review
+   result = apply_coverage_review(<work-item-id>, target_stage="plan_complete")
    ```
 
-   - If ``recommendation == "proceed"`` → all parent ACs are covered; continue to Step 7.
-   - If ``recommendation == "auto_close"`` → unambiguous gaps are identified; close them by adding the missing child ACs (where intent is clear), record a comment noting what was auto-closed.
-   - If ``recommendation == "stop"`` → unresolvable conflicts exist; **do NOT advance the stage**. Leave the item `open` with a comment describing the conflicts and which parent ACs are uncovered.
+   - `result["action"] == "proceed"` → all parent ACs are covered; continue to Step 7.
+   - `result["action"] == "auto_close"` → unambiguous gaps were closed by creating covering children (each restating the uncovered parent AC); a comment records what was auto-closed.
+   - `result["action"] == "stop"` → unresolvable conflicts exist; **do NOT advance the stage**. The item is left `open` with a comment describing the conflicts and which parent ACs are uncovered.
 
 7. Update work items (agent)
 

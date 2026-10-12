@@ -78,6 +78,20 @@ generation is unavailable (no API key, LLM/network error, missing/unreadable
 README) the pitch paragraph is **omitted** and the notification still sends. The
 pitch is never persisted to `config.yaml`.
 
+### Call-to-action (`cta`, SA-0MUWCIFU2006K39K)
+
+The optional top-level `cta` scalar is resolved with the **same precedence as
+`projectName`/`projectDescription`** (project private → project → global). When
+set, it is rendered as its own embed paragraph placed **after** the intro block
+(pitch → focus → `**<projectName> v<version>**` line) and **immediately before**
+the changelog, so the audience can act on the release (play the alpha, join
+Discord, etc.). Markdown link syntax in the value is preserved verbatim.
+
+When `cta` is unset, empty, or the config is malformed/unreadable, the
+paragraph is simply omitted and the notification still sends — a bad CTA never
+fails the release. The value is read verbatim; it is never rewritten or
+re-generated.
+
 ### Non-blocking semantics (AC3)
 
 A notification failure (network error, HTTP error, timeout) logs a warning and
@@ -86,8 +100,9 @@ failed by a notification failure.
 
 ### Discord embed limits (AC4)
 
-The changelog section in the embed description is truncated to 4 096
-characters with an ellipsis marker (`…`) when it exceeds the limit.
+The fully-composed embed description — including the pitch, focus, project
+line, `cta` and changelog — is truncated to 4 096 characters with an ellipsis
+marker (`…`) when it exceeds the limit.
 
 ## Release Workflow
 
@@ -245,17 +260,21 @@ All command boundaries (`getItemsFn`, `getItemByIdFn`, `runAuditShow`,
 After `verifyReleaseMerge()` succeeds, `sendReleaseNotification()` is called:
 
 ```javascript
-await sendReleaseNotification({ version, prUrl, projectRoot });
+await sendReleaseNotification({ version, prUrl, projectRoot }, { preRunTags });
 ```
+
+`preRunTags` is the pre-run `git tag --list` snapshot captured by the wrapper before the merge script ran. The notifier uses it as an independent provenance guard: when the resolved version's tag already existed before the run (or the snapshot is `null`), it refuses to send before resolving the webhook or building a payload (SA-0MV0QEI3Q0063KH3 AC5, defence in depth beneath the Step 8 newly-created-tag gate).
 
 **Behaviour:**
 
 - Only runs on successful, non-dry-run releases (after merge verification).
+- **Provenance guard (AC5):** refuses to send (no webhook resolution, no payload, no POST) unless the version tag was newly created by this run.
 - Resolves the webhook URL per AC2 precedence.
 - Resolves the project pitch: `projectDescription` wins; otherwise README/LLM; otherwise omitted.
+- Resolves the project call-to-action (`cta`): project config value wins; otherwise omitted when unset/malformed.
 - Extracts the released version's changelog section from `CHANGELOG.md`.
 - Extracts and removes the `> **Release focus:** …` marker from the section (no duplication).
-- Composes the embed description as pitch → focus → project/version line → changelog, truncated to 4 096 chars.
+- Composes the embed description as pitch → focus → project/version line → `cta` → changelog, truncated to 4 096 chars.
 - Builds a Discord embed payload (version, tag, date, PR URL, composed description).
 - POSTs to the webhook via built-in `fetch` (10s timeout).
 - On failure: logs a warning, returns `{ success: true, notified: false }`.
@@ -283,12 +302,16 @@ Post-release Discord notification (non-blocking).
 | `options.globalConfigPath` | `string` | No | Override global config path |
 | `options.changelogPath` | `string` | No | Override `CHANGELOG.md` path |
 | `options.changelogContent` | `string` | No | Pre-read changelog content |
+| `options.preRunTags` | `Set<string>\|string[]\|null` | No | Pre-run `git tag --list` snapshot; presence of `v<version>` (or `null`) refuses the send (AC5). `undefined` = legacy caller, guard not applicable |
+| `options.tagCreatedByThisRun` | `boolean` | No | Explicit provenance flag; `false` refuses the send (AC5) |
 | `options.readmePath` | `string` | No | Override `README.md` path (pitch fallback) |
 | `options.readmeContent` | `string` | No | Pre-read README content |
 | `options.now` | `Function` | No | Date provider for fallback date |
 | `options.timeoutMs` | `number` | No | Webhook POST timeout (default: 10 000) |
 
 **Returns:** `Promise<{ success: boolean, notified: boolean, skipped?: boolean, reason?: string, error?: string }>`
+
+When the provenance guard refuses, the result is `{ success: true, notified: false, skipped: true, reason: 'version tag not created by this run' }`.
 
 ### `resolveDiscordWebhookUrl(projectRoot, options)`
 
@@ -299,6 +322,18 @@ Resolve the Discord webhook URL with precedence (AC2): private → project → g
 ### `resolveProjectDescription(projectRoot, options)`
 
 Resolve the project elevator pitch text with the same precedence as `projectName`: private → project → global (top-level `projectDescription` scalar).
+
+**Returns:** `string | null`
+
+### `readCtaFromConfig(configPath)`
+
+Read the top-level `cta` scalar from a YAML config file. Returns `null` when the file is missing/unreadable or the key is absent/empty; markdown link syntax is preserved verbatim.
+
+**Returns:** `string | null`
+
+### `resolveCta(projectRoot, options)`
+
+Resolve the project call-to-action with the same precedence as `projectName`: private → project → global (top-level `cta` scalar). Non-blocking — a malformed/unreadable config yields `null`.
 
 **Returns:** `string | null`
 
@@ -353,6 +388,43 @@ Minimal YAML parser for config files (top-level keys + one nesting level).
 **Returns:** `Record<string, Record<string, string> | string>`
 
 ## Test Isolation
+
+### Tests never emit real release notifications (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL)
+
+Release integration harnesses run the **real** `run-release.js`, which reaches
+Step 8.5 (`sendReleaseNotification`). A harness builds its temp project root
+with no `.worklog/` config, so the **real** `discord-notify.js` would fall back
+to the operator's global `~/.pi/agent/config.yaml` and POST a real release
+notification (e.g. `Release v9.9.9`, or `Release v0.2.0` from the fail-fast
+harness) on every test run. Tests must never emit real outbound notifications.
+
+Never copy the real `discord-notify.js` into a harness's temp skill layout.
+Install the shared recording stub instead — `writeStubDiscordNotify()` from
+`tests/helpers/release-notify-stub.mjs`. The stub performs no network I/O
+and records each Step 8.5 call (as a JSON line) to `$DISCORD_NOTIFY_LOG`, so a
+test can pin that the stub — not the real module — ran.
+
+Harnesses covered:
+
+- `tests/unit/test-run-release-merge-guard.mjs` — writes the recording stub and
+  pins this with assertions that Step 8.5 was served by the stub
+  (`stubbed: true`) and that **no** notification is emitted before the merge is
+  verified;
+- `tests/unit/test-run-release-fail-fast.mjs` — the genuine-release path
+  (`gitDescribe: 'v0.2.0'`) reaches Step 8.5 and previously POSTed a real
+  `Release v0.2.0`; it now uses the shared stub (with a regression assertion),
+  while the fail-fast no-POST tests deliberately keep the **real** module and
+  point it at an in-process loopback webhook;
+- `tests/unit/test-run-release.mjs`, `tests/unit/test-run-release-arg-filtering.mjs`,
+  `tests/unit/test-code-freeze-marker.mjs`, `tests/unit/test-run-release-cleanup.mjs`
+  — use the shared stub for the `discord-notify.js` dependency;
+- `tests/unit/test-run-release-discord-notify.mjs` — the reference pattern:
+  records `sendReleaseNotification` arguments without sending.
+
+Production behaviour is unchanged: real releases still post the Discord
+notification.
+
+### Worklog isolation
 
 Close-work-items tests must **never mutate the live worklog** (SA-0MSJ2XMQL006CVQS):
 

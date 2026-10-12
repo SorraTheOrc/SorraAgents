@@ -58,6 +58,12 @@ They are **strictly additive**: they may add guidance, but they cannot
 disable, reorder or weaken a skill's safety or gating steps (plan approval,
 audit gates, build → test → commit order). A missing file is simply absent.
 
+The implement skill is a consumer (SA-0MUYEV5AO006V0HK): `implement.py start`
+surfaces `SKILL_PREFIX.md` after its gating steps and before the first
+actionable step, and `implement.py finish` surfaces `SKILL_POSTFIX.md` after
+the final step. Both are also captured in the JSON report as
+`extension.prefix_prose` / `extension.postfix_prose`.
+
 ## Machine-readable data (`extension.json`)
 
 `extension.json` must parse to a **JSON object** at the top level. The schema
@@ -86,6 +92,30 @@ Guidance:
 - **Malformed input is loud.** Unparseable JSON, an unreadable file, or a
   non-object top level raises `SkillExtensionError` naming the file. The
   loader never silently substitutes a default.
+
+### Consumer schema: implement `ignoreDirtyPaths`
+
+The implement skill defines one machine-readable key in its extension:
+
+```json
+{
+  "ignoreDirtyPaths": [".llm-wiki/"]
+}
+```
+
+- The value is a list of repository-relative **path prefixes** (a single
+  string is also accepted). A trailing `/` is optional and equivalent.
+- A dirty path matching a declared prefix is **expected** and no longer
+  hard-fails the dirty-tree gate (`git_has_dirty_files()`) used by
+  `implement.py start`, nor the worktree placement gate
+  (`_worktree_placement_violation()`) used by `implement.py finish`.
+- The declaration is project-scoped and additive: it only relaxes the gate
+  for the named prefixes. Any other dirty path still stops the workflow, and
+  uncommitted expected-dirty paths are never stashed, committed or reverted.
+- A malformed declaration (a non-list/non-string value, or a non-string/empty
+  entry) raises `SkillExtensionError` naming the file; `implement.py start`
+  refuses with an actionable message and releases the work item rather than
+  silently changing the gate.
 
 ### Loader API (`skill/shared/skill_extensions.py`)
 
@@ -148,6 +178,8 @@ commands without any change to the installed skill.
 
 - Loader unit tests: `skill/shared/tests/test_skill_extensions.py`.
 - Consumer tests: `skill/test/tests/test_run_tests_type.py`.
+- Implement consumer tests: `skill/implement/tests/test_implement_extension.py`
+  (absent/present/exempt/non-exempt, prose surfacing, placement gate).
 
 ## Related work
 

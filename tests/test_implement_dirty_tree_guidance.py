@@ -17,17 +17,33 @@ restoring them. This test suite locks in the desired behavior:
 Related work item: SA-0MSALRZ3B006FPI5
 """
 
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 _SKILL_MD = _REPO_ROOT / "skill" / "implement" / "SKILL.md"
+
+
+@pytest.fixture(scope="module")
+def implement_mod():
+    """Import ``implement.py`` as a module for the pure-logic tests below."""
+    spec = importlib.util.spec_from_file_location(
+        "implement_under_test_dirty_guidance", _IMPLEMENT_PY
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["implement_under_test_dirty_guidance"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +229,7 @@ _FAKE_WL_SRC = """\
 #!/usr/bin/env python3
 \"\"\"Fake wl CLI for tests: records calls and returns canned JSON.\"\"\"
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -232,7 +249,11 @@ if sub == "update":
         status = args[args.index("--status") + 1]
     print(json.dumps({"success": True, "workItem": {"id": "SA-TEST123", "status": status}}))
 elif sub == "show":
-    print(json.dumps({"success": True, "workItem": {"id": "SA-TEST123", "status": "open", "title": "Test"}}))
+    item = {"id": "SA-TEST123", "status": "open", "title": "Test"}
+    desc = os.environ.get("FAKE_WL_DESCRIPTION")
+    if desc:
+        item["description"] = desc
+    print(json.dumps({"success": True, "workItem": item}))
 elif sub == "comment":
     print(json.dumps({"success": True}))
 else:
@@ -321,9 +342,20 @@ def test_start_gate_aborts_without_stashing_user_changes(tmp_path: Path) -> None
         for phrase in ("do not stash", "never stash", "without permission", "forbidden")
     ), f"message must forbid stashing: {msg!r}"
 
-    # -- The gate must never have invoked git stash --
+    # -- The gate must never modify the stash. Read-only ``git stash list``
+    #    from the stash-hygiene gate is permitted; state-changing stash
+    #    commands are not (SA-0MSALRZ3B006FPI5). --
     git_log = (bin_dir / "git_calls.log").read_text(encoding="utf-8")
-    assert "stash" not in git_log, f"git stash was invoked! Calls:\n{git_log}"
+    for bad in (
+        "stash push", "stash pop", "stash apply", "stash drop",
+        "stash clear", "stash save",
+    ):
+        assert bad not in git_log, (
+            f"state-changing {bad!r} was invoked! Calls:\n{git_log}"
+        )
+    assert not re.search(r"(?m)^stash\s*$", git_log), (
+        f"bare git stash was invoked! Calls:\n{git_log}"
+    )
 
     # -- The user's file must be byte-for-byte untouched --
     assert dirty_file.read_text(encoding="utf-8") == user_content, (
@@ -336,3 +368,200 @@ def test_start_gate_aborts_without_stashing_user_changes(tmp_path: Path) -> None
     assert "--status open" in last_call, (
         f"work item must be reset to open after the dirty-tree abort, last wl call: {last_call!r}"
     )
+
+
+# ===========================================================================
+# Tests: Key Files parsing & dirty-tree relevance classification
+# (SA-0MV0NSOGE000OSMR AC2/AC5)
+# ===========================================================================
+
+
+class TestExtractKeyFilesFromDescription:
+    """The parser must handle every Key Files heading style used in practice."""
+
+    def test_parses_hash_heading_with_predicted_suffix(self, implement_mod):
+        desc = (
+            "## Key Files (predicted)\n\n"
+            "- `skill/implement/scripts/implement.py` — the gate\n"
+            "- `tests/test_implement_start_resume.py`\n"
+        )
+        assert implement_mod.extract_key_files_from_description(desc) == [
+            "skill/implement/scripts/implement.py",
+            "tests/test_implement_start_resume.py",
+        ]
+
+    def test_parses_plan_bold_heading(self, implement_mod):
+        desc = "intro\n\n**Key Files:**\n\n- `a/b.py`\n\n**Risks**\n- `ignored.py`\n"
+        assert implement_mod.extract_key_files_from_description(desc) == ["a/b.py"]
+
+    def test_returns_empty_without_section(self, implement_mod):
+        assert implement_mod.extract_key_files_from_description("plain description") == []
+        assert implement_mod.extract_key_files_from_description("") == []
+
+
+class TestClassifyDirtyTreeRelevance:
+    """The gate proceeds only when a Key Files section proves the dirt irrelevant."""
+
+    def test_irrelevant_dirty_files_can_proceed(self, implement_mod):
+        decision = implement_mod.classify_dirty_tree_relevance(
+            "## dev...dev\n M standups/2026-10-10.md\n",
+            "## Key Files\n\n- `skill/implement/scripts/implement.py`\n",
+        )
+        assert decision["dirty"] is True
+        assert decision["can_proceed"] is True
+        assert decision["relevant_files"] == []
+
+    def test_relevant_dirty_file_blocks(self, implement_mod):
+        decision = implement_mod.classify_dirty_tree_relevance(
+            "## dev...dev\n M skill/implement/scripts/implement.py\n",
+            "## Key Files\n\n- `skill/implement/scripts/implement.py`\n",
+        )
+        assert decision["dirty"] is True
+        assert decision["can_proceed"] is False
+        assert decision["relevant_files"] == ["skill/implement/scripts/implement.py"]
+
+    def test_missing_key_files_section_stays_conservative(self, implement_mod):
+        decision = implement_mod.classify_dirty_tree_relevance(
+            "## dev...dev\n M standups/2026-10-10.md\n",
+            "no key files section here",
+        )
+        assert decision["dirty"] is True
+        assert decision["can_proceed"] is False
+
+    def test_clean_tree_can_proceed(self, implement_mod):
+        decision = implement_mod.classify_dirty_tree_relevance(
+            "## dev...dev\n", "## Key Files\n\n- `a/b.py`\n"
+        )
+        assert decision["dirty"] is False
+        assert decision["can_proceed"] is True
+
+    def test_expected_dirty_paths_are_ignored(self, implement_mod):
+        decision = implement_mod.classify_dirty_tree_relevance(
+            "## dev...dev\n?? .llm-wiki/note.md\n",
+            "no key files section",
+            expected_dirty=(".llm-wiki/",),
+        )
+        assert decision["dirty"] is False
+        assert decision["can_proceed"] is True
+
+
+class TestCurrentCheckoutIsLinkedWorktree:
+    """The dirty-tree gate must be skipped when invoked from a worktree."""
+
+    def test_true_when_toplevel_has_git_file(
+        self, implement_mod, tmp_path, monkeypatch
+    ):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        (wt / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")
+        monkeypatch.setattr(
+            implement_mod, "run_cmd",
+            lambda *a, **k: types.SimpleNamespace(
+                returncode=0, stdout=f"{wt}\n", stderr=""
+            ),
+        )
+        assert implement_mod._current_checkout_is_linked_worktree() is True
+
+    def test_false_for_main_checkout(
+        self, implement_mod, tmp_path, monkeypatch
+    ):
+        main = tmp_path / "main"
+        main.mkdir()
+        (main / ".git").mkdir()
+        monkeypatch.setattr(
+            implement_mod, "run_cmd",
+            lambda *a, **k: types.SimpleNamespace(
+                returncode=0, stdout=f"{main}\n", stderr=""
+            ),
+        )
+        assert implement_mod._current_checkout_is_linked_worktree() is False
+
+
+# ===========================================================================
+# Tests: behavioural — implement.py start against a dirty tree with
+# irrelevant files (AC1/AC3/AC4/AC5a)
+# ===========================================================================
+
+
+def test_start_creates_clean_worktree_when_dirty_files_irrelevant(
+    tmp_path: Path,
+) -> None:
+    """Dirty files that do not overlap the Key Files section must not block
+    start: a clean worktree is created, the dirty files are left untouched,
+    and the decision is recorded in a work-item comment."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = dict(os.environ)
+
+    def run(
+        cmd: list[str], cwd: Path = repo, check: bool = True
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            cmd, cwd=str(cwd), env=env, capture_output=True, text=True,
+            timeout=60, check=check,
+        )
+
+    run(["git", "init"])
+    run(["git", "config", "user.email", "test@test.com"])
+    run(["git", "config", "user.name", "Test"])
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    run(["git", "add", "-A"])
+    run(["git", "commit", "-m", "init"])
+    run(["git", "branch", "dev"])
+
+    # A dirty file that is clearly unrelated to the Key Files below.
+    dirty_dir = repo / "standups"
+    dirty_dir.mkdir()
+    dirty_file = dirty_dir / "2026-10-10.md"
+    dirty_content = "# standup notes\n"
+    dirty_file.write_text(dirty_content, encoding="utf-8")
+
+    real_git = shutil.which("git")
+    assert real_git, "real git not found"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(bin_dir / "wl", _FAKE_WL_SRC)
+    _write_executable(
+        bin_dir / "git", _FAKE_GIT_SRC.replace("REAL_GIT_PATH", real_git)
+    )
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["FAKE_WL_DESCRIPTION"] = (
+        "## Key Files (predicted)\n\n"
+        "- `skill/implement/scripts/implement.py`\n"
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(_IMPLEMENT_PY), "start", "SA-TEST123", "--json"],
+        cwd=str(repo), env=env, capture_output=True, text=True,
+        timeout=300, check=False,
+    )
+    assert proc.returncode == 0, (
+        f"expected success, got {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+    )
+    report = json.loads(proc.stdout)
+    assert report["success"] is True
+    assert report.get("dirty_worktree") is False
+    left_behind = report.get("dirty_worktree_left_behind") or []
+    assert left_behind, "the left-behind dirty paths must be recorded"
+    assert all(path.startswith("standups") for path in left_behind), left_behind
+
+    # A clean worktree was created from HEAD.
+    worktree = Path(report["worktree_path"])
+    assert worktree.is_dir(), "worktree must be created"
+    assert (worktree / ".git").is_file()
+
+    # No state-changing stash, and the dirty file is byte-for-byte untouched.
+    git_log = (bin_dir / "git_calls.log").read_text(encoding="utf-8")
+    for bad in (
+        "stash push", "stash pop", "stash apply", "stash drop",
+        "stash clear", "stash save",
+    ):
+        assert bad not in git_log, (
+            f"state-changing {bad!r} was invoked! Calls:\n{git_log}"
+        )
+    assert dirty_file.read_text(encoding="utf-8") == dirty_content
+
+    # The decision and the left-behind path are recorded for auditability.
+    wl_log = (bin_dir / "wl_calls.log").read_text(encoding="utf-8")
+    assert "dirty main checkout left untouched" in wl_log
+    assert "standups" in wl_log

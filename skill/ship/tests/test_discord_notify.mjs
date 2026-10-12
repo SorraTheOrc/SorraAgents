@@ -26,6 +26,8 @@ import {
   resolveProjectName,
   readProjectDescriptionFromConfig,
   resolveProjectDescription,
+  readCtaFromConfig,
+  resolveCta,
   extractReadmePitch,
   generatePitch,
   resolveProjectPitch,
@@ -728,6 +730,188 @@ const COMPOSE_CHANGELOG = `# Changelog
 
 - Older feature (SA-OLD)
 `;
+
+// ---------------------------------------------------------------------------
+// SA-0MUWCIFU2006K39K — project call-to-action (CTA) in the release report
+// ---------------------------------------------------------------------------
+
+/** Reproduces AI_Hell/.worklog/config.yaml (WL-0MUWCGF670087GAS). */
+const AI_HELL_CTA =
+  '[Play the alpha release](https://sorratheorc.github.io/AI_Hell/). ' +
+  'Provide feedback in [Discord](https://discord.gg/gUKQTFkzQ4)';
+
+/** Write a config with a webhook and an optional CTA. */
+function writeCtaConfig(path, { webhookUrl = WEBHOOK_URL, cta } = {}) {
+  mkdirSync(dirname(path), { recursive: true });
+  let yaml = `projectName: Test Project\nprefix: TP\ndiscord:\n  webhook_url: ${webhookUrl}\n`;
+  if (cta !== undefined) yaml += `cta: "${cta}"\n`;
+  writeFileSync(path, yaml);
+}
+
+describe('discord-notify: CTA config resolution (SA-0MUWCIFU2006K39K AC1)', () => {
+  it('exports readCtaFromConfig and resolveCta', () => {
+    assert.strictEqual(typeof readCtaFromConfig, 'function');
+    assert.strictEqual(typeof resolveCta, 'function');
+  });
+
+  it('readCtaFromConfig returns the top-level cta scalar verbatim (markdown preserved)', () => {
+    const dir = mkTmpDir('discord-cta-');
+    const path = join(dir, 'config.yaml');
+    writeCtaConfig(path, { cta: AI_HELL_CTA });
+    assert.strictEqual(readCtaFromConfig(path), AI_HELL_CTA);
+    rmTmpDir(dir);
+  });
+
+  it('readCtaFromConfig returns null for missing file, absent/empty key and unreadable path', () => {
+    const dir = mkTmpDir('discord-cta-');
+    assert.strictEqual(readCtaFromConfig(join(dir, 'missing.yaml')), null);
+
+    const path = join(dir, 'config.yaml');
+    writeFileSync(path, 'projectName: Test Project\n');
+    assert.strictEqual(readCtaFromConfig(path), null);
+
+    writeFileSync(path, 'cta: "   "\n');
+    assert.strictEqual(readCtaFromConfig(path), null);
+
+    assert.strictEqual(readCtaFromConfig(dir), null);
+    rmTmpDir(dir);
+  });
+
+  it('resolveCta uses the same three-layer precedence as projectName', () => {
+    const root = mkTmpDir('discord-cta-');
+    const globalDir = mkTmpDir('discord-cta-global-');
+    writeCtaConfig(join(globalDir, 'config.yaml'), { cta: 'global cta' });
+    const globalPath = join(globalDir, 'config.yaml');
+    mkdirSync(join(root, '.worklog'), { recursive: true });
+
+    assert.strictEqual(resolveCta(root, { globalConfigPath: globalPath }), 'global cta');
+
+    writeCtaConfig(join(root, '.worklog', 'config.yaml'), { cta: 'project cta' });
+    assert.strictEqual(resolveCta(root, { globalConfigPath: globalPath }), 'project cta');
+
+    writeCtaConfig(join(root, '.worklog', 'config.private.yaml'), { cta: 'private cta' });
+    assert.strictEqual(resolveCta(root, { globalConfigPath: globalPath }), 'private cta');
+    rmTmpDir(root);
+    rmTmpDir(globalDir);
+  });
+
+  it('resolveCta returns null when unset everywhere and for a malformed cta key', () => {
+    const root = mkTmpDir('discord-cta-');
+    mkdirSync(join(root, '.worklog'), { recursive: true });
+    assert.strictEqual(resolveCta(root, { globalConfigPath: join(root, 'none.yaml') }), null);
+
+    writeFileSync(join(root, '.worklog', 'config.yaml'), 'cta:\n  nested: value\n');
+    assert.strictEqual(resolveCta(root, { globalConfigPath: join(root, 'none.yaml') }), null);
+    rmTmpDir(root);
+  });
+});
+
+describe('discord-notify: CTA embed composition (SA-0MUWCIFU2006K39K AC2/AC4)', () => {
+  it('places the CTA after pitch/focus/version and immediately before the changelog', () => {
+    const d = buildDiscordPayload({
+      version: '1.2.3', projectName: 'AI Hell',
+      pitch: 'Pitch line.', focus: 'Focus line.',
+      cta: AI_HELL_CTA,
+      changelog: '### Features\n- A',
+    }).embeds[0].description;
+
+    assert.ok(d.indexOf('Pitch line.') < d.indexOf('Focus line.'));
+    assert.ok(d.indexOf('Focus line.') < d.indexOf('**AI Hell v1.2.3**'));
+    assert.ok(d.indexOf('**AI Hell v1.2.3**') < d.indexOf(AI_HELL_CTA));
+    assert.ok(d.indexOf(AI_HELL_CTA) < d.indexOf('### Features'));
+  });
+
+  it('preserves the markdown link syntax of the configured CTA verbatim', () => {
+    const d = buildDiscordPayload({ version: '1.2.3', cta: AI_HELL_CTA, changelog: 'x' })
+      .embeds[0].description;
+    assert.ok(d.includes('[Play the alpha release](https://sorratheorc.github.io/AI_Hell/)'));
+    assert.ok(d.includes(AI_HELL_CTA));
+  });
+
+  it('omits the CTA paragraph when absent, leaving the embed unchanged', () => {
+    const base = buildDiscordPayload({
+      version: '1.2.3', projectName: 'P', pitch: 'pitch', focus: 'focus', changelog: '### Features',
+    }).embeds[0].description;
+    const withNull = buildDiscordPayload({
+      version: '1.2.3', projectName: 'P', pitch: 'pitch', focus: 'focus', changelog: '### Features', cta: null,
+    }).embeds[0].description;
+
+    assert.strictEqual(withNull, base);
+    assert.ok(!base.includes('Play the alpha release'));
+  });
+
+  it('truncates the composed description including a long CTA to ≤ 4096 characters', () => {
+    const d = buildDiscordPayload({
+      version: '1.2.3', projectName: 'P',
+      cta: 'cta '.repeat(2000),
+      changelog: 'x'.repeat(9000),
+    }).embeds[0].description;
+    assert.ok(d.length <= 4096, 'composed description must respect the Discord limit');
+    assert.ok(d.endsWith('…'), 'truncated description uses the ellipsis marker');
+  });
+});
+
+describe('discord-notify: CTA notification integration (SA-0MUWCIFU2006K39K AC3/AC6)', () => {
+  it('posts the AI_Hell-configured CTA in the composed embed description (AC6)', async () => {
+    const dir = mkProjectDir();
+    // Reproduces AI_Hell/.worklog/config.yaml verbatim.
+    writeFileSync(
+      join(dir, '.worklog', 'config.yaml'),
+      `projectName: AI Hell\nprefix: AH\nautoSync: false\ncta: "${AI_HELL_CTA}"\n`,
+    );
+    writeFileSync(
+      join(dir, 'CHANGELOG.md'),
+      '# Changelog\n\n## v1.0.0 (2026-01-15)\n### Features\n- Added something\n',
+    );
+    // AI_Hell keeps its webhook outside the tracked project config; inject one
+    // so the simulated release actually sends (the CTA still comes from the
+    // reproduced project config above).
+    const globalPath = join(dir, 'global-config.yaml');
+    writeFileSync(globalPath, `discord:\n  webhook_url: ${WEBHOOK_URL}\n`);
+
+    let body = null;
+    const result = await sendReleaseNotification(
+      { version: '1.0.0', projectRoot: dir },
+      {
+        fetchFn: async (_url, opts) => { body = JSON.parse(opts.body); return { ok: true }; },
+        globalConfigPath: globalPath,
+        readmePath: join(dir, 'none.md'),
+      },
+    );
+
+    assert.strictEqual(result.notified, true);
+    const d = body.embeds[0].description;
+    assert.ok(d.includes('[Play the alpha release](https://sorratheorc.github.io/AI_Hell/)'));
+    assert.ok(d.includes(AI_HELL_CTA), 'the full AI_Hell CTA is present verbatim');
+    assert.ok(d.indexOf('**AI Hell v1.0.0**') < d.indexOf(AI_HELL_CTA));
+    assert.ok(d.indexOf(AI_HELL_CTA) < d.indexOf('Added something'));
+    rmTmpDir(dir);
+  });
+
+  it('still sends and omits the CTA when the config is malformed (non-blocking, AC3)', async () => {
+    const dir = mkProjectDir();
+    writeFileSync(
+      join(dir, '.worklog', 'config.yaml'),
+      `discord:\n  webhook_url: ${WEBHOOK_URL}\ncta:\n  nested: value\n`,
+    );
+    writeFileSync(join(dir, 'CHANGELOG.md'), COMPOSE_CHANGELOG);
+
+    let body = null;
+    const result = await sendReleaseNotification(
+      { version: '1.2.3', projectRoot: dir },
+      {
+        fetchFn: async (_url, opts) => { body = JSON.parse(opts.body); return { ok: true }; },
+        globalConfigPath: join(dir, 'none.yaml'),
+        readmePath: join(dir, 'none.md'),
+      },
+    );
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.notified, true);
+    assert.ok(!body.embeds[0].description.includes('nested'));
+    rmTmpDir(dir);
+  });
+});
 
 describe('discord-notify: project description + pitch (SA-0MUVWL09T001N5P4)', () => {
   let savedKey;

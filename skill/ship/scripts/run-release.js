@@ -134,6 +134,97 @@ export function releaseScriptForwardArgs(cliArgs) {
   return (cliArgs || []).filter((arg) => !WRAPPER_ONLY_FLAGS.has(arg));
 }
 
+// ── parseReleaseArgs / WRAPPER_USAGE ─────────────────────────────────────────
+
+/**
+ * Wrapper usage text, printed for `--help`/`-h` and on an invalid argument.
+ *
+ * `run-release.js` invoked with an unsupported flag must fail fast instead of
+ * forwarding the flag to the canonical merge script (which printed its own
+ * usage and exited 0 without merging) — the 2026-10-09 incident where the
+ * wrapper's post-release tail then closed work items against a stale tag
+ * (SA-0MV0PZYMI004SUFR).
+ *
+ * @type {string}
+ */
+export const WRAPPER_USAGE = [
+  'Usage: node run-release.js [options]',
+  '',
+  'Options:',
+  '  -h, --help                  Show this help and exit',
+  '  --dry-run                   Run the merge script without post-release actions',
+  '  --force                     Skip the PR status-check wait',
+  '  --work-item-id <id>         Associate the release with a work item',
+  '  --bump <patch|minor|major>  Semver part to increment (default: patch)',
+  '  --skip-checks               Bypass the pre-merge gating checks',
+  '  --refresh-audits            Pre-flight only: refresh in_review audits, then exit',
+  '  --skip-audit-remediation    Skip in-gate audit remediation (audits still required)',
+].join('\n');
+
+// Boolean wrapper flags mapped to their parsed property name.
+const BOOLEAN_FLAGS = {
+  '--dry-run': 'dryRun',
+  '--force': 'force',
+  '--skip-checks': 'skipChecks',
+  '--refresh-audits': 'refreshAudits',
+  '--skip-audit-remediation': 'skipAuditRemediation',
+};
+
+// Value-taking wrapper flags mapped to their parsed property name.
+const VALUE_FLAGS = {
+  '--work-item-id': 'workItemId',
+  '--bump': 'bump',
+};
+
+/**
+ * Strictly parse the wrapper's CLI arguments.
+ *
+ * Returns one of:
+ *   - `{ action: 'help' }` — `--help`/`-h` was given.
+ *   - `{ action: 'error', message }` — an unknown flag or a missing value.
+ *   - `{ action: 'run', flags }` — the validated flag set.
+ *
+ * Unknown flags are NEVER accepted: they are rejected here so they can never
+ * be silently forwarded to the merge script (SA-0MV0PZYMI004SUFR).
+ *
+ * @param {string[]} [argv] - CLI arguments (defaults to an empty list).
+ * @returns {{action: 'help'} | {action: 'error', message: string} | {action: 'run', flags: object}}
+ */
+export function parseReleaseArgs(argv = []) {
+  const flags = {
+    dryRun: false,
+    force: false,
+    skipChecks: false,
+    refreshAudits: false,
+    skipAuditRemediation: false,
+    workItemId: null,
+    bump: null,
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      return { action: 'help' };
+    }
+    if (Object.prototype.hasOwnProperty.call(BOOLEAN_FLAGS, arg)) {
+      flags[BOOLEAN_FLAGS[arg]] = true;
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(VALUE_FLAGS, arg)) {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('-')) {
+        return { action: 'error', message: `Missing value for ${arg}` };
+      }
+      flags[VALUE_FLAGS[arg]] = value;
+      i += 1;
+      continue;
+    }
+    return { action: 'error', message: `Unknown argument: ${arg}` };
+  }
+
+  return { action: 'run', flags };
+}
+
 // ── parsePRUrl ───────────────────────────────────────────────────────────────
 
 /**
@@ -147,6 +238,48 @@ export function parsePRUrl(output) {
   if (!output) return null;
   const match = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/);
   return match ? match[0] : null;
+}
+
+// ── snapshotReleaseTags ──────────────────────────────────────────────────────
+
+/**
+ * Snapshot the git tags that exist before the merge script runs.
+ *
+ * Used by the newly-created-tag gate: after the merge, the released version is
+ * only trusted when its tag was absent from this snapshot. Returns `null` when
+ * the tag list cannot be read so the caller can fail closed
+ * (SA-0MV0PZYMI004SUFR).
+ *
+ * @returns {Set<string>|null} Tag names (e.g. `v0.2.0`), or null on error.
+ */
+export function snapshotReleaseTags() {
+  try {
+    const output = execSync('git tag --list', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    return new Set(output ? output.split('\n').map((t) => t.trim()).filter(Boolean) : []);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the released version's tag was newly created by this run.
+ *
+ * Pure decision helper for the post-release gate (SA-0MV0PZYMI004SUFR): the
+ * version read from `git describe` is only trustworthy when its tag was
+ * absent from the pre-run snapshot. A missing version or an unreadable
+ * snapshot (`null`) fails closed by returning `false`.
+ *
+ * @param {string|null} version - Released semver (e.g. "0.2.0").
+ * @param {Set<string>|null} preRunTags - Tags present before the merge.
+ * @returns {boolean} True only when `v<version>` is absent from the snapshot.
+ */
+export function isNewlyCreatedTag(version, preRunTags) {
+  if (!version) return false;
+  if (!(preRunTags instanceof Set)) return false;
+  return !preRunTags.has(`v${version}`);
 }
 
 // ── verifyReleaseMerge ───────────────────────────────────────────────────────
@@ -324,6 +457,82 @@ export function getDescendants(itemId) {
   return found;
 }
 
+// ── getParentAudit ──────────────────────────────────────────────────────────
+
+/**
+ * Resolve a work item's own audit readiness.
+ *
+ * Used by the fallback cascade (SA-0MUR7Y3BJ004FGPP recurrence): when a
+ * release candidate parent is audit-ready (`readyToClose === true`) but its
+ * descendants are still non-terminal, the close step cascades the descendants
+ * before closing the parent. This is the situation produced when the audit was
+ * recorded outside the audit runner (manual `wl audit-set` / manual approval),
+ * which bypasses the runner's own descendant cascade and would otherwise leave
+ * the audit-ready parent refused and stuck `in_review` after a release.
+ *
+ * Read-only and fail-safe: a failed/unparseable `wl audit-show` resolves to
+ * `readyToClose: false`, so the cascade is never authorised without a verified
+ * passing verdict.
+ *
+ * @param {string} itemId - Work item id.
+ * @returns {{readyToClose: boolean, auditedAt: string|null}}
+ */
+export function getParentAudit(itemId) {
+  try {
+    const output = execSync(`wl audit-show ${itemId} --json`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const parsed = JSON.parse(output);
+    const audit = (parsed && parsed.audit) || null;
+    if (!audit) {
+      return { readyToClose: false, auditedAt: null };
+    }
+    return {
+      readyToClose: audit.readyToClose === true,
+      auditedAt: audit.auditedAt || audit.time || null,
+    };
+  } catch (_err) {
+    return { readyToClose: false, auditedAt: null };
+  }
+}
+
+// ── close-state verification helpers (SA-0MUXA5ZNZ0019QY5) ──────────────────
+
+/**
+ * Terminal lifecycle for a closed work item: `status === "completed"` and
+ * `stage === "done"`.
+ *
+ * @param {{status: string|null, stage: string|null}|null} lifecycle
+ * @returns {boolean}
+ */
+function isTerminalCloseState(lifecycle) {
+  return !!lifecycle
+    && lifecycle.status === 'completed'
+    && lifecycle.stage === 'done';
+}
+
+/**
+ * Read a just-closed item's persisted lifecycle via the injectable verification
+ * boundary.
+ *
+ * Fail-safe: a throwing boundary or a `null` result resolves to `null`, which
+ * {@link isTerminalCloseState} treats as unverified/unclosed — the close step
+ * never counts an unreadable item as closed (SA-0MUXA5ZNZ0019QY5).
+ *
+ * @param {(itemId: string) => ({status: string|null, stage: string|null}|null)} getCloseStateFn
+ * @param {string} itemId
+ * @returns {{status: string|null, stage: string|null}|null}
+ */
+function readCloseState(getCloseStateFn, itemId) {
+  try {
+    return getCloseStateFn(itemId);
+  } catch (err) {
+    console.warn(`  ⚠ Could not verify close state for ${itemId}: ${err.message}`);
+    return null;
+  }
+}
+
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
@@ -346,7 +555,8 @@ export function getDescendants(itemId) {
  * Test-isolation note (SA-0MSJ2XMQL006CVQS): callers MUST NOT invoke this
  * function with the default worklog boundary unless a real, verified release
  * is in progress — the release flow gates the call behind `verifyReleaseMerge()`
- * (Step 8). Unit tests inject `getCandidateItemsFn`/`runCloseCommand` so the
+ * (Step 8). Unit tests inject `getCandidateItemsFn`/`runCloseCommand`/
+ * `getCloseStateFn` so the
  * test suite never mutates the live worklog.
  *
  * @param {string|null} version - The released semver version (e.g., "0.2.0").
@@ -374,9 +584,26 @@ export function getDescendants(itemId) {
  *   Clears the child's `needsProducerReview` flag and records the explanatory
  *   comment; defaults to `wl update <child> --needs-producer-review false`
  *   followed by `wl comment add <child>` (AC1/AC4).
+ * @param {(itemId: string) => ({readyToClose: boolean, auditedAt: string|null}|null)} [options.getParentAuditFn] -
+ *   Resolves a candidate's own audit readiness. When a candidate has
+ *   non-terminal collateral descendants AND its audit is passing
+ *   (`readyToClose === true`), the descendants are cascaded to
+ *   `completed`/`done` before the parent is closed (SA-0MUR7Y3BJ004FGPP
+ *   recurrence). Defaults to {@link getParentAudit}.
+ * @param {(childId: string, parentId: string, auditTimestamp: string|null) => void} [options.runCascadeCommand] -
+ *   Cascades one descendant to `status=completed, stage=done` and records the
+ *   explanatory comment; defaults to `wl update` + `wl comment add`.
+ * @param {(itemId: string) => ({status: string|null, stage: string|null}|null)} [options.getCloseStateFn] -
+ *   Post-close verification read boundary. After each attempted close the
+ *   item's persisted lifecycle is re-read and the item is counted as closed
+ *   ONLY when `status === "completed"` AND `stage === "done"`; an item that
+ *   exits 0 but did not persist is retried once and then reported in
+ *   `unclosedItems` (SA-0MUXA5ZNZ0019QY5). Defaults to {@link getItemLifecycle}.
+ *   A throwing/`null` read is fail-safe: the item is treated as unclosed.
  * @param {boolean} [options.dryRun=false] - When true, intended child
- *   overrides are reported but no `wl` mutation is performed (AC4).
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
+ *   overrides and cascades are reported but no `wl` mutation is performed
+ *   (AC4).
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, unclosedCount: number, unclosedItems: Array<{id: string, title: string, reason: string}>, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -387,6 +614,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     ),
     getDescendantsFn = getDescendants,
     getItemLifecycleFn = getItemLifecycle,
+    getCloseStateFn = getItemLifecycle,
     getAncestorAuditFn = (item) => resolveCandidateCoverage(item),
     runOverrideCommand = (childId, ancestorId, reason) => {
       execSync(
@@ -395,6 +623,21 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       );
       execSync(
         `wl comment add ${childId} --comment ${shellQuote(reason)} --author ship --json`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+    },
+    getParentAuditFn = getParentAudit,
+    runCascadeCommand = (childId, parentId, auditTimestamp) => {
+      execSync(
+        `wl update ${childId} --status completed --stage done --json`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      const when = auditTimestamp ? ` (audit ${auditTimestamp})` : '';
+      const comment = `Cascaded to completed/done by audit-ready parent `
+        + `${parentId}${when}: the parent audit passed, so all its descendants `
+        + 'are considered complete.';
+      execSync(
+        `wl comment add ${childId} --comment ${shellQuote(comment)} --author ship --json`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       );
     },
@@ -407,10 +650,14 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       message: 'No version provided; skipping close work items step.',
       closedCount: 0,
       errorCount: 0,
+      unclosedCount: 0,
+      unclosedItems: [],
       skippedCount: 0,
       skippedItems: [],
       overriddenCount: 0,
       overriddenItems: [],
+      cascadedCount: 0,
+      cascadedItems: [],
       refusedCount: 0,
       refusedItems: [],
       dryRun,
@@ -429,10 +676,14 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       message,
       closedCount: 0,
       errorCount: 0,
+      unclosedCount: 0,
+      unclosedItems: [],
       skippedCount: 0,
       skippedItems: [],
       overriddenCount: 0,
       overriddenItems: [],
+      cascadedCount: 0,
+      cascadedItems: [],
       refusedCount: 0,
       refusedItems: [],
       dryRun,
@@ -540,6 +791,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   const candidateItemsById = new Map(items.map((item) => [item.id, item]));
   const refusedItems = [];
   const closable = [];
+  const cascadedItems = [];
   for (const item of toClose) {
     let descendants = [];
     try {
@@ -548,7 +800,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       console.warn(`  ⚠ Could not resolve descendants for ${item.id}: ${err.message}`);
       descendants = [];
     }
-    const collateral = descendants.filter((id) => {
+    let collateral = descendants.filter((id) => {
       if (candidateIds.has(id)) return false;
       // Terminal descendants (`stage: done` or `status: deleted`) are NOT
       // collateral: `wl close --force` may sweep them harmlessly, and an
@@ -567,6 +819,65 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
         && (lifecycle.stage === 'done' || lifecycle.status === 'deleted');
       return !terminal;
     });
+
+    // Fallback cascade (SA-0MUR7Y3BJ004FGPP recurrence): a candidate whose
+    // audit is passing terminalises its non-terminal descendants before the
+    // close. This covers audits recorded OUTSIDE the audit runner (manual
+    // `wl audit-set` / manual approval), which bypass the runner's own
+    // descendant cascade and would otherwise leave this audit-ready parent
+    // refused and stuck `in_review` forever after a release. Authorised by the
+    // passing audit verdict ONLY — never by status/stage (AC2/AC3). A failed
+    // per-child cascade leaves that child as collateral, so a partially
+    // cascaded subtree is still refused rather than force-closed.
+    if (collateral.length > 0) {
+      let parentAudit = null;
+      try {
+        parentAudit = getParentAuditFn(item.id);
+      } catch (err) {
+        console.warn(`  ⚠ Could not resolve audit for ${item.id}: ${err.message}`);
+        parentAudit = null;
+      }
+      if (parentAudit && parentAudit.readyToClose === true) {
+        const auditTimestamp = parentAudit.auditedAt || null;
+        if (dryRun) {
+          console.log(
+            `  ○ ${item.title || item.id} (${item.id}) — dry-run: would cascade `
+            + `${collateral.length} non-terminal descendant(s) via passing audit`,
+          );
+          for (const childId of collateral) {
+            cascadedItems.push({
+              id: childId,
+              ancestorId: item.id,
+              auditTimestamp,
+            });
+          }
+          collateral = [];
+        } else {
+          const remaining = [];
+          for (const childId of collateral) {
+            try {
+              runCascadeCommand(childId, item.id, auditTimestamp);
+              cascadedItems.push({
+                id: childId,
+                ancestorId: item.id,
+                auditTimestamp,
+              });
+              console.log(
+                `  ✓ ${childId} — cascaded to completed/done `
+                + `(parent ${item.id} audit passed)`,
+              );
+            } catch (err) {
+              console.warn(
+                `  ⚠ Failed to cascade descendant ${childId} of `
+                + `${item.id}: ${err.message}`,
+              );
+              remaining.push(childId);
+            }
+          }
+          collateral = remaining;
+        }
+      }
+    }
     // AC2: a descendant held back solely because `needsProducerReview=true`
     // (a candidate skipped with its producer-review flag still set) must be
     // reported with a distinct reason rather than lumped under the generic
@@ -610,10 +921,14 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       message,
       closedCount: 0,
       errorCount: 0,
+      unclosedCount: 0,
+      unclosedItems: [],
       skippedCount: skippedItems.length,
       skippedItems,
       overriddenCount: overriddenItems.length,
       overriddenItems,
+      cascadedCount: cascadedItems.length,
+      cascadedItems,
       refusedCount: refusedItems.length,
       refusedItems,
       dryRun,
@@ -625,6 +940,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   let closedCount = 0;
   let errorCount = 0;
   const errors = [];
+  const unclosedItems = [];
 
   for (const item of closable) {
     if (dryRun) {
@@ -635,8 +951,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       );
       continue;
     }
+    const reason = `Shipped in v${version}`;
     try {
-      const reason = `Shipped in v${version}`;
       // --force: the audit gate (Step 2) already verified audit readiness for
       // every candidate, so the close step may bypass the per-item stage/audit
       // re-check. Without it, a parent whose descendant is stuck in a
@@ -644,24 +960,76 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       // to close recursively, leaving items dangling after the release
       // (SA-0MSAL2NQV0008HY5).
       runCloseCommand(item.id, reason);
-      console.log(`  ✓ ${item.title || item.id} — closed with reason: "${reason}"`);
-      closedCount++;
     } catch (err) {
       const errorMsg = err.stderr?.toString()?.trim() || err.message;
       console.warn(`  ⚠ Failed to close ${item.id} (${item.title}): ${errorMsg}`);
       errors.push({ id: item.id, title: item.title, error: errorMsg });
       errorCount++;
+      continue;
+    }
+
+    // Verify the close persisted (SA-0MUXA5ZNZ0019QY5). A `wl close` can exit
+    // 0 yet lose the update to the concurrent-`wl sync` lost-update race
+    // (WL-0MUXA5RI2009EUTJ); only a re-read of persisted state proves the item
+    // reached the terminal `completed`/`done` lifecycle.
+    let lifecycle = readCloseState(getCloseStateFn, item.id);
+    if (!isTerminalCloseState(lifecycle)) {
+      // Bounded retry (exactly one): a transient lost close is re-issued and
+      // re-verified before being reported unclosed.
+      console.warn(
+        `  ↻ Close of ${item.id} did not persist `
+        + `(status=${lifecycle?.status ?? 'null'}, stage=${lifecycle?.stage ?? 'null'}); retrying once...`,
+      );
+      try {
+        runCloseCommand(item.id, reason);
+      } catch (err) {
+        const errorMsg = err.stderr?.toString()?.trim() || err.message;
+        console.warn(`  ⚠ Retry failed to close ${item.id} (${item.title}): ${errorMsg}`);
+        errors.push({ id: item.id, title: item.title, error: errorMsg });
+        errorCount++;
+        continue;
+      }
+      lifecycle = readCloseState(getCloseStateFn, item.id);
+    }
+
+    if (isTerminalCloseState(lifecycle)) {
+      console.log(`  ✓ ${item.title || item.id} — closed with reason: "${reason}"`);
+      closedCount++;
+    } else {
+      // Fail-safe: never count an unverified close as closed. Report the item
+      // by id so a lost close is visible instead of silently claimed.
+      const detail = lifecycle
+        ? `status=${lifecycle.status}, stage=${lifecycle.stage}`
+        : 'state unreadable';
+      const unclosedReason = `Attempted close did not persist (${detail})`;
+      console.warn(`  ⚠ ${item.title || item.id} (${item.id}) — ${unclosedReason}`);
+      unclosedItems.push({
+        id: item.id,
+        title: item.title,
+        reason: unclosedReason,
+      });
     }
   }
 
+  const unclosedCount = unclosedItems.length;
   let summary;
   if (dryRun) {
     summary = `Dry-run: ${closable.length} work item(s) would be closed`
       + ` (${overriddenItems.length} child override(s) planned).`;
-  } else if (errorCount === 0) {
+  } else if (errorCount === 0 && unclosedCount === 0) {
     summary = `All ${closedCount} work item(s) closed successfully.`;
   } else {
-    summary = `Closed ${closedCount} work item(s); ${errorCount} error(s) (non-fatal).`;
+    const parts = [`Closed ${closedCount} work item(s)`];
+    if (errorCount > 0) {
+      parts.push(`${errorCount} error(s) (non-fatal)`);
+    }
+    if (unclosedCount > 0) {
+      parts.push(
+        `${unclosedCount} attempted close(s) did not persist `
+        + `(unclosed: ${unclosedItems.map((i) => i.id).join(', ')})`,
+      );
+    }
+    summary = `${parts.join('; ')}.`;
   }
 
   if (skippedItems.length > 0) {
@@ -670,6 +1038,9 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   if (overriddenItems.length > 0) {
     summary += ` ${overriddenItems.length} child(ren) overridden (parent audit authorises flag clear).`;
   }
+  if (cascadedItems.length > 0) {
+    summary += ` ${cascadedItems.length} descendant(s) cascaded via passing parent audit.`;
+  }
   if (refusedItems.length > 0) {
     summary += ` ${refusedItems.length} item(s) refused (collateral descendants outside candidate set).`;
   }
@@ -677,16 +1048,20 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   console.log(`\n${summary}`);
 
   return {
-    success: errorCount === 0,
+    success: errorCount === 0 && unclosedCount === 0,
     message: errors.length > 0
       ? `${summary}\nErrors: ${errors.map(e => `${e.id}: ${e.error}`).join('; ')}`
       : summary,
     closedCount,
     errorCount,
+    unclosedCount,
+    unclosedItems,
     skippedCount: skippedItems.length,
     skippedItems,
     overriddenCount: overriddenItems.length,
     overriddenItems,
+    cascadedCount: cascadedItems.length,
+    cascadedItems,
     refusedCount: refusedItems.length,
     refusedItems,
     dryRun,
@@ -906,35 +1281,32 @@ export function runPostReleaseCleanup(options = {}) {
  * 3. Merge `origin/main` into `dev` (fast-forward)
  * 4. Push `dev` to origin
  *
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {(cmd: string) => string} [options.run] - Command runner; defaults
+ *   to `execSync` with git's output streamed to stderr. Tests inject a fake
+ *   runner to assert the command sequence without touching a real repository
+ *   (SA-0MUY6U05F008RG86) — mirroring `verifyReleaseMerge`'s `options.run`.
  * @returns {{ success: boolean, message: string }}
  */
-export function syncDevWithMain() {
+export function syncDevWithMain(options = {}) {
+  const run = options.run || ((cmd) => execSync(cmd, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'inherit', 'pipe'],
+  }));
   try {
     console.log('\nSyncing dev branch with main...');
 
     // Step 1: Fetch latest
-    execSync('git fetch origin --prune', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'inherit', 'pipe'],
-    });
+    run('git fetch origin --prune');
 
     // Step 2: Checkout dev
-    execSync('git checkout dev', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'inherit', 'pipe'],
-    });
+    run('git checkout dev');
 
     // Step 3: Merge main into dev
-    execSync('git merge origin/main', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'inherit', 'pipe'],
-    });
+    run('git merge origin/main');
 
     // Step 4: Push dev to origin
-    execSync('git push origin dev', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'inherit', 'pipe'],
-    });
+    run('git push origin dev');
 
     const message = 'dev branch is now in sync with main and pushed to origin.';
     console.log(message);
@@ -1065,10 +1437,24 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * @returns {number} Exit code (0 = success).
  */
 export async function runRelease(cliArgs = []) {
+  // Fail-fast argument handling (SA-0MV0PZYMI004SUFR): `--help`/`-h` print the
+  // wrapper usage and exit 0, and an unrecognised flag exits non-zero with
+  // usage. This runs BEFORE the Code Freeze marker, project-root resolution
+  // and every gate so a mistaken/exploratory invocation is completely inert.
+  const parsed = parseReleaseArgs(cliArgs);
+  if (parsed.action === 'help') {
+    process.stdout.write(`${WRAPPER_USAGE}\n`);
+    return 0;
+  }
+  if (parsed.action === 'error') {
+    process.stderr.write(`${parsed.message}\n\n${WRAPPER_USAGE}\n`);
+    return 13;
+  }
+
   // Pre-flight-only audit refresh (SA-0MUOO5VMH005VF69): refresh the audits for
   // in_review items and exit WITHOUT merging and WITHOUT setting the Code
   // Freeze marker, so a large backlog never freezes the project.
-  if (cliArgs.includes('--refresh-audits')) {
+  if (parsed.flags.refreshAudits) {
     return runRefreshAuditsAction(cliArgs);
   }
 
@@ -1258,6 +1644,11 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   startStep('Step 5: execute release script');
   console.log('Executing release script...\n');
 
+  // Snapshot the tags that exist BEFORE the merge runs so Step 8 can prove
+  // *this* run created the release tag (SA-0MV0PZYMI004SUFR). A null snapshot
+  // means the state could not be read; post-release steps then fail closed.
+  const preRunTags = snapshotReleaseTags();
+
   // Wrapper-only flags (e.g. --skip-checks) must not reach the merge script,
   // which rejects unknown arguments (SA-0MSKYGAWJ0009M3P).
   const forwardedArgs = releaseScriptForwardArgs(args);
@@ -1356,6 +1747,20 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   }
 
   if (version) {
+    // Newly-created-tag gate (SA-0MV0PZYMI004SUFR): the version read from
+    // `git describe` is only trustworthy when its tag did not already exist
+    // before this run. An already-present tag means the merge script exited 0
+    // without producing a release (the 2026-10-09 spurious-close incident), so
+    // refuse every post-release step instead of closing against a stale tag.
+    if (!isNewlyCreatedTag(version, preRunTags)) {
+      const detail = preRunTags === null
+        ? 'Could not read the pre-run git tag snapshot — cannot prove a new release tag was created.'
+        : `Release tag v${version} already existed before this run — no new release tag was created.`;
+      console.error(`\n⚠️  ${detail}`);
+      console.error('Refusing to close work items (exit code 14).');
+      return finish(14);
+    }
+
     const mergeVerification = verifyReleaseMerge(version);
     if (!mergeVerification.success) {
       console.error(`\n⚠️  ${mergeVerification.message}`);
@@ -1369,9 +1774,13 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     // (SA-0MSQ6K7Z1002H14Z). Runs only after the release merge is verified
     // (never on --dry-run or failed releases). Notification failures are
     // logged as warnings and never change the release exit code.
+    //
+    // The pre-run tag snapshot is forwarded so the notifier can independently
+    // refuse to announce a stale tag (SA-0MV0QEI3Q0063KH3 AC5 defence in
+    // depth) — a second layer beneath the Step 8 newly-created-tag gate.
     startStep('Step 8.5: discord notification');
     try {
-      await sendReleaseNotification({ version, prUrl, projectRoot });
+      await sendReleaseNotification({ version, prUrl, projectRoot }, { preRunTags });
     } catch (err) {
       console.warn(`\n⚠ Discord notification step failed: ${err.message} (non-blocking).`);
     }
@@ -1380,7 +1789,8 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     // ── Step 9: Close work items shipped in this release (non-blocking) ──
     startStep('Step 9: close work items');
     const closeResult = closeWorkItemsAfterRelease(version, { dryRun: isDryRun });
-    if (!closeResult.success && closeResult.errorCount > 0) {
+    if (!closeResult.success
+        && (closeResult.errorCount > 0 || closeResult.unclosedCount > 0)) {
       console.warn(`\n⚠ Non-critical: ${closeResult.message}`);
     }
     stepTimers['Step 9: close work items'].stop();

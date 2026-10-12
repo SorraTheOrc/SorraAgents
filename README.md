@@ -1,10 +1,13 @@
 # Workflow & Skills Repository
 
-A lightweight collection of workflow guides, command patterns, and skill templates for building and operating small automation agents.
+SorraAgents provides agent skills and workflows for software development,
+orchestrated by [ContextHub](https://github.com/TheWizardsCode/ContextHub) (a sister project). The skills can be used with other orchestration systems —
+including humans — but they are optimised for ContextHub.
 
 ## Purpose
 
-- Centralize documentation and reusable "skills" for agent development and operational workflows.
+- Provide agent skills and workflows for software development: planning, implementation, testing, auditing, and release.
+- Support orchestration by ContextHub (a sister project), while remaining usable with other orchestration systems.
 - Provide templates and checklists to guide feature implementation, testing, and release.
 
 ## Terminology Policy
@@ -18,6 +21,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
   - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
   - [skill/report/SKILL.md](skill/report/SKILL.md): the **report helper** — canonical end-of-session report format (Acceptance Criteria table, Meta-Data with ContextHub icons, Producer Actions, Notes, Conclusion) that every work-item skill renders as its final step.
+  - [skill/test-churn/SKILL.md](skill/test-churn/SKILL.md): the **test-churn / TDD-value analysis** skill — reproducible rewrite-ratio and test-growth evidence for any git repository (see [docs/dev/test-churn-skill-reference.md](docs/dev/test-churn-skill-reference.md)).
 - plugins/: local agent framework plugins used by this repository.
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md), [worktree-isolation.md](docs/dev/worktree-isolation.md)). For setting up a new project: [skills-script-paths.md](docs/dev/skills-script-paths.md#initializing-a-new-project-global-install) (global skills install via `scripts/install_pi.sh` — project repos need no `skill/` and must not receive copies of skill scripts). New projects get a project-local `AGENTS.md` reference structure (never a copy of the global file) via `scripts/init_project_agents.py` — see [project-agents-md.md](docs/dev/project-agents-md.md).
 - Workflow.md: high-level workflow for using this repository.

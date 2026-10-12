@@ -39,7 +39,7 @@ The runner manages the item's `status`/`stage` during execution to prevent concu
 - **Verified transitions (WL-0MSVVFBJ2003RRYK):** after the terminal `wl update` the runner reads back the item via `wl show <id> --json` and confirms the status/stage actually changed to the expected values (`completed`/`in_review`, `open`/`plan_complete`, or the restored pre-audit state). A `wl update` that exits 0 without applying (silently swallowed) is retried up to 3 times with short delays; if still unverified the runner prints a loud diagnostic, best-effort restores the captured pre-audit state, and exits **non-zero** — a passing audit can never leave an item stranded in its pre-audit stage silently.
 - `--do-not-persist` doesn't affect the lifecycle; status-update failures are retried and verified, then surfaced loudly (never silently caught).
 - **Dry-run freshness (SA-0MTJ0KO6L004GIZK):** with `--do-not-persist`, a `Ready to close: Yes` verdict STILL persists the audit freshness signal — `auditedAt`/`auditResult` (not the full `rawOutput`) — via the atomic `wl audit-set --ready-to-close yes` path (`updatedAt = auditedAt`, `WL-0MT8KTE3E001Q1D9`) applied as the last write after the terminal transition. The content fingerprint is forwarded so `isAuditFresh` stays true across later `updatedAt` churn; the runner exits non-zero if the refresh fails. A `No`/`partial`/failure verdict never bumps `auditedAt` (fail-closed). Omit the flag to persist the full report.
-- **Descendant cascade on a passing parent audit (SA-0MUR7Y3BJ004FGPP):** once a `Ready to close: Yes` transition has been **verified**, the runner walks the item's full recursive subtree and sets every non-terminal, non-`deleted` descendant to `completed`/`done`, appending one explanatory comment per child naming the authorising parent and the audit timestamp. The cascade is authorised **only** by the passing verdict (never by status/stage alone: a `No`, restore, or fallback run performs no cascade), so the existing scope guard (SA-0MU2OY1N9000XL2H) is unaffected. It is idempotent (already-terminal and `deleted` descendants are skipped — no duplicate comments), suppressed under `--do-not-persist`, and non-fatal (a per-child `wl` failure is logged and does not abort the audit; the next passing audit completes the cascade). Consequently an audit-approved parent arrives at the ship close step with a fully-terminal subtree and is closed without a `--force` collateral refusal.
+- **Descendant cascade on a passing parent audit (SA-0MUR7Y3BJ004FGPP):** once a `Ready to close: Yes` transition has been **verified**, the runner walks the item's full recursive subtree and sets every non-terminal, non-`deleted` descendant to `completed`/`done`, appending one explanatory comment per child naming the authorising parent and the audit timestamp. The cascade is authorised **only** by the passing verdict (never by status/stage alone: a `No`, restore, or fallback run performs no cascade), so the existing scope guard (SA-0MU2OY1N9000XL2H) is unaffected. It is idempotent (already-terminal and `deleted` descendants are skipped — no duplicate comments), suppressed under `--do-not-persist`, and non-fatal (a per-child `wl` failure is logged and does not abort the audit; the next passing audit completes the cascade). Consequently an audit-approved parent arrives at the ship close step with a fully-terminal subtree and is closed without a `--force` collateral refusal. **Audits recorded outside the runner** (manual `wl audit-set` approval, which bypasses this helper) are covered by the ship close step's fallback cascade (SA-0MUR7Y3BJ004FGPP recurrence) — see [release-process.md](../../docs/dev/release-process.md).
 
 ### Child-exemption snapshot (SA-0MUJAPC680078396)
 
@@ -87,18 +87,27 @@ wl update <id> --status in_progress --json
 # Fail: wl update <id> --status "$ORIG_STATUS" --assignee "" --json
 ```
 
-## Fail-Fast Launch Contract
+## Launch Context and Per-Audit Scope
 
-An audit MUST be launched from the project root that owns the work item
-(LP-0MSQ32HNR007AI6B). Before any phase runs — and before any pi/model call —
-the runner verifies the launch context:
+An audit targets the project root that owns the work item
+(LP-0MSQ32HNR007AI6B, revised by SA-0MSRLECW2001AA15). Before any phase
+runs — and before any pi/model call — the runner resolves the launch
+context and the **per-audit target root**:
 
-1. **Owning project check:** the work item's id prefix is resolved to its
-   owning project via the worklog prefix-to-sibling scan (explicit
+1. **Owning project resolution:** the work item's id prefix is resolved to
+   its owning project via the worklog prefix-to-sibling scan (explicit
    `--worklog-dir` takes precedence: its parent is the expected project).
-   If the launch cwd's git root (`TARGET_PROJECT_ROOT`) does not own the
-   item, the run aborts with `Error: Audit launch-context error: ...` and a
-   non-zero exit — zero pi calls, no status lifecycle, no persisted report.
+   The resolved owner becomes the **per-audit target root**, read by every
+   scope-sensitive consumer (git-derived content, code-quality scan,
+   remediation loop, repo-index fallback, debug-log directory, and the F3
+   suite-execution cwd). Launching from a different, **determinable** cwd
+   is no longer fatal: the run proceeds against the owning project and
+   emits a one-line stderr warning naming the launch and owning roots.
+   Only **undeterminable** ownership (no `--worklog-dir`, unknown prefix,
+   no sibling match) aborts with `Error: Undeterminable project scope: ...`
+   and a non-zero exit — zero pi calls, no status lifecycle, no persisted
+   report. The warning channel is stderr only, so it never perturbs the
+   persisted report or the `--json` output (SA-0MSRLECW2001AA15).
 2. **FILE SCOPE manifest check:** before Phase 1 and again before Phase 2,
    the FILE SCOPE manifest must reference the item repository's files. A
    manifest built from the audit skill's own tree (or lacking the item
@@ -114,10 +123,11 @@ the runner verifies the launch context:
    misleading. `PERSIST_CONTENT_INVALID` (fallback notice persisted) stays
    a warning; the child audit is usable.
 
-A mis-scoped audit is indistinguishable from a failed audit, so it MUST fail
-fast (seconds, no pi calls) rather than waste model time. To re-launch
-correctly, cd into the owning project root (a worktree of the owning project
-counts as owning).
+A mis-scoped audit is indistinguishable from a failed audit, so an
+**undeterminable** launch MUST fail fast (seconds, no pi calls) rather than
+waste model time. To launch with zero ambiguity, cd into the owning project
+root (a worktree of the owning project counts as owning) or pass
+`--worklog-dir <owning>/.worklog`.
 
 **Git scope follows the worklog (SA-0MSLLGDW00098UCC).** The runner's
 git-derived content — the file-scope manifest (changed-file list + repo
@@ -131,7 +141,11 @@ silent fallback to the launch cwd's repo). Launching from inside the
 owning project — or a worktree of it (same git repository) — keeps git
 resolving to that checkout, so worktree-only changes and the worktree
 branch HEAD stay correct. The remaining `TARGET_PROJECT_ROOT` consumers
-(code-quality scan and debug-log path) are still launch-cwd-bound.
+(code-quality scan, remediation loop, `_repo_index` fallback, debug-log
+path, and the F3 suite-execution cwd) now read the **per-audit target
+root** (SA-0MULGDABC001T11L), so a foreign-cwd launch never scopes them to
+the launch directory. The module-level `TARGET_PROJECT_ROOT` is retained
+only as the cwd-derived fallback for direct/unit callers.
 
 ## Monitored Run Execution
 
@@ -228,10 +242,10 @@ Phase 2 (model verifies code against each AC)
 
 ### Tiered Phase 1 model (SA-0MSKB697P000T3HG)
 
-Phase 1 parent + child AC screening runs on the resolved model by default; a distinct phase-1 model may be supplied programmatically (direct callers), in which case Phase 1 screens on it while Phase 2 deep analysis keeps the resolved model:
+Phase 1 parent + child AC screening runs on the resolved model by default; a distinct phase-1 model may be supplied programmatically (direct callers) via `cmd_issue(..., phase1_model=...)` / `_AuditContext.phase1_model`, in which case Phase 1 screens on it while Phase 2 deep analysis keeps the resolved model. There is no config-file or CLI flag for this (the config system was removed in SA-0MUQ0I0YY000JCB5):
 
 - **Default (safe):** with no distinct phase-1 model, Phase 1 uses the same resolved model as Phase 2 (`DEFAULT_MODEL`, `Local Proxy/plan`) — behaviour is byte-for-byte identical to a single-model audit.
-- **Wall-clock target:** Phase 1 per-call < **60s** on a healthy proxy when a fast model is configured (baseline: 1,348s avg / max 2,400s — see `docs/dev/audit-phase2-measured-report.md`). Per-call `Per-call timing:` stderr lines remain the observability surface.
+- **Wall-clock target:** Phase 1 per-call < **60s** on a healthy proxy when a fast model is configured (baseline: 1,348s avg / max 2,400s — see `docs/dev/audit-phase2-measured-report.md`). Per-call `Per-call timing:` stderr lines remain the observability surface; each line appends `model=<name>` so the serving model is visible per call.
 - **Safe runtime fallback (AC4):** when a distinct fast Phase 1 model cannot produce reliable batched verdict JSON (unparseable output, provider error, or concurrency-limit timeout), the SAME Phase 1 screen is retried once with the full model before falling back to `partial` diagnostics. With no distinct phase-1 model the retry is a no-op. An infra failure on the fast attempt that succeeds on the full-model retry keeps the conservative `ac_fallback_used` provenance (restore-not-demote).
 
 ### Model metadata line

@@ -62,6 +62,29 @@ with `StatusLifecycle.require_claimed(<id>)` before any mutation; on any
 in-session resume, re-claim first via `StatusLifecycle.ensure_claimed(<id>)`
 (idempotent).
 
+## Project-local extensions
+
+The implement skill consumes the project-local extension convention
+(`.pi/skills_extensions/implement/`, contract SA-0MSQ7MQEJ0064ZB0):
+
+- **`SKILL_PREFIX.md`** is surfaced by `implement.py start` after the gating
+  steps and before the first actionable step; `SKILL_POSTFIX.md` is surfaced
+  by `implement.py finish` after the final step. Both are recorded in the JSON
+  report (`extension.prefix_prose` / `extension.postfix_prose`).
+- **`extension.json`** may declare `ignoreDirtyPaths` — a list (or single
+  string) of repository-relative path prefixes that are *expected* to be dirty
+  and therefore do **not** hard-fail the dirty-tree gate or the worktree
+  placement gate, e.g. `{"ignoreDirtyPaths": [".llm-wiki/"]}`.
+
+The declaration is project-scoped, explicit and additive: it can only relax
+`git_has_dirty_files()` for the named prefixes, never for the rest of the
+checkout, and never for the `.worklog/` or build → test → commit gates.
+Absence is a no-op (byte-for-byte unchanged behaviour). A malformed extension
+is a loud failure: `implement.py start` refuses with an actionable message and
+releases the work item (status → `open`). Uncommitted expected-dirty paths are
+never stashed, committed or reverted. See
+[docs/dev/skill-extensions.md](../../docs/dev/skill-extensions.md).
+
 ## Test Anti-Patterns
 
 Review the shared [Test Writing Guidelines](../shared/test-writing-guidelines.md)
@@ -202,6 +225,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 2. Safety gate: handle dirty working tree
 
+`implement.py start` performs this gate automatically, after it fetches the
+work item; the agent does not need to create the worktree manually.
+
 - Run `git rev-parse --is-inside-work-tree` (worktree?) and
   `git status --porcelain=v1 -b` (uncommitted changes?).
 
@@ -211,12 +237,38 @@ without asking can strand that work and is forbidden. When uncommitted changes
 exist, STOP and ask the operator how to proceed (commit, stash, revert, or
 abort); act only after the operator explicitly chooses.
 
-- **Inside a worktree:** `.worklog/`-only → carry forward; otherwise stop and
-  ask the operator; never stash/commit/revert unilaterally.
-- **Main checkout:** `.worklog/`-only → carry forward; otherwise report the
-  dirty files (may be stale) and create a worktree for isolation without
-  touching the user's changes; if dirty files prevent worktree creation, stop
+`implement.py start` implements this rule as a **Key-Files-aware dirty-tree
+gate** (SA-0MV0NSOGE000OSMR). After fetching the work item it parses the
+description's Key Files section (any of `## Key Files`, `## Key Files
+(predicted)` or `**Key Files:**`) and compares every dirty path against those
+paths:
+
+- **Dirty files demonstrably irrelevant** (no overlap with Key Files): the
+  script proceeds, creates a clean worktree from `HEAD`, leaves the dirty
+  files untouched in the main checkout, logs the decision and the exact paths
+  left behind in a work-item comment, and reports `dirty_worktree: false`.
+  No operator intervention is required.
+- **Any dirty file overlaps Key Files, or no Key Files section is present**
+  (relevance cannot be judged): the script aborts with the original
+  operator-ask behaviour, resets the work item to `open`, and creates no
+  worktree. The agent must stop and ask the operator.
+
+The gate protects the **main checkout** only. When `implement.py start` is
+invoked from inside a linked worktree (e.g. resuming a driven child), the
+gate is skipped: any dirty files there are the agent's own in-progress work.
+
+- **Inside a worktree:** `.worklog/`-only → carry forward; otherwise resume
+  normally (the main-checkout gate is skipped); never stash/commit/revert
+  unilaterally.
+- **Main checkout:** `.worklog/`-only → carry forward; otherwise rely on the
+  Key-Files-aware gate above — it creates the worktree for isolation without
+  touching the user's changes. If dirty files prevent worktree creation, stop
   and ask the operator (act only on their explicit choice).
+- **Project-declared expected-dirty paths** (e.g. `.llm-wiki/`, declared via
+  `.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`) do
+  not stop the gate. Treat them as read-only background state: never stash,
+  commit or revert them. Any dirty path outside the declaration still stops
+  the workflow (see [Project-local extensions](#project-local-extensions)).
 
 On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 
@@ -547,7 +599,7 @@ parent itself gets no worktree.
   - External constraints prevent complete tests → harnesses/mocks/placeholders,
     documented; follow project style; comment on significant decisions.
   - Discovered additional work → `wl create "<title>" --deps discovered-from:<work-item-id> --json`
-- Once all ACs are met: **build** (no errors); **validate via the [test skill](../test/SKILL.md) — the loop is scope-aware (SA-0MT6BYQHB008DOGC)**: `implement.py finish` first runs a **changed-scope** validation (only the tests affected by this change — fast iteration), then a **final full-suite gate** (`--scope full`) before commit, and the **pre-push hook enforces the full suite again on the push to `dev`**. `run_tests.py` execution must go through the test-skill runner (`/skill:test`, `run_tests.py --scope full`): only the test-skill runner records runs in the per-repo test cache (keyed by git state + scope, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run (`npx vitest run`, `pytest`, …) is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
+- Once all ACs are met: **build** (no errors); **validate via the [test skill](../test/SKILL.md) — the loop is scope-aware (SA-0MT6BYQHB008DOGC)**: `implement.py finish` first runs a **changed-scope** validation (only the tests affected by this change — fast iteration), then a **final full-suite gate** (`--scope full`) before commit, and the **pre-push hook enforces the full suite again on the push to `dev`**. The finish gate's suite execution delegates to the test skill's canonical `guarded_run_all` (the single source of truth for the outer live-repo guard, SA-0MUH1MJL6003767Q), so a green gate always implies the checkout was verified for mutation regardless of which entry point ran it. `run_tests.py` execution must go through the test-skill runner (`/skill:test`, `run_tests.py --scope full`): only the test-skill runner records runs in the per-repo test cache (keyed by git state + scope, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run (`npx vitest run`, `pytest`, …) is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
 
 7. Automated self-review
 

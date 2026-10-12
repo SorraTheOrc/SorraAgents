@@ -242,6 +242,59 @@ export function resolveProjectDescription(projectRoot, options = {}) {
   return readProjectDescriptionFromConfig(globalConfigPath);
 }
 
+// ── Project call-to-action (CTA) resolution ─────────────────────────────────
+
+/**
+ * Read the top-level `cta` scalar from a YAML config file, or null if the file
+ * is missing, unreadable or the key is absent/empty. Markdown link syntax in
+ * the value is preserved verbatim.
+ *
+ * @param {string} configPath - Absolute path to a YAML config file.
+ * @returns {string|null} The configured CTA, or null.
+ */
+export function readCtaFromConfig(configPath) {
+  if (!configPath || !existsSync(configPath)) return null;
+  try {
+    const parsed = parseSimpleYaml(readFileSync(configPath, 'utf-8'));
+    const cta = parsed.cta;
+    return typeof cta === 'string' && cta.trim() !== '' ? cta.trim() : null;
+  } catch {
+    // A corrupt/unreadable config must never break the release — skip quietly.
+    return null;
+  }
+}
+
+/**
+ * Resolve the project call-to-action with the same three-layer precedence as
+ * the webhook URL, project name and project description (AC2):
+ *   1. <project>/.worklog/config.private.yaml  (project private)
+ *   2. <project>/.worklog/config.yaml          (project, tracked)
+ *   3. ~/.pi/agent/config.yaml                 (global fallback)
+ * The first file that defines the top-level `cta` key wins.
+ *
+ * @param {string} [projectRoot] - Project root (default: process.cwd()).
+ * @param {object} [options] - Injectable paths (used by unit tests).
+ * @param {string} [options.privateConfigPath] - Default <root>/.worklog/config.private.yaml.
+ * @param {string} [options.projectConfigPath] - Default <root>/.worklog/config.yaml.
+ * @param {string} [options.globalConfigPath] - Default ~/.pi/agent/config.yaml.
+ * @returns {string|null} The resolved CTA, or null when unset.
+ */
+export function resolveCta(projectRoot, options = {}) {
+  const {
+    privateConfigPath = join(projectRoot || process.cwd(), '.worklog', 'config.private.yaml'),
+    projectConfigPath = join(projectRoot || process.cwd(), '.worklog', 'config.yaml'),
+    globalConfigPath = join(homedir(), '.pi', 'agent', 'config.yaml'),
+  } = options;
+
+  const privateCta = readCtaFromConfig(privateConfigPath);
+  if (privateCta) return privateCta;
+
+  const projectCta = readCtaFromConfig(projectConfigPath);
+  if (projectCta) return projectCta;
+
+  return readCtaFromConfig(globalConfigPath);
+}
+
 // ── Changelog extraction (AC1) ──────────────────────────────────────────────
 
 /**
@@ -445,8 +498,9 @@ export async function resolveProjectPitch(projectRoot, options = {}) {
  *
  * Description paragraphs are composed in this order (composition AC5):
  * (a) the project elevator pitch, (b) the release focus, (c) the
- * project/version line, and (d) the changelog section — absent paragraphs are
- * omitted. The composed description is truncated to the Discord limit.
+ * project/version line, (d) the project call-to-action, and (e) the changelog
+ * section — absent paragraphs are omitted. The composed description is
+ * truncated to the Discord limit.
  *
  * @param {object} details
  * @param {string} [details.version] - Released semver version.
@@ -457,10 +511,11 @@ export async function resolveProjectPitch(projectRoot, options = {}) {
  * @param {string} [details.projectName] - Project name (read from worklog config).
  * @param {string|null} [details.pitch] - Project elevator pitch (2–3 sentences).
  * @param {string|null} [details.focus] - Release focus (1–3 sentences).
+ * @param {string|null} [details.cta] - Project call-to-action (markdown preserved).
  * @returns {{ embeds: Array<object> }} Discord webhook payload.
  */
 export function buildDiscordPayload({
-  version, tag, date, prUrl, changelog, projectName, pitch, focus,
+  version, tag, date, prUrl, changelog, projectName, pitch, focus, cta,
 } = {}) {
   const versionText = version || 'unknown';
   const tagText = tag || (version ? `v${version}` : 'unknown');
@@ -475,6 +530,8 @@ export function buildDiscordPayload({
   if (pitch) paragraphs.push(pitch);
   if (focus) paragraphs.push(focus);
   if (projectName) paragraphs.push(`**${projectName} v${versionText}**`);
+  // CTA follows the intro block and sits immediately before the changelog.
+  if (cta) paragraphs.push(cta);
   paragraphs.push(
     changelog ? changelog : `No changelog available for v${versionText}.`,
   );
@@ -508,6 +565,46 @@ function toISODate(d) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+// ── Release provenance guard (SA-0MV0QEI3Q0063KH3 AC5) ──────────────────────
+
+/**
+ * Decide whether a release's version tag was newly created by the current run.
+ *
+ * Defence in depth for the 2026-10-09 incident (SA-0MV0QEI3Q0063KH3): the
+ * notifier must never announce a release whose version tag already existed
+ * before the run. The caller supplies the pre-run tag snapshot captured before
+ * the merge script ran (`preRunTags`) and/or an explicit `tagCreatedByThisRun`
+ * flag. The guard is conservative — any signal that the tag is stale wins:
+ *
+ *   - `tagCreatedByThisRun === false` → not this run's tag.
+ *   - `preRunTags === null` → the snapshot could not be read; fail closed.
+ *   - `preRunTags` (Set/array) contains `v<version>` → the tag pre-existed.
+ *   - otherwise → proven new by this run.
+ *
+ * When neither option is supplied the guard is not applicable (legacy callers
+ * and unit tests that predate the provenance check) and returns true; the
+ * production caller (`run-release.js`) always supplies `preRunTags`.
+ *
+ * @param {string} version - Released semver version (e.g. "1.2.3").
+ * @param {object} [provenance]
+ * @param {Set<string>|string[]|null} [provenance.preRunTags] - Tags present
+ *   before the run; `null` means the snapshot could not be read.
+ * @param {boolean} [provenance.tagCreatedByThisRun] - Explicit provenance flag.
+ * @returns {boolean} True only when the tag is proven new by this run.
+ */
+export function isVersionTagNew(version, { preRunTags, tagCreatedByThisRun } = {}) {
+  if (!version) return false;
+  if (tagCreatedByThisRun === false) return false;
+  if (preRunTags === null) return false;
+  if (preRunTags !== undefined) {
+    const tags = preRunTags instanceof Set
+      ? preRunTags
+      : new Set(typeof preRunTags === 'string' ? [preRunTags] : preRunTags);
+    if (tags.has(`v${version}`)) return false;
+  }
+  return true;
+}
+
 /**
  * Send the post-release Discord notification (non-blocking).
  *
@@ -517,6 +614,11 @@ function toISODate(d) {
  * and returns `{ success: true, notified: false }` so the release exit code
  * is never changed (AC3). When no webhook is configured the step is skipped
  * with an info log and the release completes normally (AC2).
+ *
+ * Provenance guard (SA-0MV0QEI3Q0063KH3 AC5): before the webhook is resolved
+ * or a payload is built the notifier independently refuses to send when the
+ * resolved version's tag was not created by the current run (see
+ * {@link isVersionTagNew}).
  *
  * @param {object} release
  * @param {string} release.version - Released semver version (e.g. "1.2.3").
@@ -534,6 +636,10 @@ function toISODate(d) {
  * @param {string} [options.changelogContent] - Pre-read changelog content.
  * @param {() => Date} [options.now] - Date provider for the date fallback.
  * @param {number} [options.timeoutMs=10000] - Webhook POST timeout.
+ * @param {Set<string>|string[]|null} [options.preRunTags] - Git tags that
+ *   existed before the run (provenance guard, AC5). `null` fails closed.
+ * @param {boolean} [options.tagCreatedByThisRun] - Explicit provenance flag
+ *   (provenance guard, AC5).
  * @returns {Promise<{success: boolean, notified: boolean, skipped?: boolean, reason?: string, error?: string}>}
  */
 export async function sendReleaseNotification({ version, prUrl, projectRoot }, options = {}) {
@@ -549,7 +655,25 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
     changelogContent,
     now = () => new Date(),
     timeoutMs = 10000,
+    preRunTags,
+    tagCreatedByThisRun,
   } = options;
+
+  // Provenance guard (AC5): independently refuse to announce a release whose
+  // version tag was not created by this run. This runs BEFORE the webhook is
+  // resolved and before any payload is built, so no POST is ever attempted.
+  if (!isVersionTagNew(version, { preRunTags, tagCreatedByThisRun })) {
+    console.log(
+      `Discord release notification skipped: version tag v${version} was not ` +
+      'created by this run.',
+    );
+    return {
+      success: true,
+      notified: false,
+      skipped: true,
+      reason: 'version tag not created by this run',
+    };
+  }
 
   const webhookUrl = resolveDiscordWebhookUrl(projectRoot, { privateConfigPath, projectConfigPath, globalConfigPath });
   if (!webhookUrl) {
@@ -562,6 +686,10 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
 
   // Resolve the project name (AC1, AC2, AC3 — same precedence as webhook URL).
   const projectName = resolveProjectName(projectRoot, { privateConfigPath, projectConfigPath, globalConfigPath });
+
+  // Resolve the project call-to-action (same precedence as projectName).
+  // Non-blocking: a missing/malformed/unreadable CTA is simply omitted.
+  const cta = resolveCta(projectRoot, { privateConfigPath, projectConfigPath, globalConfigPath });
 
   // Resolve the project pitch: configured projectDescription wins; otherwise
   // generate it from README prose. Non-blocking — any failure omits it.
@@ -608,6 +736,7 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
     projectName,
     pitch,
     focus,
+    cta,
   });
 
   try {

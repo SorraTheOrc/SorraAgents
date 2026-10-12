@@ -7,6 +7,7 @@ Provides functions for:
   - Computing whether child ACs collectively cover parent ACs
   - Auto-closing unambiguous coverage gaps
   - Detecting and reporting unresolvable conflicts
+  - Applying the review: closing gaps, commenting, and advancing/stopping
 
 The module is designed to be called from both the plan and intake skills,
 allowing them to verify that a parent's acceptance criteria are collectively
@@ -34,9 +35,23 @@ _parent_dir = os.path.dirname(_skill_dir)  # .../skills/
 if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
-from shared.status_lifecycle import resolve_worklog_flags
+from shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
 
 logger = logging.getLogger("tree_coverage")
+
+#: Similarity floor for auto-closing an uncovered parent AC.
+#:
+#: ``compute_coverage`` treats a child AC as covering a parent AC at or above
+#: the coverage threshold (0.4). An uncovered AC whose best match to any child
+#: AC is at least this floor has a *clear mapping* — the child already partially
+#: covers it — so the review can close the gap without inventing requirements.
+#: Below the floor (including zero overlap) the mapping is unclear and the
+#: review stops. Keeping the floor below the coverage threshold is what makes
+#: the ``auto_close`` recommendation reachable at all.
+AUTO_CLOSE_SIMILARITY_THRESHOLD = 0.2
+
+#: Stable marker embedded in coverage-review comments so re-runs are idempotent.
+COVERAGE_COMMENT_MARKER = "[tree-coverage-review]"
 
 # ---------------------------------------------------------------------------
 # Subprocess execution helper (supports custom runners for test injection)
@@ -108,13 +123,19 @@ def _wl_show_children(
     work_item_id: str,
     runner: Any | None = None,
 ) -> list[dict]:
-    """Call ``wl show <id> --children --json`` and return the children list."""
-    cmd = ["wl", "show", work_item_id, "--children", "--json"]
+    """Return the *direct* children of *work_item_id*.
+
+    Uses ``wl list --parent <id> --json`` (direct children only). The earlier
+    ``wl show <id> --children`` form returns the *full descendant set*, which
+    would make grandchildren look like siblings; the tree helpers require
+    direct children so recursion and coverage walks stay correct.
+    """
+    cmd = ["wl", "list", "--parent", work_item_id, "--json"]
     cmd[1:1] = resolve_worklog_flags(cmd)
     proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning(
-            "wl show children failed target=%s stderr=%s",
+            "wl list children failed target=%s stderr=%s",
             work_item_id, proc.stderr,
         )
         return []
@@ -122,15 +143,20 @@ def _wl_show_children(
         data = json.loads(proc.stdout)
     except json.JSONDecodeError:
         logger.warning(
-            "wl show children invalid JSON target=%s", work_item_id
+            "wl list children invalid JSON target=%s", work_item_id
         )
         return []
     if isinstance(data, dict) and data.get("success") is False:
         logger.warning(
-            "wl show children returned error target=%s", work_item_id
+            "wl list children returned error target=%s", work_item_id
         )
         return []
-    return data.get("children", []) if isinstance(data, dict) else []
+    if not isinstance(data, dict):
+        return []
+    # Real ``wl list`` shape is ``workItems``; the ``children`` key is kept for
+    # backward compatibility with callers that pass ``show --children`` data.
+    items = data.get("workItems", data.get("children", []))
+    return items if isinstance(items, list) else []
 
 
 def _get_title_from_children(
@@ -169,14 +195,28 @@ def order_by_dependencies(
     if not children:
         return []
 
-    # Build dependency map: child_id -> set of prerequisite IDs
-    dep_edges = _get_dep_edges(work_item_id, runner=runner)
+    # Build dependency map: child_id -> set of prerequisite IDs.
+    #
+    # Two sources are merged:
+    #   1. Parent-level edges (legacy shape) from ``_get_dep_edges`` — kept for
+    #      callers/tests that pass synthetic edge dicts (targetId/prerequisiteId).
+    #   2. Each child's *own* outbound edges from ``wl dep list <child>`` — the
+    #      real worklog shape (``{"item":..., "inbound":[...], "outbound":[...]}``).
+    #      Child-to-child edges live on the children, not the parent, so (2) is
+    #      what makes real dependency ordering work.
     deps: dict[str, set[str]] = {}
-    for edge in dep_edges:
+    for edge in _get_dep_edges(work_item_id, runner=runner):
         target = edge.get("targetId") or edge.get("target")
         prereq = edge.get("prerequisiteId") or edge.get("prerequisite")
         if target and prereq:
             deps.setdefault(target, set()).add(prereq)
+
+    for child in children:
+        child_id = child.get("id")
+        if not child_id:
+            continue
+        for prereq in _get_child_dependency_ids(child_id, runner=runner):
+            deps.setdefault(child_id, set()).add(prereq)
 
     # Build reverse map: prerequisite_id -> set of child_ids that depend on it
     dependents: dict[str, set[str]] = defaultdict(set)
@@ -245,6 +285,73 @@ def _get_dep_edges(
     if isinstance(data, list):
         return data
     return data.get("dependencies", []) if isinstance(data, dict) else []
+
+
+def _get_child_dependency_ids(
+    child_id: str,
+    runner: Any | None = None,
+) -> list[str]:
+    """Return the IDs of *child_id*'s outbound prerequisites.
+
+    Calls ``wl dep list <child_id> --json`` and reads the real worklog shape::
+
+        {"success": true, "item": "<id>", "inbound": [...], "outbound": [...]}
+
+    Each ``outbound`` entry is a prerequisite the child depends on (its ``id``
+    is the prerequisite's work-item ID). The legacy ``dependencies`` array
+    shape is also accepted. Returns an empty list on any failure so ordering
+    degrades gracefully to listed order.
+    """
+    cmd = ["wl", "dep", "list", child_id, "--json"]
+    cmd[1:1] = resolve_worklog_flags(cmd)
+    proc = _execute_subprocess(cmd, runner=runner)
+    if proc.returncode != 0:
+        logger.warning(
+            "wl dep list (child) failed target=%s stderr=%s",
+            child_id, proc.stderr,
+        )
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.warning("wl dep list (child) invalid JSON target=%s", child_id)
+        return []
+    if isinstance(data, dict) and data.get("success") is False:
+        logger.warning("wl dep list (child) returned error target=%s", child_id)
+        return []
+
+    prereqs: list[str] = []
+
+    if isinstance(data, dict) and isinstance(data.get("outbound"), list):
+        # Real wl shape: each outbound entry's ``id`` is a prerequisite.
+        for edge in data["outbound"]:
+            if not isinstance(edge, dict):
+                continue
+            prereq = (
+                edge.get("id")
+                or edge.get("targetId")
+                or edge.get("prerequisiteId")
+            )
+            if prereq:
+                prereqs.append(prereq)
+        return prereqs
+
+    # Legacy array shape: {"targetId": <depending id>, "prerequisiteId": <prereq>}.
+    legacy: list = []
+    if isinstance(data, dict) and isinstance(data.get("dependencies"), list):
+        legacy = data["dependencies"]
+    elif isinstance(data, list):
+        legacy = data
+    for edge in legacy:
+        if not isinstance(edge, dict):
+            continue
+        target = edge.get("targetId") or edge.get("target")
+        if target and target != child_id:
+            continue
+        prereq = edge.get("prerequisiteId") or edge.get("prerequisite")
+        if prereq:
+            prereqs.append(prereq)
+    return prereqs
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +659,9 @@ def run_coverage_review(
     for p_idx, parent_ac in enumerate(parent_acs):
         if parent_ac in coverage["uncovered"]:
             gap_result = resolve_coverage_gaps(
-                parent_ac, child_acs_flat, similarity_threshold=0.85
+                parent_ac,
+                child_acs_flat,
+                similarity_threshold=AUTO_CLOSE_SIMILARITY_THRESHOLD,
             )
             if gap_result["resolved"]:
                 resolved_gaps.append({
@@ -586,6 +695,227 @@ def run_coverage_review(
         "resolved_gaps": resolved_gaps,
         "unresolvable_conflicts": unresolvable_conflicts,
         "recommendation": recommendation,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Apply step (mutation) — used by the plan/intake final review
+# ---------------------------------------------------------------------------
+
+
+def _run_wl_json(
+    command: list[str],
+    runner: Any | None = None,
+) -> dict[str, Any] | None:
+    """Run a ``wl`` command and return parsed JSON, or ``None`` on failure."""
+    cmd = list(command)
+    cmd[1:1] = resolve_worklog_flags(cmd)
+    proc = _execute_subprocess(cmd, runner=runner)
+    if proc.returncode != 0:
+        logger.warning(
+            "wl command failed cmd=%s stderr=%s", " ".join(cmd), proc.stderr
+        )
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.warning("wl command returned invalid JSON cmd=%s", " ".join(cmd))
+        return None
+    if isinstance(data, dict) and data.get("success") is False:
+        logger.warning("wl command returned error cmd=%s", " ".join(cmd))
+        return None
+    return data
+
+
+def _comment_bodies(work_item_id: str, runner: Any | None = None) -> list[str]:
+    """Return the bodies of *work_item_id*'s comments (best effort)."""
+    data = _run_wl_json(
+        ["wl", "comment", "list", work_item_id, "--json"], runner=runner
+    )
+    if not data:
+        return []
+    comments = data.get("comments", data) if isinstance(data, dict) else data
+    bodies: list[str] = []
+    for comment in comments or []:
+        if isinstance(comment, dict):
+            body = (
+                comment.get("comment")
+                or comment.get("body")
+                or comment.get("text")
+                or ""
+            )
+        elif isinstance(comment, str):
+            body = comment
+        else:
+            body = ""
+        if body:
+            bodies.append(body)
+    return bodies
+
+
+def _add_comment_if_absent(
+    work_item_id: str,
+    body: str,
+    runner: Any | None = None,
+) -> bool:
+    """Add *body* as a comment unless an identical review comment exists.
+
+    Idempotence guard: re-running the apply step must not duplicate comments.
+    Returns True when a comment was added.
+    """
+    if body in _comment_bodies(work_item_id, runner=runner):
+        return False
+    _run_wl_json(
+        [
+            "wl", "comment", "add", work_item_id,
+            "--comment", body,
+            "--author", "plan-intake-coverage",
+            "--json",
+        ],
+        runner=runner,
+    )
+    return True
+
+
+def _create_coverage_child(
+    parent_id: str,
+    parent_ac: str,
+    runner: Any | None = None,
+) -> str | None:
+    """Create a child work item whose AC directly covers *parent_ac*.
+
+    The child restates the uncovered parent AC verbatim, so it is a direct
+    mapping rather than an invented requirement. Returns the new child ID, or
+    ``None`` on failure.
+    """
+    title = f"Close coverage gap: {parent_ac}"
+    if len(title) > 120:
+        title = title[:117] + "..."
+    description = (
+        "Auto-created by the plan/intake AC coverage review to close an "
+        "uncovered parent acceptance criterion.\n\n"
+        "## Acceptance Criteria\n"
+        f"- {parent_ac}\n"
+    )
+    data = _run_wl_json(
+        [
+            "wl", "create",
+            "--title", title,
+            "--description", description,
+            "--parent", parent_id,
+            "--issue-type", "task",
+            "--priority", "medium",
+            "--json",
+        ],
+        runner=runner,
+    )
+    if not data:
+        return None
+    item = data.get("workItem", data)
+    return item.get("id") if isinstance(item, dict) else None
+
+
+def _advance_stage(
+    work_item_id: str,
+    target_stage: str | None,
+    runner: Any | None = None,
+) -> bool:
+    """Advance *work_item_id* to *target_stage* (status ``open``).
+
+    Returns True when a stage was set. Uses :class:`StatusLifecycle` so the
+    transition follows the shared lifecycle rules.
+    """
+    if not target_stage:
+        return False
+    StatusLifecycle.update_status(
+        work_item_id, "open", stage=target_stage, runner=runner
+    )
+    return True
+
+
+def apply_coverage_review(
+    work_item_id: str,
+    target_stage: str | None = None,
+    runner: Any | None = None,
+) -> dict[str, Any]:
+    """Apply the AC coverage review, mutating the worklog where needed.
+
+    Deterministic implementation of the plan/intake skills' "final AC coverage
+    review" step:
+
+      - ``proceed``    — coverage is complete; when *target_stage* is given the
+        item is advanced to that stage (status ``open``).
+      - ``auto_close`` — unambiguous gaps are closed by creating a child whose
+        AC restates the uncovered parent AC; a comment records the closure and
+        the item is advanced to *target_stage*.
+      - ``stop``       — unresolvable conflicts are recorded in a comment and
+        the item is **not** advanced (left ``open``).
+
+    Idempotent: re-running does not create duplicate children or comments, and
+    a fully covered tree reports ``proceed``.
+
+    Arguments:
+        work_item_id: The reviewed work item (parent node).
+        target_stage: Stage to set on success (``plan_complete`` for the plan
+            skill, ``intake_complete`` for intake). ``None`` sets no stage.
+        runner: Optional test runner.
+
+    Returns:
+        A dict with ``action`` (``proceed``/``auto_close``/``stop``),
+        ``advanced`` (bool), ``created_children`` (IDs), ``conflicts``, and the
+        raw ``review``.
+    """
+    review = run_coverage_review(work_item_id, runner=runner)
+    recommendation = review["recommendation"]
+
+    if recommendation == "proceed":
+        advanced = _advance_stage(work_item_id, target_stage, runner=runner)
+        return {
+            "work_item_id": work_item_id,
+            "action": "proceed",
+            "advanced": advanced,
+            "created_children": [],
+            "conflicts": [],
+            "review": review,
+        }
+
+    if recommendation == "auto_close":
+        created_children: list[str] = []
+        for gap in review["resolved_gaps"]:
+            child_id = _create_coverage_child(
+                work_item_id, gap["parent_ac"], runner=runner
+            )
+            if child_id:
+                created_children.append(child_id)
+        gaps = "; ".join(f"'{g['parent_ac']}'" for g in review["resolved_gaps"])
+        body = (
+            f"{COVERAGE_COMMENT_MARKER} AC coverage review auto-closed "
+            f"{len(created_children)} gap(s): {gaps}"
+        )
+        _add_comment_if_absent(work_item_id, body, runner=runner)
+        advanced = _advance_stage(work_item_id, target_stage, runner=runner)
+        return {
+            "work_item_id": work_item_id,
+            "action": "auto_close",
+            "advanced": advanced,
+            "created_children": created_children,
+            "conflicts": [],
+            "review": review,
+        }
+
+    conflicts = review["unresolvable_conflicts"]
+    body = (
+        f"{COVERAGE_COMMENT_MARKER} AC coverage review stopped: "
+        f"{len(conflicts)} unresolved conflict(s): " + "; ".join(conflicts)
+    )
+    _add_comment_if_absent(work_item_id, body, runner=runner)
+    return {
+        "work_item_id": work_item_id,
+        "action": "stop",
+        "advanced": False,
+        "created_children": [],
+        "conflicts": conflicts,
+        "review": review,
     }
 
 

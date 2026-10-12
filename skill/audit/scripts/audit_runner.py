@@ -168,6 +168,39 @@ inherit the guard and cannot cascade further.
 """
 
 
+def _has_build_script(cwd: str) -> bool:
+    """Check whether the repo root package.json defines a ``build`` script.
+
+    A repo without a ``scripts.build`` entry (e.g. docs-only projects)
+    has nothing to build: ``npm run build`` would exit 1 with
+    ``Missing script: "build"`` and block the merge gate for every
+    implementation. Reads the root ``package.json`` directly so the
+    check works without npm.
+
+    Malformed JSON, a non-object ``scripts`` value, or a missing file
+    counts as "no build script" (fail-open — never block the merge gate
+    on a broken manifest).
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True if the root package.json exists and contains a non-empty
+        ``scripts.build`` entry.
+    """
+    package_json = Path(cwd) / "package.json"
+    if not package_json.exists():
+        return False
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return False
+    return bool(scripts.get("build"))
+
+
 def _suite_run_in_progress() -> bool:
     """Return True when an outer test-suite run owns the checkout.
 
@@ -1367,8 +1400,36 @@ TARGET_PROJECT_ROOT: Path = _detect_project_root()
 
 Defaults to the git root (or ``Path.cwd()`` as fallback) at import time.
 This may differ from ``REPO_ROOT`` when the audit runner's framework
-repository is not the working directory.
+repository is not the working directory. Retained as the **cwd-derived
+fallback** for residual consumers: the per-audit target root published in
+``_ACTIVE_AUDIT_ROOT`` (see below) takes precedence during a run
+(SA-0MULGDABC001T11L).
 """
+
+
+_ACTIVE_AUDIT_ROOT: Path | None = None
+"""Per-audit target project root, published for deep helpers.
+
+Resolved once in ``_phase_gate`` (SA-0MULGDABC001T11L) as the worklog-derived
+owning root (or the launch cwd when it is the same git repository — the
+own-project or worktree checkout) and stored on
+``_AuditContext.per_audit_project_root``. Deep Phase 1/2 helpers reached
+without an ``_AuditContext`` read it from here so a foreign-cwd launch still
+targets the audited project. ``None`` outside a run, where the cwd-derived
+``TARGET_PROJECT_ROOT`` remains the fallback. Reset by ``cmd_issue`` when the
+run completes so it never leaks across audits.
+"""
+
+
+def _audit_target_root(project_root: Path | None = None) -> Path:
+    """Resolve the target project root for a residual consumer.
+
+    Returns *project_root* when supplied, else the active per-audit root
+    published by ``_phase_gate``, else the cwd-derived
+    ``TARGET_PROJECT_ROOT`` (launch-root fallback retained for direct unit
+    callers and the existing test suite).
+    """
+    return project_root or _ACTIVE_AUDIT_ROOT or TARGET_PROJECT_ROOT
 
 
 SIBLING_SCAN_ROOT: Path = SHARED_SIBLING_SCAN_ROOT
@@ -1455,22 +1516,35 @@ def _same_git_repository(root_a: Path, root_b: Path) -> bool:
 
 def _verify_launch_context(issue_id: str,
                            worklog_dir: str | None = None) -> str | None:
-    """Return a fatal error message when the launch context does not own *issue_id*.
+    """Return a fatal error only when the item's owner is undeterminable.
 
     The launch context is the cwd-derived ``TARGET_PROJECT_ROOT`` — the
-    repository that Phase 1/2 would target. The owning project is resolved
-    from the worklog (explicit ``--worklog-dir`` parent, else
-    prefix-to-sibling scan). A mismatch (e.g. an LP item audited from the
-    SorraAgents checkout) means the run would scope its FILE SCOPE manifest
-    to the wrong repository and emit misleading 'unmet' verdicts — fail
-    fast with zero pi calls.
+    repository that a legacy launch would target. The owning project is
+    resolved from the worklog (explicit ``--worklog-dir`` parent, else
+    prefix-to-sibling scan).
 
-    Returns ``None`` when the context is correct (or ownership cannot be
-    determined — fail open).
+    SA-0MSRLECW2001AA15 inverted the guard: a **determinable** non-owning
+    launch no longer aborts. The audit now resolves a per-audit target root
+    from the worklog-derived owner (``_phase_gate``), so a foreign-cwd launch
+    proceeds against the owning project with a one-line stderr warning naming
+    the launch and owning roots. Only **undeterminable** ownership aborts —
+    with no ``--worklog-dir``, an unknown prefix, and no sibling match there
+    is no per-audit root to resolve and falling back to the launch cwd's
+    repository would silently scope the audit to the wrong project.
+
+    Returns ``None`` when the context is correct, the launch is the owning
+    project (or a worktree of it), or ownership is determinable; returns the
+    fatal error string when ownership cannot be determined.
     """
     owning_root = _resolve_owning_project_root(issue_id, worklog_dir=worklog_dir)
     if owning_root is None:
-        return None
+        return (
+            f"Undeterminable project scope for work item {issue_id}: no "
+            f"--worklog-dir, unknown item prefix, and no sibling match. "
+            f"Refusing to fall back to the launch cwd's repository for "
+            f"git-derived content. Re-launch from the owning project or "
+            f"pass --worklog-dir."
+        )
     launch_root = TARGET_PROJECT_ROOT.resolve()
     if launch_root == owning_root.resolve():
         return None
@@ -1482,15 +1556,16 @@ def _verify_launch_context(issue_id: str,
     # <owning>/.worklog/worktrees/ — same repository as the owning project.
     if (owning_root / ".worklog" / "worktrees") in launch_root.parents:
         return None
-    return (
-        f"Audit launch-context error: work item {issue_id} is owned by "
-        f"project {owning_root} (resolved from the worklog prefix scan), "
-        f"but this run was launched from project {launch_root}. The audit "
-        f"would target the wrong repository and waste model time. Re-launch "
-        f"from {owning_root} — the project that owns the item. Note: "
-        f"--worklog-dir does not change the project scope; only the launch "
-        f"directory does."
+    # Determinable non-owning launch (SA-0MSRLECW2001AA15): proceed against
+    # the owning project with a one-line stderr warning naming the launch and
+    # owning roots. The warning is deliberately written to stderr (never the
+    # persisted report or JSON output) so it cannot perturb a verdict (AC3).
+    print(
+        f"Warning: audit launched from {launch_root} but work item "
+        f"{issue_id} is owned by {owning_root}; auditing the owning project.",
+        file=sys.stderr,
     )
+    return None
 
 
 def _project_top_levels(project_root: Path) -> list[str]:
@@ -3063,7 +3138,9 @@ def _log_audit_slot(priority: int, position: int | None, ticket: str,
     )
 
 
-def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
+def _prune_dead_audit_tickets(
+    queue: PriorityQueue, timeout: float | None = None
+) -> int:
     """Remove audit queue tickets whose owning process is no longer alive.
 
     Ticket ids have the shape ``audit:{issue_id}:{pid}:{counter}``. A
@@ -3073,13 +3150,26 @@ def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
     audit times out with "audit concurrency queue saturated", even though
     no audit is actually running (the observed failure mode).
 
-    Returns the number of tickets pruned. Never raises: a malformed id or
-    a transient ``remove`` race is ignored (the caller retries the poll).
+    Args:
+        queue: The audit priority queue to prune.
+        timeout: Optional bound (seconds) on directory-lock acquisition so
+            a peer holding the lock cannot block admission indefinitely
+            (SA-0MUV4C6RZ006GN5Z).  ``None`` preserves the historical
+            unbounded behaviour.
+
+    Returns the number of tickets pruned. Never raises: a malformed id, a
+    lock-contention timeout, or a transient ``remove`` race is ignored
+    (the caller retries the poll).
     """
     try:
+        queue._deadline = (
+            None if timeout is None else time.monotonic() + float(timeout)
+        )
         entries = queue._list_entries()
-    except OSError:
+    except (OSError, TimeoutError):
         return 0
+    finally:
+        queue._deadline = None
     pruned = 0
     for entry in entries:
         parts = entry.item_id.split(":")
@@ -3094,13 +3184,33 @@ def _prune_dead_audit_tickets(queue: PriorityQueue) -> int:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            # Owner is gone — safe to drop the stale ticket.
-            if queue.remove(entry.item_id) is not None:
-                pruned += 1
+            # Owner is gone — safe to drop the stale ticket. Fail-fast on
+            # the lock so a contended directory cannot hang the prune.
+            try:
+                if queue.remove(entry.item_id, timeout=0) is not None:
+                    pruned += 1
+            except TimeoutError:
+                continue
         except PermissionError:
             # Process exists but is not ours — not stale.
             continue
     return pruned
+
+
+def _try_queue_depth(queue: PriorityQueue) -> int:
+    """Best-effort queue depth that fails fast on directory-lock contention.
+
+    Used only for the timeout diagnostic message; a peer holding the lock
+    must not turn the error path into another unbounded wait
+    (SA-0MUV4C6RZ006GN5Z). Returns 0 when the depth cannot be read.
+    """
+    queue._deadline = time.monotonic()  # immediate fail-fast deadline
+    try:
+        return len(queue)
+    except TimeoutError:
+        return 0
+    finally:
+        queue._deadline = None
 
 
 def _acquire_audit_slot(issue_id: str = "",
@@ -3149,19 +3259,28 @@ def _acquire_audit_slot(issue_id: str = "",
         f"audit:{issue_id or 'anon'}:{os.getpid()}:"
         f"{next(_AUDIT_TICKET_COUNTER)}"
     )
+    queue_timeout = _audit_queue_timeout()
+    # A single admission deadline bounds EVERY lock-taking step below, so a
+    # peer holding the queue's directory lock cannot block slot acquisition
+    # past AUDIT_QUEUE_TIMEOUT (SA-0MUV4C6RZ006GN5Z).
+    admission_deadline = time.monotonic() + queue_timeout
+
+    def _remaining() -> float:
+        return max(0.0, admission_deadline - time.monotonic())
+
     # Stale-ticket hygiene: remove tickets whose owning PID is no longer
     # alive (crashed/timed-out audits would otherwise leave them until the
     # 24h TTL prune, accumulating and saturating the queue for all
-    # subsequent audits).
-    _prune_dead_audit_tickets(queue)
-    queue_timeout = _audit_queue_timeout()
+    # subsequent audits). Bounded by the shared admission deadline.
+    _prune_dead_audit_tickets(queue, timeout=_remaining())
     queued_wall = time.time()
     queued_mono = time.monotonic()
     last_prune_mono = queued_mono
-    # Bounded enqueue: a full queue waits up to queue_timeout (AC3).
-    queue.enqueue(ticket, priority, timeout=queue_timeout)
-    position = queue.rank(ticket)
-    deadline = time.monotonic() + queue_timeout
+    # Bounded enqueue: a full queue waits up to queue_timeout (AC3); a held
+    # directory lock times out within the same bound.
+    queue.enqueue(ticket, priority, timeout=_remaining())
+    position = queue.rank(ticket, timeout=_remaining())
+    deadline = admission_deadline
     while True:
         head = queue.peek(timeout=0)
         if head is not None and head.item_id == ticket:
@@ -3170,7 +3289,15 @@ def _acquire_audit_slot(issue_id: str = "",
             except TimeoutError:
                 pass  # all slots busy — hold position and retry
             else:
-                if queue.remove(ticket) is not None:
+                try:
+                    removed = queue.remove(ticket, timeout=0)
+                except TimeoutError:
+                    # Directory lock contended — retry the poll without
+                    # holding the slot (SA-0MUV4C6RZ006GN5Z).
+                    sem.release()
+                    time.sleep(AUDIT_QUEUE_POLL_SECONDS)
+                    continue
+                if removed is not None:
                     _log_audit_slot(priority, position, ticket, queued_wall)
                     return sem
                 # Ticket vanished between peek and remove (unexpected):
@@ -3178,18 +3305,23 @@ def _acquire_audit_slot(issue_id: str = "",
                 sem.release()
         # Slow-path stale prune (~every 5s) so peers that crashed while we
         # waited do not keep the queue saturated; keep it off the hot path
-        # to avoid per-poll lock churn.
+        # to avoid per-poll lock churn. Fail-fast on the lock so a
+        # contended directory cannot hang the wait.
         now_mono = time.monotonic()
         if now_mono - last_prune_mono >= 5.0:
-            _prune_dead_audit_tickets(queue)
+            _prune_dead_audit_tickets(queue, timeout=0)
             last_prune_mono = now_mono
         if now_mono >= deadline:
             elapsed = time.monotonic() - queued_mono
-            queue_depth = len(queue)
+            queue_depth = _try_queue_depth(queue)
             retry_seconds = max(1, int(queue_timeout / 3))
             # Remove OUR OWN ticket before raising so a timed-out audit does
             # not leave a stale ticket behind (they accumulate and saturate).
-            queue.remove(ticket)
+            # Fail-fast on the lock: the shared deadline already expired.
+            try:
+                queue.remove(ticket, timeout=0)
+            except TimeoutError:
+                pass
             raise TimeoutError(
                 f"audit concurrency queue '{AUDIT_QUEUE_NAME}' saturated: "
                 f"no slot within {queue_timeout:.0f}s (waited {elapsed:.1f}s, "
@@ -3537,37 +3669,98 @@ def _query_proxy_mode(base_url: str | None = None,
         return None
 
 
+def _explicit_parallelism_request() -> int | None:
+    """Return the explicitly requested child concurrency, or ``None``.
+
+    Mirrors :func:`_resolve_parallelism`'s precedence
+    (``AUDIT_PARALLELISM`` then legacy ``AUDIT_PHASE2_PARALLELISM``). Invalid
+    (non-integer) values are ignored so a misconfigured environment cannot be
+    mistaken for an explicit request. Used by
+    :func:`_apply_proxy_mode_serialization` to keep a dispatcher-issued
+    request authoritative in cheap mode.
+    """
+    for var in (AUDIT_PARALLELISM_ENV, AUDIT_PHASE2_PARALLELISM_ENV_LEGACY):
+        raw = os.environ.get(var)
+        if not raw:
+            continue
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            continue
+    return None
+
+
 def _apply_proxy_mode_serialization() -> None:
-    """Serialize parallelism when the proxy is in ``cheap`` mode.
+    """Serialize parallelism in ``cheap`` mode only when there is no headroom.
 
-    Called once at runner start (before any pi call). When the proxy reports
-    mode exactly ``"cheap"`` (case-sensitive), this run's pi launches are
-    capped to one at a time by setting both ``AUDIT_PARALLELISM=1`` and
-    ``AUDIT_MAX_CONCURRENCY=1`` in this process's environment — so the
-    audit does not race the proxy's single-slot cheap-mode pool.
+    Called once at runner start (before any pi call). The historical rule
+    serialized *every* cheap-mode run to concurrency 1 on the (now-stale)
+    assumption that the cheap pool held a single slot. The cheap pool is
+    configured with ``session_slot_pool_size: 3``
+    (``proxy/config-cheap.yaml``), so a blanket cap defeats the dispatcher's
+    mode-aware parallel Phase 2 (WL-0MT50S9JW001DHME / SA-0MUZEIAD0008LUFN).
 
-    Fail-open: any other mode (including ``"fast"``) or a failed query
-    (unreachable / timeout / non-200 / unparseable) leaves all parallelism
-    settings unchanged; a warning is logged to stderr only on query
-    failure. The change is per-process (``os.environ``) — it affects only
-    this run's spawned pi subprocesses, never other processes or audits.
+    The rule now consults the explicit request and the live slot headroom:
+
+    - an explicit ``AUDIT_PARALLELISM`` / ``AUDIT_PHASE2_PARALLELISM``
+      request is authoritative and is never overwritten;
+    - otherwise, if the slot-status query reports >= 2 free slots, the run
+      stays parallel (bounded by the slot-aware ceiling in
+      :func:`_resolve_child_concurrency`);
+    - a failed slot query is fail-open — the configured static ceiling is
+      left unchanged rather than forcing serialization;
+    - otherwise (fewer than two free slots) the run is serialized to one pi
+      call at a time so it cannot race a saturated pool.
+
+    Any non-``cheap`` mode, or a failed proxy-mode query, leaves all
+    parallelism settings unchanged; a warning is logged to stderr only on a
+    failed proxy-mode query. All changes are per-process (``os.environ``) —
+    they affect only this run's spawned pi subprocesses, never other
+    processes or audits.
     """
     mode = _query_proxy_mode()
-    if mode == "cheap":
-        os.environ[AUDIT_PARALLELISM_ENV] = "1"
-        os.environ[ENV_MAX_WORKERS] = "1"
+    if mode != "cheap":
+        if mode is None:
+            print(
+                "Warning: could not determine proxy mode (fail-open — "
+                "parallelism settings unchanged).",
+                file=sys.stderr,
+            )
+        # Any other reported mode (e.g. "fast") → unchanged, no log noise.
+        return
+
+    explicit = _explicit_parallelism_request()
+    if explicit is not None:
         print(
-            "Proxy mode is 'cheap' — serializing audit pi calls "
-            "(AUDIT_PARALLELISM=1, AUDIT_MAX_CONCURRENCY=1).",
+            "Proxy mode is 'cheap' — honouring explicit parallelism request "
+            f"({explicit}); serialization skipped.",
             file=sys.stderr,
         )
-    elif mode is None:
+        return
+
+    available, _total = _query_slot_status()
+    if available is None:
         print(
-            "Warning: could not determine proxy mode (fail-open — "
+            "Proxy mode is 'cheap' — slot status unavailable (fail-open — "
             "parallelism settings unchanged).",
             file=sys.stderr,
         )
-    # Any other reported mode (e.g. "fast") → unchanged, no log noise.
+        return
+    if int(available) >= 2:
+        print(
+            "Proxy mode is 'cheap' — second slot free "
+            f"({available} available); serialization skipped.",
+            file=sys.stderr,
+        )
+        return
+
+    os.environ[AUDIT_PARALLELISM_ENV] = "1"
+    os.environ[ENV_MAX_WORKERS] = "1"
+    print(
+        "Proxy mode is 'cheap' — no second slot free; serializing audit pi "
+        "calls (AUDIT_PARALLELISM=1, AUDIT_MAX_CONCURRENCY=1).",
+        file=sys.stderr,
+    )
 
 
 def _resolve_max_child_concurrency() -> int:
@@ -4595,7 +4788,8 @@ def _git_changed_files(runner: Runner) -> list[str]:
 
 
 def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
-                max_root_files: int = _FILE_SCOPE_MAX_FILES) -> list[str]:
+                max_root_files: int = _FILE_SCOPE_MAX_FILES,
+                project_root: Path | None = None) -> list[str]:
     """Return a lightweight repo index (top-level entries with file counts).
 
     Uses ``git ls-files`` to count files per top-level path and returns the
@@ -4605,7 +4799,8 @@ def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
     remote, ...``) so repos whose distinctive top-level markers are all
     root-level files stay verifiable by the file-scope manifest check
     (SA-0MSUBX8PP0087OEA). On git failure, falls back to a best-effort
-    listing of ``TARGET_PROJECT_ROOT``'s top-level entries.
+    listing of *project_root*'s top-level entries (defaulting to the
+    cwd-derived ``TARGET_PROJECT_ROOT``).
     """
     buckets: dict[str, int] = {}
     root_files: list[str] = []
@@ -4624,9 +4819,10 @@ def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
         pass
 
     if not buckets:
-        # Best-effort fallback: list top-level entries of TARGET_PROJECT_ROOT
+        # Best-effort fallback: list top-level entries of the per-audit
+        # target project root (defaults to the cwd-derived launch root).
         try:
-            root = TARGET_PROJECT_ROOT
+            root = _audit_target_root(project_root)
             for entry in sorted(root.iterdir()):
                 if entry.name.startswith("."):
                     continue
@@ -4674,7 +4870,8 @@ def _phase1_evidence_refs(ac_results: list[dict],
 
 
 def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
-                               runner: Runner | None = None) -> str:
+                               runner: Runner | None = None,
+                               project_root: Path | None = None) -> str:
     """Build the file-scope manifest injected into the Phase 2 prompt.
 
     Combines the work item's Key Files, the git changed-file list, the
@@ -4740,7 +4937,7 @@ def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
         ref_lines = "\n".join(f"- `{f}`" for f in refs)
         sections.append(f"Phase 1 evidence file:line references:\n{ref_lines}")
 
-    index = _repo_index(runner)
+    index = _repo_index(runner, project_root=project_root)
     if index:
         index_lines = "\n".join(f"- {f}" for f in index)
         sections.append(f"Repository index (top-level layout):\n{index_lines}")
@@ -5568,19 +5765,25 @@ def _assemble_project_report(summary: str, recommendation: str) -> str:
 # Debug / debug-log helpers
 # ---------------------------------------------------------------------------
 
-def _debug_log_dir() -> Path:
+def _debug_log_dir(project_root: Path | None = None) -> Path:
     """Return the debug-log scratch directory (outside .worklog/ and repo).
 
     Defaults to ``~/.audit_debug/<project-slug>/`` so debug files never sit in
     scanned paths (the 9.5 GB .worklog audit_debug dump was a scan trap).
-    The directory is created lazily by callers via ``_write_debug_log``.
+    The slug is derived from *project_root* — the per-audit target project
+    root — so debug artefacts are attributable to the audited project even
+    when the runner was launched from a foreign cwd (SA-0MULGDABC001T11L).
+    When *project_root* is omitted the cwd-derived ``TARGET_PROJECT_ROOT`` is
+    used. The directory is created lazily by callers via ``_write_debug_log``.
     """
     home = Path.home()
-    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in TARGET_PROJECT_ROOT.name)
+    root = _audit_target_root(project_root)
+    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in root.name)
     return home / ".audit_debug" / (slug or "project")
 
 
-def _default_debug_log_path(issue_id: str, context: str) -> Path:
+def _default_debug_log_path(issue_id: str, context: str,
+                            project_root: Path | None = None) -> Path:
     """Return a sensible default path for debug logs.
 
     Tests monkeypatch this helper so callers should use it rather than
@@ -5589,7 +5792,7 @@ def _default_debug_log_path(issue_id: str, context: str) -> Path:
     tree) so recursive greps never walk them, and are swept by
     ``cleanup_debug_logs.py``.
     """
-    p = _debug_log_dir() / f"audit_debug_{issue_id}.jsonl"
+    p = _debug_log_dir(project_root) / f"audit_debug_{issue_id}.jsonl"
     return p
 
 
@@ -5599,7 +5802,8 @@ def _write_debug_log(path: Path, entry: dict) -> None:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def _remove_debug_log(debug_log: str | None, issue_id: str, *contexts: str) -> None:
+def _remove_debug_log(debug_log: str | None, issue_id: str, *contexts: str,
+                      project_root: Path | None = None) -> None:
     """Remove a run's debug log file after a successful audit run.
 
     Debug logs are transient forensics: a successful run leaves nothing
@@ -5617,7 +5821,8 @@ def _remove_debug_log(debug_log: str | None, issue_id: str, *contexts: str) -> N
             target = Path(debug_log)
         else:
             candidates = [
-                _default_debug_log_path(issue_id, ctx) for ctx in (contexts or ("parent",))
+                _default_debug_log_path(issue_id, ctx, project_root=project_root)
+                for ctx in (contexts or ("parent",))
             ]
             target = candidates[0] if len(set(candidates)) == 1 else None
             if target is None:
@@ -5643,7 +5848,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            child_screen: bool = False,
                            ac_count: int | None = None,
                            json_expected: bool = False,
-                           priority: int | None = None) -> dict:
+                           priority: int | None = None,
+                           project_root: Path | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -5770,7 +5976,9 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             reason = "call_trace" if parse_ok else "parse_failure"
         else:
             reason = "call_trace"
-        target = _default_debug_log_path(issue_id, context)
+        target = _default_debug_log_path(
+            issue_id, context, project_root=project_root,
+        )
 
     if reason and target:
         entry = {
@@ -7090,7 +7298,8 @@ def _run_phase2_deep_analysis(
     parent qualifies.
 
     *owning_root* is the project root that owns the audited item (resolved
-    by the launch-context guard); when omitted it is re-resolved from the
+    from the worklog owner by the launch-context resolution); when omitted it
+    is re-resolved from the
     issue id. The FILE SCOPE manifest is validated against it and an
     ``AuditScopeError`` is raised when the manifest lacks the item repo
     (LP-0MSQ32HNR007AI6B) — the caller aborts instead of emitting 'unmet'
@@ -7670,6 +7879,27 @@ class _AuditContext:
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
+    per_audit_project_root: str = ""
+    """Per-audit target project root (SA-0MULGDABC001T11L).
+
+    Resolved once in ``_phase_gate``: the worklog-derived owning root by
+    default, or the launch cwd's ``TARGET_PROJECT_ROOT`` when the launch is
+    the same git repository (an owning-project or worktree checkout). The
+    residual ``TARGET_PROJECT_ROOT`` consumers (code-quality scan, remediation
+    loop, ``_repo_index`` fallback, debug-log dir slug, and the F3
+    suite-execution cwd) read it so a foreign-cwd launch still targets the
+    audited project. Empty when ``_phase_gate`` has not run; the module-level
+    ``TARGET_PROJECT_ROOT`` remains the cwd-derived fallback.
+    """
+
+    @property
+    def per_audit_root(self) -> Path:
+        """Per-audit target root as a ``Path`` (cwd fallback when unset)."""
+        return (
+            Path(self.per_audit_project_root)
+            if self.per_audit_project_root else TARGET_PROJECT_ROOT
+        )
+
     resolved_model: str = DEFAULT_MODEL
     resolved_phase1_model: str = DEFAULT_MODEL
     green_run_block: str | None = None
@@ -7990,9 +8220,10 @@ def _integrate_into_dev(ctx: _AuditContext,
     2. Integrate the commits: if a feature branch exists and is not empty,
        replay it onto origin/dev (merge --no-ff of the branch). Otherwise
        cherry-pick each candidate commit (or the amalgamated diff).
-    3. Build the project (matching the implement skill's build step), run
-       the project test suite (via the test skill's runner), then push
-       ``HEAD:refs/heads/dev``.
+    3. Build the project (matching the implement skill's build step;
+       skipped when the repo has no ``scripts.build`` entry —
+       SA-0MT9607Q5009JA2V), run the project test suite (via the test
+       skill's runner), then push ``HEAD:refs/heads/dev``.
 
     Returns ``(ok, evidence)``. On any failure the audit does NOT proceed
     past Phase 1 (the caller emits "Ready to close: No").
@@ -8078,17 +8309,22 @@ def _integrate_into_dev(ctx: _AuditContext,
                 evidence.append("node_modules symlinked into integration worktree")
             except OSError as exc:
                 evidence.append(f"node_modules symlink failed: {exc} (best-effort)")
-        build_cmd = ["npm", "run", "build"]
-        try:
-            proc = ctx.runner(["bash", "-lc", "cd " + str(worktree_path) + " && " + " ".join(build_cmd)])
-        except Exception as exc:  # noqa: BLE001
-            evidence.append(f"build error: {exc}")
-            return False, "\n".join(evidence) + "\nIntegration failed: build error."
-        if proc.returncode != 0:
-            evidence.append(f"npm run build -> rc={proc.returncode}")
-            evidence.append(proc.stderr[-2000:])
-            return False, "\n".join(evidence) + "\nIntegration failed: build failed."
-        evidence.append("npm run build -> rc=0")
+        # Conditional build: skip if no package.json or no build script
+        # (docs-only repos, AC1/AC2).  Fail-open on malformed manifest.
+        if _has_build_script(str(worktree_path)):
+            build_cmd = ["npm", "run", "build"]
+            try:
+                proc = ctx.runner(["bash", "-lc", "cd " + str(worktree_path) + " && " + " ".join(build_cmd)])
+            except Exception as exc:  # noqa: BLE001
+                evidence.append(f"build error: {exc}")
+                return False, "\n".join(evidence) + "\nIntegration failed: build error."
+            if proc.returncode != 0:
+                evidence.append(f"npm run build -> rc={proc.returncode}")
+                evidence.append(proc.stderr[-2000:])
+                return False, "\n".join(evidence) + "\nIntegration failed: build failed."
+            evidence.append("npm run build -> rc=0")
+        else:
+            evidence.append("No build script (package.json missing or no scripts.build) — skipped")
 
         try:
             from test.scripts.run_tests import run_suite
@@ -8471,7 +8707,7 @@ def _build_merge_gate_failure_report(ctx: _AuditContext) -> str:
 
 
 def _phase_gate(ctx: _AuditContext) -> int | None:
-    """Phase 1 — launch-context guard, model/green-run resolution, original
+    """Phase 1 — launch-context resolution, model/green-run resolution, original
     status capture, freshness gates, and the in_progress claim.
 
     Returns an exit code for early-abort paths (fresh-skip, pre-flight
@@ -8548,6 +8784,12 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     git_root = owning_root
     if _same_git_repository(TARGET_PROJECT_ROOT, owning_root):
         git_root = TARGET_PROJECT_ROOT
+    # Per-audit target project root (SA-0MULGDABC001T11L): same resolution as
+    # the git root — the owning root by default, the launch cwd when it is the
+    # same git repository (owning or worktree checkout). Consumed by the
+    # residual TARGET_PROJECT_ROOT consumers below (F3 suite-execution cwd) and
+    # by later phases (code-quality scan, remediation, debug-log slug).
+    per_audit_root = git_root
     runner = _cwd_aware_runner(git_root, runner)
     ctx.runner = runner
 
@@ -8575,7 +8817,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     test_skill_run_sha = None
     if green_run_sha is None:
         auto_block, auto_sha, auto_status = _auto_green_run_outcome(
-            runner, cwd=str(TARGET_PROJECT_ROOT),
+            runner, cwd=str(per_audit_root),
         )
         if auto_sha is not None:
             green_run_block = auto_block
@@ -8613,7 +8855,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             else:
                 head_sha = _resolve_audited_head(runner)
                 test_run = _run_tests_via_test_skill(
-                    cwd=TARGET_PROJECT_ROOT,
+                    cwd=per_audit_root,
                     parent_work_item_id=issue_id,
                     head_sha=head_sha,
                 )
@@ -8774,6 +9016,11 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
 
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
+    ctx.per_audit_project_root = str(per_audit_root)
+    # Publish the per-audit root for deep Phase 1/2 helpers reached without a
+    # context (SA-0MULGDABC001T11L). Reset by ``cmd_issue`` at run end.
+    global _ACTIVE_AUDIT_ROOT
+    _ACTIVE_AUDIT_ROOT = per_audit_root
     ctx.resolved_model = resolved_model
     ctx.resolved_phase1_model = phase1_model
     ctx.green_run_block = green_run_block
@@ -8907,7 +9154,8 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
                           pi_bin: str, resolved_model: str,
                           debug_log: str | None, timeout: int | None,
                           ac_fallback_used: threading.Event,
-                          priority: int | None = None) -> list[dict]:
+                          priority: int | None = None,
+                          project_root: Path | None = None) -> list[dict]:
     """Model-judged false-positive screen over ruff findings (F1 scope).
 
     Classifies each ruff finding via one or more batched Pi calls
@@ -8983,6 +9231,7 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
                 ac_fallback_used=ac_fallback_used, child_screen=True,
                 json_expected=True,
                 priority=priority,
+                project_root=project_root,
             )
         except RuntimeError as exc:
             screen_failed = True
@@ -9453,6 +9702,12 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     json_mode = ctx.json_mode
     runner = ctx.runner
     worklog_dir = ctx.worklog_dir
+    # Per-audit target project root (SA-0MULGDABC001T11L); the cwd-derived
+    # constant remains the fallback so direct/legacy callers keep working.
+    per_audit_root = (
+        Path(ctx.per_audit_project_root)
+        if ctx.per_audit_project_root else TARGET_PROJECT_ROOT
+    )
 
     try:
         data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"],
@@ -9530,7 +9785,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         # git scan is issued here.
         cq_scope_files = _git_changed_files(runner)
         cq_result = run_code_quality(
-            project_root=TARGET_PROJECT_ROOT, runner=runner, fix=False,
+            project_root=per_audit_root, runner=runner, fix=False,
             files=cq_scope_files or None,
         )
         if cq_result.get("success", False):
@@ -9564,6 +9819,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
             timeout=ctx.timeout,
             ac_fallback_used=ctx.ac_fallback_used,
             priority=_resolve_audit_priority(ctx.work_item),
+            project_root=per_audit_root,
         )
     except Exception as exc:  # noqa: BLE001 -- the screen must never crash the audit
         ctx.record_script_failure("false-positive screen", exc)
@@ -9599,7 +9855,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         debug_log=ctx.debug_log,
         timeout=ctx.timeout,
         ac_fallback_used=ctx.ac_fallback_used,
-        project_root=TARGET_PROJECT_ROOT,
+        project_root=per_audit_root,
         worklog_dir=worklog_dir,
         work_item=work_item,
         content_fingerprint=content_fingerprint,
@@ -10038,7 +10294,9 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     ac_results = []
     if acs and acs[0] != "No acceptance criteria defined.":
         ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
-        file_scope = _build_file_scope_manifest(work_item, [], runner=runner)
+        file_scope = _build_file_scope_manifest(
+            work_item, [], runner=runner, project_root=ctx.per_audit_root,
+        )
         # Validate the FILE SCOPE manifest covers the item repository
         # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
         # (e.g. the audit skill's own tree) would emit misleading
@@ -11874,7 +12132,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # forensic record of the failed evaluation.
     # ------------------------------------------------------------------
     if ctx.audit_completed and ctx.script_failure is None and not fallback_tainted:
-        _remove_debug_log(ctx.debug_log, ctx.issue_id)
+        _remove_debug_log(
+            ctx.debug_log, ctx.issue_id, project_root=ctx.per_audit_root,
+        )
 
     if restore_cmd is None:
         # Defensive: every branch above assigns restore_cmd; a future edit
@@ -12350,6 +12610,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
         lifecycle_rc = _apply_terminal_lifecycle(ctx)
         if lifecycle_rc != 0:
             rc = lifecycle_rc
+        # Release the per-audit root published for deep helpers
+        # (SA-0MULGDABC001T11L) now that the run — including debug-log
+        # cleanup — is complete, so it never leaks into a later audit.
+        global _ACTIVE_AUDIT_ROOT
+        _ACTIVE_AUDIT_ROOT = None
     if rc == 0 and ctx.checkpoint is not None:
         if ctx.checkpoint.budget_exceeded_children():
             # Budget-exceeded children remain unverified: KEEP the checkpoint
@@ -13060,9 +13325,13 @@ def main(argv: list[str] | None = None) -> int:
         os.environ[ENV_PI_SESSION_DIR] = session_dir
 
     # Detect proxy 'cheap' mode before any pi call and serialize this run's
-    # parallelism (AUDIT_PARALLELISM=1 + AUDIT_MAX_CONCURRENCY=1) so the
-    # audit does not race the proxy's single-slot pool (SA-0MSN04X2S006ONH0).
-    # Fail-open: a failed query or any other mode leaves settings unchanged.
+    # parallelism (AUDIT_PARALLELISM=1 + AUDIT_MAX_CONCURRENCY=1) ONLY when
+    # there is no explicit request and the cheap pool has no free second slot
+    # — the pool is configured with session_slot_pool_size: 3
+    # (proxy/config-cheap.yaml), so a blanket cap would defeat the dispatcher's
+    # mode-aware parallel Phase 2 (SA-0MSN04X2S006ONH0 /
+    # SA-0MUZEIAD0008LUFN). Fail-open: a failed query or any other mode
+    # leaves settings unchanged.
     _apply_proxy_mode_serialization()
 
     if args.command == "issue":

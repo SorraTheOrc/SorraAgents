@@ -22,6 +22,9 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+// Shared no-I/O notifier stub — never copy the real discord-notify.js into a
+// release harness (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL).
+import { writeStubDiscordNotify } from '../helpers/release-notify-stub.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
@@ -64,11 +67,17 @@ function setupRunReleaseFixture(hasReleaseScript = false) {
     readFileSync(RUN_RELEASE_PATH, 'utf8'));
 
   for (const dep of deps) {
+    // discord-notify.js is written as a stub below.
+    if (dep === 'discord-notify.js') continue;
     const src = join(REPO_ROOT, 'skill', 'ship', 'scripts', dep);
     if (existsSync(src)) {
       writeFileSync(join(skillScriptDir, dep), readFileSync(src, 'utf8'));
     }
   }
+
+  // Test isolation: substitute the recording stub for the real
+  // discord-notify.js so Step 8.5 can never reach a real Discord webhook.
+  writeStubDiscordNotify(skillScriptDir);
 
   // Optionally include a fake release script
   if (hasReleaseScript) {
