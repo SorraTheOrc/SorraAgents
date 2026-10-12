@@ -1416,6 +1416,27 @@ class PushTimeoutError(RuntimeError):
         )
 
 
+class PushNonFastForwardError(RuntimeError):
+    """Raised when a push fails due to non-fast-forward (dev advanced concurrently).
+
+    Carries commit_hash, branch, and remote stderr so the caller can rebase
+    the feature branch onto origin/dev and retry the push.
+    """
+
+    def __init__(
+        self, commit_hash: str, branch: str, stderr: str, rebase_cmd: str,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.stderr = stderr
+        self.rebase_cmd = rebase_cmd
+        super().__init__(
+            f"Push to dev failed (non-fast-forward): {stderr}. "
+            f"Commit {commit_hash} on branch {branch}. "
+            f"Retry: {rebase_cmd}"
+        )
+
+
 def _kill_process_group(pid: int) -> None:
     """Kill the entire process group rooted at *pid* (POSIX only).
 
@@ -1489,13 +1510,23 @@ def git_push_to_dev(
                 commit_hash or "unknown", branch, timeout,
             ) from None
         if proc.returncode != 0:
-            LOG.error(
-                "git push to dev failed: %s", stderr.decode(errors="replace").strip(),
-            )
+            stderr_str = stderr.decode(errors="replace").strip()
+            # Detect non-fast-forward errors (dev advanced concurrently).
+            # AC1/AC2: raise a recoverable exception so the caller can rebase
+            # and retry instead of failing with information loss.
+            if "non-fast-forward" in stderr_str.lower():
+                rebase_cmd = (
+                    f"git rebase origin/dev && git push origin "
+                    f"{branch}:refs/heads/dev"
+                )
+                raise PushNonFastForwardError(
+                    commit_hash or "unknown", branch, stderr_str, rebase_cmd,
+                )
+            LOG.error("git push to dev failed: %s", stderr_str)
             return False
         return True
     except Exception as exc:
-        if isinstance(exc, PushTimeoutError):
+        if isinstance(exc, (PushTimeoutError, PushNonFastForwardError)):
             raise
         LOG.error("git push to dev error: %s", exc)
         return False
@@ -4263,6 +4294,60 @@ def phase_finish(
                     f"Push manually: git push origin {exc.branch}:refs/heads/dev",
                 )
                 raise RuntimeError(f"git push to dev timed out: {exc}") from exc
+            except PushNonFastForwardError as exc:
+                # AC1/AC2/AC3: dev advanced concurrently — rebase and retry
+                # instead of losing the completed implementation.
+                LOG.info(
+                    "Push failed (non-fast-forward); attempting rebase and retry "
+                    "...",
+                )
+                # 1. Rebase the feature branch onto the latest origin/dev.
+                rebase_result = run_cmd(
+                    ["git", "rebase", "origin/dev"],
+                    cwd=cwd,
+                )
+                if rebase_result.returncode != 0:
+                    # AC3: rebase failed — preserve all state for manual recovery.
+                    new_commit = git_get_commit_hash(repo_root) or commit_hash
+                    wl_add_comment(
+                        work_item_id,
+                        f"Push to dev failed (non-fast-forward): {exc.stderr}\n"
+                        f"Rebase onto origin/dev failed with conflicts.\n"
+                        f"Manual recovery:\n"
+                        f"  1. cd {worktree_path}\n"
+                        f"  2. git rebase origin/dev  # resolve conflicts\n"
+                        f"  3. git push origin {branch}:refs/heads/dev\n"
+                        f"Commit before rebase: {commit_hash}\n"
+                        f"Branch: {branch}\n"
+                        f"Worktree: {worktree_path}",
+                    )
+                    raise RuntimeError(
+                        f"git push to dev failed (non-fast-forward), rebase "
+                        f"also failed: {exc.stderr}",
+                    ) from exc
+                # 2. Retry the push.
+                retry_result = git_push_to_dev(repo_root, branch, commit_hash)
+                if not retry_result:
+                    # Retry failed — preserve state for manual recovery.
+                    wl_add_comment(
+                        work_item_id,
+                        f"Push to dev failed after rebase.\n"
+                        f"Original error: {exc.stderr}\n"
+                        f"Branch: {branch}\n"
+                        f"Commit: {commit_hash}\n"
+                        f"Worktree: {worktree_path}",
+                    )
+                    raise RuntimeError(
+                        f"git push to dev failed after rebase: {exc.stderr}",
+                    )
+                # 3. Post explanatory comment about the successful recovery.
+                wl_add_comment(
+                    work_item_id,
+                    f"Push to dev initially failed (non-fast-forward — dev "
+                    f"advanced concurrently). Rebased {branch} onto origin/dev "
+                    f"and retried successfully. Original error: {exc.stderr}",
+                )
+                # Fall through to success path.
 
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
