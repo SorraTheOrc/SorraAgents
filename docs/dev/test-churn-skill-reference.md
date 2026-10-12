@@ -84,7 +84,9 @@ The capability was re-homed from ContextHub into SorraAgents as part of epic
 
 Cross-worklog migration is manual: `wl` stores are per-repository, so the
 relationship is recorded in descriptions and comments rather than dependency
-edges.
+edges. The full mapping, commit provenance and the carried-over original brief
+are recorded in
+[test-churn-worklog-migration.md](test-churn-worklog-migration.md).
 
 ## Related work
 
