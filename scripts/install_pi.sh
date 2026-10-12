@@ -117,6 +117,21 @@ create_symlink "$PROMPTS_LINK" "$PROMPTS_SRC"
 create_symlink "$SKILLS_LINK" "$SKILLS_SRC"
 create_symlink "$AGENTS_LINK" "$AGENTS_SRC"
 
+# --- Required skill verification --------------------------------------------
+# The whole skill/ tree is symlinked above, so every skill placed under skill/
+# is exposed automatically on a fresh install. Verify the canonical skill set
+# (including the test-churn analyser, SA-0MV28WS5G004YNNS) is present so a
+# partial or broken checkout is surfaced at install time. Fail-open: a missing
+# skill warns rather than aborting the install.
+REQUIRED_SKILLS=(audit implement test test-churn)
+for required_skill in "${REQUIRED_SKILLS[@]}"; do
+  if [ -f "$SKILLS_SRC/$required_skill/SKILL.md" ]; then
+    echo "OK: skill exposed: $required_skill"
+  else
+    echo "WARNING: expected skill missing: $SKILLS_SRC/$required_skill/SKILL.md" >&2
+  fi
+done
+
 # --- Pi extension symlinks --------------------------------------------------
 # Wire this repository's `pi-client/*` extensions into the global extension
 # discovery directory so they load in every pi session. Extensions are
