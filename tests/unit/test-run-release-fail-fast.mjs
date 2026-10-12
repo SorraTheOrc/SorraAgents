@@ -32,6 +32,12 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { fileURLToPath } from 'node:url';
 
 import { parseReleaseArgs, WRAPPER_USAGE, isNewlyCreatedTag } from '../../skill/ship/scripts/run-release.js';
+// Shared no-I/O notifier stub: the harness must never fall back to the real
+// discord-notify.js / global webhook (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL).
+import {
+  DISCORD_NOTIFY_LOG_ENV,
+  writeStubDiscordNotify,
+} from '../helpers/release-notify-stub.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
@@ -82,7 +88,21 @@ function buildLayout(opts = {}) {
 
   writeFileSync(join(skillScriptDir, 'run-release.js'), readFileSync(join(SKILL_SCRIPTS, 'run-release.js'), 'utf8'));
   for (const dep of DEP_FILES) {
+    // discord-notify.js is written below — never blindly copy the real module.
+    if (dep === 'discord-notify.js') continue;
     writeFileSync(join(skillScriptDir, dep), readFileSync(join(SKILL_SCRIPTS, dep), 'utf8'));
+  }
+
+  // Test isolation (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL): Step 8.5 must
+  // never fall back to the operator's global ~/.pi/agent/config.yaml webhook.
+  // Only tests that deliberately observe a loopback POST get the REAL module —
+  // and even then only because they also write a project webhook config above.
+  // Every other test gets a recording stub with zero network I/O, so a
+  // genuinely-new-tag run can no longer POST a real "Release v0.2.0".
+  if (opts.webhookUrl) {
+    writeFileSync(join(skillScriptDir, 'discord-notify.js'), readFileSync(join(SKILL_SCRIPTS, 'discord-notify.js'), 'utf8'));
+  } else {
+    writeStubDiscordNotify(skillScriptDir);
   }
 
   const releaseDir = join(skillScriptDir, 'release');
@@ -175,6 +195,7 @@ function runWrapper(args, opts = {}) {
       GIT_DESCRIBE: opts.gitDescribe || 'v0.1.18',
       GIT_TAGS: opts.gitTags || '',
       GIT_TAG_LIST_FAIL: opts.tagListFails ? '1' : '',
+      [DISCORD_NOTIFY_LOG_ENV]: logs.notify,
     },
   });
   const read = (path) => (existsSync(path) ? readFileSync(path, 'utf-8').trim() : '');
@@ -186,6 +207,7 @@ function runWrapper(args, opts = {}) {
     readWl: () => read(logs.wl),
     readClose: () => read(logs.close),
     readMerge: () => read(logs.merge),
+    readNotify: () => read(logs.notify),
   };
 }
 
@@ -247,6 +269,7 @@ function runWrapperAsync(args, opts = {}) {
       GIT_DESCRIBE: opts.gitDescribe || 'v0.1.18',
       GIT_TAGS: opts.gitTags || '',
       GIT_TAG_LIST_FAIL: opts.tagListFails ? '1' : '',
+      [DISCORD_NOTIFY_LOG_ENV]: logs.notify,
     },
   });
   let stdout = '';
@@ -264,6 +287,7 @@ function runWrapperAsync(args, opts = {}) {
         readWl: () => read(logs.wl),
         readClose: () => read(logs.close),
         readMerge: () => read(logs.merge),
+        readNotify: () => read(logs.notify),
       });
     });
   });
@@ -429,6 +453,28 @@ describe('run-release: post-release gated on a newly created tag', () => {
     });
     assert.equal(res.status, 0, `expected a clean exit, got ${res.status}\n${combined(res)}`);
     assert.doesNotMatch(combined(res), /already existed|no new release/i);
+
+    // Regression guard (AC1/AC3, WL-0MUYA98Z8003HU8X): this path reaches Step
+    // 8.5 with a genuinely new tag — exactly where the harness used to POST a
+    // real "Release v0.2.0" notification via the global webhook fallback. The
+    // Step 8.5 call must be served by the recording stub, which writes a
+    // `stubbed: true` log line; the real module writes no such line, so a
+    // regression back to copying it fails here instead of silently notifying.
+    const notifyCalls = res
+      .readNotify()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.equal(
+      notifyCalls.length,
+      1,
+      'Step 8.5 must invoke the stubbed notifier exactly once on a genuine release',
+    );
+    assert.equal(
+      notifyCalls[0].stubbed,
+      true,
+      'the harness must use the recording stub, not the real discord-notify.js',
+    );
   });
 
   test('fails closed when the pre-run tag snapshot is unavailable', () => {

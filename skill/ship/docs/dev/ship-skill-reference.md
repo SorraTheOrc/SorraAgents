@@ -395,16 +395,29 @@ Release integration harnesses run the **real** `run-release.js`, which reaches
 Step 8.5 (`sendReleaseNotification`). A harness builds its temp project root
 with no `.worklog/` config, so the **real** `discord-notify.js` would fall back
 to the operator's global `~/.pi/agent/config.yaml` and POST a real release
-notification (e.g. `Release v9.9.9`) on every test run. Tests must never emit
-real outbound notifications.
+notification (e.g. `Release v9.9.9`, or `Release v0.2.0` from the fail-fast
+harness) on every test run. Tests must never emit real outbound notifications.
 
-Every harness that executes `run-release.js` **must** substitute a recording
-stub for `discord-notify.js` (never copy the real module):
+Never copy the real `discord-notify.js` into a harness's temp skill layout.
+Install the shared recording stub instead — `writeStubDiscordNotify()` from
+`tests/helpers/release-notify-stub.mjs`. The stub performs no network I/O
+and records each Step 8.5 call (as a JSON line) to `$DISCORD_NOTIFY_LOG`, so a
+test can pin that the stub — not the real module — ran.
 
-- `tests/unit/test-run-release-merge-guard.mjs` — writes `MOCK_DISCORD_NOTIFY`
-  into the temp skill layout, and pins this with assertions that Step 8.5 was
-  served by the stub (`stubbed: true`) and that **no** notification is emitted
-  before the merge is verified;
+Harnesses covered:
+
+- `tests/unit/test-run-release-merge-guard.mjs` — writes the recording stub and
+  pins this with assertions that Step 8.5 was served by the stub
+  (`stubbed: true`) and that **no** notification is emitted before the merge is
+  verified;
+- `tests/unit/test-run-release-fail-fast.mjs` — the genuine-release path
+  (`gitDescribe: 'v0.2.0'`) reaches Step 8.5 and previously POSTed a real
+  `Release v0.2.0`; it now uses the shared stub (with a regression assertion),
+  while the fail-fast no-POST tests deliberately keep the **real** module and
+  point it at an in-process loopback webhook;
+- `tests/unit/test-run-release.mjs`, `tests/unit/test-run-release-arg-filtering.mjs`,
+  `tests/unit/test-code-freeze-marker.mjs`, `tests/unit/test-run-release-cleanup.mjs`
+  — use the shared stub for the `discord-notify.js` dependency;
 - `tests/unit/test-run-release-discord-notify.mjs` — the reference pattern:
   records `sendReleaseNotification` arguments without sending.
 

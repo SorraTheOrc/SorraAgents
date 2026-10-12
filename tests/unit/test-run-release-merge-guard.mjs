@@ -26,6 +26,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
+import {
+  DISCORD_NOTIFY_LOG_ENV,
+  writeStubDiscordNotify,
+} from '../helpers/release-notify-stub.mjs';
+
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
 const RUN_RELEASE_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'run-release.js');
@@ -46,20 +51,10 @@ const LLM_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'llm.js');
 // the REAL discord-notify.js would fall back to the operator's global
 // `~/.pi/agent/config.yaml` webhook and POST a real release notification on
 // every test run. Tests must never emit real outbound notifications
-// (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL), so the harness substitutes this
-// recording stub instead of copying the real module. The stub performs no
-// network I/O; it records the call so a test can pin that the stub (not the
-// real module) is the code path that ran.
-const MOCK_DISCORD_NOTIFY = `// Recording stub — no network I/O.
-export async function sendReleaseNotification({ version, prUrl, projectRoot } = {}) {
-  const logPath = process.env.DISCORD_NOTIFY_LOG;
-  if (logPath) {
-    const { appendFileSync } = await import('node:fs');
-    appendFileSync(logPath, JSON.stringify({ version, prUrl, projectRoot, stubbed: true }) + '\\n');
-  }
-  return { success: true, notified: false, stubbed: true };
-}
-`;
+// (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL), so the harness writes the
+// shared recording stub via `writeStubDiscordNotify()` instead of copying the
+// real module. The stub performs no network I/O and records its call so a test
+// can pin that the stub (not the real module) is the code path that ran.
 
 // ── Helper: build a fake skill dir with mocked git/wl/gh ─────────────────────
 
@@ -90,7 +85,7 @@ function runReleaseWithMocks(gitMode = 'success') {
   // Substitute the recording stub for the real discord-notify.js so this
   // harness can never reach a real Discord webhook (WL-0MUYA98Z8003HU8X /
   // SA-0MU3VIW8C0035KKL). Do NOT copy the real module here.
-  writeFileSync(join(skillScriptDir, 'discord-notify.js'), MOCK_DISCORD_NOTIFY);
+  writeStubDiscordNotify(skillScriptDir);
   writeFileSync(join(skillScriptDir, 'timing.js'), readFileSync(TIMING_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'llm.js'), readFileSync(LLM_SRC, 'utf8'));
 
@@ -174,7 +169,7 @@ esac
       MOCK_TOPLVL: tmpDir,
       GIT_MOCK_MODE: gitMode,
       WL_CLOSE_LOG: closeLog,
-      DISCORD_NOTIFY_LOG: notifyLog,
+      [DISCORD_NOTIFY_LOG_ENV]: notifyLog,
     },
   });
 

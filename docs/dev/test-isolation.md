@@ -592,9 +592,19 @@ The rule:
 
 - Every test harness that executes `run-release.js` must **substitute a
   recording stub for `discord-notify.js`** instead of copying the real module;
+  install it with `writeStubDiscordNotify()` from the shared helper
+  `tests/helpers/release-notify-stub.mjs`;
 - `tests/unit/test-run-release-merge-guard.mjs` writes a recording stub and
   pins this: Step 8.5 must be served by the stub (`stubbed: true`) and no
   notification may be emitted before the merge is verified;
+- `tests/unit/test-run-release-fail-fast.mjs` covers the genuine-release path
+  (`gitDescribe: 'v0.2.0'`) that previously POSTed a real `Release v0.2.0`; it
+  now uses the shared stub and asserts Step 8.5 was stubbed, while its fail-fast
+  no-POST tests deliberately keep the **real** module and point it at an
+  in-process loopback webhook;
+- `tests/unit/test-run-release.mjs`, `tests/unit/test-run-release-arg-filtering.mjs`,
+  `tests/unit/test-code-freeze-marker.mjs` and `tests/unit/test-run-release-cleanup.mjs`
+  use the shared stub for the `discord-notify.js` dependency;
 - `tests/unit/test-run-release-discord-notify.mjs` is the reference pattern.
 
 Production behaviour is unchanged — real releases still post the Discord
