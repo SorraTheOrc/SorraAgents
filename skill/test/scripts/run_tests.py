@@ -27,6 +27,17 @@ for a free slot. Only ACTUAL executions acquire a slot — cache hits are
 served without executing and never block on the semaphore
 (SA-0MTG5U75A001F1RG).
 
+Nested-run isolation (SA-0MUY6U05F008RG86): a test that runs inside the full
+suite already sits under an outer run that holds a host-wide slot. If it
+invokes ``run_tests.py`` again (in-process or as a subprocess), the nested
+run must not contend for that same pool — the outer slot is held until the
+nested run finishes, so a nested acquire can wait out TEST_LOCK_TIMEOUT and
+deadlock when two full suites run concurrently. Fixtures that spawn a nested
+runner set ``PI_SEMAPHORE_DIR`` to a per-test isolated directory (see
+``nested_semaphore_dir``) so the nested run bounds itself in its own
+namespace. Top-level runs never do this, so the host-wide ceiling is
+preserved for genuine parallel suites.
+
 Emits structured per-failure records (test_name, stdout_excerpt, stack_trace)
 compatible with the triage skill's check_or_create.py input.
 
@@ -78,7 +89,7 @@ from shared.git_sandbox import (
     diff_snapshots,
     snapshot_repo_state,
 )
-from shared.process_semaphore import Semaphore
+from shared.process_semaphore import Semaphore, nested_semaphore_dir  # noqa: F401
 from shared.skill_extensions import (
     DATA_FILENAME,
     SkillExtensionError,
@@ -1334,6 +1345,14 @@ def _test_concurrency_slot() -> Iterator[None]:
     ``TEST_LOCK_TIMEOUT``). Only ACTUAL executions acquire a slot — a
     cached result is served without executing and never blocks on the
     semaphore, so cache behavior is unchanged (SA-0MTG5U75A001F1RG AC4).
+
+    Nested-run isolation (SA-0MUY6U05F008RG86): fixtures that spawn a nested
+    ``run_tests.py`` (or call the runner in-process) set ``PI_SEMAPHORE_DIR``
+    to a per-test isolated directory via :func:`nested_semaphore_dir`, so the
+    nested acquire never waits behind the host-wide slot its outer run holds.
+    This context manager itself is namespace-agnostic — it honours whatever
+    ``PI_SEMAPHORE_DIR`` resolves to — so a top-level run keeps the host-wide
+    ceiling while a nested run is isolated by its fixture.
 
     Raises:
         TestConcurrencyTimeout: when no slot frees within the bound.

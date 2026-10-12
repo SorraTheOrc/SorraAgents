@@ -1281,35 +1281,32 @@ export function runPostReleaseCleanup(options = {}) {
  * 3. Merge `origin/main` into `dev` (fast-forward)
  * 4. Push `dev` to origin
  *
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {(cmd: string) => string} [options.run] - Command runner; defaults
+ *   to `execSync` with git's output streamed to stderr. Tests inject a fake
+ *   runner to assert the command sequence without touching a real repository
+ *   (SA-0MUY6U05F008RG86) — mirroring `verifyReleaseMerge`'s `options.run`.
  * @returns {{ success: boolean, message: string }}
  */
-export function syncDevWithMain() {
+export function syncDevWithMain(options = {}) {
+  const run = options.run || ((cmd) => execSync(cmd, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'inherit', 'pipe'],
+  }));
   try {
     console.log('\nSyncing dev branch with main...');
 
     // Step 1: Fetch latest
-    execSync('git fetch origin --prune', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'inherit', 'pipe'],
-    });
+    run('git fetch origin --prune');
 
     // Step 2: Checkout dev
-    execSync('git checkout dev', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'inherit', 'pipe'],
-    });
+    run('git checkout dev');
 
     // Step 3: Merge main into dev
-    execSync('git merge origin/main', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'inherit', 'pipe'],
-    });
+    run('git merge origin/main');
 
     // Step 4: Push dev to origin
-    execSync('git push origin dev', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'inherit', 'pipe'],
-    });
+    run('git push origin dev');
 
     const message = 'dev branch is now in sync with main and pushed to origin.';
     console.log(message);

@@ -56,8 +56,19 @@ def _fake_result(**overrides):
 
 @pytest.fixture(autouse=True)
 def _clean_marker():
-    """Ensure the recursion marker never leaks between tests."""
-    original = os.environ.pop(MARKER_ENV, None)
+    """Ensure the session recursion marker is restored after each test.
+
+    The repo-root conftest arms the guard for the whole session, so
+    ``LIVE_REPO_GUARD_ACTIVE`` is set before these tests run. The fixture must
+    NOT pop it at setup: tests below call ``monkeypatch.delenv`` themselves,
+    and popping it first makes monkeypatch record the marker as absent, so its
+    teardown deletes it even after this fixture restores it — leaking an unset
+    marker into later tests (which then re-arm the guard and report the cache
+    write of an unrelated ``tmp_path`` repo as a mutation). Capturing the value
+    and restoring it in ``finally`` keeps the session invariant intact
+    (SA-0MUY6U05F008RG86).
+    """
+    original = os.environ.get(MARKER_ENV)
     yield
     if original is None:
         os.environ.pop(MARKER_ENV, None)
@@ -204,3 +215,26 @@ class TestGuardOwnership:
         assert captured["commands"] == ["pytest tests/x.py"]
         assert captured["test_type"] == "unit"
         assert captured["group"] == "audit"
+
+
+# ---------------------------------------------------------------------------
+# Marker-restore regression (SA-0MUY6U05F008RG86)
+# ---------------------------------------------------------------------------
+# The two tests below are a deliberate ordered pair. The first deletes the
+# session marker via ``monkeypatch`` (exactly what the ownership tests above
+# do); the second asserts the marker is present again. If ``_clean_marker``
+# popped the marker at setup, monkeypatch would record the absent value and
+# delete it on teardown — leaving later modules with an unset marker, which
+# makes ``guarded_run_all`` re-arm the guard and misreport an unrelated
+# ``tmp_path`` repo's cache write as a live-repo mutation.
+
+
+def test_marker_deleted_for_the_duration_of_a_test(monkeypatch):
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+    assert MARKER_ENV not in os.environ
+
+
+def test_marker_restored_after_the_previous_test():
+    # The repo-root conftest arms the guard for the whole session, so the
+    # marker must survive the previous test's monkeypatch teardown.
+    assert os.environ.get(MARKER_ENV) == "1"

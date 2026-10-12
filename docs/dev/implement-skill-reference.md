@@ -220,7 +220,11 @@ configured runner):
   wait come from `TEST_MAX_CONCURRENCY` / `TEST_LOCK_TIMEOUT`; on saturation
   the gate returns a clear failed result (logged with an actionable retry
   hint) and stores no cache entry, so a saturated host cannot be
-  oversubscribed by concurrent finish gates.
+  oversubscribed by concurrent finish gates. A test *inside* the spawned
+  suite that invokes `run_tests.py` again is a nested run: its fixture sets
+  `PI_SEMAPHORE_DIR` so it never queues behind the finish gate's own slot
+  (SA-0MUY6U05F008RG86 — see
+  [test-skill-reference.md](test-skill-reference.md#06-nested-run-isolation-sa-0muy6u05f008rg86)).
 
 The returned dict includes `skipped` (bool) and `tooling` (str | None) in
 addition to `success`/`stdout`/`stderr`/`exit_code`/`failures`.

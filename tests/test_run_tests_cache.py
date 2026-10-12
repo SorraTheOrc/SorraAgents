@@ -41,6 +41,12 @@ def cache_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     git(repo, "commit", "-q", "-m", "init")
 
     monkeypatch.setattr(rt, "REPO_ROOT", repo)
+    # Isolate the semaphore namespace: every in-process ``rt.main`` call below
+    # acquires a "test" slot, and this suite's outer run already holds a
+    # host-wide one, so the nested acquisitions must not contend for it
+    # (SA-0MUY6U05F008RG86). A sibling of ``repo`` keeps it out of the guard's
+    # mutation surface.
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(rt.nested_semaphore_dir(tmp_path)))
     # main() resolves the project root via detect_project_root() — pin it to
     # the throwaway repo so CLI tests stay isolated from the real checkout.
     monkeypatch.setattr(rt, "detect_project_root", lambda: repo)

@@ -25,7 +25,9 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
 from shared import git_sandbox as gs
+from shared.process_semaphore import nested_semaphore_dir
 from test.scripts.run_tests import guarded_run_all
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,10 +37,34 @@ MARKER_ENV = "LIVE_REPO_GUARD_ACTIVE"
 
 
 def _child_env() -> dict[str, str]:
-    """Environment for a nested run: no repo overrides, no guard marker."""
+    """Environment for a nested run: no repo overrides, no guard marker, and
+    an isolated semaphore namespace.
+
+    ``PI_SEMAPHORE_DIR`` is set by the autouse ``_isolated_nested_semaphore``
+    fixture to a directory beside (never inside) the fixture repo, so the
+    nested runner never contends for the host-wide ``"test"`` slot this outer
+    suite holds (SA-0MUY6U05F008RG86). It is copied explicitly so the
+    isolation is visible at the call site rather than an implicit inheritance.
+    """
     env = gs.sanitized_git_env()
     env.pop(MARKER_ENV, None)
+    if "PI_SEMAPHORE_DIR" in os.environ:
+        env["PI_SEMAPHORE_DIR"] = os.environ["PI_SEMAPHORE_DIR"]
     return env
+
+
+@pytest.fixture(autouse=True)
+def _isolated_nested_semaphore(tmp_path, monkeypatch):
+    """Isolate nested-run semaphore acquisition (SA-0MUY6U05F008RG86).
+
+    The nested ``run_tests.py`` invocations in this module execute while the
+    outer suite already holds a host-wide ``"test"`` semaphore slot; without
+    an isolated namespace they would wait behind it and deadlock when two
+    full suites run concurrently. The directory lives beside every fixture
+    repo (``tmp_path``), never inside one, so it cannot trip the live-repo
+    guard.
+    """
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
 
 
 def _init_guard_repo(base: Path, name: str = "victim") -> Path:
