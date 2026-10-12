@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.1.21 (2026-10-12)
+> **Release focus:** This release focuses on making audits, releases, and test runs more reliable and less disruptive, with fixes for hanging audits, false release announcements, and background tools that could modify live game files. It also reduces approval prompts, lets implementation start with unrelated uncommitted changes, and improves planning, test analysis, and release reporting so work items are tracked and closed accurately.
+### Features
+- Fewer approval prompts: only the biggest, riskiest plans now pause for your review. (SA-0MUYG0HE6001YTEM)
+- You can now start implementation even with uncommitted changes, as long as they don't affect your work. (SA-0MV0NSOGE000OSMR)
+- Projects can now customize the implement workflow with their own rules and exempt expected files from blocking checks. (SA-0MUYEV5AO006V0HK)
+- Test analysis now gives accurate, reproducible results for any project. (SA-0MV28WNFY009DF6Y)
+- Planning and intake now cover entire task trees, so no child work is missed. (SA-0MSLRVQIF0040GAM)
+- Audits now correctly target the project you specify, no matter where you run them from. (SA-0MSRLECW2001AA15)
+- Audits now run faster with a quick first pass, while keeping full-depth checks. (SA-0MSKB697P000T3HG)
+### Bug Fixes
+- Audited parents now automatically complete all their unfinished children, so releases close cleanly without manual cleanup. (SA-0MUR7Y3BJ004FGPP)
+- Test runs now reliably verify your game files weren't modified, so a passing check truly means everything is safe. (SA-0MUH1MJL6003767Q)
+- Release announcements now only post after a release actually ships, so no more false "we shipped!" messages. (SA-0MV0QEI3Q0063KH3)
+- Release announcements now include your project's call-to-action so players can jump straight in. (SA-0MUWCIFU2006K39K)
+- Audits no longer hang forever when another process is holding the queue lock. (SA-0MUV4C6RZ006GN5Z)
+- Fixed a bug where background tools could accidentally modify your live game files. (SA-0MUIZSXEY008NGR8)
+- Cheap-mode audits can now run their Phase 2 analyses in parallel, making them much faster. (SA-0MUZEIAD0008LUFN)
+- Accidental release commands can no longer close your work items without a real release. (SA-0MV0PZYMI004SUFR)
+- Release reports now show the true number of work items closed, so no shipped items are left dangling. (SA-0MUXA5ZNZ0019QY5)
+- Concurrent test runs no longer freeze, so your builds finish reliably. (SA-0MUY6U05F008RG86)
+- Documentation-only projects now pass audits without requiring a build step. (SA-0MT9607Q5009JA2V)
+### Other
+- Behind-the-scenes code cleanup for a smoother, more stable game. (SA-0MUVNYSKF004O6LS)
+- Project descriptions now accurately explain what this project does. (SA-0MUZISRXD005GCXL)
+- Stops test announcements from cluttering the Discord server. (SA-0MU3VIW8C0035KKL)
+
 ## v0.1.20 (2026-10-08)
 ### Features
 - Child sessions now stay inside their own worktree, so your work no longer leaks into the main checkout. (SA-0MUY9PSRS003V5CM)
