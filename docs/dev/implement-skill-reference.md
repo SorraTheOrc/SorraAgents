@@ -6,6 +6,72 @@ operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged — every command/flag
 documented here is still valid.
 
+## Project-local extensions and expected-dirty paths (SA-0MUYEV5AO006V0HK)
+
+`implement.py` loads the project-local extension for the `implement` skill via
+the shared `load_extension()` helper (`skill/shared/skill_extensions.py`,
+contract SA-0MSQ7MQEJ0064ZB0). Discovery is repo-root scoped:
+`<project_root>/.pi/skills_extensions/implement/`. An absent extension is a
+no-op.
+
+Two components are consumed:
+
+- **Prose hooks.** `phase_start` surfaces `SKILL_PREFIX.md` after the gating
+  steps and before the first actionable step; `phase_finish` surfaces
+  `SKILL_POSTFIX.md` after the final step. Both are recorded in the JSON
+  report (`extension.prefix_prose` / `extension.postfix_prose`) and printed as
+a delimited block in human mode.
+
+- **Machine-readable data.** `extension.json` may declare
+  `ignoreDirtyPaths`, a list of repository-relative path prefixes (a single
+  string is accepted) that are expected to be dirty:
+
+  ```json
+  {"ignoreDirtyPaths": [".llm-wiki/"]}
+  ```
+
+  - `git_has_dirty_files(status_output, expected_dirty=...)` skips a dirty
+    path matching a declared prefix. It defaults to no exemption, so callers
+    that do not opt in keep the original behaviour.
+  - `phase_start` passes the project's declaration to the dirty-tree safety
+    gate; `_worktree_placement_violation()` and `_child_main_checkout_violation()`
+    pass it to the placement gates (via `_main_checkout_offending_paths()` and
+    `_git_path_has_changes()`).
+  - The declaration cannot relax the `.worklog/` skip, the stash hygiene
+    gate, or the build → test → commit order. Any unexpected dirty path still
+    stops the workflow.
+  - A malformed `extension.json` or a malformed `ignoreDirtyPaths` value
+    raises `SkillExtensionError` naming the file; `phase_start` reports the
+    failure and resets the work item to `open` instead of silently changing
+    the gate. `phase_finish` treats a malformed extension as best-effort for
+    the postfix hook (already-successful pushes are never failed by prose).
+
+## Key-Files-aware dirty-tree gate (SA-0MV0NSOGE000OSMR)
+
+`phase_start` defers its dirty-tree safety gate until after it has fetched the
+work item, so the relevance of a dirty **main checkout** can be judged against
+the description's Key Files section.
+
+- `classify_dirty_tree_relevance(status_output, description, expected_dirty=...)`
+  parses the Key Files section (any of `## Key Files`, `## Key Files
+  (predicted)` or `**Key Files:**`) and compares each dirty path against it.
+- A dirty path is treated as **relevant** when it equals, is a directory-prefix
+  ancestor/descendant of, or shares a basename with any Key Files entry
+  (`dirty_file_matches_key_files`). Matching errs toward relevant.
+- When the checkout is dirty and **no** dirty file is relevant, `phase_start`
+  proceeds, creates the worktree from `HEAD`, leaves the dirty files untouched,
+  records the decision and the exact paths in a work-item comment, and reports
+  `dirty_worktree: false` plus `dirty_worktree_left_behind`.
+- When any dirty file is relevant — or the description has **no** Key Files
+  section, so relevance cannot be judged — the gate keeps the original
+  abort-and-ask behaviour (`dirty_worktree: true`, exit code 2, status reset to
+  `open`).
+- The gate is **skipped entirely** when `phase_start` is invoked from inside a
+  linked worktree (detected by `_current_checkout_is_linked_worktree()`), e.g.
+  resuming a driven child: the dirty files there are the agent's own
+  in-progress work.
+- No stash, commit, or revert is ever performed on the dirty files.
+
 ## Why driven child sessions run with extensions disabled (SA-0MUY9PYBD009Y7J5)
 
 The ``implement.py drive`` child spawner (``_default_session_spawner``) builds
@@ -154,7 +220,11 @@ configured runner):
   wait come from `TEST_MAX_CONCURRENCY` / `TEST_LOCK_TIMEOUT`; on saturation
   the gate returns a clear failed result (logged with an actionable retry
   hint) and stores no cache entry, so a saturated host cannot be
-  oversubscribed by concurrent finish gates.
+  oversubscribed by concurrent finish gates. A test *inside* the spawned
+  suite that invokes `run_tests.py` again is a nested run: its fixture sets
+  `PI_SEMAPHORE_DIR` so it never queues behind the finish gate's own slot
+  (SA-0MUY6U05F008RG86 — see
+  [test-skill-reference.md](test-skill-reference.md#06-nested-run-isolation-sa-0muy6u05f008rg86)).
 
 The returned dict includes `skipped` (bool) and `tooling` (str | None) in
 addition to `success`/`stdout`/`stderr`/`exit_code`/`failures`.

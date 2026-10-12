@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Tests for the audit runner launch-context guard (LP-0MSQ32HNR007AI6B).
 
-Covers the fail-fast launch contract so a mis-scoped audit aborts loudly and
-early instead of producing a misleading full run (incident: an audit of an
-LP item launched from the SorraAgents cwd ran Phase 2 against the audit
+Covers the launch-context contract. SA-0MSRLECW2001AA15 inverted the
+historical fail-fast guard: the per-audit target root is now resolved from
+the worklog-derived owner, so a determinable non-owning launch proceeds
+against the owning project with a one-line stderr warning; only
+undeterminable ownership still aborts (incident context: an audit of an LP
+item launched from the SorraAgents cwd once ran Phase 2 against the audit
 skill's own tree — ~124 min model time wasted):
 
-  - AC1/AC4(a): a launch from a non-owning project dir fails fast with a
-    clear error and non-zero exit, with ZERO pi calls.
+  - AC1/AC4(a): a determinable non-owning launch proceeds with a stderr
+    warning naming the launch and owning roots (no abort).
   - AC2/AC4(b): a Phase 2 FILE SCOPE manifest that lacks the item repository
     aborts with a scope error before Phase 2 (no 'unmet' verdicts emitted).
   - AC3/AC4(c): a child audit persistence failure aborts the run instead of
     being swallowed as a warning that leads to a misleading parent report.
-  - AC5: a correctly-configured launch (from the owning project root) still
-    runs unchanged (guard is zero-cost for correct launches).
+  - AC4: a correctly-configured launch (from the owning project root) runs
+    silently unchanged.
+  - Undeterminable ownership still fails fast with a clear error.
 """  # noqa: EXE001
 from __future__ import annotations
 
@@ -173,35 +177,17 @@ def _make_minimal_runner(recorded: list[list[str]] | None = None,
 
 
 class TestLaunchContextGuard:
-    """A launch from a non-owning project dir must abort before any pi call."""
+    """A launch from a determinable non-owning cwd proceeds with a warning.
 
-    def test_non_owning_cwd_aborts_with_zero_pi_calls(self, tmp_path):
-        """AC4(a): launching from a non-owning project dir returns non-zero
-        and never invokes the pi/model path (zero pi calls).
-        """
-        _target, _target_root, patcher = _make_sibling_projects(tmp_path)
-        wrong_root = tmp_path / "wrong-project"
-        wrong_root.mkdir()
+    SA-0MSRLECW2001AA15 inverted the historical fail-fast contract: the
+    per-audit target root is now resolved from the worklog-derived owner, so
+    a foreign-cwd launch audits the owning project instead of aborting. Only
+    **undeterminable** ownership still fails fast.
+    """
 
-        with (
-            patcher,
-            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", wrong_root),
-            mock.patch.object(
-                audit_runner, "_call_pi_and_maybe_log"
-            ) as pi_mock,
-            mock.patch("builtins.print"),
-        ):
-            rc = audit_runner.cmd_issue(
-                "OSL-1", persist=False, force=True,
-                runner=_make_minimal_runner(),
-            )
-
-        assert rc == 1
-        pi_mock.assert_not_called()
-
-    def test_non_owning_cwd_error_names_resolved_vs_expected(self, tmp_path, capsys):
-        """AC1: the abort message states the resolved (launch) and expected
-        (owning) project so operators can re-launch from the right directory.
+    def test_non_owning_cwd_proceeds_with_warning(self, tmp_path, capsys):
+        """AC1: a determinable non-owning launch proceeds (rc == 0) and emits
+        a one-line stderr warning naming the launch and owning roots.
         """
         _target, target_root, patcher = _make_sibling_projects(tmp_path)
         wrong_root = tmp_path / "wrong-project"
@@ -210,66 +196,42 @@ class TestLaunchContextGuard:
         with (
             patcher,
             mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", wrong_root),
-            mock.patch.object(
-                audit_runner, "_call_pi_and_maybe_log"
-            ) as pi_mock,
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
         ):
             rc = audit_runner.cmd_issue(
                 "OSL-1", persist=False, force=True,
                 runner=_make_minimal_runner(),
             )
 
-        assert rc == 1
-        pi_mock.assert_not_called()
-        err = capsys.readouterr().err
-        assert "Audit launch-context error" in err
-        assert str(wrong_root) in err
-        assert str(target_root) in err
-        assert "OSL-1" in err
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert str(wrong_root) in captured.err
+        assert str(target_root) in captured.err
+        # The warning is a stderr diagnostic only — it never enters the
+        # report/JSON output (AC3).
+        assert "Warning: audit launched from" not in captured.out
 
-    def test_guard_runs_before_any_wl_status_transition(self, tmp_path):
-        """AC1: the guard fires before the status lifecycle — a mis-scoped
-        launch never flips the item to in_progress (no wasted state changes).
+    def test_explicit_worklog_dir_foreign_cwd_proceeds(self, tmp_path, capsys):
+        """AC1: with an explicit --worklog-dir the owning root is the
+        resolved dir's parent, so a foreign-cwd launch still proceeds against
+        that owner with a warning.
         """
-        _target, _target_root, patcher = _make_sibling_projects(tmp_path)
-        wrong_root = tmp_path / "wrong-project"
-        wrong_root.mkdir()
-        recorded: list[list[str]] = []
-
-        with (
-            patcher,
-            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", wrong_root),
-            mock.patch("builtins.print"),
-        ):
-            rc = audit_runner.cmd_issue(
-                "OSL-1", persist=False, force=True,
-                runner=_make_minimal_runner(recorded),
-            )
-
-        assert rc == 1
-        status_updates = [
-            c for c in recorded if "update" in c and "--status" in c
-        ]
-        assert status_updates == [], (
-            "a mis-scoped launch must not touch the item status"
-        )
-
-    def test_explicit_worklog_dir_does_not_bypass_wrong_cwd(self, tmp_path):
-        """AC1: passing --worklog-dir does NOT change the project scope — a
-        launch from a non-owning cwd still aborts (the expected project is
-        derived from the explicit dir's parent per resolution precedence).
-        """
-        target, _target_root, patcher = _make_sibling_projects(tmp_path)
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
         wrong_root = tmp_path / "wrong-project"
         wrong_root.mkdir()
 
         with (
             patcher,
             mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", wrong_root),
-            mock.patch.object(
-                audit_runner, "_call_pi_and_maybe_log"
-            ) as pi_mock,
-            mock.patch("builtins.print"),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
         ):
             rc = audit_runner.cmd_issue(
                 "OSL-1", persist=False, force=True,
@@ -277,12 +239,13 @@ class TestLaunchContextGuard:
                 worklog_dir=str(target),
             )
 
-        assert rc == 1
-        pi_mock.assert_not_called()
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert str(target_root) in err
 
-    def test_owning_cwd_passes_guard_and_runs_unchanged(self, tmp_path):
-        """AC5 (regression): a correctly-configured launch from the owning
-        project root passes the guard and the run completes normally.
+    def test_owning_cwd_passes_guard_silently(self, tmp_path, capsys):
+        """AC4: a launch from the owning project root proceeds silently —
+        no warning is emitted.
         """
         _target, target_root, patcher = _make_sibling_projects(tmp_path)
 
@@ -301,9 +264,11 @@ class TestLaunchContextGuard:
             )
 
         assert rc == 0
+        err = capsys.readouterr().err
+        assert "Warning: audit launched from" not in err
 
     def test_undeterminable_ownership_aborts(self, tmp_path, capsys):
-        """AC2 (SA-0MSLLGDW00098UCC): when no sibling project matches the
+        """AC2 (SA-0MSRLECW2001AA15): when no sibling project matches the
         item's prefix and no --worklog-dir is given, ownership is
         undeterminable — the run aborts with a clear error instead of
         falling back to the launch cwd's repository for git-derived content.
@@ -1005,6 +970,171 @@ class TestGitResolutionFromNonOwningCwd:
             assert cmd[1] != "-C", (
                 f"owning-project launch must not inject -C: {cmd}"
             )
+
+
+class TestPerAuditRootConsumers:
+    """The per-audit target root is consumed by every residual
+    ``TARGET_PROJECT_ROOT`` reader (SA-0MULGDABC001T11L).
+
+    A foreign-cwd launch with a determinable owner resolves the per-audit
+    root to the owning project, so the code-quality scan, the repo-index
+    fallback, the debug-log slug, and the F3 suite-execution cwd all target
+    the audited project — never the launch cwd. A worktree launch keeps
+    resolving to the worktree checkout (same git repository).
+    """
+
+    def test_foreign_cwd_code_quality_targets_owning_root(self, tmp_path):
+        """The code-quality scan receives the owning project as
+        ``project_root``, not the launch cwd.
+        """
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+        mock_cq = mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+        with (
+            patcher,
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality", mock_cq
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(),
+                worklog_dir=str(target),
+            )
+
+        assert rc == 0
+        mock_cq.assert_called_once()
+        assert mock_cq.call_args.kwargs["project_root"] == target_root
+
+    def test_foreign_cwd_suite_execution_cwd_targets_owning_root(
+        self, tmp_path
+    ):
+        """The F3 auto-green / test-skill suite-execution cwd is the owning
+        project, not the launch cwd.
+        """
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+
+        with (
+            patcher,
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root),
+            mock.patch.object(
+                audit_runner, "_auto_green_run_outcome",
+                return_value=(None, None, audit_runner._FULL_SUITE_CACHE_MISS),
+            ) as auto_mock,
+            mock.patch.object(
+                audit_runner, "_run_tests_via_test_skill",
+                return_value={"success": False},
+            ) as run_mock,
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(),
+                worklog_dir=str(target),
+                run_tests=True,
+            )
+
+        assert rc == 0
+        auto_mock.assert_called_once()
+        assert auto_mock.call_args.kwargs["cwd"] == str(target_root)
+        run_mock.assert_called_once()
+        assert run_mock.call_args.kwargs["cwd"] == target_root
+
+    def test_foreign_cwd_debug_log_dir_targets_owning_root(self, tmp_path):
+        """The debug-log directory slug is derived from the owning project,
+        so debug artefacts are attributable to the audited project.
+        """
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+
+        with (
+            patcher,
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root),
+            mock.patch.object(
+                audit_runner, "_debug_log_dir",
+                wraps=audit_runner._debug_log_dir,
+            ) as debug_dir_spy,
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(),
+                worklog_dir=str(target),
+            )
+
+        assert rc == 0
+        assert debug_dir_spy.called
+        roots = [
+            (call.args[0] if call.args else call.kwargs.get("project_root"))
+            for call in debug_dir_spy.call_args_list
+        ]
+        assert any(root == target_root for root in roots), roots
+        assert all(root != launch_root for root in roots), roots
+
+    def test_repo_index_fallback_uses_per_audit_root(self, tmp_path):
+        """When ``git ls-files`` fails, ``_repo_index`` lists the per-audit
+        target root's top-level entries (not the launch cwd's).
+        """
+        _target, target_root, _patcher = _make_sibling_projects(tmp_path)
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+        (launch_root / "launch-only").mkdir()
+
+        def failing_git_runner(cmd):
+            if cmd and cmd[0] == "git":
+                return SimpleNamespace(returncode=1, stdout="", stderr="fatal")
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        with mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root):
+            index = audit_runner._repo_index(
+                failing_git_runner, project_root=target_root
+            )
+
+        assert any("src" in entry for entry in index), index
+        assert not any("launch-only" in entry for entry in index), index
+
+    def test_worktree_launch_per_audit_root_is_worktree(self, tmp_path):
+        """A worktree launch keeps the per-audit root at the worktree
+        checkout (same git repository), not the --worklog-dir parent.
+        """
+        (worklog_dir, _owning_root, worktree_path, _main_head,
+         _worktree_head) = _make_real_git_project_with_worktree(tmp_path)
+        mock_cq = mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+        with (
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", worktree_path
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality", mock_cq
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(git_cwd=worktree_path),
+                worklog_dir=str(worklog_dir),
+            )
+
+        assert rc == 0
+        assert mock_cq.call_args.kwargs["project_root"] == worktree_path
 
 
 # ===========================================================================

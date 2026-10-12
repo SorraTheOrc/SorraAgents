@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Tests for the machine-hygiene metrics collection module.
 
@@ -14,6 +13,7 @@ import importlib.util
 import io
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 _SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -161,9 +161,9 @@ class TestGetProcessCounts(unittest.TestCase):
             "/proc/1/status": "Name: systemd\nThreads: 3\n",
             "/proc/2/status": "Name: sshd\nThreads: 2\n",
         }
-        with mock.patch("builtins.open", _open_from_map(mapping)):
-            with mock.patch("os.listdir", return_value=["1", "2", "notapid"]):
-                proc_count, thread_count = metrics._get_process_counts()
+        with mock.patch("builtins.open", _open_from_map(mapping)), \
+             mock.patch("os.listdir", return_value=["1", "2", "notapid"]):
+            proc_count, thread_count = metrics._get_process_counts()
         self.assertEqual(proc_count, 2)
         self.assertEqual(thread_count, 5)
 
@@ -183,9 +183,9 @@ class TestGetRssTop10(unittest.TestCase):
             "/proc/101/status": "Name: grep\nVmRSS:   3072 kB\n",
             "/proc/102/status": "Name: node\nVmRSS:  10240 kB\n",
         }
-        with mock.patch("builtins.open", _open_from_map(mapping)):
-            with mock.patch("os.listdir", return_value=["100", "101", "102"]):
-                result = metrics._get_rss_top10()
+        with mock.patch("builtins.open", _open_from_map(mapping)), \
+             mock.patch("os.listdir", return_value=["100", "101", "102"]):
+            result = metrics._get_rss_top10()
 
         self.assertEqual([item["name"] for item in result], ["node", "grep"])
         self.assertEqual(result[0]["total_rss_bytes"], 10240 * 1024)
@@ -209,10 +209,10 @@ class TestDetectStaleDevices(unittest.TestCase):
             "/proc/100/status": "Name: defunct_proc\nState: Z (zombie)   \n",
             "/proc/101/status": "Name: healthy\nState: S (sleeping)   \n",
         }
-        with mock.patch("builtins.open", _open_from_map(mapping)):
-            with mock.patch("os.listdir", return_value=["100", "101"]):
-                with mock.patch("os.path.isdir", return_value=False):
-                    result = metrics._detect_stale_devices()
+        with mock.patch("builtins.open", _open_from_map(mapping)), \
+             mock.patch("os.listdir", return_value=["100", "101"]), \
+             mock.patch("os.path.isdir", return_value=False):
+            result = metrics._detect_stale_devices()
         self.assertEqual(result["zombie_count"], 1)
         self.assertEqual(result["zombie_details"], [(100, "defunct_proc")])
 
@@ -224,9 +224,9 @@ class TestGetRunnableCount(unittest.TestCase):
             "/proc/101/status": "Name: sleeping\nState: S (sleeping)   \n",
             "/proc/102/status": "Name: blocked\nState: D (sleeping)   \n",
         }
-        with mock.patch("builtins.open", _open_from_map(mapping)):
-            with mock.patch("os.listdir", return_value=["100", "101", "102"]):
-                self.assertEqual(metrics._get_runnable_count(), 2)
+        with mock.patch("builtins.open", _open_from_map(mapping)), \
+             mock.patch("os.listdir", return_value=["100", "101", "102"]):
+            self.assertEqual(metrics._get_runnable_count(), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +234,7 @@ class TestGetRunnableCount(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestCollectMetrics(unittest.TestCase):
-    REQUIRED_KEYS = [
+    REQUIRED_KEYS: ClassVar[list[str]] = [
         "load_average",
         "cpu_pressure",
         "memory_pressure",

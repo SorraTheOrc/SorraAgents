@@ -208,7 +208,8 @@ The item's integration evidence is derived from the item itself:
 
 - **Verify:** `git fetch origin dev` (best-effort), then `git merge-base --is-ancestor <candidate> origin/dev` for each candidate (branch first). Command + result are recorded; ANY positive ancestor check makes the item merged.
 - **No baseline:** an owning repo with neither `origin/dev` nor a local `dev` has no integration target — recorded as non-blocking (never an integration trigger).
-- **Integrate (when evidence exists, not merged, baseline present):** fetch `dev`; fresh detached worktree at `origin/dev`; merge `--no-ff` the feature branch (or cherry-pick each candidate NOT already in `dev`); symlink the owning repo's `node_modules` (implement-skill convention — never npm-install inside a worktree); build (`npm run build`); run the project test suite (test-skill runner, `run_suite("all")`); then push `HEAD:refs/heads/dev` — NEVER `main`. Post-merge the pushed sha is re-verified as an ancestor of `origin/dev`.
+- **Integrate (when evidence exists, not merged, baseline present):** fetch `dev`; fresh detached worktree at `origin/dev`; merge `--no-ff` the feature branch (or cherry-pick each candidate NOT already in `dev`); symlink the owning repo's `node_modules` (implement-skill convention — never npm-install inside a worktree); build (`npm run build`, **skipped when the repo has no `scripts.build` entry** — docs-only/Python-only repos, SA-0MT9607Q5009JA2V); run the project test suite (test-skill runner, `run_suite("all")`); then push `HEAD:refs/heads/dev` — NEVER `main`. Post-merge the pushed sha is re-verified as an ancestor of `origin/dev`.
+- **Conditional build (SA-0MT9607Q5009JA2V):** `_has_build_script()` reads the root `package.json` directly (no npm needed) and skips the build step when the file is missing or has no `scripts.build` entry, recording "No build script … — skipped" as a non-blocking evidence note. Malformed JSON or a non-object `scripts` value counts as "no build script" (fail-open — a broken manifest never blocks the gate). A repo WITH a build script runs `npm run build` unchanged and still fails the gate on a non-zero exit. Mirrors the implement skill's `run_build()` / `_has_build_script()` convention (SA-0MSM6JHG9002CZA1).
 - **Fail closed (AC3):** when integration cannot complete (fetch/ref failure, conflicts, build/test failure, push failure, or any unexpected error after evidence resolution) the gate emits "Ready to close: No" (+ `--needs-producer-review yes` via the lifecycle's no-verdict branch) — the pipeline never proceeds past Phase 1 with unmerged work. No rest of Phase 1 screening and no Phase 2 run (assessment would be misleading against unmerged code).
 - **Fail open (never blockers):** items with NO resolvable evidence (docs/admin items — no feature branch, no referenced commits) and repos with NO dev baseline proceed with the gate recorded as a note.
 
@@ -383,6 +384,17 @@ transition has been **verified** (`wl show` readback, WL-0MSVVFBJ2003RRYK),
 - **Non-fatal:** a per-child `wl` failure is caught, logged to stderr, and does not abort the audit; the next passing audit completes the remaining cascade.
 - **Worklog routing:** the helper reuses `_run_wl`, so `--worklog-dir` is resolved through the shared helpers and the cascade targets the item's own store regardless of cwd.
 
+> **Audits recorded outside the runner.** The audit-side cascade above fires
+> only on the runner's verified `Ready to close: Yes` path. An audit recorded
+> manually / via `wl audit-set` (in the worklog CLI, outside this repository)
+> bypasses it, so an audit-ready parent can reach the ship close step with a
+> non-terminal subtree. The ship close step's **fallback cascade**
+> (SA-0MUR7Y3BJ004FGPP recurrence) covers that gap: it cascades a passing
+> parent's non-terminal descendants to `completed`/`done` before closing the
+> parent. See
+> [release-process.md](release-process.md#3-work-items-are-automatically-closed)
+> and the ship-side section below.
+
 ### Ship-side terminal-descendant exclusion and producer-review reporting (AC2/AC4)
 
 `closeWorkItemsAfterRelease` computes `collateral` as descendants that are
@@ -401,6 +413,41 @@ appended to the generic out-of-scope message for a mixed subtree — rather than
 being lumped under the generic collateral list. The classification is exposed
 as `refusedItems[].needsProducerReview`; the parent is still refused, so the
 scope guard is not weakened (SA-0MUJKPDAA002VVDP AC2).
+
+### Ship-side fallback cascade for an audit-ready parent (recurrence)
+
+When a candidate has non-terminal collateral descendants but its own audit is
+passing (`getParentAuditFn` → `readyToClose === true`, default
+`getParentAudit` = `wl audit-show <id> --json`), `closeWorkItemsAfterRelease`
+cascades each non-terminal descendant to `status: completed, stage: done` via
+the injected `runCascadeCommand` (default `wl update` + `wl comment add` naming
+the parent and audit timestamp), then closes the parent. The cascade is
+**authorised by the passing audit verdict only** — a missing/non-passing audit
+leaves the descendant in the collateral set, so the parent is still refused and
+the scope guard is preserved. A per-child cascade failure is caught, logged,
+and that child stays collateral (a partially-cascaded subtree is refused, never
+force-closed). Under `--dry-run` the planned cascade is reported and
+`cascadedItems` is populated, but no `wl` mutation is performed. The cascade is
+idempotent for terminal (`stage: done`) / `deleted` descendants, which are
+already excluded from the collateral set before the cascade.
+
+This closes the gap left by audits recorded **outside** the audit runner
+(`wl audit-set` / manual approval), which bypass the audit-side cascade above.
+Result/return fields: `cascadedCount` and `cascadedItems`
+(`{id, ancestorId, auditTimestamp}`).
+
+### Ship-side close verification (SA-0MUXA5ZNZ0019QY5)
+
+The close step does not trust the `wl close` exit code. After each attempted
+close it re-reads the item's persisted lifecycle through the injectable
+`getCloseStateFn` boundary (default `getItemLifecycle`, a live `wl show`) and
+counts the item as closed only when `status === "completed"` **and**
+`stage === "done"`. A close that exits 0 but does not persist — the
+concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried
+exactly once and re-verified; if it is still not terminal (or the state read
+throws/returns `null` — fail-safe) the item is reported in `unclosedCount` /
+`unclosedItems` (`{id, title, reason}`) by id and `success` is `false`, so the
+release summary never claims blanket success. The step remains non-blocking.
 
 ## Scripts
 
@@ -424,36 +471,38 @@ standalone `persist_audit.py` CLI, which resolves the store itself when no
    git root, or nearest ancestor.
 4. No flag — `wl` resolves from cwd.
 
-**Fail-fast launch context (LP-0MSQ32HNR007AI6B):** the *project scope* has
-two independent axes. The **launch-context guard** still checks the launch
-cwd: ``TARGET_PROJECT_ROOT`` (the git root of the launch cwd) must own the
-item or be a worktree of the owning project. But the runner's **git-derived
-content now follows the worklog** (SA-0MSLLGDW00098UCC): the file-scope
-manifest (changed-file list + repo index), HEAD attestations, working-tree
-hashes, and ``--green-run`` evidence resolve against the worklog-derived
-owning project root (``--worklog-dir`` parent, else prefix-to-sibling
-scan) — NOT the launch cwd. Before any phase runs (and before any pi/model
-call) the runner verifies:
+**Launch context and per-audit scope (LP-0MSQ32HNR007AI6B, revised by
+SA-0MSRLECW2001AA15):** the *project scope* is resolved from the
+worklog-derived owner into a **per-audit target root** used by every
+scope-sensitive consumer. The runner's git-derived content follows the
+worklog (SA-0MSLLGDW00098UCC) and — since SA-0MSRLECW2001AA15 — so do the
+former launch-cwd-bound consumers. Before any phase runs (and before any
+pi/model call) the runner verifies:
 
 1. **Owning project** — the item's id prefix resolves to its owning project
    via the prefix-to-sibling scan (explicit ``--worklog-dir`` takes
    precedence: its parent is the expected project). A launch from a
-   non-owning checkout aborts with `Error: Audit launch-context error:` and
-   a non-zero exit — zero pi calls, no status lifecycle. A worktree of the
-   owning project counts as owning (same git repository). When the owning
-   project root cannot be determined (no ``--worklog-dir``, unknown item
-   prefix, no sibling match), the run aborts with `Error: Undeterminable
-   project scope: ...` before any phase runs — never a silent fallback to
-   the launch cwd's repository for git-derived content.
-2. **Git scope follows the worklog** — every git command issued by the
+   **determinable** non-owning cwd is no longer fatal: the run proceeds
+   against the owning project and emits a one-line **stderr** warning naming
+   the launch and owning roots (never in the report or ``--json`` output).
+   A worktree of the owning project counts as owning (same git repository).
+   When the owning project root cannot be determined (no ``--worklog-dir``,
+   unknown item prefix, no sibling match), the run aborts with `Error:
+   Undeterminable project scope: ...` before any phase runs — never a silent
+   fallback to the launch cwd's repository for git-derived content.
+2. **Git scope and per-audit consumers** — every git command issued by the
    runner targets the worklog-derived owning root (`git -C <owning_root>`
    when it differs from the launch root), so launching from any cwd audits
    the owning project's repository. A launch from the owning project — or a
    worktree of it (same git repository) — keeps git resolving to that
    checkout (byte-identical commands), so worktree-only changes and the
-   worktree branch HEAD stay correct. The remaining ``TARGET_PROJECT_ROOT``
-   consumers (code-quality scan and debug-log path) are still
-   launch-cwd-bound.
+   worktree branch HEAD stay correct. The residual ``TARGET_PROJECT_ROOT``
+   consumers — code-quality scan, remediation loop, ``_repo_index``
+   fallback, debug-log directory, and the F3 suite-execution cwd — now read
+   the **per-audit target root** (stored on ``_AuditContext`` and published
+   for deep helpers), so a foreign-cwd launch never scopes them to the
+   launch directory. ``TARGET_PROJECT_ROOT`` itself is retained only as the
+   cwd-derived fallback for direct/unit callers.
 3. **FILE SCOPE manifest** — before Phase 1 and again before Phase 2, the
    manifest must reference the item repository's files; a manifest built
    from the audit skill's own tree (or lacking the item repo) aborts with
@@ -474,10 +523,10 @@ python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NV
 The runner is cwd-independent for both `wl` resolution and git-derived
 content: launching from any directory (e.g. the skill install dir) with
 `--worklog-dir` pointing at the audited project audits that project's
-repository. Only the remaining `TARGET_PROJECT_ROOT` consumers (code-quality
-scan, debug-log path) stay launch-cwd-bound. If auto-resolution cannot
-determine the target store while launching from the owning project root,
-pass an explicit dir:
+repository, and every per-audit consumer (code-quality scan, debug-log path,
+repo-index fallback, F3 suite-execution cwd) now targets the owning project
+too. If auto-resolution cannot determine the target store while launching
+from the owning project root, pass an explicit dir:
 
 ```bash
 python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \
@@ -494,7 +543,7 @@ worklog left on the host. The shared autouse fixture
 `tests/conftest.py`) therefore redirects `SIBLING_SCAN_ROOT` to an empty
 isolated directory for the duration of each flow test, so a leftover
 `TEST`-prefixed worklog (e.g. `/tmp/wlfields-test`) can never hijack the
-synthetic id and trip the launch-context guard. Tests that exercise ownership
+synthetic id and mis-resolve the per-audit target root. Tests that exercise ownership
 resolution (the launch-context suite) override the scan root and resolver with
 their own patches.
 
@@ -645,7 +694,7 @@ Invalid values (0, negative, non-int) fail closed to the default with a warning 
 
 **Child-audit execution contract (SA-0MU32TE120012T49):** in-main-slot mode never presents a pending child as a normal result. Whenever any child AC is still pending main-slot review, the assembled report emits `Child screens pending: N (main-slot) — <child ids>` immediately after the `Ready to close:` header, the summary gains a `Child-audit execution gate:` line naming the children and the remediation, and closure is forced to `Ready to close: No` (the JSON payload exposes `pending_child_screens` and `ready_to_close: false`). A resumable signal (`<issue_id>.pending-screens.json` in the checkpoint directory, default `.worklog/audit-checkpoints/`) records the outstanding child ids and is deleted automatically when none remain, so a subsequent run completes exactly those child screens via child-verdict reuse without re-running completed phases. Detection keys on the in-main-slot `partial` evidence (`_pending_main_slot_child_ids`); a pending screen can never be silently mistaken for a reviewed child.
 
-**Proxy cheap-mode serialization (startup):** At runner start (`main()`, before any pi call) the runner queries the llm-manager proxy mode endpoint — `GET <base>/admin/mode` (`AUDIT_PROXY_BASE_URL`, default `http://192.168.0.199:8000`; ~3 s timeout, fail-open) — and parses the JSON `mode` field. When the mode is exactly `cheap` (the proxy's reduced 1-slot local pool, e.g. during the default 01:00–10:00 local cheap window), the runner serializes this run's pi calls by setting **both** `AUDIT_PARALLELISM=1` **and** `AUDIT_MAX_CONCURRENCY=1` in its own process environment, and prints a detection line to stderr. The change is per-process (`os.environ`) — it affects only this run's spawned pi subprocesses, never other processes or audits; `AUDIT_MAX_CONCURRENCY=1` is defensive against sibling dispatchers sharing the same host-wide flock ceiling. Any other mode (including `fast`) or a failed query (unreachable / timeout / non-200 / unparseable) leaves all parallelism settings unchanged (fail-open) and logs a warning to stderr only on query failure; verdict semantics and the two-phase pipeline are unaffected. Mode *switching* (`POST /admin/set-mode`) is out of scope — the runner is read-only (SA-0MSN04X2S006ONH0).
+**Proxy cheap-mode serialization (startup):** At runner start (`main()`, before any pi call) the runner queries the llm-manager proxy mode endpoint — `GET <base>/admin/mode` (`AUDIT_PROXY_BASE_URL`, default `http://192.168.0.199:8000`; ~3 s timeout, fail-open) — and parses the JSON `mode` field. When the mode is exactly `cheap` (e.g. during the default 01:00–10:00 local cheap window), the runner serializes this run's pi calls by setting **both** `AUDIT_PARALLELISM=1` **and** `AUDIT_MAX_CONCURRENCY=1` in its own process environment **only when it has no explicit request and no free second slot** (SA-0MUZEIAD0008LUFN): an explicit `AUDIT_PARALLELISM` / `AUDIT_PHASE2_PARALLELISM` request is authoritative and is never overwritten, and otherwise the runner consults the live slot status (`/llama/local/status`) and keeps the run parallel when >= 2 slots are free (the cheap pool is `session_slot_pool_size: 3`). It prints a detection line to stderr. The change is per-process (`os.environ`) — it affects only this run's spawned pi subprocesses, never other processes or audits; `AUDIT_MAX_CONCURRENCY=1` is defensive against sibling dispatchers sharing the same host-wide flock ceiling. Any other mode (including `fast`) or a failed mode query leaves all parallelism settings unchanged (fail-open) and logs a warning to stderr only on query failure; a failed slot-status query likewise leaves the configured static ceiling unchanged. Verdict semantics and the two-phase pipeline are unaffected. Mode *switching* (`POST /admin/set-mode`) is out of scope — the runner is read-only (SA-0MSN04X2S006ONH0).
 
 **Retry tuning (Phase 2):** Long agent-mode Phase 2 calls (`phase2_deep` / `phase2_child`) retry provider errors at most once (`_PHASE2_MAX_RETRIES = 1`), instead of the `_PI_MAX_RETRIES`=2 budget used by short Phase 1 bare calls. A provider error late in a long agent-mode call no longer restarts it multiple times (worst case was ~3 x 1800s before this change); the call degrades to `partial` with the existing provider-error diagnostic after the bounded retry.
 
@@ -776,9 +825,10 @@ Runner performs code quality checks before AC verification (invokes `../code_rev
   cwd-chain fallback, so `persist_audit.py` can be launched from any directory
   (e.g. the skill install dir) and still persist to the item's own store
   (SA-0MSKQERKH002IBLG). An explicit `--worklog-dir` keeps highest precedence.
-  Note: the repo-scope facet of the skill-dir launch pattern
-  (`TARGET_PROJECT_ROOT` code-quality scan / debug-log consumers) remains
-  launch-cwd-bound — tracked in SA-0MSRLECW2001AA15.
+  The repo-scope facet of the skill-dir launch pattern is now cwd-independent
+  too: the code-quality scan, remediation loop, `_repo_index` fallback,
+  debug-log directory, and F3 suite-execution cwd all read the **per-audit
+  target root** resolved from the worklog owner (SA-0MSRLECW2001AA15).
 
 **Unique report file naming convention:**
 
@@ -874,8 +924,10 @@ surgical ruff config change, then re-scanned:
 
 1. **Locate/create the config** (`locate_ruff_config` in
    `skill/code_review/scripts/linter_runner.py`): existing `ruff.toml`, else the
-   `pyproject.toml` `[tool.ruff]` section, else a new `ruff.toml` created in
-   `TARGET_PROJECT_ROOT`.
+   `pyproject.toml` `[tool.ruff]` section, else a new `ruff.toml` created in the
+   **per-audit target project root** (the worklog-derived owner; launched from
+   the owning project this is `TARGET_PROJECT_ROOT`). The runner passes the
+   resolved root as `project_root` to `run_code_quality` (SA-0MULGDABC001T11L).
 2. **Minimal edit** (`apply_ruff_remediation`): `per-file-ignores` entries for the
    flagged file+rule pairs only — no sweeping rule changes, no inline source
    suppressions, no `_RUFF_SEVERITY_MAP` / `_classify_ruff` edits.

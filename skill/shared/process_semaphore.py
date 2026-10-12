@@ -20,6 +20,18 @@ Configuration
   workloads (default ceiling documented below).
 - Default: 5 concurrent workers when neither is provided.
 
+Nested-run isolation
+--------------------
+``PI_SEMAPHORE_DIR`` names the base lock directory. A run that already holds
+one of the host-wide ``"test"`` slots spawns *nested* runs — pytest tests that
+invoke ``run_tests.py`` in-process, or spawn it as a subprocess. Those nested
+runs must not contend for the host-wide pool: the outer run keeps its slot
+until the nested run finishes, so a nested acquire can wait out the whole
+``TEST_LOCK_TIMEOUT`` and deadlock under concurrent agent load
+(SA-0MUY6U05F008RG86). :func:`nested_semaphore_dir` returns an isolated base
+directory for such invocations; top-level runs never call it, so the host-wide
+ceiling (``TEST_MAX_CONCURRENCY``) is preserved for genuine parallel suites.
+
 Timeout semantics
 -----------------
 - ``timeout=None`` — block indefinitely until a slot frees.
@@ -63,6 +75,9 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 DEFAULT_MAX_WORKERS = 5
 ENV_MAX_WORKERS = "AUDIT_MAX_CONCURRENCY"
 ENV_LOCK_DIR = "PI_SEMAPHORE_DIR"
+#: Subdirectory (under a caller-provided base) that names an isolated
+#: namespace for a nested (already-paced) run invocation.
+NESTED_SEMAPHORE_SUBDIR = "pi-semaphores"
 _RETRY_DELAY_SECONDS = 0.05
 
 _NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -82,6 +97,30 @@ def _sanitize_name(name: str) -> str:
     """Make a semaphore name safe for use as a directory name."""
     cleaned = _NAME_SAFE.sub("_", name).strip("_")
     return cleaned or "default"
+
+
+def nested_semaphore_dir(base_dir: str | os.PathLike[str]) -> Path:
+    """Return an isolated semaphore base directory for a nested run.
+
+    A run that already holds the host-wide ``"test"`` slot must not block its
+    own nested runs behind that slot: the outer run keeps the slot until the
+    nested run finishes, so a nested acquire can wait out the entire
+    ``TEST_LOCK_TIMEOUT`` and deadlock under concurrent agent load
+    (SA-0MUY6U05F008RG86). Callers (test fixtures, harnesses) pass a per-test
+    temporary directory and export the result as ``PI_SEMAPHORE_DIR`` for the
+    nested invocation — the nested run then bounds itself in its own
+    namespace instead of the host-wide pool. Top-level runs never call this
+    helper, so the host-wide ceiling (``TEST_MAX_CONCURRENCY``) is unchanged
+    for genuine parallel suites.
+
+    Args:
+        base_dir: The caller's isolation root (e.g. pytest ``tmp_path``).
+
+    Returns:
+        ``<base_dir>/pi-semaphores`` — slot files are created lazily by
+        :class:`Semaphore` (the directory itself need not exist yet).
+    """
+    return Path(base_dir) / NESTED_SEMAPHORE_SUBDIR
 
 
 class Semaphore:

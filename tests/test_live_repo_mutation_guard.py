@@ -17,13 +17,18 @@ No live checkout is mutated to obtain any proof; every mutation happens in a
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
+import pytest
 from shared import git_sandbox as gs
+from shared.process_semaphore import nested_semaphore_dir
+from test.scripts.run_tests import guarded_run_all
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUARD_MODULE = REPO_ROOT / "skill" / "shared" / "live_repo_guard.py"
@@ -32,10 +37,34 @@ MARKER_ENV = "LIVE_REPO_GUARD_ACTIVE"
 
 
 def _child_env() -> dict[str, str]:
-    """Environment for a nested run: no repo overrides, no guard marker."""
+    """Environment for a nested run: no repo overrides, no guard marker, and
+    an isolated semaphore namespace.
+
+    ``PI_SEMAPHORE_DIR`` is set by the autouse ``_isolated_nested_semaphore``
+    fixture to a directory beside (never inside) the fixture repo, so the
+    nested runner never contends for the host-wide ``"test"`` slot this outer
+    suite holds (SA-0MUY6U05F008RG86). It is copied explicitly so the
+    isolation is visible at the call site rather than an implicit inheritance.
+    """
     env = gs.sanitized_git_env()
     env.pop(MARKER_ENV, None)
+    if "PI_SEMAPHORE_DIR" in os.environ:
+        env["PI_SEMAPHORE_DIR"] = os.environ["PI_SEMAPHORE_DIR"]
     return env
+
+
+@pytest.fixture(autouse=True)
+def _isolated_nested_semaphore(tmp_path, monkeypatch):
+    """Isolate nested-run semaphore acquisition (SA-0MUY6U05F008RG86).
+
+    The nested ``run_tests.py`` invocations in this module execute while the
+    outer suite already holds a host-wide ``"test"`` semaphore slot; without
+    an isolated namespace they would wait behind it and deadlock when two
+    full suites run concurrently. The directory lives beside every fixture
+    repo (``tmp_path``), never inside one, so it cannot trip the live-repo
+    guard.
+    """
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
 
 
 def _init_guard_repo(base: Path, name: str = "victim") -> Path:
@@ -213,6 +242,111 @@ class TestRunTestsGuardFires:
         )
 
         assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+class TestGuardedRunAllOwnership:
+    """Guard-ownership parity at the canonical programmatic API (SA-0MUH1MJL6003767Q).
+
+    ``guarded_run_all`` is the single source of truth for outer live-repo
+    guard ownership: the CLI and ``implement.py``'s finish gate both delegate
+    to it. These tests exercise it programmatically and assert the ownership
+    contract — owns when the marker is unset (snapshot + detect + clear),
+    stands down when the marker is already set by an outer guard.
+    """
+
+    def _isolate_pacer(self, monkeypatch) -> None:
+        """Neutralise the host-wide test semaphore for in-process runs.
+
+        The guard-ownership contract is orthogonal to concurrency pacing; a
+        saturated shared semaphore (other agents running suites) would make
+        these tests wait/time out. The pacer is exercised elsewhere
+        (SA-0MTG5U75A001F1RG).
+        """
+        from test.scripts import run_tests as _rt
+
+        monkeypatch.setattr(_rt, "_test_concurrency_slot", lambda: contextlib.nullcontext())
+
+    def _mutating_repo(self, tmp_path: Path, name: str = "victim") -> Path:
+        repo = _init_guard_repo(tmp_path, name)
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": ["bash mutate.sh"]}), encoding="utf-8"
+        )
+        (repo / "mutate.sh").write_text(
+            "#!/bin/sh\ngit branch intruder\n", encoding="utf-8"
+        )
+        (repo / "mutate.sh").chmod(0o755)
+        return repo
+
+    def test_owns_checkout_and_detects_mutation(self, tmp_path, monkeypatch):
+        """Marker unset → own the checkout: mutation detected, marker cleared."""
+        repo = self._mutating_repo(tmp_path)
+        monkeypatch.delenv(MARKER_ENV, raising=False)
+        self._isolate_pacer(monkeypatch)
+
+        result = guarded_run_all(cwd=repo, use_cache=False)
+
+        assert result["success"] is False
+        assert "live_repo_mutation" in result
+        assert "intruder" in result["live_repo_mutation"]
+        assert MARKER_ENV not in os.environ
+
+    def test_clean_run_reports_no_mutation(self, tmp_path, monkeypatch):
+        """Marker unset, clean suite → success with no mutation key."""
+        repo = _init_guard_repo(tmp_path, "clean")
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": ["bash noop.sh"]}), encoding="utf-8"
+        )
+        (repo / "noop.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repo / "noop.sh").chmod(0o755)
+        monkeypatch.delenv(MARKER_ENV, raising=False)
+        self._isolate_pacer(monkeypatch)
+
+        result = guarded_run_all(cwd=repo, use_cache=False)
+
+        assert result["success"] is True
+        assert "live_repo_mutation" not in result
+        assert MARKER_ENV not in os.environ
+
+    def test_stands_down_when_marker_preset(self, tmp_path, monkeypatch):
+        """Marker preset → an outer guard owns; do not detect or clear."""
+        repo = self._mutating_repo(tmp_path, "nested")
+        monkeypatch.setenv(MARKER_ENV, "1")
+        self._isolate_pacer(monkeypatch)
+
+        result = guarded_run_all(cwd=repo, use_cache=False)
+
+        # The nested call must NOT double-report the mutation...
+        assert "live_repo_mutation" not in result
+        # ...and must not clear the outer guard's marker.
+        assert os.environ.get(MARKER_ENV) == "1"
+
+    def test_marker_set_during_owned_run(self, tmp_path, monkeypatch):
+        """Marker unset → set for the duration of run_all (inner guard down)."""
+        repo = _init_guard_repo(tmp_path, "owned")
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": ["bash probe.sh"]}), encoding="utf-8"
+        )
+        # Probe writes the marker value it observes to a file OUTSIDE the repo
+        # (writing inside the checkout would itself be a mutation), proving the
+        # marker is exported to the suite subprocess (so the inner conftest
+        # guard stands down) while the outer guard owns the checkout.
+        probe_out = tmp_path / "marker_seen.txt"
+        (repo / "probe.sh").write_text(
+            f'#!/bin/sh\nprintf "%s" "$LIVE_REPO_GUARD_ACTIVE" > "{probe_out}"\n',
+            encoding="utf-8",
+        )
+        (repo / "probe.sh").chmod(0o755)
+        monkeypatch.delenv(MARKER_ENV, raising=False)
+        self._isolate_pacer(monkeypatch)
+
+        result = guarded_run_all(cwd=repo, use_cache=False)
+
+        assert result["success"] is True
+        assert probe_out.read_text(encoding="utf-8") == "1"
+        assert MARKER_ENV not in os.environ
 
 
 # ---------------------------------------------------------------------------

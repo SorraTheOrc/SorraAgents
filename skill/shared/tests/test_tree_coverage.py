@@ -77,6 +77,9 @@ class _FakeWlRunner:
         # Determine command type and build key
         if "--children" in cmd:
             key = f"show:{target_id}:children"
+        elif "--parent" in cmd:
+            # Direct-children query used by the production helper.
+            key = f"show:{target_id}:children"
         elif "dep" in cmd and "list" in cmd:
             key = f"dep:list:{target_id}"
         elif "show" in cmd:
@@ -233,6 +236,48 @@ class TestOrderByDependencies:
         ]
         ordered = order_by_dependencies(children, "SA-01", runner=runner)
         assert [c["id"] for c in ordered] == ["SA-02", "SA-01"]
+
+    def test_child_outbound_edges_order_children(self):
+        """Real ``wl dep list`` outbound edges on children are respected.
+
+        The real worklog shape carries child-to-child edges on the child
+        (``outbound``), not the parent, so ordering must read each child.
+        """
+
+        def runner(cmd):
+            if "dep" in cmd and "list" in cmd:
+                target = next(c for c in cmd if c.startswith("SA-"))
+                if target == "SA-02":
+                    return _FakeResult(
+                        json.dumps(
+                            {
+                                "success": True,
+                                "item": "SA-02",
+                                "inbound": [],
+                                "outbound": [
+                                    {"id": "SA-01", "direction": "depends-on"}
+                                ],
+                            }
+                        )
+                    )
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "item": target,
+                            "inbound": [],
+                            "outbound": [],
+                        }
+                    )
+                )
+            return _FakeResult("{}", returncode=1)
+
+        children = [
+            {"id": "SA-02", "title": "Depends"},
+            {"id": "SA-01", "title": "Prerequisite"},
+        ]
+        ordered = order_by_dependencies(children, "SA-99", runner=runner)
+        assert [c["id"] for c in ordered] == ["SA-01", "SA-02"]
 
 
 # =========================================================================
@@ -490,7 +535,7 @@ class TestRunCoverageReview:
         """When parent ACs are not covered and cannot be auto-closed,
         recommendation is stop."""
         def _custom_runner(cmd):
-            if "--children" in cmd:
+            if "--parent" in cmd:
                 return _FakeResult(
                     json.dumps({
                         "success": True,
@@ -529,10 +574,64 @@ class TestRunCoverageReview:
         assert result["recommendation"] == "stop"
         assert len(result["unresolvable_conflicts"]) >= 1
 
+    def test_partial_match_auto_closes(self):
+        """An uncovered AC with a clear partial mapping is auto-closeable.
+
+        ``compute_coverage`` leaves the AC uncovered (best match below 0.4) but
+        ``resolve_coverage_gaps`` accepts it at the auto-close floor (0.2), so
+        the recommendation is ``auto_close`` rather than ``stop``.
+        """
+
+        def _custom_runner(cmd):
+            if "--parent" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "children": [{"id": "SA-02", "title": "Child"}],
+                        }
+                    )
+                )
+            if "SA-01" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {
+                                "description": (
+                                    "## Acceptance Criteria\n"
+                                    "- Support user authentication via OAuth "
+                                    "login\n"
+                                ),
+                            },
+                        }
+                    )
+                )
+            if "SA-02" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {
+                                "description": (
+                                    "## Acceptance Criteria\n"
+                                    "- OAuth support\n"
+                                ),
+                            },
+                        }
+                    )
+                )
+            return _FakeResult("{}")
+
+        result = run_coverage_review("SA-01", runner=_custom_runner)
+        assert result["recommendation"] == "auto_close"
+        assert result["resolved_gaps"]
+        assert result["unresolvable_conflicts"] == []
+
     def test_child_summary_includes_ac_count(self):
         """Child summary lists each child's AC count."""
         def _custom_runner(cmd):
-            if "--children" in cmd:
+            if "--parent" in cmd:
                 return _FakeResult(
                     json.dumps({
                         "success": True,

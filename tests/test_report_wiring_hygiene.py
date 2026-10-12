@@ -63,7 +63,10 @@ WORK_ITEM_SKILLS = [
     "triage",
 ]
 
-NON_WORK_ITEM_SKILLS = ["interview", "speak", "standup"]
+# test-churn (SA-0MV28WS5G004YNNS) only analyses a repository and writes
+# report artefacts — it never creates or updates work items, so it is a
+# non-work-item skill.
+NON_WORK_ITEM_SKILLS = ["interview", "speak", "standup", "test-churn"]
 
 FINAL_STEP_HEADER = "## Final step: standardized end-of-session report"
 INVOCATION = (

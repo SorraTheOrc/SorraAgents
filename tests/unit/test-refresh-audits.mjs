@@ -11,7 +11,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +20,6 @@ const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
 const MODULE_PATH = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'refresh-audits.js');
 const REMEDIATION_PATH = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js');
-const RUN_RELEASE_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'run-release.js');
 const RUN_RELEASE_PATH = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'run-release.js');
 
 const ITEM_BASE = (id, updatedAt) => ({
@@ -171,23 +170,36 @@ describe('refresh-audits: refreshAudits', () => {
 });
 
 describe('refresh-audits: run-release wiring', () => {
-  test('run-release.js imports and invokes runRefreshAuditsAction before the freeze', () => {
-    const content = readFileSync(RUN_RELEASE_SRC, 'utf-8');
-    assert.ok(
-      content.includes("from './refresh-audits.js'") && content.includes('runRefreshAuditsAction'),
-      'run-release.js should import runRefreshAuditsAction',
+  test('--refresh-audits is recognised and an unknown flag fails fast before the freeze', async () => {
+    const { parseReleaseArgs, runRelease } = await import(RUN_RELEASE_PATH);
+    assert.equal(
+      parseReleaseArgs(['--refresh-audits']).flags.refreshAudits,
+      true,
+      '--refresh-audits must be a recognised wrapper flag',
     );
-    const refreshIdx = content.indexOf("cliArgs.includes('--refresh-audits')");
-    const freezeIdx = content.indexOf('setCodeFreezeMarker(projectRoot)', refreshIdx);
-    assert.ok(refreshIdx >= 0, 'runRelease should branch on --refresh-audits');
-    assert.ok(
-      freezeIdx === -1 || freezeIdx > refreshIdx,
-      'the refresh branch must precede setCodeFreezeMarker',
-    );
-    assert.ok(
-      content.includes("'--refresh-audits'"),
-      '--refresh-audits must be a recognised wrapper-only flag',
-    );
+
+    // Strict argument parsing runs before the refresh branch and the Code
+    // Freeze marker: an unknown flag must not trigger a refresh nor freeze
+    // the project (SA-0MV0PZYMI004SUFR).
+    const cwd = mkdtempSync(join(tmpdir(), 'refresh-failfast-'));
+    const savedCwd = process.cwd();
+    try {
+      process.chdir(cwd);
+      const code = await runRelease(['--refresh-audits', '--nope']);
+      assert.notEqual(
+        code,
+        0,
+        'an unknown flag alongside --refresh-audits must exit non-zero',
+      );
+      assert.equal(
+        existsSync(join(cwd, '.worklog', 'code-freeze.json')),
+        false,
+        'an invalid invocation must not set the Code Freeze marker',
+      );
+    } finally {
+      process.chdir(savedCwd);
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test('pre-flight refresh does not set the Code Freeze marker', async () => {

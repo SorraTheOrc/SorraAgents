@@ -56,14 +56,12 @@ DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"
 DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 
 # Thresholds for the plan-approval gate (plan skill step 4)
-# If the work item's effort t-shirt size is in this set OR its risk level
-# is in the risk set, the plan skill asks the user to approve the proposed
-# feature plan (and explains why). Otherwise the plan proceeds straight to
-# the automated review stages without an approval pause.
-# "High or higher": wl risk levels are Low/Medium/High/Severe, so the risk
-# gate covers High AND Severe. Medium risk no longer triggers approval on
-# its own (SA-0MTGX1I00007DBLX).
-PLAN_APPROVAL_EFFORT: frozenset[str] = frozenset({"Medium", "Large", "Extra Large"})
+# Approval is requested ONLY when the work item is BOTH the largest
+# (effort t-shirt "Extra Large", the top of the scale) AND the highest risk
+# (High or Severe, the top of the wl risk scale) — an AND gate
+# (SA-0MUYG0HE6001YTEM). Every other effort/risk combination proceeds
+# straight to the automated review stages without an approval pause.
+PLAN_APPROVAL_EFFORT: frozenset[str] = frozenset({"Extra Large"})
 PLAN_APPROVAL_RISK: frozenset[str] = frozenset({"High", "Severe"})
 
 
@@ -352,9 +350,10 @@ def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
     """Decide whether the plan skill should ask the user to approve a feature plan.
 
     Returns ``(request_approval, reason)``:
-    - ``request_approval``: True when the work item's effort t-shirt size is
-      Medium/Large/Extra Large ("scale") OR its risk level is High or higher
-      (High/Severe). Medium risk alone does not trigger the gate.
+    - ``request_approval``: True only when the work item is BOTH the largest
+      (effort t-shirt "Extra Large", the top of the scale) AND the highest
+      risk (High/Severe, the top of the wl risk scale) — an AND gate. Every
+      other effort/risk combination proceeds without an approval pause.
     - ``reason``: a human-readable clause explaining what triggered the gate,
       used to tell the user why a human checkpoint is required. Empty string
       when approval is not needed.
@@ -378,13 +377,8 @@ def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
     if not risk:
         return True, f"its effort is {effort} and its risk is not set"
 
-    reasons: list[str] = []
-    if effort in PLAN_APPROVAL_EFFORT:
-        reasons.append(f"its effort is {effort} scale")
-    if risk in PLAN_APPROVAL_RISK:
-        reasons.append(f"its risk is {risk}")
-    if reasons:
-        return True, " and ".join(reasons)
+    if effort in PLAN_APPROVAL_EFFORT and risk in PLAN_APPROVAL_RISK:
+        return True, f"its effort is {effort} scale and its risk is {risk}"
     return False, ""
 
 

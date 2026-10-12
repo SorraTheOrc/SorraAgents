@@ -269,8 +269,10 @@ def render_approval_gate(
         "",
         render_proposed_actions(actions, ascii_only=ascii_only),
         "",
-        "> **Approval gate:** no destructive action is taken until the "
-        "operator explicitly approves it.",
+        (
+            "> **Approval gate:** no destructive action is taken until the "
+            "operator explicitly approves it."
+        ),
     ])
     return "\n".join(parts)
 

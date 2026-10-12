@@ -26,6 +26,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
+// Shared no-I/O notifier stub — never copy the real discord-notify.js into a
+// release harness (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL).
+import { writeStubDiscordNotify } from '../helpers/release-notify-stub.mjs';
+
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
 const RUN_RELEASE_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'run-release.js');
@@ -37,7 +41,6 @@ const REFRESH_AUDITS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'refresh-
 const CHECK_FINAL_VALIDATION_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-final-validation.js');
 const CHECK_CRITICAL_ITEMS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-critical-items.js');
 const CHECK_WORKLOG_REFS_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-worklog-refs.js');
-const DISCORD_NOTIFY_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'discord-notify.js');
 const TIMING_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'timing.js');
 const LLM_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'llm.js');
 
@@ -74,7 +77,9 @@ function runRunRelease(opts = {}) {
   writeFileSync(join(skillScriptDir, 'check-final-validation.js'), readFileSync(CHECK_FINAL_VALIDATION_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'check-critical-items.js'), readFileSync(CHECK_CRITICAL_ITEMS_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'check-worklog-refs.js'), readFileSync(CHECK_WORKLOG_REFS_SRC, 'utf8'));
-  writeFileSync(join(skillScriptDir, 'discord-notify.js'), readFileSync(DISCORD_NOTIFY_SRC, 'utf8'));
+  // Test isolation: substitute the recording stub for the real
+  // discord-notify.js so Step 8.5 can never reach a real Discord webhook.
+  writeStubDiscordNotify(skillScriptDir);
   writeFileSync(join(skillScriptDir, 'timing.js'), readFileSync(TIMING_SRC, 'utf8'));
   writeFileSync(join(skillScriptDir, 'llm.js'), readFileSync(LLM_SRC, 'utf8'));
 

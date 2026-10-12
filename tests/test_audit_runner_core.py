@@ -653,7 +653,7 @@ class TestDebugLogging:
         )
         monkeypatch.setattr(
             "audit.scripts.audit_runner._default_debug_log_path",
-            lambda issue_id, context: log_path,
+            lambda issue_id, context, project_root=None: log_path,
         )
 
         def fake_runner(cmd, **kwargs):
@@ -2771,7 +2771,7 @@ class TestRC2RCFallbackVerdict:
         )
         monkeypatch.setattr(
             "audit.scripts.audit_runner._default_debug_log_path",
-            lambda issue_id, context: log_path,
+            lambda issue_id, context, project_root=None: log_path,
         )
 
         parent_wi = _load_fixture("wi_with_numbered_ac.json")

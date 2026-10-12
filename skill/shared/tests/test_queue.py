@@ -486,6 +486,42 @@ def test_concurrent_enqueue_dequeue_multiprocessing():
 
 
 # ---------------------------------------------------------------------------
+# Re-entrancy (SA-0MUV4C6RZ006GN5Z AC4)
+# ---------------------------------------------------------------------------
+
+
+def test_nested_locked_is_reentrant_noop():
+    """Nested _locked() must not deadlock or release the outer lock.
+
+    A public operation acquires the lock, then _list_entries() acquires it
+    again; the inner acquisition is a no-op so the outer critical section
+    stays covered. Guard against a regression where the inner exit would
+    release the lock early.
+    """
+    pq = PriorityQueue("unit-reentrant", max_depth=10, timeout=5.0)
+    with pq._locked():
+        assert pq._lock_fd is not None
+        with pq._locked():
+            assert pq._lock_fd is not None
+            pq._list_entries()  # nested public read is also a no-op
+        # Inner exit must NOT have released the outer lock.
+        assert pq._lock_fd is not None
+    assert pq._lock_fd is None
+
+
+def test_acquire_lock_when_already_held_is_noop():
+    """_acquire_lock() when already held must not open/lock a second fd."""
+    pq = PriorityQueue("unit-reentrant-direct", max_depth=10, timeout=5.0)
+    pq._acquire_lock()
+    first_fd = pq._lock_fd
+    try:
+        pq._acquire_lock()  # re-entrant: must be a no-op
+        assert pq._lock_fd == first_fd
+    finally:
+        pq.close()
+
+
+# ---------------------------------------------------------------------------
 # Empty queue name handling
 # ---------------------------------------------------------------------------
 

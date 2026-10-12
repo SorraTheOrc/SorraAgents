@@ -1,18 +1,16 @@
 """Tests for the plan-approval gate helpers in skill/plan/plan_helpers.py.
 
 The plan skill's step 4 asks the user to approve a proposed feature plan.
-Approval is requested only when the work item's effort t-shirt size is
-Medium/Large/Extra Large ("scale") OR its risk level is High or higher
-(High/Severe). Medium risk no longer triggers the gate on its own
-(SA-0MTGX1I00007DBLX). When effort is Extra Small/Small AND risk is
-Low/Medium, the plan proceeds directly to the automated review stages
-without an approval pause.
+Approval is requested only when the work item is BOTH the largest (effort
+t-shirt "Extra Large") AND the highest risk (High/Severe) — an AND gate.
+Every other effort/risk combination proceeds directly to the automated
+review stages without an approval pause (SA-0MUYG0HE6001YTEM).
 
 Missing effort/risk values default conservatively to requesting approval
 (mirroring ``resolve_complexity_tier``'s Medium default) so a human
 checkpoint is never silently skipped.
 
-Related work item: SA-0MSHID94D009P0TL
+Related work items: SA-0MSHID94D009P0TL, SA-0MUYG0HE6001YTEM
 """
 
 
@@ -39,46 +37,72 @@ from skill.plan.plan_helpers import (
     should_request_plan_approval,
 )
 
+# Full t-shirt effort scale and wl risk scale used by the matrix tests.
+EFFORT_LEVELS = ["Extra Small", "Small", "Medium", "Large", "Extra Large"]
+RISK_LEVELS = ["Low", "Medium", "High", "Severe"]
+
 # =========================================================================
 # 1. should_request_plan_approval — pure decision logic
 # =========================================================================
 
 
 class TestShouldRequestPlanApproval:
-    """Verify the approval-gate decision across effort/risk combinations."""
+    """Verify the approval-gate decision across the full effort/risk matrix."""
 
-    @pytest.mark.parametrize(
-        "effort,risk",
-        [
-            ("Extra Small", "Low"),
-            ("Small", "Low"),
-        ],
-    )
-    def test_low_effort_low_risk_skips_approval(self, effort, risk):
-        """Extra Small/Small effort with Low risk proceeds without approval."""
-        request, reason = should_request_plan_approval({"effort": effort, "risk": risk})
+    def test_extra_large_and_high_requests_approval(self):
+        """Extra Large effort AND High risk is the gate trigger."""
+        request, reason = should_request_plan_approval(
+            {"effort": "Extra Large", "risk": "High"}
+        )
+        assert request is True
+        assert "Extra Large" in reason
+        assert "High" in reason
+
+    def test_extra_large_and_severe_requests_approval(self):
+        """Extra Large effort AND Severe risk also requests approval."""
+        request, reason = should_request_plan_approval(
+            {"effort": "Extra Large", "risk": "Severe"}
+        )
+        assert request is True
+        assert "Extra Large" in reason
+        assert "Severe" in reason
+
+    @pytest.mark.parametrize("risk", RISK_LEVELS)
+    @pytest.mark.parametrize("effort", EFFORT_LEVELS)
+    def test_full_effort_risk_matrix(self, effort, risk):
+        """Only Extra Large effort AND High/Severe risk triggers approval.
+
+        Full 5×4 matrix (effort × risk); every other combination proceeds
+        without an approval pause (SA-0MUYG0HE6001YTEM)."""
+        request, reason = should_request_plan_approval(
+            {"effort": effort, "risk": risk}
+        )
+        expected = effort == "Extra Large" and risk in {"High", "Severe"}
+        assert request is expected, f"effort={effort!r} risk={risk!r}"
+        if expected:
+            assert "Extra Large" in reason
+            assert risk in reason
+        else:
+            assert reason == ""
+
+    @pytest.mark.parametrize("risk", ["Low", "Medium"])
+    def test_extra_large_effort_alone_skips_approval(self, risk):
+        """Extra Large effort with Low/Medium risk is no longer enough."""
+        request, reason = should_request_plan_approval(
+            {"effort": "Extra Large", "risk": risk}
+        )
         assert request is False
         assert reason == ""
 
-    @pytest.mark.parametrize(
-        "effort",
-        ["Medium", "Large", "Extra Large"],
-    )
-    def test_medium_or_higher_effort_requests_approval(self, effort):
-        """Medium/Large/Extra Large effort requests approval even with Low risk."""
-        request, reason = should_request_plan_approval({"effort": effort, "risk": "Low"})
-        assert request is True
-        assert effort in reason
-
     @pytest.mark.parametrize("risk", ["High", "Severe"])
-    def test_high_or_higher_risk_requests_approval(self, risk):
-        """High or higher risk (High/Severe) requests approval even with
-        Extra Small effort."""
+    @pytest.mark.parametrize("effort", ["Extra Small", "Small", "Medium", "Large"])
+    def test_high_risk_alone_skips_approval(self, effort, risk):
+        """High/Severe risk with less than Extra Large effort is not enough."""
         request, reason = should_request_plan_approval(
-            {"effort": "Extra Small", "risk": risk}
+            {"effort": effort, "risk": risk}
         )
-        assert request is True
-        assert risk in reason
+        assert request is False, f"effort={effort!r} risk={risk!r}"
+        assert reason == ""
 
     def test_medium_risk_alone_no_longer_triggers_approval(self):
         """Medium risk no longer triggers the gate by itself
@@ -89,15 +113,6 @@ class TestShouldRequestPlanApproval:
         )
         assert request is False
         assert reason == ""
-
-    def test_high_effort_and_high_risk_lists_both_reasons(self):
-        """The reason names both the scale and the risk that triggered the gate."""
-        request, reason = should_request_plan_approval(
-            {"effort": "Large", "risk": "High"}
-        )
-        assert request is True
-        assert "Large" in reason
-        assert "High" in reason
 
     @pytest.mark.parametrize(
         "item",
@@ -160,30 +175,31 @@ class TestPlanApprovalGate:
         assert result["request_approval"] is False
         assert result["reason"] == ""
 
-    def test_approval_when_effort_scale_is_high(self):
-        """Large + Low risk yields request_approval=True with scale in reason."""
-        runner = _FakeWlShow({"id": "X", "effort": "Large", "risk": "Low"})
+    def test_approval_when_extra_large_and_high_risk(self):
+        """Extra Large + High risk yields request_approval=True naming both."""
+        runner = _FakeWlShow({"id": "X", "effort": "Extra Large", "risk": "High"})
         result = plan_approval_gate("X", runner=runner)
         assert result["request_approval"] is True
-        assert "Large" in result["reason"]
-
-    def test_approval_when_risk_is_high(self):
-        """Extra Small + High risk yields request_approval=True with risk in reason."""
-        runner = _FakeWlShow({"id": "X", "effort": "Extra Small", "risk": "High"})
-        result = plan_approval_gate("X", runner=runner)
-        assert result["request_approval"] is True
+        assert "Extra Large" in result["reason"]
         assert "High" in result["reason"]
 
-    def test_approval_when_risk_is_severe(self):
-        """Extra Small + Severe risk (higher than High) still requests approval."""
-        runner = _FakeWlShow({"id": "X", "effort": "Extra Small", "risk": "Severe"})
+    def test_approval_when_extra_large_and_severe_risk(self):
+        """Extra Large + Severe risk (higher than High) requests approval."""
+        runner = _FakeWlShow({"id": "X", "effort": "Extra Large", "risk": "Severe"})
         result = plan_approval_gate("X", runner=runner)
         assert result["request_approval"] is True
         assert "Severe" in result["reason"]
 
-    def test_skip_when_small_and_medium_risk(self):
-        """Extra Small + Medium risk no longer requests approval on its own."""
-        runner = _FakeWlShow({"id": "X", "effort": "Extra Small", "risk": "Medium"})
+    def test_skip_when_extra_large_but_low_risk(self):
+        """Extra Large effort with Low risk no longer requests approval."""
+        runner = _FakeWlShow({"id": "X", "effort": "Extra Large", "risk": "Low"})
+        result = plan_approval_gate("X", runner=runner)
+        assert result["request_approval"] is False
+        assert result["reason"] == ""
+
+    def test_skip_when_high_risk_but_small_effort(self):
+        """High risk with Small effort no longer requests approval."""
+        runner = _FakeWlShow({"id": "X", "effort": "Small", "risk": "High"})
         result = plan_approval_gate("X", runner=runner)
         assert result["request_approval"] is False
         assert result["reason"] == ""
@@ -408,11 +424,11 @@ class TestPlanApprovalReclaimInvariant:
         """A failing reclaim (show error) does not abort the gate — it proceeds."""
         runner = _SequenceRunner([
             _FakeResult("{}", returncode=1, stderr="wl show failed"),
-            _FakeResult(_show_payload({"id": "X", "effort": "Large", "risk": "Low"})),
+            _FakeResult(_show_payload({"id": "X", "effort": "Extra Large", "risk": "High"})),
         ])
         result = plan_approval_gate("X", runner=runner, reclaim_if_open=True)
         assert result["request_approval"] is True
-        assert "Large" in result["reason"]
+        assert "Extra Large" in result["reason"]
 
     def test_continuous_in_progress_from_approval_through_gate(self):
         """End-to-end: open at approval → reclaim → gate + subsequent require_claimed."""
@@ -442,11 +458,14 @@ class TestPlanApprovalReclaimInvariant:
         for effort, risk, expected in [
             ("Extra Small", "Low", False),
             ("Extra Small", "Medium", False),
-            ("Large", "Low", True),
-            ("Extra Small", "High", True),
-            ("Extra Small", "Severe", True),
+            ("Extra Large", "Low", False),
+            ("Extra Large", "Medium", False),
+            ("Medium", "Severe", False),
+            ("Large", "High", False),
+            ("Extra Large", "High", True),
+            ("Extra Large", "Severe", True),
         ]:
             runner = _FakeWlShow({"id": "X", "effort": effort, "risk": risk})
             result = plan_approval_gate("X", runner=runner)
-            assert result["request_approval"] is expected
+            assert result["request_approval"] is expected, (effort, risk)
 

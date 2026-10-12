@@ -77,6 +77,11 @@ from import_guard import guard_shared_import
 
 try:
     from shared.code_freeze import is_code_freeze_active
+    from shared.skill_extensions import (
+        SkillExtension,
+        SkillExtensionError,
+        load_extension,
+    )
     from shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
     from shared.timing import Timer
 except ModuleNotFoundError as _missing_shared:
@@ -98,11 +103,15 @@ try:
     from test.scripts.run_tests import (
         full_suite_commands as _full_suite_commands,
     )
+    from test.scripts.run_tests import (
+        guarded_run_all as _guarded_run_all,
+    )
     from test.scripts.run_tests import paced_runner as _test_paced_runner
 except ModuleNotFoundError:
     _changed_scope_commands = None  # type: ignore[assignment]
     _extension_suite_commands = None  # type: ignore[assignment]
     _full_suite_commands = None  # type: ignore[assignment]
+    _guarded_run_all = None  # type: ignore[assignment]
     _test_paced_runner = None  # type: ignore[assignment]
 
     class _TestConcurrencyTimeout(RuntimeError):  # type: ignore[no-redef]
@@ -945,14 +954,100 @@ def git_status(cwd: str | None = None) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def git_has_dirty_files(status_output: str | None = None) -> bool:
+IMPLEMENT_SKILL_NAME = "implement"
+#: ``extension.json`` key holding the project's expected-dirty path prefixes.
+EXPECTED_DIRTY_KEY = "ignoreDirtyPaths"
+
+
+def load_implement_extension(
+    project_root: str | Path | None = None,
+) -> SkillExtension | None:
+    """Load the project-local ``implement`` skill extension.
+
+    Discovery follows the shared convention
+    (``<project_root>/.pi/skills_extensions/implement/``, contract
+    SA-0MSQ7MQEJ0064ZB0): the project root defaults to the invoking git root,
+    falling back to the cwd. Absence is a no-op and returns ``None``; a
+    present-but-malformed ``extension.json`` raises
+    :class:`SkillExtensionError` (the loader's loud-failure contract).
+    """
+    extension = load_extension(IMPLEMENT_SKILL_NAME, project_root)
+    return extension if extension.present else None
+
+
+def _parse_expected_dirty(extension: SkillExtension | None) -> tuple[str, ...]:
+    """Parse the expected-dirty declaration from a loaded extension.
+
+    The declaration is a list of repository-relative path prefixes under the
+    ``ignoreDirtyPaths`` key. A trailing ``/`` is ignored so ``.llm-wiki/`` and
+    ``.llm-wiki`` are equivalent. A non-string or empty entry is a project
+    configuration error and raises :class:`SkillExtensionError` naming the
+    file — a malformed declaration must never silently change the dirty-tree
+    gate.
+    """
+    if extension is None:
+        return ()
+    raw = extension.data.get(EXPECTED_DIRTY_KEY)
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        entries: list[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        entries = list(raw)
+    else:
+        raise SkillExtensionError(
+            f"Invalid '{EXPECTED_DIRTY_KEY}' in {extension.data_path}: "
+            "expected a string or a list of strings."
+        )
+    paths: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            raise SkillExtensionError(
+                f"Invalid '{EXPECTED_DIRTY_KEY}' entry {entry!r} in "
+                f"{extension.data_path}: every entry must be a non-empty string."
+            )
+        paths.append(entry.strip())
+    return tuple(paths)
+
+
+def expected_dirty_paths(
+    project_root: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Return the project-declared expected-dirty path prefixes.
+
+    Loads (and validates) the implement extension for *project_root*. Returns
+    an empty tuple when no extension — or no ``ignoreDirtyPaths`` declaration —
+    is present, so an absent extension is a no-op.
+    """
+    return _parse_expected_dirty(load_implement_extension(project_root))
+
+
+def _path_is_expected_dirty(file_path: str, expected_dirty: tuple[str, ...]) -> bool:
+    """True when *file_path* matches a declared expected-dirty prefix."""
+    for prefix in expected_dirty:
+        normalised = prefix.rstrip("/")
+        if not normalised:
+            continue
+        if file_path == normalised or file_path.startswith(normalised + "/"):
+            return True
+    return False
+
+
+def git_has_dirty_files(
+    status_output: str | None = None,
+    expected_dirty: tuple[str, ...] = (),
+) -> bool:
     """Check if there are uncommitted changes outside .worklog/.
 
     Args:
         status_output: Optional pre-fetched git status output.
+        expected_dirty: Project-declared path prefixes that are expected to be
+            dirty and therefore do not count (e.g. ``.llm-wiki/``). Empty by
+            default, so callers that do not opt in keep the original
+            behaviour byte-for-byte.
 
     Returns:
-        True if any non-.worklog files are dirty.
+        True if any non-.worklog, non-expected-dirty file is dirty.
     """
     if status_output is None:
         status_output = git_status()
@@ -964,12 +1059,261 @@ def git_has_dirty_files(status_output: str | None = None) -> bool:
         file_path = line[3:].strip() if len(line) > 3 else ""
         if file_path.startswith(".worklog/"):
             continue
+        # Skip project-declared expected-dirty paths (never a hard-fail).
+        if _path_is_expected_dirty(file_path, expected_dirty):
+            continue
         if line.strip():
             return True
     return False
 
 
-def _main_checkout_offending_paths(repo_root: str) -> list[str]:
+# ---------------------------------------------------------------------------
+# Dirty-tree relevance helpers (SA-0MV0NSOGE000OSMR)
+# ---------------------------------------------------------------------------
+
+
+def dirty_paths_from_status(
+    status_output: str,
+    expected_dirty: tuple[str, ...] = (),
+) -> list[str]:
+    """Return the dirty paths from porcelain status, excluding ``.worklog/``.
+
+    Mirrors the filtering used by :func:`git_has_dirty_files` so the paths
+    reported to the operator are exactly the ones that caused the gate to
+    trip. Renames are reduced to their destination path and project-declared
+    expected-dirty prefixes are ignored.
+    """
+    paths: list[str] = []
+    for line in status_output.splitlines():
+        if line.startswith("##") or not line.strip():
+            continue
+        file_path = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in file_path:
+            file_path = file_path.split(" -> ", 1)[1].strip()
+        if not file_path or file_path.startswith(".worklog/"):
+            continue
+        if _path_is_expected_dirty(file_path, expected_dirty):
+            continue
+        paths.append(file_path)
+    return paths
+
+
+# Matches ``## Key Files``, ``## Key Files (predicted)`` and the plan
+# helper's ``**Key Files:**`` form (SA-0MV0NSOGE000OSMR).
+_KEY_FILES_HEADING_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*Key Files.*|\*\*Key Files:?\*\*.*)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def extract_key_files_from_description(description: str) -> list[str]:
+    """Extract file paths from a work item description's Key Files section.
+
+    Handles the heading variants seen across real work items — ``## Key
+    Files``, ``## Key Files (predicted)`` and the plan helper's
+    ``**Key Files:**`` form. Returns an empty list when no Key Files section
+    is present; callers treat that as "relevance cannot be judged" and stay
+    conservative (SA-0MV0NSOGE000OSMR).
+    """
+    if not description:
+        return []
+    match = _KEY_FILES_HEADING_RE.search(description)
+    if not match:
+        return []
+    files: list[str] = []
+    for line in description[match.end():].splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # A further markdown heading, or a standalone bold section marker,
+        # ends the Key Files list.
+        if re.match(r"^#{1,6}\s", stripped) or (
+            stripped.startswith("**") and not stripped.startswith("- ")
+        ):
+            break
+        backtick = re.search(r"`([^`]+)`", stripped)
+        if backtick:
+            candidate = backtick.group(1).strip()
+        else:
+            bullet = re.match(r"^[-*]\s+(\S+)", stripped)
+            candidate = bullet.group(1) if bullet else ""
+        if candidate:
+            files.append(candidate)
+    return files
+
+
+def dirty_file_matches_key_files(dirty_path: str, key_files: list[str]) -> bool:
+    """True when *dirty_path* plausibly overlaps one of *key_files*.
+
+    Matching is deliberately generous (errs toward *relevant*, which keeps
+    the conservative abort) — equality, directory-prefix containment in
+    either direction, or a matching basename. This is agent-discretion
+    encoded as a simple, deterministic overlap check; it is not a whitelist
+    (SA-0MV0NSOGE000OSMR).
+    """
+    dirty = dirty_path.strip().lstrip("./")
+    if not dirty:
+        return False
+    dirty_base = os.path.basename(dirty.rstrip("/"))
+    for key in key_files:
+        candidate = key.strip().lstrip("./")
+        if not candidate:
+            continue
+        if dirty == candidate:
+            return True
+        if dirty.startswith(candidate.rstrip("/") + "/"):
+            return True
+        if candidate.startswith(dirty.rstrip("/") + "/"):
+            return True
+        if dirty_base and os.path.basename(candidate.rstrip("/")) == dirty_base:
+            return True
+    return False
+
+
+def classify_dirty_tree_relevance(
+    status_output: str,
+    description: str,
+    expected_dirty: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Decide whether a dirty main checkout can be safely left behind.
+
+    The start phase may proceed past the dirty-tree safety gate only when the
+    work item's description exposes a Key Files section *and* none of the
+    dirty files overlap those paths. When there is no Key Files section the
+    relevance of the dirty files cannot be judged, so the caller keeps the
+    conservative abort-and-ask behaviour (SA-0MV0NSOGE000OSMR).
+
+    Returns a dict with keys:
+        ``dirty`` (bool), ``dirty_files`` (list), ``key_files`` (list),
+        ``relevant_files`` (list), ``can_proceed`` (bool) and ``reason``
+        (human-readable explanation).
+    """
+    dirty_files = dirty_paths_from_status(status_output, expected_dirty)
+    key_files = extract_key_files_from_description(description)
+    relevant = [
+        path for path in dirty_files
+        if dirty_file_matches_key_files(path, key_files)
+    ]
+
+    if not dirty_files:
+        return {
+            "dirty": False,
+            "dirty_files": [],
+            "key_files": key_files,
+            "relevant_files": [],
+            "can_proceed": True,
+            "reason": "clean working tree",
+        }
+    if not key_files:
+        return {
+            "dirty": True,
+            "dirty_files": dirty_files,
+            "key_files": [],
+            "relevant_files": [],
+            "can_proceed": False,
+            "reason": (
+                "no Key Files section in the work item description — "
+                "cannot judge dirty-file relevance"
+            ),
+        }
+    if relevant:
+        return {
+            "dirty": True,
+            "dirty_files": dirty_files,
+            "key_files": key_files,
+            "relevant_files": relevant,
+            "can_proceed": False,
+            "reason": (
+                "dirty file(s) overlap the work item's Key Files: "
+                + ", ".join(relevant)
+            ),
+        }
+    return {
+        "dirty": True,
+        "dirty_files": dirty_files,
+        "key_files": key_files,
+        "relevant_files": [],
+        "can_proceed": True,
+        "reason": (
+            "dirty files do not overlap the work item's Key Files — "
+            "left untouched in the main checkout"
+        ),
+    }
+
+
+def _current_checkout_is_linked_worktree(cwd: str | None = None) -> bool:
+    """True when the current working tree is a linked git worktree.
+
+    A linked worktree has ``.git`` as a file (a gitdir pointer) rather than a
+    directory. The dirty-tree safety gate protects the *main checkout* — the
+    dirty files it leaves behind when forking a worktree — so it is skipped
+    when ``phase_start`` is invoked from inside a worktree (e.g. resuming a
+    driven child), where any dirty files are the agent's own in-progress work
+    (SA-0MV0NSOGE000OSMR).
+    """
+    result = run_cmd(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    return _is_worktree(Path(result.stdout.strip()))
+
+
+def _surface_extension_prose(
+    extension: SkillExtension | None,
+    which: str,
+    json_output: bool,
+    report: dict[str, Any],
+) -> str | None:
+    """Surface a project-local prose hook and record it in the report.
+
+    Called with ``which="prefix"`` before the skill's first actionable step
+    and ``which="postfix"`` after its final step. Returns the prose text (or
+    ``None`` when absent) and prints a delimited human-readable block when not
+    emitting JSON. The JSON report always carries the text so a driving agent
+    can consume it either way.
+    """
+    if extension is None:
+        return None
+    text = extension.prefix if which == "prefix" else extension.postfix
+    if not text:
+        return None
+    report.setdefault("extension", {})[f"{which}_prose"] = text
+    if not json_output:
+        print()
+        print("=" * 60)
+        print(f"  Project extension ({which})")
+        print("=" * 60)
+        print(text.rstrip("\n"))
+        print("=" * 60)
+        print()
+    return text
+
+
+def _surface_postfix_prose(
+    project_root: str | Path | None,
+    json_output: bool,
+    report: dict[str, Any],
+) -> str | None:
+    """Load the extension and surface its postfix hook (best-effort).
+
+    A malformed extension is logged and never fails an already-successful
+    finish.
+    """
+    try:
+        extension = load_implement_extension(project_root)
+    except SkillExtensionError as exc:  # pragma: no cover - defensive
+        LOG.warning("Could not load implement extension for postfix prose: %s", exc)
+        return None
+    return _surface_extension_prose(extension, "postfix", json_output, report)
+
+
+def _main_checkout_offending_paths(
+    repo_root: str, expected_dirty: tuple[str, ...] = ()
+) -> list[str]:
     """Return the non-``.worklog/`` dirty paths in a checkout.
 
     Used by the implementation-placement gates to name the offending files
@@ -977,10 +1321,12 @@ def _main_checkout_offending_paths(repo_root: str) -> list[str]:
 
     Args:
         repo_root: Absolute path to the main checkout root.
+        expected_dirty: Project-declared path prefixes to exclude.
 
     Returns:
         Sorted, de-duplicated list of paths (relative to *repo_root*) that are
-        dirty outside ``.worklog/``. Empty when the checkout is clean.
+        dirty outside ``.worklog/`` and not expected-dirty. Empty when the
+        checkout is clean or only expected-dirty paths are modified.
     """
     status_output = git_status(cwd=repo_root)
     paths: list[str] = []
@@ -993,6 +1339,8 @@ def _main_checkout_offending_paths(repo_root: str) -> list[str]:
         if " -> " in file_path:
             file_path = file_path.split(" -> ", 1)[1].strip()
         if not file_path or file_path.startswith(".worklog/"):
+            continue
+        if _path_is_expected_dirty(file_path, expected_dirty):
             continue
         paths.append(file_path)
     return sorted(set(paths))
@@ -1065,6 +1413,27 @@ class PushTimeoutError(RuntimeError):
             f"Push to dev timed out after {timeout}s. "
             f"Commit {commit_hash} on branch {branch} is local. "
             f"Push manually: git push origin {branch}:refs/heads/dev"
+        )
+
+
+class PushNonFastForwardError(RuntimeError):
+    """Raised when a push fails due to non-fast-forward (dev advanced concurrently).
+
+    Carries commit_hash, branch, and remote stderr so the caller can rebase
+    the feature branch onto origin/dev and retry the push.
+    """
+
+    def __init__(
+        self, commit_hash: str, branch: str, stderr: str, rebase_cmd: str,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.stderr = stderr
+        self.rebase_cmd = rebase_cmd
+        super().__init__(
+            f"Push to dev failed (non-fast-forward): {stderr}. "
+            f"Commit {commit_hash} on branch {branch}. "
+            f"Retry: {rebase_cmd}"
         )
 
 
@@ -1141,13 +1510,23 @@ def git_push_to_dev(
                 commit_hash or "unknown", branch, timeout,
             ) from None
         if proc.returncode != 0:
-            LOG.error(
-                "git push to dev failed: %s", stderr.decode(errors="replace").strip(),
-            )
+            stderr_str = stderr.decode(errors="replace").strip()
+            # Detect non-fast-forward errors (dev advanced concurrently).
+            # AC1/AC2: raise a recoverable exception so the caller can rebase
+            # and retry instead of failing with information loss.
+            if "non-fast-forward" in stderr_str.lower():
+                rebase_cmd = (
+                    f"git rebase origin/dev && git push origin "
+                    f"{branch}:refs/heads/dev"
+                )
+                raise PushNonFastForwardError(
+                    commit_hash or "unknown", branch, stderr_str, rebase_cmd,
+                )
+            LOG.error("git push to dev failed: %s", stderr_str)
             return False
         return True
     except Exception as exc:
-        if isinstance(exc, PushTimeoutError):
+        if isinstance(exc, (PushTimeoutError, PushNonFastForwardError)):
             raise
         LOG.error("git push to dev error: %s", exc)
         return False
@@ -2233,6 +2612,103 @@ def _run_cached_paced(command: str, **kwargs: Any) -> dict[str, Any]:
         }
 
 
+def _guarded_exit_code(guarded: dict[str, Any]) -> int:
+    """Extract the aggregate exit code from a ``guarded_run_all`` result.
+
+    ``run_all`` aggregates per-suite results but does not expose a top-level
+    ``returncode``; the first non-zero suite returncode is the run's exit
+    code (0 when every suite passed). Falls back to ``success`` when no
+    per-suite returncode is available.
+    """
+    suites = guarded.get("suites") or {}
+    if isinstance(suites, dict):
+        for result in suites.values():
+            if not isinstance(result, dict):
+                continue
+            returncode = result.get("returncode")
+            if returncode:
+                return int(returncode)
+    return 0 if guarded.get("success") else 1
+
+
+def _adapt_guarded_result(
+    guarded: dict[str, Any], tooling: str | None, scope: str
+) -> dict[str, Any]:
+    """Adapt a ``guarded_run_all`` result to implement.py's result contract.
+
+    ``run_all`` reports structured failure dicts and an aggregate
+    ``success``; implement.py's finish loop expects a flat ``failures`` list
+    of strings, an ``exit_code``, ``skipped`` and ``tooling``. The
+    ``live_repo_mutation`` key (set by the canonical outer guard) is carried
+    through so a mutated checkout always fails the gate.
+    """
+    failures: list[str] = []
+    for failure in guarded.get("failures", []):
+        if isinstance(failure, dict):
+            failures.append(str(failure.get("test_name") or failure))
+        else:
+            failures.append(str(failure))
+    exit_code = _guarded_exit_code(guarded)
+    result: dict[str, Any] = {
+        "success": bool(guarded.get("success")) and exit_code == 0,
+        "stdout": "",
+        "stderr": "",
+        "exit_code": exit_code,
+        "failures": failures,
+        "skipped": False,
+        "tooling": tooling,
+        "scope": guarded.get("scope", scope),
+    }
+    mutation = guarded.get("live_repo_mutation")
+    if mutation:
+        result["live_repo_mutation"] = mutation
+        result["success"] = False
+    return result
+
+
+def _run_guarded_suite(
+    commands: list[str],
+    cwd: str,
+    scope: str,
+    base_ref: str | None,
+    tooling: str | None,
+) -> dict[str, Any]:
+    """Execute *commands* through the canonical guard-owning runner.
+
+    Delegates to ``run_tests.guarded_run_all`` (the single source of truth
+    for live-repo guard ownership, SA-0MUH1MJL6003767Q) so implement.py's
+    finish gate is guarded by the same outer snapshot guard as the test
+    skill's CLI — even when ``LIVE_REPO_GUARD_ACTIVE`` is already set in the
+    environment (a nested run): ``guarded_run_all`` then stands down because
+    the outer guard already owns the checkout.
+
+    When the test skill is unavailable (partial install), or the delegation
+    raises, falls back to the direct ``_run_commands_direct`` path (the
+    inner conftest guard remains armed), preserving graceful degradation.
+    """
+    if _guarded_run_all is None or _full_suite_commands is None:
+        # Partial install, or the legacy convention path: only the inner
+        # conftest guard is armed, so run directly (no delegation).
+        return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+    try:
+        guarded = _guarded_run_all(
+            cwd=Path(cwd),
+            timeout=_resolve_test_timeout(cwd),
+            commands=commands,
+            scope=scope,
+            base_ref=base_ref or "origin/dev",
+            use_cache=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade to the direct path
+        LOG.warning(
+            "Implement run_tests: guarded_run_all failed (%s) — falling "
+            "back to the direct cached runner (inner guard only).",
+            exc,
+        )
+        return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+    return _adapt_guarded_result(guarded, tooling=tooling, scope=scope)
+
+
 def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
     """Run only the tests affected by the worktree's changes vs *base_ref*.
 
@@ -2264,14 +2740,12 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     pytest_cmds = [c for c in commands if c.startswith("pytest")]
     if not pytest_cmds:
         return None
-    run = _run_cached_paced(
-        pytest_cmds[0],
-        cwd=cwd,
-        timeout=_resolve_test_timeout(cwd),
-        runner=lambda command, cwd_, timeout_: run_cmd(
-            shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
-        ),
+    run = _run_guarded_suite(
+        [pytest_cmds[0]],
+        cwd,
         scope="changed",
+        base_ref=base_ref,
+        tooling="pytest",
     )
     # pytest exit 4 is a *usage* error: "file or directory not found" (or a
     # similar no-valid-items condition). It means the selection referenced a
@@ -2288,10 +2762,27 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
             cwd,
         )
         return None
-    return _finalize_test_result(run, tooling="pytest", scope="changed")
+    return run
 
 
 def _run_commands(
+    commands: list[str], cwd: str, tooling: str, scope: str = "full"
+) -> dict[str, Any]:
+    """Execute *commands* through the canonical guard-owning runner.
+
+    Delegates to :func:`_run_guarded_suite` (which routes through the test
+    skill's ``guarded_run_all``) so the canonical outer live-repo guard owns
+    the checkout for every finish-gate suite (SA-0MUH1MJL6003767Q). Falls
+    back to :func:`_run_commands_direct` when the test skill is unavailable.
+    """
+    if _guarded_run_all is not None and _full_suite_commands is not None:
+        return _run_guarded_suite(
+            commands, cwd, scope=scope, base_ref=None, tooling=tooling
+        )
+    return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+
+
+def _run_commands_direct(
     commands: list[str], cwd: str, tooling: str, scope: str = "full"
 ) -> dict[str, Any]:
     """Run each command through the per-repo cache and combine the results.
@@ -2302,6 +2793,10 @@ def _run_commands(
     reported, and stdout/stderr are concatenated so a multi-command suite
     (e.g. pytest plus one command per node suite dir, or the declared
     ``suiteCommands``) yields one aggregated result.
+
+    This is the direct (non-delegating) path used only when the test skill's
+    guard-owning ``guarded_run_all`` is unavailable — a partial skill install
+    where only the inner conftest guard is armed.
 
     Args:
         commands: Shell command strings to run in order.
@@ -2501,6 +2996,16 @@ def run_tests(cwd: str, scope: str = "changed",
     a non-zero exit still blocks finish. Multiple resolved commands (e.g. a
     declared ``suiteCommands`` list, or pytest plus node suite dirs) all run
     and their results are combined.
+
+    Guard ownership (SA-0MUH1MJL6003767Q): when the test skill is available,
+    execution is delegated to the canonical ``run_tests.guarded_run_all``
+    (the single source of truth for the outer live-repo guard) instead of
+    arming a second guard here. That keeps the finish gate guarded by the
+    same snapshot guard as the test skill's CLI, even when
+    ``LIVE_REPO_GUARD_ACTIVE`` is already set in the environment (a nested
+    run): ``guarded_run_all`` then stands down because an outer guard already
+    owns the checkout. When the test skill is unavailable (a partial install),
+    the direct cached path runs and the inner conftest guard remains armed.
 
     Args:
         cwd: Working directory (worktree root).
@@ -3067,32 +3572,22 @@ def phase_start(
             print(format_json_output(report))
         return report
 
-    # ── Step 4: Safety gate (dirty working tree) ───────────────────
-    LOG.info("Checking git working tree...")
-    status_output = git_status()
-    is_dirty = git_has_dirty_files(status_output)
-
-    if is_dirty:
-        msg = (
-            f"Dirty working tree detected. Uncommitted changes exist outside .worklog/.\n"
-            f"Do NOT stash, commit, or revert the user's uncommitted changes.\n"
-            f"STOP and ask the operator how to proceed (commit, stash, revert, or abort)\n"
-            f"— never touch the user's working tree without explicit permission.\n"
-            f"\nTo abort and release the work item, run:\n"
-            f"  python3 {Path(__file__).resolve()} abort {work_item_id}\n"
-            f"\nGit status:\n{status_output}"
-        )
-        LOG.warning("Dirty working tree:\n%s", status_output)
-        if not json_output:
-            print("\n⚠  Dirty working tree detected")
-            print("=" * 60)
-            print(status_output)
-            print("=" * 60)
-            print("Ask the operator how to proceed — do not stash, commit, or revert user changes without permission.\n")
+    # ── Step 4: Load project-local extension ───────────────────────
+    # The extension supplies both the prose hooks and the project-scoped
+    # expected-dirty declaration honoured by the deferred dirty-tree safety
+    # gate below (SA-0MUYEV5AO006V0HK, SA-0MV0NSOGE000OSMR). Absence is a
+    # no-op; malformed data fails loudly rather than silently changing the
+    # gate.
+    repo_root = _get_repo_root() or str(Path.cwd().resolve())
+    try:
+        extension = load_implement_extension(repo_root)
+        expected_dirty = _parse_expected_dirty(extension)
+    except SkillExtensionError as exc:
+        msg = f"Invalid implement skill extension: {exc}"
+        LOG.error(msg)
         report["success"] = False
         report["message"] = msg
-        report["dirty_worktree"] = True
-        wl_add_comment(work_item_id, f"Start phase aborted: dirty working tree detected.\n```\n{status_output}\n```")
+        report["extension_error"] = True
         try:
             StatusLifecycle.update_status(work_item_id, "open")
         except RuntimeError:
@@ -3100,6 +3595,10 @@ def phase_start(
         if json_output:
             print(format_json_output(report))
         return report
+    report["extension"] = {
+        "present": extension is not None,
+        "expected_dirty_paths": list(expected_dirty),
+    }
 
     # ── Step 5: Stash hygiene gate (warn on orphaned stashes) ─────
     LOG.info("Checking for orphaned stashes...")
@@ -3131,6 +3630,10 @@ def phase_start(
     else:
         LOG.info("No stashes found.")
 
+    # Surface the project-local prose hook before the first actionable step
+    # (worktree implementation), after all gating steps have passed.
+    _surface_extension_prose(extension, "prefix", json_output, report)
+
     # ── Step 6: Fetch work item details ────────────────────────────
     LOG.info("Fetching work item %s...", work_item_id)
     work_item = wl_show(work_item_id)
@@ -3150,6 +3653,104 @@ def phase_start(
 
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
+
+    # ── Step 6.05: Safety gate (dirty working tree, Key-Files-aware) ──
+    # Deferred until after the work item is fetched so a dirty main checkout
+    # can be judged against the description's Key Files section
+    # (SA-0MV0NSOGE000OSMR). When the checkout is dirty but every dirty path
+    # is demonstrably irrelevant to those Key Files, proceed to create a
+    # clean worktree from HEAD and leave the dirty files untouched in the
+    # main checkout. Anything uncertain — no Key Files section, or any
+    # overlap — keeps the original abort-and-ask behaviour. The gate protects
+    # the main checkout only: when invoked from inside a linked worktree
+    # (e.g. resuming a driven child) it is skipped.
+    if _current_checkout_is_linked_worktree():
+        LOG.info(
+            "Inside a linked worktree — skipping the main-checkout dirty-tree gate."
+        )
+        status_output = ""
+        dirty_decision = {
+            "dirty": False,
+            "dirty_files": [],
+            "key_files": [],
+            "relevant_files": [],
+            "can_proceed": True,
+            "reason": "inside a linked worktree",
+        }
+    else:
+        LOG.info("Checking git working tree...")
+        status_output = git_status()
+        dirty_decision = classify_dirty_tree_relevance(
+            status_output,
+            work_item.get("description", ""),
+            expected_dirty=expected_dirty,
+        )
+    report["dirty_decision"] = {
+        "dirty": dirty_decision["dirty"],
+        "dirty_files": dirty_decision["dirty_files"],
+        "key_files": dirty_decision["key_files"],
+        "relevant_files": dirty_decision["relevant_files"],
+        "can_proceed": dirty_decision["can_proceed"],
+        "reason": dirty_decision["reason"],
+    }
+
+    if dirty_decision["dirty"] and not dirty_decision["can_proceed"]:
+        msg = (
+            f"Dirty working tree detected. Uncommitted changes exist outside .worklog/.\n"
+            f"Do NOT stash, commit, or revert the user's uncommitted changes.\n"
+            f"STOP and ask the operator how to proceed (commit, stash, revert, or abort)\n"
+            f"— never touch the user's working tree without explicit permission.\n"
+            f"Reason: {dirty_decision['reason']}.\n"
+            f"\nTo abort and release the work item, run:\n"
+            f"  python3 {Path(__file__).resolve()} abort {work_item_id}\n"
+            f"\nGit status:\n{status_output}"
+        )
+        LOG.warning("Dirty working tree:\n%s", status_output)
+        if not json_output:
+            print("\n⚠  Dirty working tree detected")
+            print("=" * 60)
+            print(status_output)
+            print("=" * 60)
+            print("Ask the operator how to proceed — do not stash, commit, or revert user changes without permission.\n")
+        report["success"] = False
+        report["message"] = msg
+        report["dirty_worktree"] = True
+        wl_add_comment(work_item_id, f"Start phase aborted: dirty working tree detected.\n```\n{status_output}\n```")
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        return report
+
+    if dirty_decision["dirty"]:
+        # Irrelevant dirty files: record the decision and the untouched paths
+        # for auditability, then continue to create a clean worktree from HEAD
+        # (AC1/AC4). No stash, commit, or revert is performed.
+        LOG.warning(
+            "Dirty working tree left untouched (files will not affect this work): %s",
+            ", ".join(dirty_decision["dirty_files"]),
+        )
+        if not json_output:
+            print("\nℹ  Dirty working tree left untouched — proceeding with a clean worktree")
+            print("=" * 60)
+            for path in dirty_decision["dirty_files"]:
+                print(f"  • {path}")
+            print(f"  Reason: {dirty_decision['reason']}")
+            print("=" * 60)
+        report["dirty_worktree"] = False
+        report["dirty_worktree_left_behind"] = dirty_decision["dirty_files"]
+        dirty_list = "\n".join(
+            f"- `{path}`" for path in dirty_decision["dirty_files"]
+        )
+        wl_add_comment(
+            work_item_id,
+            "Start phase: dirty main checkout left untouched — proceeding to "
+            "create a clean worktree from HEAD.\n"
+            f"Reason: {dirty_decision['reason']}\n"
+            f"Dirty files left behind in the main checkout:\n{dirty_list}",
+        )
 
     # ── Step 6.1: Check risk/effort estimates — evaluate if missing ────
     # (SA-0MTTSWHQE0072N9J) plan_complete items without risk/effort now
@@ -3693,6 +4294,60 @@ def phase_finish(
                     f"Push manually: git push origin {exc.branch}:refs/heads/dev",
                 )
                 raise RuntimeError(f"git push to dev timed out: {exc}") from exc
+            except PushNonFastForwardError as exc:
+                # AC1/AC2/AC3: dev advanced concurrently — rebase and retry
+                # instead of losing the completed implementation.
+                LOG.info(
+                    "Push failed (non-fast-forward); attempting rebase and retry "
+                    "...",
+                )
+                # 1. Rebase the feature branch onto the latest origin/dev.
+                rebase_result = run_cmd(
+                    ["git", "rebase", "origin/dev"],
+                    cwd=cwd,
+                )
+                if rebase_result.returncode != 0:
+                    # AC3: rebase failed — preserve all state for manual recovery.
+                    new_commit = git_get_commit_hash(repo_root) or commit_hash
+                    wl_add_comment(
+                        work_item_id,
+                        f"Push to dev failed (non-fast-forward): {exc.stderr}\n"
+                        f"Rebase onto origin/dev failed with conflicts.\n"
+                        f"Manual recovery:\n"
+                        f"  1. cd {worktree_path}\n"
+                        f"  2. git rebase origin/dev  # resolve conflicts\n"
+                        f"  3. git push origin {branch}:refs/heads/dev\n"
+                        f"Commit before rebase: {commit_hash}\n"
+                        f"Branch: {branch}\n"
+                        f"Worktree: {worktree_path}",
+                    )
+                    raise RuntimeError(
+                        f"git push to dev failed (non-fast-forward), rebase "
+                        f"also failed: {exc.stderr}",
+                    ) from exc
+                # 2. Retry the push.
+                retry_result = git_push_to_dev(repo_root, branch, commit_hash)
+                if not retry_result:
+                    # Retry failed — preserve state for manual recovery.
+                    wl_add_comment(
+                        work_item_id,
+                        f"Push to dev failed after rebase.\n"
+                        f"Original error: {exc.stderr}\n"
+                        f"Branch: {branch}\n"
+                        f"Commit: {commit_hash}\n"
+                        f"Worktree: {worktree_path}",
+                    )
+                    raise RuntimeError(
+                        f"git push to dev failed after rebase: {exc.stderr}",
+                    )
+                # 3. Post explanatory comment about the successful recovery.
+                wl_add_comment(
+                    work_item_id,
+                    f"Push to dev initially failed (non-fast-forward — dev "
+                    f"advanced concurrently). Rebased {branch} onto origin/dev "
+                    f"and retried successfully. Original error: {exc.stderr}",
+                )
+                # Fall through to success path.
 
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
@@ -3760,6 +4415,9 @@ def phase_finish(
         print(f"  Branch: {branch}")
         print("  Status: in_review")
         print()
+
+    # Surface the project-local prose hook after the final step.
+    _surface_postfix_prose(repo_root, json_output, report)
 
     return report
 
@@ -4850,10 +5508,15 @@ def _worktree_placement_violation(
         return None  # already inside the worktree
 
     root = Path(repo_root or _get_repo_root(cur) or cur).resolve()
-    if not git_has_dirty_files(git_status(cwd=str(root))):
+    root_expected = expected_dirty_paths(str(root))
+    if not git_has_dirty_files(
+        git_status(cwd=str(root)), expected_dirty=root_expected
+    ):
         return None  # main checkout clean; work must be in the worktree
 
-    if _git_path_has_changes(wt, parent_branch):
+    if _git_path_has_changes(
+        wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
+    ):
         return None  # work lives in the worktree; main-checkout dirt is unrelated
 
     return (
@@ -4865,7 +5528,11 @@ def _worktree_placement_violation(
     )
 
 
-def _git_path_has_changes(path: Path, parent_branch: str) -> bool:
+def _git_path_has_changes(
+    path: Path,
+    parent_branch: str,
+    expected_dirty: tuple[str, ...] = (),
+) -> bool:
     """True when the git directory at *path* contains implementation changes.
 
     Detects both uncommitted changes and commits ahead of *parent_branch*.
@@ -4873,12 +5540,15 @@ def _git_path_has_changes(path: Path, parent_branch: str) -> bool:
     Args:
         path: Directory to check (e.g. the worktree root).
         parent_branch: Branch the directory forked from (e.g. ``dev``).
+        expected_dirty: Project-declared path prefixes to exclude.
 
     Returns:
         True if the directory is dirty or its HEAD differs from the parent
         branch; False only when it is clean AND at the parent branch HEAD.
     """
-    if git_has_dirty_files(git_status(cwd=str(path))):
+    if git_has_dirty_files(
+        git_status(cwd=str(path)), expected_dirty=expected_dirty
+    ):
         return True
     head = run_cmd(
         ["git", "rev-parse", "HEAD"], cwd=str(path), check=False, capture=True
@@ -4936,11 +5606,15 @@ def _child_main_checkout_violation(
         return None
     root = Path(repo_root_str).resolve()
 
-    offending = _main_checkout_offending_paths(str(root))
+    offending = _main_checkout_offending_paths(
+        str(root), expected_dirty=expected_dirty_paths(str(root))
+    )
     if not offending:
-        return None  # main checkout clean
+        return None  # main checkout clean (or only expected-dirty paths)
 
-    if _git_path_has_changes(wt, parent_branch):
+    if _git_path_has_changes(
+        wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
+    ):
         return None  # work lives in the worktree; main-checkout dirt is unrelated
 
     listing = "\n".join(f"  - {p}" for p in offending[:20])

@@ -1,7 +1,10 @@
 /**
  * Unit tests for post-release dev sync in run-release.js
  *
- * Tests that after a successful release, dev is synced with main.
+ * Tests that after a successful release, dev is synced with main. The sync
+ * itself is exercised through an injected command runner, so no live
+ * git fetch/checkout/merge/push happens during the unit tests
+ * (SA-0MUY6U05F008RG86).
  */
 
 import { test, describe } from 'node:test';
@@ -91,17 +94,45 @@ describe('parsePRUrl', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. syncDevWithMain returns correct structure
+// 4. syncDevWithMain — hermetic via an injectable command runner
 // ---------------------------------------------------------------------------
-test('post-release sync: syncDevWithMain returns expected structure', async () => {
-  const mod = await import(RUN_RELEASE_PATH);
-  const result = mod.syncDevWithMain();
+describe('syncDevWithMain (hermetic)', () => {
+  test('runs fetch -> checkout -> merge -> push via the injected runner', async () => {
+    const mod = await import(RUN_RELEASE_PATH);
+    const commands = [];
+    const result = mod.syncDevWithMain({
+      run: (cmd) => {
+        commands.push(cmd);
+        return '';
+      },
+    });
 
-  assert.ok(typeof result === 'object');
-  assert.ok('success' in result);
-  assert.ok('message' in result);
-  assert.equal(typeof result.success, 'boolean');
-  assert.equal(typeof result.message, 'string');
+    assert.equal(result.success, true);
+    assert.equal(typeof result.message, 'string');
+    assert.ok(result.message.includes('sync'), result.message);
+    assert.deepEqual(commands, [
+      'git fetch origin --prune',
+      'git checkout dev',
+      'git merge origin/main',
+      'git push origin dev',
+    ]);
+  });
+
+  test('returns a failure result when the runner throws', async () => {
+    const mod = await import(RUN_RELEASE_PATH);
+    const result = mod.syncDevWithMain({
+      run: () => {
+        const err = new Error('boom');
+        err.stderr = 'fatal: not a git repository';
+        throw err;
+      },
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(typeof result.message, 'string');
+    assert.match(result.message, /Failed to sync dev with main/);
+    assert.match(result.message, /not a git repository/);
+  });
 });
 
 // ---------------------------------------------------------------------------

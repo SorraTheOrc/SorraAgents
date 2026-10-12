@@ -28,6 +28,8 @@ import subprocess
 import warnings
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parent
 _GUARD_PATH = _REPO_ROOT / "skill" / "shared" / "live_repo_guard.py"
 
@@ -112,3 +114,22 @@ def pytest_configure(config):
             "excluded from collection: " + ", ".join(untracked),
             stacklevel=1,
         )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_test_semaphore_dir(tmp_path_factory, monkeypatch):
+    """Isolate test-time semaphore acquisitions from the host-wide pool.
+
+    The full suite runs under an outer ``"test"`` semaphore slot held for the
+    whole session. Any test that acquires a test slot in-process
+    (``run_tests.main``, ``run_suite``, ``run_all``) or spawns a nested
+    ``run_tests.py`` would otherwise queue behind that slot; under concurrent
+    agent load two full suites each hold a slot and the nested acquire never
+    proceeds (SA-0MUY6U05F008RG86). Each test gets its own namespace, so
+    nested work never contends host-wide while top-level (production) runs keep
+    the host-wide ceiling. Tests that exercise the semaphore directly override
+    ``PI_SEMAPHORE_DIR`` (or ``ENV_LOCK_DIR``) with a directory of their own.
+    """
+    monkeypatch.setenv(
+        "PI_SEMAPHORE_DIR", str(tmp_path_factory.mktemp("test-semaphores"))
+    )

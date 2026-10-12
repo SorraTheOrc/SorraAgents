@@ -31,6 +31,8 @@ import { fileURLToPath } from 'node:url';
 // importing this module (which runs `git rev-parse` at import time)
 // (SA-0MUVV6DK0002ISW4).
 import { callLlm } from '../llm.js';
+// CTA resolver — reuse the same three-layer precedence as discord-notify.js.
+import { resolveCta } from '../discord-notify.js';
 
 // ── Resolve repo root ──────────────────────────────────────────────────────
 const REPO_ROOT = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8' }).trim();
@@ -440,14 +442,17 @@ export async function generateReleaseFocus(categorized, opts = {}) {
  *
  * When *focus* is provided it is emitted as a `> **Release focus:** …`
  * marker on the first line directly under the version heading (focus AC2).
+ * When *cta* is provided it is rendered as a blockquote after the changelog
+ * items (cta AC1). Absent CTA produces no output change.
  *
  * @param {string} version  e.g. "0.2.0"
  * @param {string} date     e.g. "2026-07-08"
  * @param {{features:string[], bugFixes:string[], other:string[]}} categorized
  * @param {string|null} [focus]  1–3 sentence release focus, or null to omit.
+ * @param {string|null} [cta]      Call-to-action Markdown string, or null to omit.
  * @returns {string}
  */
-export function generateReleaseSection(version, date, categorized, focus = null) {
+export function generateReleaseSection(version, date, categorized, focus = null, cta = null) {
   const lines = [];
   const push = (s) => { if (s !== '') lines.push(s); };
 
@@ -477,6 +482,11 @@ export function generateReleaseSection(version, date, categorized, focus = null)
     push('### Other');
     push('');
     categorized.other.forEach(e => push(e));
+    push('');
+  }
+
+  if (cta) {
+    push(`> ${cta}`);
     push('');
   }
 
@@ -579,7 +589,14 @@ async function main() {
     console.error('Release focus omitted (LLM unavailable or no work items).');
   }
 
-  const newSection = generateReleaseSection(version, date, categorized, focus);
+  // Resolve the per-project CTA (same precedence as discord-notify.js).
+  // Non-blocking: a missing/malformed CTA is simply omitted.
+  const cta = resolveCta();
+  if (cta) {
+    console.error(`CTA resolved: ${cta}`);
+  }
+
+  const newSection = generateReleaseSection(version, date, categorized, focus, cta);
   updateChangelog(newSection);
 
   console.error(`CHANGELOG.md updated at ${CHANGELOG_PATH}`);

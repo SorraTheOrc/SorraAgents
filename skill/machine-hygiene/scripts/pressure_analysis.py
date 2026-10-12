@@ -104,7 +104,7 @@ def _systemd_unit(pid: int, proc_root: str) -> str | None:
     for line in text.splitlines():
         path = line.split(":", 2)[-1].strip()
         for part in path.split("/"):
-            if part.endswith(".service") or part.endswith(".scope"):
+            if part.endswith((".service", ".scope")):
                 return part
     return None
 

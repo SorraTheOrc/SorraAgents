@@ -68,8 +68,14 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 10 | Release script timed out (killed after `SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
 | 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
+| 13 | Invalid argument — an unrecognised flag or a missing value; wrapper usage printed and nothing executed |
+| 14 | No newly-created release tag — the released tag already existed before this run (or the pre-run tag snapshot could not be read); all post-release steps refused |
 
 **Missing-script fail-fast (SA-0MUIVIJFT0009ZNV):** `run-release.js` resolves the canonical release script **before** the gating checks. When no script exists it exits 2 immediately and runs no git or live-`wl` gate commands — keeping the missing-script safety path cheap, deterministic, and free of worklog side effects.
+
+**Argument fail-fast (SA-0MV0PZYMI004SUFR):** `parseReleaseArgs(argv)` validates the wrapper's CLI arguments before the Code Freeze marker, project-root resolution and every gate. `--help`/`-h` print `WRAPPER_USAGE` and exit 0; an unknown flag or a missing value exits 13 with usage. Documented wrapper flags (`--dry-run`, `--force`, `--work-item-id`, `--bump`, `--skip-checks`, `--refresh-audits`, `--skip-audit-remediation`) keep working, and an unknown flag can never be forwarded to `merge-dev-to-main.sh`.
+
+**Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** `snapshotReleaseTags()` records `git tag --list` immediately before the merge script runs. At the verification step the released version is accepted only when `v<version>` was absent from that snapshot (`isNewlyCreatedTag(version, preRunTags)`); otherwise the wrapper exits 14 without running any post-release step. A `null` snapshot (unreadable git tags) fails closed. This is strictly additive to `verifyReleaseMerge` — both gates must pass before work items are closed.
 
 ## Audit & Producer-Review Gates
 
@@ -184,6 +190,7 @@ node ./skill/ship/scripts/run-release.js
 Steps:
 
 0. **Locate the release script (fail-fast, SA-0MUIVIJFT0009ZNV)** — resolves the canonical release script (skill-level or repository-level) **before** the gating checks and exits 2 immediately if absent; no git or live-`wl` gate commands run.
+0.5. **Parse wrapper arguments (fail-fast, SA-0MV0PZYMI004SUFR)** — `parseReleaseArgs()` runs before the Code Freeze marker and every gate. `--help`/`-h` print usage and exit 0; an unknown flag exits 13. Nothing is executed for either path.
 1. **Unmerged branches check** — aborts with report if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verifies `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — aborts with exit 7 if non-terminal critical items exist.
@@ -198,8 +205,9 @@ Steps:
    - the released version tag `v<version>` exists on origin (`git ls-remote`), and
    - the tag commit is an ancestor of `origin/main` (`git merge-base --is-ancestor`).
    If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
+   **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** before this step, `snapshotReleaseTags()` captures the pre-run tag list; `isNewlyCreatedTag(version, preRunTags)` requires `v<version>` to be absent from it. A stale tag (or an unreadable snapshot) aborts with **exit code 14** and runs no post-release step, so an old reachable tag read by `git describe` can never trigger a close.
 10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
-11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures.
+11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures. **Close verification (SA-0MUXA5ZNZ0019QY5):** every attempted close is re-read through the injectable `getCloseStateFn` boundary (default `getItemLifecycle`); an item is counted as closed only when the persisted lifecycle is `status: completed` **and** `stage: done`. A close that exits 0 but does not persist — the concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried exactly once and re-verified; if still not terminal (or the read throws/returns `null` — fail-safe) the item is listed in `unclosedCount`/`unclosedItems`, `success` is `false`, and the summary never claims blanket success. The step remains non-blocking.
 
 ### Child producer-review override (close step)
 
@@ -217,17 +225,27 @@ boundaries (all hermetic-test friendly):
   posts the explanatory comment (defaults to `wl update <child>
   --needs-producer-review false` + `wl comment add <child> ...`).
 - `runCloseCommand(itemId, reason)` — closes a candidate.
+- `getCloseStateFn(itemId)` — post-close verification boundary; re-reads the
+  item's persisted `{status, stage}` and defaults to `getItemLifecycle` (a live
+  `wl show`). An item counts as closed only when `status === "completed"` and
+  `stage === "done"`; an exit-0-but-unpersisted close is retried once, then
+  reported in `unclosedItems` (SA-0MUXA5ZNZ0019QY5). A throwing/`null` read is
+  fail-safe (treated as unclosed). Tests must inject this boundary so the suite
+  never reads the live worklog.
 - `dryRun` — when true, planned overrides/closes are reported but no mutation
   is performed.
 
 The result includes `overriddenCount` / `overriddenItems` so the planned
-overrides are auditable.
+overrides are auditable, and `unclosedCount` / `unclosedItems` so a close that
+failed to persist is visible by id rather than silently counted as a success.
 
 ### Discord release notification
 
 After a successful, verified release (`verifyReleaseMerge` passed, Step 9), `run-release.js` invokes `sendReleaseNotification()` from `discord-notify.js` alongside the close-work-items step. It is a post-release, non-blocking concern.
 
 **Hook point:** in `run-release.js`, inside the `if (version)` block after `verifyReleaseMerge(version)` succeeds, wrapped in its own `try/catch` — a defect in the notification module can never fail the release.
+
+**Provenance guard (AC5, SA-0MV0QEI3Q0063KH3):** the wrapper forwards the pre-run `git tag --list` snapshot (`preRunTags`) captured before the merge script ran. Before resolving the webhook or building a payload, `sendReleaseNotification` independently refuses to send when the resolved version's tag already existed before the run (or the snapshot could not be read) — returning `{ success: true, notified: false, skipped: true, reason: 'version tag not created by this run' }`. This is defence in depth beneath the wrapper's newly-created-tag gate (Step 8), so the project channel is never told a release shipped when none did (the 2026-10-09 incident).
 
 **Config schema** (key: `discord.webhook_url`):
 
@@ -245,11 +263,15 @@ The first file that defines `discord.webhook_url` wins. Neither set → the step
 
 When `projectDescription` is unset the pitch is generated from the leading prose of the project `README.md` (the block before the first `##` heading, capped at ~1000 characters) via the shared DeepSeek LLM caller (`skill/ship/scripts/llm.js`), summarised into 2–3 sentences. When generation is unavailable — no `DEEPSEEK_API_KEY`, LLM/network error, or missing/unreadable README — the pitch paragraph is **omitted** and the notification still sends. The generated pitch is never persisted to `config.yaml` (no tracked-file mutation during a release).
 
+**Call-to-action** (key: `cta`, SA-0MUWCIFU2006K39K):
+
+`cta` is an optional top-level scalar read with the **same three-layer precedence as `projectName`/`projectDescription`** (project private → project → global). When set it is rendered as its own embed paragraph, placed **after the intro block** (pitch → focus → `**<projectName> v<version>**` line) and **immediately before the changelog**, so the audience can act on the release. Markdown link syntax is preserved verbatim. When unset, empty, or the config is malformed/unreadable, the paragraph is simply omitted and the notification still sends — a bad CTA never fails the release.
+
 - **Gitignore:** `.worklog/config.private.yaml` is explicitly gitignored; `.worklog/config.private.yaml.example` provides a placeholder template.
 - **Migration:** if you already have `discord.webhook_url` in the global `~/.pi/agent/config.yaml`, you can move it to `.worklog/config.private.yaml` for per-project isolation. The global fallback remains supported.
 
 **Behaviour:**
-- Message content: the embed description is composed of paragraphs in this order: (a) the **project elevator pitch** (2–3 sentences, from `projectDescription` or the README/LLM fallback), (b) the **release focus** (1–3 sentences, extracted from the `> **Release focus:** …` marker generated by `generate-changelog.js`), (c) the `**<projectName> v<version>**` line, and (d) the new version's changelog section from `CHANGELOG.md` (sections are `## vX.Y.Z (YYYY-MM-DD)` blocks; the date is read from the section header, falling back to today). Absent pitch/focus paragraphs are omitted. The focus marker line is removed from the changelog body so the text is not duplicated.
+- Message content: the embed description is composed of paragraphs in this order: (a) the **project elevator pitch** (2–3 sentences, from `projectDescription` or the README/LLM fallback), (b) the **release focus** (1–3 sentences, extracted from the `> **Release focus:** …` marker generated by `generate-changelog.js`), (c) the `**<projectName> v<version>**` line, (d) the **call-to-action** (`cta`, markdown preserved), and (e) the new version's changelog section from `CHANGELOG.md` (sections are `## vX.Y.Z (YYYY-MM-DD)` blocks; the date is read from the section header, falling back to today). Absent pitch/focus/cta paragraphs are omitted. The focus marker line is removed from the changelog body so the text is not duplicated.
 - Discord limits: the fully-composed embed description is truncated to ≤ 4096 chars with an ellipsis marker (`truncateForDiscord`).
 - Non-blocking: webhook POST uses built-in `fetch` with `AbortSignal.timeout` (default 10 s). Fetch rejection, HTTP error status (incl. 429), timeout, missing/corrupt config, and missing changelog section all log a warning and return a non-failure result — the release exit code is unchanged.
 - No new runtime dependencies (Node 18+ built-in `fetch`); no `DISCORD_*` environment variables.
