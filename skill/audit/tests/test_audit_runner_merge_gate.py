@@ -199,6 +199,55 @@ class TestResolveItemIntegrationEvidence:
         assert len(commits) == 3
         assert branch == ""
 
+    def test_decimal_numbers_not_extracted_as_commit_shas(self):
+        """Regression SA-0MTECRNGR000VKLV: decimal literals in test-failure
+        prose must not be mined as commit shas.
+
+        The motivating example is a test failure line whose fractional
+        digits happen to be hex-compatible, producing phantom candidates
+        (``2329094824319696``, ``231051271500847``) that then fail to
+        integrate and spuriously block the merge gate.
+        """
+        ctx = _make_ctx(
+            description=(
+                "expected 0.23290948243196963 to be less than or equal to"
+                " 0.2310512715008475"
+            ),
+            work_item={"comments": [
+                {"comment": "retry after error 0.9876543210deadbeef"},
+            ]},
+        )
+        commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert commits == []
+        assert branch == ""
+
+    def test_valid_commit_shas_still_extracted_in_various_formats(self):
+        """AC2/AC3: full, short, GitHub-style (``#``) and ``sha=`` shas are
+        still extracted after the decimal guard."""
+        full = "2c15ebd3cc78f415afca198930339f2138bed218"
+        ctx = _make_ctx(
+            description=(
+                f"full {full} short 2c15ebd #abc1234 sha=cafe0123"
+            ),
+        )
+        commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert full in commits
+        assert "2c15ebd" in commits
+        assert "abc1234" in commits
+        assert "cafe0123" in commits
+        assert branch == ""
+
+    def test_sentence_final_commit_sha_still_extracted(self):
+        """A sha at the end of a sentence (``see commit <sha>.``) is still
+        extracted — the decimal guard must not drop it, since the implement
+        skill's canonical comment ends with a period."""
+        full = "2c15ebd3cc78f415afca198930339f2138bed218"
+        ctx = _make_ctx(
+            description=f"Completed work pushed to dev, see commit {full}.",
+        )
+        commits, _branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert full in commits
+
     def test_motivating_example_reachable_generically(self):
         """AC4: the WL-0MSI4TAT70058921 rename work is reachable through the
         generic resolution — its feature branch plus its recorded commits —

@@ -1087,8 +1087,15 @@ SA-0MSPZDALB000S18P). The line is parsed back out by
 _TOUCHED_FILES_COMMIT_MARKER = "__WL_COMMIT__"
 
 #: Regex matching a candidate 7-40 char hex commit sha (mirrors the merge
-#: gate's reference extraction in ``_resolve_item_commits``).
-_COMMIT_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
+#: gate's reference extraction in ``_resolve_item_integration_evidence``).
+#:
+#: Decimal-point adjacency is excluded so that numeric literals whose digits
+#: happen to be hex-compatible (e.g. ``0.23290948243196963`` in a test-failure
+#: message) are not mined as phantom commit shas (SA-0MTECRNGR000VKLV). The
+#: lookbehind drops the fractional part of a decimal (``0.<digits>``); the
+#: lookahead drops the integer part of a decimal (``<digits>.<digits>``)
+#: while still matching a sha that merely ends a sentence (``commit <sha>.``).
+_COMMIT_SHA_RE = re.compile(r"(?<!\.)\b[0-9a-f]{7,40}\b(?!\.\d)", re.IGNORECASE)
 
 AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30
 """Tolerance (seconds) for treating an audit as fresh despite a stale check.
@@ -8092,7 +8099,7 @@ def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], s
     #    merge gate after the fetch, before any Phase 1 screening), so no
     #    extra ``wl show`` is issued here.
     desc = ctx.description or ""
-    for m in re.finditer(r"\b[0-9a-f]{7,40}\b", desc, re.IGNORECASE):
+    for m in _COMMIT_SHA_RE.finditer(desc):
         _add_sha(m.group(0))
     # ``wl show --json`` returns comments at the TOP level of the payload, not
     # under ``workItem``; prefer the explicitly-bound ``ctx.comments``,
@@ -8101,7 +8108,7 @@ def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], s
     comment_list = ctx.comments or (ctx.work_item.get("comments", []) or [])
     for comment in comment_list:
         text = comment.get("comment", "") or ""
-        for m in re.finditer(r"\b[0-9a-f]{7,40}\b", text, re.IGNORECASE):
+        for m in _COMMIT_SHA_RE.finditer(text):
             _add_sha(m.group(0))
 
     # Drop hex tokens that are not commit objects in the owning repo

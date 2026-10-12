@@ -202,7 +202,7 @@ The item's integration evidence is derived from the item itself:
 
 1. **Owning repo** — the worklog prefix-to-sibling scan already resolves the owning project root (`_resolve_owning_project_root`); git commands run PLAIN and the cwd-aware runner pins them to the owning repo when the launch cwd differs (SA-0MSLLGDW00098UCC).
 2. **Feature branch** — `git for-each-ref refs/heads/wl-<id>-*`; only refs matching `wl-<id>-` with a 40-hex object name are accepted (mocked/garbage output is never treated as evidence).
-3. **Commits** — 7–40 hex shas referenced in the item's description and comments.
+3. **Commits** — 7–40 hex shas referenced in the item's description and comments. Decimal-literal adjacency is excluded (`<digits>.<digits>`), so numeric values whose digits happen to be hex-compatible (e.g. `0.23290948243196963` in a test-failure message) are never mined as phantom candidates that would fail to integrate and spuriously block the gate (SA-0MTECRNGR000VKLV). A sha that merely ends a sentence (`… see commit <sha>.`) is still matched.
 
 ### Verify → integrate → fail closed (AC1–AC3)
 
