@@ -25,10 +25,10 @@ python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [
 
 | Flag | Default | Description |
 |---|---|---|
-| `--json` | off | Raw JSON output instead of markdown |
+| `--json` | off | Raw JSON output instead of markdown. Streamed to **stdout** unless `--output-path` is given (then written to that file) |
 | `--count / -n N` | 20 (herdr config) | Herdr browse window |
 | `--verbose` | off | Extra detail (priority, status, stage) |
-| `--output-path <path>` | `./standups/YYYY_MM_DD.md` | Write report to file; defaults to today's dated file in `./standups/` relative to the project root (the worklog parent when `--worklog-dir` / `WL_WORKLOG_DIR` is set, otherwise `cwd`), created if missing. `--output-path` overrides the default; default uses `YYYY_MM_DD` from the report generation date (local datetime, zero-padded).
+| `--output-path <path>` | `./standups/YYYY_MM_DD.md` (markdown only) | Write the rendered report to file; defaults to today's dated file in `./standups/` relative to the project root (the worklog parent when `--worklog-dir` / `WL_WORKLOG_DIR` is set, otherwise `cwd`), created if missing. `--output-path` overrides the default; default uses `YYYY_MM_DD` from the report generation date (local datetime, zero-padded). With `--json`, `--output-path` writes the raw JSON to the given path instead of stdout |
 | `--startTime <ISO>` | prev day 06:00 | Window start (e.g. `2026-09-03T06:00:00`) |
 | `--duration <hours>` | 24 | Window length in hours |
 | `--worklog-dir <path>` | cwd | Explicit `.worklog` dir (e.g. `/path/to/project/.worklog`); also honored via `WL_WORKLOG_DIR` env var. Bypasses cwd-based resolution so the report works from any directory |

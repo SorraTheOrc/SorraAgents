@@ -20,11 +20,13 @@ Usage:
 
 Flags:
     --json           Output raw JSON data instead of the formatted report
+                     (streamed to stdout unless --output-path is given)
     --verbose        Include extra detail (priority, status, stage) in output
-    --output-path    Write report to a file (default: ./standups/YYYY_MM_DD.md)
+    --output-path    Write the report to a file (default: ./standups/YYYY_MM_DD.md)
                      Relative to project root (worklog parent when --worklog-dir
                      / WL_WORKLOG_DIR is set, otherwise cwd); directory is created
-                     if missing. Overrides to a custom path are always honored.
+                     if missing. Overrides the default for either output format;
+                     with --json the raw JSON is written to the given path.
     --count N        Herdr browse window (default: from herdr config or 20)
     --startTime STR  Window start (ISO8601, e.g. 2026-09-03T06:00:00 or 2026-09-03 06:00)
     --duration H     Window duration in hours (default 24)
@@ -1090,8 +1092,18 @@ def main():
     else:
         output = format_report(data, browse_count)
 
-    # Default output path: ./standups/YYYY_MM_DD.md relative to project root
-    if not output_path:
+    if output_path:
+        # Explicit --output-path: write here (either format), no default dated file.
+        with open(output_path, "w") as f:
+            f.write(output)
+        print(f"Report written to {output_path}", file=sys.stderr)
+    elif json_output:
+        # --json without --output-path: stream raw JSON to stdout (documented
+        # fetch-data contract). The default dated file applies to the rendered
+        # markdown report only, so a JSON artifact is never written to a .md file.
+        print(output)
+    else:
+        # Default output path: ./standups/YYYY_MM_DD.md relative to project root
         if WORKLOG_DIR:
             project_root = str(Path(WORKLOG_DIR).resolve().parent)
         else:
@@ -1100,10 +1112,9 @@ def main():
         standups_dir = Path(project_root) / "standups"
         standups_dir.mkdir(parents=True, exist_ok=True)
         output_path = str(standups_dir / f"{today}.md")
-
-    with open(output_path, "w") as f:
-        f.write(output)
-    print(f"Report written to {output_path}", file=sys.stderr)
+        with open(output_path, "w") as f:
+            f.write(output)
+        print(f"Report written to {output_path}", file=sys.stderr)
 
     return 0
 
