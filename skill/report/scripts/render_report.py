@@ -33,6 +33,10 @@ Usage
         producer_actions="Review the wiring grep output.",
         notes="Icons sourced from ContextHub.",
         next_action="ship",
+        use_cases=[
+            "As a producer, I want to see use cases at a glance.",
+            "As an agent, I want a documented way to pass use cases.",
+        ],
     )
     print(report)
 
@@ -366,6 +370,7 @@ def render_report(
     producer_actions=None,
     notes=None,
     next_action: str = "review",
+    use_cases=None,
 ) -> str:
     """Render the full canonical end-of-session report.
 
@@ -389,6 +394,12 @@ def render_report(
         Freeform agent commentary.
     next_action : str
         The next action (e.g. "review", "plan", "ship").
+    use_cases : list of str or None
+        Optional list of use-case strings (e.g. from the work-item
+        description).  When provided, a ``## Use Cases`` section is
+        inserted between the title line and the headline.  Each string
+        is rendered as a bulleted ``- <text>`` line.  When ``None`` or
+        empty the section is omitted entirely (no empty heading).
 
     Returns
     -------
@@ -405,6 +416,14 @@ def render_report(
     lines.append("")
     lines.append(f"**{title}** ({work_item_id})")
     lines.append("")
+
+    # Use Cases (optional — between title and headline)
+    if use_cases:
+        lines.append("## Use Cases")
+        lines.append("")
+        for uc in use_cases:
+            lines.append(f"- {uc}")
+        lines.append("")
 
     # Headline
     if headline:
@@ -480,6 +499,7 @@ def render_report_from_workitem(
     next_action: str = "review",
     children: list | None = None,
     audit_result: Mapping | None = None,
+    use_cases=None,
 ) -> str:
     """Convenience wrapper: read metadata from a work-item dict and render.
 
@@ -499,6 +519,7 @@ def render_report_from_workitem(
         producer_actions=producer_actions,
         notes=notes,
         next_action=next_action,
+        use_cases=use_cases,
     )
 
 
@@ -532,6 +553,7 @@ def render_from_wl(
     producer_actions=None,
     notes=None,
     next_action: str = "review",
+    use_cases=None,
 ) -> str:
     """Fetch work-item data via ``wl show`` and render a report."""
     cmd = ["wl", "show", work_item_id, "--json", "--children"]
@@ -561,6 +583,7 @@ def render_from_wl(
         next_action=next_action,
         children=children,
         audit_result=data.get("auditResult"),
+        use_cases=use_cases,
     )
 
 
@@ -645,6 +668,13 @@ def main():
         action="store_true",
         help="Use bracketed-text fallbacks instead of emoji icons.",
     )
+    parser.add_argument(
+        "--use-case",
+        action="append",
+        dest="use_cases",
+        default=None,
+        help="Use-case string (repeatable). Rendered as a bulleted list under ## Use Cases.",
+    )
     args = parser.parse_args()
 
     if args.json:
@@ -689,6 +719,7 @@ def main():
         producer_actions=args.producer_actions,
         notes=args.notes,
         next_action=args.next_action,
+        use_cases=args.use_cases,
     )
     apply_pane_status(
         ac_rows, args.producer_actions, args.notes, no_icons=args.no_icons,

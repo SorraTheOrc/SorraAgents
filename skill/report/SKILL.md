@@ -34,6 +34,11 @@ Exact section order (do not reorder, do not rename):
 
 **<title>** (<id>)
 
+## Use Cases
+
+- <use-case-1>
+- <use-case-2>
+
 <headline summary — 1-3 sentences, prose>
 
 ## Acceptance Criteria
@@ -73,6 +78,9 @@ This completes the <skill_name> process for <id> (<title>). Ready for <next_acti
   `# Completed plan`).
 - **Title line**: `**<title>** (<id>)` — the work-item title bolded, id in
   parens.
+- **Use Cases**: optional bulleted list of the work-item's use cases.
+  Inserted between the title line and the headline. Omitted entirely (no
+  heading) when no use cases are supplied.  Each item is a `- <text>` line.
 - **Headline**: 1-3 sentences of prose summarising the session.
 - **AC table**: rows are `| <ac#> | <Description> | <Metric> | <met|unmet> |`
   with the verdict column literally `met` or `unmet`. AC numbers run
@@ -196,7 +204,8 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --ac "<...>|<...>|unmet" \
   [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
-  [--next-action <review|plan|implement|...>]
+  [--next-action <review|plan|implement|...>] \
+  [--use-case "<use-case string>"]
 ```
 
 The script prints the rendered report to stdout — **paste it verbatim into
@@ -254,14 +263,18 @@ than stacking a second one.
 
 `$(skill_path report)/scripts/render_report.py`:
 
-- `render_report(...)` → full report markdown.
+- `render_report(...)` → full report markdown. Accepts an optional
+  ``use_cases`` parameter (list of strings or ``None``); when provided,
+  a ``## Use Cases`` section is rendered between the title line and the
+  headline.
 - `render_metadata(work_item, children=None, audit_result=None)` → the `## Meta-Data` bullet block. `audit_result` is the **top-level** `auditResult` object from the `wl show --json` envelope; when omitted, the legacy `workItem.auditResult` / `workItem.audit` fallbacks apply (see the precedence list above).
-- `render_report_from_workitem(work_item, *, skill_name, headline, acceptance_criteria, ..., children=None, audit_result=None)` → full report from an already-fetched work-item dict plus the envelope's structured `auditResult`.
-- `render_from_wl(skill_name, work_item_id, ...)` → fetches the `wl show <id> --children --json` envelope and threads its top-level `auditResult` into the metadata.
-- CLI (`render_report.py <id> --skill-name ... --ac ...`): fetches the item
+- `render_report_from_workitem(work_item, *, skill_name, headline, acceptance_criteria, ..., children=None, audit_result=None, use_cases=None)` → full report from an already-fetched work-item dict plus the envelope's structured `auditResult`.
+- `render_from_wl(skill_name, work_item_id, ..., use_cases=None)` → fetches the `wl show <id> --children --json` envelope and threads its top-level `auditResult` into the metadata.
+- CLI (`render_report.py <id> --skill-name ... --ac ... --use-case ...`): fetches the item
   via `wl show <id> --children --json` (worklog store resolved via the
   shared prefix-to-sibling scan, so it works from any cwd incl. git
-  worktrees) and prints the report.
+  worktrees) and prints the report. Use `--use-case` (repeatable) to
+  supply use-case strings.
 
 Tests: `./tests/test_render_report.py` (offline — fixture JSON,
 no live `wl` calls). Run with `python3 -m pytest ./tests`.
@@ -272,6 +285,13 @@ no live `wl` calls). Run with `python3 -m pytest ./tests`.
 # Completed plan
 
 **Standardize skill session end-of-session reporting via helper report skill** (SA-0MSJ082OY003IQ8S)
+
+## Use Cases
+
+- As a producer reviewing a report, I want to see the work item's objectives
+  at a glance alongside the skill's outcome.
+- As an agent producing a report, I want a clear, documented way to pass use
+  cases into the report renderer so I can include them in my output.
 
 Planned the 4-feature breakdown and created 4 child items in test-first order.
 
