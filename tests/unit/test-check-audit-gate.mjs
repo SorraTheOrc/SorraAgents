@@ -1495,3 +1495,195 @@ describe('checkAuditReadyToClose - gate never invokes wl update', () => {
     assert.equal(report.remediatedItems.length, 1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Abort-recovery: leftover audit state cleanup (SA-0MTRH8C5O005URGR)
+// ---------------------------------------------------------------------------
+
+describe('buildAbortRestoreCommand - pre-audit state restore command', () => {
+  test('builds a wl update carrying the captured status and stage', async () => {
+    const mod = await import(MODULE_PATH);
+    const cmd = mod.buildAbortRestoreCommand('SA-1', 'completed', 'in_review');
+    assert.match(cmd, /wl update SA-1/);
+    assert.match(cmd, /--status completed/);
+    assert.match(cmd, /--stage in_review/);
+    assert.match(cmd, /--assignee ""/);
+    assert.match(cmd, /--json/);
+  });
+
+  test('defaults the stage to plan_complete when the capture is empty', async () => {
+    const mod = await import(MODULE_PATH);
+    const cmd = mod.buildAbortRestoreCommand('SA-1', 'open', '');
+    assert.match(cmd, /--stage plan_complete/);
+  });
+});
+
+describe('checkAndRestoreStuckAudit - SIGKILL parent-side cleanup', () => {
+  /**
+   * Build a hermetic fs/command double. `files` maps absolute path -> raw
+   * contents; `unlinked` records removed paths; `commands` records commands.
+   */
+  function makeHarness(files) {
+    const unlinked = [];
+    const commands = [];
+    const fsMod = {
+      existsSync: (p) => Object.prototype.hasOwnProperty.call(files, p),
+      readFileSync: (p) => {
+        if (!Object.prototype.hasOwnProperty.call(files, p)) {
+          const err = new Error('ENOENT');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return files[p];
+      },
+      unlinkSync: (p) => {
+        if (!Object.prototype.hasOwnProperty.call(files, p)) {
+          const err = new Error('ENOENT');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        delete files[p];
+        unlinked.push(p);
+      },
+    };
+    return {
+      fsMod,
+      unlinked,
+      commands,
+      runCommand: (cmd) => { commands.push(cmd); return 'ok'; },
+    };
+  }
+
+  test('returns false when no leftover state file exists', async () => {
+    const mod = await import(MODULE_PATH);
+    const harness = makeHarness({});
+    const restored = mod.checkAndRestoreStuckAudit('SA-1', {
+      baseDir: '/tmp',
+      fsMod: harness.fsMod,
+      runCommand: harness.runCommand,
+    });
+    assert.equal(restored, false);
+    assert.equal(harness.commands.length, 0);
+  });
+
+  test('restores the item from a leftover state file', async () => {
+    const mod = await import(MODULE_PATH);
+    const stateFile = join('/tmp', '.audit_state_SA-1.json');
+    const harness = makeHarness({
+      [stateFile]: JSON.stringify({
+        issue_id: 'SA-1',
+        original_status: 'completed',
+        original_stage: 'in_review',
+      }),
+    });
+    const restored = mod.checkAndRestoreStuckAudit('SA-1', {
+      baseDir: '/tmp',
+      fsMod: harness.fsMod,
+      runCommand: harness.runCommand,
+    });
+    assert.equal(restored, true);
+    assert.equal(harness.commands.length, 1);
+    assert.match(harness.commands[0], /--status completed/);
+    assert.match(harness.commands[0], /--stage in_review/);
+  });
+
+  test('removes the state file after restoring', async () => {
+    const mod = await import(MODULE_PATH);
+    const stateFile = join('/tmp', '.audit_state_SA-1.json');
+    const harness = makeHarness({
+      [stateFile]: JSON.stringify({
+        issue_id: 'SA-1',
+        original_status: 'open',
+        original_stage: 'plan_complete',
+      }),
+    });
+    mod.checkAndRestoreStuckAudit('SA-1', {
+      baseDir: '/tmp',
+      fsMod: harness.fsMod,
+      runCommand: harness.runCommand,
+    });
+    assert.deepEqual(harness.unlinked, [stateFile]);
+    assert.equal(harness.fsMod.existsSync(stateFile), false);
+  });
+
+  test('never restores when the state file belongs to another item', async () => {
+    const mod = await import(MODULE_PATH);
+    const stateFile = join('/tmp', '.audit_state_SA-1.json');
+    const harness = makeHarness({
+      [stateFile]: JSON.stringify({
+        issue_id: 'SA-OTHER',
+        original_status: 'completed',
+        original_stage: 'in_review',
+      }),
+    });
+    const restored = mod.checkAndRestoreStuckAudit('SA-1', {
+      baseDir: '/tmp',
+      fsMod: harness.fsMod,
+      runCommand: harness.runCommand,
+    });
+    // The file is consumed (removed) but no update is issued for a mismatch.
+    assert.equal(restored, true);
+    assert.equal(harness.commands.length, 0);
+    assert.deepEqual(harness.unlinked, [stateFile]);
+  });
+
+  test('ignores a corrupt state file without throwing', async () => {
+    const mod = await import(MODULE_PATH);
+    const stateFile = join('/tmp', '.audit_state_SA-1.json');
+    const harness = makeHarness({ [stateFile]: 'not-json' });
+    const restored = mod.checkAndRestoreStuckAudit('SA-1', {
+      baseDir: '/tmp',
+      fsMod: harness.fsMod,
+      runCommand: harness.runCommand,
+    });
+    assert.equal(restored, true);
+    assert.equal(harness.commands.length, 0);
+    assert.deepEqual(harness.unlinked, [stateFile]);
+  });
+});
+
+describe('attemptAuditRemediation - abort-recovery cleanup after the runner', () => {
+  test('checks for a leftover state file after a successful audit command', async () => {
+    const mod = await import(MODULE_PATH);
+    const calls = [];
+    const cleanupCalls = [];
+    const result = await mod.attemptAuditRemediation(
+      { id: 'SA-1', title: 'Item' },
+      {
+        runAuditShow: () => JSON.stringify({
+          audit: { readyToClose: true, summary: 'ok' },
+        }),
+        runAuditCommand: () => { calls.push('audit'); return 'ok'; },
+        resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+        checkStuckAuditFn: (id) => { cleanupCalls.push(id); return false; },
+      },
+    );
+    assert.equal(result.status, 'passing');
+    assert.deepEqual(calls, ['audit']);
+    assert.deepEqual(cleanupCalls, ['SA-1']);
+  });
+
+  test('checks for a leftover state file when the runner is SIGKILLed', async () => {
+    const mod = await import(MODULE_PATH);
+    const cleanupCalls = [];
+    const result = await mod.attemptAuditRemediation(
+      { id: 'SA-1', title: 'Item' },
+      {
+        runAuditShow: () => '{}',
+        runAuditCommand: () => {
+          const err = new Error('killed');
+          err.signal = 'SIGKILL';
+          err.status = null;
+          throw err;
+        },
+        resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+        checkStuckAuditFn: (id) => { cleanupCalls.push(id); return true; },
+      },
+    );
+
+    assert.equal(result.status, 'runner-failed');
+    assert.equal(result.category, 'timeout');
+    // The cleanup ran on the failure path — this is the SIGKILL case.
+    assert.deepEqual(cleanupCalls, ['SA-1']);
+  });
+});

@@ -31,7 +31,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -54,6 +54,103 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..', '..', '..');
 const HOME_DIR = homedir();
+
+// ------------------------------------------------------------------
+// Abort-recovery: leftover audit state cleanup (SA-0MTRH8C5O005URGR).
+// When the audit runner is killed (SIGKILL) it cannot remove its
+// abort-recovery state file. The parent process checks for leftover
+// files after each execSync and restores the work item if needed.
+// ------------------------------------------------------------------
+
+/**
+ * Build the shell command that restores a work item to its pre-audit state.
+ *
+ * Exported for testability and reuse. The command mirrors the audit
+ * runner's own restore branch (``_apply_terminal_lifecycle``) — never a
+ * bare ``wl update`` without the captured state.
+ *
+ * @param {string} issueId - The work item id.
+ * @param {string} status - The captured pre-audit status.
+ * @param {string} [stage] - The captured pre-audit stage.
+ * @returns {string} The ``wl update`` command string.
+ */
+export function buildAbortRestoreCommand(issueId, status, stage) {
+  return (
+    `wl update ${issueId} --status ${status} ` +
+    `--stage ${stage || 'plan_complete'} ` +
+    `--assignee "" --json`
+  );
+}
+
+/**
+ * Check for a leftover audit state file and restore the work item
+ * if the audit runner was killed before cleaning up.
+ *
+ * When the audit runner is SIGKILLed it cannot run its ``finally`` block,
+ * so the pre-audit state file it wrote before the ``in_progress`` claim is
+ * left behind. This function finds that file and restores the item — the
+ * parent-process half of the abort-recovery contract
+ * (SA-0MTRH8C5O005URGR).
+ *
+ * Boundaries are injectable (mirroring the other gate helpers) so unit
+ * tests are hermetic — no live ``wl`` invocations.
+ *
+ * @param {string} workItemId - The work item id to check.
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {string|null} [options.baseDir] - Base directory for state files;
+ *   defaults to the repo root, then /tmp.
+ * @param {object} [options.fsMod] - fs-like module (``existsSync``,
+ *   ``readFileSync``, ``unlinkSync``); defaults to ``node:fs``.
+ * @param {(cmd: string) => string} [options.runCommand] - Command runner;
+ *   defaults to ``execSync``.
+ * @returns {boolean} True if a leftover state file was found and restored.
+ */
+export function checkAndRestoreStuckAudit(workItemId, options = {}) {
+  const {
+    baseDir = null,
+    fsMod = { existsSync, readFileSync, unlinkSync },
+    runCommand = (cmd) => execSync(
+      cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ),
+  } = options;
+
+  // State file naming: .audit_state_<id>.json — matches audit_runner.py.
+  const dirs = [
+    baseDir,
+    REPO_ROOT,
+    '/tmp',
+  ].filter(Boolean);
+
+  for (const dir of dirs) {
+    const stateFile = join(dir, `.audit_state_${workItemId}.json`);
+    if (fsMod.existsSync(stateFile)) {
+      try {
+        const data = JSON.parse(fsMod.readFileSync(stateFile, 'utf-8'));
+        if (data.issue_id === workItemId && data.original_status) {
+          console.log(
+            `Aborted audit for ${workItemId}: restoring "${data.original_status}" "${data.original_stage || 'plan_complete'}".`,
+          );
+          runCommand(
+            buildAbortRestoreCommand(
+              data.issue_id, data.original_status, data.original_stage,
+            ),
+          );
+        }
+      } catch (err) {
+        // Best-effort: silently ignore corrupt state files.
+      } finally {
+        // Always remove the file, even if restore failed.
+        try {
+          fsMod.unlinkSync(stateFile);
+        } catch (err) {
+          // Best-effort cleanup.
+        }
+      }
+      return true;
+    }
+  }
+  return false;
+}
 
 // ── getCandidateItems ────────────────────────────────────────────────────────
 
@@ -528,13 +625,25 @@ export function checkProducerReviewStatus(items) {
  *   Runs the audit runner for the item.
  * @param {() => string} boundaries.resolveAuditRunnerFn - Resolves the audit
  *   runner script path.
+ * @param {(workItemId: string) => boolean} [boundaries.checkStuckAuditFn] -
+ *   Abort-recovery cleanup; defaults to {@link checkAndRestoreStuckAudit}.
+ *   Injectable for hermetic tests.
  * @returns {Promise<{ status: 'passing'|'blocking'|'runner-failed', reason: string, summary: string|null }>}
  */
-export async function attemptAuditRemediation(workItem, { runAuditShow, runAuditCommand, resolveAuditRunnerFn }) {
+export async function attemptAuditRemediation(workItem, { runAuditShow, runAuditCommand, resolveAuditRunnerFn, checkStuckAuditFn = checkAndRestoreStuckAudit }) {
   try {
     const runnerPath = resolveAuditRunnerFn();
     runAuditCommand(runnerPath, workItem.id);
+    // Abort-recovery (SA-0MTRH8C5O005URGR): if the audit runner was
+    // killed (SIGKILL) it cannot run its finally block — restore the
+    // work item from the leftover state file.
+    checkStuckAuditFn(workItem.id);
   } catch (err) {
+    // Abort-recovery (SA-0MTRH8C5O005URGR): a SIGKILLed audit runner
+    // surfaces here (execSync throws with status null / signal SIGKILL)
+    // and cannot run its own finally block — restore the work item from
+    // the leftover state file before classifying the failure.
+    checkStuckAuditFn(workItem.id);
     // Classify the failure so an infrastructure problem (timeout/concurrency/
     // provider) is distinguishable from a genuine verdict
     // (SA-0MUOO5V0P00461X8). The "Audit remediation failed" prefix is retained

@@ -71,6 +71,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import itertools
 import json
@@ -79,6 +80,7 @@ import os
 import re
 import select
 import shlex
+import signal
 import statistics
 import subprocess
 import sys
@@ -1427,6 +1429,23 @@ targets the audited project. ``None`` outside a run, where the cwd-derived
 run completes so it never leaks across audits.
 """
 
+# ------------------------------------------------------------------
+# Abort-recovery state file (SA-0MTRH8C5O005URGR).
+# When the audit runner claims a work item as in_progress, it writes
+# the pre-audit state to a temporary file.  If the process is killed
+# (SIGKILL / OOM / host reboot) Python cannot catch the signal so the
+# try/finally block never runs.  The parent process (check-audit-gate.js
+# / run-release) checks for leftover state files after the child exits
+# and restores the original status when it finds one.
+# ------------------------------------------------------------------
+_AUDIT_STATE_FILE_ENV = "AUDIT_ABSTATE_FILE"
+"""Optional directory for the abort-recovery state file.
+
+When set, the state file is written to this directory (the audit
+runner's worktree root or a temp directory).  When unset the state
+file is written to a temporary file in the system temp directory.
+"""
+
 
 def _audit_target_root(project_root: Path | None = None) -> Path:
     """Resolve the target project root for a residual consumer.
@@ -1437,6 +1456,166 @@ def _audit_target_root(project_root: Path | None = None) -> Path:
     callers and the existing test suite).
     """
     return project_root or _ACTIVE_AUDIT_ROOT or TARGET_PROJECT_ROOT
+
+
+# ------------------------------------------------------------------
+# Abort-recovery helpers (SA-0MTRH8C5O005URGR).
+# ------------------------------------------------------------------
+
+def _write_audit_state_file(issue_id: str, original_status: str,
+                            original_stage: str,
+                            worklog_dir: str | None = None) -> str:
+    """Write the abort-recovery state file and return its path.
+
+    Writes a JSON file containing the pre-audit state so that a parent
+    process can restore the work item if the audit runner is killed
+    (SIGKILL, OOM, host reboot).
+
+    Returns the path to the state file (always set even on write failure).
+    """
+    state = {
+        "issue_id": issue_id,
+        "original_status": original_status,
+        "original_stage": original_stage,
+    }
+    state_path = _resolve_state_path(issue_id, worklog_dir=worklog_dir)
+    try:
+        with open(state_path, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass  # best-effort; the caller still records the path
+    return state_path
+
+
+def _resolve_state_path(issue_id: str,
+                        worklog_dir: str | None = None) -> str:
+    """Resolve the file path for the abort-recovery state file."""
+    env_dir = os.environ.get(_AUDIT_STATE_FILE_ENV)
+    if env_dir:
+        return os.path.join(env_dir, f".audit_state_{issue_id}.json")
+    # Default: use a temp directory path based on the issue id.
+    # When worklog_dir is available, place it there for easy cleanup by
+    # the parent process; otherwise fall back to the system temp dir.
+    base = worklog_dir or "/tmp"
+    return os.path.join(base, f".audit_state_{issue_id}.json")
+
+
+def _remove_audit_state_file(state_path: str) -> None:
+    """Remove the abort-recovery state file (best-effort)."""
+    try:
+        os.remove(state_path)
+    except OSError:
+        pass
+
+
+def _restore_work_item_status(issue_id: str, original_status: str,
+                              original_stage: str,
+                              worklog_dir: str | None = None) -> int:
+    """Restore a work item to its pre-audit status/stage.
+
+    Called by signal handlers when the process is interrupted.  This is a
+    lightweight version of ``_apply_terminal_lifecycle`` that does not
+    depend on the ``_AuditContext`` — it directly invokes ``wl update``
+    to restore the captured state.
+
+    Returns 0 on success, non-zero on failure.
+    """
+    safe_status, safe_stage = _coerce_valid_status_stage(
+        original_status, original_stage,
+    )
+    try:
+        cmd = [
+            "wl", "update", issue_id,
+            "--status", safe_status,
+            "--stage", safe_stage,
+            "--assignee", "",
+            "--json",
+        ]
+        if worklog_dir:
+            # Inject --worklog-dir so the update reaches the correct store.
+            full_cmd = ["wl"]
+            flags = _resolve_worklog_flags(cmd, explicit_dir=worklog_dir)
+            full_cmd[1:1] = flags
+            full_cmd.extend(cmd[1:])  # skip duplicate "wl"
+        else:
+            full_cmd = cmd
+        subprocess.run(
+            full_cmd, capture_output=True, text=True, timeout=30, check=False,
+        )
+        return 0
+    except Exception:  # noqa: BLE001 -- best-effort signal handler
+        return 1
+
+
+def _register_abort_signal_handlers(
+        issue_id: str, original_status: str, original_stage: str,
+        state_path: str, worklog_dir: str | None = None) -> Callable[[], None]:
+    """Register signal handlers for SIGTERM and SIGINT.
+
+    The handlers restore the pre-audit status and then re-raise the
+    signal so the process terminates.  This covers the case where the
+    process is killed mid-try-block (SIGTERM doesn't run finally blocks;
+    only SIGINT raises KeyboardInterrupt which triggers finally).
+
+    SIGKILL cannot be caught — that case is handled by the parent
+    process checking for leftover state files.
+
+    Returns a deactivation callable.  ``cmd_issue`` calls it once the
+    terminal lifecycle has been applied so a signal arriving after the
+    audit completed can never restore the item to its pre-audit state
+    (which would undo a legitimate ``completed``/``in_review`` advance).
+    """
+    # Mutable guard: flipped to False by the returned deactivation
+    # callable.  The handler also checks the state file so a stale handler
+    # (registered by an earlier audit in a long-lived process) is inert.
+    active = {"value": True}
+
+    def _abort_handler(signum, frame):
+        """Restore pre-audit state on process abort."""
+        if not active["value"]:
+            # The audit already completed and cleaned up — just terminate.
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        # A signal handler must never raise: swallow any restore failure
+        # and always clean up + re-signal.
+        with contextlib.suppress(Exception):
+            _restore_work_item_status(
+                issue_id, original_status, original_stage,
+                worklog_dir=worklog_dir,
+            )
+        with contextlib.suppress(Exception):
+            _remove_audit_state_file(state_path)
+        # Restore the default disposition BEFORE re-signalling so the
+        # re-raised signal terminates the process instead of recursing
+        # into this handler.
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _abort_handler)
+        signal.signal(signal.SIGINT, _abort_handler)
+    except ValueError:  # pragma: no cover - non-main thread (e.g. tests)
+        # Signal handlers can only be registered from the main thread of
+        # the main interpreter.  The state-file + parent-side cleanup path
+        # still covers this case (SIGKILL / parent restore).
+        pass
+
+    def _deactivate() -> None:
+        """Disable the handlers once the audit's lifecycle is settled."""
+        active["value"] = False
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(sig, signal.SIG_DFL)
+
+    return _deactivate
+
+
+def _cleanup_audit_state(state_path: str) -> None:
+    """Clean up the abort-recovery state file (called on normal exit)."""
+    _remove_audit_state_file(state_path)
 
 
 SIBLING_SCAN_ROOT: Path = SHARED_SIBLING_SCAN_ROOT
@@ -7943,6 +8122,17 @@ class _AuditContext:
     audit_verdict: str | None = None
     audit_completed: bool = False
 
+    # Abort-recovery state file path (SA-0MTRH8C5O005URGR).
+    # Set by ``_phase_gate`` when the pre-audit state is written before
+    # the ``in_progress`` claim; cleared by ``cmd_issue``'s finally block
+    # (or by the signal handler on abort).
+    abort_state_path: str | None = None
+    abort_deactivate: Callable[[], None] | None = None
+    """Deactivation callable for the SIGTERM/SIGINT handlers registered by
+    ``_phase_gate``.  Invoked by ``cmd_issue``'s finally block once the
+    terminal lifecycle has been applied, so a late signal cannot undo a
+    legitimate terminal transition (SA-0MTRH8C5O005URGR)."""
+
     # Merge gate state (SA-0MT456M27001LRTL — Phase 1 merge gate)
     merge_gate_merged: bool = False
     """True when the merge gate confirmed (or integrated) the item into dev."""
@@ -8878,8 +9068,8 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # (SA-0MSL1Z7E9005TLBA) — a single ``wl show`` serves both the status
     # capture and the freshness fingerprint/time-gate computation.
     # ------------------------------------------------------------------
-    original_status = "open"  # safe default
-    original_stage = ""       # safe default (unknown)
+    original_status: str = "open"  # safe default
+    original_stage: str = ""       # safe default (unknown)
     wi: dict | None = None
     wi_comments: list = []
     try:
@@ -9008,6 +9198,18 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
         return 1
 
     # ------------------------------------------------------------------
+    # Abort-recovery state file (SA-0MTRH8C5O005URGR).
+    # Write the pre-audit state BEFORE claiming in_progress so that if
+    # the process is killed (SIGKILL) the parent process can restore the
+    # work item to its original state.
+    # ------------------------------------------------------------------
+    state_path = _write_audit_state_file(
+        issue_id, original_status, original_stage,
+        worklog_dir=worklog_dir,
+    )
+    ctx.abort_state_path = state_path
+
+    # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry (verdict-driven on exit)
     # ------------------------------------------------------------------
     # A completed/done item is already terminal and cannot be claimed with
@@ -9020,6 +9222,19 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
         _run_wl(runner,
                 ["wl", "update", issue_id, "--status", "in_progress", "--json"],
                 worklog_dir=worklog_dir)
+
+    # ------------------------------------------------------------------
+    # Register SIGTERM/SIGINT signal handlers (SA-0MTRH8C5O005URGR).
+    # Python's default SIGTERM disposition terminates without running
+    # finally blocks, and SIGKILL cannot be caught at all.  The handler
+    # restores the pre-audit status and re-raises so the process still
+    # terminates normally.  SIGKILL is handled by the parent-process
+    # state-file check on exit.
+    # ------------------------------------------------------------------
+    ctx.abort_deactivate = _register_abort_signal_handlers(
+        issue_id, original_status, original_stage,
+        state_path, worklog_dir=worklog_dir,
+    )
 
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
@@ -12614,14 +12829,31 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # failure (e.g. a silently-swallowed ``wl update``) overrides the
         # run's exit code with a non-zero value so it is never a silent
         # success (WL-0MSVVFBJ2003RRYK).
-        lifecycle_rc = _apply_terminal_lifecycle(ctx)
-        if lifecycle_rc != 0:
-            rc = lifecycle_rc
-        # Release the per-audit root published for deep helpers
-        # (SA-0MULGDABC001T11L) now that the run — including debug-log
-        # cleanup — is complete, so it never leaks into a later audit.
-        global _ACTIVE_AUDIT_ROOT
-        _ACTIVE_AUDIT_ROOT = None
+        #
+        # Deactivate the abort signal handlers FIRST (SA-0MTRH8C5O005URGR):
+        # once the terminal lifecycle runs, the audit is no longer "in
+        # progress", so a signal arriving during/after it must never
+        # restore the item to its pre-audit state and undo a legitimate
+        # terminal transition.
+        if ctx.abort_deactivate is not None:
+            with contextlib.suppress(Exception):
+                ctx.abort_deactivate()
+        try:
+            lifecycle_rc = _apply_terminal_lifecycle(ctx)
+            if lifecycle_rc != 0:
+                rc = lifecycle_rc
+        finally:
+            # Release the per-audit root published for deep helpers
+            # (SA-0MULGDABC001T11L) now that the run — including debug-log
+            # cleanup — is complete, so it never leaks into a later audit.
+            global _ACTIVE_AUDIT_ROOT
+            _ACTIVE_AUDIT_ROOT = None
+            # Clean up the abort-recovery state file so the parent process
+            # knows the child exited cleanly (SA-0MTRH8C5O005URGR).  The
+            # nested finally guarantees the cleanup even if the terminal
+            # lifecycle raises unexpectedly.
+            if ctx.abort_state_path:
+                _cleanup_audit_state(ctx.abort_state_path)
     if rc == 0 and ctx.checkpoint is not None:
         if ctx.checkpoint.budget_exceeded_children():
             # Budget-exceeded children remain unverified: KEEP the checkpoint
