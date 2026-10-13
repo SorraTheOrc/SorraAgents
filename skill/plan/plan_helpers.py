@@ -93,6 +93,16 @@ def _parse_key_files_section(text: str) -> list[str]:
             # Stop at the next heading or blank-line break before another section
             if stripped.startswith("**") and stripped != "**":
                 break
+            # Stop at Markdown ATX headings (1–6 '#' chars followed by whitespace),
+            # e.g. `# Title`, `## Title`, `###### Title` (CommonMark ATX spec).
+            if stripped and stripped[0] == "#":
+                # Count the leading '#' run; a heading requires 1–6 hashes
+                # followed by whitespace (or the line ends there).
+                hash_run = len(stripped) - len(stripped.lstrip("#"))
+                if 1 <= hash_run <= 6 and (
+                    len(stripped) == hash_run or stripped[hash_run] in (" ", "\t")
+                ):
+                    break
             if stripped.startswith("- "):
                 bullet = stripped[2:].strip()
                 # Try to extract path from backticks first

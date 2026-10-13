@@ -137,6 +137,50 @@ No files listed."""
         # The first bullet has no path, so only the valid one counts
         assert issues == []
 
+    def test_stops_at_atx_heading_double(self):
+        """Key Files section must stop at a ## heading — AC bullets are not parsed as paths."""
+        text = """\
+**Key Files:**
+- `src/main.py`
+
+## Acceptance Criteria
+- [ ] `mod.main()` is still invoked"""
+        issues = validate_key_files_format(text)
+        assert issues == []
+
+    def test_stops_at_atx_heading_triple(self):
+        """Key Files section must stop at a ### heading too."""
+        text = """\
+**Key Files:**
+- `src/main.py`
+
+### Notes
+- `src/other.py` — should not be parsed"""
+        issues = validate_key_files_format(text)
+        assert issues == []
+
+    def test_stops_at_atx_heading_single(self):
+        """Key Files section must stop at a single # heading."""
+        text = """\
+**Key Files:**
+- `src/main.py`
+
+# Other Section
+- `src/fake.py`"""
+        issues = validate_key_files_format(text)
+        assert issues == []
+
+    def test_stops_at_atx_heading_six(self):
+        """Key Files section must stop at a ###### heading."""
+        text = """\
+**Key Files:**
+- `src/main.py`
+
+###### Tiny Heading
+- `src/fake.py`"""
+        issues = validate_key_files_format(text)
+        assert issues == []
+
 
 # =========================================================================
 # 2. validate_key_files_in_description — integraton-style checks
