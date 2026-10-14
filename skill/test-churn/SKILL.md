@@ -112,9 +112,7 @@ for the metric definitions, migration provenance and worked examples.
 
 ## Tests
 
-Unit and end-to-end tests live under `tests/` in this skill directory. Run
-them from the repository root with:
-
-```bash
-python3 -m pytest "$(skill_path test-churn)/tests/"
-```
+Unit and end-to-end tests live under `tests/` in this skill directory.
+Agent test execution must go through the test skill (`/skill:test`) —
+the Test execution policy in AGENTS_GLOBAL.md prohibits direct
+`pytest` invocations.

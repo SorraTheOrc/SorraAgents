@@ -277,7 +277,9 @@ than stacking a second one.
   supply use-case strings.
 
 Tests: `./tests/test_render_report.py` (offline — fixture JSON,
-no live `wl` calls). Run with `python3 -m pytest ./tests`.
+no live `wl` calls). Agent test execution must go through the
+test skill (`/skill:test`) — the Test execution policy in
+AGENTS_GLOBAL.md prohibits direct `pytest` invocations.
 
 ## Example rendered report
 

@@ -193,6 +193,16 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > new measured surface with justification rather than compacting the safety
 > text (SA-0MUN83EAF000G903 AC3).
 >
+> **Test execution policy bump (2026-10-14, SA-0MTYIMWQP0020ZUC / SA-0MV7TQOR4000RSFH):**
+> the universal **Test execution policy** section (`## Test execution policy` —
+> agents must never invoke test commands directly; every agent-initiated run
+> goes through the test skill) added ~596 B to `AGENTS_GLOBAL.md`
+> (`global_agents 11832` → `12428`; `total 17327` → `17923`; `project_agents`
+> and `skills_prose` unchanged). The addition is deliberate policy applied to
+> every project, so the thresholds were regenerated to the new measured
+> surface with justification (AC2 of SA-0MTYIMWQP0020ZUC) rather than
+> compacting the policy text.
+>
 > **Worktree-isolation guidance bump (2026-10-07, SA-0MUY9PSRS003V5CM):**
 > strengthening the "MANDATORY — worktree requirement" in `AGENTS_GLOBAL.md`
 > (stating that `cwd` is not sufficient, that a child/driven session must
