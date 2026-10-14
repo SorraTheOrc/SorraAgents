@@ -45,8 +45,11 @@ subprocesses, no randomness):
 from __future__ import annotations
 
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
+
+from tests.skill_inventory import tracked_skill_names
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -255,11 +258,25 @@ def _format_violations(violations: list[Violation]) -> str:
 
 
 def _agent_facing_docs() -> list[Path]:
-    """AGENTS_GLOBAL.md, skill/*/SKILL.md and command/*.md (non-recursive)."""
+    """AGENTS_GLOBAL.md, skill/*/SKILL.md and command/*.md (non-recursive),
+    restricted to **git-tracked** skill dirs.
+
+    An untracked ``skill/<name>/`` directory is a concurrent agent/operator's
+    uncommitted WIP; scanning it would turn the full suite red in the main
+    checkout for work that is not part of the repo (SA-0MUU206QT001M66F /
+    SA-0MUQ96V5W000TMTU) — exactly the same exclusion the sibling
+    doc-conformance guard ``tests/test_skill_path_conventions.py`` applies
+    via ``tests/skill_inventory.tracked_skill_names``. When git is
+    unavailable (exported tarball / non-git checkout) the fallback scans
+    every directory so the gate is never silently emptied.
+    """
     docs = [_REPO_ROOT / "AGENTS_GLOBAL.md"]
-    docs += sorted((_REPO_ROOT / "skill").glob("*/SKILL.md"))
+    skill_docs = sorted((_REPO_ROOT / "skill").glob("*/SKILL.md"))
     docs += sorted((_REPO_ROOT / "command").glob("*.md"))
-    return [p for p in docs if p.is_file()]
+    tracked = tracked_skill_names(_REPO_ROOT)
+    if tracked is not None:
+        skill_docs = [p for p in skill_docs if p.parent.name in tracked]
+    return [p for p in [*docs, *skill_docs] if p.is_file()]
 
 
 # ── The conformance gate ────────────────────────────────────────────────────
@@ -286,6 +303,41 @@ def test_scan_covers_all_agent_facing_docs() -> None:
     assert len(skills) >= 10, "expected the full skill/*/SKILL.md set"
     commands = [r for r in rels if r.startswith("command/") and r.endswith(".md")]
     assert len(commands) >= 1, "expected command/*.md files to be scanned"
+
+
+def test_untracked_skill_dir_excluded_from_scan(tmp_path: Path) -> None:
+    """A git-untracked ``skill/<name>/`` dir (concurrent-agent WIP, e.g.
+    ``skill/pane-triage/`` git-excluded via ``.git/info/exclude``) must NOT
+    be part of the scan surface — otherwise the conformance gate turns the
+    full suite red in the main checkout for work outside the repo
+    (SA-0MUU206QT001M66F / SA-0MUQ96V5W000TMTU). Recreates the exact
+    regression that fired ``documented direct-test-command directive in
+    skill/pane-triage/SKILL.md`` in the main checkout (SA-0MV8BBUPW0029STI):
+    a temp untracked skill dir is created in the repo, then the gate
+    must not flag it while still covering all tracked skill docs."""
+    # A temp untracked skill dir holding a prohibited directive (the exact
+    # pane-triage shape: `## Tests` fenced `python3 -m pytest tests/ -q`).
+    temp_skill = _REPO_ROOT / "skill" / "temp-execpoliticyscan-untracked-skill"
+    skill_md = temp_skill / "SKILL.md"
+    try:
+        temp_skill.mkdir(parents=True, exist_ok=True)
+        skill_md.write_text(
+            "---\nname: temp-execpoliticyscan\ndescription: temp.\n---\n\n"
+            "## Tests\n\n```bash\npython3 -m pytest tests/ -q\n```\n",
+            encoding="utf-8",
+        )
+        # The untracked dir must not be in the scan surface.
+        rels = [_repo_relative_label(p) for p in _agent_facing_docs()]
+        assert "skill/temp-execpoliticyscan-untracked-skill/SKILL.md" not in rels
+        # Tracked skill docs remain covered.
+        assert any(
+            r.startswith("skill/") and r.endswith("/SKILL.md") for r in rels
+        )
+        # And the gate itself stays green (no violation from the WIP dir).
+        assert scan_docs(_agent_facing_docs()) == []
+    finally:
+        if temp_skill.exists():
+            shutil.rmtree(temp_skill)
 
 
 # ── Sanity: the gate must be able to fire (fixtures) ────────────────────────
