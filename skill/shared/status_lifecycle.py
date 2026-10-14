@@ -100,6 +100,29 @@ def _normalise_status(status: object) -> str:
     return status.replace("_", "-")
 
 
+def _is_soft_deleted(work_item: object) -> bool:
+    """Whether a work-item dict has been soft-deleted.
+
+    ``wl delete`` sets ``deletedBy`` (and ``deleteReason``) and may leave the
+    status untouched (e.g. ``open``). A non-empty ``deletedBy`` is therefore
+    the authoritative deletion marker: such an item must never be claimed,
+    otherwise the downtime dispatcher re-selects it and works it a second
+    time (SA-0MUJBLZC60085DI9). Blank/whitespace values are treated as
+    "not deleted" so legacy rows with empty strings remain claimable.
+
+    Args:
+        work_item: A work-item dict from ``wl show``/``wl list`` (or any
+            object).
+
+    Returns:
+        True when ``deletedBy`` is a non-blank string.
+    """
+    if not isinstance(work_item, dict):
+        return False
+    deleted_by = work_item.get("deletedBy", "")
+    return isinstance(deleted_by, str) and deleted_by.strip() != ""
+
+
 # Valid workflow stages accepted by the ``wl`` CLI (default schema).
 #
 # Kept in sync with the worklog CLI's default stage configuration
@@ -665,6 +688,11 @@ class StatusLifecycle:
         """
         data = StatusLifecycle.show(work_item_id, runner=runner)
         wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+        if _is_soft_deleted(wi):
+            raise ClaimError(
+                f"Work item {work_item_id} is soft-deleted and must not be claimed or mutated. "
+                f"A deleted item can never be worked; create a new work item instead."
+            )
         status = wi.get("status", "") if isinstance(wi, dict) else ""
         if _normalise_status(status) != "in-progress":
             raise ClaimError(
@@ -706,6 +734,11 @@ class StatusLifecycle:
         """
         data = StatusLifecycle.show(work_item_id, runner=runner)
         wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+        if _is_soft_deleted(wi):
+            raise ClaimError(
+                f"Work item {work_item_id} is soft-deleted and must not be claimed or mutated. "
+                f"A deleted item can never be worked; create a new work item instead."
+            )
         status = wi.get("status", "") if isinstance(wi, dict) else ""
         if _normalise_status(status) == "in-progress":
             LOG.debug("ensure_claimed: %s already in-progress — no-op", work_item_id)
