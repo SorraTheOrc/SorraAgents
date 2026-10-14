@@ -128,6 +128,12 @@ Two lifecycle axes, managed independently:
 
 Before `in_review`, run the full suite via `/skill:test`; triage failures into critical `test-failure` work items ([triage skill](/home/rgardler/.pi/agent/skills/triage/SKILL.md)). **All tests must pass** before `in_review`.
 
+## Test execution policy
+
+Agents must **never** invoke test commands directly — no ad-hoc `pytest`, `npm test`, `vitest`, `node --test`, or equivalent invocations. **Every agent-initiated test run goes through the test skill** (`/skill:test`, `run_tests.py`), covering full/changed scope and unit/smoke types. **No exceptions** for agent-initiated runs.
+
+Automated infrastructure gates (pre-push hook, `implement.py finish`, audit F3 cache miss) execute test commands directly as part of their own logic; these are **infrastructure**, not agent runs, and are **out of scope** for this policy.
+
 ## Work-Item Management
 
 Run `wl --help` / `wl <cmd> --help` for full docs (create, update, comment, close, dep, sync, github import/push, plugins). **NEVER run `wl list` without a search term** — use `wl list <term> --json` (substring, matches filenames/paths/ids) or `wl search <keywords> --json` (FTS).
