@@ -44,6 +44,25 @@ def implement_mod():
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _neutralise_ambient_drive_guard(monkeypatch):
+    """Neutralise an ambient ``IMPLEMENT_DRIVE_ACTIVE`` for this module.
+
+    A driven child session exports ``IMPLEMENT_DRIVE_ACTIVE=1`` (so its own
+    agent cannot recursively re-enter ``drive``). When the full suite runs
+    inside that driven session (as ``implement.py finish`` / the pre-push hook
+    do), pytest inherits the variable and every ``phase_drive`` unit test
+    here that does not itself set the variable hits the recursion guard,
+    failing the run with "Refusing to drive from within a driven child
+    session" (SA-0MV8HEQ4O009Y3UB). Deleting the variable for the duration
+    of each test makes the module hermetic against the host environment; the
+    dedicated recursion-guard test re-sets it explicitly and is unaffected.
+    """
+    monkeypatch.delenv(
+        "IMPLEMENT_DRIVE_ACTIVE", raising=False,
+    )
+
+
 class ScriptedParent:
     """Return a scripted sequence of ``phase_parent`` reports, one per call."""
 
@@ -360,3 +379,51 @@ class TestDefaultSessionSpawner:
         assert result["success"] is False
         assert result["returncode"] == 3
         assert "exited with code 3" in result["reason"]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MV8HEQ4O009Y3UB — hermetic against the driven-session ambient guard
+# ---------------------------------------------------------------------------
+
+
+class TestHermeticAgainstDrivenAmbientGuard:
+    """The full suite must pass when run *inside* a driven child session.
+
+    ``implement.py finish`` in a driven child runs pytest with
+    ``IMPLEMENT_DRIVE_ACTIVE=1`` exported (the recursion guard that stops the
+    child's own agent re-entering ``drive``). Every ``phase_drive`` unit test
+    in this module inherited that ambient variable and hit the recursion
+    guard, failing the whole suite with "Refusing to drive from within a
+    driven child session" (SA-0MV8HEQ4O009Y3UB). The autouse fixture
+    neutralises the ambient variable; this proof runs the module under a
+    nested pytest with the variable exported to confirm the exact
+    driven-session scenario passes.
+    """
+
+    def test_module_passes_when_ambient_guard_var_is_exported(self, tmp_path):
+        """Run this module in a subprocess with ``IMPLEMENT_DRIVE_ACTIVE=1``
+        set in the environment, as ``implement.py finish`` does inside a
+        driven child, and assert the whole module exits green."""
+        env = dict(os.environ)
+        env["IMPLEMENT_DRIVE_ACTIVE"] = "1"
+        env.pop("PI_SESSION_ID", None)
+        env.pop("PI_SESSION_FILE", None)
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                "-p", "no:randomly",
+                "-k", "not module_passes_when_ambient_guard_var_is_exported",
+                str(_REPO_ROOT / "tests" / "test_implement_drive.py"),
+            ],
+            cwd=str(_REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, (
+            f"module must pass under IMPLEMENT_DRIVE_ACTIVE=1\n{combined}"
+        )
+        assert "Refusing to drive from within a driven child" not in combined
