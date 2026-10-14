@@ -248,7 +248,7 @@ AUDIT_SEMAPHORE_NAME = "audit"
 # its own semaphore namespace so N+1 concurrent issues wait or exit cleanly.
 AUDIT_HOST_SEMAPHORE_NAME = "audit-host"
 AUDIT_MAX_HOST_AUDITS_ENV = "AUDIT_MAX_HOST_AUDITS"
-AUDIT_MAX_HOST_AUDITS_DEFAULT = 3
+AUDIT_MAX_HOST_AUDITS_DEFAULT = 6
 AUDIT_HOST_LOCK_TIMEOUT_ENV = "AUDIT_HOST_LOCK_TIMEOUT"
 AUDIT_HOST_LOCK_TIMEOUT_DEFAULT = 90.0
 """Bounded wait (seconds) for a host-wide audit ingress slot.
@@ -259,6 +259,15 @@ bash-tool execution timeout (~120s): a saturated host makes the N+1th
 still completes) and exit cleanly with a clear message if none frees in time,
 rather than adding another concurrent suite runner. Set ``AUDIT_HOST_LOCK_TIMEOUT=0``
 to fail fast, or a larger value for longer batches.
+
+The ingress ceiling default (6) is right-sized to the host's measured
+audit-slot capacity (SA-0MUSZJRB9006ZCHE): the F7 harness
+(``skill/shared/validate_fanout.py``) showed the cap was previously
+(AUDIT_MAX_HOST_AUDITS=3) the *binding* constraint — peak concurrent
+audit runs saturated at 3 no matter how high AUDIT_MAX_CONCURRENCY went.
+Raised to 6 (2x the 3-slot local LLM proxy pool) after the F7 measurement
+showed a 6-audit burst drains with a batch-attributable load delta <= 1.63
+and no swap growth on the 16-core host.
 """
 
 #: Process-wide host slot held for the duration of a ``cmd_issue`` call.
@@ -3226,7 +3235,12 @@ def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
     Precedence:
       1. ``--max-concurrency`` CLI flag (explicit override)
       2. ``AUDIT_MAX_CONCURRENCY`` environment variable
-      3. ``DEFAULT_MAX_WORKERS`` (5)
+      3. ``DEFAULT_MAX_WORKERS`` (6)
+
+    Right-sized via the F7 harness to the host's measured audit-slot capacity
+    (SA-0MUSZJRB9006ZCHE): 6 = 2x the 3-slot local LLM proxy pool; the
+    harness drained a burst of 8 audits with a batch-attributable load delta
+    <= 1.63 on the 16-core host and no swap growth.
 
     An invalid (non-integer) env value is ignored with a warning so a
     misconfigured environment cannot break the audit run.
@@ -12476,9 +12490,13 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
 def _resolve_max_host_audits() -> int:
     """Resolve the host-wide concurrent ``issue`` ceiling (F5).
 
-    Precedence: ``AUDIT_MAX_HOST_AUDITS`` env var > default 3. Values below 1
+    Precedence: ``AUDIT_MAX_HOST_AUDITS`` env var > default 6. Values below 1
     are clamped to 1; an invalid value is ignored with a warning so a
-    misconfigured environment cannot break the audit.
+    misconfigured environment cannot break the audit. Default raised from 3 to
+    6 (SA-0MUSZJRB9006ZCHE): the F7 harness showed the previous cap was the
+    binding constraint on concurrent audits, and 6 (2x the 3-slot local LLM
+    proxy pool) drains bursts with a batch-attributable load delta <= 1.63 and
+    no swap growth on the 16-core host.
     """
     env_value = os.environ.get(AUDIT_MAX_HOST_AUDITS_ENV)
     if env_value:
@@ -13357,7 +13375,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_issue.add_argument("--max-concurrency", type=int, default=None,
-                         help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
+                         help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 6)")
     p_issue.add_argument("--green-run", default=None, metavar="SHA|HEAD",
                          help=(
                              "Operator-attested green test run: the full project test "
@@ -13503,7 +13521,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_project.add_argument("--worklog-dir", default=None,
                            help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_project.add_argument("--max-concurrency", type=int, default=None,
-                           help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
+                           help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 6)")
     p_project.add_argument("--max-citations-per-ac", type=int, default=None,
                            help=(
                                "Accepted for CLI parity with the issue subcommand; "

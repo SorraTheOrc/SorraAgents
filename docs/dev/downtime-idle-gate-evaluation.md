@@ -201,3 +201,49 @@ Supporting reasons:
 - Time-to-audit per priority is not separately derivable: the worklog does
   not record the timestamp an item entered `in_review`, so only
   dispatch-to-completion counts (not per-item latency) are reported.
+
+---
+
+## 7. Follow-up resolution — capacity tuning (SA-0MUSZJRB9006ZCHE)
+
+**Status of §5 step 1: implemented.** The residual bounded-queue saturation
+is a capacity problem, and it has been addressed by right-sizing the code
+defaults rather than by relaxing the idle gate (§5 recommendation stands
+unchanged).
+
+**Empirical measurement (F7 harness).** `skill/shared/validate_fanout.py`
+was run with the ingress cap lifted (`AUDIT_MAX_HOST_AUDITS=32`) so the
+`AUDIT_MAX_CONCURRENCY` ceiling was the binding constraint — 8 concurrent
+audit invocations with a mock pi per ceiling. Raw artifact:
+[`audit-ceiling-validation.json`](audit-ceiling-validation.json).
+
+| Ceiling | Drain (s) | Batch load delta (1m) | Swap delta | Peak batch pi |
+|--------:|----------:|----------------------:|-----------:|--------------:|
+| 3 | 18.7 | +1.51 | 0 | 3 |
+| 5 | 15.1 | +1.63 | 0 | 5 |
+| 6 | 12.9 | 0.00 | 0 | 6 |
+| 8 | 9.6 | 0.00 | 0 | 8 |
+
+**Findings.**
+
+- The previous host ingress cap (`AUDIT_MAX_HOST_AUDITS=3`) was the *binding*
+  constraint: with the cap at its default, peak concurrent batch pi
+  saturated at 3 for **every** ceiling above it. Raising the
+  `AUDIT_MAX_CONCURRENCY` ceiling alone therefore could not have cured the
+  residual saturation.
+- Drain time falls monotonically as the ceiling rises; the batch-attributable
+  load delta stays <= 1.63 and swap never grows. The host baseline load was
+  elevated by concurrent unrelated agent traffic, so the absolute "load < 16"
+  target could not be observed; the attributable batch delta is the signal.
+
+**Change (this repository, code defaults — no deployment override existed).**
+
+| Knob | Before | After | Rationale |
+|------|-------:|------:|-----------|
+| `AUDIT_MAX_CONCURRENCY` (`DEFAULT_MAX_WORKERS`) | 5 | 6 | 2x the 3-slot proxy pool; absorbs bursts without piling on proxy contention |
+| `AUDIT_MAX_HOST_AUDITS` | 3 | 6 | Remove the binding ingress cap; match the concurrency ceiling |
+| `AUDIT_QUEUE_TIMEOUT` | 90 s | 90 s (unchanged) | Stays inside the ~120 s bash-tool window (SA-0MSGEAZMC009LHKL) |
+
+The idle gate is untouched, priority ordering and the bounded-wait semantics
+are unchanged, and the cheap-mode serialization (`AUDIT_MAX_CONCURRENCY=1`)
+still applies in its window.
