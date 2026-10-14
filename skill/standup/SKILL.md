@@ -55,7 +55,7 @@ completions reflect the shared remote state.
 Output only the report defined below — no preamble or postamble. Report is rendered in the first person for TTS. Dates are spoken-form (e.g. "5th September 2026", "4th September 2026 6:00 am"), never ISO timestamps.
 
 ```markdown
-## Standup Report (5th September 2026)
+## <project_name> Standup Report (5th September 2026)
 
 ### Yesterday I completed work on...
 
@@ -90,11 +90,12 @@ or
   - Blocked on work item description, because description of problem
 ```
 
-Herdr selection rendering (smart-selection + grouping):
-`selectWorkItems` keeps all `critical` ∪ `completed/in_review` mandatory and limits
-only "other" items to `browseItemCount`; `regroupWorkItems` then assigns
-`Critical Group N / Group N / Idea / Other / In Review` deterministically from
-`Key Files` paths.
+The project name in the header is resolved by the shared
+`skill.shared.project_name.resolve_project_name()` helper: it reads
+`projectName` from `<worklog_dir>/config.yaml` (honouring
+`--worklog-dir` / `WL_WORKLOG_DIR`), falls back to the `.worklog` parent
+directory name, then the current working directory name. The JSON output of
+generate_report() also carries a `project_name` field for downstream consumers.
 
 Today's focus list includes **all** open critical items (regardless of count) plus additional non-critical items to reach **5 total** where possible. If 5 or more critical items are open, no additional items are shown.
 
@@ -128,7 +129,7 @@ Script internals mirror `fetcher.ts` exactly: `wl next -n N --include-in-progres
 ## Example
 
 ```markdown
-## Standup Report (5th September 2026)
+## Sorra Agents Standup Report (5th September 2026)
 
 ### Yesterday I completed work on...
 

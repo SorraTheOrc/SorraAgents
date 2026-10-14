@@ -63,6 +63,9 @@ try:
 except ModuleNotFoundError as _missing_shared:  # pragma: no cover
     guard_shared_import(_missing_shared.name)
 
+# Re-use the shared project-name resolver (merged via SA-0MUMHH4BB000WEM9)
+from shared.project_name import resolve_project_name  # noqa: E402
+
 DEFAULT_BROWSE_COUNT = 20
 HERDR_CONFIG_PATH = Path.home() / ".config" / "herdr" / "worklog-plugin.json"
 DEFAULT_WINDOW_HOURS = 24
@@ -909,6 +912,8 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
             "start": window_start.isoformat() if window_start else None,
             "end": window_end.isoformat() if window_end else None,
         },
+        # Project name (resolved from config.yaml projectName, then worklog parent dir, then cwd)
+        "project_name": resolve_project_name(worklog_dir=WORKLOG_DIR),
         # compat keys for older callers/tests
         "queue": [format_item(i, verbose) for i in herdr_items_sorted],
         "queue_count": len(herdr_items_sorted),
@@ -918,9 +923,11 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
     }
 
 
-def format_report(data, browse_count=None):
+def format_report(data, browse_count=None, project_name: str | None = None):
     now = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
-    lines = [f"## Standup Report ({format_date_tts(now)})", ""]
+    # Resolve project name: explicit arg > data dict > shared resolver with WORKLOG_DIR
+    name = project_name or data.get("project_name") or resolve_project_name(worklog_dir=WORKLOG_DIR)
+    lines = [f"## {name} Standup Report ({format_date_tts(now)})", ""]
 
     # Prefer TTS-friendly fields if present; fall back to legacy fields for back-compat
     yesterday_lines = data.get("yesterday_tts") if data.get("yesterday_tts") is not None else data.get("yesterday", [])
