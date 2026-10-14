@@ -20,7 +20,7 @@ by construction — no second ranking.
 ## Invocation
 
 ```bash
-python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [--verbose] [--output-path <path>] [--startTime <ISO>] [--duration <hours>] [--worklog-dir <path>] [--no-sync]
+python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [--verbose] [--output-path <path>] [--startTime <ISO>] [--duration <hours>] [--worklog-dir <path>] [--no-sync] [--no-commit]
 ```
 
 | Flag | Default | Description |
@@ -33,6 +33,7 @@ python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [
 | `--duration <hours>` | 24 | Window length in hours |
 | `--worklog-dir <path>` | cwd | Explicit `.worklog` dir (e.g. `/path/to/project/.worklog`); also honored via `WL_WORKLOG_DIR` env var. Bypasses cwd-based resolution so the report works from any directory |
 | `--no-sync` | off | Skip the initial `wl sync` (offline/deterministic runs and tests) |
+| `--no-commit` | off | Skip the git commit + push of the report file just written (offline/deterministic runs and tests). By default the file is committed and the current branch pushed, non-fatally |
 
 Default time window: **24 hours starting at 06:00 the previous day** (yesterday 06:00 → today 06:00). Override with `--startTime` and/or `--duration`.
 
@@ -49,6 +50,30 @@ completions reflect the shared remote state.
   generated from local data and the exit code is unchanged.
 - **Disable** with `--no-sync` for offline or deterministic runs (tests use
   this to stay hermetic).
+
+### Commit-and-push
+
+When the report is written to a file (the default dated path under `standups/`
+or an explicit `--output-path`), the script commits **only that file** and
+pushes the current branch so standup history is versioned automatically.
+
+- **Surgical**: `git add -- <file>` → `git commit -m "…" -- <file>` →
+  `git push`, anchored to the resolved project root (the worklog parent when
+  `--worklog-dir` / `WL_WORKLOG_DIR` is set, otherwise cwd). An unrelated
+  staged change is never swept into the commit.
+- **`main` push guard**: on `main`/`master` the report is committed locally but
+  **not** pushed (warning); the repo policy is "push only to `dev`".
+- **Non-fatal**: a non-git directory, unborn/empty repo, unset author identity,
+  missing upstream, or an offline/rejected push is logged as a warning; the
+  report is still written and the exit code is unchanged.
+- **Idempotent**: re-running with an unchanged report is a no-op ("nothing to
+  commit").
+- **`--json` to stdout writes no file**, so it performs no commit/push.
+- **Disable** with `--no-commit` for offline/deterministic runs.
+
+> The machine-local `standups/` entry in `.git/info/exclude` was a stopgap and
+> has been removed (SA-0MUDYRHVZ005PQP4) — an ignored path would make `git add`
+> silently skip the file and the commit a silent no-op.
 
 ## Report Structure
 
