@@ -79,3 +79,29 @@ def test_test_skill_doc_references_precreated_followup_item() -> None:
     """The doc must reference the pre-created follow-up wiring item."""
     content = _skill_content()
     assert "SA-0MSAC1IAS007I3K8" in content
+
+
+def test_test_skill_doc_references_test_execution_policy() -> None:
+    """The cache-contract paragraph must cross-reference the AGENTS_GLOBAL.md
+    Test execution policy (SA-0MTYIMWQP0020ZUC AC4)."""
+    content = _skill_content()
+    assert "Test execution policy" in content
+    assert "AGENTS_GLOBAL.md" in content
+
+
+def test_test_skill_doc_names_policy_conformance_gate() -> None:
+    """The doc must name the deterministic policy conformance gate so an
+    agent can find the enforcement (SA-0MTYIMWQP0020ZUC AC3/AC4)."""
+    content = _skill_content()
+    assert "tests/test_test_skill_directory.py" in content
+
+
+def test_test_skill_reference_documents_policy_and_conformance_gate() -> None:
+    """The test-skill implementation reference must document the Test
+    execution policy and its conformance gate (SA-0MTYIMWQP0020ZUC AC4)."""
+    ref = _REPO_ROOT / "docs" / "dev" / "test-skill-reference.md"
+    assert ref.exists(), f"reference doc not found at {ref}"
+    content = ref.read_text(encoding="utf-8")
+    assert "Test execution policy" in content
+    assert "tests/test_test_skill_directory.py" in content
+    assert "SA-0MTYIMWQP0020ZUC" in content
