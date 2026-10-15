@@ -516,6 +516,353 @@ class TestNoFalsePositives:
 
 
 # ---------------------------------------------------------------------------
+# SA-0MV8311B3005DNG8 — ownership-based exclusion (nested-pytest proofs)
+#
+# The ownership fix (AC1/AC2/AC3) replaces the ``.worklog/worktrees/``
+# directory anchor with a rule: a ref checked out in a registered worktree
+# **other than the guard's own root** is concurrent-infrastructure churn;
+# everything under the main checkout's ``.worklog/`` (including
+# ``.worklog/tmp-worktree-*``) is churn; and the guard root's own branch
+# stays monitored. Until the implementation sibling lands
+# (SA-0MV87GC8O006RHS8) the new-behaviour proofs below are pinned as red
+# tracer bullets with ``xfail(strict=True)`` (same convention as the unit
+# sibling SA-0MV87FGCP00865QF): they are RED for the right reason today and
+# the implementation sibling removes the markers. Confirmed-fires proofs that
+# must stay green are unmarked.
+# ---------------------------------------------------------------------------
+
+_OWNERSHIP_IMPLEMENTATION = "SA-0MV87GC8O006RHS8"
+_ownership_xfail = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ownership-based worktree exclusion not yet implemented "
+        f"({_OWNERSHIP_IMPLEMENTATION})"
+    ),
+)
+
+
+def _main_with_linked_guard_worktree(tmp_path):
+    """A main checkout on ``dev`` plus a linked guard worktree.
+
+    Mirrors the shape ``implement.py`` creates: the main checkout owns
+    ``dev`` and the guard runs from a linked worktree under
+    ``<main>/.worklog/worktrees/``. Returns ``(main_checkout, guard_root)``.
+    """
+    repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (repo / ".gitignore").write_text(
+        ".worklog/\n__pycache__/\n*.pyc\n.pytest_cache/\n", encoding="utf-8"
+    )
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    guarded = repo / ".worklog" / "worktrees" / "wl-guarded"
+    gs.add_worktree(repo, guarded, "wl-guarded")
+    return repo, guarded
+
+
+class TestOwnershipNoFalsePositivesNested:
+    """End-to-end proofs that concurrent infrastructure churn is invisible.
+
+    These arm the **real** inner guard (``live_repo_guard.py`` via a conftest)
+    and the **real** outer guard (``guarded_run_all``) at a linked-worktree
+    root inside a ``tmp_path`` repo, then mutate the main checkout exactly as
+    a concurrent ``implement.py finish`` does. Both entry points must exit 0
+    with no "live-repo mutation" text. RED (guard fires on the false
+    positive) until the ownership fix lands.
+    """
+
+    @_ownership_xfail
+    def test_concurrent_dev_fast_forward_yields_clean_diff(self, tmp_path):
+        """AC1 (direct): snapshots taken around a concurrent finish's
+        ``fetch`` + ``merge --ff-only`` of the main checkout's ``dev`` (the
+        local ref and the remote-tracking ref) must yield
+        ``diff_snapshots(before, after)["changed"] is False`` when armed at
+        the linked worktree root."""
+        repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        origin = gs.init_bare_remote(tmp_path / "origin.git")
+        gs.add_remote(repo, "origin", str(origin))
+        gs.run_git(repo, ["push", "-u", "origin", "dev"], check=True)
+        scratch = tmp_path / "scratch"
+        gs.run_git(tmp_path, ["clone", "-q", str(origin), "scratch"], check=True)
+        (scratch / "advance.txt").write_text("advance\n", encoding="utf-8")
+        gs.commit_all(scratch, "advance dev")
+        gs.run_git(scratch, ["push", "origin", "dev"], check=True)
+
+        before = gs.snapshot_repo_state(guarded)
+        gs.run_git(repo, ["fetch", "origin", "dev"], check=True)
+        gs.run_git(repo, ["merge", "--ff-only", "origin/dev"], check=True)
+        after = gs.snapshot_repo_state(guarded)
+
+        assert gs.diff_snapshots(before, after)["changed"] is False
+        # The fast-forward really happened.
+        assert after["refs"]["refs/heads/dev"] != before["refs"]["refs/heads/dev"]
+
+    @_ownership_xfail
+    def test_concurrent_dev_fast_forward_does_not_trip_linked_guard(
+        self, tmp_path,
+    ):
+        """AC2: a concurrent finish fast-forwards the main checkout's
+        ``refs/heads/dev`` (fetch + ``merge --ff-only``, remote-tracking ref
+        included); the guard armed at the guarded worktree must stay green."""
+        repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        origin = gs.init_bare_remote(tmp_path / "origin.git")
+        gs.add_remote(repo, "origin", str(origin))
+        gs.run_git(repo, ["push", "-u", "origin", "dev"], check=True)
+        _write_guard_conftest(guarded)
+
+        # Advance ``dev`` on origin the way another agent's finish does: a
+        # scratch clone commits and pushes; the main checkout then fetches and
+        # fast-forwards its local ``dev`` (plus the remote-tracking ref).
+        scratch = tmp_path / "scratch"
+        gs.run_git(tmp_path, ["clone", "-q", str(origin), "scratch"], check=True)
+        (scratch / "advance.txt").write_text("advance\n", encoding="utf-8")
+        gs.commit_all(scratch, "advance dev")
+        gs.run_git(scratch, ["push", "origin", "dev"], check=True)
+
+        # The nested test (running inside the guard worktree) reproduces the
+        # concurrent finish's main-checkout fetch + ff.
+        dev_before = gs.run_git(repo, ["rev-parse", "refs/heads/dev"]).stdout.strip()
+        (guarded / "test_concurrent_finish.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            f"MAIN = Path({str(repo)!r})\n\n"
+            "def test_finish_fast_forwards_dev():\n"
+            "    subprocess.run(['git', '-C', str(MAIN), 'fetch', 'origin', 'dev'],\n"
+            "                   check=True)\n"
+            "    subprocess.run(['git', '-C', str(MAIN), 'merge', '--ff-only',\n"
+            "                   'origin/dev'], check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(guarded)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined
+        # The fast-forward really happened: the shared integration ref moved.
+        dev_after = gs.run_git(repo, ["rev-parse", "refs/heads/dev"]).stdout.strip()
+        assert dev_after != dev_before
+
+    @_ownership_xfail
+    def test_concurrent_dev_fast_forward_outer_guard_stays_green(
+        self, tmp_path, monkeypatch,
+    ):
+        """AC2 (outer entry point): ``guarded_run_all`` armed at the linked
+        worktree root must exit 0 when ``dev`` fast-forwards concurrently."""
+        repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        origin = gs.init_bare_remote(tmp_path / "origin.git")
+        gs.add_remote(repo, "origin", str(origin))
+        gs.run_git(repo, ["push", "-u", "origin", "dev"], check=True)
+
+        scratch = tmp_path / "scratch"
+        gs.run_git(tmp_path, ["clone", "-q", str(origin), "scratch"], check=True)
+        (scratch / "advance.txt").write_text("advance\n", encoding="utf-8")
+        gs.commit_all(scratch, "advance dev")
+        gs.run_git(scratch, ["push", "origin", "dev"], check=True)
+
+        # The suite command (run by the outer guard inside the guarded
+        # worktree) reproduces the concurrent finish fast-forward.
+        (guarded / ".pi").mkdir(exist_ok=True)
+        (guarded / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": ["bash concurrent_finish.sh"]}),
+            encoding="utf-8",
+        )
+        (guarded / "concurrent_finish.sh").write_text(
+            "#!/bin/sh\n"
+            f"git -C {repo} fetch origin dev\n"
+            f"git -C {repo} merge --ff-only origin/dev\n",
+            encoding="utf-8",
+        )
+        (guarded / "concurrent_finish.sh").chmod(0o755)
+
+        from test.scripts import run_tests as _rt
+
+        monkeypatch.setattr(_rt, "_test_concurrency_slot", lambda: contextlib.nullcontext())
+        result = guarded_run_all(cwd=guarded, use_cache=False)
+
+        assert result["success"] is True, result
+        assert "live_repo_mutation" not in result, result
+
+    @_ownership_xfail
+    def test_tmp_worktree_churn_does_not_trip_linked_guard(self, tmp_path):
+        """AC3: registering + committing in / removing a
+        ``.worklog/tmp-worktree-*`` worktree mid-run is churn, not a mutation
+        — even though it is outside the ``.worklog/worktrees/`` anchor."""
+        repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        _write_guard_conftest(guarded)
+        tmp_wt = repo / ".worklog" / "tmp-worktree-abc123"
+
+        (guarded / "test_tmp_churn.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            f"REPO = Path({str(repo)!r})\n"
+            f"TMP_WT = Path({str(tmp_wt)!r})\n\n"
+            "def test_registers_commits_removes_tmp_worktree():\n"
+            "    subprocess.run(['git', '-C', str(REPO), 'worktree', 'add',\n"
+            "                    '-b', 'tmp-branch', str(TMP_WT)], check=True)\n"
+            "    (TMP_WT / 'tmp.txt').write_text('tmp\\n')\n"
+            "    subprocess.run(['git', '-C', str(TMP_WT), 'add', '-A'], check=True)\n"
+            "    subprocess.run(['git', '-C', str(TMP_WT), 'commit', '-qm', 'tmp work'],\n"
+            "                   check=True)\n"
+            "    subprocess.run(['git', '-C', str(REPO), 'worktree', 'remove',\n"
+            "                   '--force', str(TMP_WT)], check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(guarded)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined
+        assert "(no differences)" not in combined
+
+    @_ownership_xfail
+    def test_tmp_worktree_register_remove_cycle_is_invisible(self, tmp_path):
+        """AC3: a ``--track`` register→remove cycle that completes entirely
+        inside the guard window (branch and tracking config retained) must
+        not trip the guard and must never produce the "(no differences)"
+        false failure (SA-0MUINEW6X0034C65)."""
+        repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        _write_guard_conftest(guarded)
+        cycle_wt = repo / ".worklog" / "tmp-worktree-in-window"
+
+        (guarded / "test_cycle.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            f"REPO = Path({str(repo)!r})\n"
+            f"CYCLE_WT = Path({str(cycle_wt)!r})\n\n"
+            "def test_register_then_remove_inside_window():\n"
+            "    subprocess.run(['git', '-C', str(REPO), 'worktree', 'add',\n"
+            "                    '--track', '-b', 'window-branch', str(CYCLE_WT),\n"
+            "                    'dev'], check=True)\n"
+            "    subprocess.run(['git', '-C', str(REPO), 'worktree', 'remove',\n"
+            "                   '--force', str(CYCLE_WT)], check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(guarded)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined
+        assert "(no differences)" not in combined
+        # The branch really was created and retained by the cycle.
+        assert gs.run_git(repo, ["rev-parse", "--verify", "refs/heads/window-branch"]).returncode == 0
+
+
+class TestOwnershipConfirmedFiresNested:
+    """Genuine mutations must keep failing at both entry points.
+
+    The ownership fix must NOT hide: (a) a non-excluded config rewrite
+    (``core.bare``), (b) adding/deleting a tracked file in the guarded
+    working tree, or (c) moving the guard's **own** root branch. Proofs (a)
+    and (b) fire against the current code and stay green (unmarked); proof
+    (c) only fires once the guard root's own branch is monitored by the fix,
+    so it is a red tracer until then.
+    """
+
+    def test_core_bare_config_rewrite_is_failed_and_named(self, tmp_path):
+        """A non-excluded config key rewrite still fails the guarded run."""
+        _repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        _write_guard_conftest(guarded)
+        (guarded / "test_config_mutator.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            "def test_rewrites_core_bare():\n"
+            "    subprocess.run(['git', '-C', str(Path(__file__).resolve().parent),\n"
+            "                    'config', '--local', 'core.bare', 'true'],\n"
+            "                   check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(guarded)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, combined
+        assert "live-repo mutation" in combined
+        assert "core.bare" in combined
+
+    def test_tracked_file_add_is_failed_and_named(self, tmp_path):
+        """Adding a tracked file in the guarded working tree still fails."""
+        _repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        _write_guard_conftest(guarded)
+        (guarded / "test_file_add.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            "def test_adds_tracked_file():\n"
+            "    root = Path(__file__).resolve().parent\n"
+            "    (root / 'intruder.txt').write_text('intruder\\n')\n"
+            "    subprocess.run(['git', '-C', str(root), 'add', '-A'], check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(guarded)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, combined
+        assert "live-repo mutation" in combined
+        assert "intruder.txt" in combined
+
+    def test_tracked_file_delete_is_failed_and_named(self, tmp_path):
+        """Deleting a tracked file in the guarded working tree still fails."""
+        _repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        _write_guard_conftest(guarded)
+        (guarded / "test_file_delete.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            "def test_deletes_tracked_file():\n"
+            "    root = Path(__file__).resolve().parent\n"
+            "    (root / 'README.md').unlink()\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(guarded)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, combined
+        assert "live-repo mutation" in combined
+        assert "README.md" in combined
+
+    @_ownership_xfail
+    def test_guard_own_root_branch_move_is_failed(self, tmp_path):
+        """AC1: the guard root's own branch stays monitored — moving
+        ``refs/heads/wl-guarded`` must fail the run (currently the own root IS
+        excluded by the ``.worklog/worktrees/`` anchor, so this is RED until
+        the ownership fix monitors it).
+
+        The move is a tree-identical ``commit-tree`` + ``update-ref`` from the
+        main checkout so ONLY the branch ref moves (the guarded working tree
+        stays untouched) — a real commit would also churn untracked fixture
+        files and give a false positive.
+        """
+        repo, guarded = _main_with_linked_guard_worktree(tmp_path)
+        _write_guard_conftest(guarded)
+        (guarded / "test_moves_own_root_branch.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            f"REPO = Path({str(repo)!r})\n"
+            f"GUARDED = Path({str(guarded)!r})\n\n"
+            "def test_moves_guard_root_branch():\n"
+            "    parent = subprocess.run(['git', '-C', str(GUARDED), 'rev-parse', 'HEAD'],\n"
+            "                           check=True, capture_output=True, text=True).stdout.strip()\n"
+            "    tree = subprocess.run(['git', '-C', str(GUARDED), 'rev-parse', 'HEAD^{tree}'],\n"
+            "                          check=True, capture_output=True, text=True).stdout.strip()\n"
+            "    sub = subprocess.run(['git', '-C', str(GUARDED), 'commit-tree', tree, '-p', parent,\n"
+            "                          '-m', 'fresh'],\n"
+            "                         check=True, capture_output=True, text=True)\n"
+            "    fresh = sub.stdout.strip()\n"
+            "    subprocess.run(['git', '-C', str(REPO), 'update-ref',\n"
+            "                   'refs/heads/wl-guarded', fresh], check=True)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(guarded)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, combined
+        assert "live-repo mutation" in combined
+
+
+# ---------------------------------------------------------------------------
 # Teardown ordering — guard must run AFTER fixture finalisation
 # ---------------------------------------------------------------------------
 
