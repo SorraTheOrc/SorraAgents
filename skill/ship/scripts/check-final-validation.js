@@ -19,7 +19,7 @@
  *   a. a missing audit (no audit record exists),
  *   b. a stale audit (audit exists but predates the item's last update),
  *   c. a failing audit (a fresh "not ready to close" verdict), or
- *   d. a producer-review flag (`needsProducerReview === true`).
+ *   d. a producer hold (a non-empty producer assignee — `assignee === 'Map'`).
  *
  * Missing, stale, and transient audits are auto-remediated conservatively by
  * re-running the audit runner (`audit_runner.py issue <id>`, which persists
@@ -29,9 +29,9 @@
  * with the command needed to clear them.
  *
  * **Escalation for uncovered children (SA-0MUJLWPB10038Z8Q):** When an
- * uncovered child has `needsProducerReview === true` and no audit-ready
- * `in_review` ancestor, the gate escalates by setting `needsProducerReview`
- * `true` on the nearest `in_review` ancestor (or top-level parent) and adds
+ * uncovered child is producer-held and has no audit-ready `in_review`
+ * ancestor, the gate escalates by setting the producer hold on the nearest
+ * `in_review` ancestor (or top-level parent) and adds
  * a comment enumerating the child id(s). Because the producer-review gate
  * (Step 3.6, exit 9) has already run, the escalated ancestor is surfaced as a
  * **blocking item** so the current release fails this gate (exit 12); the flag
@@ -55,6 +55,8 @@ import {
   attemptAuditRemediation,
   queryContentFreshness,
   hasContentFingerprint,
+  PRODUCER_HOLD_ASSIGNEE,
+  isProducerHeld,
 } from './check-audit-gate.js';
 import {
   RemediationBudget,
@@ -75,6 +77,11 @@ export {
   parseIsoUtc,
   isAuditStale,
 } from './audit-freshness.js';
+
+export {
+  PRODUCER_HOLD_ASSIGNEE,
+  isProducerHeld,
+} from './check-audit-gate.js';
 
 // ── shellQuote ───────────────────────────────────────────────────────────────
 
@@ -153,13 +160,13 @@ export function classifyAudit(workItem, auditData) {
  * `bash -c` for `set -o pipefail` support. `updatedAt` is projected so
  * {@link isAuditStale} can evaluate freshness without an extra `wl show`.
  *
- * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null, updatedAt: string|null }>}
+ * @returns {Array<{ id: string, title: string, assignee: string|null, parentId: string|null, updatedAt: string|null }>}
  */
 export function getInReviewItems() {
   try {
     const output = execSync(
       `bash -c 'set -o pipefail; wl list --stage in_review --json ` +
-      `| jq -c "[.workItems[] | {id, title, needsProducerReview, parentId, updatedAt}]"'`,
+      `| jq -c "[.workItems[] | {id, title, assignee, parentId, updatedAt}]"'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     const projected = JSON.parse(output);
@@ -169,9 +176,7 @@ export function getInReviewItems() {
     return projected.map((item) => ({
       id: item.id,
       title: item.title || item.id,
-      needsProducerReview: item.needsProducerReview !== undefined
-        ? item.needsProducerReview
-        : null,
+      assignee: item.assignee !== undefined ? item.assignee : null,
       parentId: item.parentId !== undefined ? item.parentId : null,
       updatedAt: item.updatedAt !== undefined ? item.updatedAt : null,
     }));
@@ -411,10 +416,10 @@ export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
  * Run the final validation sweep over **all** `in_review` work items.
  *
  * For each item:
- *   - `needsProducerReview === true` → blocking (AC4) with remediation. An
+ *   - producer-held (`assignee === 'Map'`) → blocking (AC4) with remediation. An
  *     **uncovered child** with the flag set is escalated to its nearest
  *     `in_review` ancestor instead (SA-0MUJLWPB10038Z8Q): the ancestor is
- *     flagged `needsProducerReview=true` with a comment enumerating the
+ *     held with the producer assignee and a comment enumerating the
  *     child(ren), and the child is removed from the blocking list (the
  *     parent now blocks the producer-review gate).
  *   - audit `missing` / `stale` / `transient` → auto-remediate via the audit
@@ -534,7 +539,7 @@ export async function checkFinalValidation(options = {}) {
         // the override (SA-0MUJLWPB10038Z8Q AC1). Report it as planned here so
         // `--dry-run` surfaces the intended overrides (AC4). The real override
         // (flag clear + comment) happens in `closeWorkItemsAfterRelease`.
-        if (item.needsProducerReview === true) {
+        if (isProducerHeld(item)) {
           plannedOverrides.push({
             workItemId: item.id,
             title: item.title,
@@ -564,9 +569,9 @@ export async function checkFinalValidation(options = {}) {
     let auditIssue = false;
 
     // ── Producer-review flag (AC1d, AC2, AC4) ─────────────────────────
-    if (item.needsProducerReview === true) {
+    if (isProducerHeld(item)) {
       // Escalation for uncovered children (SA-0MUJLWPB10038Z8Q AC2): set
-      // needsProducerReview=true on the nearest in_review ancestor with a
+      // the producer hold on the nearest in_review ancestor with a
       // comment enumerating the child id(s). The parent then blocks the
       // producer-review gate. Only applies to uncovered children (parentId
       // is set and resolveChildScope returned 'uncovered').
@@ -580,25 +585,25 @@ export async function checkFinalValidation(options = {}) {
             workItemId: item.id,
             title: item.title,
             ancestorId,
-            reason: 'needsProducerReview escalated to in_review ancestor',
+            reason: 'producer hold escalated to in_review ancestor',
             planned: dryRun,
           });
           if (dryRun) {
             // `--dry-run` must not mutate the worklog (AC4).
             console.log(
               `Final-validation gate (dry-run): would escalate ${item.id} `
-              + `needsProducerReview to ancestor ${ancestorId}.`,
+              + `producer hold to ancestor ${ancestorId}.`,
             );
             continue;
           }
           try {
             runCloseCommand(ancestorId, [
               'update', ancestorId,
-              '--needs-producer-review', 'true',
+              '--assignee', PRODUCER_HOLD_ASSIGNEE,
               '--comment', `final-validation: ${escalationMsg}`,
             ]);
             console.log(
-              `Final-validation gate: escalated ${item.id} needsProducerReview to ancestor ${ancestorId}.`,
+              `Final-validation gate: escalated ${item.id} producer hold to ancestor ${ancestorId}.`,
             );
             // Child no longer blocks independently — parent does.
             continue;
@@ -611,7 +616,7 @@ export async function checkFinalValidation(options = {}) {
         }
       }
       producerReview = true;
-      reasons.push('Flagged for producer review');
+      reasons.push('Producer-owned (assignee hold set)');
     }
 
     // ── Audit evaluation (AC1a–c, AC2, AC3) ────────────────────────────

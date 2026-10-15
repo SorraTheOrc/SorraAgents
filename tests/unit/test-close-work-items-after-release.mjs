@@ -102,17 +102,17 @@ test('close-work-items: closeWorkItemsAfterRelease accepts a version string', as
 // ---------------------------------------------------------------------------
 // 4b. closeWorkItemsAfterRelease closes candidates via the injected close fn
 // ---------------------------------------------------------------------------
-test('close-work-items: closes only needsProducerReview=false candidates', async () => {
+test('close-work-items: closes only non-producer-held candidates', async () => {
   const mod = await import(RUN_RELEASE_PATH);
 
   const closed = [];
   const skipped = [];
   const result = mod.closeWorkItemsAfterRelease('0.2.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-CLOSE1', title: 'Close Me', needsProducerReview: false },
-      { id: 'SA-CLOSE2', title: 'Close Me Too', needsProducerReview: false },
-      { id: 'SA-SKIP1', title: 'Review Me', needsProducerReview: true },
-      { id: 'SA-SKIP2', title: 'Unknown Review', needsProducerReview: null },
+      { id: 'SA-CLOSE1', title: 'Close Me', assignee: '' },
+      { id: 'SA-CLOSE2', title: 'Close Me Too', assignee: '' },
+      { id: 'SA-SKIP1', title: 'Review Me', assignee: 'Map' },
+      { id: 'SA-SKIP2', title: 'Unassigned', assignee: null },
     ],
     runCloseCommand: (itemId, reason) => {
       closed.push({ itemId, reason });
@@ -123,18 +123,18 @@ test('close-work-items: closes only needsProducerReview=false candidates', async
 
   assert.deepEqual(
     closed.map((c) => c.itemId).sort(),
-    ['SA-CLOSE1', 'SA-CLOSE2'],
-    'only needsProducerReview=false items should be closed',
+    ['SA-CLOSE1', 'SA-CLOSE2', 'SA-SKIP2'],
+    'only producer-held items should be skipped from closing',
   );
   assert.ok(
     closed.every((c) => c.reason === 'Shipped in v0.2.0'),
     'close reason should be "Shipped in v<version>"',
   );
-  assert.equal(result.closedCount, 2);
-  assert.equal(result.skippedCount, 2);
+  assert.equal(result.closedCount, 3);
+  assert.equal(result.skippedCount, 1);
   assert.deepEqual(
     result.skippedItems.map((s) => s.id).sort(),
-    ['SA-SKIP1', 'SA-SKIP2'],
+    ['SA-SKIP1'],
     'skipped items should be reported',
   );
 });
@@ -147,8 +147,8 @@ test('close-work-items: reports close failures without aborting the sweep', asyn
 
   const result = mod.closeWorkItemsAfterRelease('0.2.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-OK', title: 'OK', needsProducerReview: false },
-      { id: 'SA-FAIL', title: 'Fails', needsProducerReview: false },
+      { id: 'SA-OK', title: 'OK', assignee: '' },
+      { id: 'SA-FAIL', title: 'Fails', assignee: '' },
     ],
     runCloseCommand: (itemId) => {
       if (itemId === 'SA-FAIL') {
@@ -172,7 +172,7 @@ test('close-work-items: closeWorkItemsAfterRelease handles missing version', asy
   const mod = await import(RUN_RELEASE_PATH);
 
   const result = mod.closeWorkItemsAfterRelease(null, {
-    getCandidateItemsFn: () => [{ id: 'SA-X', title: 'X', needsProducerReview: false }],
+    getCandidateItemsFn: () => [{ id: 'SA-X', title: 'X', assignee: '' }],
     runCloseCommand: () => { throw new Error('should not be called'); },
   });
 
@@ -231,8 +231,8 @@ test('close-work-items: refuses to force-close a candidate with collateral desce
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.3.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
-      { id: 'SA-CHILD', title: 'Child', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
+      { id: 'SA-CHILD', title: 'Child', assignee: '' },
     ],
     // SA-PARENT has a descendant (SA-OTHER) outside the candidate set
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-CHILD', 'SA-OTHER'] : []),
@@ -255,8 +255,8 @@ test('close-work-items: force-closes a candidate whose descendants are all candi
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.3.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
-      { id: 'SA-CHILD', title: 'Child', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
+      { id: 'SA-CHILD', title: 'Child', assignee: '' },
     ],
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-CHILD'] : []),
     runCloseCommand: (itemId) => { closed.push(itemId); },
@@ -277,7 +277,7 @@ test('close-work-items: closes a parent whose descendants are all terminal', asy
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
     ],
     getDescendantsFn: (id) =>
       (id === 'SA-PARENT' ? ['SA-DONE', 'SA-DELETED'] : []),
@@ -302,7 +302,7 @@ test('close-work-items: still refuses a parent with a non-terminal descendant', 
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
     ],
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-PLAN'] : []),
     getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
@@ -322,7 +322,7 @@ test('close-work-items: mixed terminal/non-terminal refusal names only non-termi
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
     ],
     getDescendantsFn: (id) =>
       (id === 'SA-PARENT' ? ['SA-DONE', 'SA-PLAN'] : []),
@@ -350,11 +350,11 @@ test('close-work-items: npr descendant refusal reports a distinct producer-revie
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
       {
         id: 'SA-NPR',
         title: 'Needs Review Child',
-        needsProducerReview: true,
+        assignee: 'Map',
         parentId: 'SA-PARENT',
       },
     ],
@@ -379,7 +379,7 @@ test('close-work-items: npr descendant refusal reports a distinct producer-revie
     `reason must not be lumped under the generic collateral message, got: ${result.refusedItems[0].reason}`,
   );
   assert.deepEqual(
-    result.refusedItems[0].needsProducerReview,
+    result.refusedItems[0].producerOwned,
     ['SA-NPR'],
     'the refusal should name the producer-review descendant(s) separately',
   );
@@ -390,11 +390,11 @@ test('close-work-items: mixed generic/npr collateral reports both causes distinc
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
       {
         id: 'SA-NPR',
         title: 'Needs Review Child',
-        needsProducerReview: true,
+        assignee: 'Map',
         parentId: 'SA-PARENT',
       },
     ],
@@ -413,7 +413,7 @@ test('close-work-items: mixed generic/npr collateral reports both causes distinc
     'the full collateral list is preserved for callers',
   );
   assert.deepEqual(
-    result.refusedItems[0].needsProducerReview,
+    result.refusedItems[0].producerOwned,
     ['SA-NPR'],
     'the producer-review descendant is classified separately',
   );
@@ -444,7 +444,7 @@ test('close-work-items: cascades non-terminal descendants of an audit-ready pare
   const cascaded = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
     ],
     getDescendantsFn: (id) =>
       (id === 'SA-PARENT' ? ['SA-OPEN', 'SA-BLOCKED'] : []),
@@ -483,7 +483,7 @@ test('close-work-items: does not cascade when the parent audit is not passing', 
   const cascaded = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
     ],
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-OPEN'] : []),
     getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
@@ -506,7 +506,7 @@ test('close-work-items: dry-run reports the cascade without mutating descendants
   const cascaded = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
     ],
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-OPEN'] : []),
     getItemLifecycleFn: () => ({ status: 'open', stage: 'plan_complete' }),
@@ -530,7 +530,7 @@ test('close-work-items: a cascade failure leaves that child as collateral and re
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
     ],
     getDescendantsFn: (id) =>
       (id === 'SA-PARENT' ? ['SA-OPEN', 'SA-STUCK'] : []),
@@ -556,7 +556,7 @@ test('close-work-items: already-terminal descendants are never cascaded', async 
   const cascaded = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-PARENT', title: 'Parent', assignee: '' },
     ],
     getDescendantsFn: (id) =>
       (id === 'SA-PARENT' ? ['SA-DONE', 'SA-DELETED'] : []),
@@ -595,12 +595,12 @@ test('close-work-items: Post-merge section mentions auto-close', () => {
 // ---------------------------------------------------------------------------
 // F3: Filter closeWorkItemsAfterRelease by needsProducerReview
 // ---------------------------------------------------------------------------
-test('close-work-items: closeWorkItemsAfterRelease filters by needsProducerReview=false', () => {
+test('close-work-items: closeWorkItemsAfterRelease filters by the producer hold', () => {
   const content = readFileSync(RUN_RELEASE_PATH, 'utf-8');
-  // Verify the function checks needsProducerReview before closing
+  // Verify the function filters on the producer hold (assignee sentinel)
   assert.ok(
-    content.includes('needsProducerReview'),
-    'closeWorkItemsAfterRelease should reference needsProducerReview for filtering',
+    content.includes('PRODUCER_HOLD_ASSIGNEE') || content.includes('isProducerHeld'),
+    'closeWorkItemsAfterRelease should reference the producer hold for filtering',
   );
 });
 
@@ -742,8 +742,8 @@ test('close-verify: all closes persist -> success with no unclosed items', async
   const closes = [];
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-A', title: 'A', needsProducerReview: false },
-      { id: 'SA-B', title: 'B', needsProducerReview: false },
+      { id: 'SA-A', title: 'A', assignee: '' },
+      { id: 'SA-B', title: 'B', assignee: '' },
     ],
     getDescendantsFn: () => [],
     runCloseCommand: (itemId) => { closes.push(itemId); },
@@ -763,8 +763,8 @@ test('close-verify: a no-op close (exit 0, state unchanged) is retried then repo
   const closes = [];
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-OK', title: 'OK', needsProducerReview: false },
-      { id: 'SA-LOST', title: 'Lost', needsProducerReview: false },
+      { id: 'SA-OK', title: 'OK', assignee: '' },
+      { id: 'SA-LOST', title: 'Lost', assignee: '' },
     ],
     getDescendantsFn: () => [],
     runCloseCommand: (itemId) => { closes.push(itemId); },
@@ -800,7 +800,7 @@ test('close-verify: a retry that re-persists reports the item closed', async () 
   let reads = 0;
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-FLAKY', title: 'Flaky', needsProducerReview: false },
+      { id: 'SA-FLAKY', title: 'Flaky', assignee: '' },
     ],
     getDescendantsFn: () => [],
     runCloseCommand: (itemId) => { closes.push(itemId); },
@@ -823,7 +823,7 @@ test('close-verify: an unreadable/null verification state is unclosed (fail-safe
   const mod = await import(RUN_RELEASE_PATH);
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-UNREADABLE', title: 'Unreadable', needsProducerReview: false },
+      { id: 'SA-UNREADABLE', title: 'Unreadable', assignee: '' },
     ],
     getDescendantsFn: () => [],
     runCloseCommand: () => {},
@@ -840,7 +840,7 @@ test('close-verify: a throwing verification boundary is unclosed (fail-safe)', a
   const mod = await import(RUN_RELEASE_PATH);
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-THROW', title: 'Throw', needsProducerReview: false },
+      { id: 'SA-THROW', title: 'Throw', assignee: '' },
     ],
     getDescendantsFn: () => [],
     runCloseCommand: () => {},
@@ -859,7 +859,7 @@ test('close-verify: dry-run neither closes nor verifies', async () => {
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
     dryRun: true,
     getCandidateItemsFn: () => [
-      { id: 'SA-DRY', title: 'Dry', needsProducerReview: false },
+      { id: 'SA-DRY', title: 'Dry', assignee: '' },
     ],
     getDescendantsFn: () => [],
     runCloseCommand: () => { closes.push('x'); },
@@ -876,9 +876,9 @@ test('close-verify: unclosed items never contribute to closedCount', async () =>
   const mod = await import(RUN_RELEASE_PATH);
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
     getCandidateItemsFn: () => [
-      { id: 'SA-P1', title: 'Persists', needsProducerReview: false },
-      { id: 'SA-L1', title: 'Lost One', needsProducerReview: false },
-      { id: 'SA-L2', title: 'Lost Two', needsProducerReview: false },
+      { id: 'SA-P1', title: 'Persists', assignee: '' },
+      { id: 'SA-L1', title: 'Lost One', assignee: '' },
+      { id: 'SA-L2', title: 'Lost Two', assignee: '' },
     ],
     getDescendantsFn: () => [],
     runCloseCommand: () => {},
