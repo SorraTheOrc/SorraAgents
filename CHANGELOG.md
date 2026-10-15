@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.1.22 (2026-10-15)
+> **Release focus:** This release focuses on making agent work more reliable and trustworthy, with improvements to release safety checks, version syncing, test runner consistency, and audit accuracy. It also reduces wasted effort by having agents skip already-completed work, refining task planning, and preventing false failures from aborted releases or concurrent updates. Standup reports and audits are now saved and displayed more dependably, so daily summaries and results are easier to track.
+### Features
+- Agents now spot and skip work that's already been done, so you get fixes faster. (SA-0MTWMCJ37000485M)
+- Related work suggestions are now more accurate and on-topic. (SA-0MUG46NJE003JOCD)
+- Release safety checks now work the same way behind the scenes, so updates ship just as reliably. (SA-0MV9DUE6F006SK1H)
+- Standup reports are now saved to version history automatically. (SA-0MUDYRHVZ005PQP4)
+- Tests now always run through the official test runner, so passing results are trustworthy and verifiable. (SA-0MTYIMWQP0020ZUC)
+- Standup reports now show which project they belong to, so you can tell them apart at a glance. (SA-0MTWO7HFW001N9QJ)
+- Releases now keep version numbers in sync so version checks pass right after an update. (SA-0MV7WAUHZ009UWY2)
+- Audits now finish with real results during busy periods instead of timing out. (SA-0MUSZJRB9006ZCHE)
+- Test reports now show how many tests are added vs removed, so runaway test growth is easy to spot. (SA-0MV28WXPA003EHJC)
+- Reports now show what the work was meant to achieve, not just whether it ran. (SA-0MTQY7YM5009J6QR)
+- Standup reports now save automatically to dated files, so you never lose a daily summary. (SA-0MTVB0NAQ007UKID)
+- Audit tools now find work items more reliably using the standard lookup command. (SA-0MSOMINF8007K9S4)
+- All projects now automatically block pushes that would bloat startup context. (SA-0MSN2ULOF007JJ35)
+### Bug Fixes
+- Audit results now display correctly without leaving items stuck in review. (SA-0MV98PAT7005VXXS)
+- Deleted work items now stay deleted and won't be picked up again. (SA-0MUJBLZC60085DI9)
+- Tests no longer fail when another agent updates shared code at the same time. (SA-0MV8311B3005DNG8)
+- Small tasks are no longer over-planned, and large risky tasks now correctly require approval. (SA-0MV85VT250096CTY)
+- Audits no longer mistake decimal numbers for commit IDs, preventing false failures. (SA-0MTECRNGR000VKLV)
+- Aborted releases no longer leave work items stuck, so your pipeline stays clean. (SA-0MTRH8C5O005URGR)
+- Plan reviews no longer flag false errors when acceptance criteria include code snippets. (SA-0MTYMD1NQ009R6W2)
+
 ## v0.1.21 (2026-10-12)
 > **Release focus:** This release focuses on making audits, releases, and test runs more reliable and less disruptive, with fixes for hanging audits, false release announcements, and background tools that could modify live game files. It also reduces approval prompts, lets implementation start with unrelated uncommitted changes, and improves planning, test analysis, and release reporting so work items are tracked and closed accurately.
 ### Features
