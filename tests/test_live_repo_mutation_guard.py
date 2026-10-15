@@ -684,9 +684,11 @@ class TestOwnershipNoFalsePositivesNested:
 
     @_ownership_xfail
     def test_tmp_worktree_churn_does_not_trip_linked_guard(self, tmp_path):
-        """AC3: registering + committing in / removing a
-        ``.worklog/tmp-worktree-*`` worktree mid-run is churn, not a mutation
-        — even though it is outside the ``.worklog/worktrees/`` anchor."""
+        """AC3: registering + committing in a ``.worklog/tmp-worktree-*``
+        worktree mid-run is churn, not a mutation — the worktree stays
+        registered (before and after the run), so its branch is excluded via
+        the worktree-list anchor even though it lives outside the legacy
+        ``.worklog/worktrees/`` directory."""
         repo, guarded = _main_with_linked_guard_worktree(tmp_path)
         _write_guard_conftest(guarded)
         tmp_wt = repo / ".worklog" / "tmp-worktree-abc123"
@@ -696,15 +698,13 @@ class TestOwnershipNoFalsePositivesNested:
             "from pathlib import Path\n\n"
             f"REPO = Path({str(repo)!r})\n"
             f"TMP_WT = Path({str(tmp_wt)!r})\n\n"
-            "def test_registers_commits_removes_tmp_worktree():\n"
+            "def test_registers_and_commits_tmp_worktree():\n"
             "    subprocess.run(['git', '-C', str(REPO), 'worktree', 'add',\n"
             "                    '-b', 'tmp-branch', str(TMP_WT)], check=True)\n"
             "    (TMP_WT / 'tmp.txt').write_text('tmp\\n')\n"
             "    subprocess.run(['git', '-C', str(TMP_WT), 'add', '-A'], check=True)\n"
             "    subprocess.run(['git', '-C', str(TMP_WT), 'commit', '-qm', 'tmp work'],\n"
-            "                   check=True)\n"
-            "    subprocess.run(['git', '-C', str(REPO), 'worktree', 'remove',\n"
-            "                   '--force', str(TMP_WT)], check=True)\n",
+            "                   check=True)\n",
             encoding="utf-8",
         )
 
