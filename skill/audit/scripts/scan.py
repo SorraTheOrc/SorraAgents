@@ -10,10 +10,6 @@ recursive greps over ``.worklog/`` (9.5 GB of audit_debug jsonl) and repo
 roots. This CLI replaces those agent-decided scans with bounded,
 required-and-efficient operations:
 
-    scan.py find-workitem <work-item-id>
-        Resolve a work item via `wl search` (structured index lookup,
-        milliseconds) — never a recursive grep over .worklog/.
-
     scan.py search-code <pattern> [--path PATH] [--type TYPE] [--max-filesize N]
         Bounded rg wrapper: prunes node_modules/.git/.worklog and
         **/audit_debug_*.jsonl, enforces a max file size, and requires an
@@ -22,14 +18,20 @@ required-and-efficient operations:
     scan.py list-files [--path PATH] [--type TYPE] [--maxdepth N]
         Bounded file listing with maxdepth (default 2) and the same prunes.
 
-All subcommands run offline (stdlib + wl/rg only), never scan the repo root
+Worklog lookups are **not** handled here (SA-0MSOMINF8007K9S4). The former
+``find-workitem`` wrapper was retired once the wl CLI gained tolerant ID
+resolution; use the native commands directly:
+
+    wl list <term> --json     # case-insensitive substring match (id/title/desc)
+    wl show <id> --json       # exact / unique-substring ID resolution
+
+Both subcommands run offline (stdlib + rg/grep fallback), never scan the repo root
 implicitly, and exit non-zero with a clear message when nothing is found.
 See ``docs/dev/audit-grep-scan-patterns.md`` for the recipe catalogue.
 """  # noqa: EXE001
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import subprocess
 import sys
@@ -67,46 +69,6 @@ def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess
         cmd, cwd=cwd, capture_output=True, text=True, timeout=600,
         check=False,
     )
-
-
-def cmd_find_workitem(args: argparse.Namespace) -> int:
-    """Resolve a work item via `wl search`; never grep .worklog/ recursively."""
-    wl = shutil.which("wl")
-    if not wl:
-        print("error: `wl` (worklog CLI) not found on PATH", file=sys.stderr)
-        return 2
-    cmd = [wl, "search", args.work_item_id, "--json"]
-    if getattr(args, "worklog_dir", None):
-        cmd += ["--worklog-dir", args.worklog_dir]
-    proc = _run(cmd)
-    if proc.returncode != 0:
-        print(
-            f"error: `wl search` failed for {args.work_item_id}: "
-            f"{proc.stderr.strip() or proc.stdout.strip()}",
-            file=sys.stderr,
-        )
-        return 1
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        print(f"error: unparseable `wl search` output for {args.work_item_id}",
-              file=sys.stderr)
-        return 1
-
-    items = []
-    if isinstance(data, dict):
-        items = data.get("items") or data.get("workItems") or (
-            [data["workItem"]] if data.get("workItem") else []
-        )
-    elif isinstance(data, list):
-        items = data
-
-    exact = [it for it in items if str(it.get("id", "")) == args.work_item_id]
-    if not exact:
-        print(f"Work item {args.work_item_id} not found.", file=sys.stderr)
-        return 1
-    print(json.dumps(exact[0], indent=2))
-    return 0
 
 
 def _rg_or_grep() -> str:
@@ -210,18 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scan.py",
         description=(
-            "Bounded-scan helper for audit agents: find-workitem / "
-            "search-code / list-files. Replaces slow unbounded grep -r "
+            "Bounded-scan helper for audit agents: search-code / "
+            "list-files. Replaces slow unbounded grep -r "
             "scans with pruned, bounded operations."
         ),
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
-
-    p_find = sub.add_parser("find-workitem", help="Resolve a work item via wl search")
-    p_find.add_argument("work_item_id", help="Work item id, e.g. SA-XXXXXXXXXXX")
-    p_find.add_argument("--worklog-dir", default=None,
-                        help="Explicit path to .worklog directory (bypasses auto-resolution)")
-    p_find.set_defaults(func=cmd_find_workitem)
 
     p_search = sub.add_parser("search-code", help="Bounded rg/grep for a pattern")
     p_search.add_argument("pattern", help="Regex/pattern to search for")

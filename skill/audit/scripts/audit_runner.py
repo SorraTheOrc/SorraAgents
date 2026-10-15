@@ -944,7 +944,7 @@ _STATUS_RESTORE_RETRY_DELAY_S = 0.5
 
 _SCANNING_BLOCK = (
     "SCANNING — When you need to look something up, use the bounded helpers:\n"
-    "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
+    "- Worklog lookups: `wl list <term> --json` for substring matching, `wl show <id> --json` for exact/unique-ID resolution (never `grep -r` over .worklog/).\n"
     "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
     "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
     "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
@@ -959,6 +959,14 @@ It is the fuller version with the ``list-files`` bullet and the
 single-file ``.worklog`` grep note; the model reads only in-scope files and
 uses the bounded ``scan.py`` helpers instead of unbounded repository
 exploration (P7 / Phase 2 performance pattern).
+
+Worklog lookups use the **native wl CLI only** (SA-0MSOMINF8007K9S4):
+``wl list <term> --json`` for case-insensitive substring matching over
+id/title/description, and tolerant ``wl show <id> --json`` for
+exact/unique-ID resolution (exact-first, unique substring fallback). The
+former interim ``scan.py find-workitem`` wrapper is retired, and ``wl search``
+(full-text/FTS, token-prefix based) is NOT a substring matcher and must not
+be presented as one.
 """
 
 _PHASE2_MAX_RETRIES = 1

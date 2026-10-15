@@ -708,11 +708,13 @@ implementation code. Only the project-level audit summary call remains in bare
 LLM pipe mode (`enable_tools=False`).
 
 **Bounded scanning (Phase 2):** The Phase 2 prompts include a **SCANNING** block
-that directs agents to the bounded helper `./scripts/scan.py` instead
-of improvised recursive greps:
+that directs agents to the bounded helper `./scripts/scan.py` and the native
+wl CLI instead of improvised recursive greps:
 
-- Worklog lookups: `python3 ./scripts/scan.py find-workitem <id>`
-  (delegates to `wl search`; never greps the `.worklog/` tree).
+- Worklog lookups: native wl CLI only — `wl list <term> --json` for
+  case-insensitive substring matching over id/title/description, and
+  `wl show <id> --json` for exact/unique-ID resolution (tolerant: exact-first,
+  unique substring fallback). Never greps the `.worklog/` tree.
 - Code search: `python3 ./scripts/scan.py search-code <pattern> --path <dir> --type py`
   (bounded rg with prunes for node_modules/.git/.worklog/.audit_debug and
   `audit_debug_*.jsonl`, max file size, explicit path).
@@ -721,8 +723,12 @@ of improvised recursive greps:
 
 Unbounded recursive greps over the repo root or `.worklog/` (e.g.
 `grep -r ... .` or `grep -r ... .worklog/`) are forbidden. Worklog lookups use
-`wl search <keywords> --json` or `wl list <term> --json` for substring
-matching, `scan.py find-workitem <id>` for exact match.
+the native wl CLI: `wl list <term> --json` for substring matching,
+`wl show <id> --json` for exact/unique-ID resolution. The interim scan.py
+worklog-lookup wrapper was retired by SA-0MSOMINF8007K9S4 once the wl
+CLI gained tolerant ID resolution; note that `wl search <keywords> --json` is
+full-text search (FTS, token/prefix based) — **not** a substring matcher — and
+must not be presented as one.
 See `docs/dev/audit-grep-scan-patterns.md` (SA-0MSBR06GX0051T1Q) for the
 pattern catalogue and benchmark.
 
@@ -733,7 +739,7 @@ scans never walk them), and are swept by
 `./scripts/cleanup_debug_logs.py` (dry-run default, `--apply`,
 `--older-than N` days, default 14). Successful audit runs delete their own
 debug file; failed runs keep full-content forensics. Never read them back
-programmatically — use `scan.py find-workitem` / `wl search` instead.
+programmatically — use `wl show <id> --json` / `wl list <term> --json` instead.
 
 **Reason taxonomy (SA-0MU32TAMB007HI99):** each debug entry carries a `reason`
 and an explicit `parse_ok` field, so a returned call can never be mistaken for
