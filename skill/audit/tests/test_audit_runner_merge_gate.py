@@ -199,6 +199,55 @@ class TestResolveItemIntegrationEvidence:
         assert len(commits) == 3
         assert branch == ""
 
+    def test_decimal_numbers_not_extracted_as_commit_shas(self):
+        """Regression SA-0MTECRNGR000VKLV: decimal literals in test-failure
+        prose must not be mined as commit shas.
+
+        The motivating example is a test failure line whose fractional
+        digits happen to be hex-compatible, producing phantom candidates
+        (``2329094824319696``, ``231051271500847``) that then fail to
+        integrate and spuriously block the merge gate.
+        """
+        ctx = _make_ctx(
+            description=(
+                "expected 0.23290948243196963 to be less than or equal to"
+                " 0.2310512715008475"
+            ),
+            work_item={"comments": [
+                {"comment": "retry after error 0.9876543210deadbeef"},
+            ]},
+        )
+        commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert commits == []
+        assert branch == ""
+
+    def test_valid_commit_shas_still_extracted_in_various_formats(self):
+        """AC2/AC3: full, short, GitHub-style (``#``) and ``sha=`` shas are
+        still extracted after the decimal guard."""
+        full = "2c15ebd3cc78f415afca198930339f2138bed218"
+        ctx = _make_ctx(
+            description=(
+                f"full {full} short 2c15ebd #abc1234 sha=cafe0123"
+            ),
+        )
+        commits, branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert full in commits
+        assert "2c15ebd" in commits
+        assert "abc1234" in commits
+        assert "cafe0123" in commits
+        assert branch == ""
+
+    def test_sentence_final_commit_sha_still_extracted(self):
+        """A sha at the end of a sentence (``see commit <sha>.``) is still
+        extracted — the decimal guard must not drop it, since the implement
+        skill's canonical comment ends with a period."""
+        full = "2c15ebd3cc78f415afca198930339f2138bed218"
+        ctx = _make_ctx(
+            description=f"Completed work pushed to dev, see commit {full}.",
+        )
+        commits, _branch = audit_runner._resolve_item_integration_evidence(ctx)
+        assert full in commits
+
     def test_motivating_example_reachable_generically(self):
         """AC4: the WL-0MSI4TAT70058921 rename work is reachable through the
         generic resolution — its feature branch plus its recorded commits —
@@ -515,15 +564,15 @@ class TestCmdIssueMergeGateFailClosed:
         assert "Merge gate" in out
         # Screening must NOT run: zero pi calls on the blocked path.
         pi_mock.assert_not_called()
-        # Lifecycle applies the fail-closed transition with producer review.
+        # Lifecycle applies the fail-closed transition with the producer hold.
         updates = [c for c in recorded if "update" in " ".join(c)]
         assert updates, "expected a lifecycle wl update"
         producer_updates = [
             c for c in updates
-            if "--needs-producer-review" in c and "yes" in c
+            if "--assignee" in c and "Map" in c
         ]
         assert producer_updates, (
-            f"blocked gate must flag needs-producer-review, got {updates}"
+            f"blocked gate must apply the producer hold, got {updates}"
         )
         open_updates = [
             c for c in updates if "--status" in c and "open" in c
@@ -600,8 +649,8 @@ class TestMergeGateFailureReport:
 
 
 class TestLifecycleMergeGateBlocker:
-    """The 'no' verdict with a merge-gate blocker adds
-    --needs-producer-review yes (AC3)."""
+    """The 'no' verdict with a merge-gate blocker applies the producer hold
+    (--assignee Map) — replacing the retired needsProducerReview flag (AC3)."""
 
     def test_lifecycle_flags_producer_review(self):
         ctx = _make_ctx()
@@ -639,9 +688,9 @@ class TestLifecycleMergeGateBlocker:
         audit_runner._apply_terminal_lifecycle(ctx)
         update_cmds = [c for c in calls if "update" in " ".join(c)]
         assert any(
-            "--needs-producer-review" in c and "yes" in c
+            "--assignee" in c and "Map" in c
             for c in update_cmds
-        ), f"expected --needs-producer-review yes, got {update_cmds}"
+        ), f"expected the producer hold (--assignee Map), got {update_cmds}"
 
 # ---------------------------------------------------------------------------
 # _audit_base_freshness — stale-audit-base guard (SA-0MT9EK1UU000DT1R)

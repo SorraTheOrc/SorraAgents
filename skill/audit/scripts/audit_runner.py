@@ -71,6 +71,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import itertools
 import json
@@ -79,6 +80,7 @@ import os
 import re
 import select
 import shlex
+import signal
 import statistics
 import subprocess
 import sys
@@ -246,7 +248,7 @@ AUDIT_SEMAPHORE_NAME = "audit"
 # its own semaphore namespace so N+1 concurrent issues wait or exit cleanly.
 AUDIT_HOST_SEMAPHORE_NAME = "audit-host"
 AUDIT_MAX_HOST_AUDITS_ENV = "AUDIT_MAX_HOST_AUDITS"
-AUDIT_MAX_HOST_AUDITS_DEFAULT = 3
+AUDIT_MAX_HOST_AUDITS_DEFAULT = 6
 AUDIT_HOST_LOCK_TIMEOUT_ENV = "AUDIT_HOST_LOCK_TIMEOUT"
 AUDIT_HOST_LOCK_TIMEOUT_DEFAULT = 90.0
 """Bounded wait (seconds) for a host-wide audit ingress slot.
@@ -257,6 +259,15 @@ bash-tool execution timeout (~120s): a saturated host makes the N+1th
 still completes) and exit cleanly with a clear message if none frees in time,
 rather than adding another concurrent suite runner. Set ``AUDIT_HOST_LOCK_TIMEOUT=0``
 to fail fast, or a larger value for longer batches.
+
+The ingress ceiling default (6) is right-sized to the host's measured
+audit-slot capacity (SA-0MUSZJRB9006ZCHE): the F7 harness
+(``skill/shared/validate_fanout.py``) showed the cap was previously
+(AUDIT_MAX_HOST_AUDITS=3) the *binding* constraint — peak concurrent
+audit runs saturated at 3 no matter how high AUDIT_MAX_CONCURRENCY went.
+Raised to 6 (2x the 3-slot local LLM proxy pool) after the F7 measurement
+showed a 6-audit burst drains with a batch-attributable load delta <= 1.63
+and no swap growth on the 16-core host.
 """
 
 #: Process-wide host slot held for the duration of a ``cmd_issue`` call.
@@ -942,7 +953,7 @@ _STATUS_RESTORE_RETRY_DELAY_S = 0.5
 
 _SCANNING_BLOCK = (
     "SCANNING — When you need to look something up, use the bounded helpers:\n"
-    "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
+    "- Worklog lookups: `wl list <term> --json` for substring matching, `wl show <id> --json` for exact/unique-ID resolution (never `grep -r` over .worklog/).\n"
     "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
     "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
     "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
@@ -957,6 +968,14 @@ It is the fuller version with the ``list-files`` bullet and the
 single-file ``.worklog`` grep note; the model reads only in-scope files and
 uses the bounded ``scan.py`` helpers instead of unbounded repository
 exploration (P7 / Phase 2 performance pattern).
+
+Worklog lookups use the **native wl CLI only** (SA-0MSOMINF8007K9S4):
+``wl list <term> --json`` for case-insensitive substring matching over
+id/title/description, and tolerant ``wl show <id> --json`` for
+exact/unique-ID resolution (exact-first, unique substring fallback). The
+former interim ``scan.py find-workitem`` wrapper is retired, and ``wl search``
+(full-text/FTS, token-prefix based) is NOT a substring matcher and must not
+be presented as one.
 """
 
 _PHASE2_MAX_RETRIES = 1
@@ -1087,8 +1106,15 @@ SA-0MSPZDALB000S18P). The line is parsed back out by
 _TOUCHED_FILES_COMMIT_MARKER = "__WL_COMMIT__"
 
 #: Regex matching a candidate 7-40 char hex commit sha (mirrors the merge
-#: gate's reference extraction in ``_resolve_item_commits``).
-_COMMIT_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
+#: gate's reference extraction in ``_resolve_item_integration_evidence``).
+#:
+#: Decimal-point adjacency is excluded so that numeric literals whose digits
+#: happen to be hex-compatible (e.g. ``0.23290948243196963`` in a test-failure
+#: message) are not mined as phantom commit shas (SA-0MTECRNGR000VKLV). The
+#: lookbehind drops the fractional part of a decimal (``0.<digits>``); the
+#: lookahead drops the integer part of a decimal (``<digits>.<digits>``)
+#: while still matching a sha that merely ends a sentence (``commit <sha>.``).
+_COMMIT_SHA_RE = re.compile(r"(?<!\.)\b[0-9a-f]{7,40}\b(?!\.\d)", re.IGNORECASE)
 
 AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30
 """Tolerance (seconds) for treating an audit as fresh despite a stale check.
@@ -1420,6 +1446,23 @@ targets the audited project. ``None`` outside a run, where the cwd-derived
 run completes so it never leaks across audits.
 """
 
+# ------------------------------------------------------------------
+# Abort-recovery state file (SA-0MTRH8C5O005URGR).
+# When the audit runner claims a work item as in_progress, it writes
+# the pre-audit state to a temporary file.  If the process is killed
+# (SIGKILL / OOM / host reboot) Python cannot catch the signal so the
+# try/finally block never runs.  The parent process (check-audit-gate.js
+# / run-release) checks for leftover state files after the child exits
+# and restores the original status when it finds one.
+# ------------------------------------------------------------------
+_AUDIT_STATE_FILE_ENV = "AUDIT_ABSTATE_FILE"
+"""Optional directory for the abort-recovery state file.
+
+When set, the state file is written to this directory (the audit
+runner's worktree root or a temp directory).  When unset the state
+file is written to a temporary file in the system temp directory.
+"""
+
 
 def _audit_target_root(project_root: Path | None = None) -> Path:
     """Resolve the target project root for a residual consumer.
@@ -1430,6 +1473,166 @@ def _audit_target_root(project_root: Path | None = None) -> Path:
     callers and the existing test suite).
     """
     return project_root or _ACTIVE_AUDIT_ROOT or TARGET_PROJECT_ROOT
+
+
+# ------------------------------------------------------------------
+# Abort-recovery helpers (SA-0MTRH8C5O005URGR).
+# ------------------------------------------------------------------
+
+def _write_audit_state_file(issue_id: str, original_status: str,
+                            original_stage: str,
+                            worklog_dir: str | None = None) -> str:
+    """Write the abort-recovery state file and return its path.
+
+    Writes a JSON file containing the pre-audit state so that a parent
+    process can restore the work item if the audit runner is killed
+    (SIGKILL, OOM, host reboot).
+
+    Returns the path to the state file (always set even on write failure).
+    """
+    state = {
+        "issue_id": issue_id,
+        "original_status": original_status,
+        "original_stage": original_stage,
+    }
+    state_path = _resolve_state_path(issue_id, worklog_dir=worklog_dir)
+    try:
+        with open(state_path, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass  # best-effort; the caller still records the path
+    return state_path
+
+
+def _resolve_state_path(issue_id: str,
+                        worklog_dir: str | None = None) -> str:
+    """Resolve the file path for the abort-recovery state file."""
+    env_dir = os.environ.get(_AUDIT_STATE_FILE_ENV)
+    if env_dir:
+        return os.path.join(env_dir, f".audit_state_{issue_id}.json")
+    # Default: use a temp directory path based on the issue id.
+    # When worklog_dir is available, place it there for easy cleanup by
+    # the parent process; otherwise fall back to the system temp dir.
+    base = worklog_dir or "/tmp"
+    return os.path.join(base, f".audit_state_{issue_id}.json")
+
+
+def _remove_audit_state_file(state_path: str) -> None:
+    """Remove the abort-recovery state file (best-effort)."""
+    try:
+        os.remove(state_path)
+    except OSError:
+        pass
+
+
+def _restore_work_item_status(issue_id: str, original_status: str,
+                              original_stage: str,
+                              worklog_dir: str | None = None) -> int:
+    """Restore a work item to its pre-audit status/stage.
+
+    Called by signal handlers when the process is interrupted.  This is a
+    lightweight version of ``_apply_terminal_lifecycle`` that does not
+    depend on the ``_AuditContext`` — it directly invokes ``wl update``
+    to restore the captured state.
+
+    Returns 0 on success, non-zero on failure.
+    """
+    safe_status, safe_stage = _coerce_valid_status_stage(
+        original_status, original_stage,
+    )
+    try:
+        cmd = [
+            "wl", "update", issue_id,
+            "--status", safe_status,
+            "--stage", safe_stage,
+            "--assignee", "",
+            "--json",
+        ]
+        if worklog_dir:
+            # Inject --worklog-dir so the update reaches the correct store.
+            full_cmd = ["wl"]
+            flags = _resolve_worklog_flags(cmd, explicit_dir=worklog_dir)
+            full_cmd[1:1] = flags
+            full_cmd.extend(cmd[1:])  # skip duplicate "wl"
+        else:
+            full_cmd = cmd
+        subprocess.run(
+            full_cmd, capture_output=True, text=True, timeout=30, check=False,
+        )
+        return 0
+    except Exception:  # noqa: BLE001 -- best-effort signal handler
+        return 1
+
+
+def _register_abort_signal_handlers(
+        issue_id: str, original_status: str, original_stage: str,
+        state_path: str, worklog_dir: str | None = None) -> Callable[[], None]:
+    """Register signal handlers for SIGTERM and SIGINT.
+
+    The handlers restore the pre-audit status and then re-raise the
+    signal so the process terminates.  This covers the case where the
+    process is killed mid-try-block (SIGTERM doesn't run finally blocks;
+    only SIGINT raises KeyboardInterrupt which triggers finally).
+
+    SIGKILL cannot be caught — that case is handled by the parent
+    process checking for leftover state files.
+
+    Returns a deactivation callable.  ``cmd_issue`` calls it once the
+    terminal lifecycle has been applied so a signal arriving after the
+    audit completed can never restore the item to its pre-audit state
+    (which would undo a legitimate ``completed``/``in_review`` advance).
+    """
+    # Mutable guard: flipped to False by the returned deactivation
+    # callable.  The handler also checks the state file so a stale handler
+    # (registered by an earlier audit in a long-lived process) is inert.
+    active = {"value": True}
+
+    def _abort_handler(signum, frame):
+        """Restore pre-audit state on process abort."""
+        if not active["value"]:
+            # The audit already completed and cleaned up — just terminate.
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        # A signal handler must never raise: swallow any restore failure
+        # and always clean up + re-signal.
+        with contextlib.suppress(Exception):
+            _restore_work_item_status(
+                issue_id, original_status, original_stage,
+                worklog_dir=worklog_dir,
+            )
+        with contextlib.suppress(Exception):
+            _remove_audit_state_file(state_path)
+        # Restore the default disposition BEFORE re-signalling so the
+        # re-raised signal terminates the process instead of recursing
+        # into this handler.
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _abort_handler)
+        signal.signal(signal.SIGINT, _abort_handler)
+    except ValueError:  # pragma: no cover - non-main thread (e.g. tests)
+        # Signal handlers can only be registered from the main thread of
+        # the main interpreter.  The state-file + parent-side cleanup path
+        # still covers this case (SIGKILL / parent restore).
+        pass
+
+    def _deactivate() -> None:
+        """Disable the handlers once the audit's lifecycle is settled."""
+        active["value"] = False
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(sig, signal.SIG_DFL)
+
+    return _deactivate
+
+
+def _cleanup_audit_state(state_path: str) -> None:
+    """Clean up the abort-recovery state file (called on normal exit)."""
+    _remove_audit_state_file(state_path)
 
 
 SIBLING_SCAN_ROOT: Path = SHARED_SIBLING_SCAN_ROOT
@@ -3032,7 +3235,12 @@ def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
     Precedence:
       1. ``--max-concurrency`` CLI flag (explicit override)
       2. ``AUDIT_MAX_CONCURRENCY`` environment variable
-      3. ``DEFAULT_MAX_WORKERS`` (5)
+      3. ``DEFAULT_MAX_WORKERS`` (6)
+
+    Right-sized via the F7 harness to the host's measured audit-slot capacity
+    (SA-0MUSZJRB9006ZCHE): 6 = 2x the 3-slot local LLM proxy pool; the
+    harness drained a burst of 8 audits with a batch-attributable load delta
+    <= 1.63 on the 16-core host and no swap growth.
 
     An invalid (non-integer) env value is ignored with a warning so a
     misconfigured environment cannot break the audit run.
@@ -7936,6 +8144,17 @@ class _AuditContext:
     audit_verdict: str | None = None
     audit_completed: bool = False
 
+    # Abort-recovery state file path (SA-0MTRH8C5O005URGR).
+    # Set by ``_phase_gate`` when the pre-audit state is written before
+    # the ``in_progress`` claim; cleared by ``cmd_issue``'s finally block
+    # (or by the signal handler on abort).
+    abort_state_path: str | None = None
+    abort_deactivate: Callable[[], None] | None = None
+    """Deactivation callable for the SIGTERM/SIGINT handlers registered by
+    ``_phase_gate``.  Invoked by ``cmd_issue``'s finally block once the
+    terminal lifecycle has been applied, so a late signal cannot undo a
+    legitimate terminal transition (SA-0MTRH8C5O005URGR)."""
+
     # Merge gate state (SA-0MT456M27001LRTL — Phase 1 merge gate)
     merge_gate_merged: bool = False
     """True when the merge gate confirmed (or integrated) the item into dev."""
@@ -8092,7 +8311,7 @@ def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], s
     #    merge gate after the fetch, before any Phase 1 screening), so no
     #    extra ``wl show`` is issued here.
     desc = ctx.description or ""
-    for m in re.finditer(r"\b[0-9a-f]{7,40}\b", desc, re.IGNORECASE):
+    for m in _COMMIT_SHA_RE.finditer(desc):
         _add_sha(m.group(0))
     # ``wl show --json`` returns comments at the TOP level of the payload, not
     # under ``workItem``; prefer the explicitly-bound ``ctx.comments``,
@@ -8101,7 +8320,7 @@ def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], s
     comment_list = ctx.comments or (ctx.work_item.get("comments", []) or [])
     for comment in comment_list:
         text = comment.get("comment", "") or ""
-        for m in re.finditer(r"\b[0-9a-f]{7,40}\b", text, re.IGNORECASE):
+        for m in _COMMIT_SHA_RE.finditer(text):
             _add_sha(m.group(0))
 
     # Drop hex tokens that are not commit objects in the owning repo
@@ -8528,7 +8747,7 @@ def _phase_merge_gate(ctx: _AuditContext) -> int | None:
     Returns None when the gate passes (work merged or never resolvable —
     see below) or when integration succeeded; returns 1 when integration
     is REQUIRED but FAILED (the audit must fail with "Ready to close: No"
-    + needs-producer-review — AC3, never proceeds past Phase 1 with
+    + the producer hold — AC3, never proceeds past Phase 1 with
     unmerged work). A gate with no resolvable evidence is NOT a blocker:
     the item may have no code changes at all (docs-only, no feature
     branch, no commits referenced) — verification degrades to a recorded
@@ -8871,8 +9090,8 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # (SA-0MSL1Z7E9005TLBA) — a single ``wl show`` serves both the status
     # capture and the freshness fingerprint/time-gate computation.
     # ------------------------------------------------------------------
-    original_status = "open"  # safe default
-    original_stage = ""       # safe default (unknown)
+    original_status: str = "open"  # safe default
+    original_stage: str = ""       # safe default (unknown)
     wi: dict | None = None
     wi_comments: list = []
     try:
@@ -9001,6 +9220,18 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
         return 1
 
     # ------------------------------------------------------------------
+    # Abort-recovery state file (SA-0MTRH8C5O005URGR).
+    # Write the pre-audit state BEFORE claiming in_progress so that if
+    # the process is killed (SIGKILL) the parent process can restore the
+    # work item to its original state.
+    # ------------------------------------------------------------------
+    state_path = _write_audit_state_file(
+        issue_id, original_status, original_stage,
+        worklog_dir=worklog_dir,
+    )
+    ctx.abort_state_path = state_path
+
+    # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry (verdict-driven on exit)
     # ------------------------------------------------------------------
     # A completed/done item is already terminal and cannot be claimed with
@@ -9013,6 +9244,19 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
         _run_wl(runner,
                 ["wl", "update", issue_id, "--status", "in_progress", "--json"],
                 worklog_dir=worklog_dir)
+
+    # ------------------------------------------------------------------
+    # Register SIGTERM/SIGINT signal handlers (SA-0MTRH8C5O005URGR).
+    # Python's default SIGTERM disposition terminates without running
+    # finally blocks, and SIGKILL cannot be caught at all.  The handler
+    # restores the pre-audit status and re-raises so the process still
+    # terminates normally.  SIGKILL is handled by the parent-process
+    # state-file check on exit.
+    # ------------------------------------------------------------------
+    ctx.abort_deactivate = _register_abort_signal_handlers(
+        issue_id, original_status, original_stage,
+        state_path, worklog_dir=worklog_dir,
+    )
 
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
@@ -11679,6 +11923,15 @@ _STATUS_STAGE_COMPAT: dict[str, frozenset[str]] = {
 }
 _DEFAULT_SAFE_STAGE = "plan_complete"
 
+#: Reserved assignee value that marks the producer's per-item scheduling hold.
+#: Mirrors ContextHub's ``PRODUCER_HOLD_ASSIGNEE`` in
+#: ``packages/herdr/src/downtime-worker.ts`` (WL-0MV85WDOM007BKF8; epic
+#: WL-0MV82CHGQ000HAZZ Q2). Assigning an item to the producer pauses
+#: auto-dispatch and marks the item producer-owned for the release gate —
+#: this replaces the retired ``needsProducerReview`` flag
+#: (WL-0MV85WE7Q00044P9).
+_PRODUCER_HOLD_ASSIGNEE = "Map"
+
 
 def _coerce_valid_status_stage(status, stage):
     """Validate and coerce a (status, stage) pair to a valid combination.
@@ -11704,6 +11957,23 @@ def _coerce_valid_status_stage(status, stage):
         effective_stage = (
             "in_review" if effective_status == "completed" else "plan_complete"
         )
+
+    # Legacy hybrid recovery (WL-0MV85WE7Q00044P9). Before Option A the
+    # audit-tier claim flipped status to ``in-progress`` while leaving the
+    # stage at ``in_review`` (or a terminal ``done``). Coercing such a
+    # review-queue item to ``in-progress/plan_complete`` strands it off the
+    # review queue, so restore it to its true terminal ``completed`` status
+    # instead. This makes the ``in_review`` → ``plan_complete`` coercion
+    # unreachable for review-queue items.
+    if effective_status in ("in-progress", "in_progress") and effective_stage in ("in_review", "done"):
+        print(
+            f"Warning: captured pre-audit state "
+            f"({effective_status}/{effective_stage}) is the legacy audit-claim "
+            f"hybrid; restoring to (completed/{effective_stage}) so the item "
+            "stays on the review queue.",
+            file=sys.stderr,
+        )
+        return "completed", effective_stage
 
     # Check validity.
     valid_stages = _STATUS_STAGE_COMPAT.get(effective_status)
@@ -12039,14 +12309,15 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             expected_status, expected_stage = safe_status, safe_stage
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
-            # Top-level items (no parent) get --needs-producer-review yes so
-            # the producer-review gate (closeWorkItemsAfterRelease) blocks
-            # release until the producer explicitly reviews the item.  Child
-            # items are covered by their parent's review and must NOT be
-            # flagged — the flag would flood the producer queue with
-            # redundant approvals (SA-0MSSVKYEW008PJ9H). The flag is
-            # inserted before the trailing --json (file convention:
-            # --json is always the last flag).
+            # Producer hold (Option A; WL-0MV85WE7Q00044P9): a top-level item
+            # is assigned to the producer sentinel so the release gate blocks
+            # it until the producer reviews it. Child items are covered by
+            # their parent's review, so their assignee is CLEARED instead — a
+            # non-empty assignee would act as a scheduling hold and stop the
+            # item being re-dispatched (epic Q2; replaces the retired
+            # --needs-producer-review flag, SA-0MSSVKYEW008PJ9H). Either way
+            # the audit agent's own claim is released. The flag is inserted
+            # before the trailing --json (file convention: --json last).
             # This is the sole authorisation for the descendant cascade
             # below — a passing verdict, not status/stage (AC3).
             cascade_authorised = True
@@ -12056,7 +12327,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             else:
                 cmd += ["--status", "completed", "--stage", "in_review"]
             if not ctx.wi or not ctx.wi.get("parentId"):
-                cmd += ["--needs-producer-review", "yes"]
+                cmd += ["--assignee", _PRODUCER_HOLD_ASSIGNEE]
+            else:
+                cmd += ["--assignee", ""]
             cmd.append("--json")
             restore_cmd = cmd
             # Stage is kept as the pre-existing 'done' when the item already
@@ -12102,18 +12375,21 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             else:
                 restore_cmd = [
                     "wl", "update", ctx.issue_id,
-                    "--status", "open", "--stage", "plan_complete", "--json",
+                    "--status", "open", "--stage", "plan_complete",
+                    "--assignee", "", "--json",
                 ]
                 expected_status, expected_stage = "open", "plan_complete"
                 # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
                 # integration fails the audit closed and flags the item for
                 # producer review so the producer investigates and integrates
                 # manually — never proceed past Phase 1 with unmerged work.
+                # The producer-review flag is re-homed onto the producer-hold
+                # assignee (WL-0MV85WE7Q00044P9).
                 if ctx.merge_gate_blocker:
                     restore_cmd = [
                         "wl", "update", ctx.issue_id,
                         "--status", "open", "--stage", "plan_complete",
-                        "--needs-producer-review", "yes", "--json",
+                        "--assignee", _PRODUCER_HOLD_ASSIGNEE, "--json",
                     ]
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(
@@ -12246,9 +12522,13 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
 def _resolve_max_host_audits() -> int:
     """Resolve the host-wide concurrent ``issue`` ceiling (F5).
 
-    Precedence: ``AUDIT_MAX_HOST_AUDITS`` env var > default 3. Values below 1
+    Precedence: ``AUDIT_MAX_HOST_AUDITS`` env var > default 6. Values below 1
     are clamped to 1; an invalid value is ignored with a warning so a
-    misconfigured environment cannot break the audit.
+    misconfigured environment cannot break the audit. Default raised from 3 to
+    6 (SA-0MUSZJRB9006ZCHE): the F7 harness showed the previous cap was the
+    binding constraint on concurrent audits, and 6 (2x the 3-slot local LLM
+    proxy pool) drains bursts with a batch-attributable load delta <= 1.63 and
+    no swap growth on the 16-core host.
     """
     env_value = os.environ.get(AUDIT_MAX_HOST_AUDITS_ENV)
     if env_value:
@@ -12517,7 +12797,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # check, or surface AC assessment): the item's work must be merged
         # into the owning repo's dev, and is integrated when missing. A
         # blocked gate (integration failed) emits a fail-closed report here
-        # ("Ready to close: No" + needs-producer-review) — the pipeline
+        # ("Ready to close: No" + the producer hold) — the pipeline
         # never proceeds past Phase 1 with unmerged work (AC3).
         rc = _phase_fetch_and_cq(ctx)
         if rc is not None:
@@ -12607,14 +12887,31 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # failure (e.g. a silently-swallowed ``wl update``) overrides the
         # run's exit code with a non-zero value so it is never a silent
         # success (WL-0MSVVFBJ2003RRYK).
-        lifecycle_rc = _apply_terminal_lifecycle(ctx)
-        if lifecycle_rc != 0:
-            rc = lifecycle_rc
-        # Release the per-audit root published for deep helpers
-        # (SA-0MULGDABC001T11L) now that the run — including debug-log
-        # cleanup — is complete, so it never leaks into a later audit.
-        global _ACTIVE_AUDIT_ROOT
-        _ACTIVE_AUDIT_ROOT = None
+        #
+        # Deactivate the abort signal handlers FIRST (SA-0MTRH8C5O005URGR):
+        # once the terminal lifecycle runs, the audit is no longer "in
+        # progress", so a signal arriving during/after it must never
+        # restore the item to its pre-audit state and undo a legitimate
+        # terminal transition.
+        if ctx.abort_deactivate is not None:
+            with contextlib.suppress(Exception):
+                ctx.abort_deactivate()
+        try:
+            lifecycle_rc = _apply_terminal_lifecycle(ctx)
+            if lifecycle_rc != 0:
+                rc = lifecycle_rc
+        finally:
+            # Release the per-audit root published for deep helpers
+            # (SA-0MULGDABC001T11L) now that the run — including debug-log
+            # cleanup — is complete, so it never leaks into a later audit.
+            global _ACTIVE_AUDIT_ROOT
+            _ACTIVE_AUDIT_ROOT = None
+            # Clean up the abort-recovery state file so the parent process
+            # knows the child exited cleanly (SA-0MTRH8C5O005URGR).  The
+            # nested finally guarantees the cleanup even if the terminal
+            # lifecycle raises unexpectedly.
+            if ctx.abort_state_path:
+                _cleanup_audit_state(ctx.abort_state_path)
     if rc == 0 and ctx.checkpoint is not None:
         if ctx.checkpoint.budget_exceeded_children():
             # Budget-exceeded children remain unverified: KEEP the checkpoint
@@ -13110,7 +13407,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_issue.add_argument("--max-concurrency", type=int, default=None,
-                         help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
+                         help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 6)")
     p_issue.add_argument("--green-run", default=None, metavar="SHA|HEAD",
                          help=(
                              "Operator-attested green test run: the full project test "
@@ -13256,7 +13553,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_project.add_argument("--worklog-dir", default=None,
                            help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_project.add_argument("--max-concurrency", type=int, default=None,
-                           help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
+                           help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 6)")
     p_project.add_argument("--max-citations-per-ac", type=int, default=None,
                            help=(
                                "Accepted for CLI parity with the issue subcommand; "

@@ -1,0 +1,58 @@
+{
+  "work_item": "SA-0MUSZJRB9006ZCHE",
+  "harness": "skill/shared/validate_fanout.py (F7)",
+  "host": {
+    "cpu_count": 16,
+    "proxy_slot_pool_size": 3
+  },
+  "method": "AUDIT_MAX_HOST_AUDITS=32 (ingress cap lifted so the AUDIT_MAX_CONCURRENCY ceiling is the binding constraint); mock pi (1.2s sleep); 8 concurrent audit_runner issue invocations per ceiling; 0.25s metric sampling.",
+  "caveat": "Host baseline load was elevated (~24-43 on 16 cores) by concurrent, unrelated agent traffic, so the absolute 'load < 16' target could not be observed; the batch-attributable load delta and swap delta are the attributable signals. peak_batch_pi == ceiling confirms admission/parallelism.",
+  "generated_at": "2026-10-14T22:32:50Z",
+  "runs": [
+    {
+      "ceiling": 3,
+      "batch_ok": true,
+      "elapsed_seconds": 18.68,
+      "baseline_load_1min": 34.18,
+      "peak_load_1min": 35.68,
+      "batch_load_delta_1min": 1.51,
+      "swap_delta_bytes": -4096,
+      "peak_batch_pi": 3,
+      "peak_audit": 8
+    },
+    {
+      "ceiling": 5,
+      "batch_ok": true,
+      "elapsed_seconds": 15.14,
+      "baseline_load_1min": 35.62,
+      "peak_load_1min": 37.25,
+      "batch_load_delta_1min": 1.63,
+      "swap_delta_bytes": 0,
+      "peak_batch_pi": 5,
+      "peak_audit": 8
+    },
+    {
+      "ceiling": 6,
+      "batch_ok": true,
+      "elapsed_seconds": 12.94,
+      "baseline_load_1min": 36.75,
+      "peak_load_1min": 36.75,
+      "batch_load_delta_1min": 0.0,
+      "swap_delta_bytes": -49152,
+      "peak_batch_pi": 6,
+      "peak_audit": 8
+    },
+    {
+      "ceiling": 8,
+      "batch_ok": true,
+      "elapsed_seconds": 9.64,
+      "baseline_load_1min": 32.45,
+      "peak_load_1min": 32.45,
+      "batch_load_delta_1min": 0.0,
+      "swap_delta_bytes": 0,
+      "peak_batch_pi": 8,
+      "peak_audit": 8
+    }
+  ],
+  "conclusion": "Drain time falls monotonically (18.7s -> 9.6s) as the ceiling rises 3 -> 8; batch-attributable load delta stays <= 1.63 and swap never grows. With the default ingress cap (3) peak_batch_pi saturated at 3 for every ceiling, proving AUDIT_MAX_HOST_AUDITS=3 was the binding constraint. Chosen ceilings: 6 (= 2x the 3-slot proxy pool) for both AUDIT_MAX_CONCURRENCY and AUDIT_MAX_HOST_AUDITS - absorbs bursts while bounded proxy contention; 8 gave diminishing returns and higher fan-out."
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the audit scan.py bounded-scan helper (find-workitem / search-code / list-files).
+"""Tests for the audit scan.py bounded-scan helper (search-code / list-files).
 
 Work item: SA-0MSBR0E8Y0022Z4V (parent SA-0MSAEJCP7002LTIM — "Optimize audit
 grep scans: only perform required and efficient scans").
@@ -8,11 +8,16 @@ These tests encode the replacement recipes documented in
 ``docs/dev/audit-grep-scan-patterns.md`` (SA-0MSBR06GX0051T1Q). They are
 written first (TDD): ``scan.py`` is implemented by SA-0MSBR0LLT006JCXN.
 
+The former ``find-workitem`` subcommand was RETIRED by SA-0MSOMINF8007K9S4
+— worklog lookups now use the native wl CLI (`wl list <term> --json` for
+substring matching, `wl show <id> --json` for exact/unique-ID resolution).
+This file therefore asserts the subcommand's removal and tests only the two
+bounded-scan subcommands that remain.
+
 Covered:
 
-  - ``find-workitem <ID>``: resolves the work item via ``wl search`` (mocked),
-    never greps ``.worklog/`` recursively, and exits non-zero with a message
-    when not found. Prints the work item as JSON on stdout.
+  - ``find-workitem`` retirement: the subcommand is gone from the CLI
+    (non-zero exit with a parser error; absent from --help).
   - ``search-code <TERM>``: invokes ``rg`` with prunes (``!node_modules``,
     ``!.git``, ``!.worklog``, ``!**/audit_debug_*.jsonl``), a size cap, and an
     explicit path; returns matches; exits non-zero when nothing matches.
@@ -25,7 +30,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import subprocess
 import sys
 import tempfile
@@ -69,90 +73,30 @@ def _make_fixture() -> Path:
 
 
 # ===========================================================================
-# find-workitem
+# find-workitem (retired by SA-0MSOMINF8007K9S4)
 # ===========================================================================
 
 
-class TestFindWorkitem:
-    def test_find_workitem_uses_wl_search_not_grep(self) -> None:
-        """find-workitem resolves via `wl search`, not a recursive grep."""
-        # Mock subprocess so no real wl/grep runs; verify the *constructed*
-        # command uses `wl search` and never `grep -r` over .worklog.
-        proc = subprocess.run  # noqa: F841 (documentation)
-        with mock.patch("subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                ["wl", "search"], 0,
-                stdout=json.dumps({"success": True, "items": [{"id": "SA-X"}]}),
-            )
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("scan", SCAN_SCRIPT)
-            scan = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(scan)
-            rc = scan.main(["find-workitem", "SA-X"])
-        assert rc == 0
-        called_cmds = [c.args[0] for c in mock_run.call_args_list]
-        joined = " ".join(" ".join(str(a) for a in c) for c in called_cmds)
-        assert "wl" in joined and "search" in joined
-        assert not any("grep" in c for c in called_cmds)
+class TestFindWorkitemRetired:
+    """AC3: scan.py find-workitem is retired; worklog lookups use the native
+    wl CLI (`wl list <term> --json` substring, `wl show <id> --json` exact).
+    """
 
-    def test_find_workitem_not_found_exits_nonzero_with_message(self) -> None:
-        """Not found -> non-zero exit and a clear message, no crash."""
-        with mock.patch("subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                ["wl", "search"], 0,
-                stdout=json.dumps({"success": True, "items": []}),
-            )
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("scan", SCAN_SCRIPT)
-            scan = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(scan)
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
-                rc = scan.main(["find-workitem", "SA-NOPE"])
-        assert rc != 0
-        assert "SA-NOPE" in stderr.getvalue()
-        assert "not found" in stderr.getvalue().lower()
+    def test_find_workitem_subcommand_removed(self) -> None:
+        """The find-workitem subcommand no longer parses (parser error)."""
+        root = _make_fixture()
+        proc = _run_scan("find-workitem", "SA-X", cwd=root)
+        assert proc.returncode != 0
+        assert "invalid choice" in proc.stderr
 
-    def test_find_workitem_prints_work_item_json(self) -> None:
-        """Found -> the work item is printed as JSON on stdout."""
-        item = {"id": "SA-X", "title": "found", "status": "open"}
-        with mock.patch("subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                ["wl", "search"], 0,
-                stdout=json.dumps({"success": True, "items": [item]}),
-            )
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("scan", SCAN_SCRIPT)
-            scan = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(scan)
-            stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout):
-                rc = scan.main(["find-workitem", "SA-X"])
-        assert rc == 0
-        printed = json.loads(stdout.getvalue())
-        assert printed["id"] == "SA-X"
-        assert printed["title"] == "found"
-
-    def test_find_workitem_no_recursive_grep_over_worklog(self) -> None:
-        """The recipe must never run `grep -r ... .worklog/`."""
-        with mock.patch("subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                ["wl", "search"], 0,
-                stdout=json.dumps({"success": True, "items": []}),
-            )
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("scan", SCAN_SCRIPT)
-            scan = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(scan)
-            scan.main(["find-workitem", "SA-X"])
-        for c in mock_run.call_args_list:
-            args = c.args[0]
-            joined = " ".join(str(a) for a in args)
-            assert "grep" not in joined or ".worklog" not in joined
+    def test_help_lists_only_bounded_subscommands(self) -> None:
+        """--help advertises search-code/list-files, never find-workitem."""
+        root = _make_fixture()
+        proc = _run_scan("--help", cwd=root)
+        assert proc.returncode == 0
+        assert "search-code" in proc.stdout
+        assert "list-files" in proc.stdout
+        assert "find-workitem" not in proc.stdout
 
 
 # ===========================================================================
@@ -337,9 +281,11 @@ class TestListFiles:
 
 
 def test_scan_script_has_cli_help() -> None:
-    """scan.py exposes a CLI with the three subcommands."""
+    """scan.py exposes a CLI with the bounded-scan subcommands; the retired
+    find-workitem subcommand is absent (SA-0MSOMINF8007K9S4 AC3)."""
     root = _make_fixture()
     proc = _run_scan("--help", cwd=root)
     assert proc.returncode == 0
-    for sub in ("find-workitem", "search-code", "list-files"):
+    for sub in ("search-code", "list-files"):
         assert sub in proc.stdout
+    assert "find-workitem" not in proc.stdout

@@ -38,6 +38,7 @@ from audit.scripts import audit_runner
 
 SKILL_MD = REPO_ROOT / "skill" / "audit" / "SKILL.md"
 SKILL_REF = REPO_ROOT / "docs" / "dev" / "audit-skill-reference.md"
+GREP_SCAN_DOC = REPO_ROOT / "docs" / "dev" / "audit-grep-scan-patterns.md"
 
 
 def _skill_docs() -> str:
@@ -90,6 +91,39 @@ class TestSkillMdScanningGuidance:
         )
         assert "--batch-phase2" in runner_line
         assert "--max-concurrency" in runner_line
+
+
+class TestSkillMdNativeWorklogLookups:
+    """SA-0MSOMINF8007K9S4 AC4/AC6: docs route worklog lookups to the native wl
+    CLI and carry no stale ``scan.py find-workitem`` guidance.
+
+    Substring matching is `wl list <term> --json`; exact/unique-ID resolution
+    is `wl show <id> --json`. The interim ``scan.py find-workitem`` wrapper is
+    retired now that the wl CLI resolves IDs tolerantly.
+    """
+
+    def test_reference_doc_has_native_worklog_commands(self) -> None:
+        """The reference doc names both native worklog-lookup commands."""
+        text = SKILL_REF.read_text()
+        assert "wl list <term> --json" in text
+        assert "wl show <id> --json" in text
+
+    def test_grep_scan_patterns_doc_uses_native_commands(self) -> None:
+        """The pattern catalogue's replacements use native wl lookups."""
+        text = GREP_SCAN_DOC.read_text()
+        assert "wl list <term> --json" in text or "wl list <ID>" in text
+        assert "wl show <ID>" in text or "wl show <id>" in text
+
+    def test_no_stale_find_workitem_guidance_remains(self) -> None:
+        """No stale ``scan.py find-workitem`` guidance remains in the docs."""
+        for doc in (SKILL_MD, SKILL_REF, GREP_SCAN_DOC):
+            text = doc.read_text()
+            assert "find-workitem" not in text, f"stale guidance in {doc}"
+
+    def test_docs_do_not_present_wl_search_as_substring_matcher(self) -> None:
+        """wl search is FTS, never a substring matcher (AC2)."""
+        text = SKILL_REF.read_text()
+        assert "wl search <keywords> --json` or `wl list" not in text
 
 
 # ===========================================================================

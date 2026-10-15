@@ -78,3 +78,29 @@ Target achieved: clean run ~3s total (was 9.8s); polluted-run growth bounded
 | Repo scan files | 2,188 | 362 |
 | Total wall-clock | ≥240s (timed out) | **~3s** |
 | Report duplicates on re-run | stacked `###` sub-blocks | 1 section, 1 sub-block |
+
+## 6. v4 follow-up — keyword relevance (SA-0MUG46NJE003JOCD)
+
+v3 fixed *how many* keywords are queried (8) but not *which*: extraction was
+pure frequency-ranked from the combined title+description text, so
+corpus-generic scaffold terms ("related", "skill", "find", "work",
+"item", "report", "review") dominated the top-8 sweep. On the review item
+SA-0MNCDAQ8W008KOG9 the live reproduction searched
+`related, skill, find, terms, keyword, audit, frequency, generic` and
+returned unrelated lint items matched on generic words ("acceptance",
+"audit", "behaviour").
+
+v4 (implemented, this item) adds two zero-subprocess-cost weighting changes
+inside `extract_keywords`:
+
+| Change | Mechanism | Effect |
+|--------|-----------|--------|
+| Title boost | `TITLE_WEIGHT` (3) × title occurrence + body occurrence | A distinctive title term leads the list; the item's compressed subject is surfaced first. Static IDF proxy (no extra subprocesses; corpus-wide IDF via per-term doc-frequency pass explicitly out of scope). |
+| Project-generic suppression | `PROJECT_STOP_WORDS` ("work", "item", "items", "worklog", "report", "review", "reviews", "skill", "skills", "related", "find", "finding", "finds") | Generic terms never consume a capped query slot — the top-8 sweep is spent on distinctive domain terms. Conservative: prefer false negatives. |
+| Result ranking de-inverted + match-count primary | Rank = descending distinct-keyword match count → ascending best score → id | wl `search` returns results best-first with an **ascending** score (negated BM25/hybrid rank, `dist/commands/search.js`); the v2 code sorted *descending*, surfacing score-0 (worst) items first. Multi-keyword matches (e.g. "keyword"+"keywords"+item-id) now win, so find-related siblings surface. The re-ranked item ordering also mirrors the existing repo-file match-count heuristic. |
+
+Determinism is preserved: keyword ordering is (weight desc, token asc), and
+result ranking is (match count desc, score asc, id asc). Search fan-out is
+unchanged (≤ `MAX_SEARCH_KEYWORDS` = 8). The soft top-3
+`MAX_WORK_ITEM_RESULTS` cap and the `(+N more)` report compaction are
+untouched.

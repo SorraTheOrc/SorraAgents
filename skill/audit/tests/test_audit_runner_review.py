@@ -336,7 +336,8 @@ class TestCascadeNoSideEffectDemotion:
             )
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
-            "--status", "open", "--stage", "plan_complete", "--json",
+            "--status", "open", "--stage", "plan_complete",
+            "--assignee", "", "--json",
         ]
 
     def test_cascade_no_verdict_demotes_pre_review_child(self):
@@ -353,7 +354,8 @@ class TestCascadeNoSideEffectDemotion:
             )
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
-            "--status", "open", "--stage", "plan_complete", "--json",
+            "--status", "open", "--stage", "plan_complete",
+            "--assignee", "", "--json",
         ]
 
     def test_cascade_yes_verdict_still_advances(self):
@@ -371,5 +373,5 @@ class TestCascadeNoSideEffectDemotion:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--needs-producer-review", "yes", "--json",
+            "--assignee", "Map", "--json",
         ]

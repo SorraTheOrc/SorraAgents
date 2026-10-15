@@ -3,3 +3,9 @@ prefix: SA
 autoExport: true
 autoSync: false
 githubRepo: SorraTheOrc/SorraAgents
+# Author-identity gate allow-list (SA-0MUJ2VMF7000UHCX): accepts commits
+# authored by the project's GitHub identity in addition to the local
+# user.email, so `wl sync` can merge worklog data pushed from the operator's
+# GitHub-identity checkout.
+syncAllowedAuthors:
+  - 250240+SorraTheOrc@users.noreply.github.com

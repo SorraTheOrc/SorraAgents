@@ -22,9 +22,14 @@ Safety / no-false-positive rules (F5 AC2/AC5/AC6/AC7):
 - a recursion marker env var makes nested pytest/``run_tests.py`` stand down;
 - a no-op under ``--collect-only`` and under xdist workers;
 - a no-op for non-git roots;
-- refs checked out in ``.worklog/worktrees/`` (agent worktrees) are excluded
-  (derived from ``git worktree list --porcelain``, never a ``wl-*`` pattern),
-  together with the ``branch.<name>.*`` config those worktrees own;
+- refs checked out in a registered worktree **other than the guard's own
+  root** (ownership-based exclusion) are excluded (derived from
+  ``git worktree list --porcelain``, never a ``wl-*`` pattern), together with
+  the ``branch.<name>.*`` config those worktrees own, retained worktree-track
+  config (``branch.<name>.remote=.``, surviving ``git worktree remove`` for a
+  register→remove cycle wholly inside the guard window) and the
+  remote-tracking refs of an excluded branch; the guard root's own branch
+  stays monitored (SA-0MV8311B3005DNG8);
 - the cheap fingerprint is only a **trigger**: a movement is confirmed against
   the authoritative diff before a test is failed, so excluded-set churn
   (worktree registered/removed mid-run) cannot fail a clean run with

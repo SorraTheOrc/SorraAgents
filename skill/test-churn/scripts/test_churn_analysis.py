@@ -18,8 +18,10 @@ Unlike the ad-hoc script it replaces (ContextHub
   files only, and including newly added test files);
 * counts **distinct commits** for the temporal trend (a rate can never exceed
   100%);
-* accounts for whole-file test deletions; and
-* counts each churned file once when aggregating by domain.
+* accounts for whole-file test deletions;
+* counts each churned file once when aggregating by domain; and
+* reports a consolidated tests-added / tests-deleted / tests-modified / net-
+  growth metric per project and per test area, trended by calendar quarter.
 
 Scope and limitations are documented in the generated report.  The tool never
 mutates the analysed repository: it reads git history and writes its two
@@ -47,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ANALYSIS_VERSION = "2.0.0"
+ANALYSIS_VERSION = "2.1.0"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -615,6 +617,126 @@ def analyse_feature_commits(
     }
 
 
+def _growth_empty() -> dict[str, int]:
+    """Return a zeroed growth accumulator."""
+    return {
+        "files_added": 0,
+        "files_deleted": 0,
+        "files_modified": 0,
+        "lines_added": 0,
+        "lines_deleted": 0,
+    }
+
+
+def _accumulate_growth(acc: dict[str, int], change: FileChange) -> None:
+    """Fold *change* into a growth accumulator (statuses A/M/R/D).
+
+    Additions count added test files and additions to modified/renamed ones;
+    deletions count whole-file deletions and deletions from modified/renamed
+    ones.  Renames count as *modified* (the path is the new path); copy events
+    are excluded by the diff filter.
+    """
+    if change.status == "A":
+        acc["files_added"] += 1
+        acc["lines_added"] += change.additions
+    elif change.status == "D":
+        acc["files_deleted"] += 1
+        acc["lines_deleted"] += change.deletions
+    elif _is_modification(change):
+        acc["files_modified"] += 1
+        acc["lines_added"] += change.additions
+        acc["lines_deleted"] += change.deletions
+
+
+def _growth_row(acc: dict[str, int]) -> dict[str, int]:
+    """Attach the net-growth fields to a growth accumulator."""
+    return {
+        **acc,
+        "files_net_growth": acc["files_added"] - acc["files_deleted"],
+        "lines_net_growth": acc["lines_added"] - acc["lines_deleted"],
+    }
+
+
+def analyse_growth_accounting(
+    commits: Sequence[Commit], config: ChurnConfig
+) -> dict[str, Any]:
+    """Consolidated tests-added / tests-deleted / tests-modified / net-growth.
+
+    Spans the **whole** analysed history — every commit, not just feature
+    commits — so the added and deleted figures are directly comparable: a new
+    test file added (or deleted) in a test-only commit counts exactly like one
+    accompanying a source change.  File counts count *change events* (adding
+    the same path twice across history counts as two additions; a later whole
+    delete counts as one deletion, so a delete-and-re-add yields net growth
+    zero); line counts accumulate the real ``--numstat`` figures for the
+    relevant statuses.
+
+    Reported both per project (``totals`` fields) and per test area
+    (``area``).  The mapping to the historical corrected fields is documented
+    in ``docs/dev/test-churn-skill-reference.md``.
+    """
+    totals = _growth_empty()
+    per_area: dict[str, dict[str, int]] = defaultdict(_growth_empty)
+    for commit in commits:
+        for change in commit.files:
+            if not is_test_file(change.path, config):
+                continue
+            _accumulate_growth(totals, change)
+            _accumulate_growth(
+                per_area[classify_area(change.path, config)], change
+            )
+    return {
+        **_growth_row(totals),
+        "area": {
+            area: _growth_row(stats)
+            for area, stats in sorted(per_area.items())
+        },
+    }
+
+
+def _calendar_quarter(date_str: str) -> str:
+    """Map an ISO ``YYYY-MM-DD`` commit date to a ``YYYY-QN`` quarter."""
+    month = int(date_str[5:7])
+    return f"{date_str[:4]}-Q{(month - 1) // 3 + 1}"
+
+
+def analyse_growth_trend_by_quarter(
+    commits: Sequence[Commit], config: ChurnConfig
+) -> list[dict[str, Any]]:
+    """Growth per **calendar quarter**, derived from commit dates.
+
+    The trend covers the continuous quarter range from the first to the last
+    analysed commit; quarters without test changes are reported as zero rather
+    than omitted, so a quarter where test-suite growth regresses stays
+    visible.  Empty histories yield an empty list.
+    """
+    per_quarter: dict[str, dict[str, int]] = defaultdict(_growth_empty)
+    for commit in commits:
+        for change in commit.files:
+            if not is_test_file(change.path, config):
+                continue
+            _accumulate_growth(
+                per_quarter[_calendar_quarter(commit.date)], change
+            )
+
+    result: list[dict[str, Any]] = []
+    if not commits:
+        return result
+    year, quarter = (int(part) for part in _calendar_quarter(commits[0].date).split("-Q"))
+    end_year, end_quarter = (
+        int(part) for part in _calendar_quarter(commits[-1].date).split("-Q")
+    )
+    while (year, quarter) <= (end_year, end_quarter):
+        period = f"{year}-Q{quarter}"
+        row = _growth_row(per_quarter.get(period, _growth_empty()))
+        result.append({"quarter": period, **row})
+        quarter += 1
+        if quarter > 4:
+            quarter = 1
+            year += 1
+    return result
+
+
 def analyse_temporal_trends(
     commits: Sequence[Commit], config: ChurnConfig
 ) -> list[dict[str, Any]]:
@@ -969,6 +1091,8 @@ def generate_report(report: dict[str, Any]) -> str:
     """Render the self-contained Markdown report."""
     meta = report["metadata"]
     analysis = report["primary_metrics"]
+    growth = report["growth_metrics"]
+    quarterly = report["quarterly_growth_trends"]
     temporal = report["temporal_trends"]
     stability = report["file_stability"]
     domain = report["domain_churn"]
@@ -1012,6 +1136,11 @@ def generate_report(report: dict[str, Any]) -> str:
     add("  deletions, i.e. existing test lines were replaced.")
     add("- **New test file** — a test file added (git status `A`).")
     add("- **Deleted test file** — a test file removed wholesale (git status `D`).")
+    add("- **Net growth** — files/lines of tests added minus files/lines deleted")
+    add("  over the whole analysed history (all commits, not just feature")
+    add("  commits); file counts count change events.")
+    add("- **Calendar quarter** — a `YYYY-QN` grouping derived from a commit's")
+    add("  date, used to trend the growth metric over time.")
     add("")
     add("**Limitations.**")
     add("")
@@ -1063,7 +1192,49 @@ def generate_report(report: dict[str, Any]) -> str:
         f"({analysis['deleted_test_lines']:,} lines)")
     add("")
 
-    add("## 3. Temporal trend (distinct commits per month)")
+    add("## 3. Test growth — added, deleted, net")
+    add("")
+    add("Net growth is `added − deleted` over the **whole analysed history**")
+    add("(all commits, not just feature commits), so a whole-file deletion in a")
+    add("test-only commit is not invisible.  File counts count change events;")
+    add("line counts accumulate the real name-status + numstat figures (renames")
+    add("count as modified; copy events are excluded).")
+    add("")
+    add(f"- Test files added / deleted / modified: "
+        f"{growth['files_added']:,} / {growth['files_deleted']:,} / "
+        f"{growth['files_modified']:,}")
+    add(f"- Net file growth: {growth['files_net_growth']:,}")
+    add(f"- Test lines added / deleted: {growth['lines_added']:,} / "
+        f"{growth['lines_deleted']:,}")
+    add(f"- Net line growth: {growth['lines_net_growth']:,}")
+    add("")
+    add("| Area | Files added | Files deleted | Files modified | Net files | "
+        "Lines added | Lines deleted | Net lines |")
+    add("|---|---|---|---|---|---|---|---|")
+    for area, stats in sorted(growth["area"].items()):
+        add(f"| {area} | {stats['files_added']:,} | {stats['files_deleted']:,} | "
+            f"{stats['files_modified']:,} | {stats['files_net_growth']:,} | "
+            f"{stats['lines_added']:,} | {stats['lines_deleted']:,} | "
+            f"{stats['lines_net_growth']:,} |")
+    add("")
+
+    add("## 4. Quarterly growth trend (calendar quarters)")
+    add("")
+    add("Growth grouped by calendar quarter derived from commit dates.  Quarters")
+    add("with no test changes are reported as zero, so growth regressions over")
+    add("time remain visible.")
+    add("")
+    add("| Quarter | Files added | Files deleted | Files modified | Net files | "
+        "Lines added | Lines deleted | Net lines |")
+    add("|---|---|---|---|---|---|---|---|")
+    for row in quarterly:
+        add(f"| {row['quarter']} | {row['files_added']:,} | "
+            f"{row['files_deleted']:,} | {row['files_modified']:,} | "
+            f"{row['files_net_growth']:,} | {row['lines_added']:,} | "
+            f"{row['lines_deleted']:,} | {row['lines_net_growth']:,} |")
+    add("")
+
+    add("## 5. Temporal trend (distinct commits per month)")
     add("")
     add("| Period | Feature commits | With rewrites | Rate | "
         "Lines deleted | Lines added |")
@@ -1078,7 +1249,7 @@ def generate_report(report: dict[str, Any]) -> str:
     add("so it cannot exceed 100%.")
     add("")
 
-    add("## 4. Churn by area")
+    add("## 6. Churn by area")
     add("")
     add("| Area | Feature commits | Rewrites | New files | Deleted | "
         "Lines deleted | Lines added |")
@@ -1094,7 +1265,7 @@ def generate_report(report: dict[str, Any]) -> str:
             f"{stats['total_added']:,} |")
     add("")
 
-    add("## 5. Most volatile test files")
+    add("## 7. Most volatile test files")
     add("")
     add(f"Total test files modified: {stability['total_test_files_modified']:,}")
     add("")
@@ -1105,7 +1276,7 @@ def generate_report(report: dict[str, Any]) -> str:
             f"{row['total_additions']:,} | {row['total_deletions']:,} |")
     add("")
 
-    add("## 6. Rewrite intensity")
+    add("## 8. Rewrite intensity")
     add("")
     if intensity["total_rewrite_commits"]:
         add(f"- Rewrite commits: {intensity['total_rewrite_commits']:,}")
@@ -1123,7 +1294,7 @@ def generate_report(report: dict[str, Any]) -> str:
         add("No rewrite commits were observed.")
     add("")
 
-    add("## 7. Test change pattern (co-evolution, not test-first)")
+    add("## 9. Test change pattern (co-evolution, not test-first)")
     add("")
     add(f"- Feature commits: {pattern['feature_commits']:,}")
     add(f"- Feature commits adding test files: "
@@ -1135,7 +1306,7 @@ def generate_report(report: dict[str, Any]) -> str:
         f"{pattern['test_only_commits']:,}")
     add("")
 
-    add("## 8. Source volatility correlation")
+    add("## 10. Source volatility correlation")
     add("")
     add(f"- Pearson correlation (source churn vs test rewrite lines): "
         f"{correlation['correlation']}")
@@ -1147,7 +1318,7 @@ def generate_report(report: dict[str, Any]) -> str:
             f"{correlation['avg_test_rewrite_lines_per_feature']:,}")
     add("")
 
-    add("## 9. Efficiency metrics")
+    add("## 11. Efficiency metrics")
     add("")
     add(f"- Source files touched: {efficiency['total_src_files_touched']:,}")
     add(f"- Test files touched: {efficiency['total_test_files_touched']:,}")
@@ -1158,7 +1329,7 @@ def generate_report(report: dict[str, Any]) -> str:
         f"{efficiency['test_churn_per_source_line']}")
     add("")
 
-    add("## 10. Commit patterns")
+    add("## 12. Commit patterns")
     add("")
     add("| Pattern | Count |")
     add("|---|---|")
@@ -1166,7 +1337,7 @@ def generate_report(report: dict[str, Any]) -> str:
         add(f"| {pattern_name} | {count:,} |")
     add("")
 
-    add("## 11. Domain churn (each file counted once)")
+    add("## 13. Domain churn (each file counted once)")
     add("")
     add("| Area | Test files | Source files | Rewrites | New tests | "
         "Deleted tests | Lines deleted | Lines added |")
@@ -1180,7 +1351,7 @@ def generate_report(report: dict[str, Any]) -> str:
             f"{stats['total_additions']:,} |")
     add("")
 
-    add("## 12. TDD value assessment")
+    add("## 14. TDD value assessment")
     add("")
     add(f"- Modified-only rewrite ratio: "
         f"**{assessment['rewrite_ratio_modified_only_pct']}%**")
@@ -1244,6 +1415,10 @@ def build_report(
         },
         "primary_metrics": primary,
         "area_stats": primary["area_stats"],
+        "growth_metrics": analyse_growth_accounting(commits, config),
+        "quarterly_growth_trends": analyse_growth_trend_by_quarter(
+            commits, config
+        ),
         "temporal_trends": analyse_temporal_trends(commits, config),
         "file_stability": analyse_per_file_stability(commits, config),
         "domain_churn": analyse_domain_churn(commits, config),

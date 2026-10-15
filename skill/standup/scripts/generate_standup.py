@@ -16,15 +16,17 @@ Default time window: 24 hours starting at 06:00 the previous day
 Usage:
     python3 generate_standup.py [--json] [--verbose] [--output-path <path>] [--count N]
                             [--startTime <ISO>] [--duration <hours>]
-                            [--worklog-dir <path>] [--no-sync]
+                            [--worklog-dir <path>] [--no-sync] [--no-commit]
 
 Flags:
     --json           Output raw JSON data instead of the formatted report
+                     (streamed to stdout unless --output-path is given)
     --verbose        Include extra detail (priority, status, stage) in output
-    --output-path    Write report to a file (default: ./standups/YYYY_MM_DD.md)
+    --output-path    Write the report to a file (default: ./standups/YYYY_MM_DD.md)
                      Relative to project root (worklog parent when --worklog-dir
                      / WL_WORKLOG_DIR is set, otherwise cwd); directory is created
-                     if missing. Overrides to a custom path are always honored.
+                     if missing. Overrides the default for either output format;
+                     with --json the raw JSON is written to the given path.
     --count N        Herdr browse window (default: from herdr config or 20)
     --startTime STR  Window start (ISO8601, e.g. 2026-09-03T06:00:00 or 2026-09-03 06:00)
     --duration H     Window duration in hours (default 24)
@@ -34,6 +36,11 @@ Flags:
                      --worklog-dir <path>.
     --no-sync        Skip the initial `wl sync` (offline/deterministic runs and
                      tests). By default the worklog is synced first, non-fatally.
+    --no-commit      Skip the git commit + push of the report file just written
+                     (offline/deterministic runs and tests). By default the
+                     report file is committed and the current branch pushed,
+                     non-fatally; ``main``/``master`` are committed locally but
+                     never pushed.
 
 The script runs `wl sync` (lock-aware, non-fatal) before its first `wl next`
 / `wl list` fetch so the Herdr selection list reflects the shared remote
@@ -57,9 +64,13 @@ if str(_SKILLS_ROOT) not in sys.path:
 from import_guard import guard_shared_import
 
 try:
+    from shared.git_sandbox import scrub_repository_overrides
     from shared.worklog_sync import sync_worklog
 except ModuleNotFoundError as _missing_shared:  # pragma: no cover
     guard_shared_import(_missing_shared.name)
+
+# Re-use the shared project-name resolver (merged via SA-0MUMHH4BB000WEM9)
+from shared.project_name import resolve_project_name
 
 DEFAULT_BROWSE_COUNT = 20
 HERDR_CONFIG_PATH = Path.home() / ".config" / "herdr" / "worklog-plugin.json"
@@ -907,6 +918,8 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
             "start": window_start.isoformat() if window_start else None,
             "end": window_end.isoformat() if window_end else None,
         },
+        # Project name (resolved from config.yaml projectName, then worklog parent dir, then cwd)
+        "project_name": resolve_project_name(worklog_dir=WORKLOG_DIR),
         # compat keys for older callers/tests
         "queue": [format_item(i, verbose) for i in herdr_items_sorted],
         "queue_count": len(herdr_items_sorted),
@@ -916,9 +929,11 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
     }
 
 
-def format_report(data, browse_count=None):
+def format_report(data, browse_count=None, project_name: str | None = None):
     now = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
-    lines = [f"## Standup Report ({format_date_tts(now)})", ""]
+    # Resolve project name: explicit arg > data dict > shared resolver with WORKLOG_DIR
+    name = project_name or data.get("project_name") or resolve_project_name(worklog_dir=WORKLOG_DIR)
+    lines = [f"## {name} Standup Report ({format_date_tts(now)})", ""]
 
     # Prefer TTS-friendly fields if present; fall back to legacy fields for back-compat
     yesterday_lines = data.get("yesterday_tts") if data.get("yesterday_tts") is not None else data.get("yesterday", [])
@@ -1004,6 +1019,160 @@ def _run_with_sync(report_fn, worklog_dir=None, no_sync=False, sync_fn=None):
     return report_fn()
 
 
+# ── Commit helpers ──────────────────────────────────────────────────
+#
+# The standup report is persisted to git so standup history is versioned
+# automatically (SA-0MUDYRHVZ005PQP4). The commit/push is deliberately
+# surgical (exactly the report file written by this run), non-fatal and
+# lock-free, mirroring the sync-first pattern: any failure is a warning to
+# stderr and the exit code is unchanged. ``--no-commit`` disables it entirely.
+
+#: Branches the script refuses to auto-push to (repo policy: never push main).
+PROTECTED_PUSH_BRANCHES = frozenset({"main", "master"})
+
+#: Upper bound (seconds) on a single git invocation so a hung git cannot hang
+#: an agent session.
+COMMIT_TIMEOUT = 60
+
+
+def _warn(message):
+    """Emit a non-fatal warning to stderr."""
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+def _default_git_runner(project_root):
+    """Return a runner that executes ``git`` with ``cwd=project_root``.
+
+    Repository-override environment variables (``GIT_DIR`` &c.) are stripped so
+    a leaked value cannot redirect the commit to another checkout (see
+    ``docs/dev/test-isolation.md``). The runner mirrors :func:`_run_git` and
+    never raises: any error is returned as ``(False, "", message)``.
+    """
+    def _run(args):
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=str(project_root),
+                env=scrub_repository_overrides(),
+                capture_output=True,
+                text=True,
+                timeout=COMMIT_TIMEOUT,
+                check=False,
+            )
+            return (
+                result.returncode == 0,
+                result.stdout.strip(),
+                result.stderr.strip(),
+            )
+        except subprocess.TimeoutExpired:
+            return False, "", "Command timed out"
+        except Exception as e:  # noqa: BLE001
+            return False, "", str(e)
+
+    return _run
+
+
+def commit_report_file(path, project_root, message=None, runner=None):
+    """Commit (and push) the standup report file just written.
+
+    Only *path* is staged — never ``git add -A``/``.`` — so unrelated
+    work-in-progress is never swept into the commit. The current branch is
+    pushed unless it is protected (``main``/``master``), honouring the repo's
+    "push only to dev" policy.
+
+    The operation is **non-fatal**: every failure (non-git directory, unborn
+    repo, unset author identity, missing upstream, offline push, push race) is
+    logged as a warning to stderr and returned in the status dict. It never
+    raises and never changes the caller's exit code. A file with no changes is
+    an idempotent no-op.
+
+    Args:
+        path: The report file to commit (absolute, or relative to
+            *project_root*).
+        project_root: Project root the commit runs in (the git working tree).
+        message: Commit message; a clear default is derived from *path*.
+        runner: Optional injectable ``git`` runner for tests. It receives the
+            argument list (without ``git``) and returns
+            ``(success, stdout, stderr)``. Defaults to a subprocess runner
+            anchored at *project_root*.
+
+    Returns:
+        A status dict: ``{"status": "committed", "pushed": bool, ...}``,
+        ``{"status": "no_changes"}``, or
+        ``{"status": "failed", "step": ..., "error": ...}``.
+    """
+    report_path = Path(path)
+    if not report_path.is_absolute():
+        report_path = Path(project_root) / report_path
+    path_arg = str(report_path)
+
+    if message is None:
+        message = f"chore(standup): add standup report {report_path.name}"
+
+    run_git = runner or _default_git_runner(project_root)
+
+    # 1. Stage exactly this file (surgical; never add -A / .).
+    ok, _stdout, err = run_git(["add", "--", path_arg])
+    if not ok:
+        _warn(f"could not stage standup report for commit: {err or 'unknown git error'}")
+        return {"status": "failed", "step": "add", "error": err}
+
+    # 2. Nothing staged for this path → idempotent no-op (also covers an
+    #    ignored path, which is why the local exclusion must be removed).
+    ok, _stdout, _err = run_git(["diff", "--cached", "--quiet", "--", path_arg])
+    if ok:
+        return {"status": "no_changes"}
+
+    # 3. Commit exactly this path (ignores any unrelated staged changes).
+    ok, _stdout, err = run_git(["commit", "-m", message, "--", path_arg])
+    if not ok:
+        _warn(f"could not commit standup report: {err or 'unknown git error'}")
+        return {"status": "failed", "step": "commit", "error": err}
+
+    # 4. Push the current branch, unless protected.
+    ok, branch, _err = run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+    if not ok or not branch:
+        _warn("committed standup report but could not determine the current branch to push")
+        return {"status": "committed", "pushed": False, "reason": "branch_unknown"}
+    if branch in PROTECTED_PUSH_BRANCHES:
+        _warn(
+            f"committed standup report to local branch '{branch}' but did not "
+            "push: refusing to push a protected branch"
+        )
+        return {
+            "status": "committed",
+            "pushed": False,
+            "reason": "protected_branch",
+            "branch": branch,
+        }
+
+    ok, _stdout, err = run_git(["push"])
+    if not ok:
+        _warn(
+            f"committed standup report but could not push branch '{branch}': "
+            f"{err or 'unknown git error'}"
+        )
+        return {
+            "status": "committed",
+            "pushed": False,
+            "reason": "push_failed",
+            "branch": branch,
+            "error": err,
+        }
+    return {"status": "committed", "pushed": True, "branch": branch}
+
+
+def _resolve_project_root():
+    """Project root used for the default output path and the commit.
+
+    The worklog parent when ``--worklog-dir`` / ``WL_WORKLOG_DIR`` is set
+    (SA-0MTOMCML900254CI), otherwise cwd.
+    """
+    if WORKLOG_DIR:
+        return str(Path(WORKLOG_DIR).resolve().parent)
+    return str(Path.cwd().resolve())
+
+
 def main():
     global WORKLOG_DIR
     args = sys.argv[1:]
@@ -1030,6 +1199,7 @@ def main():
     json_output = "--json" in args
     verbose = "--verbose" in args
     no_sync = "--no-sync" in args
+    no_commit = "--no-commit" in args
     output_path = None
     browse_count = None
     start_time_str = None
@@ -1090,20 +1260,31 @@ def main():
     else:
         output = format_report(data, browse_count)
 
-    # Default output path: ./standups/YYYY_MM_DD.md relative to project root
-    if not output_path:
-        if WORKLOG_DIR:
-            project_root = str(Path(WORKLOG_DIR).resolve().parent)
-        else:
-            project_root = str(Path.cwd().resolve())
+    if output_path:
+        # Explicit --output-path: write here (either format), no default dated file.
+        with open(output_path, "w") as f:
+            f.write(output)
+        print(f"Report written to {output_path}", file=sys.stderr)
+        if not no_commit:
+            # The file is written cwd-relative; commit the actual written path.
+            commit_report_file(os.path.abspath(output_path), _resolve_project_root())
+    elif json_output:
+        # --json without --output-path: stream raw JSON to stdout (documented
+        # fetch-data contract). The default dated file applies to the rendered
+        # markdown report only, so a JSON artifact is never written to a .md file.
+        print(output)
+    else:
+        # Default output path: ./standups/YYYY_MM_DD.md relative to project root
+        project_root = _resolve_project_root()
         today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
         standups_dir = Path(project_root) / "standups"
         standups_dir.mkdir(parents=True, exist_ok=True)
         output_path = str(standups_dir / f"{today}.md")
-
-    with open(output_path, "w") as f:
-        f.write(output)
-    print(f"Report written to {output_path}", file=sys.stderr)
+        with open(output_path, "w") as f:
+            f.write(output)
+        print(f"Report written to {output_path}", file=sys.stderr)
+        if not no_commit:
+            commit_report_file(output_path, project_root)
 
     return 0
 

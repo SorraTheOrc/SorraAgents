@@ -57,12 +57,20 @@ class TestCoerceValidStatusStage:
         assert "blocked/in_review" in err
         assert "coercing to (blocked/plan_complete)" in err
 
-    def test_invalid_combo_in_progress_in_review_coerces(self, capsys):
-        """in-progress/in_review is invalid → coerced to in-progress/plan_complete."""
+    def test_invalid_combo_in_progress_in_review_is_recovered_to_completed(self, capsys):
+        """WL-0MV85WE7Q00044P9: the legacy audit-claim hybrid
+        in-progress/in_review is restored to completed/in_review — never
+        coerced to in-progress/plan_complete (which strands review-queue items)."""
         result = audit_runner._coerce_valid_status_stage("in-progress", "in_review")
-        assert result == ("in-progress", "plan_complete")
+        assert result == ("completed", "in_review")
         err = capsys.readouterr().err
-        assert "Warning" in err
+        assert "legacy audit-claim" in err
+
+    def test_legacy_hybrid_in_progress_done_is_recovered_to_completed(self):
+        """WL-0MV85WE7Q00044P9: in-progress/done is likewise a legacy hybrid
+        and restores to completed/done."""
+        result = audit_runner._coerce_valid_status_stage("in-progress", "done")
+        assert result == ("completed", "done")
 
     def test_invalid_combo_blocked_done_coerces(self, capsys):
         """blocked/done is invalid → coerced to blocked/plan_complete."""
@@ -219,12 +227,13 @@ class TestVerdictDrivenStatusLifecycle:
     # Ready to close: Yes
     # ------------------------------------------------------------------
 
-    def test_ready_yes_sets_completed_in_review(self):
+    def test_ready_yes_sets_completed_in_review_with_producer_hold(self):
         """AC1: Ready to close: Yes → status=completed, stage=in_review.
 
         Applies regardless of the pre-audit status (here: in_progress). The
-        item has no parent, so the terminal update also sets
-        --needs-producer-review yes (SA-0MSSVKYEW008PJ9H).
+        item has no parent, so the terminal update applies the producer hold
+        (assignee = producer sentinel) — replacing the retired
+        --needs-producer-review flag (WL-0MV85WE7Q00044P9).
         """
         updates = []
         self._run_issue(
@@ -235,12 +244,12 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--needs-producer-review", "yes", "--json",
+            "--assignee", "Map", "--json",
         ]
 
-    def test_ready_yes_child_does_not_set_producer_review(self):
-        """AC2: Ready to close: Yes on a child item (has a parent) does not
-        set --needs-producer-review — the parent's review covers the subtree.
+    def test_ready_yes_child_clears_assignee(self):
+        """AC2: Ready to close: Yes on a child item (has a parent) clears the
+        assignee — the parent's review covers the subtree, so no producer hold.
         """
         updates = []
         self._run_issue(
@@ -251,12 +260,13 @@ class TestVerdictDrivenStatusLifecycle:
         )
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
-            "--status", "completed", "--stage", "in_review", "--json",
+            "--status", "completed", "--stage", "in_review",
+            "--assignee", "", "--json",
         ]
 
     def test_ready_yes_keeps_terminal_done_stage(self):
         """AC1: Ready to close: Yes keeps a pre-existing 'done' stage, and a
-        top-level item still gets --needs-producer-review yes."""
+        top-level item gets the producer hold."""
         updates = []
         self._run_issue(
             updates,
@@ -266,11 +276,11 @@ class TestVerdictDrivenStatusLifecycle:
         last = self._last_update(updates)
         assert "--status" in last and "completed" in last
         assert "--stage" not in last  # stage stays 'done'
-        assert "--needs-producer-review" in last and "yes" in last
+        assert "--assignee" in last and "Map" in last
 
     def test_ready_yes_child_keeps_terminal_done_stage(self):
-        """AC2: A child keeps a pre-existing 'done' stage and does NOT get the
-        producer-review flag on the terminal update."""
+        """AC2: A child keeps a pre-existing 'done' stage and clears the
+        assignee (no producer hold)."""
         updates = []
         self._run_issue(
             updates,
@@ -281,7 +291,7 @@ class TestVerdictDrivenStatusLifecycle:
         last = self._last_update(updates)
         assert "--status" in last and "completed" in last
         assert "--stage" not in last  # stage stays 'done'
-        assert "--needs-producer-review" not in last
+        assert "--assignee" in last and "Map" not in last
 
     def test_ready_yes_idempotent_on_completed_in_review(self):
         """AC6: Re-auditing a completed/in_review item with Yes stays completed/in_review."""
@@ -294,7 +304,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--needs-producer-review", "yes", "--json",
+            "--assignee", "Map", "--json",
         ]
 
     # ------------------------------------------------------------------
@@ -315,7 +325,8 @@ class TestVerdictDrivenStatusLifecycle:
         )
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
-            "--status", "open", "--stage", "plan_complete", "--json",
+            "--status", "open", "--stage", "plan_complete",
+            "--assignee", "", "--json",
         ]
 
     def test_ready_no_moves_open_item_to_plan_complete(self):
@@ -328,7 +339,8 @@ class TestVerdictDrivenStatusLifecycle:
         )
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
-            "--status", "open", "--stage", "plan_complete", "--json",
+            "--status", "open", "--stage", "plan_complete",
+            "--assignee", "", "--json",
         ]
 
     # ------------------------------------------------------------------
@@ -438,19 +450,20 @@ class TestVerdictDrivenStatusLifecycle:
         assert "--stage" in last and "plan_complete" in last
         assert "--assignee" in last and "" in last
 
-    def test_failure_on_invalid_combo_in_progress_in_review_coerces(self):
-        """AC1: in_progress/in_review is also invalid → coerced to
-        in_progress/plan_complete."""
+    def test_failure_on_legacy_hybrid_in_progress_in_review_recovers_to_completed(self):
+        """WL-0MV85WE7Q00044P9: an infra failure while the captured pre-audit
+        state is the legacy audit-claim hybrid in-progress/in_review restores
+        to completed/in_review (never in-progress/plan_complete)."""
         updates = []
         self._run_issue(
             updates,
             verdict_report="Ready to close: Yes",
-            status="in_progress", stage="in_review",
+            status="in-progress", stage="in_review",
             fail_children_show=True,
         )
         last = self._last_update(updates)
-        assert "--status" in last and "in_progress" in last
-        assert "--stage" in last and "plan_complete" in last
+        assert "--status" in last and "completed" in last
+        assert "--stage" in last and "in_review" in last
         assert "--assignee" in last and "" in last
 
     # ------------------------------------------------------------------
@@ -503,7 +516,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--needs-producer-review", "yes", "--json",
+            "--assignee", "Map", "--json",
         ]
 
     def test_preflight_guard_allows_open_items(self):
@@ -526,7 +539,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--needs-producer-review", "yes", "--json",
+            "--assignee", "Map", "--json",
         ]
 
     # ------------------------------------------------------------------

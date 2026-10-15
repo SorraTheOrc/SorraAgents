@@ -396,7 +396,36 @@ If **any** detection signal applies:
    Proceed directly to Step 9 (Commit, Push to dev and mark in_review).
 
 If **no** detection signal applies (the item genuinely needs implementation):
-proceed to Step 5.
+proceed to Step 4.3.
+
+4.3. Detect duplicate work items (if applicable)
+
+Before creating a worktree, check whether an **overlapping completed work item**
+exists that may already cover this item's scope. This is distinct from
+Step 4.2 (which detects work *already implemented in the repository* by a prior
+session). Step 4.3 detects work items that describe overlapping or duplicate
+scope.
+
+1. **Search:** `wl search <keywords> --json` using 3–6 keywords from the work
+   item's title and description. Also try `wl list --status completed --json`
+   for completed items with matching tags.
+2. **Review:** For each candidate, read its description and acceptance criteria.
+3. **Compare ACs:** Are all acceptance criteria of this item fully satisfied by
+   the existing item?
+   - **Yes (full duplicate):** Close the current item. Comment: `"Duplicate of
+     <existing-item-id>: all acceptance criteria are met by that item. Closing
+     to avoid redundant work."` Then:
+     `wl close <id> --reason "Duplicate of <existing-item-id>: work already
+     completed" --json`
+   - **No (partial overlap):** Rewrite the description and ACs to address only
+     the differences/gaps. Comment: `"Rewritten to address differences from
+     <existing-item-id>: <summary of differences>."` Link as related work.
+   - **No (no overlap found):** Proceed normally. Note:
+     `"Duplicate check performed — no overlapping completed item found."`
+4. **Idempotence:** Re-running produces the same result; do not re-close or
+   re-rewrite an already-closed item.
+
+After this step (or after closing/rewriting), proceed to Step 5.
 
 5. Create a worktree from dev and branch inside it
 

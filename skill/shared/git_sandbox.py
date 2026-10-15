@@ -26,15 +26,18 @@ Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
   ``sys.path`` and ``run_tests.py`` can import it after its own bootstrap.
 
   Residual risk (F3 AC6): a mutation is attributed to the *checkout*
-  (``refs/heads/*`` etc.). Exclusion of agent worktrees is derived from
-  ``git worktree list --porcelain`` — never a ``wl-*`` name pattern, which
-  would also have excluded the incident's own fixture branches. A fixture
-  branch that happens to be backed by a registered worktree is therefore
-  excluded, and so is the ``branch.<name>.*`` local config that registering
-  that worktree writes (``remote``/``merge``) — both are mechanical agent
-  churn, not checkout mutations (SA-0MUINEW6X0034C65). The incident is still
-  caught via config rewrites of any non-excluded key, moved ``dev``,
-  ``refs/heads/origin/dev`` and the working-tree surface.
+  (``refs/heads/*`` etc.). Exclusion of concurrent infrastructure is
+  **ownership-based** (SA-0MV8311B3005DNG8 AC1/AC3): a ref checked out in a
+  registered worktree **other than the guard's own root** is mechanical agent
+  churn (a sibling agent's ``implement.py finish`` fast-forwarding ``dev``,
+  registering/removing ``.worklog/`` worktrees), and so is the
+  ``branch.<name>.*`` local config that worktree registration writes
+  (``remote``/``merge``) — both derived from ``git worktree list --porcelain``
+  and the retained-local-track config, never a ``wl-*`` name pattern. The
+  guard's own root branch stays monitored. The GIT_DIR-leak incident class is
+  still caught via config rewrites of any non-excluded key, working-tree
+  contamination, and moves of the guard's own root branch
+  (SA-0MUIA3OE40001QJX).
 """
 
 from __future__ import annotations
@@ -62,13 +65,6 @@ REPOSITORY_OVERRIDE_ENV_VARS: tuple[str, ...] = (
 #: fixture never depends on (or rewrites) an ambient identity.
 FIXTURE_AUTHOR_NAME = "Git Sandbox"
 FIXTURE_AUTHOR_EMAIL = "git-sandbox@example.invalid"
-
-#: Worktree-registration directory whose refs (and their ``branch.<name>.*``
-#: config) are excluded from snapshot diffs: agent worktrees under
-#: ``<main_checkout>/.worklog/worktrees/``. The anchor is always the **main
-#: checkout** (see :func:`main_checkout_root`), even when the snapshot is taken
-#: from a linked worktree.
-AGENT_WORKTREE_DIR = (".worklog", "worktrees")
 
 #: Worklog data namespace. These refs are managed by the ``wl`` tool (they can
 #: be fetched/reset during a test run) and are not part of the source checkout,
@@ -390,31 +386,35 @@ def _parse_status(output: str) -> dict[str, str]:
     return entries
 
 
-def _parse_worktrees(output: str, anchor: Path) -> tuple[dict[str, str], set[str]]:
+def _parse_worktrees(
+    output: str, own_root: Path | None = None
+) -> tuple[dict[str, str], set[str]]:
     """Parse ``git worktree list --porcelain``.
 
     Returns ``(branches_by_path, excluded_refs)`` where *excluded_refs* are the
-    branch refs checked out in registered worktrees under
-    ``<anchor>/.worklog/worktrees/`` (agent worktrees whose churn is
-    legitimate). *anchor* must be the **main checkout** even when the snapshot
-    is taken from a linked worktree, so the exclusion is not silently empty
-    (SA-0MUINEW6X0034C65); resolve it with :func:`main_checkout_root`.
+    branch refs checked out in registered worktrees **other than the guard's
+    own root** (*own_root*; ``None`` = nothing is excluded). This is the
+    ownership-based exclusion (SA-0MV8311B3005DNG8 AC1): a ref checked out in
+    any registered worktree that is not the root the guard runs from is
+    concurrent-infrastructure churn — regardless of the worktree's directory
+    name (``.worklog/worktrees/``, ``.worklog/tmp-worktree-*``, or anywhere
+    else). The guard root's own branch stays monitored.
     """
     branches: dict[str, str] = {}
     path: str | None = None
     branch: str | None = None
     excluded: set[str] = set()
-    agent_root = anchor.joinpath(*AGENT_WORKTREE_DIR)
+    own = Path(own_root).resolve() if own_root is not None else None
 
     def _flush() -> None:
         if path is None:
             return
         branches[path] = branch or ""
-        if branch:
+        if branch and own is not None:
             try:
-                Path(path).resolve().relative_to(agent_root.resolve())
-                excluded.add(branch)
-            except ValueError:
+                if Path(path).resolve() != own:
+                    excluded.add(branch)
+            except OSError:
                 pass
 
     for line in output.splitlines():
@@ -426,6 +426,63 @@ def _parse_worktrees(output: str, anchor: Path) -> tuple[dict[str, str], set[str
             branch = line[len("branch "):].strip()
     _flush()
     return branches, excluded
+
+
+def _retained_worktree_tracked_branches(config: dict[str, str]) -> set[str]:
+    """Branches whose ``--track`` worktree-ownership signal survives removal.
+
+    ``git worktree add --track -b <name> ... <local-base>`` writes
+    ``branch.<name>.remote=.`` and ``branch.<name>.merge=refs/heads/<base>``;
+    ``git worktree remove`` keeps the branch and that config. A
+    register→remove cycle that completes entirely inside the guard window
+    therefore leaves the branch's ownership config as the only observable
+    signal (SA-0MV8311B3005DNG8 AC3 — C1 tracer test
+    ``test_register_remove_cycle_wholly_inside_window_is_invisible``).
+
+    Returns the ``refs/heads/<name>`` set for every local branch that carries
+    the self-tracking signature. Deleting a worktree never removes it, and a
+    plain ``git branch --track <name> <local-base>`` writes the same keys, so
+    this is exactly the ownership signal the C1 boundary test documents
+    ("the ownership signal must as well").
+    """
+    tracked: set[str] = set()
+    for key, value in config.items():
+        prefix = "branch."
+        suffix = ".remote"
+        if not (key.startswith(prefix) and key.endswith(suffix)):
+            continue
+        # A worktree created against a local base records the repository
+        # itself as the tracking remote (``remote=.``); ``remote=origin`` etc.
+        # is an ordinary branch and is not worktree churn.
+        if value != ".":
+            continue
+        name = key[len(prefix):-len(suffix)]
+        # Require the merge half of the tracking pair; a bare remote=. is not
+        # the worktree-created shape.
+        if f"branch.{name}.merge" in config:
+            tracked.add(f"refs/heads/{name}")
+    return tracked
+
+
+def _remote_tracking_refs_for_branch(
+    refs: dict[str, str], branch_ref: str
+) -> set[str]:
+    """Remote-tracking refs resolving to an excluded branch (parent AC2).
+
+    A concurrent ``implement.py finish`` fetches before fast-forwarding, moving
+    ``refs/remotes/origin/<parent>`` in addition to the local branch. To treat
+    the whole fast-forward as churn, every remote-tracking ref whose short
+    name matches the excluded branch is excluded too. Remote-tracking refs of
+    non-excluded branches remain observable.
+    """
+    if not branch_ref.startswith("refs/heads/"):
+        return set()
+    short = branch_ref[len("refs/heads/"):]
+    return {
+        ref for ref in refs
+        if ref.startswith("refs/remotes/")
+        and ref.removeprefix("refs/remotes/").split("/", 1)[-1] == short
+    }
 
 
 def main_checkout_root(
@@ -511,15 +568,36 @@ def snapshot_repo_state(
         if include_status
         else {}
     )
-    # Anchor on the main checkout, not the passed root: from a linked worktree
-    # the agent-worktree directory lives under the main checkout, and anchoring
-    # on the worktree would leave ``excluded_refs`` empty and turn concurrent
-    # sibling churn into a bogus mutation (SA-0MUINEW6X0034C65).
-    anchor = main_checkout_root(resolved, top=top) or Path(top)
     worktrees, excluded = _parse_worktrees(
         run_git(resolved, ["worktree", "list", "--porcelain"]).stdout,
-        anchor,
+        own_root=top,
     )
+    # The guard root's own checked-out branch must stay monitored even if its
+    # ``--track`` worktree registration left a ``branch.<name>.remote=.``
+    # config (SA-0MV8311B3005DNG8 AC1).
+    own_branch = ""
+    for wt_path, wt_branch in worktrees.items():
+        try:
+            if Path(wt_path).resolve() == Path(top).resolve():
+                own_branch = wt_branch
+                break
+        except OSError:
+            continue
+    # Retained worktree-track branches (SA-0MV8311B3005DNG8 AC3): a
+    # register→remove cycle wholly inside the guard window leaves the branch
+    # and its ``--track`` config without a ``git worktree list`` row; the
+    # ``branch.<name>.remote=.`` config is the only surviving ownership signal.
+    retained = _retained_worktree_tracked_branches(config)
+    if own_branch:
+        retained.discard(own_branch)
+    # Remote-tracking refs of excluded branches (parent AC2): a concurrent
+    # finish fetches before fast-forwarding, so ``refs/remotes/origin/<parent>``
+    # moves alongside the local branch and must be treated as the same churn.
+    churn = set(excluded) | retained
+    remote_tracking: set[str] = set()
+    for branch_ref in list(churn):
+        remote_tracking |= _remote_tracking_refs_for_branch(refs, branch_ref)
+    excluded = churn | remote_tracking
     return {
         "root": str(resolved),
         "git": True,

@@ -10,6 +10,11 @@ set -euo pipefail
 #   Before merging dev into main, this script automatically increments the
 #   version in package.json, commits the change, and creates an annotated git
 #   tag (v<semver>) on the merge commit. The tag is pushed to origin.
+#
+# Derived version files:
+#   After the dev merge, when package.json declares a `build` script, the
+#   script runs the build and commits regenerated tracked files (e.g.
+#   ContextHub src/version.ts) so they match the bumped version (non-fatal).
 
 # Resolve the directory where this script resides (used to find sibling scripts)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -214,6 +219,23 @@ else
     echo "Merge failed; please resolve conflicts manually." >&2
     exit 1
   fi
+fi
+
+# ── Regenerate derived version files (only on actual release) ───────
+# After the dev merge (final tree) and before tagging, run the repo's build
+# so auto-generated derived version files (e.g. ContextHub src/version.ts)
+# match the bumped package.json; then commit the regenerated tracked files
+# (SA-0MV7WAUHZ009UWY2). Non-fatal: a failed build logs a warning and the
+# release continues, mirroring the CHANGELOG step.
+if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
+  REGEN_SCRIPT="${SCRIPT_DIR}/regenerate-version.js"
+  if [[ -f "$REGEN_SCRIPT" ]]; then
+    node "$REGEN_SCRIPT" "$NEW_VERSION" || {
+      echo "Warning: derived version file regeneration failed (continuing with release)" >&2
+    }
+  fi
+elif [[ "$DRY_RUN" == "true" ]]; then
+  echo "Dry-run: derived version files would be regenerated for v${NEW_VERSION:-<version>}"
 fi
 
 # ── Create git tag (only on actual release) ───────────────────────

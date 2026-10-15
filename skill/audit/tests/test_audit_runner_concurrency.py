@@ -234,6 +234,83 @@ def test_invalid_env_ceiling_falls_back(monkeypatch, capsys):
     assert "invalid" in capsys.readouterr().err.lower()
 
 
+def test_default_ceiling_right_sized_to_proxy_pool():
+    """The default audit concurrency ceiling is right-sized (SA-0MUSZJRB9006ZCHE).
+
+    The F7 harness measured the host's real audit-slot capacity and the
+    3-slot local LLM proxy pool bounds useful inference concurrency. The
+    default must be at least 3 (so N >= 3 concurrent audits are admitted
+    without queueing) and bounded (so it does not exceed the host's CPU
+    headroom; 6 = 2x the proxy pool).
+    """
+    from shared.process_semaphore import DEFAULT_MAX_WORKERS
+
+    assert DEFAULT_MAX_WORKERS >= 3, "must admit at least 3 concurrent audits"
+    assert DEFAULT_MAX_WORKERS <= 8, "must stay within measured host headroom"
+    assert audit_runner._audit_semaphore_max_workers() == DEFAULT_MAX_WORKERS
+
+
+def test_default_host_cap_right_sized_to_proxy_pool(monkeypatch):
+    """The default host-wide ingress cap is right-sized (SA-0MUSZJRB9006ZCHE).
+
+    F7 showed the previous default of 3 was the *binding* constraint on
+    concurrent audit runs. The default is raised to 6 (2x the 3-slot proxy
+    pool) so peak bursts are admitted instead of queueing for a host slot.
+    """
+    assert audit_runner.AUDIT_MAX_HOST_AUDITS_DEFAULT == 6
+    monkeypatch.delenv(audit_runner.AUDIT_MAX_HOST_AUDITS_ENV, raising=False)
+    assert audit_runner._resolve_max_host_audits() == 6
+
+
+def test_default_ceiling_admits_n_ge_3_without_saturation(monkeypatch):
+    """AC3: N >= 3 concurrent audits at the default ceiling yield no saturation.
+
+    With the default ceiling in place (no AUDIT_MAX_CONCURRENCY override), a
+    burst of 3 concurrent pi calls against a busy host must all be admitted
+    and complete with real `met` verdicts — zero `unmet`
+    (bounded-queue/host-wide saturation) verdicts. Mirrors
+    SA-0MTG5RYH8005RQNM AC1 and this item's AC3.
+    """
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    class _SlowPopen(_MockProcess):
+        def communicate(self, timeout=None):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.2)
+            with lock:
+                active -= 1
+            return self._text, ""
+
+    monkeypatch.setattr(audit_runner.subprocess, "Popen", lambda *a, **k: _SlowPopen())
+    # A bounded queue wait (not fail-fast); large enough that a properly
+    # sized ceiling never needs it.
+    monkeypatch.setenv("AUDIT_QUEUE_TIMEOUT", "10")
+
+    results: dict[int, dict] = {}
+
+    def _run(idx: int) -> None:
+        results[idx] = audit_runner._call_pi(
+            "prompt", model="m", pi_bin="pi",
+            issue_id=f"SA-AC3-{idx}",
+        )
+
+    threads = [threading.Thread(target=_run, args=(i,)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert len(results) == 3, results
+    assert all(r.get("verdict") == "met" for r in results.values()), results
+    assert not any(r.get("_concurrency_timeout") for r in results.values()), results
+    assert peak >= 2, f"all three audits should overlap under the new ceiling: {peak}"
+
+
 # ---------------------------------------------------------------------------
 # SA-0MSGEAZMC009LHKL: fail fast when the concurrency ceiling is saturated
 # ---------------------------------------------------------------------------

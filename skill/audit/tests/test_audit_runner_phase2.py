@@ -1529,6 +1529,25 @@ class TestCanonicalScanningBlock:
         assert "list-files" in block
         assert "never `grep -r` over .worklog/" in block
 
+    def test_scaining_block_uses_native_wl_commands_for_worklog(self):
+        """SA-0MSOMINF8007K9S4 AC1: worklog lookups route to native wl only.
+
+        Substring matching is `wl list <term> --json`; exact/unique-ID
+        resolution is `wl show <id> --json` (tolerant lookup).
+        """
+        block = audit_runner._SCANNING_BLOCK
+        assert "`wl list <term> --json`" in block
+        assert "`wl show <id> --json`" in block
+
+    def test_scaining_block_retires_scan_find_workitem(self):
+        """SA-0MSOMINF8007K9S4 AC1/AC3: scan.py find-workitem is retired."""
+        assert "find-workitem" not in audit_runner._SCANNING_BLOCK
+
+    def test_scaining_block_drops_dual_wl_search_recommendation(self):
+        """SA-0MSOMINF8007K9S4 AC2: wl search (FTS) is not a substring matcher
+        and must not be presented as an alternative to `wl list`."""
+        assert "wl search" not in audit_runner._SCANNING_BLOCK
+
 
 class TestPhase2BatchRouting:
     """AC1/AC2/AC4: Batch mode folds parent + pending child ACs into one

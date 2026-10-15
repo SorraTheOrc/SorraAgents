@@ -5,6 +5,20 @@ Fetches a work item, derives keywords from its title/description, searches
 Worklog and the repository for related items, generates a concise Markdown
 report, and updates the work-item description.
 
+v4 (SA-0MUG46NJE003JOCD) keyword-relevance changes:
+  - Keywords are weighted (title terms outweigh body occurrences) and
+    project-generic scaffold terms ("work", "item", "report", "review",
+    "skill", "related", "find", ...) are suppressed, so a capped search
+    sweep spends its query slots on distinctive domain terms instead of
+    corpus-generic words. Zero extra subprocess cost; ordering stays
+    deterministic (weight desc, ties alphabetical).
+  - Result ranking was re-ranked and de-inverted: items are ranked by
+    descending distinct-keyword match count, then ascending best score
+    (more negative = better; wl search returns best-first with an
+    ascending score field), then id. The v2 descending-score sort surfaced
+    the worst matches first; multi-keyword matches now win. The analyzed
+    item is excluded during aggregation so it never occupies a capped slot.
+
 v3 (SA-0MNCDAQ8W008KOG9) performance/value changes:
   - Keywords are extracted with the skill's own automated report section
     stripped and ordered by descending frequency (closes the feedback loop
@@ -69,6 +83,35 @@ STOP_WORDS: set = {
     "be", "been", "being", "am", "are", "was", "were",
 }
 
+# Project-generic terms that recur in nearly every Worklog item (title, intake
+# brief, description) and carry no discriminating signal for `wl search`.
+# Excluded in addition to the general English STOP_WORDS (v4,
+# SA-0MUG46NJE003JOCD) so a capped MAX_SEARCH_KEYWORDS sweep is never spent on
+# a term that matches most of the corpus. Rationale per group:
+#   - "work" / "item" / "items" / "worklog": every item is a work item in the
+#     worklog — no search signal.
+#   - "report" / "review" / "reviews" / "skill" / "skills": the find-related
+#     automation/report and skill-review vocabulary — self-referential.
+#   - "related" / "find" / "finding" / "finds": the skill's own name.
+# These were the top-frequency terms on the review item SA-0MNCDAQ8W008KOG9
+# (searched sweep: "related, skill, find, ...") and dominated its results.
+# Conservative policy: prefer a false negative over a false positive.
+PROJECT_STOP_WORDS: set = {
+    "work", "item", "items", "worklog",
+    "report", "review", "reviews",
+    "skill", "skills",
+    "related", "find", "finding", "finds",
+}
+
+# Relative weight of one title occurrence versus one body/description
+# occurrence in extract_keywords (v4, SA-0MUG46NJE003JOCD). A title is the
+# item's compressed subject, so a title token is worth TITLE_WEIGHT body
+# occurrences — a zero-extra-subprocess proxy for inverse document frequency:
+# a distinctive title term outranks corpus-generic body repetition, while
+# repeated body terms still outrank one-off body terms. Determinism is
+# preserved by the (weight desc, token asc) ordering key.
+TITLE_WEIGHT: int = 3
+
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +149,7 @@ MAX_KEYWORDS_PER_FILE: int = 5
 # subprocess fan-out (v2 spawned one `wl search` per extracted keyword —
 # measured ~0.5s/spawn, 96% of runtime — and grew unbounded on polluted
 # descriptions: 14 -> 82 -> 523 keywords). Only the top
-# MAX_SEARCH_KEYWORDS frequency-ranked keywords (see extract_keywords) are
+# MAX_SEARCH_KEYWORDS signal-weighted keywords (see extract_keywords) are
 # queried per-keyword: this preserved recall (26 distinct items from 6
 # spawns on the review item) where multi-term batched queries collapsed to
 # ~1 conjunctive result, so capping beats batching as the speed lever.
@@ -174,16 +217,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def extract_keywords(title: str, description: str) -> list[str]:
-    """Derive conservative keywords from a work-item title and description.
+def _tokenize(text: str) -> list[str]:
+    """Lowercase *text* and return its search-signal tokens.
 
-    Returns unique, lowercased keywords ordered by **descending frequency**
-    (deterministic — ties alphabetical). Frequency ordering puts the
-    descriptive core of the text first, so capped search queries (see
-    ``search_and_dedup`` / ``MAX_SEARCH_KEYWORDS``) pick the most
-    representative terms rather than alphabetical junk (v3). Pure numeric
-    tokens (years, counts) carry no search signal and are dropped.
-    Common English stop words and very short terms are excluded.
+    Splits on any non-alphanumeric character (including hyphens) and drops
+    general English stop words (``STOP_WORDS``), project-generic scaffold
+    terms (``PROJECT_STOP_WORDS``), terms shorter than 3 characters, and
+    numeric-only tokens (years/counts carry no search signal).
+    """
+    lowered = re.sub(r"[^a-z0-9]", " ", text.lower())
+    return [
+        token for token in lowered.split()
+        if token not in STOP_WORDS
+        and token not in PROJECT_STOP_WORDS
+        and len(token) >= 3
+        and not token.isdigit()
+    ]
+
+
+def extract_keywords(title: str, description: str) -> list[str]:
+    """Derive conservative, signal-weighted keywords from title/description.
+
+    Returns unique, lowercased keywords ordered by **descending weight**
+    (deterministic — ties alphabetical). A token's weight is
+    ``TITLE_WEIGHT * title_occurrences + body_occurrences``:
+
+    - **Title boost** (v4): a title token outweighs a single body
+      occurrence, so the item's compressed subject leads the list. This is a
+      zero-extra-subprocess proxy for inverse document frequency: a
+      distinctive title term outranks corpus-generic body repetition.
+    - **Body frequency** (v3): repeated description terms still rank above
+      one-off terms, surfacing the descriptive core.
+    - **Generic-term suppression** (v4): project-scaffold terms (see
+      ``PROJECT_STOP_WORDS`` — "work", "item", "report", "review",
+      "skill", "related", "find", ...) are excluded so capped search
+      queries (see ``search_and_dedup`` / ``MAX_SEARCH_KEYWORDS``) never
+      spend a query slot on a term that matches most of the corpus.
+
+    Common English stop words (``STOP_WORDS``), very short terms, and pure
+    numeric tokens (years, counts) are excluded.
 
     The skill's own 'Related work (automated report)' section is stripped
     from the description before tokenizing (v3): report words (work-item
@@ -191,23 +263,14 @@ def extract_keywords(title: str, description: str) -> list[str]:
     keywords, or every run re-extracts them and the search fan-out grows
     unbounded (feedback loop).
     """
-    combined = f"{title} {strip_report_sections(description)}"
-    # Lowercase
-    combined = combined.lower()
-    # Replace special characters (including hyphens) with spaces
-    combined = re.sub(r"[^a-z0-9]", " ", combined)
-    # Split into tokens
-    tokens = combined.split()
-    # Count frequencies: exclude stop words, short terms, and numeric-only
-    # tokens ("2026", "452") that carry no search signal.
-    counts: dict[str, int] = {}
-    for token in tokens:
-        if token in STOP_WORDS or len(token) < 3 or token.isdigit():
-            continue
-        counts[token] = counts.get(token, 0) + 1
-    # Deterministic ordering: descending frequency, ties alphabetical. The
-    # top of the list is the descriptive core of the item.
-    return sorted(counts, key=lambda word: (-counts[word], word))
+    weights: dict[str, int] = {}
+    for token in _tokenize(title):
+        weights[token] = weights.get(token, 0) + TITLE_WEIGHT
+    for token in _tokenize(strip_report_sections(description)):
+        weights[token] = weights.get(token, 0) + 1
+    # Deterministic ordering: descending weight, ties alphabetical. The top
+    # of the list is the descriptive (and title-weighted) core of the item.
+    return sorted(weights, key=lambda word: (-weights[word], word))
 
 
 # ---------------------------------------------------------------------------
@@ -336,23 +399,12 @@ def is_semantic_available(worklog_flags: list[str] | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _score_key(item: dict[str, Any]) -> float:
-    """Return the score of a work item for ranking, with tiebreaker by title.
-
-    Items without a score field sort last (score = float('-inf')).
-    Higher (less negative) scores rank first.
-    """
-    score = item.get("score")
-    if score is None:
-        return float("-inf")
-    return float(score)
-
-
 def search_and_dedup(
     keywords: list[str],
     use_semantic: bool = False,
     worklog_flags: list[str] | None = None,
     max_keywords: int | None = None,
+    exclude_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Search Worklog for related items, aggregate, dedup, rank, and limit.
 
@@ -368,30 +420,53 @@ def search_and_dedup(
     ``worklog_flags`` pins the target worklog store (resolved from the
     work-item id being analyzed) so every search targets the same store.
 
-    Ranking heuristic: items are sorted by descending score (the `score`
-    field from `wl search --json`, BM25 or hybrid BM25+semantic). Items
-    without a score sort last. The final list is capped at
-    MAX_WORK_ITEM_RESULTS.
+    v4 (SA-0MUG46NJE003JOCD) ranking: items are ranked by **descending
+    number of distinct searched keywords they match**, then **ascending
+    best score** (more negative = better, matching ``wl search``'s own
+    ordering), then item id for determinism. Multi-keyword matches are the
+    strongest free relevance signal: a term matched by several distinctive
+    keywords (e.g. the *searched* keyword set for a find-related item) is
+    far more likely to be genuinely related than an item surfaced by one
+    corpus-generic keyword. This fixed an inverted sort (the old code
+    ranked by *descending* score, i.e. the worst matches first, because wl
+    returns best-first with an ascending score field). Items without a
+    score sort last. The analyzed item itself (*exclude_id*) is skipped so
+    it never occupies one of the capped result slots. The final list is
+    capped at MAX_WORK_ITEM_RESULTS.
     """
     if not keywords:
         return []
     if max_keywords is None:
         max_keywords = MAX_SEARCH_KEYWORDS
 
-    seen: set = set()
-    results: list[dict[str, Any]] = []
+    # item_id -> {item, matches (distinct searched keywords), best score}
+    found: dict[str, dict[str, Any]] = {}
 
     for keyword in keywords[:max_keywords]:
         items = run_wl_search(keyword, use_semantic=use_semantic,
                               worklog_flags=worklog_flags)
         for item in items:
             item_id = item.get("id")
-            if item_id and item_id not in seen:
-                seen.add(item_id)
-                results.append(item)
+            if not item_id or item_id == exclude_id:
+                continue
+            entry = found.get(item_id)
+            if entry is None:
+                entry = {"item": item, "matches": 0, "score": float("inf")}
+                found[item_id] = entry
+            entry["matches"] += 1
+            score = item.get("score")
+            if score is not None and float(score) < entry["score"]:
+                entry["score"] = float(score)
 
-    # Rank by descending score (unscored items sort last)
-    results.sort(key=_score_key, reverse=True)
+    results = [entry["item"] for entry in found.values()]
+
+    # v4 rank: descending distinct-keyword match count, then ascending best
+    # score (more negative = better), then id for deterministic ties.
+    results.sort(key=lambda it: (
+        -found[it["id"]]["matches"],
+        found[it["id"]]["score"],
+        it.get("id", ""),
+    ))
 
     # Limit to configured maximum
     return results[:MAX_WORK_ITEM_RESULTS]
@@ -745,12 +820,15 @@ def _main() -> None:
         if args.verbose:
             print(f"[find-related] Semantic search available: {use_semantic}", file=sys.stderr)
 
-        # Search Worklog (with semantic ranking when available)
+        # Search Worklog (with semantic ranking when available); the item
+        # being analyzed is excluded so it never occupies a capped slot.
         related_items = search_and_dedup(keywords, use_semantic=use_semantic,
-                                         worklog_flags=wl_flags)
+                                         worklog_flags=wl_flags,
+                                         exclude_id=args.work_item_id)
 
         # Search repository (ranked and limited)
         repo_matches = search_repo(args.repo_path, keywords)
+
 
         # Filter out the current work item from results
         related_items = [

@@ -140,9 +140,12 @@ def test_keywords_from_title():
     assert "deterministic" in keywords
     assert "script" in keywords
     assert "automation" in keywords
-    assert "find" in keywords
-    assert "related" in keywords
-    assert "skill" in keywords
+    # v4 (SA-0MUG46NJE003JOCD): project-generic scaffold terms
+    # (find/related/skill) are suppressed as keyword noise.
+    for generic in ("find", "related", "skill"):
+        assert generic not in keywords, (
+            f"Project-generic term '{generic}' must be suppressed"
+        )
 
 
 def test_keywords_from_description():
@@ -156,8 +159,11 @@ def test_keywords_from_description():
     assert "python" in keywords
     assert "script" in keywords
     assert "automate" in keywords
-    assert "related" in keywords
-    assert "report" in keywords
+    # v4: project-generic terms (related/report) are suppressed.
+    for generic in ("related", "report"):
+        assert generic not in keywords, (
+            f"Project-generic term '{generic}' must be suppressed"
+        )
 
 
 def test_keywords_from_both_title_and_description():
@@ -169,11 +175,13 @@ def test_keywords_from_both_title_and_description():
     assert isinstance(keywords, list)
     assert len(set(keywords)) == len(keywords), "Keywords should be unique"
     assert "automation" in keywords
-    assert "find" in keywords
-    assert "related" in keywords
-    assert "work" in keywords
     assert "project" in keywords
     assert "repository" in keywords
+    # v4: project-generic terms (find/related/work/items/finding) suppressed.
+    for generic in ("find", "related", "work", "items", "finding"):
+        assert generic not in keywords, (
+            f"Project-generic term '{generic}' must be suppressed"
+        )
 
 
 def test_keywords_empty_title():
@@ -523,15 +531,15 @@ def test_configurable_max_constants_exist():
 
 
 def test_search_and_dedup_limits_to_top_3_by_score(monkeypatch):
-    """search_and_dedup should return at most MAX_WORK_ITEM_RESULTS items, ranked by descending score."""
+    """search_and_dedup should return at most MAX_WORK_ITEM_RESULTS items, ranked by v4 heuristic."""
     mod = _import_find_related()
 
     items_with_scores = [
-        {"id": "REL-001", "title": "Top item", "score": -0.1},
-        {"id": "REL-002", "title": "Second item", "score": -0.5},
-        {"id": "REL-003", "title": "Third item", "score": -0.8},
-        {"id": "REL-004", "title": "Fourth item (lowest score)", "score": -1.5},
-        {"id": "REL-005", "title": "Fifth item", "score": -2.0},
+        {"id": "REL-001", "title": "Item", "score": -0.1},
+        {"id": "REL-002", "title": "Item", "score": -0.5},
+        {"id": "REL-003", "title": "Item", "score": -0.8},
+        {"id": "REL-004", "title": "Item", "score": -1.5},
+        {"id": "REL-005", "title": "Item", "score": -2.0},
     ]
 
     def mock_search(keyword, use_semantic=False, worklog_flags=None):
@@ -543,14 +551,19 @@ def test_search_and_dedup_limits_to_top_3_by_score(monkeypatch):
     results = mod.search_and_dedup(keywords)
     # Should be limited to MAX_WORK_ITEM_RESULTS (3)
     assert len(results) <= mod.MAX_WORK_ITEM_RESULTS
-    # Items should be returned in descending score order
+    # v4 (SA-0MUG46NJE003JOCD): items are ranked by descending distinct-keyword
+    # match count, then **ascending** best score (wl returns best-first with a
+    # more-negative = better score field). Each item here matches both
+    # keywords, so the ascending-score tie-break decides.
     scores = [item.get("score", 0) for item in results]
-    assert scores == sorted(scores, reverse=True), "Items should be ranked by descending score"
-    # The top 3 by score should be included
+    assert scores == sorted(scores), (
+        "Items should be ranked by ascending score (more negative = better)"
+    )
+    # The three most-negative (best) items should be included
     result_ids = [item["id"] for item in results]
-    assert "REL-001" in result_ids
-    assert "REL-002" in result_ids
     assert "REL-003" in result_ids
+    assert "REL-004" in result_ids
+    assert "REL-005" in result_ids
 
 
 def test_search_and_dedup_all_items_when_under_limit(monkeypatch):
@@ -587,7 +600,8 @@ def test_search_and_dedup_items_without_score_go_last(monkeypatch):
     monkeypatch.setattr(mod, "run_wl_search", mock_search)
 
     results = mod.search_and_dedup(["test"])
-    # Items with scores should come before those without
+    # Items with scores should come before those without (v4 ascending sort
+    # treats None as +inf, so unscored items sort last).
     scored_ids = [item["id"] for item in results if "score" in item]
     unscored_ids = [item["id"] for item in results if "score" not in item]
     if scored_ids and unscored_ids:

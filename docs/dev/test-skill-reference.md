@@ -6,6 +6,42 @@ operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged — every command documented
 here is still valid.
 
+## Test execution policy and conformance gate (SA-0MTYIMWQP0020ZUC)
+
+`AGENTS_GLOBAL.md` carries an explicit **Test execution policy** (`## Test
+execution policy`): agents must **never** invoke test commands directly — no
+ad-hoc `pytest`, `npm test`, `vitest`, `node --test`, or equivalent — and
+**every agent-initiated test run goes through the test skill** (`/skill:test`,
+`run_tests.py`; full and changed scope, unit and smoke types), with no
+exceptions. Automated gates that already route through this skill's runner
+(the pre-push hook's `--scope full` runs, `implement.py finish` via
+`guarded_run_all`, the audit skill's F3 auto-execution) are pipeline
+infrastructure, not agent-invoked ad-hoc runs, and are out of scope.
+
+The rule exists because only the test-skill runner populates the per-repo test
+cache (§0 Cached execution below; git state + 2h TTL) that the audit skill
+reads read-only via `query_cached()` to auto-verify execution-dependent ACs.
+An ad-hoc run at the same git state is invisible to the cache and degrades
+audit verification to F3 auto-execution or an operator `--green-run HEAD`
+attestation.
+
+**Conformance gate:** the policy is enforced machine-readably by
+`tests/test_test_skill_directory.py` (AC3 of SA-0MTYIMWQP0020ZUC). It scans
+every agent-facing doc (`AGENTS_GLOBAL.md`, `skill/*/SKILL.md`, `command/*.md`)
+for command-shaped direct test-command patterns and fails when a *directive*
+is introduced that is not an explicitly commented whitelist entry. The nested
+exceptions are the legitimate infrastructure references: this skill's own
+runner docs, git hooks/CI (`pre-push hook`, `--scope full`), the audit F2
+suite-command resolution prose (`skill/audit/SKILL.md`, SA-0MSTMYE79006NA61),
+and the single known resolve-pr-comments snippet tracked by SA-0MSN6FBFF009VCOB.
+`<skill> ## Tests` sections are reworded to route through the test skill
+(AC2), never deleted.
+
+Note: doc-conformance tests scan **git-tracked** skill dirs only
+(`tests/skill_inventory.py`), so an untracked `skill/<name>/` directory left by
+concurrent WIP is excluded (SA-0MUU206QT001M66F) — its docs are not part of
+the policy surface until committed.
+
 ### 0. Cached execution (default)
 
 `run_tests.py` caches each suite run per-repo by default (see

@@ -74,9 +74,10 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Impact:** 7-20 minutes at ~40% CPU per scan on the real worklog
 - **Origin:** agent tool use during Phase 2 (tools allowlist
   `audit_runner.py` L1312-1316; parent FILE SCOPE + SCANNING L3664-3677)
-- **Replacement:** `rg --hidden -l <ID> -g '*.jsonl' .worklog/` (bounded scan,
-  see scan.py `find-workitem`) **or** `wl search <ID> --json` (milliseconds —
-  worklog is the source of truth and searchable).
+- **Replacement:** native `wl show <ID> --json` (structured index lookup,
+  milliseconds — worklog is the source of truth and searchable). The bounded
+  `rg --hidden -l <ID> -g '*.jsonl' .worklog/` recipe remains available as a
+  last-resort fallback.
 
 ### P2. Recursive grep from repo root with `--include` filters
 
@@ -88,7 +89,7 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
   `audit_runner.py` L1312-1316; parent FILE SCOPE + SCANNING L3664-3677 —
   the `rg --hidden -g '*.jsonl' -g '*.db'` recipe prunes node_modules/.git)
 - **Replacement:** `rg --hidden -l <ID> -g '*.jsonl' -g '*.db' -g '!node_modules/**' -g '!.git/**' .`
-  (prunes node_modules/.git; see scan.py `find-workitem` with `--root .`).
+  (prunes node_modules/.git; see the native `wl show <ID> --json` lookup).
 
 ### P3. `find -type f … | xargs grep -l` over a source tree
 
@@ -194,9 +195,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Impact:** minutes; a full linear read of a multi-GB file
 - **Origin:** agent tool use during Phase 2 (allowlist
   `audit_runner.py` L1312-1316; SCANNING block L3671-3676 — worklog lookups
-  must use `scan.py find-workitem` / `wl search`, never grep)
-- **Replacement:** `wl search WL-0MS4FHW290053SH4 --json` (structured lookup,
-  milliseconds) or `scan.py find-workitem <ID>`.
+  must use the native wl CLI (`wl list` / `wl show`), never grep)
+- **Replacement:** `wl show WL-0MS4FHW290053SH4 --json` (native exact/unique-ID
+  resolution, milliseconds).
 
 ### P10. Unbounded `grep -r` over the whole repo root
 
@@ -215,14 +216,14 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 
 | Legacy shape | Replacement | Why it is bounded |
 |--------------|-------------|-------------------|
-| `grep -r … .worklog/` | `rg --hidden -l <ID> -g '*.jsonl' .worklog/` or `wl search <ID>` | rg prunes hidden/ignored dirs; glob limits file types; `wl search` uses the structured worklog index |
+| `grep -r … .worklog/` | `rg --hidden -l <ID> -g '*.jsonl' .worklog/` or `wl show <ID>` | rg prunes hidden/ignored dirs; glob limits file types; `wl show` uses the structured worklog index |
 | `grep -rln … --include=*.jsonl --include=*.db .` | `rg --hidden -l … -g '!node_modules/**' -g '!.git/**' .` | node_modules/.git pruned before reading |
 | `find … \| xargs grep -l` | `rg --type py -l …` | single process, typed scan, no xargs |
 | `grep -rn --include=*.py .` | `rg -n --type py -g '!node_modules/**' .` | native ignore handling |
 | `grep -r … ~/.pi/agent/skills/…` | `rg -n … skill/audit/scripts/audit_runner.py` | target the repo copy, no recursion |
 | `find … \| sort` | `rg --files -g '*.ts' <dir>` | bounded file listing |
 | `grep … . \| grep -v node_modules` | `rg … -g '!node_modules/**'` | prune before scan, not after |
-| `grep -rn … worklog-data.jsonl` | `wl search <ID> --json` | structured index lookup |
+| `grep -rn … worklog-data.jsonl` | `wl show <ID> --json` | structured index lookup |
 
 > **Note on `--hidden`:** `.worklog/` is a hidden directory (leading dot), and
 > ripgrep skips hidden dirs by default. Replacement recipes that must search
@@ -270,14 +271,16 @@ was 9.5 GB with 86 files (up to 1.5 GB each), and the observed production scans
 ran 7-20 minutes at ~40% CPU because (a) file volume was ~10x the fixture,
 (b) node_modules/.git were walked from repo root, and (c) many concurrent
 audits repeated identical scans. Extrapolating the 4.9x recipe speedup to the
-9.5 GB worklog bounds each scan to well under a minute of CPU, and `wl search`
-eliminates worklog content scans entirely.
+9.5 GB worklog bounds each scan to well under a minute of CPU, and native
+`wl list` / `wl show` lookups eliminate worklog content scans entirely.
 
 ## 7. Follow-up
 
 - F2/F3/F4 (children SA-0MSBR0E8Y0022Z4V, SA-0MSBR0LLT006JCXN,
-  SA-0MSBR0SRK0035HB1) add a `scan.py` helper (find-workitem/search-code/
-  list-files) and wire its guidance into the audit prompts and SKILL.md.
+  SA-0MSBR0SRK0035HB1) add a `scan.py` helper (search-code / list-files) and
+  wire its guidance into the audit prompts and SKILL.md. Worklog lookups were
+  subsequently moved to the native wl CLI (`wl list` / `wl show`) by
+  SA-0MSOMINF8007K9S4 (see `skill/audit/scripts/scan.py` module docstring).
 - After F4 lands, re-run `benchmark_grep_scans.py` and, on the workstation,
   re-measure a real audit's scan CPU-time to verify AC4 in production.
 
@@ -320,11 +323,12 @@ Re-verified during the post-audit remediation of SA-0MSAEJCP7002LTIM
 | Scan | Elapsed (wall) | User CPU | Notes |
 |------|----------------|----------|-------|
 | `grep -r <ID> .worklog/` (legacy recipe) | 1.58 s | 1.42 s | 449 MB real worklog (post-sweep) |
-| `wl search <ID> --json` (worklog lookup) | 0.30 s | 0.25 s | structured index lookup |
+| `wl show <ID> --json` (worklog lookup) | 0.30 s | 0.25 s | structured index lookup |
 | `rg --hidden -l <ID> -g '*.jsonl' .worklog/` (bounded recipe) | 0.14 s | 0.02 s | rg prunes + glob |
 
-Worklog lookups in audits route exclusively to `wl search` via
-`scan.py find-workitem`, so the expensive legacy scan shape is **eliminated**
+Worklog lookups in audits route exclusively to the native wl CLI
+(`wl list <term> --json` / `wl show <id> --json`), so the expensive legacy
+scan shape is **eliminated**
 from real audits — not just sped up. The 9.5 GB dump that made the legacy
 scans run 7-20 min was swept to 370 MB (SA-0MSBSOAEM0078LAO F5), so even a
 legacy scan is now seconds, and the replacement recipes are sub-second.
@@ -332,5 +336,6 @@ legacy scan is now seconds, and the replacement recipes are sub-second.
 **Stream 2 — real audit runs post-F4:** audits run since the SCANNING
 guidance landed (including this remediation's own audit) show no unbounded
 `grep -r .worklog/` or repo-root scans; Phase 2 agents use `scan.py` helpers
-and `wl search` per the prompt guidance. No audit hung on a scan (the
+and native wl lookups (`wl list` / `wl show`) per the prompt guidance. No
+audit hung on a scan (the
 7-20 min per-scan pattern is gone).

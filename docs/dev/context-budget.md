@@ -193,6 +193,16 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > new measured surface with justification rather than compacting the safety
 > text (SA-0MUN83EAF000G903 AC3).
 >
+> **Test execution policy bump (2026-10-14, SA-0MTYIMWQP0020ZUC / SA-0MV7TQOR4000RSFH):**
+> the universal **Test execution policy** section (`## Test execution policy` —
+> agents must never invoke test commands directly; every agent-initiated run
+> goes through the test skill) added ~596 B to `AGENTS_GLOBAL.md`
+> (`global_agents 11832` → `12428`; `total 17327` → `17923`; `project_agents`
+> and `skills_prose` unchanged). The addition is deliberate policy applied to
+> every project, so the thresholds were regenerated to the new measured
+> surface with justification (AC2 of SA-0MTYIMWQP0020ZUC) rather than
+> compacting the policy text.
+>
 > **Worktree-isolation guidance bump (2026-10-07, SA-0MUY9PSRS003V5CM):**
 > strengthening the "MANDATORY — worktree requirement" in `AGENTS_GLOBAL.md`
 > (stating that `cwd` is not sufficient, that a child/driven session must
@@ -245,13 +255,40 @@ pinned in place.
 ## Rollout to all framework projects
 
 The context-budget pre-push gate (F6, SA-0MSLK7XNZ00366YY) is enforced in
-SorraAgents and all framework projects: ContextHub, dev-scripts, llm-manager,
-open_source_llm, and Tableau-Card-Engine. (ampa was retired 2026-08-20 and is
-out of scope.) Each project ships the v2 pre-push hook
+SorraAgents and every framework project: ContextHub, dev-scripts, llm-manager,
+open_source_llm, Tableau-Card-Engine, and **AI_Hell**. (ampa was retired
+2026-08-20 and is out of scope.) Each project ships the v2 pre-push hook
 (`.githooks/pre-push`) with **worklog sync + context-budget gate + branch
 policy**, wired via `core.hooksPath=.githooks` (or equivalent), plus its own
 committed per-project thresholds file
 (`docs/dev/context-budget.thresholds.json`).
+
+> **AI_Hell rollout (SA-0MSN2ULOF007JJ35, 2026-10-14):** AI_Hell was the last
+> in-scope project still on the v1 sync-only hook, with `core.hooksPath` unset
+> and no thresholds file. It now ships the framework v2 hook (byte-identical to
+> the ContextHub v2 hook), activates it with `core.hooksPath=.githooks`, and
+> commits its own generated thresholds. Because AI_Hell has no repo-local
+> `AGENTS_GLOBAL.md` or `skill/` tree, its measurement is `global_agents 0`,
+> `project_agents 24044`, `skills_prose 0`, `total 24044`.
+
+| Project | Hook | `core.hooksPath` | Thresholds file |
+|---|---|---|---|
+| SorraAgents | v3 (context-budget gate + sync + branch policy + full-suite gate) | `.git/hooks` | `docs/dev/context-budget.thresholds.json` |
+| ContextHub | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
+| dev-scripts | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
+| llm-manager | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
+| open_source_llm | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
+| Tableau-Card-Engine | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
+| AI_Hell | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
+
+> **Measurement scope in non-SorraAgents projects.** `install_pi.sh` symlinks
+> the global guidance to `~/.pi/agent/AGENTS.md` (machine-global), **not** into
+> each repository. Consequently `measure_context.py` reports
+> `global_agents = 0` and `skills_prose = 0` (no repo-local `skill/` tree) in
+> the sibling projects: each project's gate protects its **repo-local**
+> startup surface (chiefly its own `AGENTS.md`), while the machine-global
+> surface is gated by SorraAgents itself. This is expected, not a wiring bug —
+> the sibling thresholds files record `global_agents 0` and `skills_prose 0`.
 
 ### How the v2 gate works in a multi-project framework
 
@@ -312,6 +349,39 @@ gate for **future** projects. When run inside a git project, it:
    file if one is missing.
 
 Bypass hook installation with `PI_SKIP_HOOK_INSTALL=1`.
+
+> **Note:** `install_pi.sh` only *creates* `.githooks/pre-push` when it is
+> absent; it never overwrites an existing hook. A project that already ships an
+> older (e.g. v1 sync-only) `.githooks/pre-push` therefore needs its hook
+> replaced explicitly — as AI_Hell did in SA-0MSN2ULOF007JJ35.
+
+### End-to-end verification (real project)
+
+The gate is verified against the real AI_Hell checkout (SA-0MSN2ULOF007JJ35),
+not a temporary test repo, by invoking the installed hook with a simulated
+`dev` push on stdin:
+
+```bash
+cd /home/rgardler/projects/AI_Hell   # no local skill/context-audit → global symlink
+
+# Within budget → push allowed (exit 0)
+WORKLOG_SKIP_PRE_PUSH=1 sh .githooks/pre-push <<'EOF'
+refs/heads/dev 0000000000000000000000000000000000000000 refs/heads/dev 1111111111111111111111111111111111111111
+EOF
+
+# Over budget → push blocked (exit 1). Temporarily point the committed
+# thresholds at an impossible budget, then restore them.
+printf '{"global_agents":0,"project_agents":1,"skills_prose":0,"total":1}\n' \
+  > docs/dev/context-budget.thresholds.json
+WORKLOG_SKIP_PRE_PUSH=1 sh .githooks/pre-push <<'EOF'
+refs/heads/dev 0000000000000000000000000000000000000000 refs/heads/dev 1111111111111111111111111111111111111111
+EOF
+# → exit 1: "ERROR: Context budget exceeded committed thresholds."
+```
+
+The rollout push of AI_Hell's `dev` branch (`5b519480..bbf42c84`) then ran the
+live v2 hook (branch policy + context-budget gate + worklog sync) and completed
+successfully, confirming the gate is active for ordinary pushes.
 
 ### Troubleshooting
 

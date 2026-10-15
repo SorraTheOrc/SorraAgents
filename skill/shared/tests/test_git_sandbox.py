@@ -13,7 +13,14 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
   (F3 AC5; parent AC3);
 - agent-worktree registration/removal churn (including the
   ``branch.<name>.*`` config written by ``git worktree add --track``) moves
-  neither the fingerprint nor the diff (SA-0MUINEW6X0034C65).
+  neither the fingerprint nor the diff (SA-0MUINEW6X0034C65);
+- ownership-based exclusion (SA-0MV8311B3005DNG8): a ref checked out in a
+  registered worktree **other than the guard's own root** is invisible to the
+  guard, while the guard root's own branch stays monitored. The
+  new-behaviour tests are red-for-the-right-reason via ``xfail(strict=True)``
+  (a tracer bullet, same convention as
+  ``tests/test_repository_override_isolation.py``) until the implementation
+  sibling SA-0MV87GC8O006RHS8 removes the markers.
 """
 from __future__ import annotations
 
@@ -239,13 +246,22 @@ class TestMainCheckoutAnchoring:
         assert gs.main_checkout_root(guarded) == repo.resolve()
         assert gs.main_checkout_root(repo) == repo.resolve()
 
-    def test_snapshot_from_linked_worktree_excludes_agent_branches(self, tmp_path):
+    def test_snapshot_from_linked_worktree_excludes_sibling_branches(self, tmp_path):
+        """A snapshot armed *from a linked worktree* (the guard root) excludes
+        sibling worktree branches but keeps its own root branch monitored.
+
+        Ownership-based exclusion (SA-0MV8311B3005DNG8 AC1) replaced the
+        ``.worklog/worktrees/`` directory anchor: ``wl-a`` is the guard root
+        here, so it stays monitored, while sibling ``wl-b`` is another
+        registered worktree and is excluded — the same SA-0MUILGH5E007X627
+        sibling-churn invisibility, expressed via ownership.
+        """
         _repo, guarded, sibling = self._repo_with_two_worktrees(tmp_path)
         (sibling / "sibling.txt").write_text("sibling", encoding="utf-8")
         gs.commit_all(sibling, "sibling work")
         snapshot = gs.snapshot_repo_state(guarded)
         assert snapshot["root"] == str(guarded.resolve())
-        assert "refs/heads/wl-a" in snapshot["excluded_refs"]
+        assert "refs/heads/wl-a" not in snapshot["excluded_refs"]
         assert "refs/heads/wl-b" in snapshot["excluded_refs"]
 
     def test_linked_worktree_sibling_commit_reports_nothing(self, tmp_path):
@@ -256,6 +272,159 @@ class TestMainCheckoutAnchoring:
         after = gs.snapshot_repo_state(guarded)
         assert gs.fingerprint(after) == gs.fingerprint(before)
         assert not gs.diff_snapshots(before, after)["changed"]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MV8311B3005DNG8 — ownership-based exclusion (guard root vs other worktrees)
+#
+# Ownership-based exclusion: a ref checked out in a registered worktree **other
+# than the guard's own root** is concurrent-infrastructure churn, invisible to
+# ``fingerprint()`` / ``diff_snapshots()``. The guard root's own branch stays
+# monitored, and a register→remove cycle wholly inside the window is invisible
+# via the retained ``branch.<name>.remote=.`` worktree-track config.
+# ---------------------------------------------------------------------------
+
+
+def _repo_with_linked_guard_worktree(
+    tmp_path: Path, *, guard_branch: str = "wl-guard"
+) -> tuple[Path, Path]:
+    """A main checkout on ``dev`` plus a linked guard worktree.
+
+    Mirrors the shape ``implement.py`` creates: the main checkout owns
+    ``dev``, and the linked worktree (the guard root) lives under the main
+    checkout's ``.worklog/worktrees/``. Returns ``(main_checkout, guard_root)``.
+    """
+    repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (repo / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    guarded = repo / ".worklog" / "worktrees" / "wl-guard"
+    gs.add_worktree(repo, guarded, guard_branch)
+    return repo, guarded
+
+
+class TestOwnershipBasedExclusion:
+    """A ref owned by *another* registered worktree is churn, not a mutation.
+
+    The guard root's own branch stays monitored; every ref checked out in a
+    different registered worktree (the main checkout's integration branch,
+    a sibling anywhere, a transient ``.worklog/tmp-worktree-*``) is excluded
+    regardless of directory name. Red for the right reason pre-fix.
+    """
+
+    def test_linked_worktree_root_excludes_other_checkouts_not_its_own(
+        self, tmp_path
+    ):
+        """AC1/AC2: armed at a linked worktree, the main checkout's ``dev`` is
+        excluded, while the guard root's own branch stays monitored."""
+        _repo, guarded = _repo_with_linked_guard_worktree(tmp_path)
+        snapshot = gs.snapshot_repo_state(guarded)
+        assert "refs/heads/dev" in snapshot["excluded_refs"]
+        assert "refs/heads/wl-guard" not in snapshot["excluded_refs"]
+
+    def test_sibling_worktree_branch_excluded_outside_agent_dir(self, tmp_path):
+        """AC3: exclusion is ownership-based, not bound to a directory name.
+
+        A sibling worktree registered *outside* ``.worklog/worktrees/`` must
+        still be excluded, and its commit must not trip the diff."""
+        repo, guarded = _repo_with_linked_guard_worktree(tmp_path)
+        sibling = tmp_path / "not-under-worklog" / "sibling"
+        gs.add_worktree(repo, sibling, "sibling-branch")
+        before = gs.snapshot_repo_state(guarded)
+        assert "refs/heads/sibling-branch" in before["excluded_refs"]
+        (sibling / "sibling.txt").write_text("sibling\n", encoding="utf-8")
+        gs.commit_all(sibling, "sibling work")
+        after = gs.snapshot_repo_state(guarded)
+        assert not gs.diff_snapshots(before, after)["changed"]
+
+    def test_tmp_worktree_under_worklog_is_excluded(self, tmp_path):
+        """AC4: ``.worklog/tmp-worktree-*`` is churn even though it is not
+        under the ``.worklog/worktrees/`` anchor."""
+        repo, guarded = _repo_with_linked_guard_worktree(tmp_path)
+        tmp_wt = repo / ".worklog" / "tmp-worktree-abc123"
+        gs.add_worktree(repo, tmp_wt, "tmp-branch")
+        before = gs.snapshot_repo_state(guarded)
+        assert "refs/heads/tmp-branch" in before["excluded_refs"]
+        (tmp_wt / "tmp.txt").write_text("tmp\n", encoding="utf-8")
+        gs.commit_all(tmp_wt, "tmp work")
+        after = gs.snapshot_repo_state(guarded)
+        assert not gs.diff_snapshots(before, after)["changed"]
+
+    def test_register_remove_cycle_wholly_inside_window_is_invisible(
+        self, tmp_path
+    ):
+        """A register→remove cycle that starts and ends inside the window.
+
+        A ``--track`` branch is created and removed entirely between *before*
+        and *after*; the branch and its tracking config persist. Neither the
+        diff nor the fingerprint may move."""
+        repo, guarded = _repo_with_linked_guard_worktree(tmp_path)
+        cycle_wt = repo / ".worklog" / "tmp-worktree-in-window"
+        before = gs.snapshot_repo_state(guarded)
+        gs.run_git(
+            repo,
+            [
+                "worktree",
+                "add",
+                "--track",
+                "-b",
+                "window-branch",
+                str(cycle_wt),
+                "dev",
+            ],
+            check=True,
+        )
+        gs.run_git(repo, ["worktree", "remove", "--force", str(cycle_wt)], check=True)
+        after = gs.snapshot_repo_state(guarded)
+        assert "refs/heads/window-branch" in after["refs"]  # branch retained
+        assert not gs.diff_snapshots(before, after)["changed"]
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+
+
+class TestOwnershipExclusionBoundaries:
+    """Limits of the ownership rule that must never false-fail.
+
+    These pin (a) the guard's own checkout and (b) a worktree registered and
+    removed within the window. They are green against the unmodified module
+    and must stay green after the ownership fix — an unexpected pass under a
+    strict ``xfail`` would itself be a failure, so they are unmarked.
+    """
+
+    def test_main_checkout_root_keeps_its_own_branch_monitored(self, tmp_path):
+        """AC2: armed at the main checkout, its own ``dev`` is not excluded."""
+        repo, _guarded = _repo_with_linked_guard_worktree(tmp_path)
+        snapshot = gs.snapshot_repo_state(repo)
+        assert "refs/heads/dev" not in snapshot["excluded_refs"]
+
+    def test_worktree_registered_then_removed_with_branch_retained(
+        self, tmp_path
+    ):
+        """AC5: a ``--track`` worktree registered at *before* and removed by
+        *after* (branch retained) moves neither the diff nor the fingerprint.
+
+        The branch's ``branch.<name>.remote``/``.merge`` config survives the
+        removal, so the ownership signal must as well."""
+        repo, guarded = _repo_with_linked_guard_worktree(tmp_path)
+        cycle_wt = repo / ".worklog" / "tmp-worktree-cycle"
+        gs.run_git(
+            repo,
+            [
+                "worktree",
+                "add",
+                "--track",
+                "-b",
+                "cycle-branch",
+                str(cycle_wt),
+                "dev",
+            ],
+            check=True,
+        )
+        before = gs.snapshot_repo_state(guarded)
+        gs.run_git(repo, ["worktree", "remove", "--force", str(cycle_wt)], check=True)
+        after = gs.snapshot_repo_state(guarded)
+        assert "refs/heads/cycle-branch" in after["refs"]  # branch retained
+        assert not gs.diff_snapshots(before, after)["changed"]
+        assert gs.fingerprint(after) == gs.fingerprint(before)
 
 
 # ---------------------------------------------------------------------------
