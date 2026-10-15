@@ -8747,7 +8747,7 @@ def _phase_merge_gate(ctx: _AuditContext) -> int | None:
     Returns None when the gate passes (work merged or never resolvable —
     see below) or when integration succeeded; returns 1 when integration
     is REQUIRED but FAILED (the audit must fail with "Ready to close: No"
-    + needs-producer-review — AC3, never proceeds past Phase 1 with
+    + the producer hold — AC3, never proceeds past Phase 1 with
     unmerged work). A gate with no resolvable evidence is NOT a blocker:
     the item may have no code changes at all (docs-only, no feature
     branch, no commits referenced) — verification degrades to a recorded
@@ -11923,6 +11923,15 @@ _STATUS_STAGE_COMPAT: dict[str, frozenset[str]] = {
 }
 _DEFAULT_SAFE_STAGE = "plan_complete"
 
+#: Reserved assignee value that marks the producer's per-item scheduling hold.
+#: Mirrors ContextHub's ``PRODUCER_HOLD_ASSIGNEE`` in
+#: ``packages/herdr/src/downtime-worker.ts`` (WL-0MV85WDOM007BKF8; epic
+#: WL-0MV82CHGQ000HAZZ Q2). Assigning an item to the producer pauses
+#: auto-dispatch and marks the item producer-owned for the release gate —
+#: this replaces the retired ``needsProducerReview`` flag
+#: (WL-0MV85WE7Q00044P9).
+_PRODUCER_HOLD_ASSIGNEE = "Map"
+
 
 def _coerce_valid_status_stage(status, stage):
     """Validate and coerce a (status, stage) pair to a valid combination.
@@ -11948,6 +11957,23 @@ def _coerce_valid_status_stage(status, stage):
         effective_stage = (
             "in_review" if effective_status == "completed" else "plan_complete"
         )
+
+    # Legacy hybrid recovery (WL-0MV85WE7Q00044P9). Before Option A the
+    # audit-tier claim flipped status to ``in-progress`` while leaving the
+    # stage at ``in_review`` (or a terminal ``done``). Coercing such a
+    # review-queue item to ``in-progress/plan_complete`` strands it off the
+    # review queue, so restore it to its true terminal ``completed`` status
+    # instead. This makes the ``in_review`` → ``plan_complete`` coercion
+    # unreachable for review-queue items.
+    if effective_status in ("in-progress", "in_progress") and effective_stage in ("in_review", "done"):
+        print(
+            f"Warning: captured pre-audit state "
+            f"({effective_status}/{effective_stage}) is the legacy audit-claim "
+            f"hybrid; restoring to (completed/{effective_stage}) so the item "
+            "stays on the review queue.",
+            file=sys.stderr,
+        )
+        return "completed", effective_stage
 
     # Check validity.
     valid_stages = _STATUS_STAGE_COMPAT.get(effective_status)
@@ -12283,14 +12309,15 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             expected_status, expected_stage = safe_status, safe_stage
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
-            # Top-level items (no parent) get --needs-producer-review yes so
-            # the producer-review gate (closeWorkItemsAfterRelease) blocks
-            # release until the producer explicitly reviews the item.  Child
-            # items are covered by their parent's review and must NOT be
-            # flagged — the flag would flood the producer queue with
-            # redundant approvals (SA-0MSSVKYEW008PJ9H). The flag is
-            # inserted before the trailing --json (file convention:
-            # --json is always the last flag).
+            # Producer hold (Option A; WL-0MV85WE7Q00044P9): a top-level item
+            # is assigned to the producer sentinel so the release gate blocks
+            # it until the producer reviews it. Child items are covered by
+            # their parent's review, so their assignee is CLEARED instead — a
+            # non-empty assignee would act as a scheduling hold and stop the
+            # item being re-dispatched (epic Q2; replaces the retired
+            # --needs-producer-review flag, SA-0MSSVKYEW008PJ9H). Either way
+            # the audit agent's own claim is released. The flag is inserted
+            # before the trailing --json (file convention: --json last).
             # This is the sole authorisation for the descendant cascade
             # below — a passing verdict, not status/stage (AC3).
             cascade_authorised = True
@@ -12300,7 +12327,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             else:
                 cmd += ["--status", "completed", "--stage", "in_review"]
             if not ctx.wi or not ctx.wi.get("parentId"):
-                cmd += ["--needs-producer-review", "yes"]
+                cmd += ["--assignee", _PRODUCER_HOLD_ASSIGNEE]
+            else:
+                cmd += ["--assignee", ""]
             cmd.append("--json")
             restore_cmd = cmd
             # Stage is kept as the pre-existing 'done' when the item already
@@ -12346,18 +12375,21 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             else:
                 restore_cmd = [
                     "wl", "update", ctx.issue_id,
-                    "--status", "open", "--stage", "plan_complete", "--json",
+                    "--status", "open", "--stage", "plan_complete",
+                    "--assignee", "", "--json",
                 ]
                 expected_status, expected_stage = "open", "plan_complete"
                 # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
                 # integration fails the audit closed and flags the item for
                 # producer review so the producer investigates and integrates
                 # manually — never proceed past Phase 1 with unmerged work.
+                # The producer-review flag is re-homed onto the producer-hold
+                # assignee (WL-0MV85WE7Q00044P9).
                 if ctx.merge_gate_blocker:
                     restore_cmd = [
                         "wl", "update", ctx.issue_id,
                         "--status", "open", "--stage", "plan_complete",
-                        "--needs-producer-review", "yes", "--json",
+                        "--assignee", _PRODUCER_HOLD_ASSIGNEE, "--json",
                     ]
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(
@@ -12765,7 +12797,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # check, or surface AC assessment): the item's work must be merged
         # into the owning repo's dev, and is integrated when missing. A
         # blocked gate (integration failed) emits a fail-closed report here
-        # ("Ready to close: No" + needs-producer-review) — the pipeline
+        # ("Ready to close: No" + the producer hold) — the pipeline
         # never proceeds past Phase 1 with unmerged work (AC3).
         rc = _phase_fetch_and_cq(ctx)
         if rc is not None:

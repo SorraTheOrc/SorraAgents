@@ -221,6 +221,24 @@ class TestRestoreWorkItemStatus:
         idx = cmd.index("--stage")
         assert cmd[idx + 1] == "plan_complete"
 
+    def test_restore_legacy_hybrid_in_progress_in_review_recovers_to_completed(self, capsys):
+        """WL-0MV85WE7Q00044P9: abort-recovery of the legacy audit-claim
+        hybrid in-progress/in_review restores to completed/in_review (never
+        in-progress/plan_complete) and always clears the assignee."""
+        with mock.patch("subprocess.run") as run:
+            run.return_value = SimpleNamespace(returncode=0)
+            rc = audit_runner._restore_work_item_status(
+                "TEST-1", "in-progress", "in_review",
+            )
+        assert rc == 0
+        cmd = run.call_args.args[0]
+        idx = cmd.index("--status")
+        assert cmd[idx + 1] == "completed"
+        idx = cmd.index("--stage")
+        assert cmd[idx + 1] == "in_review"
+        idx = cmd.index("--assignee")
+        assert cmd[idx + 1] == ""
+
     def test_restore_injects_worklog_dir_when_supplied(self, tmp_path):
         """An explicit worklog_dir is forwarded to the wl invocation."""
         with mock.patch("subprocess.run") as run:
