@@ -245,6 +245,167 @@ def test_deletion_accounting_includes_test_only_commits(churn):
 
 
 # ---------------------------------------------------------------------------
+# Growth accounting (added / deleted / modified / net)
+# ---------------------------------------------------------------------------
+
+def test_growth_accounting_totals_and_area(churn):
+    commits = [
+        _commit(
+            churn,
+            [
+                churn.FileChange("src/app.py", "A", additions=3, deletions=0),
+                # new test file alongside a source change (feature commit)
+                churn.FileChange("tests/test_app.py", "A", additions=5, deletions=0),
+            ],
+            date="2026-01-01",
+        ),
+        _commit(
+            churn,
+            [
+                # rewrite: renamed test file counts as modified
+                churn.FileChange("tests/test_app.py", "R", additions=2, deletions=1),
+            ],
+            date="2026-02-01",
+        ),
+        _commit(
+            churn,
+            [churn.FileChange("tests/test_app.py", "D", additions=0, deletions=4)],
+            date="2026-03-01",
+        ),
+        # a test-only commit adding a file must count toward "added"
+        _commit(
+            churn,
+            [churn.FileChange("tests/test_new.py", "A", additions=3, deletions=0)],
+            date="2026-04-01",
+        ),
+    ]
+    growth = churn.analyse_growth_accounting(commits, churn.ChurnConfig())
+
+    # Totals: 2 additions (feature + test-only), 1 deletion, 1 rename-modified.
+    assert growth["files_added"] == 2
+    assert growth["files_deleted"] == 1
+    assert growth["files_modified"] == 1
+    assert growth["files_net_growth"] == 1
+    assert growth["lines_added"] == 5 + 2 + 3
+    assert growth["lines_deleted"] == 1 + 4
+    assert growth["lines_net_growth"] == (5 + 2 + 3) - (1 + 4)
+
+    # Per-area: both test files classify under the ``tests`` area.
+    area = growth["area"]["tests"]
+    assert area["files_added"] == 2
+    assert area["files_deleted"] == 1
+    assert area["files_modified"] == 1
+    assert area["files_net_growth"] == 1
+
+
+def test_growth_accounting_counts_delete_and_readd_once_each(churn):
+    """A file deleted and re-added is an addition and a deletion (AC5).
+
+    Per-event accounting must not under- or double-count: two add events and
+    one delete event yield net growth +1.
+    """
+    commits = [
+        _commit(
+            churn,
+            [churn.FileChange("tests/feature.py", "A", additions=6, deletions=0)],
+            date="2026-01-01",
+        ),
+        _commit(
+            churn,
+            [churn.FileChange("tests/feature.py", "D", additions=0, deletions=6)],
+            date="2026-02-01",
+        ),
+        _commit(
+            churn,
+            [churn.FileChange("tests/feature.py", "A", additions=4, deletions=0)],
+            date="2026-03-01",
+        ),
+    ]
+    growth = churn.analyse_growth_accounting(commits, churn.ChurnConfig())
+    assert growth["files_added"] == 2
+    assert growth["files_deleted"] == 1
+    assert growth["files_net_growth"] == 1
+    assert growth["lines_added"] == 10
+    assert growth["lines_deleted"] == 6
+    assert growth["lines_net_growth"] == 4
+
+
+def test_growth_accounting_ignores_non_test_changes(churn):
+    commits = [
+        _commit(
+            churn,
+            [
+                churn.FileChange("src/app.py", "A", additions=9, deletions=0),
+                churn.FileChange("docs/guide.md", "A", additions=7, deletions=0),
+            ],
+        )
+    ]
+    growth = churn.analyse_growth_accounting(commits, churn.ChurnConfig())
+    assert growth["files_added"] == 0
+    assert growth["lines_added"] == 0
+    assert growth["files_net_growth"] == 0
+    assert growth["area"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Quarterly growth trend
+# ---------------------------------------------------------------------------
+
+def test_quarterly_trend_groups_by_calendar_quarter(churn):
+    commits = [
+        _commit(
+            churn,
+            [churn.FileChange("tests/a.py", "A", additions=3, deletions=0)],
+            date="2026-01-10",
+        ),
+        _commit(
+            churn,
+            [churn.FileChange("tests/b.py", "A", additions=4, deletions=0)],
+            date="2026-04-10",
+        ),
+        _commit(
+            churn,
+            [churn.FileChange("tests/c.py", "A", additions=5, deletions=0)],
+            date="2026-10-10",
+        ),
+    ]
+    trend = churn.analyse_growth_trend_by_quarter(commits, churn.ChurnConfig())
+    periods = [row["quarter"] for row in trend]
+    # Continuous Q1..Q4: the empty quarter (Q3) is reported as zero, not omitted.
+    assert periods == ["2026-Q1", "2026-Q2", "2026-Q3", "2026-Q4"]
+    by_quarter = {row["quarter"]: row for row in trend}
+    assert by_quarter["2026-Q1"]["files_added"] == 1  # 2026-01-10
+    assert by_quarter["2026-Q2"]["files_added"] == 1  # 2026-04-10
+    assert by_quarter["2026-Q3"]["files_added"] == 0  # no commits -> zero row
+    assert by_quarter["2026-Q4"]["files_added"] == 1  # 2026-10-10
+    assert all(row["files_net_growth"] >= 0 for row in trend)
+
+
+def test_quarterly_trend_spans_year_boundary(churn):
+    commits = [
+        _commit(
+            churn,
+            [churn.FileChange("tests/a.py", "D", additions=0, deletions=2)],
+            date="2025-11-15",
+        ),
+        _commit(
+            churn,
+            [churn.FileChange("tests/b.py", "A", additions=3, deletions=0)],
+            date="2026-02-01",
+        ),
+    ]
+    trend = churn.analyse_growth_trend_by_quarter(commits, churn.ChurnConfig())
+    # Range covers first..last commit quarter and rolls over the year boundary.
+    assert [row["quarter"] for row in trend] == ["2025-Q4", "2026-Q1"]
+    assert trend[0]["files_deleted"] == 1
+    assert trend[1]["files_added"] == 1
+
+
+def test_quarterly_trend_empty_history_is_empty(churn):
+    assert churn.analyse_growth_trend_by_quarter([], churn.ChurnConfig()) == []
+
+
+# ---------------------------------------------------------------------------
 # Domain churn
 # ---------------------------------------------------------------------------
 
@@ -300,10 +461,22 @@ def test_build_report_is_self_contained(churn, git_repo):
     assert report["primary_metrics"]["total_commits"] == 4
     assert report["primary_metrics"]["deleted_test_files"] == 1
     assert report["tdd_value_assessment"]["rewrite_ratio_modified_only_pct"] >= 0
+    # Fixture history: A (test_app.py), M, R, D -> 1 added, 2 modified, 1 deleted.
+    growth = report["growth_metrics"]
+    assert growth["files_added"] == 1
+    assert growth["files_deleted"] == 1
+    assert growth["files_modified"] == 2
+    assert growth["files_net_growth"] == 0
+    assert growth["lines_net_growth"] == growth["lines_added"] - growth["lines_deleted"]
+    trend = report["quarterly_growth_trends"]
+    assert trend and trend[0]["quarter"] == "2026-Q1"
+    assert trend[-1]["quarter"] == "2026-Q2"
     text = churn.generate_report(report)
     assert "TDD value assessment" in text
     assert "Scope and definitions" in text
     assert "Rewrite" in text
+    assert "## 3. Test growth — added, deleted, net" in text
+    assert "## 4. Quarterly growth trend (calendar quarters)" in text
 
 
 def test_write_outputs_produces_both_files(churn, git_repo, tmp_path):

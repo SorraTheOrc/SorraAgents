@@ -57,12 +57,18 @@ def test_entry_point_writes_both_artefacts(git_repo, tmp_path):
     assert "# Test Churn Report" in text
     assert "Scope and definitions" in text
     assert "TDD value assessment" in text
+    assert "Test growth — added, deleted, net" in text
+    assert "Quarterly growth trend" in text
 
     payload = json.loads(data.read_text(encoding="utf-8"))
     assert payload["metadata"]["branch"] == "dev"
     assert payload["metadata"]["project_root"] == str(git_repo.resolve())
     assert payload["primary_metrics"]["total_commits"] == 4
     assert payload["primary_metrics"]["deleted_test_files"] == 1
+    growth = payload["growth_metrics"]
+    assert growth["files_net_growth"] == growth["files_added"] - growth["files_deleted"]
+    assert growth["area"]  # per test area present
+    assert payload["quarterly_growth_trends"][0]["quarter"] == "2026-Q1"
 
 
 def test_entry_point_format_json_writes_only_json(git_repo, tmp_path):
