@@ -159,12 +159,16 @@ The script will:
    work items, categorising by issue_type, and prepending a new release
    section. The updated file is committed.
 4. Merge `dev` into the release branch (`dev` → `main`).
-5. Create an **annotated git tag** `v<new-version>` on the merge commit.
-6. Push the merge branch and the tag to `origin`.
-7. Create a **GitHub Pull Request** from the temp branch to `main`.
-8. Wait for required status checks to pass on the PR (if any are configured).
-9. Merge the PR using `gh pr merge --merge --delete-branch`.
-10. Record an audit comment in the worklog with the merge commit hash,
+5. **Regenerate derived version files** — when `package.json` declares a
+   `build` script, run `npm run build` on the merged tree and commit the
+   regenerated tracked files (non-fatal; see [Derived Version File
+   Regeneration](#derived-version-file-regeneration)).
+6. Create an **annotated git tag** `v<new-version>` on the merge commit.
+7. Push the merge branch and the tag to `origin`.
+8. Create a **GitHub Pull Request** from the temp branch to `main`.
+9. Wait for required status checks to pass on the PR (if any are configured).
+10. Merge the PR using `gh pr merge --merge --delete-branch`.
+11. Record an audit comment in the worklog with the merge commit hash,
     PR number, and approver identity.
 
 Example with custom bump:
@@ -343,6 +347,35 @@ node skill/ship/scripts/remediate-spurious-closes.js
 | `--bump patch` (default) | Increments patch version | `0.1.0` → `0.1.1` |
 | `--bump minor` | Increments minor version, resets patch | `0.1.0` → `0.2.0` |
 | `--bump major` | Increments major version, resets minor and patch | `0.1.0` → `1.0.0` |
+
+### Derived Version File Regeneration
+
+Some consumer repositories derive a CLI/runtime version from `package.json` via
+a build step (e.g. ContextHub's auto-generated `src/version.ts`, written by
+`scripts/generate-version.cjs` during `npm run build`, and tracked in git).
+After the version bump the release flow runs the repository's build **once**, on
+the final merged tree between the `dev` merge and the tag, and commits any
+regenerated **tracked** files (subject `Regenerate derived version files for
+v<version>`) so version-parity checks pass immediately after the release
+(SA-0MV7WAUHZ009UWY2).
+
+Trigger and constraints:
+
+- Only runs on a **real release** (never on `--dry-run`, which prints a
+  would-be regeneration line instead) and only when `package.json` declares a
+  `build` script (`scripts.build`). Repos without a build script are
+  unaffected.
+- **Non-fatal:** a failed or slow build logs
+  `Warning: derived version file regeneration failed (continuing with release)`
+  and the release continues — mirroring the post-bump CHANGELOG step. A build
+  failure never aborts the release or changes its exit code.
+- **Tracked files only:** regenerated files are staged with `git add -u`, so new
+  untracked build droppings (e.g. `dist/`) are never committed. A derived file
+  that is generated fresh (untracked/gitignored) is out of scope — the fix
+  targets repos that already track their derived version file.
+
+Implementation: `skill/ship/scripts/release/regenerate-version.js` (invoked by
+`merge-dev-to-main.sh` after the dev merge, before the tag).
 
 ### Tag Collision Handling
 

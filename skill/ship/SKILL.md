@@ -181,7 +181,7 @@ node $(skill_path ship)/scripts/run-release.js
 2. **Pre-flight checks** — verify `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — exit 7 if non-terminal critical items exist.
 4. **Final validation sweep** — exit 12 if any top-level or **uncovered child** `in_review` item has a missing/stale/failing audit or a producer-review flag after auto-remediation. Children covered by a passing `in_review` parent audit, or excluded (parent deleted / not `in_review`), are skipped and reported.
-5. **Merge commit** — fetch dev/main, `--no-ff` merge commit.
+5. **Merge commit** — fetch dev/main, `--no-ff` merge commit, then **regenerate derived version files**: when `package.json` declares a `scripts.build` command, `merge-dev-to-main.sh` runs `npm run build` on the merged tree and commits the regenerated **tracked** files (subject `Regenerate derived version files for v<version>`) so consumer repos' derived version files (e.g. ContextHub `src/version.ts`) match the bumped `package.json` (SA-0MV7WAUHZ009UWY2). Runs only on a real release (never `--dry-run`), post-bump and pre-tag, and is **non-fatal**: a failed build logs `Warning: derived version file regeneration failed (continuing with release)` and the release proceeds — mirroring the CHANGELOG step. Repos without a `build` script are unaffected; only already-tracked files are committed (`git add -u`, so `dist/` droppings are never staged).
 6. **PR creation** — push `release/dev-to-main-<timestamp>`, create PR to `main`.
 7. **Status check wait & merge** — if the PR has status checks, wait for them (default 10 min), then `gh pr merge --merge --delete-branch`; no checks → merge immediately; `--force` skips the wait.
 8. **Audit logging** — record merge hash, PR URL in worklog.
