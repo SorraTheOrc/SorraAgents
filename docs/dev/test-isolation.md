@@ -365,53 +365,66 @@ namespaces are deliberately excluded because they are tooling churn, not
 checkout mutations:
 
 - `refs/worklog/*` — managed by the `wl` tool;
-- agent worktrees — every branch ref checked out in a worktree under
-  `<main_checkout>/.worklog/worktrees/`, **plus the `branch.<name>.remote` /
+- concurrent-infrastructure churn — every branch ref checked out in a
+  registered worktree **other than the guard's own root** (ownership-based
+  exclusion, SA-0MV8311B3005DNG8), **plus the `branch.<name>.remote` /
   `branch.<name>.merge` config that `git worktree add --track -b` writes for
-  that branch**.
+  that branch** (which survives `git worktree remove`, so a register→remove
+  cycle wholly inside the guard window is also invisible), **plus the
+  remote-tracking refs of an excluded branch** (a concurrent finish fetches
+  before fast-forwarding, so `refs/remotes/origin/<parent>` moves alongside
+  the local branch).
 
-Exclusion is derived from `git worktree list --porcelain`; it is **never** a
-`wl-*` name pattern (which would also have excluded the incident's own fixture
-branches). A legitimately-created fixture branch that happens to be backed by
-a registered agent worktree is therefore excluded.
+Exclusion is derived from `git worktree list --porcelain` and the retained
+local-track config; it is **never** a `wl-*` name pattern (which would also
+have excluded the incident's own fixture branches). A legitimately-created
+fixture branch that happens to be backed by a registered worktree other than
+the guard root is therefore excluded.
 
-### 8.2 Main-checkout anchoring
+### 8.2 Ownership rule and guard-root anchoring
 
-The exclusion directory is anchored on the **main checkout**, not on the root
-the snapshot was taken from. `main_checkout_root()` resolves it with git
-plumbing — `git rev-parse --git-common-dir` (its parent when it is named
-`.git`) — with the first `git worktree list --porcelain` entry as a validated
-fallback. This matters because `implement.py finish` runs the suite from a
-linked worktree: anchoring on the worktree root left `excluded_refs` empty
-there, so every concurrent sibling commit looked like a mutation.
+The exclusion is **ownership-based**: every ref checked out in a registered
+worktree that is *not* the root the guard runs from (`snapshot_repo_state`
+threads the guard's toplevel into the worktree parser) is a concurrent agent's
+infrastructure churn, regardless of the worktree's directory name
+(`.worklog/worktrees/`, `.worklog/tmp-worktree-*`, or anywhere else). The
+**guard root's own branch stays monitored** — a suite running from the main
+checkout still detects a move of its own `dev`, and a suite running from a
+linked worktree still detects a move of that worktree's branch. A concurrent
+sibling agent's `implement.py finish` (which fast-forwards the main checkout's
+`dev` and registers/removes its own `.worklog/` worktrees) therefore no longer
+trips either guard.
 
 ### 8.3 No false positives: fingerprint is a trigger, the diff is the authority
 
 The per-test guard uses a cheap `fingerprint()` (refs + config only, no status
 scan) as a **trigger**. When it moves, the guard confirms the movement against
 the authoritative `diff_snapshots()` before failing; an empty diff re-baselines
-and continues. `fingerprint()` also excludes the agent-worktree refs/config
-entirely, so registration/removal churn does not even move it in the common
-case. Consequently excluded-set churn alone can never fail a test with the
-bogus `(no differences)` signature.
+and continues. `fingerprint()` also excludes the owned refs/config entirely, so
+registration/removal churn does not even move it in the common case.
+Consequently excluded-set churn alone can never fail a test with the bogus
+`(no differences)` signature.
 
 ### 8.4 No false negatives: genuine mutations are still reported
 
-Exclusion is scoped to the agent-worktree namespace only. Genuine mutations
+Exclusion is scoped to the ownership-based namespace only. Genuine mutations
 still fail the guard and name the offending test:
 
 - an added/deleted/moved ref outside the excluded set (e.g. `refs/heads/intruder`);
 - a rewritten local-config key outside the excluded set (e.g. `user.name`,
-  `branch.dev.remote`);
-- a deleted tracked file or an added untracked file.
+  `core.bare`, `branch.dev.remote`);
+- a deleted tracked file or an added untracked file;
+- a move of the guard's **own root** branch.
 
 Regression coverage:
 
-- helper-level `excluded_refs` churn (`TestAgentWorktreeChurn`) and
-  linked-worktree anchoring (`TestMainCheckoutAnchoring`) in
+- helper-level `excluded_refs` ownership (`TestOwnershipBasedExclusion`,
+  `TestOwnershipExclusionBoundaries`) and linked-worktree anchoring
+  (`TestMainCheckoutAnchoring`) in
   `skill/shared/tests/test_git_sandbox.py`;
-- guard-level registration, `--track` registration, removal and
-  linked-worktree sibling churn, plus the config-rewrite fires proof, in
+- guard-level registration, `--track` registration, removal, concurrent-`dev`
+  fast-forward and linked-worktree sibling churn, plus the config-rewrite and
+  own-root-branch fires proofs, in
   `tests/test_live_repo_mutation_guard.py`.
 
 
