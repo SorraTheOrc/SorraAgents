@@ -518,28 +518,14 @@ class TestNoFalsePositives:
 # ---------------------------------------------------------------------------
 # SA-0MV8311B3005DNG8 — ownership-based exclusion (nested-pytest proofs)
 #
-# The ownership fix (AC1/AC2/AC3) replaces the ``.worklog/worktrees/``
-# directory anchor with a rule: a ref checked out in a registered worktree
-# **other than the guard's own root** is concurrent-infrastructure churn;
-# everything under the main checkout's ``.worklog/`` (including
-# ``.worklog/tmp-worktree-*``) is churn; and the guard root's own branch
-# stays monitored. Until the implementation sibling lands
-# (SA-0MV87GC8O006RHS8) the new-behaviour proofs below are pinned as red
-# tracer bullets with ``xfail(strict=True)`` (same convention as the unit
-# sibling SA-0MV87FGCP00865QF): they are RED for the right reason today and
-# the implementation sibling removes the markers. Confirmed-fires proofs that
-# must stay green are unmarked.
+# End-to-end proofs that the ownership fix works through the real inner guard
+# (``live_repo_guard.py``) and the outer guard (``guarded_run_all``): a ref
+# checked out in a registered worktree **other than the guard's own root** is
+# concurrent-infrastructure churn; everything under the main checkout's
+# ``.worklog/`` (including ``.worklog/tmp-worktree-*``) is churn; and the
+# guard root's own branch stays monitored. Confirmed-fires proofs that must
+# stay green are unmarked.
 # ---------------------------------------------------------------------------
-
-_OWNERSHIP_IMPLEMENTATION = "SA-0MV87GC8O006RHS8"
-_ownership_xfail = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ownership-based worktree exclusion not yet implemented "
-        f"({_OWNERSHIP_IMPLEMENTATION})"
-    ),
-)
-
 
 def _main_with_linked_guard_worktree(tmp_path):
     """A main checkout on ``dev`` plus a linked guard worktree.
@@ -570,7 +556,6 @@ class TestOwnershipNoFalsePositivesNested:
     positive) until the ownership fix lands.
     """
 
-    @_ownership_xfail
     def test_concurrent_dev_fast_forward_yields_clean_diff(self, tmp_path):
         """AC1 (direct): snapshots taken around a concurrent finish's
         ``fetch`` + ``merge --ff-only`` of the main checkout's ``dev`` (the
@@ -582,7 +567,8 @@ class TestOwnershipNoFalsePositivesNested:
         gs.add_remote(repo, "origin", str(origin))
         gs.run_git(repo, ["push", "-u", "origin", "dev"], check=True)
         scratch = tmp_path / "scratch"
-        gs.run_git(tmp_path, ["clone", "-q", str(origin), "scratch"], check=True)
+        gs.run_git(tmp_path, ["clone", "-q", "-b", "dev", str(origin), "scratch"],
+                   check=True)
         (scratch / "advance.txt").write_text("advance\n", encoding="utf-8")
         gs.commit_all(scratch, "advance dev")
         gs.run_git(scratch, ["push", "origin", "dev"], check=True)
@@ -596,7 +582,6 @@ class TestOwnershipNoFalsePositivesNested:
         # The fast-forward really happened.
         assert after["refs"]["refs/heads/dev"] != before["refs"]["refs/heads/dev"]
 
-    @_ownership_xfail
     def test_concurrent_dev_fast_forward_does_not_trip_linked_guard(
         self, tmp_path,
     ):
@@ -613,7 +598,8 @@ class TestOwnershipNoFalsePositivesNested:
         # scratch clone commits and pushes; the main checkout then fetches and
         # fast-forwards its local ``dev`` (plus the remote-tracking ref).
         scratch = tmp_path / "scratch"
-        gs.run_git(tmp_path, ["clone", "-q", str(origin), "scratch"], check=True)
+        gs.run_git(tmp_path, ["clone", "-q", "-b", "dev", str(origin), "scratch"],
+                   check=True)
         (scratch / "advance.txt").write_text("advance\n", encoding="utf-8")
         gs.commit_all(scratch, "advance dev")
         gs.run_git(scratch, ["push", "origin", "dev"], check=True)
@@ -642,7 +628,6 @@ class TestOwnershipNoFalsePositivesNested:
         dev_after = gs.run_git(repo, ["rev-parse", "refs/heads/dev"]).stdout.strip()
         assert dev_after != dev_before
 
-    @_ownership_xfail
     def test_concurrent_dev_fast_forward_outer_guard_stays_green(
         self, tmp_path, monkeypatch,
     ):
@@ -654,7 +639,8 @@ class TestOwnershipNoFalsePositivesNested:
         gs.run_git(repo, ["push", "-u", "origin", "dev"], check=True)
 
         scratch = tmp_path / "scratch"
-        gs.run_git(tmp_path, ["clone", "-q", str(origin), "scratch"], check=True)
+        gs.run_git(tmp_path, ["clone", "-q", "-b", "dev", str(origin), "scratch"],
+                   check=True)
         (scratch / "advance.txt").write_text("advance\n", encoding="utf-8")
         gs.commit_all(scratch, "advance dev")
         gs.run_git(scratch, ["push", "origin", "dev"], check=True)
@@ -682,7 +668,6 @@ class TestOwnershipNoFalsePositivesNested:
         assert result["success"] is True, result
         assert "live_repo_mutation" not in result, result
 
-    @_ownership_xfail
     def test_tmp_worktree_churn_does_not_trip_linked_guard(self, tmp_path):
         """AC3: registering + committing in a ``.worklog/tmp-worktree-*``
         worktree mid-run is churn, not a mutation — the worktree stays
@@ -715,7 +700,6 @@ class TestOwnershipNoFalsePositivesNested:
         assert "live-repo mutation" not in combined
         assert "(no differences)" not in combined
 
-    @_ownership_xfail
     def test_tmp_worktree_register_remove_cycle_is_invisible(self, tmp_path):
         """AC3: a ``--track`` register→remove cycle that completes entirely
         inside the guard window (branch and tracking config retained) must
@@ -822,7 +806,6 @@ class TestOwnershipConfirmedFiresNested:
         assert "live-repo mutation" in combined
         assert "README.md" in combined
 
-    @_ownership_xfail
     def test_guard_own_root_branch_move_is_failed(self, tmp_path):
         """AC1: the guard root's own branch stays monitored — moving
         ``refs/heads/wl-guarded`` must fail the run (currently the own root IS

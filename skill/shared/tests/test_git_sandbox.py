@@ -246,13 +246,22 @@ class TestMainCheckoutAnchoring:
         assert gs.main_checkout_root(guarded) == repo.resolve()
         assert gs.main_checkout_root(repo) == repo.resolve()
 
-    def test_snapshot_from_linked_worktree_excludes_agent_branches(self, tmp_path):
+    def test_snapshot_from_linked_worktree_excludes_sibling_branches(self, tmp_path):
+        """A snapshot armed *from a linked worktree* (the guard root) excludes
+        sibling worktree branches but keeps its own root branch monitored.
+
+        Ownership-based exclusion (SA-0MV8311B3005DNG8 AC1) replaced the
+        ``.worklog/worktrees/`` directory anchor: ``wl-a`` is the guard root
+        here, so it stays monitored, while sibling ``wl-b`` is another
+        registered worktree and is excluded — the same SA-0MUILGH5E007X627
+        sibling-churn invisibility, expressed via ownership.
+        """
         _repo, guarded, sibling = self._repo_with_two_worktrees(tmp_path)
         (sibling / "sibling.txt").write_text("sibling", encoding="utf-8")
         gs.commit_all(sibling, "sibling work")
         snapshot = gs.snapshot_repo_state(guarded)
         assert snapshot["root"] == str(guarded.resolve())
-        assert "refs/heads/wl-a" in snapshot["excluded_refs"]
+        assert "refs/heads/wl-a" not in snapshot["excluded_refs"]
         assert "refs/heads/wl-b" in snapshot["excluded_refs"]
 
     def test_linked_worktree_sibling_commit_reports_nothing(self, tmp_path):
@@ -268,26 +277,12 @@ class TestMainCheckoutAnchoring:
 # ---------------------------------------------------------------------------
 # SA-0MV8311B3005DNG8 — ownership-based exclusion (guard root vs other worktrees)
 #
-# The ownership fix replaces the ``.worklog/worktrees/`` directory anchor with
-# a rule: a ref checked out in a registered worktree **other than the guard's
-# own root** is concurrent-infrastructure churn, invisible to
-# ``fingerprint()`` / ``diff_snapshots()``. Until the implementation sibling
-# lands (SA-0MV87GC8O006RHS8) the new-behaviour tests below are pinned as a
-# red tracer bullet with ``xfail(strict=True)``; the implementation sibling
-# removes the marker once the exclusion exists. Boundary tests (the guard's
-# own checkout, and a register→remove cycle) are deliberately **not** marked:
-# they are green before the fix and must stay green after it, and a strict
-# ``xfail`` would fail on their unexpected pass.
+# Ownership-based exclusion: a ref checked out in a registered worktree **other
+# than the guard's own root** is concurrent-infrastructure churn, invisible to
+# ``fingerprint()`` / ``diff_snapshots()``. The guard root's own branch stays
+# monitored, and a register→remove cycle wholly inside the window is invisible
+# via the retained ``branch.<name>.remote=.`` worktree-track config.
 # ---------------------------------------------------------------------------
-
-_OWNERSHIP_IMPLEMENTATION = "SA-0MV87GC8O006RHS8"
-_ownership_xfail = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ownership-based worktree exclusion not yet implemented "
-        f"({_OWNERSHIP_IMPLEMENTATION})"
-    ),
-)
 
 
 def _repo_with_linked_guard_worktree(
@@ -317,7 +312,6 @@ class TestOwnershipBasedExclusion:
     regardless of directory name. Red for the right reason pre-fix.
     """
 
-    @_ownership_xfail
     def test_linked_worktree_root_excludes_other_checkouts_not_its_own(
         self, tmp_path
     ):
@@ -328,7 +322,6 @@ class TestOwnershipBasedExclusion:
         assert "refs/heads/dev" in snapshot["excluded_refs"]
         assert "refs/heads/wl-guard" not in snapshot["excluded_refs"]
 
-    @_ownership_xfail
     def test_sibling_worktree_branch_excluded_outside_agent_dir(self, tmp_path):
         """AC3: exclusion is ownership-based, not bound to a directory name.
 
@@ -344,7 +337,6 @@ class TestOwnershipBasedExclusion:
         after = gs.snapshot_repo_state(guarded)
         assert not gs.diff_snapshots(before, after)["changed"]
 
-    @_ownership_xfail
     def test_tmp_worktree_under_worklog_is_excluded(self, tmp_path):
         """AC4: ``.worklog/tmp-worktree-*`` is churn even though it is not
         under the ``.worklog/worktrees/`` anchor."""
@@ -358,7 +350,6 @@ class TestOwnershipBasedExclusion:
         after = gs.snapshot_repo_state(guarded)
         assert not gs.diff_snapshots(before, after)["changed"]
 
-    @_ownership_xfail
     def test_register_remove_cycle_wholly_inside_window_is_invisible(
         self, tmp_path
     ):
