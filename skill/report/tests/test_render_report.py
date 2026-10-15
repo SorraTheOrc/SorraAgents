@@ -934,6 +934,132 @@ class TestJsonStdinEnvelope(unittest.TestCase):
         self.last_pane.assert_called_once()
 
 
+class TestUseCasesSection(unittest.TestCase):
+    """Verify the ## Use Cases section rendering (AC1-AC5)."""
+
+    def setUp(self):
+        from render_report import render_report, render_report_from_workitem
+        self.render_report = render_report
+        self.render_report_from_workitem = render_report_from_workitem
+
+    def _build_result(self, use_cases=None, **kwargs):
+        """Helper to render with the minimal required args plus use_cases."""
+        return self.render_report(
+            skill_name="test-skill",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="A test headline",
+            acceptance_criteria=[],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="review",
+            use_cases=use_cases,
+            **kwargs,
+        )
+
+    def test_use_cases_rendered_when_provided(self):
+        """AC1: ## Use Cases section appears when use_cases list is non-empty."""
+        result = self._build_result(
+            use_cases=[
+                "As an operator, I want to see use cases at a glance.",
+                "As an agent, I want a documented way to pass use cases.",
+            ],
+        )
+        self.assertIn("## Use Cases", result)
+        self.assertIn("As an operator, I want to see use cases at a glance.", result)
+        self.assertIn("As an agent, I want a documented way to pass use cases.", result)
+
+    def test_use_cases_rendered_as_bullet_list(self):
+        """AC2: Each use case is a bulleted line starting with '- '."""
+        result = self._build_result(
+            use_cases=["First use case", "Second use case"],
+        )
+        lines = result.split("\n")
+        in_use_cases = False
+        bullets = []
+        for line in lines:
+            if "## Use Cases" in line:
+                in_use_cases = True
+                continue
+            if in_use_cases:
+                if line.startswith("- "):
+                    bullets.append(line)
+                elif line.startswith("##"):
+                    break
+                # Skip empty lines within the Use Cases block
+        self.assertEqual(len(bullets), 2)
+        self.assertIn("First use case", bullets[0])
+        self.assertIn("Second use case", bullets[1])
+
+    def test_use_cases_omitted_when_none(self):
+        """AC1/AC5: No ## Use Cases heading when use_cases is None."""
+        result = self._build_result(use_cases=None)
+        self.assertNotIn("## Use Cases", result)
+
+    def test_use_cases_omitted_when_empty_list(self):
+        """AC1: No ## Use Cases heading when use_cases is []."""
+        result = self._build_result(use_cases=[])
+        self.assertNotIn("## Use Cases", result)
+
+    def test_use_cases_position(self):
+        """AC1: Use Cases section appears between title line and headline."""
+        result = self._build_result(
+            use_cases=["A use case"],
+        )
+        title_pos = result.find("**Test title**")
+        use_cases_pos = result.find("## Use Cases")
+        headline_pos = result.find("A test headline")
+        self.assertGreater(use_cases_pos, title_pos)
+        self.assertLess(use_cases_pos, headline_pos)
+
+    def test_use_cases_backward_compatible_no_param(self):
+        """AC5: Omitting use_cases entirely produces no Use Cases section."""
+        # Call without use_cases keyword — should not have the section
+        result = self.render_report(
+            skill_name="test-skill",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="A test headline",
+            acceptance_criteria=[],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            next_action="review",
+        )
+        self.assertNotIn("## Use Cases", result)
+
+
+class TestUseCasesIntegration(unittest.TestCase):
+    """Verify use_cases flows through render_report_from_workitem."""
+
+    def setUp(self):
+        from render_report import render_report_from_workitem
+        self.render_report_from_workitem = render_report_from_workitem
+
+    def test_from_workitem_with_use_cases(self):
+        """AC5: render_report_from_workitem passes use_cases through."""
+        result = self.render_report_from_workitem(
+            work_item={"id": "SA-0TEST", "title": "Test"},
+            skill_name="test-skill",
+            headline="Headline",
+            acceptance_criteria=[],
+            use_cases=["A use case"],
+        )
+        self.assertIn("## Use Cases", result)
+        self.assertIn("A use case", result)
+
+    def test_from_workitem_without_use_cases(self):
+        """AC5: render_report_from_workitem omits section when no use_cases."""
+        result = self.render_report_from_workitem(
+            work_item={"id": "SA-0TEST", "title": "Test"},
+            skill_name="test-skill",
+            headline="Headline",
+            acceptance_criteria=[],
+        )
+        self.assertNotIn("## Use Cases", result)
+
+
 class TestPaneStatusIntegration(unittest.TestCase):
     """The CLI must derive a status and update the herdr pane title (AC1/AC3)."""
 
@@ -947,7 +1073,8 @@ class TestPaneStatusIntegration(unittest.TestCase):
         pane_patcher = mock.patch.object(
             rr, "update_pane_title", return_value={"updated": True})
         with mock.patch.object(rr.sys, "argv", argv), \
-                mock.patch.object(rr, "render_from_wl", return_value="# report"), \
+                mock.patch.object(rr, "render_from_wl",
+                                  return_value="# report"), \
                 pane_patcher as pane:
             buffer = io.StringIO()
             with redirect_stdout(buffer):

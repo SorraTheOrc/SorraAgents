@@ -80,6 +80,62 @@ The analyser implements the corrected methodology re-homed from ContextHub
    rewrite, so a monthly rate can never exceed 100%.
 4. Whole-file test deletions are accounted for across the whole history.
 5. Domain churn counts each file exactly once.
+6. A consolidated **test-growth metric** — tests added / deleted / modified
+   and **net growth** — is reported per project and per test area, and is
+   trended **per calendar quarter** from commit dates (empty quarters report
+   zero, they are never omitted).
+
+## Test growth metric
+
+Section 3 of the report (and the `growth_metrics` block of the JSON) gives an
+honest, at-a-glance growth figure: how many test files and lines were **added**,
+**deleted** and **modified** across the whole analysed history, and the **net
+growth** (`added − deleted`). File counts count *change events*; line counts
+accumulate the real name-status + numstat figures. The accounting spans **all**
+commits (not just feature commits), so a whole-file deletion or a new test file
+in a test-only commit is never invisible. Section 4 trends the same figures per
+calendar quarter (`YYYY-QN`, derived from commit dates), making growth
+regressions over time visible.
+
+Pruning a suite always starts with this section: a positive net growth quarter
+over quarter, or areas where additions far outstrip deletions, are the signal
+that the suite may be growing without bound. See the pruning workflow below.
+
+## Pruning review workflow
+
+When, on this metric, a suite is growing without manifest benefit, prune tests
+that **no longer map to observable behaviour** using the following repeatable
+workflow. The criteria come from
+[`../shared/test-writing-guidelines.md`](../shared/test-writing-guidelines.md):
+
+1. **Locate the signal.** Run the analyser and read the growth section: net
+   growth by area and the quarterly trend. Note the areas and files flagged by
+   the report (top volatile files, high-rewrite files).
+2. **Inspect candidates.** For each candidate test file, apply the anti-pattern
+   checklist from the test-writing guidelines:
+   - source-code-grep tests (assert file text, not behaviour);
+   - placeholder tests (`expect(true).toBe(true)`, zero assertions);
+   - self-referential simulations (the test re-implements the production
+     logic it claims to test);
+   - duplicates of existing core coverage (same behaviour covered via a
+     different import path);
+   - type-level / structural-only tests (asserting what the compiler already
+     checks);
+   - zero-assertion browser/scene tests.
+3. **Verify against observable behaviour.** For each candidate, confirm the
+   test no longer exercises a public behaviour that is exercised elsewhere:
+   `git blame` the file to see when it last asserted something, and grep the
+   suite for equivalent coverage of the same behaviour through the public
+   API. If the behaviour it pinned is still covered by a live test, the
+   candidate is prunable.
+4. **Prune.** Remove the dead test (or file), run the full suite and confirm
+   nothing breaks. Record the removal in a Worklog item — the pruning pass is
+   a tracked change, not an ad-hoc edit.
+
+**Pruning criteria are conservative:** when in doubt, keep the test and file a
+work item instead. Removing a useful test is a regression; keeping a dead one
+only costs runtime. Pruning is deliberately higher-risk than measuring, so it
+is tracked as a follow-on work item rather than bundled into a metrics change.
 
 ## Definitions
 
@@ -87,6 +143,9 @@ The analyser implements the corrected methodology re-homed from ContextHub
   deletions (existing test lines replaced).
 - **New test file** — a test file added (git status `A`).
 - **Deleted test file** — a test file removed wholesale (git status `D`).
+- **Net growth** — files/lines of tests added minus files/lines deleted over
+  the whole analysed history; file counts count change events.
+- **Calendar quarter** — a `YYYY-QN` grouping derived from a commit's date.
 - **Feature commit** — a commit that changes at least one source file.
 
 ## Limitations
@@ -98,6 +157,9 @@ The analyser implements the corrected methodology re-homed from ContextHub
   pass `--config` to match unusual layouts.
 - A rewrite can reflect a legitimate interface change, not only poor test
   design.
+- Growth file counts count change events (a delete-and-re-add of the same path
+  is one deletion and one addition), and are bounded by rename-detection
+  heuristics.
 
 ## Configuration
 
@@ -112,9 +174,7 @@ for the metric definitions, migration provenance and worked examples.
 
 ## Tests
 
-Unit and end-to-end tests live under `tests/` in this skill directory. Run
-them from the repository root with:
-
-```bash
-python3 -m pytest "$(skill_path test-churn)/tests/"
-```
+Unit and end-to-end tests live under `tests/` in this skill directory.
+Agent test execution must go through the test skill (`/skill:test`) —
+the Test execution policy in AGENTS_GLOBAL.md prohibits direct
+`pytest` invocations.

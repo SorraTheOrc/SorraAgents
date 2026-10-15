@@ -17,16 +17,17 @@ Discover related work for a work item via Worklog search, file inspection, and o
 ## Decision logic
 
 1. Fetch item: `wl show <id> --json`
-2. Derive keywords from title/description; stop words excluded, 3+ chars, numeric-only tokens dropped; **the skill's own automated-report section is stripped first** so report tokens never feed back; ordered by descending frequency so the top-k terms are the descriptive core (v3)
-3. Probe `wl search --semantic` — use hybrid ranking if available
-4. **Cap** worklog search to the top `MAX_SEARCH_KEYWORDS` frequency-ranked keywords, one `wl search` subprocess each (v3; was one subprocess per extracted keyword — 523 spawns on the polluted review item); multi-term batched queries were measured to collapse conjunctively, so capping (not batching) preserves recall
-5. **Rank** work items by descending `score` field (BM25 or hybrid), cap at `MAX_WORK_ITEM_RESULTS`
-6. Search repo files (`.md`, `.py`, `.js`, `.mjs`, `.txt`, excluding `.git`, `.worklog`, `node_modules`, etc. — the main checkout is authoritative; stale worktrees/sidecar output are never scanned)
-7. **Rank** repo files by distinct keyword match count, cap at `MAX_REPO_FILE_RESULTS`
-8. Filter out the current work item from results
-9. Generate report under "## Related work (automated report)"
-10. Update item description (replace existing automated report section **including its `###` sub-headings**, preserving manual content)
-11. Return JSON summary
+2. Derive keywords from title/description; stop words excluded, 3+ chars, numeric-only tokens dropped; **the skill's own automated-report section is stripped first** so report tokens never feed back; ordered by **descending weight** where a title occurrence weighs `TITLE_WEIGHT` (3) body occurrences (v4) so the top-k terms are the item's compressed subject
+3. Suppress **project-generic scaffold terms** — `PROJECT_STOP_WORDS` ("work", "item", "report", "review", "skill", "related", "find", …) — so a capped search sweep never spends a query slot on a term that matches most of the corpus (v4; zero extra subprocess cost)
+4. Probe `wl search --semantic` — use hybrid ranking if available
+5. **Cap** worklog search to the top `MAX_SEARCH_KEYWORDS` weighted keywords, one `wl search` subprocess each (v3; was one subprocess per extracted keyword — 523 spawns on the polluted review item); multi-term batched queries were measured to collapse conjunctively, so capping (not batching) preserves recall
+6. **Rank** work items by descending **distinct-keyword match count**, then ascending best `score` (more negative = better — matching wl's own best-first `score` ordering), then id (v4; fixes the v2 inverted descending-score sort that surfaced the *worst* matches first)
+7. Search repo files (`.md`, `.py`, `.js`, `.mjs`, `.txt`, excluding `.git`, `.worklog`, `node_modules`, etc. — the main checkout is authoritative; stale worktrees/sidecar output are never scanned)
+8. **Rank** repo files by distinct keyword match count, cap at `MAX_REPO_FILE_RESULTS`
+9. Filter out the current work item from results (during aggregation, so it never occupies a capped slot)
+10. Generate report under "## Related work (automated report)"
+11. Update item description (replace existing automated report section **including its `###` sub-headings**, preserving manual content)
+12. Return JSON summary
 
 **Policy**: Conservative — prefer false negatives over false positives. Only include truly related items.
 
@@ -34,7 +35,8 @@ Discover related work for a work item via Worklog search, file inspection, and o
 
 | Section | Heuristic | Detail |
 |---------|-----------|--------|
-| Work items | `score` field from `wl search --json` | BM25 score (keyword) or hybrid BM25+semantic. Higher (less negative) = more relevant. Unscored items sort last. |
+| Keyword selection | `TITLE_WEIGHT * title_occurrences + body_occurrences` (descending) | Title tokens are the item's compressed subject and outweigh body occurrences — a zero-extra-subprocess IDF proxy (v4). `PROJECT_STOP_WORDS` generic scaffold terms are excluded. Ties broken alphabetically (deterministic). |
+| Work items | Distinct keyword match count (descending), then ascending best `score` | Items matched by several of the *searched* keywords rank first (v4) — multi-keyword matches are the strongest free relevance signal. Ties within a match count break on the most-negative `score` (`wl search --json` returns best-first with an ascending score field: more negative = better), then on id. Unscored items sort last. |
 | Repo files | Distinct keyword match count (descending) | Files matching more distinct keywords rank higher. Ties broken alphabetically. |
 
 ### Configurable limits
@@ -45,6 +47,8 @@ Discover related work for a work item via Worklog search, file inspection, and o
 | `MAX_REPO_FILE_RESULTS` | 3 | Maximum repo file matches shown. Same soft-limit semantics. |
 | `MAX_KEYWORDS_PER_FILE` | 5 | Maximum matched keywords listed per repo file match. Raw keyword word-lists are the dominant source of report bloat (measured ~58% of the related-work section), so lists are capped with a `(+N more)` marker to keep descriptions/prompts compact. |
 | `MAX_SEARCH_KEYWORDS` | 8 | Maximum keywords fed to Worklog search. Bounds the subprocess fan-out (v2 spawned one `wl search` per keyword, growing 14 → 82 → 523 across runs) while preserving per-keyword recall — measured 26 distinct items from 6 spawns vs 1 result from a 25-term batched semantic query. |
+| `TITLE_WEIGHT` | 3 | Weight of one title occurrence relative to one body occurrence (v4). A zero-extra-cost IDF proxy; setting it to `1` reverts to v3 frequency-only ordering. |
+| `PROJECT_STOP_WORDS` | see source | Project-scaffold terms ("work", "item", "report", "review", "skill", "related", "find", …) suppressed in addition to the general English `STOP_WORDS` (v4); documented per-term in `find_related.py`. |
 
 ### Prompt-size management (P11)
 
@@ -139,7 +143,8 @@ Typical runs finish in **~3–6s** (v3): worklog search is bounded to
 `MAX_SEARCH_KEYWORDS` (8) per-keyword subprocesses (~0.4–0.5s each) instead of one
 per extracted keyword (96% of v2 runtime was subprocess waits; the polluted
 review item hit 523 spawns / unbounded wall-clock). Keyword extraction never
-reads the skill's own report and is frequency-ranked, so re-runs do not grow
+reads the skill's own report and is weight-ranked (title boost + generic-term
+suppression, v4) with zero extra subprocesses, so re-runs do not grow
 slower over time (pre-fix feedback loop: 14 → 82 → 523 keywords). Repo
 scanning excludes `.worklog` (~83% of scanned files) so stale worktrees and
 the sidecar full report are neither read nor matched. See
@@ -162,6 +167,30 @@ replaced with the section instead of being orphaned or stacked. Manual
 ### Design
 
 Fully offline (local `wl` + filesystem). Conservative keyword matching. Scans `.md`, `.py`, `.js`, `.mjs`, `.txt` files only.
+
+### Changes in v4 (keyword relevance — SA-0MUG46NJE003JOCD)
+
+- **Title weighting:** a title occurrence weighs `TITLE_WEIGHT` (3) body
+  occurrences, so a distinctive term in the title leads the keyword list.
+  Zero extra subprocess cost; ordering stays deterministic (weight desc,
+  ties alphabetical).
+- **Project-generic suppression:** `PROJECT_STOP_WORDS` drops scaffold terms
+  ("work", "item", "report", "review", "skill", "related", "find", …)
+  that recur in every item and carry no search signal, so the capped
+  `MAX_SEARCH_KEYWORDS` sweep spends its slots on distinctive domain terms.
+- **Result ranking fixed & re-ranked:** items are now ranked by descending
+  distinct-keyword match count, then ascending best `score` (more negative =
+  better — wl returns best-first). The old code ranked by *descending*
+  score, which inverted wl's ordering and surfaced the worst-matched items
+  (score `0.0`) at the top (demonstrated re-ranking need, per the intake
+  assumption). Multi-keyword matches now win.
+- **Self-item excluded during aggregation** so it never consumes a capped
+  result slot.
+- **Runtime bound unchanged:** still ≤ `MAX_SEARCH_KEYWORDS` (8) `wl search`
+  subprocesses; no extra worklog probe.
+- **No minimum-relevance threshold:** the soft top-3 cap
+  (`MAX_WORK_ITEM_RESULTS`) is retained (Appendix Q2 of the intake brief);
+  keywords with no results are simply absent.
 
 ### Changes in v3 (speed & value — SA-0MNCDAQ8W008KOG9)
 

@@ -81,7 +81,7 @@ changes. This prevents duplicate `REFACTOR` work items and stale analysis.
 Refactoring changes must be verified against the full project test suite
 before completion. Run the suite via the
 [test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate →
-loop until green), following the quiet pytest contract, so refactor fixes do
+loop until green), following the test skill's output contract, so refactor fixes do
 not silently break behavior.
 
 ## Status Management

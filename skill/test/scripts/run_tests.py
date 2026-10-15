@@ -47,7 +47,12 @@ the ``LIVE_REPO_GUARD_ACTIVE`` recursion marker. The CLI (:func:`main`) and
 ``implement.py``'s finish-gate test step both delegate to it, so no entry
 point is left unguarded and no second guard implementation can diverge. When
 the marker is already set by an outer guard, :func:`guarded_run_all` stands
-down (the outermost guard stays the single owner). See also the repo-root
+down (the outermost guard stays the single owner). The mutation surface is
+refs + local config + working tree, with an **ownership-based exclusion**: a
+ref checked out in a registered worktree other than the guard's own root (plus
+its ``branch.<name>.*`` config, retained worktree-track config, and
+remote-tracking refs) is concurrent-infrastructure churn; the guard root's
+own branch stays monitored (SA-0MV8311B3005DNG8). See also the repo-root
 ``conftest.py`` / ``skill/shared/live_repo_guard.py`` inner guard, which this
 outer guard stands down (SA-0MUG30J5F001L57H, SA-0MUH1MJL6003767Q).
 

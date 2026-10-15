@@ -109,6 +109,10 @@ class TestKeywordRankingAndNoise:
 
         The v3 batched semantic query feeds only the top MAX_SEARCH_KEYWORDS
         terms, so the ordering must surface the item's true subject first.
+        Under v4 (title boost + body frequency) this item's title words
+        ('search'/'optimize'/'speed' once each, TITLE_WEIGHT 3) still lead
+        the repeated body terms, and the deterministic alphabetical tie
+        ('optimize' vs 'speed' at equal weight) is unchanged.
         """
         title = "Optimize search speed"
         desc = (
@@ -217,7 +221,9 @@ class TestSearchAndDedupTopK:
             results = mod.search_and_dedup(["alpha", "beta", "gamma"],
                                            use_semantic=False)
         ids = [r["id"] for r in results]
-        assert ids == ["REL-001", "REL-002"], "Dedup + descending score order"
+        # REL-001 matched by two keywords (alpha+beta) and ranks first on the
+        # v4 distinct-keyword match-count primary; REL-002 matched by one.
+        assert ids == ["REL-001", "REL-002"], "Dedup + match-count rank"
 
 
 # ---------------------------------------------------------------------------

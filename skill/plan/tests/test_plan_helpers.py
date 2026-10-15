@@ -32,6 +32,7 @@ import pytest
 
 from skill.plan.plan_helpers import (
     make_autoplan_decision,
+    normalise_effort_label,
     plan_approval_gate,
     plan_if_needed,
     should_request_plan_approval,
@@ -40,6 +41,50 @@ from skill.plan.plan_helpers import (
 # Full t-shirt effort scale and wl risk scale used by the matrix tests.
 EFFORT_LEVELS = ["Extra Small", "Small", "Medium", "Large", "Extra Large"]
 RISK_LEVELS = ["Low", "Medium", "High", "Severe"]
+
+# =========================================================================
+# 0. normalise_effort_label — spelling parity (abbreviations vs full labels)
+#
+# Root cause c04ecb5b: the effort-and-risk skill writes FULL labels
+# ("Extra Small" …) via `wl update --effort`, while wl's canonical
+# vocabulary is ABBREVIATED (XS/S/M/L/XL per WorkItemEffortLevel and the
+# `wl update --effort` help text). plan_helpers compared only full labels,
+# so DEFAULT_AUTOPLAN_EFFORT_SKIP never matched a stored "S"/"XS" and
+# PLAN_APPROVAL_EFFORT never matched a stored "XL". The fix normalises
+# both spellings to one canonical form at every threshold site.
+# =========================================================================
+
+
+class TestNormaliseEffortLabel:
+    """Both spellings of every effort level map to one canonical full label."""
+
+    @pytest.mark.parametrize(
+        ("raw", "canonical"),
+        [
+            ("XS", "Extra Small"),
+            ("S", "Small"),
+            ("M", "Medium"),
+            ("L", "Large"),
+            ("XL", "Extra Large"),
+            ("Extra Small", "Extra Small"),
+            ("Small", "Small"),
+            ("Medium", "Medium"),
+            ("Large", "Large"),
+            ("Extra Large", "Extra Large"),
+        ],
+    )
+    def test_both_spellings_map_to_canonical_full_label(self, raw, canonical):
+        assert normalise_effort_label(raw) == canonical
+
+    @pytest.mark.parametrize("raw", ["", None, "  ", "unknown-label", "Small "])
+    def test_blank_and_unknown_values_degrade_gracefully(self, raw):
+        """Blank values become empty string; unknown spellings pass through (stripped)."""
+        result = normalise_effort_label(raw)
+        if raw is None or raw.strip() == "":
+            assert result == ""
+        else:
+            assert result == raw.strip()
+
 
 # =========================================================================
 # 1. should_request_plan_approval — pure decision logic
@@ -172,6 +217,21 @@ class TestPlanApprovalGate:
         runner = _FakeWlShow({"id": "X", "effort": "Extra Small", "risk": "Low"})
         result = plan_approval_gate("X", runner=runner)
         assert result["target_id"] == "X"
+        assert result["request_approval"] is False
+        assert result["reason"] == ""
+
+    def test_approval_when_xl_abbreviation_and_high_risk(self):
+        """Stored wl abbreviation XL + High risk yields request_approval=True."""
+        runner = _FakeWlShow({"id": "X", "effort": "XL", "risk": "High"})
+        result = plan_approval_gate("X", runner=runner)
+        assert result["request_approval"] is True
+        assert "Extra Large" in result["reason"]
+        assert "High" in result["reason"]
+
+    def test_skip_when_s_abbreviation_and_low_risk(self):
+        """Stored wl abbreviation S + Low risk yields request_approval=False."""
+        runner = _FakeWlShow({"id": "X", "effort": "S", "risk": "Low"})
+        result = plan_approval_gate("X", runner=runner)
         assert result["request_approval"] is False
         assert result["reason"] == ""
 
@@ -469,3 +529,177 @@ class TestPlanApprovalReclaimInvariant:
             result = plan_approval_gate("X", runner=runner)
             assert result["request_approval"] is expected, (effort, risk)
 
+
+
+# =========================================================================
+# 5. Effort spelling parity at the threshold evaluation sites
+#
+# The autoplan skip and approval gates must accept BOTH the abbreviated wl
+# vocabulary (XS/S/M/L/XL) and the full labels written by the effort-and-risk
+# skill (SA-0MV85VT250096CTY). Without normalisation the skip set never
+# matched stored "S"/"XS" (small items always planned) and the approval set
+# never matched stored "XL" (the producer safety gate never fired).
+# =========================================================================
+
+
+class TestShouldRequestPlanApprovalEffortSpellingParity:
+    """Abbreviated wl spellings trigger the same approval gate as full labels."""
+
+    @pytest.mark.parametrize(
+        "effort", ["XL", "Extra Large"],
+        ids=["abbrev-xl", "full-xl"],
+    )
+    @pytest.mark.parametrize("risk", ["High", "Severe"])
+    def test_xl_high_or_severe_requests_approval_under_both_spellings(self, effort, risk):
+        request, reason = should_request_plan_approval({"effort": effort, "risk": risk})
+        assert request is True
+        assert "Extra Large" in reason
+        assert risk in reason
+
+    @pytest.mark.parametrize(
+        "effort", ["XL", "Extra Large"],
+        ids=["abbrev-xl", "full-xl"],
+    )
+    @pytest.mark.parametrize("risk", ["Low", "Medium"])
+    def test_xl_alone_never_requests_approval(self, effort, risk):
+        request, reason = should_request_plan_approval({"effort": effort, "risk": risk})
+        assert request is False
+        assert reason == ""
+
+    @pytest.mark.parametrize(
+        "effort",
+        ["XS", "S", "M", "L", "Extra Small", "Small", "Medium", "Large"],
+        ids=["abbrev-xs", "abbrev-s", "abbrev-m", "abbrev-l", "full-xs", "full-s", "full-m", "full-l"],
+    )
+    @pytest.mark.parametrize("risk", ["High", "Severe"])
+    def test_sub_xl_effort_never_requests_approval(self, effort, risk):
+        request, reason = should_request_plan_approval({"effort": effort, "risk": risk})
+        assert request is False, f"effort={effort!r} risk={risk!r}"
+        assert reason == ""
+
+
+class TestMakeAutoplanDecisionEffortSpellingParity:
+    """The autoplan skip threshold accepts abbreviated stored effort values.
+
+    The idempotence path (stored effort/risk read back from the item) is the
+    path that runs in practice for previously-computed items
+    (make_autoplan_decision reads the stored field when
+    is_effort_risk_computed), so abbreviations there are the critical
+    regression (SA-0MV85VT250096CTY).
+    """
+
+    @pytest.mark.parametrize(
+        ("effort", "canonical"),
+        [
+            ("S", "Small"),
+            ("XS", "Extra Small"),
+            ("Small", "Small"),
+            ("Extra Small", "Extra Small"),
+        ],
+        ids=["abbrev-s", "abbrev-xs", "full-s", "full-xs"],
+    )
+    def test_skip_for_small_or_xs_low_under_both_spellings(self, effort, canonical):
+        do_plan, stage, effort_risk = make_autoplan_decision(
+            target_id="SA-TEST",
+            config={},
+            precomputed_item={"effort": effort, "risk": "Low"},
+            precomputed_comments=[],
+        )
+        assert do_plan is False, f"effort={effort!r} risk=Low"
+        assert stage == "intake_complete"
+        assert effort_risk == {"effort": canonical, "risk": "Low"}
+
+    @pytest.mark.parametrize(
+        "effort",
+        ["M", "L", "XL", "Medium", "Large", "Extra Large"],
+        ids=["abbrev-m", "abbrev-l", "abbrev-xl", "full-m", "full-l", "full-xl"],
+    )
+    def test_plan_for_medium_or_larger_under_both_spellings(self, effort):
+        do_plan, stage, _ = make_autoplan_decision(
+            target_id="SA-TEST",
+            config={},
+            precomputed_item={"effort": effort, "risk": "Low"},
+            precomputed_comments=[],
+        )
+        assert do_plan is True, f"effort={effort!r} risk=Low"
+        assert stage == "plan_complete"
+
+    def test_plan_if_needed_skips_for_stored_s_low(self):
+        """End-to-end evidence case: stored effort 'S' + risk 'Low' -> skip."""
+        runner = _FakeWlShow({"id": "SA-TEST", "effort": "S", "risk": "Low"})
+        with patch("skill.plan.plan_helpers._wl_comment_list", return_value=[]):
+            result = plan_if_needed("SA-TEST", runner=runner)
+        assert result["decision"] == "skip"
+        assert result["effort"] == "Small"
+        assert result["risk"] == "Low"
+
+    def test_plan_if_needed_skips_for_stored_xs_low(self):
+        """End-to-end evidence case: stored effort 'XS' + risk 'Low' -> skip."""
+        runner = _FakeWlShow({"id": "SA-TEST", "effort": "XS", "risk": "Low"})
+        with patch("skill.plan.plan_helpers._wl_comment_list", return_value=[]):
+            result = plan_if_needed("SA-TEST", runner=runner)
+        assert result["decision"] == "skip"
+        assert result["effort"] == "Extra Small"
+        assert result["risk"] == "Low"
+
+    def test_plan_approval_gate_xl_high_under_abbreviated_stored_value(self):
+        """End-to-end: stored effort 'XL' + risk 'High' -> request_approval."""
+        runner = _FakeWlShow({"id": "SA-TEST", "effort": "XL", "risk": "High"})
+        result = plan_approval_gate("SA-TEST", runner=runner)
+        assert result["request_approval"] is True
+        assert "Extra Large" in result["reason"]
+        assert "High" in result["reason"]
+
+    def test_plan_approval_gate_xl_severe_under_abbreviated_stored_value(self):
+        """End-to-end: stored effort 'XL' + risk 'Severe' -> request_approval."""
+        runner = _FakeWlShow({"id": "SA-TEST", "effort": "XL", "risk": "Severe"})
+        result = plan_approval_gate("SA-TEST", runner=runner)
+        assert result["request_approval"] is True
+        assert "Severe" in result["reason"]
+
+
+class TestMakeAutoplanDecisionFreshPathEffortSpellingParity:
+    """The freshly-computed effort-and-risk path normalises labels too."""
+
+    @staticmethod
+    def _fresh_decision(tshirt: str, risk: str) -> tuple[bool, str, dict]:
+        runner = _FakeWlShow({"id": "SA-TEST", "effort": "", "risk": ""})
+        er_result = {
+            "effort": {"tshirt": tshirt},
+            "risk": {"level": risk, "score": 0},
+        }
+        with (
+            patch("skill.plan.plan_helpers.run_effort_and_risk", return_value=er_result),
+            patch("skill.plan.plan_helpers.append_autoplan_decision_comment") as mock_append,
+            patch("skill.plan.plan_helpers._wl_comment_list", return_value=[]),
+        ):
+            do_plan, stage, effort_risk = make_autoplan_decision(
+                "SA-TEST", config={}, runner=runner
+            )
+            mock_append.assert_called_once()
+        return do_plan, stage, effort_risk
+
+    def test_fresh_small_low_skips(self):
+        """Freshly computed tshirt 'S' + Low -> skip plan."""
+        do_plan, stage, effort_risk = self._fresh_decision("S", "Low")
+        assert do_plan is False
+        assert stage == "intake_complete"
+        assert effort_risk == {"effort": "Small", "risk": "Low"}
+
+    def test_fresh_xs_low_skips(self):
+        """Freshly computed tshirt 'XS' + Low -> skip plan."""
+        do_plan, stage, _ = self._fresh_decision("XS", "Low")
+        assert do_plan is False
+        assert stage == "intake_complete"
+
+    def test_fresh_xl_high_plans(self):
+        """Freshly computed tshirt 'XL' + High -> run /plan."""
+        do_plan, stage, _ = self._fresh_decision("XL", "High")
+        assert do_plan is True
+        assert stage == "plan_complete"
+
+    def test_fresh_medium_low_plans(self):
+        """Freshly computed tshirt 'M' + Low -> run /plan (above skip effort)."""
+        do_plan, stage, _ = self._fresh_decision("M", "Low")
+        assert do_plan is True
+        assert stage == "plan_complete"

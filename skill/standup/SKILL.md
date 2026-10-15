@@ -20,19 +20,20 @@ by construction — no second ranking.
 ## Invocation
 
 ```bash
-python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [--verbose] [--output-path <path>] [--startTime <ISO>] [--duration <hours>] [--worklog-dir <path>] [--no-sync]
+python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [--verbose] [--output-path <path>] [--startTime <ISO>] [--duration <hours>] [--worklog-dir <path>] [--no-sync] [--no-commit]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--json` | off | Raw JSON output instead of markdown |
+| `--json` | off | Raw JSON output instead of markdown. Streamed to **stdout** unless `--output-path` is given (then written to that file) |
 | `--count / -n N` | 20 (herdr config) | Herdr browse window |
 | `--verbose` | off | Extra detail (priority, status, stage) |
-| `--output-path <path>` | `./standups/YYYY_MM_DD.md` | Write report to file; defaults to today's dated file in `./standups/` relative to the project root (the worklog parent when `--worklog-dir` / `WL_WORKLOG_DIR` is set, otherwise `cwd`), created if missing. `--output-path` overrides the default; default uses `YYYY_MM_DD` from the report generation date (local datetime, zero-padded).
+| `--output-path <path>` | `./standups/YYYY_MM_DD.md` (markdown only) | Write the rendered report to file; defaults to today's dated file in `./standups/` relative to the project root (the worklog parent when `--worklog-dir` / `WL_WORKLOG_DIR` is set, otherwise `cwd`), created if missing. `--output-path` overrides the default; default uses `YYYY_MM_DD` from the report generation date (local datetime, zero-padded). With `--json`, `--output-path` writes the raw JSON to the given path instead of stdout |
 | `--startTime <ISO>` | prev day 06:00 | Window start (e.g. `2026-09-03T06:00:00`) |
 | `--duration <hours>` | 24 | Window length in hours |
 | `--worklog-dir <path>` | cwd | Explicit `.worklog` dir (e.g. `/path/to/project/.worklog`); also honored via `WL_WORKLOG_DIR` env var. Bypasses cwd-based resolution so the report works from any directory |
 | `--no-sync` | off | Skip the initial `wl sync` (offline/deterministic runs and tests) |
+| `--no-commit` | off | Skip the git commit + push of the report file just written (offline/deterministic runs and tests). By default the file is committed and the current branch pushed, non-fatally |
 
 Default time window: **24 hours starting at 06:00 the previous day** (yesterday 06:00 → today 06:00). Override with `--startTime` and/or `--duration`.
 
@@ -50,12 +51,36 @@ completions reflect the shared remote state.
 - **Disable** with `--no-sync` for offline or deterministic runs (tests use
   this to stay hermetic).
 
+### Commit-and-push
+
+When the report is written to a file (the default dated path under `standups/`
+or an explicit `--output-path`), the script commits **only that file** and
+pushes the current branch so standup history is versioned automatically.
+
+- **Surgical**: `git add -- <file>` → `git commit -m "…" -- <file>` →
+  `git push`, anchored to the resolved project root (the worklog parent when
+  `--worklog-dir` / `WL_WORKLOG_DIR` is set, otherwise cwd). An unrelated
+  staged change is never swept into the commit.
+- **`main` push guard**: on `main`/`master` the report is committed locally but
+  **not** pushed (warning); the repo policy is "push only to `dev`".
+- **Non-fatal**: a non-git directory, unborn/empty repo, unset author identity,
+  missing upstream, or an offline/rejected push is logged as a warning; the
+  report is still written and the exit code is unchanged.
+- **Idempotent**: re-running with an unchanged report is a no-op ("nothing to
+  commit").
+- **`--json` to stdout writes no file**, so it performs no commit/push.
+- **Disable** with `--no-commit` for offline/deterministic runs.
+
+> The machine-local `standups/` entry in `.git/info/exclude` was a stopgap and
+> has been removed (SA-0MUDYRHVZ005PQP4) — an ignored path would make `git add`
+> silently skip the file and the commit a silent no-op.
+
 ## Report Structure
 
 Output only the report defined below — no preamble or postamble. Report is rendered in the first person for TTS. Dates are spoken-form (e.g. "5th September 2026", "4th September 2026 6:00 am"), never ISO timestamps.
 
 ```markdown
-## Standup Report (5th September 2026)
+## <project_name> Standup Report (5th September 2026)
 
 ### Yesterday I completed work on...
 
@@ -90,11 +115,12 @@ or
   - Blocked on work item description, because description of problem
 ```
 
-Herdr selection rendering (smart-selection + grouping):
-`selectWorkItems` keeps all `critical` ∪ `completed/in_review` mandatory and limits
-only "other" items to `browseItemCount`; `regroupWorkItems` then assigns
-`Critical Group N / Group N / Idea / Other / In Review` deterministically from
-`Key Files` paths.
+The project name in the header is resolved by the shared
+`skill.shared.project_name.resolve_project_name()` helper: it reads
+`projectName` from `<worklog_dir>/config.yaml` (honouring
+`--worklog-dir` / `WL_WORKLOG_DIR`), falls back to the `.worklog` parent
+directory name, then the current working directory name. The JSON output of
+generate_report() also carries a `project_name` field for downstream consumers.
 
 Today's focus list includes **all** open critical items (regardless of count) plus additional non-critical items to reach **5 total** where possible. If 5 or more critical items are open, no additional items are shown.
 
@@ -128,7 +154,7 @@ Script internals mirror `fetcher.ts` exactly: `wl next -n N --include-in-progres
 ## Example
 
 ```markdown
-## Standup Report (5th September 2026)
+## Sorra Agents Standup Report (5th September 2026)
 
 ### Yesterday I completed work on...
 

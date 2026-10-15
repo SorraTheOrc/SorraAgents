@@ -202,7 +202,7 @@ The item's integration evidence is derived from the item itself:
 
 1. **Owning repo** — the worklog prefix-to-sibling scan already resolves the owning project root (`_resolve_owning_project_root`); git commands run PLAIN and the cwd-aware runner pins them to the owning repo when the launch cwd differs (SA-0MSLLGDW00098UCC).
 2. **Feature branch** — `git for-each-ref refs/heads/wl-<id>-*`; only refs matching `wl-<id>-` with a 40-hex object name are accepted (mocked/garbage output is never treated as evidence).
-3. **Commits** — 7–40 hex shas referenced in the item's description and comments.
+3. **Commits** — 7–40 hex shas referenced in the item's description and comments. Decimal-literal adjacency is excluded (`<digits>.<digits>`), so numeric values whose digits happen to be hex-compatible (e.g. `0.23290948243196963` in a test-failure message) are never mined as phantom candidates that would fail to integrate and spuriously block the gate (SA-0MTECRNGR000VKLV). A sha that merely ends a sentence (`… see commit <sha>.`) is still matched.
 
 ### Verify → integrate → fail closed (AC1–AC3)
 
@@ -641,7 +641,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 - **Fail-closed:** a non-green executed run (failures, non-zero exit, timeout, missing binary) yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict).
 - A green cache hit at the audited state short-circuits the invocation entirely (the suite is only executed when the cache cannot satisfy the evidence).
 
-**Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide (default: `AUDIT_MAX_CONCURRENCY` env var or 2). Each pi launch holds one audit slot; when the ceiling is saturated the launch **waits on a shared bounded priority queue** (SA-0MTG5RYH8005RQNM) instead of failing fast: it enqueues a ticket at its work item's priority (critical > high > medium > low; missing/unknown priority defaults to medium), and is admitted in priority order (FIFO within a tier) as slots free up. The total wait for admission + slot is bounded by `AUDIT_QUEUE_TIMEOUT` (default 90s); `AUDIT_LOCK_TIMEOUT` now bounds only each individual semaphore attempt inside the admission poll (default 0s = immediate retry). Log lines (`Audit slot acquired: queued_at=<ts> priority=<level> queue_position=<N> dequeued_at=<ts> wait_seconds=<N> ticket=<id>`) make queue behaviour observable from stderr (AC4). If the bound is exhausted the audit still completes gracefully with the `unmet` evidence "Audit concurrency limit reached" (bounded, never fail-fast). Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > 2 default. Queue/admission and downtime-gate metrics are collected read-only by [`skill/shared/audit_gate_metrics.py`](../../skill/shared/audit_gate_metrics.py) (a pure-Python metrics collector); its host measurements and the keep-the-gate recommendation are recorded in [`downtime-idle-gate-evaluation.md`](downtime-idle-gate-evaluation.md) (SA-0MTG5UPBR0028K50).
+**Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide (default: `AUDIT_MAX_CONCURRENCY` env var or 6). The host-wide `issue` ingress cap (`AUDIT_MAX_HOST_AUDITS`, default 6) separately bounds independently launched `audit_runner.py issue` processes. Both defaults were right-sized to the host's measured audit-slot capacity (SA-0MUSZJRB9006ZCHE): the F7 harness (`skill/shared/validate_fanout.py`) showed the old ingress cap of 3 was the binding constraint on concurrent audits, and 6 (= 2x the 3-slot local LLM proxy pool) drains bursts with a batch-attributable load delta <= 1.63 and no swap growth on the 16-core host. Each pi launch holds one audit slot; when the ceiling is saturated the launch **waits on a shared bounded priority queue** (SA-0MTG5RYH8005RQNM) instead of failing fast: it enqueues a ticket at its work item's priority (critical > high > medium > low; missing/unknown priority defaults to medium), and is admitted in priority order (FIFO within a tier) as slots free up. The total wait for admission + slot is bounded by `AUDIT_QUEUE_TIMEOUT` (default 90s); `AUDIT_LOCK_TIMEOUT` now bounds only each individual semaphore attempt inside the admission poll (default 0s = immediate retry). Log lines (`Audit slot acquired: queued_at=<ts> priority=<level> queue_position=<N> dequeued_at=<ts> wait_seconds=<N> ticket=<id>`) make queue behaviour observable from stderr (AC4). If the bound is exhausted the audit still completes gracefully with the `unmet` evidence "Audit concurrency limit reached" (bounded, never fail-fast). Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > 6 default. Queue/admission and downtime-gate metrics are collected read-only by [`skill/shared/audit_gate_metrics.py`](../../skill/shared/audit_gate_metrics.py) (a pure-Python metrics collector); its host measurements and the keep-the-gate recommendation are recorded in [`downtime-idle-gate-evaluation.md`](downtime-idle-gate-evaluation.md) (SA-0MTG5UPBR0028K50).
 
 **Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
 
@@ -708,11 +708,13 @@ implementation code. Only the project-level audit summary call remains in bare
 LLM pipe mode (`enable_tools=False`).
 
 **Bounded scanning (Phase 2):** The Phase 2 prompts include a **SCANNING** block
-that directs agents to the bounded helper `./scripts/scan.py` instead
-of improvised recursive greps:
+that directs agents to the bounded helper `./scripts/scan.py` and the native
+wl CLI instead of improvised recursive greps:
 
-- Worklog lookups: `python3 ./scripts/scan.py find-workitem <id>`
-  (delegates to `wl search`; never greps the `.worklog/` tree).
+- Worklog lookups: native wl CLI only — `wl list <term> --json` for
+  case-insensitive substring matching over id/title/description, and
+  `wl show <id> --json` for exact/unique-ID resolution (tolerant: exact-first,
+  unique substring fallback). Never greps the `.worklog/` tree.
 - Code search: `python3 ./scripts/scan.py search-code <pattern> --path <dir> --type py`
   (bounded rg with prunes for node_modules/.git/.worklog/.audit_debug and
   `audit_debug_*.jsonl`, max file size, explicit path).
@@ -721,8 +723,12 @@ of improvised recursive greps:
 
 Unbounded recursive greps over the repo root or `.worklog/` (e.g.
 `grep -r ... .` or `grep -r ... .worklog/`) are forbidden. Worklog lookups use
-`wl search <keywords> --json` or `wl list <term> --json` for substring
-matching, `scan.py find-workitem <id>` for exact match.
+the native wl CLI: `wl list <term> --json` for substring matching,
+`wl show <id> --json` for exact/unique-ID resolution. The interim scan.py
+worklog-lookup wrapper was retired by SA-0MSOMINF8007K9S4 once the wl
+CLI gained tolerant ID resolution; note that `wl search <keywords> --json` is
+full-text search (FTS, token/prefix based) — **not** a substring matcher — and
+must not be presented as one.
 See `docs/dev/audit-grep-scan-patterns.md` (SA-0MSBR06GX0051T1Q) for the
 pattern catalogue and benchmark.
 
@@ -733,7 +739,7 @@ scans never walk them), and are swept by
 `./scripts/cleanup_debug_logs.py` (dry-run default, `--apply`,
 `--older-than N` days, default 14). Successful audit runs delete their own
 debug file; failed runs keep full-content forensics. Never read them back
-programmatically — use `scan.py find-workitem` / `wl search` instead.
+programmatically — use `wl show <id> --json` / `wl list <term> --json` instead.
 
 **Reason taxonomy (SA-0MU32TAMB007HI99):** each debug entry carries a `reason`
 and an explicit `parse_ok` field, so a returned call can never be mistaken for

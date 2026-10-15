@@ -55,7 +55,9 @@ Behavior
 
 - Conservative matching: return existing issue id if any heuristic matches
 - No match: create new `critical` issue from template with assignee `Build`
-- Prefer quiet test commands (`pytest -q` / `npm --silent test`) for local reproduction
+- Route test execution through the test skill (`/skill:test`) — the Test
+  execution policy in AGENTS_GLOBAL.md prohibits direct test-command
+  invocation by agents
 - Enhance existing issues by adding comment with new evidence (don't overwrite fields)
 
 Telemetry: emits `triage.issue.created` / `triage.issue.enhanced` to stderr.

@@ -236,7 +236,17 @@ Then output a summary of what each stage checked/found.
    - Run `wl show <work-item-id> --json` and summarise: title, type, headline, existing children, plan info.
    - Validate readiness by `stage`: `intake_complete` → ready for planning; `plan_complete` or later → skip, record a no-op comment; other → check Step 1 heuristics before asking. Only ask the operator when heuristics genuinely cannot determine.
    - Read any linked PRD for key details.
+   - **Duplicate-work detection procedure** (also applied during child decomposition in Step 0 and during automated review):
+     1. **Search:** `wl search <keywords> --json` using 3–6 keywords from the item's title/description. For children, search each child's title/ACs independently.
+     2. **Review:** For each candidate, read its description and acceptance criteria.
+     3. **Compare ACs:** Are all ACs of the current item (or child) fully satisfied by the existing item?
+        - **Yes (full duplicate):** Close the item/child. Comment: `"Duplicate of <existing-item-id>: all acceptance criteria are met by that item. Closing to avoid redundant work."` Then: `wl close <id> --reason "Duplicate of <existing-item-id>: work already completed" --json`
+        - **No (partial overlap):** Rewrite the description and ACs to address only the differences/gaps. Comment: `"Rewritten to address differences from <existing-item-id>: <summary of differences>."` Link as related work.
+        - **No (no overlap found):** Proceed normally. Note: `"Duplicate check performed — no overlapping completed item found."`
+     4. **Idempotence:** Re-running produces the same result; do not re-close or re-rewrite an already-closed item.
+     5. **During child decomposition (Step 0):** Apply this procedure to each child before creating it; close duplicates outright; rewrite partial overlaps to cover only remaining gaps.
    - Derive 3-6 keywords from title/description to search for related work; present likely duplicates or relationships.
+   - **Duplicate-work detection (same procedure as intake):** For any candidate duplicate found, apply the same AC-comparison decision procedure. If a child's scope overlaps with an existing completed item, close the duplicate or rewrite to cover remaining gaps. See the procedure below.
 
 3. Interview
 

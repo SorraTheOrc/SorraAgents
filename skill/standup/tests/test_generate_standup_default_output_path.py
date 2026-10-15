@@ -8,7 +8,8 @@ Covers:
   - The standups directory is created if it does not exist.
   - When --output-path IS supplied, it writes to that explicit path only.
   - Default uses YYYY_MM_DD of the generation date (local, zero-padded).
-  - --json content is written to the same default/override path when output is file-based.
+  - --json without --output-path streams raw JSON to stdout (documented fetch-data
+    contract); with --output-path the JSON is written to that explicit path.
 
 Regenerates ACs:
   1. default dated file (created, under correct project root)
@@ -134,27 +135,40 @@ class TestDefaultOutputPath:
         finally:
             _cleanup_standup_env()
 
-    def test_default_json_writes_json_to_standups_dated_file(self, tmp_path):
-        """--json with no --output-path also writes to the default dated file (as JSON)."""
+    def test_default_json_streams_to_stdout_without_dated_file(self, tmp_path):
+        """--json with no --output-path prints raw JSON to stdout and writes no dated file."""
         repo_root = tmp_path / "proj3"
         worklog = repo_root / ".worklog"
         worklog.mkdir(parents=True)
 
         mod = _reload_standup()
         try:
+            printed_stdout = []
+            printed_stderr = []
+
+            def capture_print(*args, **kwargs):
+                text = " ".join(str(a) for a in args)
+                stream = kwargs.get("file", sys.stdout)
+                if stream is sys.stderr:
+                    printed_stderr.append(text)
+                else:
+                    printed_stdout.append(text)
+
             with mock.patch.object(sys, "argv", ["generate_standup.py", "--json", "--worklog-dir", str(worklog)]):
                 with _fake_run_wl_empty_git_fail(mod):
-                    with mock.patch("builtins.print", side_effect=lambda *a, **kw: None):
+                    with mock.patch("builtins.print", side_effect=capture_print):
                         rc = mod.main()
                     assert rc == 0
-                today = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y_%m_%d")
-                expected = repo_root / "standups" / f"{today}.md"
-                assert expected.is_file()
-                raw = expected.read_text(encoding="utf-8")
-                # Should be JSON (not markdown) when --json is used
-                data = json.loads(raw)
+                # Raw JSON is streamed to stdout (documented --json fetch-data contract)
+                assert len(printed_stdout) == 1, f"Expected one JSON blob on stdout, got {printed_stdout}"
+                data = json.loads(printed_stdout[0])
                 assert isinstance(data, dict)
                 assert "herdr_count" in data or "window" in data
+                # No default dated .md file is written for --json without --output-path
+                standups_dir = repo_root / "standups"
+                assert not standups_dir.exists(), "--json without --output-path must not create ./standups/"
+                # No 'Report written to' confirmation on stderr for the stdout path
+                assert "".join(printed_stderr) == "", f"Expected no stderr, got {printed_stderr}"
         finally:
             _cleanup_standup_env()
 

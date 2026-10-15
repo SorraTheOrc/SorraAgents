@@ -1513,8 +1513,16 @@ def git_push_to_dev(
             stderr_str = stderr.decode(errors="replace").strip()
             # Detect non-fast-forward errors (dev advanced concurrently).
             # AC1/AC2: raise a recoverable exception so the caller can rebase
-            # and retry instead of failing with information loss.
-            if "non-fast-forward" in stderr_str.lower():
+            # and retry instead of failing with information loss.  Remotes
+            # word this differently: SSH/HTTPS report "non-fast-forward",
+            # while local/file remotes report "fetch first" /
+            # "remote contains work that you do not have locally".
+            lower = stderr_str.lower()
+            if (
+                "non-fast-forward" in lower
+                or "fetch first" in lower
+                or "remote contains work" in lower
+            ):
                 rebase_cmd = (
                     f"git rebase origin/dev && git push origin "
                     f"{branch}:refs/heads/dev"
@@ -3892,6 +3900,102 @@ def phase_start(
     return report
 
 
+def _recover_non_fast_forward_push(
+    worktree_path: str,
+    repo_root: str,
+    branch: str,
+    commit_hash: str,
+    exc: PushNonFastForwardError,
+    work_item_id: str,
+) -> str:
+    """Recover from a non-fast-forward push by rebasing and retrying.
+
+    ``dev`` advanced concurrently, so the feature branch must be rebased
+    onto the latest ``origin/dev`` and re-pushed.  The rebase MUST run
+    inside the worktree (that is where *branch* is checked out);
+    ``phase_finish`` therefore pushes *before* removing the worktree.
+
+    ``origin/dev`` is fetched first: a failed push leaves the
+    remote-tracking ref at the pre-advance tip, so rebasing onto the
+    stale ref would just produce another non-fast-forward push.
+
+    Args:
+        worktree_path: Worktree where *branch* is checked out.
+        repo_root: Main checkout used to push to ``refs/heads/dev``.
+        branch: Feature branch to rebase and push.
+        commit_hash: Commit being pushed (pre-rebase).
+        exc: The original :class:`PushNonFastForwardError`.
+        work_item_id: Work item to comment on for the recovery audit trail.
+
+    Returns:
+        The (possibly rewritten) commit hash that was pushed.
+
+    Raises:
+        RuntimeError: if the rebase or the retry push fails; recovery
+            state (commit, branch, worktree) is preserved in a comment
+            before raising so a human can recover manually.
+    """
+    # 0. Refresh origin/dev so the rebase targets the concurrently-advanced
+    #    tip rather than the stale remote-tracking ref.  Best-effort: if the
+    #    fetch fails we still attempt the rebase and let the retry push
+    #    surface the problem.
+    fetch_result = run_cmd(["git", "fetch", "origin", "dev"], cwd=worktree_path)
+    if fetch_result.returncode != 0:
+        LOG.warning(
+            "git fetch origin dev failed during non-fast-forward recovery: %s",
+            fetch_result.stderr.strip(),
+        )
+
+    # 1. Rebase the feature branch onto the latest origin/dev.
+    rebase_result = run_cmd(["git", "rebase", "origin/dev"], cwd=worktree_path)
+    if rebase_result.returncode != 0:
+        # AC3: rebase failed — preserve all state for manual recovery.
+        wl_add_comment(
+            work_item_id,
+            f"Push to dev failed (non-fast-forward): {exc.stderr}\n"
+            f"Rebase onto origin/dev failed with conflicts.\n"
+            f"Manual recovery:\n"
+            f"  1. cd {worktree_path}\n"
+            f"  2. git rebase origin/dev  # resolve conflicts\n"
+            f"  3. git push origin {branch}:refs/heads/dev\n"
+            f"Commit before rebase: {commit_hash}\n"
+            f"Branch: {branch}\n"
+            f"Worktree: {worktree_path}",
+        )
+        raise RuntimeError(
+            f"git push to dev failed (non-fast-forward), rebase "
+            f"also failed: {exc.stderr}",
+        ) from exc
+
+    # The rebase rewrote HEAD — capture the new tip so the retry push and
+    # the completion comment reference the commit that actually lands.
+    new_commit = git_get_commit_hash(worktree_path) or commit_hash
+
+    # 2. Retry the push.
+    if not git_push_to_dev(repo_root, branch, new_commit):
+        # Retry failed — preserve state for manual recovery.
+        wl_add_comment(
+            work_item_id,
+            f"Push to dev failed after rebase.\n"
+            f"Original error: {exc.stderr}\n"
+            f"Branch: {branch}\n"
+            f"Commit: {new_commit}\n"
+            f"Worktree: {worktree_path}",
+        )
+        raise RuntimeError(
+            f"git push to dev failed after rebase: {exc.stderr}",
+        ) from exc
+
+    # 3. Post explanatory comment about the successful recovery.
+    wl_add_comment(
+        work_item_id,
+        f"Push to dev initially failed (non-fast-forward \u2014 dev "
+        f"advanced concurrently). Rebased {branch} onto origin/dev "
+        f"and retried successfully. Original error: {exc.stderr}",
+    )
+    return new_commit
+
+
 def phase_finish(
     work_item_id: str,
     json_output: bool = False,
@@ -3911,8 +4015,8 @@ def phase_finish(
     5. Commit
     6. Fast-forward dev in the main checkout (AC1 — context-budget fix)
     7. Clean up worktree processes
-    8. Remove worktree
-    9. Push to dev
+    8. Push to dev (rebase + retry on concurrent advance)
+    9. Remove worktree
     10. Sync local parent branch (post-push, AC1/AC2)
     11. Mark in_review
 
@@ -4265,18 +4369,12 @@ def phase_finish(
             if cleanup_result.get("warning"):
                 LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
 
-            # ── Step 6: Remove worktree ───────────────────────────────────
-            LOG.info("Removing worktree...")
-            remove_state(worktree_path)
-            if not _remove_worktree(
-                worktree_path,
-                repo_root=state.repo_root if state else None,
-            ):
-                msg = f"Failed to remove worktree at {worktree_path}"
-                LOG.warning(msg)
-                report["steps"]["worktree_removed"] = False
-
-            # ── Step 7: Push to dev ────────────────────────────────────────
+            # ── Step 6: Push to dev ────────────────────────────────────────
+            # The push runs *before* the worktree is removed: a
+            # non-fast-forward recovery must rebase the feature branch where
+            # it is checked out (the worktree), and a failed push must leave
+            # the worktree in place for manual recovery
+            # (WL-0MV533YSW004D1E1).
             # repo_root was resolved in Step 5 (fast-forward) above.
             LOG.info("Pushing to dev...")
             try:
@@ -4296,61 +4394,39 @@ def phase_finish(
                 raise RuntimeError(f"git push to dev timed out: {exc}") from exc
             except PushNonFastForwardError as exc:
                 # AC1/AC2/AC3: dev advanced concurrently — rebase and retry
-                # instead of losing the completed implementation.
+                # inside the (still-present) worktree instead of losing the
+                # completed implementation.
                 LOG.info(
                     "Push failed (non-fast-forward); attempting rebase and retry "
                     "...",
                 )
-                # 1. Rebase the feature branch onto the latest origin/dev.
-                rebase_result = run_cmd(
-                    ["git", "rebase", "origin/dev"],
-                    cwd=cwd,
+                commit_hash = _recover_non_fast_forward_push(
+                    worktree_path=worktree_path,
+                    repo_root=repo_root,
+                    branch=branch,
+                    commit_hash=commit_hash,
+                    exc=exc,
+                    work_item_id=work_item_id,
                 )
-                if rebase_result.returncode != 0:
-                    # AC3: rebase failed — preserve all state for manual recovery.
-                    new_commit = git_get_commit_hash(repo_root) or commit_hash
-                    wl_add_comment(
-                        work_item_id,
-                        f"Push to dev failed (non-fast-forward): {exc.stderr}\n"
-                        f"Rebase onto origin/dev failed with conflicts.\n"
-                        f"Manual recovery:\n"
-                        f"  1. cd {worktree_path}\n"
-                        f"  2. git rebase origin/dev  # resolve conflicts\n"
-                        f"  3. git push origin {branch}:refs/heads/dev\n"
-                        f"Commit before rebase: {commit_hash}\n"
-                        f"Branch: {branch}\n"
-                        f"Worktree: {worktree_path}",
-                    )
-                    raise RuntimeError(
-                        f"git push to dev failed (non-fast-forward), rebase "
-                        f"also failed: {exc.stderr}",
-                    ) from exc
-                # 2. Retry the push.
-                retry_result = git_push_to_dev(repo_root, branch, commit_hash)
-                if not retry_result:
-                    # Retry failed — preserve state for manual recovery.
-                    wl_add_comment(
-                        work_item_id,
-                        f"Push to dev failed after rebase.\n"
-                        f"Original error: {exc.stderr}\n"
-                        f"Branch: {branch}\n"
-                        f"Commit: {commit_hash}\n"
-                        f"Worktree: {worktree_path}",
-                    )
-                    raise RuntimeError(
-                        f"git push to dev failed after rebase: {exc.stderr}",
-                    )
-                # 3. Post explanatory comment about the successful recovery.
-                wl_add_comment(
-                    work_item_id,
-                    f"Push to dev initially failed (non-fast-forward — dev "
-                    f"advanced concurrently). Rebased {branch} onto origin/dev "
-                    f"and retried successfully. Original error: {exc.stderr}",
-                )
-                # Fall through to success path.
+                # The rebase rewrote HEAD; keep the reported commit in sync.
+                report["steps"]["commit"]["hash"] = commit_hash
 
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
+
+            # ── Step 7: Remove worktree ───────────────────────────────────
+            # Only after a successful push — a failed push keeps the
+            # worktree so the recovery rebase and manual recovery remain
+            # possible (WL-0MV533YSW004D1E1).
+            LOG.info("Removing worktree...")
+            remove_state(worktree_path)
+            if not _remove_worktree(
+                worktree_path,
+                repo_root=state.repo_root if state else None,
+            ):
+                msg = f"Failed to remove worktree at {worktree_path}"
+                LOG.warning(msg)
+                report["steps"]["worktree_removed"] = False
 
             # ── Step 8: Sync local parent branch (AC1 / AC2) ──────────────
             # After a successful push, bring the main checkout's local

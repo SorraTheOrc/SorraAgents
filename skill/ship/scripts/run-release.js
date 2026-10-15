@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
-import { checkFinalValidation, resolveChildScope, getItemById, getItemLifecycle, shellQuote } from './check-final-validation.js';
+import { checkFinalValidation, resolveChildScope, getItemById, getItemLifecycle, shellQuote, PRODUCER_HOLD_ASSIGNEE, isProducerHeld } from './check-final-validation.js';
 import { runRefreshAuditsAction } from './refresh-audits.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
@@ -391,7 +391,7 @@ export function verifyReleaseMerge(version, options = {}) {
  * (Step 9) and the final-validation gate (Step 3.7) apply identical
  * `covered` / `uncovered` / `excluded` semantics. Only a `covered` outcome
  * (nearest `in_review` ancestor with `readyToClose === true`) authorises
- * clearing the child's `needsProducerReview` flag (AC1, AC3).
+ * clearing the child's producer hold (AC1, AC3).
  *
  * Command boundaries are injectable for hermetic tests.
  *
@@ -536,14 +536,14 @@ function readCloseState(getCloseStateFn, itemId) {
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
- * Close candidate work items after a successful release, filtering by
- * `needsProducerReview`.
+ * Close candidate work items after a successful release, filtering by the
+ * producer hold.
  *
  * Uses `getCandidateItems()` from check-audit-gate.js to find items in
  * `in_review` stage or `completed` status (excluding `stage: done`).
- * Only items with `needsProducerReview === false` are closed. Items with
- * `needsProducerReview = true`, `null`, or `undefined` are skipped and
- * logged with "Skipped (needs producer review)".
+ * Items not producer-held are closed. Producer-held items without a
+ * covered passing parent audit are skipped and logged with
+ * "Skipped (producer-owned: requires producer review)".
  *
  * The existing audit gate (Step 2) already validates `audit.readyToClose`,
  * so this step does not re-check `readyToClose`.
@@ -561,7 +561,7 @@ function readCloseState(getCloseStateFn, itemId) {
  *
  * @param {string|null} version - The released semver version (e.g., "0.2.0").
  * @param {object} [options] - Optional injection point (used by unit tests).
- * @param {() => Array<{id: string, title: string, needsProducerReview: boolean|null}>} [options.getCandidateItemsFn] -
+ * @param {() => Array<{id: string, title: string, assignee: string|null}>} [options.getCandidateItemsFn] -
  *   Candidate-item query; defaults to `getCandidateItems()` from
  *   check-audit-gate.js (real `wl list`).
  * @param {(itemId: string, reason: string) => void} [options.runCloseCommand] -
@@ -578,11 +578,11 @@ function readCloseState(getCloseStateFn, itemId) {
  * @param {(item: object) => {outcome: string, ancestorId: string|null}} [options.getAncestorAuditFn] -
  *   Resolves whether a child is covered by an audit-ready `in_review`
  *   ancestor; defaults to {@link resolveCandidateCoverage}. Only a `covered`
- *   outcome authorises clearing a child's `needsProducerReview` flag
+ *   outcome authorises clearing a child's producer hold
  *   (SA-0MUJLWPB10038Z8Q AC1/AC3).
  * @param {(childId: string, ancestorId: string, reason: string) => void} [options.runOverrideCommand] -
- *   Clears the child's `needsProducerReview` flag and records the explanatory
- *   comment; defaults to `wl update <child> --needs-producer-review false`
+ *   Clears the child's producer hold (assignee) and records the explanatory
+ *   comment; defaults to `wl update <child> --assignee ""`
  *   followed by `wl comment add <child>` (AC1/AC4).
  * @param {(itemId: string) => ({readyToClose: boolean, auditedAt: string|null}|null)} [options.getParentAuditFn] -
  *   Resolves a candidate's own audit readiness. When a candidate has
@@ -603,7 +603,7 @@ function readCloseState(getCloseStateFn, itemId) {
  * @param {boolean} [options.dryRun=false] - When true, intended child
  *   overrides and cascades are reported but no `wl` mutation is performed
  *   (AC4).
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, unclosedCount: number, unclosedItems: Array<{id: string, title: string, reason: string}>, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, unclosedCount: number, unclosedItems: Array<{id: string, title: string, reason: string}>, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], producerOwned: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -618,7 +618,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     getAncestorAuditFn = (item) => resolveCandidateCoverage(item),
     runOverrideCommand = (childId, ancestorId, reason) => {
       execSync(
-        `wl update ${childId} --needs-producer-review false --json`,
+        `wl update ${childId} --assignee "" --json`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       );
       execSync(
@@ -692,23 +692,23 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
 
   console.log(`Found ${items.length} work item(s).`);
 
-  // Filter: close items where needsProducerReview === false. A child with
-  // needsProducerReview === true whose nearest in_review ancestor is an
+  // Filter: close items that are not producer-held. A producer-held child
+  // whose nearest in_review ancestor is an
   // audit-ready release candidate (readyToClose === true) is OVERRIDDEN:
   // its flag is cleared (with an explanatory comment) and it is closed
   // (SA-0MUJLWPB10038Z8Q AC1). The override is authorised ONLY by the
-  // parent's passing audit — never by status alone (AC3). Items with
-  // needsProducerReview null/undefined, or true-but-uncovered, are skipped.
+  // parent's passing audit — never by status alone (AC3). Producer-held
+  // items without coverage are skipped.
   const toClose = [];
   const overriddenItems = [];
   const skippedItems = [];
   for (const item of items) {
-    if (item.needsProducerReview === false) {
+    if (!isProducerHeld(item)) {
       toClose.push(item);
       continue;
     }
 
-    if (item.needsProducerReview === true && item.parentId) {
+    if (isProducerHeld(item) && item.parentId) {
       let coverage = null;
       try {
         coverage = getAncestorAuditFn(item);
@@ -717,18 +717,18 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       }
       if (coverage && coverage.outcome === 'covered') {
         const reason = `Auto-override by ship release (SA-0MUJLWPB10038Z8Q): `
-          + `needsProducerReview cleared — this child is covered by the passing `
+          + `producer hold cleared — this child is covered by the passing `
           + `audit of in_review ancestor ${coverage.ancestorId}.`;
         if (dryRun) {
           console.log(
             `  ○ ${item.title || item.id} (${item.id}) — dry-run: would override `
-            + `needsProducerReview via ancestor ${coverage.ancestorId}`,
+            + `producer hold via ancestor ${coverage.ancestorId}`,
           );
         } else {
           try {
             runOverrideCommand(item.id, coverage.ancestorId, reason);
             console.log(
-              `  ✓ ${item.title || item.id} (${item.id}) — cleared needsProducerReview `
+              `  ✓ ${item.title || item.id} (${item.id}) — cleared producer hold `
               + `(covered by ${coverage.ancestorId})`,
             );
           } catch (err) {
@@ -786,7 +786,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   const candidateIds = new Set(toClose.map((item) => item.id));
   // Full candidate set keyed by id. Used to classify a non-candidate,
   // non-terminal descendant that is held back solely because
-  // `needsProducerReview === true` separately from generic out-of-scope
+  // producer-held descendants separately from generic out-of-scope
   // collateral (SA-0MUJKPDAA002VVDP AC2).
   const candidateItemsById = new Map(items.map((item) => [item.id, item]));
   const refusedItems = [];
@@ -878,26 +878,26 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
         }
       }
     }
-    // AC2: a descendant held back solely because `needsProducerReview=true`
+    // AC2: a descendant held back solely because it is producer-held
     // (a candidate skipped with its producer-review flag still set) must be
     // reported with a distinct reason rather than lumped under the generic
     // collateral message. The parent is still refused either way — this
     // classifies the cause, it does not weaken the scope guard (AC3).
-    const needsProducerReview = collateral.filter((id) => {
+    const producerOwned = collateral.filter((id) => {
       const candidate = candidateItemsById.get(id);
-      return !!candidate && candidate.needsProducerReview === true;
+      return !!candidate && isProducerHeld(candidate);
     });
-    const needsProducerReviewIds = new Set(needsProducerReview);
-    const outsideSetCollateral = collateral.filter((id) => !needsProducerReviewIds.has(id));
+    const producerOwnedIds = new Set(producerOwned);
+    const outsideSetCollateral = collateral.filter((id) => !producerOwnedIds.has(id));
     if (collateral.length > 0) {
       let reason;
       if (outsideSetCollateral.length > 0) {
         reason = `Refused: --force close would sweep descendant(s) outside the candidate set: ${outsideSetCollateral.join(', ')}`;
-        if (needsProducerReview.length > 0) {
-          reason += `; descendant(s) need producer review: ${needsProducerReview.join(', ')}`;
+        if (producerOwned.length > 0) {
+          reason += `; descendant(s) need producer review: ${producerOwned.join(', ')}`;
         }
       } else {
-        reason = `Refused: descendant(s) need producer review: ${needsProducerReview.join(', ')}`;
+        reason = `Refused: descendant(s) need producer review: ${producerOwned.join(', ')}`;
       }
       console.log(`  ○ ${item.title || item.id} (${item.id}) — ${reason}`);
       refusedItems.push({
@@ -905,7 +905,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
         title: item.title,
         reason,
         collateral,
-        needsProducerReview,
+        producerOwned,
       });
     } else {
       closable.push(item);

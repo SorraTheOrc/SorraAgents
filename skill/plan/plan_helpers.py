@@ -52,6 +52,10 @@ logger = logging.getLogger("plan_helpers")
 # Default thresholds for auto-plan decision
 # If effort t-shirt is in this set AND risk level is in the risk set,
 # skip /plan and proceed directly to implement.
+# Effort values are normalised to the full-label spelling via
+# normalise_effort_label() before comparison, so both the abbreviated wl
+# vocabulary (XS/S/M/L/XL) and the full labels written by the
+# effort-and-risk skill ("Extra Small" …) match (SA-0MV85VT250096CTY).
 DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"})
 DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 
@@ -61,8 +65,53 @@ DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 # (High or Severe, the top of the wl risk scale) — an AND gate
 # (SA-0MUYG0HE6001YTEM). Every other effort/risk combination proceeds
 # straight to the automated review stages without an approval pause.
+# Effort values are normalised to the full-label spelling before comparison
+# (see DEFAULT_AUTOPLAN_EFFORT_SKIP note — same abbreviation parity).
 PLAN_APPROVAL_EFFORT: frozenset[str] = frozenset({"Extra Large"})
 PLAN_APPROVAL_RISK: frozenset[str] = frozenset({"High", "Severe"})
+
+
+# ---------------------------------------------------------------------------
+# Effort label normalisation
+# ---------------------------------------------------------------------------
+
+# Canonical effort t-shirt labels (full spelling). Both the abbreviated wl
+# vocabulary (XS/S/M/L/XL — per WorkItemEffortLevel and the ``wl update
+# --effort`` help text) and the full labels written by the effort-and-risk
+# skill (commit c04ecb5b changed it to expand abbreviations) exist in the
+# store because ``wl`` does not validate the value at runtime. Threshold
+# evaluation sites must therefore accept both spellings.
+_EFFORT_LABEL_TO_CANONICAL: dict[str, str] = {
+    "XS": "Extra Small",
+    "S": "Small",
+    "M": "Medium",
+    "L": "Large",
+    "XL": "Extra Large",
+    "Extra Small": "Extra Small",
+    "Small": "Small",
+    "Medium": "Medium",
+    "Large": "Large",
+    "Extra Large": "Extra Large",
+}
+
+
+def normalise_effort_label(value: str | None) -> str:
+    """Normalise an effort t-shirt label to its canonical full-label spelling.
+
+    Maps both the abbreviated wl vocabulary (``XS``/``S``/``M``/``L``/``XL``)
+    and the full labels (``Extra Small``/``Small``/``Medium``/``Large``/
+    ``Extra Large``) to a single canonical form (the full label), so threshold
+    comparisons against the full-label sets are correct regardless of which
+    spelling a work item carries (SA-0MV85VT250096CTY).
+
+    Blank/None values become ``""``; unknown spellings pass through stripped
+    and verbatim (callers degrade gracefully instead of crashing or silently
+    mis-mapping a future label).
+    """
+    if not value:
+        return ""
+    stripped = value.strip()
+    return _EFFORT_LABEL_TO_CANONICAL.get(stripped, stripped)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +142,16 @@ def _parse_key_files_section(text: str) -> list[str]:
             # Stop at the next heading or blank-line break before another section
             if stripped.startswith("**") and stripped != "**":
                 break
+            # Stop at Markdown ATX headings (1–6 '#' chars followed by whitespace),
+            # e.g. `# Title`, `## Title`, `###### Title` (CommonMark ATX spec).
+            if stripped and stripped[0] == "#":
+                # Count the leading '#' run; a heading requires 1–6 hashes
+                # followed by whitespace (or the line ends there).
+                hash_run = len(stripped) - len(stripped.lstrip("#"))
+                if 1 <= hash_run <= 6 and (
+                    len(stripped) == hash_run or stripped[hash_run] in (" ", "\t")
+                ):
+                    break
             if stripped.startswith("- "):
                 bullet = stripped[2:].strip()
                 # Try to extract path from backticks first
@@ -362,11 +421,15 @@ def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
     approval (mirroring ``resolve_complexity_tier``'s Medium default), so a
     human checkpoint is never silently skipped.
 
+    Effort is normalised via ``normalise_effort_label()`` so both the
+    abbreviated wl spelling (``XL``) and the full label (``Extra Large``)
+    trigger the gate (SA-0MV85VT250096CTY).
+
     Arguments:
         work_item: The work item dict (from ``wl show --json``) with
             ``effort`` (t-shirt size) and ``risk`` (level) fields.
     """
-    effort = (work_item.get("effort") or "").strip()
+    effort = normalise_effort_label(work_item.get("effort"))
     risk = (work_item.get("risk") or "").strip()
 
     # Missing values default conservatively to requesting approval.
@@ -607,7 +670,7 @@ def make_autoplan_decision(
 
     # Idempotence check: skip re-computation if already computed
     if is_effort_risk_computed(item, comments):
-        effort = (item.get("effort") or "").strip()
+        effort = normalise_effort_label(item.get("effort"))
         risk = (item.get("risk") or "").strip()
         effort_risk = {"effort": effort, "risk": risk}
         do_plan = not (effort in effort_skip and risk in risk_skip)
@@ -630,7 +693,7 @@ def make_autoplan_decision(
         risk_level = "unknown"
         risk_score = 0
     else:
-        tshirt = er_result.get("effort", {}).get("tshirt", "")
+        tshirt = normalise_effort_label(er_result.get("effort", {}).get("tshirt", ""))
         risk_level = er_result.get("risk", {}).get("level", "")
         risk_score = er_result.get("risk", {}).get("score", 0)
         do_plan = not (tshirt in effort_skip and risk_level in risk_skip)

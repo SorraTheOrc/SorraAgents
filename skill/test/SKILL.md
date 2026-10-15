@@ -12,7 +12,11 @@ useless), or escalated with a clear justification.
 
 **Part of the contract:** every run is cached per-repo (git state + 2h TTL) and
 consumed read-only by the audit skill to auto-verify execution-dependent ACs —
-the pre-`in_review` suite pass MUST therefore go through this skill. An ad-hoc
+the pre-`in_review` suite pass MUST therefore go through this skill. This is the
+[Test execution policy](../../AGENTS_GLOBAL.md#test-execution-policy) made
+enforceable: agents must never invoke test commands directly, and the rule is
+guarded by the deterministic conformance test
+`tests/test_test_skill_directory.py`. An ad-hoc
 `npx vitest run`/`pytest` at the same commit does not populate the cache, so the
 audit cannot auto-verify those ACs (it auto-executes the suite itself on a cache
 miss — F3, SA-0MSTN5KRF0097TVP — or the operator attests with `--green-run HEAD`;

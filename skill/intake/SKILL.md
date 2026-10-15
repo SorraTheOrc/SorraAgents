@@ -114,8 +114,18 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 ### 2. Gather context (agent responsibility)
 
 - Derive 2–6 keywords from `<seed-context>` and user input; search work items (`wl search <keywords> --json`) and the repo (ignore `node_modules`, `.git`, `.`-prefixed folders).
-- Duplicates: highlight and ask if they represent the work; if confirmed, ask the user to resolve; if parent/child, create the relationship when creating work items.
+- **Duplicate-work detection:** before drafting, run `wl search <keywords> --json` to find potential duplicate or overlapping items. For each candidate, compare acceptance criteria (ACs) against the current item using the procedure below. If a candidate is found, follow the decision procedure (see **Duplicate-work detection procedure** below). If no candidate is found, proceed normally and note the check was performed.
 - Output labelled lists — "Potentially related docs" (paths) and "Potentially related work items" (titles + IDs) — and summarize each.
+
+**Duplicate-work detection procedure:**
+
+1. **Search:** `wl search <keywords> --json` using 3–6 keywords derived from the item's title and description. Also try `wl list --status completed --json` for completed items with matching tags.
+2. **Review:** For each candidate, read its description and acceptance criteria.
+3. **Compare ACs:** Are all acceptance criteria of the current item fully satisfied by the existing item?
+   - **Yes (full duplicate):** Close the current item. Comment: `"Duplicate of <existing-item-id>: all acceptance criteria are met by that item. Closing to avoid redundant work."` Then: `wl close <id> --reason "Duplicate of <existing-item-id>: work already completed" --json`
+   - **No (partial overlap):** Rewrite the current item's description and ACs to address only the differences/gaps. Comment: `"Rewritten to address differences from <existing-item-id>: <summary of differences>."` Link the existing item as related work.
+   - **No (no overlap found):** Proceed normally. Note in a comment: `"Duplicate check performed — no overlapping completed item found."`
+4. **Idempotence:** Re-running this check on the same item produces the same result; do not re-close or re-rewrite an already-closed item.
 
 ### 3. Work Item prep (agent responsibility)
 

@@ -18,7 +18,15 @@ Configuration
 - ``max_workers`` (explicit argument) — highest priority.
 - ``AUDIT_MAX_CONCURRENCY`` environment variable — override for audit-style
   workloads (default ceiling documented below).
-- Default: 5 concurrent workers when neither is provided.
+- Default: 6 concurrent workers when neither is provided.
+
+The default is right-sized to the host's measured audit-slot capacity
+(SA-0MUSZJRB9006ZCHE): the F7 harness (``skill/shared/validate_fanout.py``)
+drained a burst of 8 audits in 18.7s at ceiling 3 vs 12.9s at ceiling 6,
+with a batch-attributable load delta <= 1.63 on the 16-core host and no swap
+growth. Six is 2x the 3-slot local LLM proxy pool, so one inference-bound and
+one local/tool-bound pi call can overlap per proxy slot without piling on
+further proxy contention.
 
 Nested-run isolation
 --------------------
@@ -72,7 +80,7 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None  # type: ignore[assignment]
 
-DEFAULT_MAX_WORKERS = 5
+DEFAULT_MAX_WORKERS = 6
 ENV_MAX_WORKERS = "AUDIT_MAX_CONCURRENCY"
 ENV_LOCK_DIR = "PI_SEMAPHORE_DIR"
 #: Subdirectory (under a caller-provided base) that names an isolated
@@ -129,7 +137,7 @@ class Semaphore:
     Args:
         name: Logical name of the semaphore (shared across processes).
         max_workers: Maximum concurrent holders. Resolved as: explicit
-            argument > ``AUDIT_MAX_CONCURRENCY`` env var > default (2).
+            argument > ``AUDIT_MAX_CONCURRENCY`` env var > default (6).
         timeout: Bounded wait in seconds (``None`` = block indefinitely,
             ``0`` = fail fast). Default 30.
     """

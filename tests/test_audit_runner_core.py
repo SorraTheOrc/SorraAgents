@@ -1406,10 +1406,10 @@ class TestStatusLifecycle:
     # Tests: needs_producer_review flag (AC1, AC2)
     # ------------------------------------------------------------------
 
-    def test_completed_update_includes_needs_producer_review_when_ready_to_close(self, monkeypatch):
+    def test_completed_update_applies_producer_hold_when_ready_to_close(self, monkeypatch):
         """On a 'Ready to close: Yes' verdict for a top-level item (no parent),
-        the terminal wl update includes --needs-producer-review yes (AC1,
-        SA-0MSSVKYEW008PJ9H)."""
+        the terminal wl update applies the producer hold (assignee sentinel) —
+        replacing --needs-producer-review (AC1, WL-0MV85WE7Q00044P9)."""
         calls = []
 
         monkeypatch.setattr(
@@ -1426,17 +1426,18 @@ class TestStatusLifecycle:
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
         # The verdict-driven transition (final update) sets a compatible stage
         # (in_review for a yes verdict) and, for a top-level item (no parentId
-        # in the captured work item), --needs-producer-review yes.
+        # in the captured work item), applies the producer hold
+        # (--assignee Map).
         final_update = wl_updates[-1] if wl_updates else []
         assert final_update[3:7] == ["--status", "completed", "--stage", "in_review"], (
             f"Expected completed/in_review transition on yes verdict, got: {final_update}"
         )
-        assert "--needs-producer-review" in final_update, (
-            f"Top-level yes verdict must include --needs-producer-review, got: {final_update}"
+        assert "--assignee" in final_update, (
+            f"Top-level yes verdict must clear/apply the assignee, got: {final_update}"
         )
-        npr_idx = final_update.index("--needs-producer-review")
-        assert final_update[npr_idx + 1] == "yes", (
-            f"--needs-producer-review must be 'yes', got: {final_update}"
+        hold_idx = final_update.index("--assignee")
+        assert final_update[hold_idx + 1] == "Map", (
+            f"Top-level yes verdict must apply the producer hold --assignee Map, got: {final_update}"
         )
 
     def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):

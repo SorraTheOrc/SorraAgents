@@ -54,14 +54,23 @@ def mock_run():
         yield m
 
 
-def _make_wl_show_proc(status: str = "open", stage: str = "idea"):
-    """Build a mock CompletedProcess for ``wl show <id> --json``."""
+def _make_wl_show_proc(
+    status: str = "open",
+    stage: str = "idea",
+    deleted_by: str = "",
+):
+    """Build a mock CompletedProcess for ``wl show <id> --json``.
+
+    ``deleted_by`` (SA-0MUJBLZC60085DI9) populates the soft-delete
+    attribution field ``deletedBy``; an empty value means the item is live.
+    """
     data = {
         "success": True,
         "workItem": {
             "id": "TEST-123",
             "status": status,
             "stage": stage,
+            "deletedBy": deleted_by,
         },
     }
     return subprocess.CompletedProcess(
@@ -646,6 +655,55 @@ class TestStatusLifecycleUnit:
         StatusLifecycle.ensure_claimed("TEST-123")
         # Subsequent mutation guard now passes
         mock_run.side_effect = [_make_wl_show_proc(status="in-progress")]
+        data = StatusLifecycle.require_claimed("TEST-123")
+        assert data["workItem"]["status"] == "in-progress"
+
+    # ------------------------------------------------------------------
+    # Soft-delete guard (SA-0MUJBLZC60085DI9): a soft-deleted item must
+    # never be claimed — otherwise the downtime dispatcher re-selects it.
+    # ------------------------------------------------------------------
+
+    def test_require_claimed_raises_claim_error_when_soft_deleted(self, mock_run):
+        """require_claimed refuses a soft-deleted item even when status is in-progress (AC2)."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="in-progress", deleted_by="someone@example.com"),
+        ]
+        with pytest.raises(ClaimError, match="soft-deleted"):
+            StatusLifecycle.require_claimed("TEST-123")
+        # Only the read happened; no mutation/claim was attempted.
+        assert mock_run.call_count == 1
+
+    def test_require_claimed_soft_deleted_error_names_item(self, mock_run):
+        """The soft-delete refusal names the deleted item for the operator (AC2)."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", deleted_by="deleter@example.com"),
+        ]
+        with pytest.raises(ClaimError) as excinfo:
+            StatusLifecycle.require_claimed("TEST-123")
+        assert "TEST-123" in str(excinfo.value)
+
+    def test_ensure_claimed_refuses_soft_deleted_without_write(self, mock_run):
+        """ensure_claimed raises ClaimError and never issues a reclaim write (AC2)."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", deleted_by="deleter@example.com"),
+        ]
+        with pytest.raises(ClaimError, match="soft-deleted"):
+            StatusLifecycle.ensure_claimed("TEST-123")
+        # show only — the reclaim `wl update` must never run for a deleted item.
+        assert mock_run.call_count == 1
+
+    def test_ensure_claimed_refuses_soft_deleted_in_progress(self, mock_run):
+        """ensure_claimed refuses a soft-deleted item even if it looks in-progress (AC2)."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="in-progress", deleted_by="deleter@example.com"),
+        ]
+        with pytest.raises(ClaimError, match="soft-deleted"):
+            StatusLifecycle.ensure_claimed("TEST-123")
+        assert mock_run.call_count == 1
+
+    def test_soft_deleted_guards_ignore_blank_deleted_by(self, mock_run):
+        """An empty/whitespace deletedBy is not a deletion (live item proceeds)."""
+        mock_run.side_effect = [_make_wl_show_proc(status="in-progress", deleted_by="   ")]
         data = StatusLifecycle.require_claimed("TEST-123")
         assert data["workItem"]["status"] == "in-progress"
 

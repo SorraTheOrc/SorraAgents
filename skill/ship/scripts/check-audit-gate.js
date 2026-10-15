@@ -31,7 +31,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +42,30 @@ import { isAuditStale } from './audit-freshness.js';
 // can detect a fingerprint-bearing audit without spawning the runner
 // (SA-0MUOO5W8J001DYTI).
 export const AUDIT_CONTENT_FINGERPRINT_PREFIX = 'Audit content fingerprint: ';
+
+/**
+ * Reserved assignee value that marks the producer's per-item scheduling hold.
+ *
+ * Mirrors ContextHub's ``PRODUCER_HOLD_ASSIGNEE`` in
+ * ``packages/herdr/src/downtime-worker.ts`` (WL-0MV85WDOM007BKF8; epic
+ * WL-0MV82CHGQ000HAZZ Q2). An item assigned to the producer is producer-owned
+ * and must be reviewed before release — this replaces the retired
+ * ``needsProducerReview`` flag (SA-0MV9DUE6F006SK1H).
+ */
+export const PRODUCER_HOLD_ASSIGNEE = 'Map';
+
+/**
+ * Whether a projected release-candidate item is producer-owned (held).
+ *
+ * The hold is the assignee sentinel: a non-empty producer assignee means the
+ * item is the producer's to review/close. Blank/absent assignees are not held.
+ *
+ * @param {object|null|undefined} item - Projected candidate item.
+ * @returns {boolean} True when the item is producer-owned.
+ */
+export function isProducerHeld(item) {
+  return Boolean(item && item.assignee === PRODUCER_HOLD_ASSIGNEE);
+}
 import {
   RemediationBudget,
   classifyRemediationError,
@@ -54,6 +78,103 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..', '..', '..');
 const HOME_DIR = homedir();
+
+// ------------------------------------------------------------------
+// Abort-recovery: leftover audit state cleanup (SA-0MTRH8C5O005URGR).
+// When the audit runner is killed (SIGKILL) it cannot remove its
+// abort-recovery state file. The parent process checks for leftover
+// files after each execSync and restores the work item if needed.
+// ------------------------------------------------------------------
+
+/**
+ * Build the shell command that restores a work item to its pre-audit state.
+ *
+ * Exported for testability and reuse. The command mirrors the audit
+ * runner's own restore branch (``_apply_terminal_lifecycle``) — never a
+ * bare ``wl update`` without the captured state.
+ *
+ * @param {string} issueId - The work item id.
+ * @param {string} status - The captured pre-audit status.
+ * @param {string} [stage] - The captured pre-audit stage.
+ * @returns {string} The ``wl update`` command string.
+ */
+export function buildAbortRestoreCommand(issueId, status, stage) {
+  return (
+    `wl update ${issueId} --status ${status} ` +
+    `--stage ${stage || 'plan_complete'} ` +
+    `--assignee "" --json`
+  );
+}
+
+/**
+ * Check for a leftover audit state file and restore the work item
+ * if the audit runner was killed before cleaning up.
+ *
+ * When the audit runner is SIGKILLed it cannot run its ``finally`` block,
+ * so the pre-audit state file it wrote before the ``in_progress`` claim is
+ * left behind. This function finds that file and restores the item — the
+ * parent-process half of the abort-recovery contract
+ * (SA-0MTRH8C5O005URGR).
+ *
+ * Boundaries are injectable (mirroring the other gate helpers) so unit
+ * tests are hermetic — no live ``wl`` invocations.
+ *
+ * @param {string} workItemId - The work item id to check.
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {string|null} [options.baseDir] - Base directory for state files;
+ *   defaults to the repo root, then /tmp.
+ * @param {object} [options.fsMod] - fs-like module (``existsSync``,
+ *   ``readFileSync``, ``unlinkSync``); defaults to ``node:fs``.
+ * @param {(cmd: string) => string} [options.runCommand] - Command runner;
+ *   defaults to ``execSync``.
+ * @returns {boolean} True if a leftover state file was found and restored.
+ */
+export function checkAndRestoreStuckAudit(workItemId, options = {}) {
+  const {
+    baseDir = null,
+    fsMod = { existsSync, readFileSync, unlinkSync },
+    runCommand = (cmd) => execSync(
+      cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ),
+  } = options;
+
+  // State file naming: .audit_state_<id>.json — matches audit_runner.py.
+  const dirs = [
+    baseDir,
+    REPO_ROOT,
+    '/tmp',
+  ].filter(Boolean);
+
+  for (const dir of dirs) {
+    const stateFile = join(dir, `.audit_state_${workItemId}.json`);
+    if (fsMod.existsSync(stateFile)) {
+      try {
+        const data = JSON.parse(fsMod.readFileSync(stateFile, 'utf-8'));
+        if (data.issue_id === workItemId && data.original_status) {
+          console.log(
+            `Aborted audit for ${workItemId}: restoring "${data.original_status}" "${data.original_stage || 'plan_complete'}".`,
+          );
+          runCommand(
+            buildAbortRestoreCommand(
+              data.issue_id, data.original_status, data.original_stage,
+            ),
+          );
+        }
+      } catch (err) {
+        // Best-effort: silently ignore corrupt state files.
+      } finally {
+        // Always remove the file, even if restore failed.
+        try {
+          fsMod.unlinkSync(stateFile);
+        } catch (err) {
+          // Best-effort cleanup.
+        }
+      }
+      return true;
+    }
+  }
+  return false;
+}
 
 // ── getCandidateItems ────────────────────────────────────────────────────────
 
@@ -75,7 +196,7 @@ const HOME_DIR = homedir();
  * ensures a `wl` failure still surfaces as an execSync error so the
  * warning path below fires.
  *
- * Extracts `needsProducerReview` from each item's `wl list` output,
+ * Extracts `assignee` (producer-hold sentinel) from each item's `wl list` output,
  * defaulting to `null` when the field is missing. This field is used
  * by `checkProducerReviewStatus()` for the producer-review gating step.
  * Also projects `parentId` (SA-0MSUT8GQP004WSYN) so callers can
@@ -87,33 +208,30 @@ const HOME_DIR = homedir();
  * is a bash-ism not supported by dash (Ubuntu/Debian's default sh) —
  * see LP-0MSQ0NTMO00577UJ.
  *
- * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null, updatedAt: string|null }>}
+ * @returns {Array<{ id: string, title: string, assignee: string|null, parentId: string|null, updatedAt: string|null }>}
  */
 export function getCandidateItems() {
   try {
     // Single query: stage=in_review implies status=completed (the
     // completed-minus-done == in_review invariant), piped through jq so only
-    // {id, title, needsProducerReview, parentId, updatedAt} enters the execSync
+    // {id, title, assignee, parentId, updatedAt} enters the execSync
     // buffer (updatedAt lets the gate evaluate audit staleness —
     // SA-0MUOO5UEB008RXBP).
     const output = execSync(
       `bash -c 'set -o pipefail; wl list --stage in_review --json ` +
-      `| jq -c \"[.workItems[] | {id, title, needsProducerReview, parentId, updatedAt}]\"'`,
+      `| jq -c \"[.workItems[] | {id, title, assignee, parentId, updatedAt}]\"'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     const projected = JSON.parse(output);
     if (!Array.isArray(projected)) {
       return [];
     }
-    // jq emits null for a missing needsProducerReview/parentId; normalize
-    // them to null (the same default the previous extraction applied for
-    // undefined).
+    // jq emits null for a missing assignee/parentId; normalize them to null
+    // (the same default the previous extraction applied for undefined).
     return projected.map((item) => ({
       id: item.id,
       title: item.title || item.id,
-      needsProducerReview: item.needsProducerReview !== undefined
-        ? item.needsProducerReview
-        : null,
+      assignee: item.assignee !== undefined ? item.assignee : null,
       parentId: item.parentId !== undefined ? item.parentId : null,
       updatedAt: item.updatedAt !== undefined ? item.updatedAt : null,
     }));
@@ -135,7 +253,7 @@ export function getCandidateItems() {
  * release (SA-0MSUT8GQP004WSYN). An orphaned `in_review` item with no
  * parent (`parentId == null`) IS top-level and remains gated.
  *
- * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null, parentId: string|null, updatedAt: string|null }>}
+ * @returns {Array<{ id: string, title: string, assignee: string|null, parentId: string|null, updatedAt: string|null }>}
  */
 export function getTopLevelCandidateItems() {
   return getCandidateItems().filter((item) => item.parentId === null);
@@ -395,18 +513,17 @@ export function hasContentFingerprint(auditData) {
  * Build an actionable remediation command string for a work item that is
  * blocked by the producer-review gate.
  *
- * Suggests running the audit to clear the flag or clearing it manually
- * with `wl update <id> --needs-producer-review false` (the `wl` CLI flag is
- * kebab-case; the JSON field read back from `wl --json` is
- * `needsProducerReview`).
+ * Suggests clearing the producer hold manually with
+ * `wl update <id> --assignee ""` or running the audit to auto-resolve
+ * (SA-0MV9DUE6F006SK1H).
  *
  * @param {string} workItemId - The ID of the blocking work item.
- * @returns {string} A shell command to resolve the producer-review flag.
+ * @returns {string} A shell command to release the producer hold.
  */
 export function buildProducerReviewRemediationCommand(workItemId) {
   return [
-    `  # Clear the producer-review flag for ${workItemId}:`,
-    `  wl update ${workItemId} --needs-producer-review false --json`,
+    `  # Clear the producer hold for ${workItemId}:`,
+    `  wl update ${workItemId} --assignee "" --json`,
     `  # Or re-run audit to auto-resolve:`,
     `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId}`,
   ].join('\n');
@@ -415,24 +532,25 @@ export function buildProducerReviewRemediationCommand(workItemId) {
 // ── checkProducerReviewStatus ────────────────────────────────────────────────
 
 /**
- * Check a list of candidate work items for producer-review blocking.
+ * Check a list of candidate work items for producer-hold blocking.
  *
- * Items with `needsProducerReview = true`, `null`, or `undefined` are
- * considered blocking — they require producer approval before they can
- * be shipped. Items with `needsProducerReview = false` are passing.
+ * An item is blocking when it is producer-owned (`assignee === 'Map'`, the
+ * producer-hold sentinel) and therefore requires a producer decision before
+ * it can ship. Items without the producer hold are passing. This replaces
+ * the retired `needsProducerReview` flag (SA-0MV9DUE6F006SK1H).
  *
  * This is intended as a gating step in the release process, complementing
  * the audit readiness gate. It blocks the release with exit code 9 if any
- * candidate items need producer review.
+ * candidate items are producer-owned.
  *
- * @param {Array<{ id: string, title: string, needsProducerReview: boolean|null }>} items -
+ * @param {Array<{ id: string, title: string, assignee: string|null }>} items -
  *   Candidate work items to check (typically from `getCandidateItems()`).
  * @returns {{
  *   hasBlockingItems: boolean,
  *   blockingItems: Array<{
  *     workItemId: string,
  *     title: string,
- *     needsProducerReview: boolean|null,
+ *     assignee: string|null,
  *     reason: string,
  *     remediation: string
  *   }>,
@@ -451,23 +569,14 @@ export function checkProducerReviewStatus(items) {
   const blockingItems = [];
 
   for (const item of items) {
-    // Items with needsProducerReview = true, null, or undefined are blocking
-    const needsReview = item.needsProducerReview === true ||
-      item.needsProducerReview === null ||
-      item.needsProducerReview === undefined;
-
-    if (needsReview) {
-      const reason = item.needsProducerReview === true
-        ? 'Flagged for producer review'
-        : 'Producer-review status unknown (needsProducerReview not set)';
-
+    // Producer-owned items (assignee = producer-hold sentinel) block release
+    // until the producer reviews and releases the hold.
+    if (isProducerHeld(item)) {
       blockingItems.push({
         workItemId: item.id,
         title: item.title,
-        needsProducerReview: item.needsProducerReview !== undefined
-          ? item.needsProducerReview
-          : null,
-        reason,
+        assignee: item.assignee !== undefined ? item.assignee : null,
+        reason: 'Producer-owned (assignee hold set)',
         remediation: buildProducerReviewRemediationCommand(item.id),
       });
     }
@@ -528,13 +637,25 @@ export function checkProducerReviewStatus(items) {
  *   Runs the audit runner for the item.
  * @param {() => string} boundaries.resolveAuditRunnerFn - Resolves the audit
  *   runner script path.
+ * @param {(workItemId: string) => boolean} [boundaries.checkStuckAuditFn] -
+ *   Abort-recovery cleanup; defaults to {@link checkAndRestoreStuckAudit}.
+ *   Injectable for hermetic tests.
  * @returns {Promise<{ status: 'passing'|'blocking'|'runner-failed', reason: string, summary: string|null }>}
  */
-export async function attemptAuditRemediation(workItem, { runAuditShow, runAuditCommand, resolveAuditRunnerFn }) {
+export async function attemptAuditRemediation(workItem, { runAuditShow, runAuditCommand, resolveAuditRunnerFn, checkStuckAuditFn = checkAndRestoreStuckAudit }) {
   try {
     const runnerPath = resolveAuditRunnerFn();
     runAuditCommand(runnerPath, workItem.id);
+    // Abort-recovery (SA-0MTRH8C5O005URGR): if the audit runner was
+    // killed (SIGKILL) it cannot run its finally block — restore the
+    // work item from the leftover state file.
+    checkStuckAuditFn(workItem.id);
   } catch (err) {
+    // Abort-recovery (SA-0MTRH8C5O005URGR): a SIGKILLed audit runner
+    // surfaces here (execSync throws with status null / signal SIGKILL)
+    // and cannot run its own finally block — restore the work item from
+    // the leftover state file before classifying the failure.
+    checkStuckAuditFn(workItem.id);
     // Classify the failure so an infrastructure problem (timeout/concurrency/
     // provider) is distinguishable from a genuine verdict
     // (SA-0MUOO5V0P00461X8). The "Audit remediation failed" prefix is retained
