@@ -5365,7 +5365,6 @@ def _classify_child_assessment_reason(
 
     The caller decides whether to surface the code in the report or JSON payload.
     """
-    cid = str(child.get("id", "") or "")
     if _is_unserviced_main_slot_child(child, stale_pending_ids):
         return REASON_UNSERVICED_IN_MAIN_SLOT
     # A child whose child_audit_ready is False and which is not unserviced
