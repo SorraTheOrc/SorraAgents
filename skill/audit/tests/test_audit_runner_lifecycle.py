@@ -231,9 +231,9 @@ class TestVerdictDrivenStatusLifecycle:
         """AC1: Ready to close: Yes → status=completed, stage=in_review.
 
         Applies regardless of the pre-audit status (here: in_progress). The
-        item has no parent, so the terminal update applies the producer hold
-        (assignee = producer sentinel) — replacing the retired
-        --needs-producer-review flag (WL-0MV85WE7Q00044P9).
+        item has no parent, so the terminal update sets the restored
+        --needs-producer-review flag and clears the audit claim
+        (WL-0MVAMS4RO000H3B0 F6 / Q2=C).
         """
         updates = []
         self._run_issue(
@@ -244,7 +244,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--assignee", "Map", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]
 
     def test_ready_yes_child_clears_assignee(self):
@@ -276,7 +276,8 @@ class TestVerdictDrivenStatusLifecycle:
         last = self._last_update(updates)
         assert "--status" in last and "completed" in last
         assert "--stage" not in last  # stage stays 'done'
-        assert "--assignee" in last and "Map" in last
+        assert "--needs-producer-review" in last and "yes" in last
+        assert last[last.index("--assignee") + 1] == ""
 
     def test_ready_yes_child_keeps_terminal_done_stage(self):
         """AC2: A child keeps a pre-existing 'done' stage and clears the
@@ -291,7 +292,8 @@ class TestVerdictDrivenStatusLifecycle:
         last = self._last_update(updates)
         assert "--status" in last and "completed" in last
         assert "--stage" not in last  # stage stays 'done'
-        assert "--assignee" in last and "Map" not in last
+        assert "--needs-producer-review" not in last
+        assert last[last.index("--assignee") + 1] == ""
 
     def test_ready_yes_idempotent_on_completed_in_review(self):
         """AC6: Re-auditing a completed/in_review item with Yes stays completed/in_review."""
@@ -304,7 +306,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--assignee", "Map", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]
 
     # ------------------------------------------------------------------
@@ -516,7 +518,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--assignee", "Map", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]
 
     def test_preflight_guard_allows_open_items(self):
@@ -539,7 +541,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--assignee", "Map", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]
 
     # ------------------------------------------------------------------

@@ -373,5 +373,5 @@ class TestCascadeNoSideEffectDemotion:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review",
-            "--assignee", "Map", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]

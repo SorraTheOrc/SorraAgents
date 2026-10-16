@@ -11923,15 +11923,6 @@ _STATUS_STAGE_COMPAT: dict[str, frozenset[str]] = {
 }
 _DEFAULT_SAFE_STAGE = "plan_complete"
 
-#: Reserved assignee value that marks the producer's per-item scheduling hold.
-#: Mirrors ContextHub's ``PRODUCER_HOLD_ASSIGNEE`` in
-#: ``packages/herdr/src/downtime-worker.ts`` (WL-0MV85WDOM007BKF8; epic
-#: WL-0MV82CHGQ000HAZZ Q2). Assigning an item to the producer pauses
-#: auto-dispatch and marks the item producer-owned for the release gate —
-#: this replaces the retired ``needsProducerReview`` flag
-#: (WL-0MV85WE7Q00044P9).
-_PRODUCER_HOLD_ASSIGNEE = "Map"
-
 
 def _coerce_valid_status_stage(status, stage):
     """Validate and coerce a (status, stage) pair to a valid combination.
@@ -12309,15 +12300,16 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             expected_status, expected_stage = safe_status, safe_stage
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
-            # Producer hold (Option A; WL-0MV85WE7Q00044P9): a top-level item
-            # is assigned to the producer sentinel so the release gate blocks
-            # it until the producer reviews it. Child items are covered by
-            # their parent's review, so their assignee is CLEARED instead — a
-            # non-empty assignee would act as a scheduling hold and stop the
-            # item being re-dispatched (epic Q2; replaces the retired
-            # --needs-producer-review flag, SA-0MSSVKYEW008PJ9H). Either way
-            # the audit agent's own claim is released. The flag is inserted
-            # before the trailing --json (file convention: --json last).
+            # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6 / Q2=C): a
+            # top-level item is flagged `--needs-producer-review yes` so the
+            # release gate blocks it until the producer explicitly reviews
+            # it. Child items are covered by their parent's review, so they
+            # are NOT flagged — the flag would flood the producer queue with
+            # redundant approvals (SA-0MSSVKYEW008PJ9H). In both cases the
+            # audit agent's own assignee claim is CLEARED (status-neutral
+            # claim, WL-0MV85WCJJ0087VMP / WL-0MV7W77AY005MGBL fix). Flags
+            # are inserted before the trailing --json (file convention:
+            # --json last).
             # This is the sole authorisation for the descendant cascade
             # below — a passing verdict, not status/stage (AC3).
             cascade_authorised = True
@@ -12326,10 +12318,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                 cmd += ["--status", "completed"]
             else:
                 cmd += ["--status", "completed", "--stage", "in_review"]
+            cmd += ["--assignee", ""]
             if not ctx.wi or not ctx.wi.get("parentId"):
-                cmd += ["--assignee", _PRODUCER_HOLD_ASSIGNEE]
-            else:
-                cmd += ["--assignee", ""]
+                cmd += ["--needs-producer-review", "yes"]
             cmd.append("--json")
             restore_cmd = cmd
             # Stage is kept as the pre-existing 'done' when the item already
@@ -12383,13 +12374,14 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                 # integration fails the audit closed and flags the item for
                 # producer review so the producer investigates and integrates
                 # manually — never proceed past Phase 1 with unmerged work.
-                # The producer-review flag is re-homed onto the producer-hold
-                # assignee (WL-0MV85WE7Q00044P9).
+                # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6): flag the
+                # item for producer review, and clear the audit claim.
                 if ctx.merge_gate_blocker:
                     restore_cmd = [
                         "wl", "update", ctx.issue_id,
                         "--status", "open", "--stage", "plan_complete",
-                        "--assignee", _PRODUCER_HOLD_ASSIGNEE, "--json",
+                        "--assignee", "",
+                        "--needs-producer-review", "yes", "--json",
                     ]
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(

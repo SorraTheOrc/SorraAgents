@@ -1426,18 +1426,21 @@ class TestStatusLifecycle:
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
         # The verdict-driven transition (final update) sets a compatible stage
         # (in_review for a yes verdict) and, for a top-level item (no parentId
-        # in the captured work item), applies the producer hold
-        # (--assignee Map).
+        # in the captured work item), applies the restored
+        # --needs-producer-review flag after clearing the audit claim.
         final_update = wl_updates[-1] if wl_updates else []
         assert final_update[3:7] == ["--status", "completed", "--stage", "in_review"], (
             f"Expected completed/in_review transition on yes verdict, got: {final_update}"
         )
         assert "--assignee" in final_update, (
-            f"Top-level yes verdict must clear/apply the assignee, got: {final_update}"
+            f"Top-level yes verdict must clear the audit claim, got: {final_update}"
         )
         hold_idx = final_update.index("--assignee")
-        assert final_update[hold_idx + 1] == "Map", (
-            f"Top-level yes verdict must apply the producer hold --assignee Map, got: {final_update}"
+        assert final_update[hold_idx + 1] == "", (
+            f"Top-level yes verdict must clear the assignee, got: {final_update}"
+        )
+        assert "--needs-producer-review" in final_update and "yes" in final_update, (
+            f"Top-level yes verdict must set the restored --needs-producer-review yes, got: {final_update}"
         )
 
     def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):
