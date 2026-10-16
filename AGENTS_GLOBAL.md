@@ -18,6 +18,7 @@ Core principles for AI Agents working with work-items tracked in Worklog (wl) an
 If you already have a current work-item id, continue using it; otherwise ask the operator to create one or get permission to create one.
 
 1. **Claim** — `wl update <id> --status in_progress --assignee <agent>`.
+   Audit tier claims status-neutrally (assignee-CAS `--if-assignee ""`; stays completed/in_review); non-empty assignee = scheduling hold (producer `Map`; clear to release).
 2. **Define** — `wl show <id> --children --json`; verify clear goal + testable ACs; advance stage `intake_complete`.
 3. **Plan** — break into sub-tasks; `wl create --parent <id> --issue-type <type> --priority <level> --json`; advance stage `plan_complete`.
 4. **Decide** — `wl next --json`; recurse into children until reaching a leaf item; if none remain, go to End session. (`/skill:implement <parent>` recurses automatically.)
@@ -78,7 +79,7 @@ and relevant context.
 - Always record the commit message and hash in a comment on the relevant work item(s).
 - If push fails, resolve and retry until it succeeds.
 - When displaying a work-item ID, always include the title: `Title Text (ID)`.
-- **Session logging:** on new Pi session or work item, comment on the worklog item: `<agent_action> - Session ID: <pi_session_id> - <path_to_sessions_log>` (`PI_SESSION_ID` / `PI_SESSION_FILE`) via `wl comment add <id> --comment "<comment>" --author "<agent_name>" --json`.
+- **Session logging:** on new Pi session or work item, comment the worklog item via `wl comment add <id> --comment "<agent_action> - Session ID: <pi_session_id> - <path_to_sessions_log>" --author "<agent_name>" --json`.
 
 ## Important Rules
 
@@ -86,15 +87,15 @@ and relevant context.
 
 ## Recovering from a wiped/corrupt worklog database
 
-If the worklog database becomes wiped or corrupt (e.g. a mistaken `wl import`), the recovery procedure is:
+If the worklog database is wiped or corrupt (e.g. a mistaken `wl import`):
 
 1. **Run `wl init`** — this reinitialises the worklog store with a fresh database. It is the canonical recovery path.
 
-> **WARNING:** `wl import` is **destructive** — it replaces the entire target worklog store. Only use `wl import` with a verified full export/backup. An accidental `wl import` can wipe thousands of work items in seconds.
+> **WARNING:** `wl import` is **destructive** — it replaces the entire store. Use it only with a verified export/backup; an accidental import can wipe thousands of items.
 
 If `wl init` alone does not restore the data you need (e.g. when working from a backup rather than a fresh store), check for pre-migration snapshots:
 
-- `.worklog/backups/worklog.db.<timestamp>` — created automatically before `wl doctor upgrade` migrations. Restore by copying the snapshot into place and running `wl init`.
+- `.worklog/backups/worklog.db.<timestamp>` — automatic pre-upgrade snapshot; restore by copying into place, then `wl init`.
 
 ## Local skill extensions
 
