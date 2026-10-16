@@ -139,7 +139,10 @@ requests approval only for the largest and highest-risk work items — effort
 risk, or High/Severe risk with smaller effort) skips the approval pause and
 proceeds directly to the automated review stages. Absent effort/risk →
 default conservatively to requesting approval (a human checkpoint is never
-silently skipped).
+silently skipped); a value that is present but unrecognised (outside the
+canonical `wl` effort/risk vocabulary) likewise defaults conservatively to
+requesting approval, so a future vocabulary addition never silently skips
+the checkpoint (SA-0MUIUTJJS008W06Y).
 
 - **`request_approval == true`**: present the plan and ask the user to
   accept, edit, reorder, or split/merge — iterating until approved. State
