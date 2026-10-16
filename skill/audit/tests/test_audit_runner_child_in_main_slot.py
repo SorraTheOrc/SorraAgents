@@ -413,3 +413,220 @@ class TestChildScreensPendingGate:
         )
         assert "Child screens pending" not in report
         assert "Ready to close: Yes" in report
+
+
+#: Evidence text the in-main-slot Phase-1 screen call leaves on a child whose
+#: ``[AUDIT_IN_MAIN_SLOT_WORK]`` screens were emitted but never serviced
+#: (partial + ``MAIN_SLOT_PENDING_EVIDENCE`` — the single detection key of
+#: ``_pending_main_slot_child_ids``).
+_MAIN_SLOT_PENDING_SCREEN_EVIDENCE = (
+    "In-main-slot child Phase-1 AC screen emitted to the main LLM slot; "
+    "verdict pending main-session review."
+)
+
+
+def _child_in_main_slot(**overrides):
+    """Fixture child carrying the unserviced in-main-slot pending marker
+    (partial AC verdict + main-session-review evidence)."""
+    child = {
+        "id": "CHILD-1",
+        "title": "Child CHILD-1",
+        "status": "in_progress",
+        "stage": "in_review",
+        "ac_results": [
+            {"text": "CAC1", "verdict": "partial",
+             "evidence": _MAIN_SLOT_PENDING_SCREEN_EVIDENCE},
+        ],
+    }
+    child.update(overrides)
+    return child
+
+
+def unserviced_child_with_stored_verdict():
+    """An unserviced in-main-slot child that HAS a previously stored verdict.
+
+    The child's ``ac_results`` still carry the in-main-slot pending marker
+    (an earlier session serviced the screens and persisted the child audit
+    without rewriting the work item's ``ac_results``), but a stored verdict
+    exists (``reused_from`` + ``child_audit_ready`` — the same markers the
+    child-verdict reuse path, LP-0MSQ32MF200675AR, records).
+    """
+    return _child_in_main_slot(
+        child_audit_ready=True,
+        reused_from="2026-10-01T00:00:00.000Z",
+    )
+
+
+def unserviced_child_no_verdict():
+    """An unserviced in-main-slot child with NO stored verdict.
+
+    The ``[AUDIT_IN_MAIN_SLOT_WORK]`` screens were emitted by an earlier
+    session and never serviced (no persisted child audit, no ``reused_from``
+    marker) — the child is reportable only as NOT-ASSESSED.
+    """
+    return _child_in_main_slot()
+
+
+def genuinely_not_ready_child():
+    """A genuinely NOT-READY child: a blocking verdict whose evidence carries
+    NO in-main-slot pending marker (distinct from an unserviced child)."""
+    return {
+        "id": "CHILD-1",
+        "title": "Child CHILD-1",
+        "status": "in_progress",
+        "stage": "plan_complete",
+        "ac_results": [
+            {"text": "CAC1", "verdict": "unmet",
+             "evidence": "child.py:4 — blocking"},
+        ],
+        "child_audit_ready": False,
+        "child_audit_not_ready": True,
+    }
+
+
+#: Parent ACs (all met) shared by the unserviced-verdict fixtures so the
+#: report/JSON assessment depends only on the child under test.
+_UNSERVICED_PARENT_ACS = [
+    {"text": "AC one", "verdict": "met", "evidence": "parent.py:1"},
+]
+
+
+class TestUnservicedMainSlotVerdicts:
+    """TDD fixture suite for the parent's handling of UN-SERVICED in-main-slot
+    child verdicts (parent AC2, SA-0MUH6H87Z001HYJ7).
+
+    An *unserviced* child is one whose ``ac_results`` still carry the
+    in-main-slot pending evidence (``partial`` + main-session-review marker)
+    because an EARLIER invoking session emitted its
+    ``[AUDIT_IN_MAIN_SLOT_WORK]`` screens and never serviced them. Such
+    children are identified by the persisted ``<issue_id>.pending-screens.json``
+    signal written by the PREVIOUS run (the *stale* pending ids) — the parent
+    must not re-block its readiness-to-close decision on them:
+
+    - with a previously stored verdict → the parent INHERITS the stored
+      verdict rather than blocking (the ``stale_pending_ids``-driven
+      subtraction lands with SA-0MVAWFUU0004VW45 — the first two tests are
+      pinned RED with ``xfail(strict=True)`` tracer-bullet markers, the same
+      pattern as ``test_suite_resolution.py`` F1→F2, and are un-marked once
+      the production change lands);
+    - without a stored verdict → the child is NOT-ASSESSED (does not block
+      via the pending gate and is never reported ready);
+    - a genuinely not-ready child (blocking verdict, no pending marker)
+      still blocks — covered GREEN in
+      ``test_audit_runner_children.py::TestUnservicedVerdictGuardAndAgreement``;
+    - freshly emitted screens in the CURRENT run (no stale signal) still
+      force ``Ready to close: No``.
+
+    Asserts on ``_build_issue_json`` / ``_assemble_issue_report`` directly
+    with fixture child results (this item's Minimal Implementation).
+    """
+
+    # ------------------------------------------------------------------
+    # AC2 — unserviced child WITH a previously stored verdict is inherited
+    # ------------------------------------------------------------------
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "unserviced in-main-slot verdict inheritance lands with "
+            "SA-0MVAWFUU0004VW45 (stale_pending_ids subtraction)"
+        ),
+    )
+    def test_inherits_stored_ready_verdict_rather_than_blocking(self):
+        """A child whose ac_results stay ``partial`` (unserviced screens) but
+        which has a previously STORED ready verdict is inherited: the parent
+        does not re-block on the pending gate — the JSON payload reports
+        ``ready_to_close: True`` with no pending screens and the markdown
+        report says ``Ready to close: Yes`` with no gate line."""
+        stale_pending_ids = {"CHILD-1"}
+        child = unserviced_child_with_stored_verdict()
+
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+            stale_pending_ids=stale_pending_ids,
+        )
+        assert payload["ready_to_close"] is True
+        assert payload["pending_child_screens"] == []
+
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+            stale_pending_ids=stale_pending_ids,
+        )
+        assert "Ready to close: Yes" in report
+        assert "Child screens pending" not in report
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "unserviced in-main-slot not-assessed marking lands with "
+            "SA-0MVAWFUU0004VW45 (stale_pending_ids subtraction)"
+        ),
+    )
+    def test_not_assessed_without_stored_verdict_no_gate_never_ready(self):
+        """An unserviced child with NO stored verdict is NOT-ASSESSED: it
+        does not trigger the pending-screens gate (no ``Child screens
+        pending`` line, not listed in ``pending_child_screens``) and is
+        never reported ready (``ready_to_close: False`` / ``Ready to close:
+        No``)."""
+        stale_pending_ids = {"CHILD-1"}
+        child = unserviced_child_no_verdict()
+
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+            stale_pending_ids=stale_pending_ids,
+        )
+        assert payload["ready_to_close"] is False  # never reported ready
+        assert "CHILD-1" not in payload["pending_child_screens"]  # no gate
+
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+            stale_pending_ids=stale_pending_ids,
+        )
+        assert "Ready to close: No" in report
+        assert "Child screens pending" not in report
+
+    # ------------------------------------------------------------------
+    # Controls that are GREEN against the current runner
+    # ------------------------------------------------------------------
+
+    def test_fresh_pending_without_stale_signal_still_gate_blocks(self):
+        """A child whose in-main-slot screens were freshly emitted in the
+        CURRENT run (no stale pending-screens signal — ``stale_pending_ids``
+        absent) still forces ``Ready to close: No`` and the child-audit
+        execution gate (SA-0MU32TE120012T49)."""
+        child = _child_in_main_slot()
+
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        assert payload["ready_to_close"] is False
+        assert payload["pending_child_screens"] == ["CHILD-1"]
+
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        assert "Ready to close: No" in report
+        assert "Child screens pending: 1 (main-slot) — CHILD-1" in report
+
+    def test_reused_stored_verdict_child_already_inherited_today(self):
+        """GREEN baseline: a child whose ac_results carry the STORED verdict
+        (child-verdict reuse, LP-0MSQ32MF200675AR — ``reused_from`` + met
+        acs, in_review stage) is already treated as inherited today: the
+        parent reports ready and never emits a gate line. The unserviced
+        xfail fixtures above extend THIS contract to children whose
+        ac_results still carry the stale pending marker."""
+        child = unserviced_child_with_stored_verdict()
+        child["ac_results"] = [
+            {"text": "CAC1", "verdict": "met", "evidence": "child.py:1"},
+        ]
+
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        assert payload["ready_to_close"] is True
+
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        assert "Ready to close: Yes" in report
+        assert "Child screens pending" not in report
