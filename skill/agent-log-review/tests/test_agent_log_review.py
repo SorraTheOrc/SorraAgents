@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 
 import agent_log_review as alr
+import pytest
 
 # ── fixture helpers ────────────────────────────────────────────────────────
 
@@ -638,10 +639,202 @@ def test_extract_signals_bundles_all_signal_types():
                  thinking_texts=["hmm, this is wrong"])
     sig = alr.extract_signals([s])
     assert set(sig.keys()) >= {
-        "session_count", "tool_distribution", "thinking_signals",
+        "session_count", "session_files", "tool_distribution", "thinking_signals",
         "tool_errors", "retry_patterns",
     }
+    assert sig["session_files"] == ["a.jsonl"]
     assert sig["tool_distribution"]["total_calls"] == 1
     assert sig["tool_errors"]["total"] == 1
     assert sig["thinking_signals"]["total_hits"] >= 2
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Child 3 — LLM-assisted pattern classification
+# (SA-0MV6UETWV002CF5T)
+# ══════════════════════════════════════════════════════════════════════════
+
+import types
+
+
+def _fake_runner(stdout: str, rc: int = 0):
+    """A pi runner that records the command and returns a canned response."""
+    return types.SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
+
+
+def _capture_runner(responses):
+    """A runner that appends each command to a list and returns responses."""
+    captured = []
+
+    def runner(cmd):
+        captured.append(cmd)
+        return _fake_runner(responses.pop(0))
+
+    return runner, captured
+
+
+class _Runner:
+    """Duck-typed runner wrapper for fixed responses."""
+
+    def __init__(self, stdout="", rc=0):
+        self.stdout = stdout
+        self.rc = rc
+        self.commands = []
+
+    def __call__(self, cmd):
+        self.commands.append(cmd)
+        return _fake_runner(self.stdout, self.rc)
+
+
+WELL_FORMED_RESPONSE = json.dumps({
+    "categories": [
+        {
+            "name": "shell quoting issues",
+            "confidence": 0.9,
+            "evidence_sessions": ["a.jsonl"],
+            "summary": "Backticks expanded in shell commands.",
+        }
+    ],
+    "recommendations": [
+        {
+            "title": "Warn when backticks are used in bash commands",
+            "issue_type": "chore",
+            "target_skill": "implement",
+            "rationale": "Backtick expansion caused repeated retries.",
+            "evidence_sessions": ["a.jsonl"],
+        }
+    ],
+})
+
+
+def _classification_fixture():
+    s1 = _session("a.jsonl",
+                  events=[
+                      _tool_call("a.jsonl", "bash", {"cmd": "echo `ls`"}, 1),
+                      _tool_result("a.jsonl", "bash", "Traceback (command not found: ls`)", 2, is_error=True),
+                      _tool_call("a.jsonl", "bash", {"cmd": "echo \"$(ls)\""}, 3),
+                  ],
+                  thinking_texts=["hmm, the backticks expanded — that is wrong"])
+    s2 = _session("b.jsonl",
+                  events=[_tool_call("b.jsonl", "read", {"path": "x.py"}, 1)],
+                  thinking_texts=["nothing concerning here"])
+    return alr.extract_signals([s1, s2])
+
+
+def test_classify_prompt_excludes_raw_log_content_and_cites_sessions():
+    signals = _classification_fixture()
+    runner = _Runner()
+    alr.classify_patterns(signals, runner=runner)
+    assert runner.commands
+    prompt = runner.commands[0][-1]
+    # Evidence mapping: session file names present.
+    assert "a.jsonl" in prompt
+    assert "b.jsonl" in prompt
+    # Prompt carries only distilled signals, never raw thinking text... the
+    # capped context keeps short excerpts, so assert full sentences are absent.
+    assert "nothing concerning here" not in prompt
+    assert "echo \"$(ls)\"" not in prompt
+
+
+def test_classify_prompt_stays_under_budget():
+    signals = _classification_fixture()
+    runner = _Runner()
+    result = alr.classify_patterns(signals, runner=runner)
+    assert result["prompt_bytes"] <= alr.PROMPT_BUDGET_BYTES
+    prompt = runner.commands[0][-1]
+    assert len(prompt.encode("utf-8")) <= alr.PROMPT_BUDGET_BYTES
+
+
+def test_classify_patterns_parses_well_formed_response():
+    signals = _classification_fixture()
+    runner = _Runner(stdout=WELL_FORMED_RESPONSE)
+    result = alr.classify_patterns(signals, runner=runner)
+    assert result["error"] is None
+    assert len(result["categories"]) == 1
+    cat = result["categories"][0]
+    assert cat["name"] == "shell quoting issues"
+    assert cat["confidence"] == 0.9
+    assert cat["evidence_sessions"] == ["a.jsonl"]
+    assert len(result["recommendations"]) == 1
+    rec = result["recommendations"][0]
+    assert rec["issue_type"] == "chore"
+    assert rec["target_skill"] == "implement"
+
+
+def test_classify_patterns_tolerates_code_fence():
+    signals = _classification_fixture()
+    fenced = "```json\n" + WELL_FORMED_RESPONSE + "\n```"
+    result = alr.classify_patterns(signals, runner=_Runner(stdout=fenced))
+    assert result["error"] is None
+    assert result["categories"][0]["name"] == "shell quoting issues"
+
+
+def test_classify_patterns_malformed_response_is_diagnostic():
+    signals = _classification_fixture()
+    result = alr.classify_patterns(signals, runner=_Runner(stdout="{ not json !!!"))
+    assert result["error"] is not None
+    assert "malformed JSON" in result["error"]
+    assert result["categories"] == []
+    assert result["recommendations"] == []
+
+
+def test_classify_patterns_empty_response_is_diagnostic():
+    signals = _classification_fixture()
+    result = alr.classify_patterns(signals, runner=_Runner(stdout=""))
+    assert result["error"] is not None
+    assert result["categories"] == []
+
+
+def test_classify_patterns_pi_failure_is_diagnostic():
+    signals = _classification_fixture()
+    result = alr.classify_patterns(signals, runner=_Runner(rc=1))
+    assert result["error"] is not None
+    assert "pi classification call failed" in result["error"]
+    assert result["categories"] == []
+
+
+def test_classify_patterns_prompt_budget_overflow_raises():
+    signals = _classification_fixture()
+    with pytest.raises(alr.ClassificationError):
+        alr.classify_patterns(signals, runner=_Runner(), prompt_budget=100)
+
+
+def test_call_pi_builds_context_reduced_command():
+    signals = _classification_fixture()
+    runner = _Runner(stdout=WELL_FORMED_RESPONSE)
+    alr.classify_patterns(signals, model="m/model", runner=runner)
+    cmd = runner.commands[0]
+    assert "-p" in cmd and "--print" in cmd
+    assert "--model" in cmd and "m/model" in cmd
+    assert "--no-tools" in cmd
+    for flag in ("--no-context-files", "--no-skills", "--no-extensions"):
+        assert flag in cmd
+    assert cmd[-1] == runner.commands[0][-1]  # prompt is the last arg
+
+
+def test_redact_secrets_basic():
+    text = (
+        "key=sk-abcdef1234567890abcdef1234567890 token=Bearer eyJhbGciOiJIUzI1NiJ9 "
+        "path1=/home/u/.ssh/id_rsa path2=/.env.local"
+    )
+    redacted = alr.redact_secrets(text)
+    assert "sk-abcdef1234567890abcdef1234567890" not in redacted
+    assert "<API_KEY>" in redacted
+    assert "eyJhbGciOiJIUzI1NiJ9" not in redacted
+    assert "Bearer <TOKEN>" in redacted
+    assert ".ssh" in redacted and "id_rsa" not in redacted
+    assert "env<redacted>" in redacted
+
+
+def test_prompt_is_redacted_before_send():
+    signals = _classification_fixture()
+    # Inject a secret-looking thinking excerpt through the fixture.
+    s = _session("secret.jsonl",
+                 thinking_texts=["hmm, my token sk-abcdef1234567890abcdef1234567890 leaked"])
+    signals = alr.extract_signals([s])
+    runner = _Runner(stdout=WELL_FORMED_RESPONSE)
+    alr.classify_patterns(signals, runner=runner)
+    prompt = runner.commands[0][-1]
+    assert "sk-abcdef1234567890abcdef1234567890" not in prompt
+    assert "<API_KEY>" in prompt
+
 

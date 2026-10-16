@@ -28,9 +28,8 @@ if str(REPO_ROOT) not in sys.path:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pytest
-
 import benchmark_grep_scans as bench
+import pytest
 
 
 @contextlib.contextmanager

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -722,9 +723,195 @@ def extract_signals(
         result_sessions = [s for s in result_sessions if _session_has_error(s)]
     return {
         "session_count": len(result_sessions),
+        "session_files": sorted(s.filename for s in result_sessions),
         "tool_distribution": extract_tool_distribution(result_sessions),
         "thinking_signals": extract_thinking_signals(result_sessions),
         "tool_errors": extract_tool_errors(result_sessions),
         "retry_patterns": extract_retry_patterns(result_sessions),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Layer 3 — LLM-assisted pattern classification
+# (SA-0MV6UETWV002CF5T)
+# ══════════════════════════════════════════════════════════════════════════
+
+DEFAULT_CLASSIFIER_MODEL = os.environ.get(
+    "AGENT_LOG_REVIEW_MODEL", "Local Proxy/code"
+)
+"""Model used for classification (configurable via env or ``--model``)."""
+
+PROMPT_BUDGET_BYTES = 32 * 1024
+"""Documented upper bound for the distilled-signal prompt (parent AC 3)."""
+
+PI_CALL_TIMEOUT = 600
+"""Per-call timeout for the classification ``pi`` subprocess."""
+
+SECRET_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"sk-[A-Za-z0-9_-]{16,}"), "<API_KEY>"),
+    (re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE), "Bearer <TOKEN>"),
+    (re.compile(r"\.ssh[/\\][^\s\"']*"), ".ssh/ <redacted>"),
+    (re.compile(r"\.env(?:\.local)?\b", re.IGNORECASE), ".env<redacted>"),
+)
+"""Redaction rules applied to every excerpt/prompt before an LLM call."""
+
+
+class PiCallError(RuntimeError):
+    """Raised when the classification ``pi`` subprocess exits non-zero."""
+
+
+class ClassificationError(RuntimeError):
+    """Raised for prompt-budget overflow (hard error, not a parse failure)."""
+
+
+def redact_secrets(text: str) -> str:
+    """Replace secret-like substrings in *text* with placeholders.
+
+    Covers API-key patterns (``sk-...``), ``Bearer`` tokens, and paths
+    mentioning ``.ssh`` / ``.env`` (privacy rule: excerpts never persist raw
+    secrets). Deterministic per input.
+    """
+    if not text:
+        return text
+    redacted = text
+    for pattern, replacement in SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _default_pi_runner(cmd: list[str]) -> object:
+    """Run the classification ``pi`` call, capturing stdout/stderr."""
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=PI_CALL_TIMEOUT, check=False,
+    )
+
+
+def _call_pi(
+    prompt: str,
+    model: str = DEFAULT_CLASSIFIER_MODEL,
+    runner: Any = None,
+    pi_bin: str = "pi",
+) -> str:
+    """Make a single non-interactive ``pi --print --no-tools`` call.
+
+    Follows the audit skill's subprocess pattern with full context reduction
+    (``--no-context-files --no-skills --no-extensions``) so the classifier
+    returns plain text and never inherits repo/skill context. *runner* is
+    injectable for deterministic tests; it must accept the command list and
+    return an object with ``returncode``/``stdout``/``stderr``.
+    """
+    cmd = [
+        pi_bin, "-p", "--print", "--model", model,
+        "--no-tools", "--no-context-files", "--no-skills", "--no-extensions",
+        prompt,
+    ]
+    runner_fn = runner if runner is not None else _default_pi_runner
+    proc = runner_fn(cmd)
+    if getattr(proc, "returncode", 1) != 0:
+        stderr = (getattr(proc, "stderr", "") or "").strip()
+        raise PiCallError(f"pi classification call failed (rc={proc.returncode}): {stderr[:300]}")
+    return proc.stdout or ""
+
+
+def _build_classification_prompt(signals: dict[str, Any]) -> str:
+    """Compose the distilled-signal prompt for the LLM classifier.
+
+    Only counts, distributions and capped excerpts are included — never raw
+    session log content. Session file names (redacted-then-sorted) are listed
+    up front so model citations map back to sessions. The signals JSON is
+    passed through :func:`redact_secrets` before inclusion.
+    """
+    session_files = sorted(signals.get("session_files") or [])
+    count = int(signals.get("session_count", len(session_files)))
+    signals_redacted = redact_secrets(json.dumps(signals, indent=1))
+    return (
+        "You are analysing pi coding-agent session logs for repeated confusion patterns.\n"
+        f"Below are distilled heuristic signals from {count} session(s):\n"
+        f"Sessions analysed: {', '.join(session_files) if session_files else '(none)'.strip()}\n\n"
+        "Classify the signals into confusion-pattern categories and actionable "
+        "skill improvements. Respond with ONLY a JSON object of exactly this shape:\n"
+        '{"categories": [{"name": str, "confidence": float between 0 and 1, '
+        '"evidence_sessions": [str], "summary": str}], '
+        '"recommendations": [{"title": str, "issue_type": "chore" or "feature", '
+        '"target_skill": str, "rationale": str, "evidence_sessions": [str]}]}\n'
+        '"evidence_sessions" entries must be session file names from the '
+        "Sessions analysed list above (or [] if none).\n\n"
+        "SIGNALS (redacted):\n"
+        f"{signals_redacted}\n"
+    )
+
+
+def _parse_classification_response(stdout: str) -> dict[str, Any]:
+    """Parse the model's JSON response, tolerating surrounding text/fences."""
+    text = (stdout or "").strip()
+    if not text:
+        raise ClassificationError("model returned an empty response")
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ClassificationError(f"model returned malformed JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ClassificationError("model response is not a JSON object")
+    return parsed
+
+
+def classify_patterns(
+    signals: dict[str, Any],
+    model: str = DEFAULT_CLASSIFIER_MODEL,
+    runner: Any = None,
+    prompt_budget: int = PROMPT_BUDGET_BYTES,
+) -> dict[str, Any]:
+    """Classify distilled *signals* into categories and recommendations.
+
+    One batched ``pi --print --no-tools`` call, hybrid design: heuristics
+    extracted the signals, the LLM only classifies them. Fail-soft:
+    - prompt over *prompt_budget* → raises :class:`ClassificationError`
+      (hard error: the signals are too large to send safely);
+    - pi subprocess failure or malformed model output → returned as a
+      structured ``error`` diagnostic (never a crash), with empty
+      categories/recommendations.
+
+    Returns: ``{"error": str|None, "categories": [...],
+    "recommendations": [...], "prompt_bytes": int}`` where
+    ``categories`` is a list of ``{name, confidence, evidence_sessions,
+    summary}`` and ``recommendations`` a list of ``{title, issue_type,
+    target_skill, rationale, evidence_sessions}``.
+    """
+    prompt = _build_classification_prompt(signals)
+    prompt_bytes = len(prompt.encode("utf-8"))
+    if prompt_bytes > prompt_budget:
+        raise ClassificationError(
+            f"classification prompt of {prompt_bytes} bytes exceeds the "
+            f"{prompt_budget}-byte budget; reduce max_sessions or excerpt size"
+        )
+    try:
+        stdout = _call_pi(prompt, model=model, runner=runner)
+        parsed = _parse_classification_response(stdout)
+    except PiCallError as exc:
+        return {
+            "error": str(exc), "categories": [], "recommendations": [],
+            "prompt_bytes": prompt_bytes,
+        }
+    except ClassificationError as exc:
+        return {
+            "error": str(exc), "categories": [], "recommendations": [],
+            "prompt_bytes": prompt_bytes,
+        }
+    categories = parsed.get("categories") or []
+    recommendations = parsed.get("recommendations") or []
+    if not isinstance(categories, list) or not isinstance(recommendations, list):
+        return {
+            "error": "model response missing categories/recommendations lists",
+            "categories": [], "recommendations": [], "prompt_bytes": prompt_bytes,
+        }
+    return {
+        "error": None,
+        "categories": categories,
+        "recommendations": recommendations,
+        "prompt_bytes": prompt_bytes,
+    }
+
 
