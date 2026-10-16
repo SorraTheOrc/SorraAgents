@@ -260,34 +260,49 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$pif_bin"; then
   echo "  export PATH=\"$pif_bin:\$PATH\"" >&2
 fi
 # ── Context-budget pre-push hook wiring ───────────────────────────────────
-# Install the v2 pre-push hook (worklog sync + context-budget gate + branch
-# policy) into the *current project* and configure git to use .githooks/.
-# The gate's measure_context.py resolves via the installed global skill
-# symlink (~/.pi/agent/skills/context-audit/scripts/measure_context.py); each
-# project ships its own per-project thresholds file
+# Install a pre-push hook (worklog sync + context-budget gate + branch policy)
+# into the *current project* and configure git to use .githooks/. The gate's
+# measure_context.py resolves via the installed global skill symlink
+# (~/.pi/agent/skills/context-audit/scripts/measure_context.py); each project
+# ships its own per-project thresholds file
 # (docs/dev/context-budget.thresholds.json) generated via
 # `measure_context.py --generate-thresholds`.
+#
+# Two hook variants exist. The canonical source repo (SorraAgents) ships a
+# repo-local full-suite runner, so it gets the v3 hook (.githooks/pre-push:
+# context-budget gate + worklog sync + branch policy + full-suite test gate).
+# Every other project gets the framework v2 hook (.githooks/pre-push.v2:
+# context-budget gate + worklog sync + branch policy, NO full-suite gate) —
+# only SorraAgents ships skill/test/scripts/run_tests.py, and the v3
+# full-suite gate would otherwise hard-fail every dev/main push in a project
+# that lacks the repo-local runner (SA-0MV8M4OVX000QHSM).
 #
 # Set PI_SKIP_HOOK_INSTALL=1 to skip hook wiring entirely.
 if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
   CURRENT_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -n "$CURRENT_REPO_ROOT" ]; then
     GITHOOKS_DIR="$CURRENT_REPO_ROOT/.githooks"
-    HOOK_SRC="$SRC_DIR/.githooks/pre-push"
+    if [ -f "$CURRENT_REPO_ROOT/skill/test/scripts/run_tests.py" ]; then
+      HOOK_SRC="$SRC_DIR/.githooks/pre-push"
+      HOOK_LABEL="v3"
+    else
+      HOOK_SRC="$SRC_DIR/.githooks/pre-push.v2"
+      HOOK_LABEL="framework v2"
+    fi
     HOOK_DST="$GITHOOKS_DIR/pre-push"
 
-    # 1. Ensure the v2 hook is present in .githooks/pre-push (idempotent).
+    # 1. Ensure the selected hook is present in .githooks/pre-push (idempotent).
     if [ -f "$HOOK_SRC" ]; then
       if [ ! -f "$HOOK_DST" ]; then
         mkdir -p "$GITHOOKS_DIR"
         cp "$HOOK_SRC" "$HOOK_DST"
         chmod +x "$HOOK_DST"
-        echo "Installed v2 pre-push hook: $HOOK_DST (context-budget gate + worklog sync)"
+        echo "Installed $HOOK_LABEL pre-push hook: $HOOK_DST (context-budget gate + worklog sync)"
       else
         echo "OK: pre-push hook already present: $HOOK_DST"
       fi
     else
-      echo "WARNING: source v2 pre-push hook not found at $HOOK_SRC; skipping hook install" >&2
+      echo "WARNING: source $HOOK_LABEL pre-push hook not found at $HOOK_SRC; skipping hook install" >&2
     fi
 
     # 2. Configure git to use .githooks/ (idempotent).
