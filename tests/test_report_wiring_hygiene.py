@@ -46,6 +46,7 @@ import render_report as report_renderer
 # standardized report. git-management and owner-inference were retired
 # (SA-0MSN81W9G006K0K8); report/speak are excluded (helper / non-work-item).
 WORK_ITEM_SKILLS = [
+    "agent-log-review",
     "audit",
     "author-command",
     "cleanup",
