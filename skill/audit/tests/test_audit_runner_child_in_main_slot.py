@@ -505,10 +505,7 @@ class TestUnservicedMainSlotVerdicts:
 
     - with a previously stored verdict → the parent INHERITS the stored
       verdict rather than blocking (the ``stale_pending_ids``-driven
-      subtraction lands with SA-0MVAWFUU0004VW45 — the first two tests are
-      pinned RED with ``xfail(strict=True)`` tracer-bullet markers, the same
-      pattern as ``test_suite_resolution.py`` F1→F2, and are un-marked once
-      the production change lands);
+      subtraction, SA-0MVAWFUU0004VW45);
     - without a stored verdict → the child is NOT-ASSESSED (does not block
       via the pending gate and is never reported ready);
     - a genuinely not-ready child (blocking verdict, no pending marker)
@@ -525,13 +522,6 @@ class TestUnservicedMainSlotVerdicts:
     # AC2 — unserviced child WITH a previously stored verdict is inherited
     # ------------------------------------------------------------------
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "unserviced in-main-slot verdict inheritance lands with "
-            "SA-0MVAWFUU0004VW45 (stale_pending_ids subtraction)"
-        ),
-    )
     def test_inherits_stored_ready_verdict_rather_than_blocking(self):
         """A child whose ac_results stay ``partial`` (unserviced screens) but
         which has a previously STORED ready verdict is inherited: the parent
@@ -555,13 +545,6 @@ class TestUnservicedMainSlotVerdicts:
         assert "Ready to close: Yes" in report
         assert "Child screens pending" not in report
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "unserviced in-main-slot not-assessed marking lands with "
-            "SA-0MVAWFUU0004VW45 (stale_pending_ids subtraction)"
-        ),
-    )
     def test_not_assessed_without_stored_verdict_no_gate_never_ready(self):
         """An unserviced child with NO stored verdict is NOT-ASSESSED: it
         does not trigger the pending-screens gate (no ``Child screens
@@ -630,3 +613,74 @@ class TestUnservicedMainSlotVerdicts:
         )
         assert "Ready to close: Yes" in report
         assert "Child screens pending" not in report
+
+
+class TestPendingScreensSignalRead:
+    """The stale pending-screens signal is the unserviced-child detection
+    key (SA-0MVAWFUU0004VW45 AC2).
+
+    ``_read_pending_screens_signal`` must read the ``<issue_id>.pending-
+    screens.json`` file written by a previous run, and degrade to an empty
+    set when the file is absent or unreadable (fail-open).
+    """
+
+    def test_reads_persisted_signal(self, tmp_path):
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1", "CHILD-2"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        signal = tmp_path / "TEST-1.pending-screens.json"
+        assert signal.is_file()
+        assert audit_runner._read_pending_screens_signal(
+            "TEST-1", tmp_path, str(tmp_path),
+        ) == {"CHILD-1", "CHILD-2"}
+
+    def test_missing_signal_reads_empty(self, tmp_path):
+        assert audit_runner._read_pending_screens_signal(
+            "TEST-1", tmp_path, str(tmp_path),
+        ) == set()
+
+    def test_corrupt_signal_reads_empty(self, tmp_path):
+        (tmp_path / "TEST-1.pending-screens.json").write_text(
+            "{not valid json", encoding="utf-8",
+        )
+        assert audit_runner._read_pending_screens_signal(
+            "TEST-1", tmp_path, str(tmp_path),
+        ) == set()
+
+    def test_signal_round_trip_drives_inheritance(self, tmp_path):
+        """End-to-end detection: a persisted stale signal plus the child's
+        unserviced pending marker drives the inheritance subtraction through
+        ``_build_issue_json`` — no explicit set is hand-passed by the test."""
+        child = unserviced_child_with_stored_verdict()
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        stale = audit_runner._read_pending_screens_signal(
+            "TEST-1", tmp_path, str(tmp_path),
+        )
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+            stale_pending_ids=stale,
+        )
+        assert payload["ready_to_close"] is True
+        assert payload["pending_child_screens"] == []
+
+    def test_stale_signal_for_other_child_does_not_unservice_fresh_child(
+        self, tmp_path,
+    ):
+        """A stale signal naming a DIFFERENT child must not suppress the
+        current run's freshly emitted pending screen for this child: the
+        fresh child still gates."""
+        child = _child_in_main_slot()  # fresh pending marker, id CHILD-1
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-OTHER"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        stale = audit_runner._read_pending_screens_signal(
+            "TEST-1", tmp_path, str(tmp_path),
+        )
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+            stale_pending_ids=stale,
+        )
+        assert payload["ready_to_close"] is False
+        assert payload["pending_child_screens"] == ["CHILD-1"]

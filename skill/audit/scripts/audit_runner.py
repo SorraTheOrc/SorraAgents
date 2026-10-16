@@ -5233,6 +5233,92 @@ def _write_pending_screens_signal(
         pass
 
 
+def _is_unserviced_main_slot_child(
+    child: dict,
+    stale_pending_ids: set[str] | None,
+) -> bool:
+    """True when *child* is an UN-SERVICED in-main-slot child from a previous run.
+
+    Reads the persisted ``<issue_id>.pending-screens.json`` signal written
+    by the PREVIOUS run (the *stale* pending ids, see
+    :func:`_read_pending_screens_signal`) plus the child's own pending
+    state: a child named in the stale signal whose ``ac_results`` still
+    carry the unserviced in-main-slot pending marker (``partial`` +
+    :data:`MAIN_SLOT_PENDING_EVIDENCE`) was left pending by an invoking
+    session that never serviced its ``[AUDIT_IN_MAIN_SLOT_WORK]`` screens.
+    The parent must not re-block its readiness decision on such a child
+    (SA-0MVAWFUU0004VW45 AC2). Whether the child INHERITS a previously
+    stored verdict or is reported NOT-ASSESSED is decided by the caller via
+    :func:`_child_has_stored_verdict`.
+    """
+    cid = str(child.get("id", "") or "")
+    if not cid or not stale_pending_ids or cid not in stale_pending_ids:
+        return False
+    acs = child.get("ac_results") or []
+    return any(
+        a.get("verdict") == VERDICT_PARTIAL
+        and MAIN_SLOT_PENDING_EVIDENCE in str(a.get("evidence", ""))
+        for a in acs
+    )
+
+
+def _child_has_stored_verdict(child: dict) -> bool:
+    """True when *child* carries a previously stored child-audit verdict.
+
+    The child-verdict reuse path (LP-0MSQ32MF200675AR) records
+    ``reused_from`` (the child audit's audited-at timestamp) plus an
+    explicit ``child_audit_ready`` bool when it reuses a persisted child
+    audit. An unserviced in-main-slot child carrying such markers INHERITS
+    the stored verdict instead of being reported not-assessed
+    (SA-0MVAWFUU0004VW45 AC2).
+    """
+    return bool(child.get("reused_from")) or child.get("child_audit_ready") is not None
+
+
+def _unserviced_main_slot_child_ids(
+    child_results: list[dict],
+    stale_pending_ids: set[str] | None,
+) -> set[str]:
+    """Ids of *child_results* that are un-serviced in-main-slot children.
+
+    The stale-signal subtraction point shared by the report-assembly and
+    JSON-payload paths: every such child is subtracted from the pending
+    gate before the readiness calculation (SA-0MVAWFUU0004VW45 AC2).
+    """
+    return {
+        str(c.get("id", "") or "")
+        for c in child_results or []
+        if _is_unserviced_main_slot_child(c, stale_pending_ids)
+    }
+
+
+def _read_pending_screens_signal(
+    issue_id: str,
+    owning_root: str | Path | None,
+    explicit_dir: str | None = None,
+) -> set[str]:
+    """Read the resumable in-main-slot pending-screens signal of a previous run.
+
+    Returns the set of child ids whose in-main-slot screens were left
+    pending by the PREVIOUS run (the *stale* pending ids), or an empty set
+    when no signal exists (no previous in-main-slot run, checkpointing
+    disabled, or all screens serviced/cleared). Best-effort: a missing or
+    unreadable file yields an empty set, never an error
+    (SA-0MVAWFUU0004VW45 AC2).
+    """
+    directory = resolve_checkpoint_dir(owning_root, explicit_dir)
+    if directory is None:
+        return set()
+    signal = Path(directory) / f"{issue_id}{PENDING_SCREENS_SIGNAL_SUFFIX}"
+    try:
+        if not signal.is_file():
+            return set()
+        payload = json.loads(signal.read_text(encoding="utf-8"))
+        return set(payload.get("pending_child_screens") or [])
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
 def _format_blocking_children(children: list[dict]) -> str:
     """Render pre-review children for the report's summary line.
 
@@ -5263,7 +5349,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            test_skill_run_sha: str | None = None,
                            content_fingerprint: str | None = None,
                            merge_gate_evidence: str | None = None,
-                           snapshot_exempt: set[str] | None = None) -> str:
+                           snapshot_exempt: set[str] | None = None,
+                           stale_pending_ids: set[str] | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -5335,9 +5422,27 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         ("Ready to close: No"). Medium and low findings produce warnings
         but do NOT block closure.
     """
+    # UN-SERVICED in-main-slot children (SA-0MVAWFUU0004VW45 AC2): a child
+    # whose screens were left pending by a PREVIOUS run (stale
+    # pending-screens signal) and whose ac_results still carry the unserviced
+    # pending marker is subtracted from the pending gate below. With a
+    # previously STORED verdict the parent INHERITS it — the child's partial
+    # acs no longer count against all_ac_acceptable (the stored verdict
+    # governs); without one the child is NOT-ASSESSED — its acs still count
+    # (partial ⇒ not acceptable ⇒ the parent is never reported ready).
+    unserviced_ids = _unserviced_main_slot_child_ids(child_results, stale_pending_ids)
+    child_acs = [
+        a
+        for c in child_results
+        if (
+            str(c.get("id", "") or "") not in unserviced_ids
+            or not _child_has_stored_verdict(c)
+        )
+        for a in c.get("ac_results", [])
+    ]
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
-        for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+        for r in ac_results + child_acs
     )
     # Check that all active children are in in_review or done stage.
     # The stage check is independent of inherited_pass (parent-first
@@ -5381,7 +5486,10 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     # Explicit child-audit execution gate (SA-0MU32TE120012T49): in-main-slot
     # pending child screens are never presented as a normal result. The gate
     # names the child ids and how to complete them, and forces Ready=No.
-    pending_child_screens = _pending_main_slot_child_ids(child_results)
+    pending_child_screens = [
+        cid for cid in _pending_main_slot_child_ids(child_results)
+        if cid not in unserviced_ids
+    ]
     gate_lines: list[str] = []
     if pending_child_screens:
         ready = "No"
@@ -6908,6 +7016,7 @@ def _build_issue_json(
     phase2_completed: bool = False,
     phase2_skip_note: str | None = None,
     snapshot_exempt: set[str] | None = None,
+    stale_pending_ids: set[str] | None = None,
 ) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
@@ -6922,9 +7031,27 @@ def _build_issue_json(
         do NOT block closure — only pre-review stages (``idea``,
         ``intake_complete``, ``plan_complete``) block.
     """
+    # UN-SERVICED in-main-slot children (SA-0MVAWFUU0004VW45 AC2): a child
+    # whose screens were left pending by a PREVIOUS run (stale
+    # pending-screens signal) and whose ac_results still carry the unserviced
+    # pending marker is subtracted from the pending gate below. With a
+    # previously STORED verdict the parent INHERITS it — the child's partial
+    # acs no longer count against all_ac_acceptable; without one the child is
+    # NOT-ASSESSED — its acs still count (partial ⇒ not acceptable ⇒ the
+    # parent is never reported ready).
+    unserviced_ids = _unserviced_main_slot_child_ids(child_results, stale_pending_ids)
+    child_acs = [
+        a
+        for c in child_results
+        if (
+            str(c.get("id", "") or "") not in unserviced_ids
+            or not _child_has_stored_verdict(c)
+        )
+        for a in c.get("ac_results", [])
+    ]
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
-        for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+        for r in ac_results + child_acs
     )
     # Check that all active children are in in_review or done stage.
     # The stage check is independent of inherited_pass (parent-first
@@ -6956,7 +7083,10 @@ def _build_issue_json(
         cq_findings, fp_screen_results or []
     ))
 
-    pending_child_screens = _pending_main_slot_child_ids(child_results)
+    pending_child_screens = [
+        cid for cid in _pending_main_slot_child_ids(child_results)
+        if cid not in unserviced_ids
+    ]
     ready = (
         all_ac_acceptable
         and all_children_reviewed
@@ -11678,6 +11808,16 @@ def _phase_report(ctx: _AuditContext) -> int:
         # Assemble and output report. The assembly is reusable: the bounded
         # re-ask path (SA-0MSF3RXUB000NLOI) reassembles the report after a
         # single model re-emit of the verdict array.
+        # UN-SERVICED in-main-slot children (SA-0MVAWFUU0004VW45 AC2): read
+        # the pending-screens signal written by the PREVIOUS run so children
+        # whose in-main-slot screens were never serviced are treated as
+        # not-assessed/inherited instead of re-blocking the parent's
+        # readiness decision. Read once here and shared by the report and the
+        # JSON payload (and by the signal rewrite below).
+        stale_pending_ids = _read_pending_screens_signal(
+            issue_id, ctx.owning_root, ctx.checkpoint_dir,
+        )
+
         def _assemble_report() -> str:
             assembled = _assemble_issue_report(
                 work_item, ac_results, child_results,
@@ -11696,6 +11836,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 content_fingerprint=content_fingerprint,
                 merge_gate_evidence=ctx.merge_gate_evidence,
                 snapshot_exempt=ctx.snapshot_exempt_children,
+                stale_pending_ids=stale_pending_ids,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if ctx.script_failure:
@@ -11741,6 +11882,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 phase2_completed=phase2_completed,
                 phase2_skip_note=phase2_skip_note,
                 snapshot_exempt=ctx.snapshot_exempt_children,
+                stale_pending_ids=stale_pending_ids,
             )
             payload["child_persist_results"] = child_persist_results
             # Include script failure info in JSON output
