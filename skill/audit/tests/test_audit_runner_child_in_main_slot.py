@@ -484,6 +484,31 @@ def genuinely_not_ready_child():
     }
 
 
+def serviced_child():
+    """An in-main-slot child whose screens WERE serviced by the invoking
+    session (the interactive case).
+
+    The agent performed the emitted ``[AUDIT_IN_MAIN_SLOT_WORK]`` screen and
+    persisted the child audit, so the child now carries a FRESH stored audit
+    (``reused_from`` + ``child_audit_ready``, the LP-0MSQ32MF200675AR reuse
+    markers) with met AC verdicts and NO in-main-slot pending marker. Such a
+    child must never be classified unserviced/not-assessed: the ready path is
+    unchanged and carries no assessment diagnostic
+    (SA-0MVAWFQ4A002XCAO AC4).
+    """
+    return {
+        "id": "CHILD-1",
+        "title": "Child CHILD-1",
+        "status": "completed",
+        "stage": "in_review",
+        "ac_results": [
+            {"text": "CAC1", "verdict": "met", "evidence": "child.py:1"},
+        ],
+        "child_audit_ready": True,
+        "reused_from": "2026-10-01T00:00:00.000Z",
+    }
+
+
 #: Parent ACs (all met) shared by the unserviced-verdict fixtures so the
 #: report/JSON assessment depends only on the child under test.
 _UNSERVICED_PARENT_ACS = [
@@ -590,6 +615,10 @@ class TestUnservicedMainSlotVerdicts:
         )
         assert "Ready to close: No" in report
         assert "Child screens pending: 1 (main-slot) — CHILD-1" in report
+        # The child-audit execution gate (SA-0MU32TE120012T49) is unchanged:
+        # a fresh pending screen is never presented as a normal result.
+        assert "Child-audit execution gate:" in report
+        assert "CHILD-1" in report
 
     def test_reused_stored_verdict_child_already_inherited_today(self):
         """GREEN baseline: a child whose ac_results carry the STORED verdict
@@ -684,3 +713,186 @@ class TestPendingScreensSignalRead:
         )
         assert payload["ready_to_close"] is False
         assert payload["pending_child_screens"] == ["CHILD-1"]
+
+
+class TestInteractiveRegressionGuard:
+    """AC4 regression guard (SA-0MVAWFQ4A002XCAO): the unserviced-verdict
+    handling and child-assessment diagnostics introduced by the sibling
+    items (SA-0MVAWFUU0004VW45 / SA-0MVAWFYZE0040SQ3) do not change the
+    behaviour of INTERACTIVE in-main-slot audit runs — those in which the
+    invoking agent session CAN service the emitted
+    ``[AUDIT_IN_MAIN_SLOT_WORK]`` screens.
+
+    The unserviced handling keys on the *stale* pending-screens signal (a
+    signal naming a child whose ``ac_results`` STILL carry the in-main-slot
+    pending marker). An interactive run either:
+
+    - freshly emits the screens (no stale signal) — the child-audit
+      execution gate (SA-0MU32TE120012T49) still blocks closure; or
+    - has its screens serviced — the child carries a fresh stored audit with
+      met verdicts and NO pending marker, so the ready path is unchanged and
+      carries no assessment diagnostic.
+    """
+
+    #: A stored child audit that ``wl audit-show`` returns once the agent has
+    #: serviced the emitted screen (ready verdict + parseable AC table).
+    _STORED_READY_CHILD_AUDIT = (
+        "Ready to close: Yes\n\n"
+        "Audit report for work item CHILD-1\n\n"
+        "## Acceptance Criteria Status\n\n"
+        "| # | Criterion | Verdict | Evidence |\n"
+        "|---|-----------|---------|----------|\n"
+        "| 1 | CAC1: child criterion 1 | met | child.py:1 |"
+    )
+
+    def _run_interactive(self, capsys, *, stored_child_audit=None,
+                         force=False):
+        """Run ``cmd_issue`` in in-main-slot mode like an interactive
+        session, returning ``(rc, stdout, stderr, child_pi_contexts)``.
+
+        *stored_child_audit*, when given, is served by ``wl audit-show`` for
+        CHILD-1 (the serviced case); otherwise the child has no stored audit
+        and is freshly screened in the main slot (the pending case).
+        *force* exercises the ``--force`` bypass of child-verdict reuse.
+        """
+        context_log: list[str] = []
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            context_log.append(context)
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "parent.py:1"},
+            ])}
+
+        child = _phase1_child(1, stage="in_review")
+        child_audit_raw = (
+            {"CHILD-1": stored_child_audit} if stored_child_audit else None
+        )
+        runner, _ = _make_phase1_runner(
+            [child], child_audit_raw=child_audit_raw,
+        )
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "code_review.scripts.code_quality.run_code_quality",
+            return_value={"success": True, "findings": [],
+                          "fixes_applied": 0},
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=force, runner=runner,
+                audit_children=True, child_in_main_slot=True,
+            )
+
+        captured = capsys.readouterr()
+        child_ctx = [
+            c for c in context_log
+            if c.startswith(("child:", "phase2_child"))
+        ]
+        return rc, captured.out, captured.err, child_ctx
+
+    # ------------------------------------------------------------------
+    # Serviced run — no assessment diagnostic on the ready path (AC4)
+    # ------------------------------------------------------------------
+
+    def test_serviced_child_ready_path_has_no_assessment_diagnostic(self):
+        """A serviced in-main-slot child (fresh stored audit, met verdicts,
+        no pending marker) leaves the ready path unchanged: the parent is
+        ready and neither the report nor the JSON payload emits a
+        child-assessment diagnostic or a pending-screens gate."""
+        child = serviced_child()
+
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        assert payload["ready_to_close"] is True
+        assert payload["pending_child_screens"] == []
+        assert payload["child_reasons"] == {}
+        assert payload["not_assessed_children"] == []
+
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        assert "Ready to close: Yes" in report
+        assert "Child screens pending" not in report
+        assert "Child assessment reasons:" not in report
+
+    def test_serviced_child_lingering_stale_signal_still_clean(self):
+        """A serviced child named by a LINGERING stale signal is still not
+        misclassified: its ac_results carry no pending marker, so it is
+        never an unserviced child — the ready path and the diagnostics are
+        unchanged."""
+        child = serviced_child()
+        stale = {"CHILD-1"}
+
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+            stale_pending_ids=stale,
+        )
+        assert payload["ready_to_close"] is True
+        assert payload["pending_child_screens"] == []
+        assert payload["child_reasons"] == {}
+        assert payload["not_assessed_children"] == []
+
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+            stale_pending_ids=stale,
+        )
+        assert "Ready to close: Yes" in report
+        assert "Child screens pending" not in report
+        assert "Child assessment reasons:" not in report
+
+    # ------------------------------------------------------------------
+    # Interactive lifecycle, end-to-end through cmd_issue (AC4)
+    # ------------------------------------------------------------------
+
+    def test_interactive_service_then_rerun_reports_ready(self, capsys):
+        """The full interactive lifecycle is unchanged: the first run emits
+        the pending screens and blocks with the execution gate; once the
+        agent services them (the child gains a fresh stored audit), the
+        re-run reuses the child verdict, reports ready, and emits no
+        assessment diagnostic and no fresh screen."""
+        rc1, out1, err1, ctx1 = self._run_interactive(capsys)
+        assert rc1 == 0
+        assert ctx1 == []  # in-main-slot: no child pi subprocess
+        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER in err1
+        assert "Ready to close: No" in out1
+        assert "Child screens pending: 1 (main-slot) — CHILD-1" in out1
+        assert "Child-audit execution gate:" in out1
+
+        rc2, out2, err2, ctx2 = self._run_interactive(
+            capsys, stored_child_audit=self._STORED_READY_CHILD_AUDIT,
+        )
+        assert rc2 == 0
+        assert ctx2 == []
+        assert "Child verdict reused from" in out2
+        assert "Ready to close: Yes" in out2
+        assert "Child screens pending" not in out2
+        assert "Child assessment reasons:" not in out2
+        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER not in err2
+
+    # ------------------------------------------------------------------
+    # --force still re-audits all children (AC4)
+    # ------------------------------------------------------------------
+
+    def test_force_reaudits_children_in_main_slot(self, capsys):
+        """``--force`` still bypasses child-verdict reuse in in-main-slot
+        mode: a child with a fresh stored audit is reused by default but
+        re-audited when forced (its screen is freshly emitted)."""
+        # Baseline (no --force): the fresh stored child audit is reused.
+        _, out_reuse, err_reuse, _ = self._run_interactive(
+            capsys, stored_child_audit=self._STORED_READY_CHILD_AUDIT,
+        )
+        assert "Child verdict reused from" in out_reuse
+        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER not in err_reuse
+
+        # --force bypasses reuse: the child is re-audited in the main slot.
+        rc, out_force, err_force, ctx = self._run_interactive(
+            capsys, stored_child_audit=self._STORED_READY_CHILD_AUDIT,
+            force=True,
+        )
+        assert rc == 0
+        assert ctx == []  # still no child pi subprocess
+        assert "Child verdict reused from" not in out_force
+        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER in err_force
+        assert "phase1_child_screen" in err_force
+        assert "CHILD-1" in err_force
