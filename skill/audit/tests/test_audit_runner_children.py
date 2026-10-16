@@ -1349,6 +1349,47 @@ class TestParentFirstChildPassThrough:
             changed = ar._child_content_changed(mock.MagicMock(), "CHILD-1")
         assert changed is False
 
+    def test_child_content_changed_fresh_audit_survives_newer_updated_at(self):
+        """_child_content_changed: a content-fresh audit stays unchanged even
+        when the child's updatedAt is far newer than the persisted auditedAt.
+
+        The content fingerprint is the PRIMARY gate: once it matches, the
+        child's own persistence writes (comments, status/stage bumps as it
+        moves to in_review) must not trigger a spurious re-audit. The legacy
+        60s time floor would have declared this child changed — this guards
+        the gate ordering (content before time).
+        """
+        from audit.scripts import audit_runner as ar
+        child_desc = "## Acceptance Criteria\n- CAC1: child criterion"
+        fp = ar._compute_content_fingerprint(
+            mock.MagicMock(), "CHILD-1",
+            work_item={"description": child_desc},
+        )
+        assert fp is not None
+        stored = (
+            f"Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
+            f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}\n\n## Summary\nok"
+        )
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {"success": True, "audit": {
+                    "workItemId": "CHILD-1",
+                    "auditedAt": "2026-08-01T00:00:00.000Z",
+                    "rawOutput": stored,
+                }}
+            if "show" in cmd_str:
+                return {"success": True, "workItem": {
+                    "id": "CHILD-1", "description": child_desc,
+                    "updatedAt": "2026-08-10T00:00:00.000Z",
+                }}
+            raise AssertionError(f"unexpected wl cmd: {cmd_str}")
+
+        with mock.patch.object(ar, "_run_wl", side_effect=_fake_run_wl):
+            changed = ar._child_content_changed(mock.MagicMock(), "CHILD-1")
+        assert changed is False
+
     def test_child_content_changed_stale_audit_true(self):
         """_child_content_changed: an audit whose fingerprint no longer
         matches (a touched file changed) → content changed."""

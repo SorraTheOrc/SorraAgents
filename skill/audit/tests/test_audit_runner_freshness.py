@@ -442,6 +442,46 @@ class TestContentFreshnessGate:
             [str(a) for a in call] for call in repo.calls
         ]
 
+    def test_fingerprint_payload_keys_exclude_global_head(self):
+        """AC1/AC4: the fingerprint payload carries exactly the scoped keys
+        (path_states, description_hash, key_files) — it never embeds the
+        global git HEAD sha, whose movement would otherwise invalidate every
+        stored audit regardless of the item's own content.
+
+        Asserts directly on the serialized payload (captured before the
+        final digest): the key set is exactly the scoped triple, the global
+        HEAD sha appears nowhere, and two different HEAD shas produce a
+        byte-identical payload.
+        """
+        captured: list[str] = []
+        real_sha256 = audit_runner.hashlib.sha256
+
+        def _capture(data: bytes, *args, **kwargs):
+            captured.append(data.decode("utf-8"))
+            return real_sha256(data, *args, **kwargs)
+
+        with mock.patch.object(
+            audit_runner.hashlib, "sha256", side_effect=_capture
+        ):
+            fp_a = self._fp(
+                self._repo(head_sha="b" * 40, blobs={"src/a.py": "blob-a"})
+            )
+            fp_b = self._fp(
+                self._repo(head_sha="c" * 40, blobs={"src/a.py": "blob-a"})
+            )
+        assert fp_a is not None and fp_b is not None
+        assert fp_a == fp_b  # payload is HEAD-independent
+        assert captured, "the fingerprint payload must have been serialized"
+        payload = json.loads(captured[-1])
+        assert set(payload) == {"path_states", "description_hash", "key_files"}
+        assert "b" * 40 not in captured[-1]
+        assert "c" * 40 not in captured[-1]
+        assert payload["path_states"] == {
+            "src/a.py": {"head": "blob-a", "worktree": ""},
+        }
+        assert payload["key_files"] == ["src/a.py"]
+        assert len(payload["description_hash"]) == 64
+
     # ------------------------------------------------------------------
     # Fingerprint computation — AC2: touched-file changes invalidate
     # ------------------------------------------------------------------
@@ -580,6 +620,31 @@ class TestContentFreshnessGate:
         repo = self._repo(head_sha="b" * 40, status=[" M src/unrelated.py"])
         assert self._check(run_wl, repo) == report
 
+    def test_child_content_changed_fresh_survives_unrelated_head_movement(self):
+        """AC1 at the child gate: a child whose individually-persisted audit
+        is content-fresh is NOT re-audited by the parent even after the
+        repository HEAD moved elsewhere with only unrelated files dirty.
+
+        ``_child_content_changed`` must return False (the parent reuses the
+        child); the pre-scoping whole-repo HEAD-based fingerprint would have
+        declared the child changed and re-audited it (NV-0MSP7P2PN009FT9U
+        false re-audit scenario).
+        """
+        stored_fp = self._fp(self._repo(head_sha="a" * 40))
+        assert stored_fp is not None
+        stored = self._report_with_fingerprint(stored_fp)
+        run_wl = self._make_run_wl(
+            audit_raw=stored,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_desc=self._DESC,
+        )
+        with mock.patch.object(audit_runner, "_run_wl", side_effect=run_wl):
+            changed = audit_runner._child_content_changed(
+                self._repo(head_sha="b" * 40, status=[" M src/unrelated.py"]),
+                "TEST-1",
+            )
+        assert changed is False
+
     def test_touched_file_change_reauths(self):
         """AC2: an uncommitted change to a touched file → re-audit (None)."""
         fp = self._fp(self._repo(status=[]))
@@ -648,6 +713,51 @@ class TestContentFreshnessGate:
         fp_without = self._fp(repo, desc="", comments=None)
         assert fp_with is not None
         assert fp_without is None  # no grep files, no Key Files → fail open
+
+    def test_comment_recorded_hashes_stable_when_comments_dropped(self):
+        """AC2: an item audited with comment-recorded commit hashes yields
+        the same fingerprint when checked WITHOUT the caller re-supplying the
+        comments — no spurious invalidation (comment-source stability).
+
+        The parent-first flow computes the fingerprint with the fetched
+        comments at audit time (``cmd_issue``) but drops them at child-reuse
+        check time (SA-0MSL1Z7E9005TLBA), so the two computations must agree.
+        That holds because the implement-skill convention embeds the item id
+        in every commit message: the comment-recorded hashes reference
+        commits the item-id grep already resolves, so the comment source
+        never adds a unique path to the touched set.
+        """
+        repo = _FakeGitRepo(
+            grep_files=["src/a.py"],
+            comment_commits={"c" * 40: ["src/a.py"]},
+            blobs={"src/a.py": "blob-a"},
+        )
+        comments = [{"comment": f"recorded commit {'c' * 40} in the message"}]
+        touched_with = audit_runner._resolve_touched_files(
+            repo, "TEST-1", work_item={"description": self._DESC},
+            comments=comments,
+        )
+        touched_without = audit_runner._resolve_touched_files(
+            repo, "TEST-1", work_item={"description": self._DESC},
+        )
+        assert touched_with == touched_without == ["src/a.py"]
+
+        fp_with = self._fp(repo, comments=comments)
+        fp_without = self._fp(repo)
+        assert fp_with is not None
+        assert fp_with == fp_without
+
+        # The comment-recorded commit's file is genuinely policed at check
+        # time too (via the item-id grep source): a content change flips
+        # BOTH computations identically, so dropping comments never blinds
+        # the gate to the file.
+        changed = _FakeGitRepo(
+            grep_files=["src/a.py"],
+            comment_commits={"c" * 40: ["src/a.py"]},
+            blobs={"src/a.py": "blob-b"},
+        )
+        assert self._fp(changed, comments=comments) != fp_with
+        assert self._fp(changed) != fp_without
 
     # ------------------------------------------------------------------
     # 60s time floor interaction (legacy audits)
