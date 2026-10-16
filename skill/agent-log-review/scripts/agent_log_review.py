@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -427,3 +428,303 @@ def read_sessions(
         missing_usage=missing_usage,
         sessions=sessions,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Layer 2 — heuristic confusion-pattern extraction
+# (SA-0MV6UDSAF0064B85)
+# ══════════════════════════════════════════════════════════════════════════
+
+THINKING_KEYWORDS: tuple[str, ...] = (
+    "error", "fail", "retry", "incorrect", "sorry", "wrong", "fix",
+    "correct", "issue", "problem", "confused", "wait", "actually",
+    "oh", "hmm", "ah",
+)
+"""Keywords signalling confusion in thinking content (configurable)."""
+
+EXCERPT_BYTES_PER_SESSION = 2048
+"""Maximum bytes of thinking-context excerpt kept per session (prompt budget)."""
+
+CONTEXT_RADIUS = 120
+"""Characters of context kept either side of a keyword hit (mitigates false
+positives by giving the LLM evidence to confirm/deny)."""
+
+REPEATED_CALL_MIN_COUNT = 2
+"""Identical tool call occurrences within a session that count as a retry."""
+
+ERROR_MODIFY_WINDOW = 3
+"""Events after an error result to scan for a same-tool modified call."""
+
+TOOL_ERROR_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    ("traceback", re.compile(r"traceback|exception|error", re.IGNORECASE)),
+    ("permission_denied", re.compile(r"permission denied", re.IGNORECASE)),
+    ("command_not_found", re.compile(r"command not found|no such file|\bnot found\b", re.IGNORECASE)),
+    ("shell_expansion", re.compile(r"unexpected token|bad substitution|ambiguous redirect|syntax error near", re.IGNORECASE)),
+    ("import_error", re.compile(r"importerror|modulenotfounderror|no module named", re.IGNORECASE)),
+    ("python_error", re.compile(r"nameerror|keyerror|typeerror|valueerror|attributeerror|indentationerror", re.IGNORECASE)),
+)
+"""(kind, regex) pairs used to classify tool-result error content."""
+
+
+def _truncate_utf8(text: str, cap_bytes: int) -> str:
+    """Truncate *text* (plus an ellipsis marker) to fit in *cap_bytes* bytes."""
+    marker = "…"
+    if len(text.encode("utf-8")) + len(marker.encode("utf-8")) <= cap_bytes:
+        return text
+    target = cap_bytes - len(marker.encode("utf-8"))
+    while text and len(text.encode("utf-8")) > target:
+        text = text[:-1]
+    return text + marker
+
+
+def _context_around(text: str, index: int, radius: int = CONTEXT_RADIUS) -> str:
+    """Return a centred context window around *index* in *text*."""
+    start = max(0, index - radius)
+    end = min(len(text), index + radius)
+    return text[start:end].replace("\n", " ")
+
+
+def _canonical_arguments(arguments: Any) -> str:
+    """Deterministic string form of tool-call arguments (dict keys sorted)."""
+    if isinstance(arguments, dict):
+        return json.dumps(arguments, sort_keys=True, default=str)
+    if arguments is None:
+        return "null"
+    return str(arguments)
+
+
+def _tool_error_kind(content: str) -> str | None:
+    """First matching error-pattern kind, or None when no pattern matches."""
+    for kind, pattern in TOOL_ERROR_PATTERNS:
+        if pattern.search(content or ""):
+            return kind
+    return None
+
+
+def _session_has_error(session: ParsedSession) -> bool:
+    """True when the session contains any error-flagged or error-pattern result."""
+    for tr in session.tool_results:
+        if tr.is_error or _tool_error_kind(tr.content) is not None:
+            return True
+    return False
+
+
+def extract_tool_distribution(
+    sessions: list[ParsedSession],
+) -> dict[str, Any]:
+    """Count tool calls across *sessions* and per-tool error rates.
+
+    Returns ``{"total_calls", "total_error_results", "by_tool": {tool: {"calls",
+    "error_results", "error_rate"}}}``. A result counts as an error when the
+    ``toolResult`` has ``isError`` set OR its content matches a
+    :data:`TOOL_ERROR_PATTERNS` pattern. Deterministic: ``by_tool`` is sorted
+    by tool name.
+    """
+    calls: Counter = Counter()
+    errors: Counter = Counter()
+    for session in sessions:
+        for tc in session.tool_calls:
+            calls[tc.name] += 1
+        for tr in session.tool_results:
+            if tr.is_error or _tool_error_kind(tr.content) is not None:
+                errors[tr.tool_name] += 1
+    by_tool: dict[str, dict[str, Any]] = {}
+    for name in sorted(calls):
+        call_count = calls[name]
+        error_count = errors[name]
+        by_tool[name] = {
+            "calls": call_count,
+            "error_results": error_count,
+            "error_rate": round(error_count / call_count, 3) if call_count else 0.0,
+        }
+    return {
+        "total_calls": sum(calls.values()),
+        "total_error_results": sum(errors.values()),
+        "by_tool": by_tool,
+    }
+
+
+def extract_thinking_signals(
+    sessions: list[ParsedSession],
+    keywords: tuple[str, ...] = THINKING_KEYWORDS,
+    excerpt_cap: int = EXCERPT_BYTES_PER_SESSION,
+) -> dict[str, Any]:
+    """Extract keyword-based confusion signals from assistant thinking content.
+
+    For each (session, keyword) pair a hit count and a capped context-window
+    excerpt are produced. The context window (see :data:`CONTEXT_RADIUS`)
+    keeps legitimate uses (e.g. "error handling") visible for the LLM to
+    confirm, and the per-session excerpt is capped at *excerpt_cap* bytes to
+    bound the LLM prompt (parent AC 2 false-positive mitigation).
+
+    Deterministic: hits are ordered by (session, keyword).
+    """
+    total_hits = 0
+    hits: list[dict[str, Any]] = []
+    for session in sessions:
+        counts: Counter = Counter()
+        per_keyword: dict[str, list[str]] = {
+            kw: [] for kw in keywords
+        }
+        for block in session.thinking:
+            lowered = (block.text or "").lower()
+            for kw in keywords:
+                needle = kw.lower()
+                pos = 0
+                while True:
+                    idx = lowered.find(needle, pos)
+                    if idx < 0:
+                        break
+                    counts[kw] += 1
+                    per_keyword[kw].append(_context_around(block.text, idx))
+                    pos = idx + len(needle)
+        total_hits += sum(counts.values())
+        budget = excerpt_cap
+        for kw in sorted(counts):
+            joined = " | ".join(per_keyword[kw])
+            size = len(joined.encode("utf-8"))
+            if size > budget:
+                joined = _truncate_utf8(joined, budget)
+                size = budget
+            budget = max(0, budget - size)
+            hits.append({
+                "session": session.filename,
+                "keyword": kw,
+                "count": counts[kw],
+                "context": joined,
+            })
+    hits.sort(key=lambda h: (h["session"], h["keyword"]))
+    return {"total_hits": total_hits, "hits": hits}
+
+
+def extract_tool_errors(
+    sessions: list[ParsedSession],
+    max_excerpt_bytes: int = EXCERPT_BYTES_PER_SESSION,
+) -> dict[str, Any]:
+    """Extract error signals from ``toolResult`` messages.
+
+    A result is an error signal when its ``isError`` flag is set OR its
+    content matches a :data:`TOOL_ERROR_PATTERNS` pattern (e.g. tracebacks,
+    "permission denied", "command not found", shell-expansion errors). Each
+    entry carries a capped excerpt and the matched ``kind`` ("unclassified"
+    when only the flag fired). Deterministic: sorted by (session, tool,
+    excerpt).
+    """
+    errors: list[dict[str, Any]] = []
+    for session in sessions:
+        for tr in session.tool_results:
+            kind = _tool_error_kind(tr.content) if not tr.is_error else (
+                _tool_error_kind(tr.content) or "unclassified"
+            )
+            if kind is None:
+                continue
+            excerpt = tr.content.replace("\n", " ").strip()
+            if len(excerpt.encode("utf-8")) > max_excerpt_bytes:
+                excerpt = _truncate_utf8(excerpt, max_excerpt_bytes)
+            errors.append({
+                "session": session.filename,
+                "tool": tr.tool_name,
+                "kind": kind,
+                "is_error": tr.is_error,
+                "excerpt": excerpt,
+            })
+    errors.sort(key=lambda e: (e["session"], e["tool"], e["excerpt"]))
+    return {"total": len(errors), "errors": errors}
+
+
+def extract_retry_patterns(
+    sessions: list[ParsedSession],
+) -> dict[str, Any]:
+    """Detect retry / self-correction patterns per session.
+
+    Two kinds:
+
+    - ``repeated_call`` — the same tool was called with identical
+      (canonicalised) arguments at least :data:`REPEATED_CALL_MIN_COUNT`
+      times.
+    - ``call_error_modify`` — a tool call returned an error result and the
+      same tool was called again with *different* arguments within
+      :data:`ERROR_MODIFY_WINDOW` events.
+
+    Deterministic: patterns are sorted by (session, tool, arguments, count).
+    """
+    patterns: list[dict[str, Any]] = []
+    for session in sessions:
+        # Repeated identical calls.
+        per_key: Counter = Counter()
+        for tc in session.tool_calls:
+            per_key[(tc.name, _canonical_arguments(tc.arguments))] += 1
+        for (name, args), count in sorted(per_key.items()):
+            if count >= REPEATED_CALL_MIN_COUNT:
+                patterns.append({
+                    "session": session.filename,
+                    "kind": "repeated_call",
+                    "tool": name,
+                    "arguments": args,
+                    "count": count,
+                })
+        # Call → error → modified call.
+        events: list[ToolCall | ToolResult] = session.events
+        last_call: dict[str, ToolCall] = {}
+        for i, event in enumerate(events):
+            if isinstance(event, ToolCall):
+                last_call[event.name] = event
+            elif (
+                isinstance(event, ToolResult)
+                and event.is_error
+                and event.tool_name in last_call
+            ):
+                original = last_call[event.tool_name]
+                for j in range(i + 1, min(i + 1 + ERROR_MODIFY_WINDOW, len(events))):
+                    nxt = events[j]
+                    if isinstance(nxt, ToolCall) and nxt.name == original.name:
+                        if _canonical_arguments(nxt.arguments) != _canonical_arguments(
+                            original.arguments
+                        ):
+                            patterns.append({
+                                "session": session.filename,
+                                "kind": "call_error_modify",
+                                "tool": original.name,
+                                "original_arguments": _canonical_arguments(original.arguments),
+                                "modified_arguments": _canonical_arguments(nxt.arguments),
+                            })
+                        break
+    patterns.sort(
+        key=lambda p: (
+            p["session"],
+            p["tool"],
+            p.get("original_arguments") or p.get("arguments", ""),
+            p.get("count", 0),
+        )
+    )
+    return {"total": len(patterns), "patterns": patterns}
+
+
+def extract_signals(
+    sessions: list[ParsedSession],
+    max_sessions: int | None = None,
+    errors_only: bool = False,
+) -> dict[str, Any]:
+    """Bundle all heuristic extractions into one deterministic signals dict.
+
+    This is the distilled input handed to the LLM classification layer
+    (Layer 3). Flags (deterministic, for CLI mapping):
+
+    - ``max_sessions`` — keep only the first N sessions (already ordered
+      newest-first by :func:`read_sessions`).
+    - ``errors_only`` — keep only sessions containing at least one error
+      result (``isError`` or error-pattern content).
+    """
+    result_sessions = list(sessions)
+    if max_sessions is not None and max_sessions >= 0:
+        result_sessions = result_sessions[:max_sessions]
+    if errors_only:
+        result_sessions = [s for s in result_sessions if _session_has_error(s)]
+    return {
+        "session_count": len(result_sessions),
+        "tool_distribution": extract_tool_distribution(result_sessions),
+        "thinking_signals": extract_thinking_signals(result_sessions),
+        "tool_errors": extract_tool_errors(result_sessions),
+        "retry_patterns": extract_retry_patterns(result_sessions),
+    }
+

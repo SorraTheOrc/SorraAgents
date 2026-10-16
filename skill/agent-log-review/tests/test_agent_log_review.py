@@ -373,3 +373,275 @@ def test_read_sessions_respects_max_sessions(tmp_path):
 def test_session_root_honours_env_var(tmp_path, monkeypatch):
     monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path))
     assert alr.get_session_root() == tmp_path
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Child 2 — heuristic confusion-pattern extraction
+# (SA-0MV6UDSAF0064B85)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _tool_call(filename, name, args, seq, call_id="c"):
+    return alr.ToolCall(filename=filename, seq=seq, id=call_id, name=name,
+                        arguments=args, timestamp="2026-01-01T00:00:00Z")
+
+
+def _tool_result(filename, tool_name, content, seq, is_error=False):
+    return alr.ToolResult(filename=filename, seq=seq, tool_call_id="c",
+                          tool_name=tool_name, content=content, is_error=is_error,
+                          timestamp="2026-01-01T00:00:01Z")
+
+
+def _session(filename, events=None, thinking_texts=None, seq_start=0):
+    events = events or []
+    thinking = [
+        alr.ThinkingBlock(filename=filename, seq=seq_start + i, text=text,
+                          timestamp="t")
+        for i, text in enumerate(thinking_texts or [])
+    ]
+    return alr.ParsedSession(
+        filename=filename, path=f"/tmp/{filename}", session_id="s",
+        cwd="/home/operator/project", timestamp="t", version=3,
+        model={"provider": "x", "modelId": "y"},
+        messages=0, thinking=thinking, text=[], events=events,
+        malformed_lines=0, has_usage=True,
+    )
+
+
+# ── tool call distribution ────────────────────────────────────────────────
+
+def test_tool_distribution_counts_and_error_rates():
+    s1 = _session("a.jsonl", events=[
+        _tool_call("a.jsonl", "bash", {"cmd": "ls"}, 1),
+        _tool_result("a.jsonl", "bash", "Traceback (most recent call last)", 2, is_error=True),
+        _tool_call("a.jsonl", "read", {"path": "x"}, 3),
+        _tool_result("a.jsonl", "read", "file contents", 4),
+        _tool_call("a.jsonl", "bash", {"cmd": "ls -la"}, 5),
+        _tool_result("a.jsonl", "bash", "ok", 6),
+    ])
+    s2 = _session("b.jsonl", events=[
+        _tool_call("b.jsonl", "bash", {"cmd": "pwd"}, 1),
+        _tool_result("b.jsonl", "bash", "Permission denied", 2),
+    ])
+    dist = alr.extract_tool_distribution([s1, s2])
+    assert dist["total_calls"] == 4
+    assert dist["total_error_results"] == 2  # explicit isError + pattern match
+    by_tool = dist["by_tool"]
+    assert by_tool["bash"]["calls"] == 3
+    assert by_tool["bash"]["error_results"] == 2
+    assert by_tool["bash"]["error_rate"] == round(2 / 3, 3)
+    assert by_tool["read"]["calls"] == 1
+    assert by_tool["read"]["error_results"] == 0
+    assert by_tool["read"]["error_rate"] == 0.0
+
+
+def test_tool_distribution_deterministic_tool_ordering():
+    s = _session("a.jsonl", events=[
+        _tool_call("a.jsonl", "read", {"path": "x"}, 1),
+        _tool_call("a.jsonl", "bash", {"cmd": "ls"}, 2),
+    ])
+    dist = alr.extract_tool_distribution([s])
+    assert list(dist["by_tool"].keys()) == ["bash", "read"]
+
+
+# ── thinking-content error signals ─────────────────────────────────────────
+
+def test_thinking_signals_keyword_hits_with_context():
+    s = _session("a.jsonl", thinking_texts=[
+        "Hmm, that approach is wrong, let me fix it.",
+        "Nothing to see here, everything worked.",
+    ])
+    sig = alr.extract_thinking_signals([s])
+    hits = sig["hits"]
+    assert sig["total_hits"] > 0
+    kw_hits = {h["keyword"]: h["count"] for h in hits}
+    assert kw_hits.get("wrong", 0) >= 1
+    assert kw_hits.get("fix", 0) >= 1
+    assert kw_hits.get("hmm", 0) >= 1
+    # Context window preserves surrounding text (evidence for the LLM).
+    wrong_hits = [h for h in hits if h["keyword"] == "wrong"]
+    assert wrong_hits and "approach is wrong, let me fix" in wrong_hits[0]["context"]
+    # Deterministic ordering by (session, keyword).
+    sessions = [h["session"] for h in hits]
+    assert sessions == sorted(sessions)
+
+
+def test_thinking_signals_borderline_false_positive_kept_with_context():
+    """Legitimate uses ("error handling") stay visible so the LLM decides."""
+    s = _session("a.jsonl", thinking_texts=[
+        "This code does proper error handling for network calls.",
+    ])
+    sig = alr.extract_thinking_signals([s])
+    error_hits = [h for h in sig["hits"] if h["keyword"] == "error"]
+    assert error_hits
+    assert "proper error handling" in error_hits[0]["context"]
+
+
+def test_thinking_signals_no_keyword_hits():
+    s = _session("a.jsonl", thinking_texts=[
+        "All checks passed with no concerns.",
+    ])
+    sig = alr.extract_thinking_signals([s])
+    assert sig["total_hits"] == 0
+    assert sig["hits"] == []
+
+
+def test_thinking_signals_case_insensitive():
+    s = _session("a.jsonl", thinking_texts=["ERROR in the log"])
+    sig = alr.extract_thinking_signals([s])
+    assert any(h["keyword"] == "error" and h["count"] >= 1 for h in sig["hits"])
+
+
+def test_thinking_signals_excerpt_capped_per_session():
+    big = "hmm " + ("error " * 500)
+    s = _session("a.jsonl", thinking_texts=[big])
+    sig = alr.extract_thinking_signals([s])
+    for h in sig["hits"]:
+        assert len(h["context"].encode("utf-8")) <= alr.EXCERPT_BYTES_PER_SESSION
+
+
+# ── tool result errors ─────────────────────────────────────────────────────
+
+def test_tool_errors_detects_is_error_flag():
+    s = _session("a.jsonl", events=[
+        _tool_result("a.jsonl", "bash", "Traceback (most recent call last):\n  File \"x.py\"", 1, is_error=True),
+    ])
+    err = alr.extract_tool_errors([s])
+    assert err["total"] == 1
+    entry = err["errors"][0]
+    assert entry["tool"] == "bash"
+    assert entry["is_error"] is True
+    assert entry["kind"] == "traceback"
+    assert "Traceback" in entry["excerpt"]
+
+
+def test_tool_errors_detects_pattern_without_is_error_flag():
+    s = _session("a.jsonl", events=[
+        _tool_result("a.jsonl", "read",
+                     "bash: line 1: cd: /nonexistent: No such file or directory", 1,
+                     is_error=False),
+    ])
+    err = alr.extract_tool_errors([s])
+    assert err["total"] == 1
+    assert err["errors"][0]["kind"] == "command_not_found"
+    assert err["errors"][0]["is_error"] is False
+
+
+def test_tool_errors_permission_denied():
+    s = _session("a.jsonl", events=[
+        _tool_result("a.jsonl", "bash", "Permission denied", 1, is_error=True),
+    ])
+    err = alr.extract_tool_errors([s])
+    assert err["total"] == 1
+    assert err["errors"][0]["kind"] == "permission_denied"
+
+
+def test_tool_errors_ignores_benign_results():
+    s = _session("a.jsonl", events=[
+        _tool_result("a.jsonl", "bash", "ok all good", 1, is_error=False),
+        _tool_result("a.jsonl", "read", "success", 2, is_error=False),
+    ])
+    err = alr.extract_tool_errors([s])
+    assert err["total"] == 0
+
+
+# ── retry / self-correction patterns ──────────────────────────────────────
+
+def test_retry_repeated_identical_call():
+    s = _session("a.jsonl", events=[
+        _tool_call("a.jsonl", "bash", {"cmd": "ls"}, 1),
+        _tool_result("a.jsonl", "bash", "ok", 2),
+        _tool_call("a.jsonl", "bash", {"cmd": "ls"}, 3),
+        _tool_result("a.jsonl", "bash", "ok", 4),
+        _tool_call("a.jsonl", "bash", {"cmd": "ls"}, 5),
+    ])
+    pat = alr.extract_retry_patterns([s])
+    repeated = [p for p in pat["patterns"] if p["kind"] == "repeated_call"]
+    assert len(repeated) == 1
+    assert repeated[0]["tool"] == "bash"
+    assert repeated[0]["count"] == 3
+    assert repeated[0]["arguments"] == '{"cmd": "ls"}'
+
+
+def test_retry_call_error_modify():
+    """Tool call → error result → modified tool call is detected."""
+    s = _session("a.jsonl", events=[
+        _tool_call("a.jsonl", "bash", {"cmd": "cat /nonexistent"}, 1),
+        _tool_result("a.jsonl", "bash", "No such file or directory", 2, is_error=True),
+        _tool_call("a.jsonl", "bash", {"cmd": "cat /existing"}, 3),
+        _tool_result("a.jsonl", "bash", "ok", 4),
+    ])
+    pat = alr.extract_retry_patterns([s])
+    modify = [p for p in pat["patterns"] if p["kind"] == "call_error_modify"]
+    assert len(modify) == 1
+    assert modify[0]["tool"] == "bash"
+    assert "nonexistent" in modify[0]["original_arguments"]
+    assert "existing" in modify[0]["modified_arguments"]
+
+
+def test_retry_no_self_correction_when_args_unchanged():
+    s = _session("a.jsonl", events=[
+        _tool_call("a.jsonl", "bash", {"cmd": "ls"}, 1),
+        _tool_result("a.jsonl", "bash", "error", 2, is_error=True),
+        _tool_call("a.jsonl", "bash", {"cmd": "ls"}, 3),  # identical retry
+    ])
+    pat = alr.extract_retry_patterns([s])
+    modify = [p for p in pat["patterns"] if p["kind"] == "call_error_modify"]
+    assert modify == []
+    # The identical retry still counts as a repeated call.
+    repeated = [p for p in pat["patterns"] if p["kind"] == "repeated_call"]
+    assert len(repeated) == 1
+    assert repeated[0]["count"] == 2
+
+
+def test_retry_string_arguments_canonicalised():
+    s = _session("a.jsonl", events=[
+        _tool_call("a.jsonl", "bash", "ls", 1),
+        _tool_call("a.jsonl", "bash", "ls", 2),
+    ])
+    pat = alr.extract_retry_patterns([s])
+    repeated = [p for p in pat["patterns"] if p["kind"] == "repeated_call"]
+    assert len(repeated) == 1
+    assert repeated[0]["arguments"] == "ls"
+
+
+# ── orchestrator (max_sessions / errors_only) ─────────────────────────────
+
+def test_extract_signals_max_sessions_truncates():
+    s1 = _session("a.jsonl", thinking_texts=["error one"])
+    s2 = _session("b.jsonl", thinking_texts=["error two"])
+    sig = alr.extract_signals([s1, s2], max_sessions=1)
+    assert sig["session_count"] == 1
+
+
+def test_extract_signals_errors_only_filters_to_error_sessions():
+    ok = _session("ok.jsonl", events=[
+        _tool_call("ok.jsonl", "bash", {"cmd": "ls"}, 1),
+        _tool_result("ok.jsonl", "bash", "all good", 2),
+    ])
+    bad = _session("bad.jsonl", events=[
+        _tool_call("bad.jsonl", "bash", {"cmd": "x"}, 1),
+        _tool_result("bad.jsonl", "bash", "Permission denied", 2, is_error=True),
+    ])
+    sig = alr.extract_signals([ok, bad], errors_only=True)
+    assert sig["session_count"] == 1
+    assert sig["tool_errors"]["total"] == 1
+    assert sig["tool_errors"]["errors"][0]["session"] == "bad.jsonl"
+
+
+def test_extract_signals_bundles_all_signal_types():
+    s = _session("a.jsonl",
+                 events=[
+                     _tool_call("a.jsonl", "bash", {"cmd": "ls"}, 1),
+                     _tool_result("a.jsonl", "bash", "Traceback", 2, is_error=True),
+                 ],
+                 thinking_texts=["hmm, this is wrong"])
+    sig = alr.extract_signals([s])
+    assert set(sig.keys()) >= {
+        "session_count", "tool_distribution", "thinking_signals",
+        "tool_errors", "retry_patterns",
+    }
+    assert sig["tool_distribution"]["total_calls"] == 1
+    assert sig["tool_errors"]["total"] == 1
+    assert sig["thinking_signals"]["total_hits"] >= 2
+
