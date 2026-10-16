@@ -6,14 +6,11 @@ Covers SA-0MTWO7HFW001N9QJ — Add project title to standup report template:
     ## <project_name> Standup Report (<date>)
   - Resolution order: explicit arg > data dict > shared resolve_project_name()
   - Shared helper is imported (skill.shared.project_name), not inlined.
-"""  # noqa: EXE001
+"""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest import mock
-
-import yaml
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 _SKILLS_ROOT = Path(__file__).resolve().parents[3] / "skill"
