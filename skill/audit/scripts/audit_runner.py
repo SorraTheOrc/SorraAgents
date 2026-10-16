@@ -1958,11 +1958,12 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     for the fingerprint computation and the time-gate ``updatedAt``. When
     omitted, the work item is fetched via ``wl show``.
 
-    *comments* is the item's already-fetched ``wl show`` comment list. It is
-    passed into the fingerprint computation so comment-recorded commit hashes
-    contribute to the touched-file set; callers must pass the SAME comments
-    at audit time and check time for the resolved set to be stable (see
-    ``_resolve_touched_files``).
+    *comments* is the item's comment list (fetched via ``wl show``). It is
+    optional: when supplied it is forwarded to the fingerprint computation;
+    when omitted, ``_compute_content_fingerprint`` fetches it itself
+    (deterministic comment source, SA-0MVAWFYKT002CQ3L), so the
+    audit-time and check-time computations agree even when the caller does
+    not hold the list (parent child-reuse gate, read-only freshness probe).
     """
 
     try:
@@ -2134,6 +2135,36 @@ def _normalise_repo_path(path: str) -> str:
     return p.strip()
 
 
+def _fetch_item_comments(runner: Runner, issue_id: str,
+                         worklog_dir: str | None = None) -> list[dict]:
+    """Best-effort fetch of a work item's comments for the fingerprint.
+
+    ``wl show --json`` returns the item's comments at the TOP level of the
+    payload (beside ``workItem`` — SA-0MSPZDALB000S18P), which is what
+    ``_bind_fetched_item`` binds into ``ctx.comments``. Used to make the
+    comment-recorded commit-hash source deterministic: callers that do not
+    already hold the comments list (the parent child-reuse gate and the
+    read-only freshness probe) fetch it here so the fingerprint they
+    compute matches the one the audit recorded at persist time
+    (SA-0MVAWFYKT002CQ3L).
+
+    Returns an empty list when the item has no comments or the fetch fails
+    (fail-open: the fingerprint then falls back to the item-id-grep and Key
+    Files sources).
+    """
+    if not issue_id:
+        return []
+    try:
+        data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except Exception:  # noqa: BLE001 -- best-effort; never fail the fingerprint
+        return []
+    if not isinstance(data, dict):
+        return []
+    comments = data.get("comments")
+    return list(comments) if isinstance(comments, list) else []
+
+
 def _extract_comment_commit_hashes(comments: Sequence[dict] | None) -> list[str]:
     """Extract candidate commit shas recorded in a work item's comments.
 
@@ -2168,9 +2199,7 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
        the item id in every commit message (``<WIP-id>: <summary>``);
     2. files in commits whose hashes are recorded in the item's *comments*
        (the implement skill records each change's commit hash there) — a
-       best-effort safety net for commits whose message lacks the id. Only
-       resolved when the caller supplies *comments* (see the determinism
-       note below);
+       best-effort safety net for commits whose message lacks the id;
     3. the ``Key Files`` entries parsed from the description.
 
     Paths are normalised, de-duplicated, and sorted. Returns ``None`` (the
@@ -2181,14 +2210,18 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
 
     **Determinism.** The fingerprint is recomputed on every freshness check,
     so the touched-file set must be identical at audit time and check time.
-    Comment-derived hashes are therefore used only when the caller explicitly
-    supplies *comments*; callers that hold the fetched item pass the same
-    comments list at both points. Callers that avoid an extra fetch (child
-    reuse paths, SA-0MSL1Z7E9005TLBA) pass ``None`` and rely on the grep +
-    Key Files sources, which keeps the two computations consistent.
+    The fingerprint layer (``_compute_content_fingerprint``) guarantees this
+    by supplying the item's comments at every call site: callers that hold
+    the fetched list pass it through, and callers that do not (child-reuse
+    paths, the read-only freshness probe) have it fetched there
+    (deterministic comment source, SA-0MVAWFYKT002CQ3L). This function
+    itself stays a pure resolver — the comment source contributes only when
+    *comments* is supplied; direct callers building the Phase-2 file-scope
+    manifest rely on the grep + Key Files sources, which is stable for their
+    use.
 
     *work_item* may be passed in to reuse an already-fetched item; when
-    omitted it is fetched via ``wl show`` (unless *comments* are supplied).
+    omitted it is fetched via ``wl show``.
     """
     if work_item is None:
         try:
@@ -2379,10 +2412,13 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
     artefact is treated as a genuine change (the safe direction — stale ⇒
     re-run). See ``docs/dev/audit-skill-reference.md``.
 
-    *work_item* / *comments* may be passed in to avoid a redundant ``wl show``
-    call when the caller already fetched the item (SA-0MSL1Z7E9005TLBA). Both
-    must be supplied consistently at audit time and check time so the resolved
-    touched-file set is stable (see ``_resolve_touched_files``).
+    *work_item* / *comments* may be passed in to avoid redundant ``wl show``
+    calls when the caller already fetched the item (SA-0MSL1Z7E9005TLBA). Both
+    are determined automatically when omitted: the fingerprint always resolves
+    the item's comments itself (deterministic comment source,
+    SA-0MVAWFYKT002CQ3L), so the comment-recorded commit-hash component of
+    the touched-file set contributes identically at audit/persist time,
+    parent child-reuse check time, and the read-only freshness probe.
 
     Returns a sha256 hex digest of the canonical JSON payload, or ``None``
     when the fingerprint cannot be determined (touched set unresolved, git
@@ -2396,6 +2432,17 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
         except Exception:  # noqa: BLE001 -- fail open on any wl/runner failure
             return None
         work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
+        if comments is None and isinstance(data, dict):
+            # Reuse the comments from the same payload — no second fetch.
+            fetched = data.get("comments")
+            if isinstance(fetched, list):
+                comments = fetched
+    if comments is None and issue_id:
+        # Check-time callers (child-reuse gate, freshness probe) do not hold
+        # the comments list, so fetch it here. This keeps the touched-file
+        # set — and therefore the fingerprint — identical to the one the
+        # audit recorded at persist time (SA-0MVAWFYKT002CQ3L).
+        comments = _fetch_item_comments(runner, issue_id, worklog_dir=worklog_dir)
     description = work_item.get("description", "") or ""
     key_files = _extract_key_files(description)
     touched = _resolve_touched_files(

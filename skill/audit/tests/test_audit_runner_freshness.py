@@ -250,8 +250,12 @@ class TestTouchedFileResolution:
         assert paths == ["src/a.py", "src/b.py"]
 
     def test_resolve_touched_files_ignores_comments_when_not_supplied(self):
-        """Comment hashes are only used when the caller supplies the comments
-        (determinism between audit-time and check-time computation)."""
+        """The resolver stays a PURE function: comment hashes are only used
+        when the caller supplies the comments. The fingerprint layer
+        (``_compute_content_fingerprint``) is responsible for supplying them
+        deterministically (it fetches them when omitted —
+        SA-0MVAWFYKT002CQ3L), so audit-time and check-time computations
+        agree."""
         repo = _FakeGitRepo(
             grep_files=["src/a.py"],
             comment_commits={"c" * 40: ["src/c.py"]},
@@ -368,17 +372,44 @@ class TestContentFreshnessGate:
         defaults.update(kwargs)
         return _FakeGitRepo(**defaults)
 
-    def _fp(self, repo, desc=None, comments=None) -> str | None:
-        """Compute the fingerprint against *repo* for the default item."""
-        return audit_runner._compute_content_fingerprint(
-            repo, "TEST-1",
-            work_item={"description": desc if desc is not None else self._DESC},
-            comments=comments,
-        )
+    def _fp(self, repo, desc=None, comments=None, run_wl_comments=None) -> str | None:
+        """Compute the fingerprint against *repo* for the default item.
+
+        ``_run_wl`` is mocked so the deterministic comment fetch (performed
+        when *comments* is omitted) is hermetic: the fake ``wl show`` payload
+        carries *run_wl_comments* (empty by default, mirroring the
+        pre-fetch resolved set). Tests that exercise the comment source pass
+        explicit *comments* (audit/persist time) or *run_wl_comments*
+        (check-time fetch).
+        """
+        show_payload = {
+            "success": True,
+            "workItem": {"id": "TEST-1"},
+            "comments": list(run_wl_comments or []),
+        }
+
+        def _run_wl(runner, cmd, worklog_dir=None):
+            return show_payload
+
+        with mock.patch.object(audit_runner, "_run_wl", side_effect=_run_wl):
+            return audit_runner._compute_content_fingerprint(
+                repo, "TEST-1",
+                work_item={"description": desc if desc is not None else self._DESC},
+                comments=comments,
+            )
 
     def _make_run_wl(self, audit_raw=None, audit_audited_at="2026-08-01T00:00:00.000Z",
-                     work_item_desc=_DESC, work_item_updated_at="2026-07-01T00:00:00.000Z"):
-        """Build a ``_run_wl`` fake returning a stored audit + work item."""
+                     work_item_desc=_DESC, work_item_updated_at="2026-07-01T00:00:00.000Z",
+                     work_item_comments=None):
+        """Build a ``_run_wl`` fake returning a stored audit + work item.
+
+        *work_item_comments* seeds the top-level ``comments`` list of the
+        ``wl show`` payload so the fingerprint's deterministic comment fetch
+        (SA-0MVAWFYKT002CQ3L) sees the same comments at check time that the
+        audit recorded.
+        """
+        comments = list(work_item_comments or [])
+
         def _fake(runner, cmd, worklog_dir=None):
             cmd_str = " ".join(cmd)
             if "audit-show" in cmd_str:
@@ -397,6 +428,7 @@ class TestContentFreshnessGate:
                         "description": work_item_desc,
                         "updatedAt": work_item_updated_at,
                     },
+                    "comments": list(comments),
                 }
             raise AssertionError(f"unexpected wl command: {cmd_str}")
 
@@ -720,12 +752,13 @@ class TestContentFreshnessGate:
         comments — no spurious invalidation (comment-source stability).
 
         The parent-first flow computes the fingerprint with the fetched
-        comments at audit time (``cmd_issue``) but drops them at child-reuse
-        check time (SA-0MSL1Z7E9005TLBA), so the two computations must agree.
-        That holds because the implement-skill convention embeds the item id
-        in every commit message: the comment-recorded hashes reference
-        commits the item-id grep already resolves, so the comment source
-        never adds a unique path to the touched set.
+        comments at audit time (``cmd_issue``) and the check-time callers
+        (child-reuse gate, freshness probe) fetch the comments themselves
+        (deterministic comment source, SA-0MVAWFYKT002CQ3L), so the two
+        computations must agree. For the implement-skill convention (comment
+        hashes reference commits the item-id grep already resolves) the
+        comment source adds no unique path; the unique-path case is covered
+        by the tests below.
         """
         repo = _FakeGitRepo(
             grep_files=["src/a.py"],
@@ -758,6 +791,154 @@ class TestContentFreshnessGate:
         )
         assert self._fp(changed, comments=comments) != fp_with
         assert self._fp(changed) != fp_without
+
+    # ------------------------------------------------------------------
+    # Deterministic comment source (SA-0MVAWFYKT002CQ3L)
+    # ------------------------------------------------------------------
+
+    def test_fingerprint_fetches_comments_when_not_supplied(self):
+        """AC1: when the caller does not supply the comments, the fingerprint
+        fetches them from ``wl show`` so a comment-recorded commit hash that
+        the item-id grep does NOT cover still contributes identically at
+        audit/persist time and check time.
+
+        Regression for the residual: ``cmd_issue`` passes ``ctx.comments`` at
+        persist time but the child-reuse gate and the freshness probe do not
+        hold the list, so the two computations used to diverge (spurious
+        re-audit).
+        """
+        repo = _FakeGitRepo(
+            grep_files=["src/a.py"],  # the comment commit is NOT id-referenced
+            comment_commits={"c" * 40: ["src/from_comment.py"]},
+            blobs={"src/a.py": "blob-a", "src/from_comment.py": "blob-c"},
+        )
+        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
+
+        # Check time: comments NOT supplied → fetched internally.
+        fp_fetched = self._fp(repo, desc="", run_wl_comments=comments)
+        # Audit/persist time: the caller holds the comments.
+        fp_audit = self._fp(repo, desc="", comments=comments)
+        # Sanity: an empty comment payload does NOT include the unique path.
+        fp_commentless = self._fp(repo, desc="")
+
+        assert fp_fetched is not None
+        assert fp_audit == fp_fetched
+        assert fp_audit != fp_commentless
+
+    def test_comment_hash_unique_path_consistent_at_probe(self):
+        """AC1: a fingerprint recorded at audit time (with a unique
+        comment-derived path) is reproduced by the read-only freshness probe,
+        which fetches the comments itself — the stored audit stays fresh."""
+        repo = _FakeGitRepo(
+            grep_files=["src/a.py"],
+            comment_commits={"c" * 40: ["src/from_comment.py"]},
+            blobs={"src/a.py": "blob-a", "src/from_comment.py": "blob-c"},
+        )
+        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
+        stored_fp = self._fp(repo, desc="", comments=comments)
+        assert stored_fp is not None
+        report = self._report_with_fingerprint(stored_fp)
+
+        # Probe passes NO comments; the gate's internal fetch must see them.
+        run_wl = self._make_run_wl(
+            audit_raw=report,
+            work_item_desc="",
+            work_item_comments=comments,
+        )
+        assert self._check(run_wl, repo) == report
+
+    def test_child_content_changed_fresh_for_unique_comment_hash(self):
+        """AC1 residual at the child gate: a child whose stored audit encodes
+        a comment-recorded commit hash (not reachable via the item-id grep)
+        stays content-fresh — ``_child_content_changed`` must return False so
+        the parent reuses the child instead of re-auditing it."""
+        repo = _FakeGitRepo(
+            grep_files=["src/a.py"],
+            comment_commits={"c" * 40: ["src/from_comment.py"]},
+            blobs={"src/a.py": "blob-a", "src/from_comment.py": "blob-c"},
+        )
+        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
+        stored_fp = self._fp(repo, desc="", comments=comments)
+        assert stored_fp is not None
+        stored = self._report_with_fingerprint(stored_fp)
+        run_wl = self._make_run_wl(
+            audit_raw=stored,
+            work_item_desc="",
+            work_item_comments=comments,
+        )
+        with mock.patch.object(audit_runner, "_run_wl", side_effect=run_wl):
+            changed = audit_runner._child_content_changed(repo, "TEST-1")
+        assert changed is False
+
+    def test_get_child_audit_verdict_reuses_comment_fresh_child(self):
+        """AC1 residual at the parent child-reuse gate: a child whose
+        individually-persisted audit covers a comment-recorded commit hash is
+        content-fresh when the parent evaluates it — the parent reuses the
+        verdict (``ready``) instead of re-auditing.
+
+        The check drops the comments on purpose (child dict from ``wl show
+        --children`` carries none); the fingerprint fetch must restore them.
+        """
+        repo = _FakeGitRepo(
+            grep_files=["src/a.py"],
+            comment_commits={"c" * 40: ["src/from_comment.py"]},
+            blobs={"src/a.py": "blob-a", "src/from_comment.py": "blob-c"},
+        )
+        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
+        stored_fp = self._fp(repo, desc="", comments=comments)
+        assert stored_fp is not None
+        stored = (
+            "Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
+            f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{stored_fp}\n\n"
+            "## Summary\nchild audit ok"
+        )
+        child = {"id": "CHILD-1", "description": "",
+                 "updatedAt": "2026-08-01T00:00:00.000Z"}
+
+        def _combined(cmd):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return _proc(0, json.dumps({
+                    "success": True,
+                    "audit": {
+                        "auditedAt": "2026-08-01T00:00:00.000Z",
+                        "rawOutput": stored,
+                    },
+                }))
+            if "show" in cmd_str and "--children" not in cmd_str:
+                return _proc(0, json.dumps({
+                    "success": True,
+                    "workItem": child,
+                    "comments": list(comments),
+                }))
+            return repo(cmd)
+
+        verdict, reason, _ = audit_runner._get_child_audit_verdict(
+            _combined, "CHILD-1", child=child,
+        )
+        assert verdict is True
+        assert reason == "ready"
+
+    def test_convention_item_fingerprint_unchanged_by_comment_fetch(self):
+        """Backward compatibility: for the implement-skill convention
+        (comment-recorded hashes reference commits the item-id grep already
+        resolves) the comment fetch adds no new path — the fingerprint is
+        byte-identical whether comments are supplied, fetched, or absent, so
+        previously persisted audits are not invalidated solely by this
+        change. Legacy fingerprint-less reports keep the time floor
+        (covered above).
+        """
+        repo = _FakeGitRepo(
+            grep_files=["src/a.py"],
+            comment_commits={"c" * 40: ["src/a.py"]},
+            blobs={"src/a.py": "blob-a"},
+        )
+        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
+        fp_audit = self._fp(repo, comments=comments)
+        fp_fetched = self._fp(repo, run_wl_comments=comments)
+        fp_commentless = self._fp(repo)
+        assert fp_audit is not None
+        assert fp_audit == fp_fetched == fp_commentless
 
     # ------------------------------------------------------------------
     # 60s time floor interaction (legacy audits)
