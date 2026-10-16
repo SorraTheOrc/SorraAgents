@@ -183,6 +183,20 @@ class TestCorpusReplay:
         # 7 genuine failures recorded by the RCA (baseline before the fix).
         assert baseline == 7
 
+    @staticmethod
+    def _make_reask_fake(original_text: str):
+        """Factory to create a fake for _call_pi_and_maybe_log, capturing
+        ``original_text`` and a per-iteration call tracker via defaults."""
+        tracker: list[str] = []
+
+        def fake(issue_id: str, context: str, prompt: str, **kwargs):
+            tracker.append(context)
+            if context == "verdict_reask":
+                return {"extracted_text": _VALID_ARRAY}
+            return {"extracted_text": original_text}
+
+        return fake, tracker
+
     def test_reask_reduces_genuine_failure_rate_to_zero(self):
         baseline = sum(
             1 for t in _CORPUS
@@ -193,13 +207,7 @@ class TestCorpusReplay:
         for text in _CORPUS:
             if audit_runner._extract_json_array(text) is not None:
                 continue
-            calls: list[str] = []
-
-            def fake(issue_id, context, prompt, _text=text, _calls=calls, **kwargs):
-                _calls.append(context)
-                if context == "verdict_reask":
-                    return {"extracted_text": _VALID_ARRAY}
-                return {"extracted_text": _text}
+            fake, calls = self._make_reask_fake(text)
 
             with mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", side_effect=fake
