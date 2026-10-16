@@ -1138,6 +1138,12 @@ VERDICT_ADJUSTED = "adjusted"
 VERDICT_WARNING = "warning"  # zero-AC sentinel / extraction failure (SA-0MSRLLQ0V008EW3J)
 _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
 
+# Child-assessment reason codes (SA-0MVAWFYZE0040SQ3 AC3): machine-parseable
+# diagnostics that distinguish an unserviced-in-main-slot child from a
+# genuine not-ready child.
+REASON_UNSERVICED_IN_MAIN_SLOT = "unserviced_in_main_slot"
+REASON_NOT_ASSESSED = "not_assessed"
+
 
 def _normalize_verdict(verdict: str | None) -> str:
     """Normalize a model-provided verdict to the runner vocabulary.
@@ -5339,6 +5345,36 @@ def _unserviced_main_slot_child_ids(
     }
 
 
+def _classify_child_assessment_reason(
+    child: dict,
+    stale_pending_ids: set[str] | None,
+) -> str | None:
+    """Return a machine-parseable reason code for a child's assessment state.
+
+    Reasons (SA-0MVAWFYZE0040SQ3 AC3):
+
+    * ``unserviced_in_main_slot`` — the child is an un-serviced in-main-slot
+      child from a previous run (stale pending-screens signal present, ac_results
+      carry the unserviced pending marker).  Whether the parent inherits a
+      stored verdict or not is a separate concern; the reason always names the
+      unserviced-in-main-slot origin.
+    * ``not_assessed`` — the child is genuinely not-ready and has no stored
+      verdict (a normal "not ready" verdict).
+    * ``None`` — the child is assessed (stored-verdict-inherited, in_review,
+      done, exempt, etc.) and does not need a diagnostic.
+
+    The caller decides whether to surface the code in the report or JSON payload.
+    """
+    cid = str(child.get("id", "") or "")
+    if _is_unserviced_main_slot_child(child, stale_pending_ids):
+        return REASON_UNSERVICED_IN_MAIN_SLOT
+    # A child whose child_audit_ready is False and which is not unserviced
+    # is genuinely not-ready / not-assessed.
+    if child.get("child_audit_ready") is False:
+        return REASON_NOT_ASSESSED
+    return None
+
+
 def _read_pending_screens_signal(
     issue_id: str,
     owning_root: str | Path | None,
@@ -5478,6 +5514,16 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     # governs); without one the child is NOT-ASSESSED — its acs still count
     # (partial ⇒ not acceptable ⇒ the parent is never reported ready).
     unserviced_ids = _unserviced_main_slot_child_ids(child_results, stale_pending_ids)
+
+    # Child-assessment reason diagnostics (SA-0MVAWFYZE0040SQ3 AC3): classify
+    # every child and collect greppable diagnostic lines.
+    child_reasons: dict[str, str] = {}
+    for c in child_results:
+        cid = str(c.get("id", "") or "")
+        reason = _classify_child_assessment_reason(c, stale_pending_ids)
+        if reason:
+            child_reasons[cid] = reason
+
     child_acs = [
         a
         for c in child_results
@@ -5773,6 +5819,18 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     lines.append("")
     lines.append("## Children Status")
     lines.append("")
+
+    # Child-assessment reason diagnostics (SA-0MVAWFYZE0040SQ3 AC3): emit a
+    # greppable diagnostic line for every child that is unserviced-in-main-slot
+    # or genuinely not-ready.  The line is machine-parseable (``REASON_*``
+    # tokens) and human-readable.
+    if child_reasons:
+        reason_parts = [
+            f"[{reason}] {cid}"
+            for cid, reason in sorted(child_reasons.items())
+        ]
+        lines.append("Child assessment reasons: " + ", ".join(reason_parts))
+        lines.append("")
 
     if not child_results:
         lines.append("No children.")
@@ -7087,6 +7145,18 @@ def _build_issue_json(
     # NOT-ASSESSED — its acs still count (partial ⇒ not acceptable ⇒ the
     # parent is never reported ready).
     unserviced_ids = _unserviced_main_slot_child_ids(child_results, stale_pending_ids)
+
+    # Child-assessment reason codes (SA-0MVAWFYZE0040SQ3 AC3): classify every
+    # child and emit machine-parseable diagnostics.
+    child_reasons: dict[str, str] = {}
+    not_assessed_children: list[dict] = []
+    for c in child_results:
+        cid = str(c.get("id", "") or "")
+        reason = _classify_child_assessment_reason(c, stale_pending_ids)
+        if reason:
+            child_reasons[cid] = reason
+            not_assessed_children.append({"id": cid, "reason": reason})
+
     child_acs = [
         a
         for c in child_results
@@ -7177,6 +7247,11 @@ def _build_issue_json(
         "summary": summary,
         "acceptance_criteria": ac_results,
         "children": child_results,
+        # Child-assessment reason diagnostics (SA-0MVAWFYZE0040SQ3 AC3):
+        # mapping of child id → reason code, and a compact list of
+        # not-assessed children with their reasons.
+        "child_reasons": child_reasons,
+        "not_assessed_children": not_assessed_children,
         "code_quality": {
             "total_findings": len(cq_findings),
             "fixes_applied": code_quality_fixes_applied,
