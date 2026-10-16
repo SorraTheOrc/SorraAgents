@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import agent_log_review as alr
@@ -1032,3 +1033,222 @@ def test_build_analysis_and_report_end_to_end():
     md = alr.render_report(analysis, fmt="markdown")
     assert "Sessions analysed: 1" in md
     assert "Warn when backticks are used in bash commands" in md
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Child 5 — worklog integration (comments + child items)
+# (SA-0MV6UGWC4000GU0G)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class _WlStub:
+    """A mocked ``wl`` runner that records commands and simulates a store."""
+
+    def __init__(self, children=None):
+        self.commands = []
+        self.children = list(children or [])
+        self.created = []
+        self._next = 1
+
+    def __call__(self, cmd):
+        self.commands.append(list(cmd))
+        joined = " ".join(cmd)
+        if "show" in cmd and "--children" in cmd:
+            payload = {"success": True, "children": list(self.children)}
+            return _fake_runner(json.dumps(payload))
+        if "comment" in cmd and "add" in cmd:
+            return _fake_runner(json.dumps({"success": True}))
+        if "create" in cmd:
+            title = ""
+            for i, tok in enumerate(cmd):
+                if tok in ("-t", "--title") and i + 1 < len(cmd):
+                    title = cmd[i + 1]
+            new_id = f"NEW-{self._next:03d}"
+            self._next += 1
+            self.created.append((new_id, title))
+            self.children.append({"id": new_id, "title": title})
+            return _fake_runner(json.dumps({"success": True, "workItem": {"id": new_id}}))
+        return _fake_runner(json.dumps({"success": True}))
+
+
+RECS = [
+    {"title": "Warn about backticks in bash commands", "issue_type": "chore",
+     "target_skill": "implement", "rationale": "Backtick expansion caused retries.",
+     "evidence_sessions": ["a.jsonl"]},
+    {"title": "Add python3 import guard", "issue_type": "feature",
+     "target_skill": "shared", "rationale": "NameError from missing imports.",
+     "evidence_sessions": ["b.jsonl"]},
+]
+
+PARENT = "SA-0MUEKTJRD0010CGC"
+
+
+def test_file_recommendations_files_comment():
+    stub = _WlStub()
+    result = alr.file_recommendations(RECS, PARENT, report_markdown="## Report\nbody",
+                                      wl_runner=stub, worklog_flags=[])
+    assert result["comment_posted"] is True
+    comment_cmds = [c for c in stub.commands if "comment" in c and "add" in c]
+    assert len(comment_cmds) == 1
+    cmd = comment_cmds[0]
+    assert PARENT in cmd
+    # The report body is included in the comment.
+    assert any("## Report" in tok for tok in cmd)
+
+
+def test_file_recommendations_creates_children_with_linking():
+    stub = _WlStub()
+    result = alr.file_recommendations(RECS, PARENT, wl_runner=stub, worklog_flags=[])
+    assert len(result["created"]) == 2
+    create_cmds = [c for c in stub.commands if "create" in c]
+    assert len(create_cmds) == 2
+    for cmd in create_cmds:
+        assert "--parent" in cmd and PARENT in cmd
+        assert "--assignee" in cmd and "Map" in cmd
+        assert "--issue-type" in cmd
+        joined = " ".join(cmd)
+        assert f"related-to:{PARENT}" in joined
+    chore_cmd = next(c for c in create_cmds
+                    if any("Warn about backticks" in tok for tok in c))
+    assert chore_cmd[chore_cmd.index("--issue-type") + 1] == "chore"
+    assert chore_cmd[chore_cmd.index("--priority") + 1] == "low"
+    feat_cmd = next(c for c in create_cmds
+                    if any("import guard" in tok for tok in c))
+    assert feat_cmd[feat_cmd.index("--issue-type") + 1] == "feature"
+    assert feat_cmd[feat_cmd.index("--priority") + 1] == "medium"
+
+
+def test_file_recommendations_idempotent_reuses_existing():
+    # First run creates two children.
+    stub = _WlStub()
+    first = alr.file_recommendations(RECS, PARENT, wl_runner=stub, worklog_flags=[])
+    assert len(first["created"]) == 2
+    # Re-run against the same (now-populated) stub store.
+    create_before = len([c for c in stub.commands if "create" in c])
+    second = alr.file_recommendations(RECS, PARENT, wl_runner=stub, worklog_flags=[])
+    assert second["created"] == []
+    assert len(second["reused"]) == 2
+    assert len([c for c in stub.commands if "create" in c]) == create_before
+
+
+def test_file_recommendations_dry_run_no_mutations():
+    stub = _WlStub()
+    result = alr.file_recommendations(RECS, PARENT, wl_runner=stub, dry_run=True,
+                                      worklog_flags=[])
+    assert result["dry_run"] is True
+    assert result["comment_posted"] is False
+    assert result["created"] == []
+    # No mutating commands were issued.
+    assert not any("create" in c for c in stub.commands)
+    assert not any("comment" in c and "add" in c for c in stub.commands)
+    # The planned actions are reported.
+    assert sum(1 for a in result["actions"] if a.startswith("would create")) == 2
+
+
+def test_file_recommendations_confidence_threshold_skips():
+    recs = [dict(RECS[0], confidence=0.2), dict(RECS[1], confidence=0.95)]
+    stub = _WlStub()
+    result = alr.file_recommendations(recs, PARENT, wl_runner=stub,
+                                      min_confidence=0.5, worklog_flags=[])
+    titles = [c["title"] for c in result["created"]]
+    assert titles == ["Add python3 import guard"]
+    skipped = [s["title"] for s in result["skipped"]]
+    assert "Warn about backticks in bash commands" in skipped
+
+
+def test_file_recommendations_invalid_issue_type_defaults_to_chore():
+    recs = [dict(RECS[0], issue_type="banana")]
+    stub = _WlStub()
+    result = alr.file_recommendations(recs, PARENT, wl_runner=stub, worklog_flags=[])
+    cmd = next(c for c in stub.commands if "create" in c)
+    assert cmd[cmd.index("--issue-type") + 1] == "chore"
+    assert result["created"][0]["title"] == RECS[0]["title"]
+
+
+def test_file_recommendations_empty_recs_no_create():
+    stub = _WlStub()
+    result = alr.file_recommendations([], PARENT, wl_runner=stub, worklog_flags=[])
+    assert result["created"] == []
+    assert not any("create" in c for c in stub.commands)
+    # Still files a report comment (empty recommendation summary).
+    assert result["comment_posted"] is True
+
+
+def test_wl_flags_are_injected_before_subcommand():
+    stub = _WlStub()
+    alr.file_recommendations([RECS[0]], PARENT, wl_runner=stub,
+                             worklog_flags=["--worklog-dir", "/main/.worklog"])
+    for cmd in stub.commands:
+        assert cmd[0] == "wl"
+        assert cmd[1:3] == ["--worklog-dir", "/main/.worklog"]
+        # subcommand follows the flags
+        assert cmd[3] in ("show", "comment", "create")
+
+
+def test_file_recommendations_create_failure_is_reported():
+    """A failed wl create is recorded, not raised."""
+
+    class FailingCreate(_WlStub):
+        def __call__(self, cmd):
+            if "create" in cmd:
+                self.commands.append(list(cmd))
+                return _fake_runner(json.dumps({"success": False, "error": "boom"}), rc=1)
+            return super().__call__(cmd)
+
+    stub = FailingCreate()
+    result = alr.file_recommendations([RECS[0]], PARENT, wl_runner=stub, worklog_flags=[])
+    assert result["created"] == []
+    assert result["errors"]
+    assert "boom" in result["errors"][0]["error"] or "rc=1" in result["errors"][0]["error"]
+
+
+# ── CLI smoke tests (script entry point) ───────────────────────────────────
+
+_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "agent_log_review.py"
+
+
+def test_cli_help_prints_usage():
+    import subprocess
+    proc = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--help"],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert proc.returncode == 0
+    for flag in ("--max-sessions", "--json", "--dry-run", "--parent-id",
+                 "--model", "--errors-only"):
+        assert flag in proc.stdout, f"missing {flag} in --help"
+
+
+def test_cli_no_classify_end_to_end(tmp_path):
+    import subprocess
+    cwd = "/home/operator/project"
+    sdir = tmp_path / alr.project_slug(cwd)
+    _write_session(sdir, "a.jsonl", [
+        _header(session_id="s1"),
+        _assistant_msg([_tool_call_part("bash", {"cmd": "ls"})]),
+        _tool_result_msg("bash", "command not found", is_error=True),
+    ])
+    proc = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--no-classify", "--json",
+         "--cwd", cwd, "--session-root", str(tmp_path)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[:400]
+    report = json.loads(proc.stdout)
+    assert report["summary"]["sessions_analysed"] == 1
+    assert report["summary"]["classification_error"]
+
+
+def test_cli_dry_run_does_not_mutate_worklog(tmp_path):
+    import subprocess
+    cwd = "/home/operator/project"
+    sdir = tmp_path / alr.project_slug(cwd)
+    _write_session(sdir, "a.jsonl", [_header(session_id="s1")])
+    proc = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--no-classify", "--json", "--dry-run",
+         "--parent-id", PARENT, "--cwd", cwd, "--session-root", str(tmp_path)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[:400]
+    # dry-run prints "would comment" to stderr, never an actual mutation.
+    assert "would comment" in proc.stderr

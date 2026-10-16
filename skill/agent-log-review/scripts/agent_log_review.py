@@ -32,6 +32,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1155,3 +1156,346 @@ def render_report(
     if fmt in ("markdown", "md"):
         return _render_markdown(doc)
     raise ValueError(f"unknown report format: {fmt!r}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Layer 5 — worklog integration (comments + child items)
+# (SA-0MV6UGWC4000GU0G)
+# ══════════════════════════════════════════════════════════════════════════
+
+WL_TIMEOUT = 120
+"""Per-``wl`` subprocess timeout (seconds)."""
+
+DEFAULT_REC_ASSIGNEE = "Map"
+"""Assignee for auto-created recommendation child items (parent AC 6)."""
+
+
+class WlError(RuntimeError):
+    """Raised when a mutating ``wl`` command exits non-zero."""
+
+
+def _default_wl_runner(cmd: list[str]) -> object:
+    """Run a ``wl`` command, capturing stdout/stderr."""
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=WL_TIMEOUT, check=False,
+    )
+
+
+def _resolve_wl_flags(cmd: list[str]) -> list[str]:
+    """Resolve ``--worklog-dir`` flags via the shared worklog-safe helper.
+
+    Falls back to an empty list (let ``wl`` resolve from cwd) when the shared
+    helper is unavailable — e.g. a partial install — so the skill degrades
+    gracefully rather than crashing.
+    """
+    try:
+        from shared.status_lifecycle import resolve_worklog_flags  # type: ignore
+        return list(resolve_worklog_flags(cmd))
+    except Exception:  # noqa: BLE001 - best-effort resolution
+        return []
+
+
+def _wl_command(
+    subcommand: list[str],
+    worklog_flags: list[str] | None = None,
+) -> list[str]:
+    """Build a worklog-safe ``wl`` command with ``--worklog-dir`` inserted.
+
+    ``--worklog-dir`` must appear before the subcommand (mirrors every other
+    caller, e.g. ``wl --worklog-dir <dir> update <id> ...``).
+    """
+    flags = list(worklog_flags) if worklog_flags is not None else _resolve_wl_flags(subcommand)
+    return ["wl", *flags, *subcommand]
+
+
+def _extract_child_titles(payload: str) -> dict[str, str]:
+    """Map existing child titles → ids from ``wl show --children --json``."""
+    try:
+        data = json.loads(payload or "{}")
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    children = data.get("children")
+    if not isinstance(children, list):
+        return {}
+    titles: dict[str, str] = {}
+    for child in children:
+        if isinstance(child, dict) and child.get("title"):
+            titles.setdefault(str(child["title"]), str(child.get("id", "")))
+    return titles
+
+
+def _recommendation_description(rec: dict[str, Any], parent_id: str) -> str:
+    """Build a created child's description with a ``related-to`` link back."""
+    target = rec.get("target_skill") or "(unspecified)"
+    rationale = rec.get("rationale") or rec.get("summary") or "(none given)"
+    sessions = rec.get("evidence_sessions") or []
+    lines = [
+        "Auto-created from an agent-log-review recommendation.",
+        "",
+        f"related-to:{parent_id}",
+        f"target_skill: {target}",
+        f"rationale: {rationale}",
+    ]
+    if sessions:
+        lines.append(f"evidence_sessions: {', '.join(str(s) for s in sessions)}")
+    return "\n".join(lines)
+
+
+def _build_recommendation_comment(
+    recommendations: list[dict[str, Any]],
+    report_markdown: str = "",
+) -> str:
+    """Compose the worklog comment body filed on the parent item."""
+    lines = ["## Agent Log Review — Recommendations", ""]
+    if report_markdown.strip():
+        lines.append(report_markdown.strip())
+        lines.append("")
+    if recommendations:
+        lines.append("### Actionable recommendations")
+        for i, rec in enumerate(recommendations, start=1):
+            lines.append(
+                f"{i}. **{rec.get('title')}** ({rec.get('issue_type', 'chore')}; "
+                f"target_skill: {rec.get('target_skill') or 'n/a'})"
+            )
+            rationale = rec.get("rationale") or rec.get("summary")
+            if rationale:
+                lines.append(f"   - Rationale: {rationale}")
+            sessions = rec.get("evidence_sessions") or []
+            if sessions:
+                lines.append(f"   - Evidence: {', '.join(str(s) for s in sessions)}")
+    else:
+        lines.append("_No actionable recommendations._")
+    return redact_secrets("\n".join(lines))
+
+
+def file_recommendations(
+    recommendations: list[dict[str, Any]],
+    parent_id: str,
+    report_markdown: str = "",
+    wl_runner: Any = None,
+    dry_run: bool = False,
+    min_confidence: float = 0.0,
+    worklog_flags: list[str] | None = None,
+    assignee: str = DEFAULT_REC_ASSIGNEE,
+) -> dict[str, Any]:
+    """File recommendations as a comment and auto-create child work items.
+
+    Ordering (idempotent, conservative):
+
+    1. Read the parent's existing children (``wl show --children``) so a
+       recommendation whose title already exists as a child is **reused**
+       rather than duplicated.
+    2. File the report + recommendations as a comment on *parent_id*.
+    3. For each recommendation at/above *min_confidence*, create a child item
+       (``--parent <parent_id>``, issue-type ``chore``/``feature``, priority
+       ``low``/``medium``, assignee *assignee*) whose description contains
+       ``related-to:<parent_id>``. A title that already exists is reused.
+
+    ``dry_run=True`` performs **no mutations** (no comment, no create) but
+    still reports the planned actions. Nothing from the parent is
+    implemented here — creation only.
+
+    Returns a result dict with ``dry_run``, ``comment_posted``, ``created``,
+    ``reused``, ``skipped``, ``errors`` and human-readable ``actions``.
+    """
+    runner = wl_runner if wl_runner is not None else _default_wl_runner
+    result: dict[str, Any] = {
+        "dry_run": dry_run,
+        "comment_posted": False,
+        "created": [],
+        "reused": [],
+        "skipped": [],
+        "errors": [],
+        "actions": [],
+    }
+
+    # 1. Fetch existing children for idempotence.
+    show_cmd = _wl_command(
+        ["show", parent_id, "--children", "--json"], worklog_flags
+    )
+    existing: dict[str, str] = {}
+    try:
+        show_proc = runner(show_cmd)
+        if getattr(show_proc, "returncode", 1) == 0:
+            existing = _extract_child_titles(getattr(show_proc, "stdout", ""))
+    except Exception as exc:  # noqa: BLE001 - don't block on show failure
+        result["errors"].append({"stage": "show", "error": str(exc)})
+
+    # 2. File the report/recommendations comment.
+    comment_body = _build_recommendation_comment(recommendations, report_markdown)
+    if dry_run:
+        result["actions"].append(f"would comment on {parent_id}")
+    else:
+        comment_cmd = _wl_command(
+            ["comment", "add", parent_id, "--comment", comment_body,
+             "--author", assignee, "--json"],
+            worklog_flags,
+        )
+        try:
+            proc = runner(comment_cmd)
+            if getattr(proc, "returncode", 1) == 0:
+                result["comment_posted"] = True
+                result["actions"].append(f"commented on {parent_id}")
+            else:
+                result["errors"].append(
+                    {"stage": "comment", "error": getattr(proc, "stderr", "") or "rc!=0"}
+                )
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append({"stage": "comment", "error": str(exc)})
+
+    # 3. Create (or reuse) a child item per recommendation.
+    for rec in recommendations:
+        title = str(rec.get("title") or "").strip()
+        if not title:
+            result["skipped"].append({"title": title, "reason": "empty title"})
+            continue
+        confidence = rec.get("confidence", 1.0)
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 1.0
+        if confidence_value < min_confidence:
+            result["skipped"].append(
+                {"title": title, "reason": f"confidence {confidence_value} < {min_confidence}"}
+            )
+            continue
+
+        if title in existing:
+            result["reused"].append({"title": title, "id": existing[title]})
+            result["actions"].append(f"reused existing child for '{title}'")
+            continue
+
+        issue_type = rec.get("issue_type")
+        if issue_type not in ("chore", "feature"):
+            issue_type = "chore"
+        priority = rec.get("priority") or ("medium" if issue_type == "feature" else "low")
+        description = _recommendation_description(rec, parent_id)
+
+        if dry_run:
+            result["actions"].append(f"would create child: {title}")
+            continue
+
+        create_cmd = _wl_command(
+            ["create", "--title", title, "--description", description,
+             "--parent", parent_id, "--issue-type", issue_type,
+             "--priority", priority, "--assignee", assignee, "--json"],
+            worklog_flags,
+        )
+        try:
+            proc = runner(create_cmd)
+            if getattr(proc, "returncode", 1) == 0:
+                new_id = ""
+                try:
+                    payload = json.loads(getattr(proc, "stdout", "") or "{}")
+                    new_id = str(
+                        (payload.get("workItem") or {}).get("id")
+                        or payload.get("id")
+                        or ""
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    new_id = ""
+                result["created"].append({"title": title, "id": new_id})
+                existing[title] = new_id
+                result["actions"].append(f"created child '{title}' ({new_id})")
+            else:
+                result["errors"].append(
+                    {
+                        "stage": "create",
+                        "title": title,
+                        "error": getattr(proc, "stderr", "") or f"rc={getattr(proc, 'returncode', '?')}",
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append({"stage": "create", "title": title, "error": str(exc)})
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CLI entry point (used by the /skill:agent-log-review invocation)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _parse_args(argv: list[str] | None = None):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="agent_log_review",
+        description=(
+            "Analyse pi session logs for repeated agent-confusion patterns "
+            "(hybrid: heuristics + one LLM classification call)."
+        ),
+    )
+    parser.add_argument("--cwd", default=None,
+                        help="Project working directory (default: current dir)")
+    parser.add_argument("--session-root", default=None,
+                        help="Pi session store root (default: ~/.pi/agent/sessions)")
+    parser.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS,
+                        help=f"Most-recent session logs to analyse (default {DEFAULT_MAX_SESSIONS})")
+    parser.add_argument("--errors-only", action="store_true",
+                        help="Only analyse sessions containing an error result")
+    parser.add_argument("--model", default=DEFAULT_CLASSIFIER_MODEL,
+                        help="Model for the classification call")
+    parser.add_argument("--no-classify", action="store_true",
+                        help="Skip the LLM classification (heuristic report only)")
+    parser.add_argument("--json", action="store_true",
+                        help="Emit the report as a single JSON document")
+    parser.add_argument("--output-file", default=None,
+                        help="Write the Markdown report to this path")
+    parser.add_argument("--parent-id", default=None,
+                        help="Work item to comment on and attach recommendation children to")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --parent-id: print planned worklog actions without mutating")
+    parser.add_argument("--min-confidence", type=float, default=0.0,
+                        help="Only create recommendations at/above this confidence")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the agent-log-review pipeline and print the report.
+
+    Pipeline: parse session logs → extract heuristic signals → one LLM
+    classification call (unless ``--no-classify``) → render the report →
+    optionally file recommendations on ``--parent-id``. Returns a process
+    exit code (0 on success).
+    """
+    args = _parse_args(argv)
+    session_root = Path(args.session_root) if args.session_root else None
+    scan = read_sessions(cwd=args.cwd, session_root=session_root,
+                         max_sessions=args.max_sessions)
+    signals = extract_signals(scan.sessions, max_sessions=args.max_sessions,
+                              errors_only=args.errors_only)
+    if args.no_classify:
+        classification = {
+            "error": "classification skipped (--no-classify)",
+            "categories": [], "recommendations": [],
+        }
+    else:
+        classification = classify_patterns(signals, model=args.model)
+    analysis = build_analysis(scan, classification=classification)
+    report = render_report(analysis, fmt="json" if args.json else "markdown")
+    print(report)
+
+    if args.output_file:
+        out = Path(args.output_file)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(report, encoding="utf-8")
+
+    if args.parent_id:
+        recommendations = analysis["classification"].get("recommendations") or []
+        outcome = file_recommendations(
+            recommendations, args.parent_id, report_markdown=report,
+            dry_run=args.dry_run, min_confidence=args.min_confidence,
+        )
+        for action in outcome["actions"]:
+            print(f"[worklog] {action}", file=sys.stderr)
+        for err in outcome["errors"]:
+            print(f"[worklog] error: {err}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
