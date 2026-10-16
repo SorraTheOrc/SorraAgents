@@ -838,3 +838,197 @@ def test_prompt_is_redacted_before_send():
     assert "<API_KEY>" in prompt
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Child 4 — structured report rendering
+# (SA-0MV6UFVV30059ZPC)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _analysis_fixture() -> dict:
+    """A realistic analysis document for rendering tests."""
+    return {
+        "scan": {
+            "cwd": "/home/operator/project",
+            "session_dir": "/home/operator/.pi/agent/sessions/--home-operator-project--",
+            "files_found": 2,
+            "files_analysed": 2,
+            "malformed_lines": 1,
+            "missing_usage": 0,
+            "sessions": [
+                {"filename": "a.jsonl", "session_id": "s1",
+                 "started_at": "2026-01-01T00:00:00.000Z", "cwd": "/home/operator/project"},
+                {"filename": "b.jsonl", "session_id": "s2",
+                 "started_at": "2026-01-02T00:00:00.000Z", "cwd": "/home/operator/project"},
+            ],
+        },
+        "signals": {
+            "session_count": 2,
+            "session_files": ["a.jsonl", "b.jsonl"],
+            "tool_distribution": {
+                "total_calls": 3,
+                "total_error_results": 2,
+                "by_tool": {"bash": {"calls": 2, "error_results": 2, "error_rate": 1.0}},
+            },
+            "thinking_signals": {
+                "total_hits": 3,
+                "hits": [
+                    {"session": "a.jsonl", "keyword": "hmm", "count": 2, "context": "hmm ..."},
+                    {"session": "b.jsonl", "keyword": "hmm", "count": 1, "context": "hmm?"},
+                ],
+            },
+            "tool_errors": {
+                "total": 2,
+                "errors": [
+                    {"session": "a.jsonl", "tool": "bash", "kind": "command_not_found",
+                     "is_error": True, "excerpt": "not found"},
+                    {"session": "a.jsonl", "tool": "bash", "kind": "command_not_found",
+                     "is_error": True, "excerpt": "not found too"},
+                ],
+            },
+            "retry_patterns": {
+                "total": 1,
+                "patterns": [
+                    {"session": "b.jsonl", "kind": "repeated_call", "tool": "bash",
+                     "arguments": "x", "count": 3},
+                ],
+            },
+        },
+        "classification": {
+            "error": None,
+            "categories": [
+                {"name": "shell quoting issues", "confidence": 0.9,
+                 "evidence_sessions": ["a.jsonl"], "summary": "Backticks expanded."},
+            ],
+            "recommendations": [
+                {"title": "Warn about backticks in bash commands",
+                 "issue_type": "chore", "target_skill": "implement",
+                 "rationale": "Backtick expansion caused retries.",
+                 "evidence_sessions": ["a.jsonl"]},
+            ],
+        },
+    }
+
+
+def test_render_report_markdown_has_required_sections():
+    md = alr.render_report(_analysis_fixture(), fmt="markdown")
+    assert "# Agent Log Review" in md
+    assert "## Summary" in md
+    assert "Sessions analysed: 2" in md
+    assert "Date range: 2026-01-01T00:00:00.000Z .. 2026-01-02T00:00:00.000Z" in md
+    assert "malformed line(s) skipped" in md
+    assert "## Top Patterns" in md
+    assert "## Recommended Improvements" in md
+    assert "Warn about backticks in bash commands" in md
+    assert "## Evidence Citations" in md
+    assert "a.jsonl" in md
+
+
+def test_render_report_top_patterns_deterministic_ordering():
+    parsed = json.loads(alr.render_report(_analysis_fixture(), fmt="json"))
+    patterns = parsed["top_patterns"]
+    counts = [p["count"] for p in patterns]
+    assert counts == sorted(counts, reverse=True)
+    for i in range(len(patterns) - 1):
+        if patterns[i]["count"] == patterns[i + 1]["count"]:
+            assert patterns[i]["name"] < patterns[i + 1]["name"]
+    by_name = {p["name"]: p for p in patterns}
+    assert by_name["thinking:hmm"]["count"] == 3
+    assert by_name["thinking:hmm"]["sessions"] == ["a.jsonl", "b.jsonl"]
+    assert by_name["tool_error:command_not_found"]["sessions"] == ["a.jsonl"]
+
+
+def test_render_report_json_structure():
+    parsed = json.loads(alr.render_report(_analysis_fixture(), fmt="json"))
+    assert set(parsed.keys()) == {
+        "summary", "top_patterns", "recommendations", "evidence_citations",
+    }
+    assert parsed["summary"]["sessions_analysed"] == 2
+    assert parsed["summary"]["date_range"] == {
+        "from": "2026-01-01T00:00:00.000Z", "to": "2026-01-02T00:00:00.000Z",
+    }
+    assert parsed["recommendations"][0]["title"] == "Warn about backticks in bash commands"
+    assert parsed["recommendations"][0]["evidence_sessions"] == ["a.jsonl"]
+    assert len(parsed["evidence_citations"]) >= 1
+    for cit in parsed["evidence_citations"]:
+        assert "/" not in cit["session"]
+
+
+def test_render_report_redacts_secrets():
+    analysis = _analysis_fixture()
+    # Secrets in a *rendered* field (recommendation rationale) are redacted.
+    analysis["classification"]["recommendations"][0]["rationale"] = (
+        "saw token sk-abcdef1234567890abcdef1234567890 under /home/u/.ssh/id_rsa"
+    )
+    md = alr.render_report(analysis, fmt="markdown")
+    assert "sk-abcdef1234567890abcdef1234567890" not in md
+    assert "<API_KEY>" in md
+    assert "id_rsa" not in md
+
+
+def test_render_report_redacts_secrets_in_json():
+    analysis = _analysis_fixture()
+    analysis["classification"]["recommendations"][0]["rationale"] = (
+        "saw token sk-abcdef1234567890abcdef1234567890"
+    )
+    parsed = json.loads(alr.render_report(analysis, fmt="json"))
+    rationale = parsed["recommendations"][0]["rationale"]
+    assert "sk-abcdef1234567890abcdef1234567890" not in rationale
+    assert "<API_KEY>" in rationale
+
+
+def test_render_report_deterministic_same_input():
+    a = alr.render_report(_analysis_fixture(), fmt="markdown")
+    b = alr.render_report(_analysis_fixture(), fmt="markdown")
+    assert a == b
+    assert alr.render_report(_analysis_fixture(), fmt="json") == alr.render_report(
+        _analysis_fixture(), fmt="json"
+    )
+
+
+def test_render_report_unknown_format_raises():
+    with pytest.raises(ValueError):
+        alr.render_report(_analysis_fixture(), fmt="xml")
+
+
+def test_render_report_missing_usage_in_summary():
+    analysis = _analysis_fixture()
+    analysis["scan"]["missing_usage"] = 1
+    md = alr.render_report(analysis, fmt="markdown")
+    assert "1 session(s) missing usage data" in md
+
+
+def test_render_report_classification_error_diagnostic():
+    analysis = _analysis_fixture()
+    analysis["classification"]["error"] = "model returned malformed JSON: nope"
+    analysis["classification"]["categories"] = []
+    analysis["classification"]["recommendations"] = []
+    md = alr.render_report(analysis, fmt="markdown")
+    assert "Classification: not available" in md
+    assert "model returned malformed JSON" in md
+
+
+def test_build_analysis_and_report_end_to_end():
+    s1 = _session("a.jsonl",
+                  events=[
+                      _tool_call("a.jsonl", "bash", {"cmd": "ls `pwd`"}, 1),
+                      _tool_result("a.jsonl", "bash", "command not found", 2, is_error=True),
+                  ],
+                  thinking_texts=["hmm, wrong quoting"])
+    scan = alr.SessionScan(
+        cwd="/home/operator/project",
+        session_dir="/x/sessions",
+        files_found=1,
+        files_analysed=1,
+        malformed_lines=0,
+        missing_usage=0,
+        sessions=[s1],
+    )
+    runner = _Runner(stdout=WELL_FORMED_RESPONSE)
+    signals = alr.extract_signals([s1])
+    classification = alr.classify_patterns(signals, runner=runner)
+    analysis = alr.build_analysis(scan, classification=classification)
+    md = alr.render_report(analysis, fmt="markdown")
+    assert "Sessions analysed: 1" in md
+    assert "Warn when backticks are used in bash commands" in md

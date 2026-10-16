@@ -915,3 +915,243 @@ def classify_patterns(
     }
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Layer 4 — structured report rendering
+# (SA-0MV6UFVV30059ZPC)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def build_analysis(
+    scan: SessionScan,
+    classification: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble the full analysis document consumed by :func:`render_report`.
+
+    Combines the parsed-session scan metadata, the distilled heuristic
+    signals (see :func:`extract_signals`) and the LLM classification into one
+    deterministic document whose textual fields are redacted by
+    :func:`redact_secrets` before rendering.
+    """
+    scan_meta = {
+        "cwd": scan.cwd,
+        "session_dir": scan.session_dir,
+        "files_found": scan.files_found,
+        "files_analysed": scan.files_analysed,
+        "malformed_lines": scan.malformed_lines,
+        "missing_usage": scan.missing_usage,
+        "sessions": [
+            {
+                "filename": s.filename,
+                "session_id": s.session_id,
+                "started_at": s.timestamp,
+                "cwd": s.cwd,
+            }
+            for s in scan.sessions
+        ],
+    }
+    return {
+        "scan": scan_meta,
+        "signals": extract_signals(scan.sessions),
+        "classification": classification
+        or {"error": "no classification available", "categories": [], "recommendations": []},
+    }
+
+
+def _aggregate_top_patterns(signals: dict[str, Any]) -> list[dict[str, Any]]:
+    """Aggregate heuristic signals into counted top-pattern rows.
+
+    Each row is ``{"name", "count", "sessions"}`` where ``sessions`` is a
+    sorted list of session file names. Deterministic: sorted by count
+    descending, then name ascending.
+    """
+    counts: dict[str, int] = {}
+    session_sets: dict[str, set[str]] = {}
+
+    def _add(name: str, count: int, session: str) -> None:
+        counts[name] = counts.get(name, 0) + count
+        session_sets.setdefault(name, set()).add(session)
+
+    for hit in (signals.get("thinking_signals") or {}).get("hits", []):
+        _add(f"thinking:{hit.get('keyword')}", int(hit.get("count", 0)), hit["session"])
+    for err in (signals.get("tool_errors") or {}).get("errors", []):
+        _add(f"tool_error:{err.get('kind')}", 1, err["session"])
+    for pat in (signals.get("retry_patterns") or {}).get("patterns", []):
+        _add(f"retry:{pat.get('kind')}", 1, pat["session"])
+
+    rows = [
+        {
+            "name": name,
+            "count": counts[name],
+            "sessions": sorted(session_sets[name]),
+        }
+        for name in counts
+    ]
+    rows.sort(key=lambda r: (-r["count"], r["name"]))
+    return rows
+
+
+def _redact_document(obj: Any) -> Any:
+    """Recursively redact every textual leaf of a report document."""
+    if isinstance(obj, str):
+        return redact_secrets(obj)
+    if isinstance(obj, dict):
+        return {k: _redact_document(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_document(x) for x in obj]
+    return obj
+
+
+def _report_document(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Build the redacted, deterministic report document (shared by JSON/MD)."""
+    scan = analysis.get("scan") or {}
+    signals = analysis.get("signals") or {}
+    classification = analysis.get("classification") or {}
+    sessions = scan.get("sessions") or []
+
+    timestamps = sorted(
+        s.get("started_at") for s in sessions if s.get("started_at")
+    )
+    date_range = (
+        {"from": timestamps[0], "to": timestamps[-1]} if timestamps
+        else {"from": None, "to": None}
+    )
+
+    top_patterns = _aggregate_top_patterns(signals)
+    recommendations = classification.get("recommendations") or []
+    if not isinstance(recommendations, list):
+        recommendations = []
+
+    # Evidence citations: per session, the pattern names / recommendation
+    # titles that cite it (AC 3/4 — "which sessions showed which patterns").
+    evidence: dict[str, set[str]] = {}
+    for row in top_patterns:
+        for sess in row["sessions"]:
+            evidence.setdefault(sess, set()).add(row["name"])
+    for rec in recommendations:
+        for sess in rec.get("evidence_sessions") or []:
+            evidence.setdefault(sess, set()).add(str(rec.get("title", "")))
+    evidence_citations = [
+        {"session": sess, "patterns": sorted(names)}
+        for sess, names in sorted(evidence.items())
+    ]
+
+    doc = {
+        "summary": {
+            "sessions_analysed": int(scan.get("files_analysed", len(sessions))),
+            "files_found": int(scan.get("files_found", 0)),
+            "date_range": date_range,
+            "session_dir": str(scan.get("session_dir", "")),
+            "malformed_lines": int(scan.get("malformed_lines", 0)),
+            "missing_usage": int(scan.get("missing_usage", 0)),
+            "classification_error": classification.get("error"),
+            "categories": classification.get("categories") or [],
+        },
+        "top_patterns": top_patterns,
+        "recommendations": recommendations,
+        "evidence_citations": evidence_citations,
+    }
+    return _redact_document(doc)  # type: ignore[return-value]
+
+
+def _render_markdown(doc: dict[str, Any]) -> str:
+    """Render the report document as deterministic Markdown."""
+    lines: list[str] = []
+    lines.append("# Agent Log Review")
+    lines.append("")
+
+    lines.append("## Summary")
+    summary = doc["summary"]
+    lines.append(f"- Sessions analysed: {summary['sessions_analysed']}")
+    date_range = summary["date_range"]
+    if date_range.get("from"):
+        lines.append(
+            f"- Date range: {date_range['from']} .. {date_range['to']}"
+        )
+    else:
+        lines.append(
+            "- Date range: unknown (sessions carry no start timestamps)"
+        )
+    lines.append(f"- Session directory: {summary['session_dir']}")
+    lines.append(
+        f"- Fail-soft: {summary['malformed_lines']} malformed line(s) "
+        f"skipped; {summary['missing_usage']} session(s) missing usage data"
+    )
+    classification_error = summary.get("classification_error")
+    if classification_error:
+        lines.append(f"- Classification: not available ({classification_error})")
+    else:
+        lines.append(
+            f"- Classification: {len(summary.get('categories') or [])} "
+            f"pattern categor{'y' if len(summary.get('categories') or []) == 1 else 'ies'}, "
+            f"{len(doc['recommendations'])} recommendation(s)"
+        )
+    lines.append("")
+
+    lines.append("## Top Patterns")
+    patterns = doc["top_patterns"]
+    if patterns:
+        lines.append("| Pattern | Count | Sessions |")
+        lines.append("|---|---|---|")
+        for p in patterns:
+            lines.append(
+                f"| {p['name']} | {p['count']} | {', '.join(p['sessions'])} |"
+            )
+    else:
+        lines.append("_No confusion patterns detected._")
+    lines.append("")
+
+    lines.append("## Recommended Improvements")
+    recs = doc["recommendations"]
+    if recs:
+        for i, rec in enumerate(recs, start=1):
+            lines.append(
+                f"{i}. **{rec.get('title')}** "
+                f"({rec.get('issue_type')}, target_skill: {rec.get('target_skill')})"
+            )
+            rationale = rec.get("rationale") or rec.get("summary") or ""
+            if rationale:
+                lines.append(f"   Rationale: {rationale}")
+            sessions = rec.get("evidence_sessions") or []
+            if sessions:
+                lines.append(f"   Sessions: {', '.join(sessions)}")
+    else:
+        lines.append("_No recommendations._")
+    lines.append("")
+
+    lines.append("## Evidence Citations")
+    citations = doc["evidence_citations"]
+    if citations:
+        for cit in citations:
+            lines.append(
+                f"- {cit['session']}: {', '.join(cit['patterns'])}"
+            )
+    else:
+        lines.append("_No evidence citations._")
+
+    return "\n".join(lines) + "\n"
+
+
+def render_report(
+    analysis: dict[str, Any],
+    fmt: str = "markdown",
+) -> str:
+    """Render the analysis document as deterministic Markdown or JSON.
+
+    Args:
+        analysis: The analysis document from :func:`build_analysis` (scan +
+            signals + classification).
+        fmt: ``"markdown"`` (default, human-readable) or ``"json"``
+            (single machine-readable document).
+
+    Output is deterministic for the same input (explicit sorting
+    everywhere) and every textual leaf is passed through the secrets
+    redaction (privacy rule).
+    """
+    doc = _report_document(analysis)
+    if fmt == "json":
+        return json.dumps(doc, indent=2) + "\n"
+    if fmt in ("markdown", "md"):
+        return _render_markdown(doc)
+    raise ValueError(f"unknown report format: {fmt!r}")
