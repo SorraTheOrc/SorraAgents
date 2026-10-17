@@ -118,7 +118,7 @@ from audit.scripts.persist_audit import (
 )
 from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
-from scripts.pi_utils import extract_pi_text
+from scripts.pi_utils import extract_pi_text, extract_pi_text_with_fallback
 
 try:
     from shared.git_sandbox import scrub_repository_overrides
@@ -854,6 +854,12 @@ _PI_RETRY_BACKOFF_SECONDS = 2.0
 
 Backoff grows linearly: 1x, 2x, ... base per retry attempt.
 """
+
+#: Maximum number of characters of raw pi stream embedded in an unparseable
+#: -output diagnostic. Bounds the evidence field so a huge stream never bloats
+#: a report; the head keeps the session preamble/event shapes and the tail
+#: keeps the terminating event (usually the informative one) for debugging.
+_UNPARSEABLE_RAW_MAX_CHARS = 4000
 
 # ---------------------------------------------------------------------------
 # Per-run reliability summary (SA-0MU32TH89000YHP9, R7)
@@ -4527,7 +4533,33 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     # Parse JSON lines looking for the final agent_end message
     text = extract_pi_text(raw)
     if not text:
-        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds, **retry_meta}
+        # Recovery pass: tolerate alternative stream shapes the canonical
+        # parser may have skipped (e.g. a string-encoded assistant event)
+        # before declaring the output unparseable. This is what lets a child
+        # Phase-1 screen subprocess recover a valid verdict instead of
+        # silently degrading to 'partial' (WL-0MU0FHSEP003PCDY AC1).
+        text = extract_pi_text_with_fallback(raw)
+    if not text:
+        # Diagnostic path (WL-0MU0FHSEP003PCDY AC3): the subprocess stream
+        # genuinely could not be parsed. Record the raw output (truncated)
+        # plus explicit provenance so callers can distinguish a parse failure
+        # from a provider error/timeout and log it into the AC evidence.
+        return {
+            "verdict": "unmet",
+            "evidence": "",
+            "raw_stdout": stdout,
+            "raw_stderr": stderr,
+            "extracted_text": "",
+            "_unparseable_output": True,
+            "_unparseable_raw_stdout": _truncate_raw_output(
+                stdout, _UNPARSEABLE_RAW_MAX_CHARS,
+            ),
+            "_unparseable_raw_stderr": _truncate_raw_output(
+                stderr, _UNPARSEABLE_RAW_MAX_CHARS,
+            ),
+            "elapsed_seconds": elapsed_seconds,
+            **retry_meta,
+        }
 
     # Input-token capture (AC2 of SA-0MSISKM8F004NW1U): the pi JSON stream's
     # agent_end message carries the provider usage block, so each call's
@@ -4555,6 +4587,42 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
 
     # If Pi returned free-form text, use it as evidence and default to met
     return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds, "input_tokens": input_tokens, **retry_meta}
+
+
+def _truncate_raw_output(raw: str | None, limit: int) -> str:
+    """Bound a raw stream string for embedding in a diagnostic field.
+
+    When the string exceeds *limit* characters the head and tail are kept
+    (joined by a marker) so the stream's session preamble and its terminating
+    event both survive — the two ends an operator needs to identify a format
+    mismatch. ``None``/empty input yields an empty string.
+    """
+    if not raw:
+        return ""
+    if len(raw) <= limit:
+        return raw
+    head = raw[: limit // 2]
+    tail = raw[-(limit - limit // 2):]
+    return f"{head}\n... [truncated {len(raw) - limit} chars] ...\n{tail}"
+
+
+def _parse_failure_evidence(result: dict, phase: str) -> str:
+    """Build diagnostic evidence for a response that could not be parsed.
+
+    Names the failure phase and, when ``_call_pi`` captured the subprocess
+    stream, embeds a truncated head+tail of the raw pi output so operators can
+    see the actual format that failed to parse (WL-0MU0FHSEP003PCDY AC3). The
+    raw output is only present for genuine parse failures — provider errors and
+    timeouts carry their own dedicated evidence and never reach this helper.
+    """
+    base = "Pi model output could not be parsed — raw output logged."
+    raw = result.get("_unparseable_raw_stdout") if isinstance(result, dict) else None
+    if raw:
+        return (
+            f"{base} Phase: {phase}. "
+            f"Raw output (truncated): {raw[: _UNPARSEABLE_RAW_MAX_CHARS]}"
+        )
+    return f"{base} Phase: {phase}."
 
 
 def _extract_input_tokens(raw: str) -> int | None:
@@ -4723,23 +4791,26 @@ def _reask_json_array_once(
     timeout: int | None,
     instruction: str,
     priority: int | None = None,
+    child_screen: bool = False,
 ) -> list | None:
     """Issue exactly one bounded 'return only the JSON array' re-ask.
 
     Called at a Phase 1/2 parse site when the first response could not be
     parsed into an index-bearing verdict array. The re-ask is observable
-    under the ``verdict_reask`` context and bounded by the per-call budget.
-    Returns the recovered batch, or ``None`` when the single re-ask also
-    fails (timeout, provider error, or unparseable output) — the caller then
-    falls back to the conservative ``partial`` verdict, never ``met``
-    (SA-0MU32TCFM003B78I AC3/AC5).
+    under the ``verdict_reask`` context and bounded by the per-call budget
+    (child Phase-1 screens keep their short budget when *child_screen* is
+    True, so the retry is as bounded as the call it retries —
+    WL-0MU0FHSEP003PCDY AC4). Returns the recovered batch, or ``None`` when
+    the single re-ask also fails (timeout, provider error, or unparseable
+    output) — the caller then falls back to the conservative ``partial``
+    verdict, never ``met`` (SA-0MU32TCFM003B78I AC3/AC5).
     """
     prompt = _JSON_REASK_PREFIX + _JSON_REASK_SCHEMA + "\n\n" + instruction
     try:
         result = _call_pi_and_maybe_log(
             issue_id, "verdict_reask", prompt,
             model=model, pi_bin=pi_bin, debug_log=debug_log,
-            timeout=timeout, json_expected=True,
+            timeout=timeout, json_expected=True, child_screen=child_screen,
             priority=priority if priority is not None else Priority.MEDIUM,
         )
     except RuntimeError:
@@ -6850,9 +6921,14 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                         "issue_id": child.get("id"),
                         "child_id": child.get("id"),
                         "context": "child_ac_fallback",
+                        "phase": "Phase 1 child screening",
                         "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
                         "parse_ok": False if not result.get("_provider_error") else None,
                         "raw_text": raw_text,
+                        "raw_stdout_truncated": _truncate_raw_output(
+                            result.get("_unparseable_raw_stdout") or "",
+                            _UNPARSEABLE_RAW_MAX_CHARS,
+                        ),
                         "result_verdict": result.get("verdict"),
                         "result_evidence": result.get("evidence", "")[:500],
                         "provider_error": result.get("_provider_error_message"),
@@ -6877,7 +6953,12 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                         f"Root-level diagnostic: {outer_evidence[:500]}"
                     )
                 else:
-                    evidence = "Pi model output could not be parsed — raw output logged"
+                    # AC3 (WL-0MU0FHSEP003PCDY): include the truncated raw
+                    # subprocess stream so the Phase-1 child screen failure is
+                    # diagnosable from the persisted AC evidence alone.
+                    evidence = _parse_failure_evidence(
+                        result, "Phase 1 child screening",
+                    )
             for ac in child_acs:
                 child_ac_results.append({
                     "text": ac,
@@ -7455,19 +7536,20 @@ def _deep_analyze_child(
             # Child Phase 2 output unparseable — disclose it explicitly
             # rather than silently keeping stale Phase 1 verdicts.  A valid
             # empty array is not a parse failure (existing contract).
+            # AC3 (WL-0MU0FHSEP003PCDY): when the subprocess stream was
+            # captured, embed a truncated head+tail of it in the evidence so
+            # the Phase-2 child deep failure is diagnosable from the report.
             if ac_fallback_used is not None:
                 ac_fallback_used.set()
+            diag = _parse_failure_evidence(
+                child_result, "Phase 2 child deep analysis",
+            )
             for i in range(len(updated_child_acs)):
                 prev_evidence = _evidence_text(updated_child_acs[i].get("evidence"))
                 updated_child_acs[i] = {
                     "text": updated_child_acs[i]["text"],
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": (
-                        (f"{prev_evidence} " if prev_evidence else "")
-                        + "Phase 2 child deep analysis did not return "
-                        "parseable results (model output could not be "
-                        "parsed). Phase: Phase 2 child deep analysis."
-                    ),
+                    "evidence": ((f"{prev_evidence} " if prev_evidence else "") + diag),
                 }
         else:
             reviewed = {
@@ -10435,6 +10517,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
     reasked = _reask_json_array_once(
         issue_id, model, pi_bin, debug_log, timeout, prompt,
         priority=effective_priority,
+        child_screen=child_screen,
     )
     if reasked:
         return result, reasked, raw_text
