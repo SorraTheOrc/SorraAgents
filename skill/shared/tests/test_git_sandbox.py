@@ -27,9 +27,7 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
   concurrent fetch/push on a multi-agent host) is invisible to
   ``diff_snapshots`` and ``fingerprint``, while every other mutation (new /
   removed / moved non-excluded ref, local-config rewrite, working-tree
-  change) is still reported. The new-behaviour tests are red-for-the-right-
-  reason via ``xfail(strict=True)`` until the implementation sibling
-  WL-0MV9820OB0041PPO removes the markers.
+  change) is still reported.
 """
 from __future__ import annotations
 
@@ -729,18 +727,6 @@ def _repo_with_origin(tmp_path: Path, name: str = "repo") -> Path:
     return repo
 
 
-#: Red tracer bullet — see the module docstring. The implementation sibling
-#: WL-0MV9820OB0041PPO removes this marker once ``refs/heads/dev`` and
-#: ``refs/remotes/origin/*`` are excluded from the diff/fingerprint.
-_concurrency_xfail = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "concurrent dev/remote-tracking ref exclusion not yet implemented "
-        "(WL-0MV9820OB0041PPO)"
-    ),
-)
-
-
 class TestConcurrencyExcludedRefs:
     """Concurrent dev / origin ref movement is invisible; other mutation still fires.
 
@@ -751,7 +737,6 @@ class TestConcurrencyExcludedRefs:
     working-tree change each still report ``changed == true``.
     """
 
-    @_concurrency_xfail
     def test_dev_ref_move_is_invisible(self, tmp_path):
         """AC1: only refs/heads/dev moved → no diff, equal fingerprint."""
         repo = gs.init_repo(tmp_path / "main", default_branch="dev")
@@ -764,7 +749,6 @@ class TestConcurrencyExcludedRefs:
         assert not gs.diff_snapshots(before, after)["changed"]
         assert gs.fingerprint(after) == gs.fingerprint(before)
 
-    @_concurrency_xfail
     def test_origin_dev_ref_move_is_invisible(self, tmp_path):
         """AC2: only refs/remotes/origin/dev moved → no diff, equal fingerprint."""
         repo = _repo_with_origin(tmp_path)
@@ -775,7 +759,6 @@ class TestConcurrencyExcludedRefs:
         assert not gs.diff_snapshots(before, after)["changed"]
         assert gs.fingerprint(after) == gs.fingerprint(before)
 
-    @_concurrency_xfail
     def test_arbitrary_origin_ref_move_is_invisible(self, tmp_path):
         """AC2: only an arbitrary refs/remotes/origin/* ref moved → no diff."""
         repo = _repo_with_origin(tmp_path, "repo2")

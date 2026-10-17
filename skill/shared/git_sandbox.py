@@ -71,6 +71,35 @@ FIXTURE_AUTHOR_EMAIL = "git-sandbox@example.invalid"
 #: so they are excluded from the mutation surface to avoid false positives.
 WORKLOG_REF_PREFIX = "refs/worklog/"
 
+#: Exact ref excluded because concurrent collaborative movement is
+#: indistinguishable from suite-caused movement (WL-0MV5MYBKJ0033P8U).
+#: ``refs/heads/dev`` is the shared integration branch: sibling agents'
+#: ``implement.py finish`` fast-forwards it on the shared main checkout while
+#: this suite runs, so its movement is never a hermetic-fixture signal. The
+#: incident class stays detectable through the config / working-tree /
+#: non-excluded-ref surfaces (see docs/dev/test-isolation.md §8).
+CONCURRENCY_EXCLUDED_REF_EXACT = "refs/heads/dev"
+
+#: Remote-tracking ref namespace excluded for the same reason: on a multi-agent
+#: host, concurrent fetch/push moves ``refs/remotes/origin/dev`` and every other
+#: ``refs/remotes/origin/*`` ref while the suite runs; only ``fetch``/``pull``/
+#: ``push`` can ever move them, never a hermetic fixture. Derived from git
+#: plumbing namespaces (never a ``wl-*`` name pattern) so the incident's own
+#: fixture branches remain detectable.
+CONCURRENCY_EXCLUDED_REF_NAMESPACES: tuple[str, ...] = ("refs/remotes/origin/",)
+
+
+def _is_concurrency_excluded_ref(ref: str) -> bool:
+    """True when *ref* is a concurrency-excluded namespace (WL-0MV5MYBKJ0033P8U).
+
+    Applies to both the exact integration branch and the remote-tracking
+    namespace, so ``diff_snapshots`` and ``fingerprint`` filter the same set
+    and cannot drift.
+    """
+    if ref == CONCURRENCY_EXCLUDED_REF_EXACT:
+        return True
+    return any(ref.startswith(prefix) for prefix in CONCURRENCY_EXCLUDED_REF_NAMESPACES)
+
 
 class GitSandboxError(RuntimeError):
     """Raised when a sandbox invariant is violated (e.g. a non-hermetic path)."""
@@ -654,7 +683,7 @@ def fingerprint(snapshot: dict[str, Any]) -> tuple[Any, ...]:
         sorted(
             (ref, sha)
             for ref, sha in snapshot.get("refs", {}).items()
-            if ref not in excluded
+            if ref not in excluded and not _is_concurrency_excluded_ref(ref)
         )
     )
     config = tuple(
@@ -685,8 +714,16 @@ def diff_snapshots(
         after.get("excluded_refs", set())
     )
     prefixes = _excluded_branch_config_prefixes(excluded)
-    before_refs = {k: v for k, v in before["refs"].items() if k not in excluded}
-    after_refs = {k: v for k, v in after["refs"].items() if k not in excluded}
+    before_refs = {
+        k: v
+        for k, v in before["refs"].items()
+        if k not in excluded and not _is_concurrency_excluded_ref(k)
+    }
+    after_refs = {
+        k: v
+        for k, v in after["refs"].items()
+        if k not in excluded and not _is_concurrency_excluded_ref(k)
+    }
     before_config = _filter_excluded_config(before["config"], prefixes)
     after_config = _filter_excluded_config(after["config"], prefixes)
 

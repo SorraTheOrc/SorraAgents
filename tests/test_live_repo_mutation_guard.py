@@ -894,15 +894,6 @@ class TestTeardownRunsAfterFixtureFinalisation:
 # ---------------------------------------------------------------------------
 
 
-_CONCURRENCY_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "concurrent dev/remote-tracking ref exclusion not yet implemented "
-        "(WL-0MV9820OB0041PPO)"
-    ),
-)
-
-
 def _repo_with_origin_refs(tmp_path: Path, name: str = "victim") -> Path:
     """A dev-checkout repo with origin remote-tracking refs (dev + feature-x)."""
     repo = gs.init_repo(tmp_path / name, default_branch="dev")
@@ -925,12 +916,10 @@ class TestConcurrencyExcludedNested:
 
     AC4 (parent WL-0MV5MYBKJ0033P8U): a test body that advances
     ``refs/heads/dev`` and ``refs/remotes/origin/dev`` mid-run passes the
-    session clean once F2 lands (red tracer now); a sibling test creating a
-    new non-excluded branch still fails and names the test (green now and
-    stays green).
+    session clean via the shared helper exclusion; a sibling test creating a
+    new non-excluded branch still fails and names the test.
     """
 
-    @_CONCURRENCY_XFAIL
     def test_dev_and_origin_ref_moves_pass_session_clean(self, tmp_path):
         """AC4: advancing dev + origin/dev + an arbitrary origin/* ref between
         the guard snapshots must not trip the inner per-test guard."""
@@ -992,19 +981,18 @@ class TestConcurrencyExcludedOuterGuard:
 
     A suite command that moves ``refs/heads/dev`` + ``refs/remotes/origin/*``
     (as a sibling agent's finish fast-forward / concurrent fetch-push does)
-    must yield a clean run once F2 lands (red tracer now); a suite command
-    creating a new non-excluded branch still fails the run (green now, stays
-    green).
+    yields a clean run via the shared helper; a suite command creating a new
+    non-excluded branch still fails the run.
     """
 
-    def _isolate_pacer(self, monkeypatch) -> None:
+    @staticmethod
+    def _isolate_pacer(monkeypatch) -> None:
         from test.scripts import run_tests as _rt
 
         monkeypatch.setattr(
             _rt, "_test_concurrency_slot", lambda: contextlib.nullcontext()
         )
 
-    @_CONCURRENCY_XFAIL
     def test_dev_and_origin_ref_moves_run_clean(self, tmp_path, monkeypatch):
         """AC5: a suite command advancing dev + origin refs mid-run does not
         produce a ``live_repo_mutation``."""

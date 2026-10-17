@@ -259,20 +259,13 @@ def _advance_refs(repo, *refs):
         gs.run_git(repo, ["update-ref", ref, fresh], check=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "concurrent dev/remote-tracking ref exclusion not yet implemented "
-        "(WL-0MV9820OB0041PPO)"
-    ),
-)
 def test_outer_guard_detection_ignores_only_dev_and_origin_ref_moves(tmp_path):
     """The outer guard's mutation detector inherits the shared helper fix.
 
     Snapshots that differ ONLY in ``refs/heads/dev`` and ``refs/remotes/origin/*``
     (concurrent sibling finish fast-forward / fetch-push) must not produce a
-    ``live_repo_mutation``. RED until the shared ``git_sandbox`` helper excludes
-    those namespaces — there is no consumer-side drift to fix (AC4)."""
+    ``live_repo_mutation`` — the shared ``git_sandbox`` helper excludes those
+    namespaces, so there is no consumer-side drift (AC4)."""
     from run_tests import _detect_live_repo_mutation
     from shared import git_sandbox as gs
 
