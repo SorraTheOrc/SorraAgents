@@ -21,6 +21,15 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
   (a tracer bullet, same convention as
   ``tests/test_repository_override_isolation.py``) until the implementation
   sibling SA-0MV87GC8O006RHS8 removes the markers.
+- concurrency ref-namespace exclusion (WL-0MV5MYBKJ0033P8U): moving only
+  ``refs/heads/dev``, only ``refs/remotes/origin/dev`` or any
+  ``refs/remotes/origin/*`` ref (a sibling ``finish`` fast-forward, a
+  concurrent fetch/push on a multi-agent host) is invisible to
+  ``diff_snapshots`` and ``fingerprint``, while every other mutation (new /
+  removed / moved non-excluded ref, local-config rewrite, working-tree
+  change) is still reported. The new-behaviour tests are red-for-the-right-
+  reason via ``xfail(strict=True)`` until the implementation sibling
+  WL-0MV9820OB0041PPO removes the markers.
 """
 from __future__ import annotations
 
@@ -617,12 +626,18 @@ class TestSnapshotContract:
         assert "refs/heads/doomed" in diff["refs"]["removed"]
 
     def test_moved_ref_is_reported(self, tmp_path):
+        """A moved **non-excluded** ref is still reported.
+
+        Uses ``feature-x`` rather than ``dev``: ``refs/heads/dev`` is a
+        concurrency-excluded namespace (WL-0MV5MYBKJ0033P8U) whose movement is
+        invisible by design — see ``TestConcurrencyExcludedRefs``.
+        """
         repo = self._repo(tmp_path)
+        gs.run_git(repo, ["branch", "feature-x"], check=True)
         before = gs.snapshot_repo_state(repo)
-        (repo / "tracked.txt").write_text("moved", encoding="utf-8")
-        gs.commit_all(repo, "advance dev")
+        _advance_ref(repo, "refs/heads/feature-x")
         diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
-        assert "refs/heads/dev" in diff["refs"]["moved"]
+        assert "refs/heads/feature-x" in diff["refs"]["moved"]
 
     def test_changed_config_key_is_reported(self, tmp_path):
         repo = self._repo(tmp_path)
@@ -679,3 +694,131 @@ class TestSnapshotContract:
         gs.run_git(repo, ["branch", "feature-x"], check=True)
         text = gs.describe_diff(gs.diff_snapshots(before, gs.snapshot_repo_state(repo)))
         assert "refs/heads/feature-x" in text
+
+
+# ---------------------------------------------------------------------------
+# WL-0MV5MYBKJ0033P8U — concurrent dev / remote-tracking ref movement is
+# invisible; every other mutation is still reported
+# ---------------------------------------------------------------------------
+
+
+def _advance_ref(repo: Path, ref: str) -> None:
+    """Move *ref* to a fresh tree-identical commit without touching the worktree.
+
+    A ``commit-tree`` child with the same tree means ONLY the ref moves — the
+    working tree and index stay clean, so a snapshot diff attributes the change
+    entirely to the ref (deterministic adversary/movement fixture).
+    """
+    parent = gs.run_git(repo, ["rev-parse", "HEAD"]).stdout.strip()
+    tree = gs.run_git(repo, ["rev-parse", "HEAD^{tree}"]).stdout.strip()
+    fresh = gs.run_git(
+        repo, ["commit-tree", tree, "-p", parent, "-m", "advance"], check=True
+    ).stdout.strip()
+    gs.run_git(repo, ["update-ref", ref, fresh], check=True)
+
+
+def _repo_with_origin(tmp_path: Path, name: str = "repo") -> Path:
+    """A dev-checkout repo with an origin remote and remote-tracking refs."""
+    repo = gs.init_repo(tmp_path / name, default_branch="dev")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    origin = gs.init_bare_remote(tmp_path / "origin.git")
+    gs.add_remote(repo, "origin", str(origin))
+    gs.run_git(repo, ["push", "-u", "origin", "dev"], check=True)
+    gs.run_git(repo, ["update-ref", "refs/remotes/origin/feature-x", "HEAD"], check=True)
+    return repo
+
+
+#: Red tracer bullet — see the module docstring. The implementation sibling
+#: WL-0MV9820OB0041PPO removes this marker once ``refs/heads/dev`` and
+#: ``refs/remotes/origin/*`` are excluded from the diff/fingerprint.
+_concurrency_xfail = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "concurrent dev/remote-tracking ref exclusion not yet implemented "
+        "(WL-0MV9820OB0041PPO)"
+    ),
+)
+
+
+class TestConcurrencyExcludedRefs:
+    """Concurrent dev / origin ref movement is invisible; other mutation still fires.
+
+    AC1/AC2 (parent WL-0MV5MYBKJ0033P8U): moving only ``refs/heads/dev``, only
+    ``refs/remotes/origin/dev`` or only an arbitrary ``refs/remotes/origin/*``
+    yields ``changed == false`` from both ``diff_snapshots`` and ``fingerprint``.
+    AC3: new/removed/moved non-excluded refs, a local-config rewrite and a
+    working-tree change each still report ``changed == true``.
+    """
+
+    @_concurrency_xfail
+    def test_dev_ref_move_is_invisible(self, tmp_path):
+        """AC1: only refs/heads/dev moved → no diff, equal fingerprint."""
+        repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        before = gs.snapshot_repo_state(repo)
+        _advance_ref(repo, "refs/heads/dev")
+        after = gs.snapshot_repo_state(repo)
+        assert after["refs"]["refs/heads/dev"] != before["refs"]["refs/heads/dev"]
+        assert not gs.diff_snapshots(before, after)["changed"]
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+
+    @_concurrency_xfail
+    def test_origin_dev_ref_move_is_invisible(self, tmp_path):
+        """AC2: only refs/remotes/origin/dev moved → no diff, equal fingerprint."""
+        repo = _repo_with_origin(tmp_path)
+        before = gs.snapshot_repo_state(repo)
+        _advance_ref(repo, "refs/remotes/origin/dev")
+        after = gs.snapshot_repo_state(repo)
+        assert after["refs"]["refs/remotes/origin/dev"] != before["refs"]["refs/remotes/origin/dev"]
+        assert not gs.diff_snapshots(before, after)["changed"]
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+
+    @_concurrency_xfail
+    def test_arbitrary_origin_ref_move_is_invisible(self, tmp_path):
+        """AC2: only an arbitrary refs/remotes/origin/* ref moved → no diff."""
+        repo = _repo_with_origin(tmp_path, "repo2")
+        before = gs.snapshot_repo_state(repo)
+        _advance_ref(repo, "refs/remotes/origin/feature-x")
+        after = gs.snapshot_repo_state(repo)
+        assert after["refs"]["refs/remotes/origin/feature-x"] != before["refs"]["refs/remotes/origin/feature-x"]
+        assert not gs.diff_snapshots(before, after)["changed"]
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+
+    def test_new_non_excluded_branch_still_reported(self, tmp_path):
+        """AC3: a new non-excluded branch (fixture branch) still fails the diff."""
+        repo = _repo_with_origin(tmp_path, "repo3")
+        before = gs.snapshot_repo_state(repo)
+        gs.run_git(repo, ["branch", "feature-x"], check=True)
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+        assert diff["changed"]
+        assert "refs/heads/feature-x" in diff["refs"]["added"]
+
+    def test_removed_non_excluded_ref_still_reported(self, tmp_path):
+        """AC3: removing a non-excluded ref still fails the diff."""
+        repo = _repo_with_origin(tmp_path, "repo4")
+        gs.run_git(repo, ["branch", "doomed"], check=True)
+        before = gs.snapshot_repo_state(repo)
+        gs.run_git(repo, ["branch", "-D", "doomed"], check=True)
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+        assert diff["changed"]
+        assert "refs/heads/doomed" in diff["refs"]["removed"]
+
+    def test_local_config_rewrite_still_reported(self, tmp_path):
+        """AC3: a non-excluded local-config rewrite still fails the diff."""
+        repo = _repo_with_origin(tmp_path, "repo5")
+        before = gs.snapshot_repo_state(repo)
+        gs.run_git(repo, ["config", "--local", "user.name", "intruder"], check=True)
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+        assert diff["changed"]
+        assert "user.name" in diff["config"]["changed"]
+
+    def test_working_tree_change_still_reported(self, tmp_path):
+        """AC3: a working-tree change still fails the diff."""
+        repo = _repo_with_origin(tmp_path, "repo6")
+        before = gs.snapshot_repo_state(repo)
+        (repo / "intruder.txt").write_text("x", encoding="utf-8")
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+        assert diff["changed"]
+        assert "intruder.txt" in diff["status"]["added"]

@@ -886,3 +886,170 @@ class TestTeardownRunsAfterFixtureFinalisation:
         assert proc.returncode == 0, combined
         assert "TypeError" not in combined, combined
         assert "live-repo mutation" not in combined, combined
+
+
+# ---------------------------------------------------------------------------
+# WL-0MV5MYBKJ0033P8U — concurrent dev / remote-tracking ref movement must not
+# trip either guard entry point; genuine mutations still do
+# ---------------------------------------------------------------------------
+
+
+_CONCURRENCY_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "concurrent dev/remote-tracking ref exclusion not yet implemented "
+        "(WL-0MV9820OB0041PPO)"
+    ),
+)
+
+
+def _repo_with_origin_refs(tmp_path: Path, name: str = "victim") -> Path:
+    """A dev-checkout repo with origin remote-tracking refs (dev + feature-x)."""
+    repo = gs.init_repo(tmp_path / name, default_branch="dev")
+    (repo / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n.pytest_cache/\n.worklog/\n", encoding="utf-8"
+    )
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    origin = gs.init_bare_remote(tmp_path / f"{name}-origin.git")
+    gs.add_remote(repo, "origin", str(origin))
+    gs.run_git(repo, ["push", "-u", "origin", "dev"], check=True)
+    gs.run_git(
+        repo, ["update-ref", "refs/remotes/origin/feature-x", "HEAD"], check=True
+    )
+    return repo
+
+
+class TestConcurrencyExcludedNested:
+    """Concurrent dev/origin ref movement is invisible to the inner per-test guard.
+
+    AC4 (parent WL-0MV5MYBKJ0033P8U): a test body that advances
+    ``refs/heads/dev`` and ``refs/remotes/origin/dev`` mid-run passes the
+    session clean once F2 lands (red tracer now); a sibling test creating a
+    new non-excluded branch still fails and names the test (green now and
+    stays green).
+    """
+
+    @_CONCURRENCY_XFAIL
+    def test_dev_and_origin_ref_moves_pass_session_clean(self, tmp_path):
+        """AC4: advancing dev + origin/dev + an arbitrary origin/* ref between
+        the guard snapshots must not trip the inner per-test guard."""
+        repo = _repo_with_origin_refs(tmp_path)
+        _write_guard_conftest(repo)
+        (repo / "test_concurrent_moves.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            "ROOT = Path(r'" + str(repo) + "')\n\n"
+            "def _advance_ref(ref):\n"
+            "    parent = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'],\n"
+            "                           check=True, capture_output=True, text=True).stdout.strip()\n"
+            "    tree = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD^{tree}'],\n"
+            "                          check=True, capture_output=True, text=True).stdout.strip()\n"
+            "    fresh = subprocess.run(['git', '-C', str(ROOT), 'commit-tree', tree, '-p', parent,\n"
+            "                           '-m', 'advance'],\n"
+            "                          check=True, capture_output=True, text=True).stdout.strip()\n"
+            "    subprocess.run(['git', '-C', str(ROOT), 'update-ref', ref, fresh], check=True)\n\n"
+            "def test_advances_dev_and_origin_refs():\n"
+            "    for ref in ('refs/heads/dev', 'refs/remotes/origin/dev',\n"
+            "                 'refs/remotes/origin/feature-x'):\n"
+            "        _advance_ref(ref)\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(repo)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined
+
+    def test_new_non_excluded_branch_still_fails_and_names_test(self, tmp_path):
+        """AC4: a sibling test creating a new non-excluded branch still fails
+        and names the offending test (both before and after the exclusion)."""
+        repo = _repo_with_origin_refs(tmp_path, "adversary")
+        _write_guard_conftest(repo)
+        (repo / "test_mutator.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            "def test_creates_feature_branch():\n"
+            "    subprocess.run(\n"
+            "        ['git', '-C', str(Path(__file__).resolve().parent),\n"
+            "         'branch', 'feature-x'],\n"
+            "        check=True,\n"
+            "    )\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(repo)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, combined
+        assert "live-repo mutation" in combined
+        assert "test_creates_feature_branch" in combined
+
+
+class TestConcurrencyExcludedOuterGuard:
+    """AC5: ``guarded_run_all`` tolerates dev/origin ref movement mid-run.
+
+    A suite command that moves ``refs/heads/dev`` + ``refs/remotes/origin/*``
+    (as a sibling agent's finish fast-forward / concurrent fetch-push does)
+    must yield a clean run once F2 lands (red tracer now); a suite command
+    creating a new non-excluded branch still fails the run (green now, stays
+    green).
+    """
+
+    def _isolate_pacer(self, monkeypatch) -> None:
+        from test.scripts import run_tests as _rt
+
+        monkeypatch.setattr(
+            _rt, "_test_concurrency_slot", lambda: contextlib.nullcontext()
+        )
+
+    @_CONCURRENCY_XFAIL
+    def test_dev_and_origin_ref_moves_run_clean(self, tmp_path, monkeypatch):
+        """AC5: a suite command advancing dev + origin refs mid-run does not
+        produce a ``live_repo_mutation``."""
+        repo = _repo_with_origin_refs(tmp_path)
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": ["bash concurrent_moves.sh"]}),
+            encoding="utf-8",
+        )
+        (repo / "concurrent_moves.sh").write_text(
+            "#!/bin/sh\n"
+            "parent=$(git rev-parse HEAD)\n"
+            "tree=$(git rev-parse 'HEAD^{tree}')\n"
+            "fresh=$(git commit-tree \"$tree\" -p \"$parent\" -m advance)\n"
+            "git update-ref refs/heads/dev \"$fresh\"\n"
+            "git update-ref refs/remotes/origin/dev \"$fresh\"\n"
+            "git update-ref refs/remotes/origin/feature-x \"$fresh\"\n",
+            encoding="utf-8",
+        )
+        (repo / "concurrent_moves.sh").chmod(0o755)
+        monkeypatch.delenv(MARKER_ENV, raising=False)
+        self._isolate_pacer(monkeypatch)
+
+        result = guarded_run_all(cwd=repo, use_cache=False)
+
+        assert result["success"] is True, result
+        assert "live_repo_mutation" not in result, result
+
+    def test_new_non_excluded_branch_still_fails_run(self, tmp_path, monkeypatch):
+        """AC5: a suite command creating a new non-excluded branch still fails
+        the run and names the ref."""
+        repo = _repo_with_origin_refs(tmp_path, "adversary")
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": ["bash mutate.sh"]}), encoding="utf-8"
+        )
+        (repo / "mutate.sh").write_text(
+            "#!/bin/sh\ngit branch feature-x\n", encoding="utf-8"
+        )
+        (repo / "mutate.sh").chmod(0o755)
+        monkeypatch.delenv(MARKER_ENV, raising=False)
+        self._isolate_pacer(monkeypatch)
+
+        result = guarded_run_all(cwd=repo, use_cache=False)
+
+        assert result["success"] is False
+        assert "live_repo_mutation" in result
+        assert "feature-x" in result["live_repo_mutation"]
