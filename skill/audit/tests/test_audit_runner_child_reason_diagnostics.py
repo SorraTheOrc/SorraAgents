@@ -240,7 +240,7 @@ class TestMarkdownReportDiagnostics:
             {"id": "TEST-1"}, _PARENT_ACS, children,
             stale_pending_ids=stale_pending_ids,
         )
-        line = next(l for l in report.splitlines()
-                    if l.startswith("Child assessment reasons:"))
+        line = next(ln for ln in report.splitlines()
+                    if ln.startswith("Child assessment reasons:"))
         assert "[unserviced_in_main_slot] CHILD-UNS" in line
         assert "[not_assessed] CHILD-NOTREADY" in line

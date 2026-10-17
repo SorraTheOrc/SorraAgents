@@ -884,12 +884,12 @@ def test_parent_screen_priority_beats_child_under_saturation(monkeypatch, capsys
 
     # Admission order: parent (CRITICAL) before child (MEDIUM)
     lines = [
-        l
-        for l in capsys.readouterr().err.splitlines()
-        if "Audit slot acquired" in l
+        ln
+        for ln in capsys.readouterr().err.splitlines()
+        if "Audit slot acquired" in ln
     ]
     assert len(lines) == 2, f"expected 2 admission logs, got {len(lines)}"
-    seq = [re.search(r"priority=(\w+)", l).group(1) for l in lines]
+    seq = [re.search(r"priority=(\w+)", ln).group(1) for ln in lines]
     assert seq[0] == "critical", f"parent (CRITICAL) must admit first: {seq}"
 
 

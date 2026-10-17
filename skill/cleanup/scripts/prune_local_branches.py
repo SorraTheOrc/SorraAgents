@@ -35,7 +35,7 @@ def parse_branches(values: list[str] | None) -> list[str]:
 
 def load_branches_from_file(path: str) -> list[str]:
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
     except Exception:  # noqa: BLE001
         return []

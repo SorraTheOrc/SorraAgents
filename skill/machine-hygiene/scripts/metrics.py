@@ -96,7 +96,7 @@ def _multiplier_thresholds(base_cfg: dict[str, float], cores: int) -> dict[str, 
 def _read_file_lines(path: str) -> list[str] | None:
     """Read a file and return lines, or None on failure."""
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return fh.readlines()
     except (FileNotFoundError, PermissionError, OSError):
         return None
@@ -129,7 +129,7 @@ def _get_core_count() -> int:
 def _get_load_average() -> float:
     """Return the 1-minute load average, or 0.0 when unavailable."""
     try:
-        with open("/proc/loadavg", "r", encoding="utf-8") as fh:
+        with open("/proc/loadavg", encoding="utf-8") as fh:
             return float(fh.read().split()[0])
     except (FileNotFoundError, ValueError, IndexError):
         return 0.0

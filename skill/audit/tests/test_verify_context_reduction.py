@@ -103,7 +103,7 @@ class TestSessionTokenExtraction:
                          "usage": {"input": input_tokens}}},
         ]
         p = tmp_path / fname
-        p.write_text("\n".join(json.dumps(l) for l in lines), encoding="utf-8")
+        p.write_text("\n".join(json.dumps(ln) for ln in lines), encoding="utf-8")
         return p
 
     def test_extracts_audit_sessions_only(self, tmp_path, monkeypatch):

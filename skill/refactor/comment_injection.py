@@ -316,7 +316,7 @@ def has_existing_comment(file_path: str, smell_type: str) -> bool:
         return False
 
     try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(file_path, encoding="utf-8", errors="replace") as f:
             content = f.read()
     except (OSError, UnicodeDecodeError):
         return False
@@ -430,7 +430,7 @@ def inject_refactor_comment(
     comment_block = _build_comment_block(work_item_id, smell, style)
 
     try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(file_path, encoding="utf-8", errors="replace") as f:
             original_content = f.read()
     except (OSError, UnicodeDecodeError) as exc:
         LOG.warning("Failed to read %s: %s", file_path, exc)

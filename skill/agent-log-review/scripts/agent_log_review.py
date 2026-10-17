@@ -259,7 +259,100 @@ def parse_session(path: Path | str) -> ParsedSession:
     has_usage = False
 
     try:
-        fh = open(path, encoding="utf-8", errors="replace")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    malformed += 1
+                    continue
+                if not isinstance(entry, dict):
+                    malformed += 1
+                    continue
+
+                etype = entry.get("type")
+                if etype == "session":
+                    session_id = entry.get("id") or None
+                    cwd = entry.get("cwd") or None
+                    timestamp = entry.get("timestamp") or None
+                    session_version = entry.get("version")
+                elif etype == "model_change":
+                    model = {
+                        "provider": entry.get("provider"),
+                        "modelId": entry.get("modelId"),
+                    }
+                elif etype == "message":
+                    messages += 1
+                    msg = entry.get("message") or {}
+                    if not isinstance(msg, dict):
+                        malformed += 1
+                        continue
+                    role = msg.get("role")
+                    ts = msg.get("timestamp") or entry.get("timestamp")
+
+                    if role == "assistant":
+                        usage = msg.get("usage")
+                        if isinstance(usage, dict):
+                            has_usage = True
+                            for key in ("input", "output", "totalTokens"):
+                                value = usage.get(key)
+                                if isinstance(value, (int, float)):
+                                    usage_totals[key] += int(value)
+                        content = msg.get("content")
+                        if isinstance(content, list):
+                            for part in content:
+                                if not isinstance(part, dict):
+                                    continue
+                                ptype = part.get("type")
+                                if ptype == "thinking":
+                                    seq += 1
+                                    thinking.append(
+                                        ThinkingBlock(
+                                            filename=filename,
+                                            seq=seq,
+                                            text=part.get("thinking", "") or "",
+                                            timestamp=ts,
+                                        )
+                                    )
+                                elif ptype == "toolCall":
+                                    seq += 1
+                                    events.append(
+                                        ToolCall(
+                                            filename=filename,
+                                            seq=seq,
+                                            id=part.get("id", "") or "",
+                                            name=part.get("name", "") or "",
+                                            arguments=part.get("arguments"),
+                                            timestamp=ts,
+                                        )
+                                    )
+                                elif ptype == "text":
+                                    seq += 1
+                                    text.append(
+                                        TextBlock(
+                                            filename=filename,
+                                            seq=seq,
+                                            text=part.get("text", "") or "",
+                                            timestamp=ts,
+                                        )
+                                    )
+                    elif role == "toolResult":
+                        seq += 1
+                        events.append(
+                            ToolResult(
+                                filename=filename,
+                                seq=seq,
+                                tool_call_id=msg.get("toolCallId", "") or "",
+                                tool_name=msg.get("toolName", "") or "",
+                                content=_content_to_text(msg.get("content")),
+                                is_error=bool(msg.get("isError")),
+                                timestamp=ts,
+                            )
+                        )
+
     except OSError:
         # Unreadable file degrades to a zeroed session + one malformed line.
         return ParsedSession(
@@ -274,100 +367,6 @@ def parse_session(path: Path | str) -> ParsedSession:
             usage=usage_totals,
             has_usage=False,
         )
-
-    with fh:
-        for raw in fh:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                entry = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                malformed += 1
-                continue
-            if not isinstance(entry, dict):
-                malformed += 1
-                continue
-
-            etype = entry.get("type")
-            if etype == "session":
-                session_id = entry.get("id") or None
-                cwd = entry.get("cwd") or None
-                timestamp = entry.get("timestamp") or None
-                session_version = entry.get("version")
-            elif etype == "model_change":
-                model = {
-                    "provider": entry.get("provider"),
-                    "modelId": entry.get("modelId"),
-                }
-            elif etype == "message":
-                messages += 1
-                msg = entry.get("message") or {}
-                if not isinstance(msg, dict):
-                    malformed += 1
-                    continue
-                role = msg.get("role")
-                ts = msg.get("timestamp") or entry.get("timestamp")
-
-                if role == "assistant":
-                    usage = msg.get("usage")
-                    if isinstance(usage, dict):
-                        has_usage = True
-                        for key in ("input", "output", "totalTokens"):
-                            value = usage.get(key)
-                            if isinstance(value, (int, float)):
-                                usage_totals[key] += int(value)
-                    content = msg.get("content")
-                    if isinstance(content, list):
-                        for part in content:
-                            if not isinstance(part, dict):
-                                continue
-                            ptype = part.get("type")
-                            if ptype == "thinking":
-                                seq += 1
-                                thinking.append(
-                                    ThinkingBlock(
-                                        filename=filename,
-                                        seq=seq,
-                                        text=part.get("thinking", "") or "",
-                                        timestamp=ts,
-                                    )
-                                )
-                            elif ptype == "toolCall":
-                                seq += 1
-                                events.append(
-                                    ToolCall(
-                                        filename=filename,
-                                        seq=seq,
-                                        id=part.get("id", "") or "",
-                                        name=part.get("name", "") or "",
-                                        arguments=part.get("arguments"),
-                                        timestamp=ts,
-                                    )
-                                )
-                            elif ptype == "text":
-                                seq += 1
-                                text.append(
-                                    TextBlock(
-                                        filename=filename,
-                                        seq=seq,
-                                        text=part.get("text", "") or "",
-                                        timestamp=ts,
-                                    )
-                                )
-                elif role == "toolResult":
-                    seq += 1
-                    events.append(
-                        ToolResult(
-                            filename=filename,
-                            seq=seq,
-                            tool_call_id=msg.get("toolCallId", "") or "",
-                            tool_name=msg.get("toolName", "") or "",
-                            content=_content_to_text(msg.get("content")),
-                            is_error=bool(msg.get("isError")),
-                            timestamp=ts,
-                        )
-                    )
 
     return ParsedSession(
         filename=filename,

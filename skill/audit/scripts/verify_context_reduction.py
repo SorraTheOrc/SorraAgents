@@ -423,9 +423,9 @@ def _wl_flags() -> list[str]:
     have no worklog DB of their own).
     """
     try:
-        _SKILLS_ROOT = Path(__file__).resolve().parents[2]
-        if str(_SKILLS_ROOT) not in sys.path:
-            sys.path.insert(0, str(_SKILLS_ROOT))
+        skills_root = Path(__file__).resolve().parents[2]
+        if str(skills_root) not in sys.path:
+            sys.path.insert(0, str(skills_root))
         from shared.status_lifecycle import (  # type: ignore[import-not-found]
             resolve_worklog_flags as _resolve,
         )

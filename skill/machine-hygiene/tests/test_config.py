@@ -93,7 +93,7 @@ class TestDefaults(unittest.TestCase):
         """AC3: the shipped config.yaml encodes the documented defaults."""
         import yaml
 
-        with open(_SKILL_DIR / "config.yaml", "r", encoding="utf-8") as fh:
+        with open(_SKILL_DIR / "config.yaml", encoding="utf-8") as fh:
             shipped = yaml.safe_load(fh)
         for key, default_val in _DEFAULTS.items():
             self.assertIn(key, shipped, f"config.yaml missing category {key}")

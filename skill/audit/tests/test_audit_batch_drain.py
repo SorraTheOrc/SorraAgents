@@ -240,8 +240,8 @@ def test_batch_drain_logs_metrics_line(capsys):
     assert len(records) == 2
 
     line = next(
-        l for l in capsys.readouterr().err.splitlines()
-        if "Audit batch drain:" in l
+        ln for ln in capsys.readouterr().err.splitlines()
+        if "Audit batch drain:" in ln
     )
     assert "batch_start=20" in line  # ISO timestamp year prefix
     assert "batch_end=20" in line
@@ -256,8 +256,8 @@ def test_batch_drain_metrics_line_emitted_even_when_empty(capsys):
     audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
     assert records == []
     line = next(
-        l for l in capsys.readouterr().err.splitlines()
-        if "Audit batch drain:" in l
+        ln for ln in capsys.readouterr().err.splitlines()
+        if "Audit batch drain:" in ln
     )
     assert "items_processed=0" in line
     assert "items_included=[]" in line
@@ -424,8 +424,8 @@ def test_maybe_run_batch_drain_runs_when_backlogged(monkeypatch, capsys):
 
     assert records == ["SA-Q1", "SA-Q2"]
     line = next(
-        l for l in capsys.readouterr().err.splitlines()
-        if "Audit batch drain:" in l
+        ln for ln in capsys.readouterr().err.splitlines()
+        if "Audit batch drain:" in ln
     )
     assert "items_processed=2" in line
 

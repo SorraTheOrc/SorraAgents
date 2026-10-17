@@ -330,7 +330,7 @@ class PriorityQueue:
         now = time.monotonic()
         for entry_file in self._queue_dir.glob(f"*{_QUEUE_FILE_EXT}"):
             try:
-                with open(entry_file, "r") as f:
+                with open(entry_file) as f:
                     data = json.load(f)
                 timestamp = data.get("timestamp", 0)
                 if now - timestamp > self.ttl_seconds:
@@ -357,7 +357,7 @@ class PriorityQueue:
             entries: list[QueueEntry] = []
             for entry_file in self._queue_dir.glob(f"*{_QUEUE_FILE_EXT}"):
                 try:
-                    with open(entry_file, "r") as f:
+                    with open(entry_file) as f:
                         data = json.load(f)
                     entry = QueueEntry.from_dict(data)
                     entries.append(entry)
