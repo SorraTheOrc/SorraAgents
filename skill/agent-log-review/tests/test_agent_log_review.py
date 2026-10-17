@@ -1052,7 +1052,6 @@ class _WlStub:
 
     def __call__(self, cmd):
         self.commands.append(list(cmd))
-        joined = " ".join(cmd)
         if "show" in cmd and "--children" in cmd:
             payload = {"success": True, "children": list(self.children)}
             return _fake_runner(json.dumps(payload))
