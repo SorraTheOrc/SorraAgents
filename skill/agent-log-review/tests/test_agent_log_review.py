@@ -1329,3 +1329,83 @@ def test_prompt_budget_overflow_still_raises_on_pathological_input():
     # Even trimmed, an absurd budget below the floor must still hard-fail.
     with pytest.raises(alr.ClassificationError):
         alr.classify_patterns(_large_signals_fixture(), runner=_Runner(stdout=WELL_FORMED_RESPONSE), prompt_budget=100)
+
+
+# ── Impact-scope classification (SA-0MVCDZKN6005V5TB) ──────────────────────
+# Recommendations now carry target_skill + impact_scope (global/local) +
+# priority, carried through classification, rendering and filing.
+
+SCOPED_RESPONSE = json.dumps({
+    "categories": [{"name": "shell quoting issues", "confidence": 0.9,
+                    "evidence_sessions": ["a.jsonl"], "summary": "Backticks."}],
+    "recommendations": [
+        {"title": "Add max re-ask guard to audit", "issue_type": "feature",
+         "target_skill": "audit", "impact_scope": "global", "priority": "high",
+         "rationale": "Repeated deep reruns cost.", "evidence_sessions": ["a.jsonl"]},
+        {"title": "Local polish tweak", "issue_type": "chore",
+         "target_skill": "this-repo", "impact_scope": "local", "priority": "low",
+         "rationale": "Project-only.", "evidence_sessions": []},
+    ],
+})
+
+
+def test_classify_parses_impact_scope_and_priority():
+    result = alr.classify_patterns(
+        _classification_fixture(), runner=_Runner(stdout=SCOPED_RESPONSE)
+    )
+    assert result["error"] is None
+    recs = result["recommendations"]
+    assert len(recs) == 2
+    assert recs[0]["target_skill"] == "audit"
+    assert recs[0]["impact_scope"] == "global"
+    assert recs[0]["priority"] == "high"
+    assert recs[1]["impact_scope"] == "local"
+    assert recs[1]["priority"] == "low"
+
+
+def test_normalise_recommendation_defaults_invalid_scope():
+    rec = {"title": "x", "issue_type": "banana", "impact_scope": "sideways",
+           "priority": "urgent"}
+    norm = alr._normalise_recommendation(rec)
+    assert norm["issue_type"] == "chore"
+    assert norm["impact_scope"] == "unknown"
+    assert norm["priority"] == "low"  # derived from chore
+
+
+def test_normalise_recommendation_default_priority_by_issue_type():
+    rec = {"title": "f", "issue_type": "feature"}
+    assert alr._normalise_recommendation(rec)["priority"] == "medium"
+    assert alr._normalise_recommendation({"title": "c", "issue_type": "chore"})["priority"] == "low"
+
+
+def test_normalise_recommendation_tolerates_non_dict():
+    norm = alr._normalise_recommendation(None)
+    assert norm["title"] == ""
+    assert norm["impact_scope"] == "unknown"
+    norm2 = alr._normalise_recommendation("plain string")
+    assert norm2["title"] == "plain string"
+
+
+def test_report_renders_impact_scope():
+    analysis = _analysis_fixture()
+    analysis["classification"]["recommendations"] = [
+        {"title": "Audit guard", "issue_type": "feature", "target_skill": "audit",
+         "impact_scope": "global", "priority": "high",
+         "rationale": "Costly reruns.", "evidence_sessions": ["a.jsonl"]},
+    ]
+    md = alr.render_report(analysis, fmt="markdown")
+    assert "impact_scope: global" in md
+    parsed = json.loads(alr.render_report(analysis, fmt="json"))
+    assert parsed["recommendations"][0]["impact_scope"] == "global"
+
+
+def test_filing_description_and_priority_carry_scope():
+    stub = _WlStub()
+    rec = dict(RECS[0], impact_scope="global", priority="high")
+    result = alr.file_recommendations([rec], PARENT, wl_runner=stub, worklog_flags=[])
+    assert result["created"][0]["title"] == rec["title"]
+    cmd = next(c for c in stub.commands if "create" in c)
+    joined = " ".join(cmd)
+    assert "impact_scope: global" in joined
+    assert cmd[cmd.index("--priority") + 1] == "high"
+    assert "priority_hint: high" in joined

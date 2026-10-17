@@ -846,12 +846,53 @@ def _build_classification_prompt(signals: dict[str, Any]) -> str:
         '{"categories": [{"name": str, "confidence": float between 0 and 1, '
         '"evidence_sessions": [str], "summary": str}], '
         '"recommendations": [{"title": str, "issue_type": "chore" or "feature", '
-        '"target_skill": str, "rationale": str, "evidence_sessions": [str]}]}\n'
+        '"target_skill": str, "impact_scope": "global" or "local", '
+        '"priority": "low", "medium", or "high", "rationale": str, '
+        '"evidence_sessions": [str]}]}\n'
+        '"target_skill" is the skill (or tool) the change belongs to; '
+        '"impact_scope" is "global" when the change affects shared framework '
+        'code/tooling used by every project, or "local" when it only affects '
+        'this project. "priority" reflects cost/risk: high for repeated '
+        'expensive/blocking issues, medium for robustness, low for polish.\n'
         '"evidence_sessions" entries must be session file names from the '
         "Sessions analysed list above (or [] if none).\n\n"
         "SIGNALS (redacted):\n"
         f"{signals_redacted}\n"
     )
+
+
+def _normalise_recommendation(rec: Any) -> dict[str, Any]:
+    """Normalise one model recommendation to the expected field set.
+
+    Fail-soft: missing/invalid attribute values degrade to safe defaults
+    (``issue_type`` → ``chore``, ``impact_scope`` → ``unknown``,
+    ``priority`` → derived from ``issue_type`` when absent/invalid) instead
+    of breaking downstream rendering or filing.
+    """
+    if not isinstance(rec, dict):
+        rec = {} if rec is None else {"title": str(rec)}
+    issue_type = rec.get("issue_type")
+    if issue_type not in ("chore", "feature"):
+        issue_type = "chore"
+    impact_scope = rec.get("impact_scope")
+    if impact_scope not in ("global", "local"):
+        impact_scope = "unknown"
+    priority = rec.get("priority")
+    if priority not in ("low", "medium", "high"):
+        priority = "medium" if issue_type == "feature" else "low"
+    out: dict[str, Any] = {
+        "title": str(rec.get("title") or "").strip(),
+        "issue_type": issue_type,
+        "target_skill": str(rec.get("target_skill") or "").strip(),
+        "impact_scope": impact_scope,
+        "priority": priority,
+        "rationale": str(rec.get("rationale") or rec.get("summary") or "").strip(),
+        "evidence_sessions": [
+            str(s) for s in (rec.get("evidence_sessions") or [])
+            if isinstance(s, str) and s
+        ],
+    }
+    return out
 
 
 def _parse_classification_response(stdout: str) -> dict[str, Any]:
@@ -1000,8 +1041,8 @@ def classify_patterns(
         }
     return {
         "error": None,
-        "categories": categories,
-        "recommendations": recommendations,
+        "categories": categories if isinstance(categories, list) else [],
+        "recommendations": [_normalise_recommendation(r) for r in recommendations],
         "prompt_bytes": prompt_bytes,
     }
 
@@ -1199,7 +1240,8 @@ def _render_markdown(doc: dict[str, Any]) -> str:
         for i, rec in enumerate(recs, start=1):
             lines.append(
                 f"{i}. **{rec.get('title')}** "
-                f"({rec.get('issue_type')}, target_skill: {rec.get('target_skill')})"
+                f"({rec.get('issue_type')}, target_skill: {rec.get('target_skill')}, "
+                f"impact_scope: {rec.get('impact_scope') or 'unknown'})"
             )
             rationale = rec.get("rationale") or rec.get("summary") or ""
             if rationale:
@@ -1319,6 +1361,8 @@ def _extract_child_titles(payload: str) -> dict[str, str]:
 def _recommendation_description(rec: dict[str, Any], parent_id: str) -> str:
     """Build a created child's description with a ``related-to`` link back."""
     target = rec.get("target_skill") or "(unspecified)"
+    scope = rec.get("impact_scope") or "unknown"
+    priority = rec.get("priority") or "low"
     rationale = rec.get("rationale") or rec.get("summary") or "(none given)"
     sessions = rec.get("evidence_sessions") or []
     lines = [
@@ -1326,6 +1370,8 @@ def _recommendation_description(rec: dict[str, Any], parent_id: str) -> str:
         "",
         f"related-to:{parent_id}",
         f"target_skill: {target}",
+        f"impact_scope: {scope}",
+        f"priority_hint: {priority}",
         f"rationale: {rationale}",
     ]
     if sessions:
@@ -1347,7 +1393,8 @@ def _build_recommendation_comment(
         for i, rec in enumerate(recommendations, start=1):
             lines.append(
                 f"{i}. **{rec.get('title')}** ({rec.get('issue_type', 'chore')}; "
-                f"target_skill: {rec.get('target_skill') or 'n/a'})"
+                f"target_skill: {rec.get('target_skill') or 'n/a'}; "
+                f"impact_scope: {rec.get('impact_scope') or 'unknown'})"
             )
             rationale = rec.get("rationale") or rec.get("summary")
             if rationale:

@@ -119,8 +119,11 @@ directory always produces the same signals.
   context-reduction flags keep the call cheap and self-contained).
 - Instructs the model to reply with a JSON object of exactly this shape:
   `{"categories": [{"name", "confidence", "evidence_sessions", "summary"}],
-  "recommendations": [{"title", "issue_type", "target_skill", "rationale",
-  "evidence_sessions"}]}`.
+  "recommendations": [{"title", "issue_type", "target_skill",
+  "impact_scope", "priority", "rationale", "evidence_sessions"}]}`. Each
+  recommendation is normalised (`_normalise_recommendation`): `impact_scope`
+  defaults to `unknown` and `priority` to the issue-type default when the
+  model omits or mangles them.
 - **Bounds the prompt**: `_trim_signals_for_prompt()` deterministically
   caps the rows carried per signal kind and the excerpt sizes so a real
   20-session run (which can serialise to hundreds of KB) always fits
@@ -157,9 +160,10 @@ dry_run=False, min_confidence=0.0, ...)`:
 2. Files the report as a worklog comment on `parent_id`.
 3. For each recommendation at/above `min_confidence`: auto-creates a child
    work item with `--parent <parent_id>`, issue-type `chore`/`feature`,
-   priority `low`/`medium`, assignee `Map`, and a description that links
-   back via `related-to:<parent_id>`. Same-title existing children are
-   **reused**, never duplicated. `--dry-run` prints the planned actions
+   priority (from the recommendation, defaulting to `low`/`medium` by
+   issue-type), assignee `Map`, and a description that links back via
+   `related-to:<parent_id>` and records `target_skill` + `impact_scope`.
+   Same-title existing children are **reused**, never duplicated. `--dry-run` prints the planned actions
    without mutating.
 
 All `wl` commands route through the worklog-safe runner: `--worklog-dir` is

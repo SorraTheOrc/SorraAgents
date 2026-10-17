@@ -47,7 +47,9 @@ are never sent to the model and never persisted.
   - **Top Patterns** — counted and sorted by frequency, with session
     citations.
   - **Recommended Improvements** — LLM-classified recommendations with
-    rationale and evidence sessions.
+    rationale, evidence sessions, the affected **target skill**, and an
+    **impact scope** (`global` = affects shared/all-project code,
+    `local` = this project only).
   - **Evidence Citations** — which sessions showed which patterns.
 - With `--parent-id`: a worklog comment on the parent item and one child work
   item per actionable recommendation (`chore`/`feature`, assigned to `Map`,
@@ -66,9 +68,11 @@ are never sent to the model and never persisted.
    patterns (deterministic, side-effect free).
 3. **Classify** — `classify_patterns()` makes exactly **one** `pi --print
    --no-tools` call with the distilled signals and parses the JSON response
-   into categories and recommendations (fail-soft on malformed output). The
-   signals are deterministically trimmed to the 32 KB prompt budget so real
-   20-session runs always fit.
+   into categories and recommendations (fail-soft on malformed output). Each
+   recommendation carries `target_skill` and `impact_scope` (`global`/`local`)
+   plus a `priority`, normalised defensively (`unknown` scope, issue-type
+   default priority). The signals are deterministically trimmed to the 32 KB
+   prompt budget so real 20-session runs always fit.
 4. **Render** — `render_report()` emits the deterministic Markdown or JSON
    report with secrets redaction.
 5. **File** — with `--parent-id`, `file_recommendations()` posts the report
