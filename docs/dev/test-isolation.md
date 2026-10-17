@@ -360,9 +360,9 @@ drift.
 
 ### 8.1 Surfaces and exclusions
 
-The mutation surface is **refs + local `.git/config` + working tree**. Two
-namespaces are deliberately excluded because they are tooling churn, not
-checkout mutations:
+The mutation surface is **refs + local `.git/config` + working tree**. Three
+namespaces are deliberately excluded because their movement cannot be
+distinguished from suite-caused movement:
 
 - `refs/worklog/*` — managed by the `wl` tool;
 - concurrent-infrastructure churn — every branch ref checked out in a
@@ -373,27 +373,43 @@ checkout mutations:
   cycle wholly inside the guard window is also invisible), **plus the
   remote-tracking refs of an excluded branch** (a concurrent finish fetches
   before fast-forwarding, so `refs/remotes/origin/<parent>` moves alongside
-  the local branch).
+  the local branch);
+- concurrency-excluded ref namespaces (WL-0MV5MYBKJ0033P8U): the exact ref
+  `refs/heads/dev` and the whole `refs/remotes/origin/*` namespace. On a
+  multi-agent host these are moved by **concurrent collaborative activity** —
+  a sibling agent's `implement.py finish` fast-forwards the shared main
+  checkout's `dev`, and concurrent `fetch`/`pull`/`push` moves
+  `refs/remotes/origin/*` (including `refs/remotes/origin/dev`). Such movement
+  is **indistinguishable from suite-caused movement**, so it is excluded from
+  the diff and fingerprint; a hermetic fixture can never move these refs
+  (only `fetch`/`pull`/`push` can create/move remote-tracking refs, and a
+  suite never fast-forwards the integration branch). The excluded set is
+  expressed as ref-namespace constants in
+  `skill/shared/git_sandbox.py` (`CONCURRENCY_EXCLUDED_REF_EXACT` /
+  `CONCURRENCY_EXCLUDED_REF_NAMESPACES`), derived from git plumbing
+  namespaces — never a `wl-*` name pattern (which would also have excluded
+  the incident's own fixture branches) and never directory names.
 
-Exclusion is derived from `git worktree list --porcelain` and the retained
-local-track config; it is **never** a `wl-*` name pattern (which would also
-have excluded the incident's own fixture branches). A legitimately-created
-fixture branch that happens to be backed by a registered worktree other than
-the guard root is therefore excluded.
+A legitimately-created fixture branch that happens to be backed by a
+registered worktree other than the guard root is therefore excluded, as is
+the shared integration branch and the remote-tracking namespace.
 
 ### 8.2 Ownership rule and guard-root anchoring
 
-The exclusion is **ownership-based**: every ref checked out in a registered
-worktree that is *not* the root the guard runs from (`snapshot_repo_state`
-threads the guard's toplevel into the worktree parser) is a concurrent agent's
-infrastructure churn, regardless of the worktree's directory name
-(`.worklog/worktrees/`, `.worklog/tmp-worktree-*`, or anywhere else). The
-**guard root's own branch stays monitored** — a suite running from the main
-checkout still detects a move of its own `dev`, and a suite running from a
-linked worktree still detects a move of that worktree's branch. A concurrent
-sibling agent's `implement.py finish` (which fast-forwards the main checkout's
-`dev` and registers/removes its own `.worklog/` worktrees) therefore no longer
-trips either guard.
+The exclusion is **ownership-based plus concurrency-based**: every ref checked
+out in a registered worktree that is *not* the root the guard runs from
+(`snapshot_repo_state` threads the guard's toplevel into the worktree parser)
+is a concurrent agent's infrastructure churn, regardless of the worktree's
+directory name (`.worklog/worktrees/`, `.worklog/tmp-worktree-*`, or anywhere
+else). The **guard root's own branch stays monitored** except where a
+concurrency namespace applies — `refs/heads/dev` is the shared integration
+branch on a multi-agent host, so a sibling finish's fast-forward of it is
+indistinguishable from suite-caused movement and is excluded even when the
+guard runs at the main checkout (see §8.1); every other own-root branch (e.g.
+``wl-guarded`` in a linked worktree) stays monitored. A concurrent sibling
+agent's `implement.py finish` (which fast-forwards the main checkout's
+`dev` and registers/removes its own `.worklog/` worktrees) therefore no
+longer trips either guard.
 
 ### 8.3 No false positives: fingerprint is a trigger, the diff is the authority
 
@@ -407,25 +423,50 @@ Consequently excluded-set churn alone can never fail a test with the bogus
 
 ### 8.4 No false negatives: genuine mutations are still reported
 
-Exclusion is scoped to the ownership-based namespace only. Genuine mutations
-still fail the guard and name the offending test:
+Exclusion is scoped to the ownership/worklog/concurrency namespaces only.
+Genuine mutations still fail the guard and name the offending test:
 
-- an added/deleted/moved ref outside the excluded set (e.g. `refs/heads/intruder`);
+- an added/deleted/moved ref outside the excluded set (e.g.
+  `refs/heads/intruder`, `refs/heads/feature-x`, `refs/worklog/`-less fixture
+  branches);
 - a rewritten local-config key outside the excluded set (e.g. `user.name`,
   `core.bare`, `branch.dev.remote`);
 - a deleted tracked file or an added untracked file;
-- a move of the guard's **own root** branch.
+- a move of a monitored own-root branch (own-root branches other than the
+  concurrency-excluded `refs/heads/dev` stay monitored).
+
+**Residual risks.** Two blind spots remain and are accepted:
+
+1. **Unregistered sibling feature-branch movement.** A sibling's feature
+   branch that is NOT checked out in a registered worktree at either snapshot
+   time (e.g. a scratch branch created and deleted outside the guard window,
+   or a branch never attached to a worktree) is not ownership-excluded, so its
+   movement can still trip the guard. There is no safe plumbing-derived
+   criterion to distinguish it from a suite-caused mutation while keeping the
+   incident class detectable (a name pattern is forbidden).
+2. **`refs/heads/dev`-only movement is no longer a standalone incident
+   signal.** Because the integration branch is concurrency-excluded, a
+   mutation that moves *only* `dev` is no longer detected via the ref surface.
+   The SA-0MUIA3OE40001QJX leak class is still caught through the other
+   surfaces — a `GIT_DIR`-leak incident also rewrites local config and/or the
+   working tree (see §9), and those surfaces always fire — but detection of a
+   hypothetical *pure* ref-only `dev` rewrite is traded away for multi-agent
+   false-positive immunity (WL-0MV5MYBKJ0033P8U).
 
 Regression coverage:
 
 - helper-level `excluded_refs` ownership (`TestOwnershipBasedExclusion`,
-  `TestOwnershipExclusionBoundaries`) and linked-worktree anchoring
-  (`TestMainCheckoutAnchoring`) in
+  `TestOwnershipExclusionBoundaries`), linked-worktree anchoring
+  (`TestMainCheckoutAnchoring`) and concurrency namespaces
+  (`TestConcurrencyExcludedRefs`) in
   `skill/shared/tests/test_git_sandbox.py`;
 - guard-level registration, `--track` registration, removal, concurrent-`dev`
-  fast-forward and linked-worktree sibling churn, plus the config-rewrite and
-  own-root-branch fires proofs, in
-  `tests/test_live_repo_mutation_guard.py`.
+  fast-forward, linked-worktree sibling churn, the config-rewrite and
+  own-root-branch fires proofs, plus the concurrency-namespace clean-run and
+  adversary proofs, in
+  `tests/test_live_repo_mutation_guard.py`;
+- outer-guard detection inherits the helper (no drift) in
+  `skill/test/tests/test_guarded_run_all.py`.
 
 
 ## 9. Production test-execution scrub (2026-09-26 recurrence, SA-0MUIA3OE40001QJX)

@@ -33,11 +33,20 @@ Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
   registering/removing ``.worklog/`` worktrees), and so is the
   ``branch.<name>.*`` local config that worktree registration writes
   (``remote``/``merge``) — both derived from ``git worktree list --porcelain``
-  and the retained-local-track config, never a ``wl-*`` name pattern. The
-  guard's own root branch stays monitored. The GIT_DIR-leak incident class is
-  still caught via config rewrites of any non-excluded key, working-tree
-  contamination, and moves of the guard's own root branch
-  (SA-0MUIA3OE40001QJX).
+  and the retained-local-track config, never a ``wl-*`` name pattern. It is
+  also **concurrency-based** (WL-0MV5MYBKJ0033P8U): the exact ref
+  ``refs/heads/dev`` (``CONCURRENCY_EXCLUDED_REF_EXACT``) and the whole
+  ``refs/remotes/origin/*`` namespace (``CONCURRENCY_EXCLUDED_REF_NAMESPACES``)
+  are excluded because concurrent collaborative movement of those refs (a
+  sibling finish fast-forward on the shared main checkout, concurrent
+  ``fetch``/``pull``/``push`` on a multi-agent host) is indistinguishable
+  from suite-caused movement; the exclusions are plumbing-derived ref
+  namespaces, never a ``wl-*`` name pattern. The guard's own root branch
+  stays monitored except for the concurrency-excluded ``refs/heads/dev``. The
+  GIT_DIR-leak incident class is still caught via config rewrites of any
+  non-excluded key, working-tree contamination, and moves of non-excluded
+  refs (SA-0MUIA3OE40001QJX); a ``refs/heads/dev``-only ref move is no longer
+  a standalone incident signal (see ``docs/dev/test-isolation.md`` §8.4).
 """
 
 from __future__ import annotations
