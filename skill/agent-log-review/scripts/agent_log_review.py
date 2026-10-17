@@ -747,6 +747,19 @@ PROMPT_BUDGET_BYTES = 32 * 1024
 PI_CALL_TIMEOUT = 600
 """Per-call timeout for the classification ``pi`` subprocess."""
 
+PROMPT_BOILERPLATE_BYTES = 2048
+"""Reserve for the prompt template + session list (overhead above the JSON)."""
+
+MAX_SIGNAL_ROWS_PER_KIND = 60
+"""Max rows carried per signal kind (thinking hits / tool errors / retries)
+in the LLM prompt; the rest are dropped from the *prompt* copy only."""
+
+SIGNAL_EXCERPT_CAP_BYTES = 192
+"""Per-context / per-excerpt byte cap applied to the prompt copy."""
+
+MIN_EXCERPT_CAP_BYTES = 64
+"""Floor for the progressive shrink loop in :func:`_trim_signals_for_prompt`."""
+
 SECRET_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"sk-[A-Za-z0-9_-]{16,}"), "<API_KEY>"),
     (re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE), "Bearer <TOKEN>"),
@@ -858,6 +871,80 @@ def _parse_classification_response(stdout: str) -> dict[str, Any]:
     return parsed
 
 
+def _trim_signals_for_prompt(
+    signals: dict[str, Any],
+    prompt_budget: int = PROMPT_BUDGET_BYTES,
+) -> dict[str, Any]:
+    """Return a deterministic deep copy of *signals* sized for the prompt.
+
+    The heuristic extractors cap each excerpt individually (2 KB per session)
+    but a real 20-session run still serialises to hundreds of KB — far over
+    ``PROMPT_BUDGET_BYTES``. This helper bounds the **total** payload that is
+    handed to the model (hybrid design keeps the LLM call cheap):
+
+    - each signal kind keeps at most ``MAX_SIGNAL_ROWS_PER_KIND`` rows,
+      selected deterministically (thinking hits by count desc, then by
+      session/keyword; tool errors and retries by kind then session);
+    - every context/excerpt is truncated to ``SIGNAL_EXCERPT_CAP_BYTES``;
+    - the caps shrink (halving, down to ``MIN_EXCERPT_CAP_BYTES``) until the
+      serialised payload fits ``prompt_budget - PROMPT_BOILERPLATE_BYTES``.
+
+    Counts and session names are preserved on the retained rows and the
+    per-kind ``total*`` fields are recomputed from the trimmed rows, so the
+    LLM still sees the full distribution. The caller's original dict is never
+    mutated (deep copy).
+    """
+    import copy
+
+    target = max(MIN_EXCERPT_CAP_BYTES, prompt_budget - PROMPT_BOILERPLATE_BYTES)
+
+    def _snapshot() -> dict[str, Any]:
+        return copy.deepcopy(signals)
+
+    def _apply(trimmed: dict[str, Any], row_cap: int, excerpt_cap: int) -> None:
+        # Thinking hits: keep the most frequent keywords first.
+        thinking = trimmed.get("thinking_signals") or {}
+        hits = thinking.get("hits") or []
+        hits.sort(key=lambda h: (-int(h.get("count", 0)), h.get("session", ""), h.get("keyword", "")))
+        hits = hits[:row_cap]
+        for hit in hits:
+            if isinstance(hit, dict) and isinstance(hit.get("context"), str):
+                hit["context"] = _truncate_utf8(hit["context"], excerpt_cap)
+        hits.sort(key=lambda h: (h.get("session", ""), h.get("keyword", "")))
+        thinking["hits"] = hits
+        thinking["total_hits"] = sum(int(h.get("count", 0)) for h in hits)
+        trimmed["thinking_signals"] = thinking
+
+        # Tool errors: keep a deterministic spread by session, tool, kind.
+        errors = (trimmed.get("tool_errors") or {}).get("errors") or []
+        errors.sort(key=lambda e: (e.get("session", ""), e.get("tool", ""), e.get("excerpt", "")))
+        errors = errors[:row_cap]
+        for err in errors:
+            if isinstance(err.get("excerpt"), str):
+                err["excerpt"] = _truncate_utf8(err["excerpt"], excerpt_cap)
+        trimmed["tool_errors"] = {"total": len(errors), "errors": errors}
+
+        # Retry patterns: keep a deterministic spread by kind, tool, session.
+        patterns = (trimmed.get("retry_patterns") or {}).get("patterns") or []
+        patterns.sort(
+            key=lambda p: (p.get("kind", ""), p.get("tool", ""), p.get("session", ""))
+        )
+        patterns = patterns[:row_cap]
+        trimmed["retry_patterns"] = {"total": len(patterns), "patterns": patterns}
+
+    row_cap = MAX_SIGNAL_ROWS_PER_KIND
+    excerpt_cap = SIGNAL_EXCERPT_CAP_BYTES
+    for _ in range(8):  # bounded progressive shrink
+        trimmed = _snapshot()
+        _apply(trimmed, row_cap, excerpt_cap)
+        size = len(json.dumps(trimmed).encode("utf-8"))
+        if size <= target:
+            return trimmed
+        row_cap = max(10, row_cap // 2)
+        excerpt_cap = max(MIN_EXCERPT_CAP_BYTES, excerpt_cap // 2)
+    return _snapshot()  # last resort: caller still guards with raise
+
+
 def classify_patterns(
     signals: dict[str, Any],
     model: str = DEFAULT_CLASSIFIER_MODEL,
@@ -867,9 +954,11 @@ def classify_patterns(
     """Classify distilled *signals* into categories and recommendations.
 
     One batched ``pi --print --no-tools`` call, hybrid design: heuristics
-    extracted the signals, the LLM only classifies them. Fail-soft:
-    - prompt over *prompt_budget* → raises :class:`ClassificationError`
-      (hard error: the signals are too large to send safely);
+    extracted the signals, the LLM only classifies them. The signals are
+    deterministically trimmed (see :func:`_trim_signals_for_prompt`) so the
+    prompt always fits *prompt_budget* on real session sets. Fail-soft:
+    - even the trimmed prompt exceeding *prompt_budget* → raises
+      :class:`ClassificationError` (pathological input — nothing to send);
     - pi subprocess failure or malformed model output → returned as a
       structured ``error`` diagnostic (never a crash), with empty
       categories/recommendations.
@@ -880,12 +969,14 @@ def classify_patterns(
     summary}`` and ``recommendations`` a list of ``{title, issue_type,
     target_skill, rationale, evidence_sessions}``.
     """
-    prompt = _build_classification_prompt(signals)
+    prompt = _build_classification_prompt(
+        _trim_signals_for_prompt(signals, prompt_budget)
+    )
     prompt_bytes = len(prompt.encode("utf-8"))
     if prompt_bytes > prompt_budget:
         raise ClassificationError(
             f"classification prompt of {prompt_bytes} bytes exceeds the "
-            f"{prompt_budget}-byte budget; reduce max_sessions or excerpt size"
+            f"{prompt_budget}-byte budget even after trimming"
         )
     try:
         stdout = _call_pi(prompt, model=model, runner=runner)

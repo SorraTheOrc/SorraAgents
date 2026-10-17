@@ -121,11 +121,13 @@ directory always produces the same signals.
   `{"categories": [{"name", "confidence", "evidence_sessions", "summary"}],
   "recommendations": [{"title", "issue_type", "target_skill", "rationale",
   "evidence_sessions"}]}`.
-- **Fail-soft**: malformed/empty model output or a failed subprocess is
-  returned as a structured `error` diagnostic (empty categories /
-  recommendations), never a crash. A prompt over `PROMPT_BUDGET_BYTES`
-  (32 KB) raises `ClassificationError` — the signals are too large to send
-  safely.
+- **Bounds the prompt**: `_trim_signals_for_prompt()` deterministically
+  caps the rows carried per signal kind and the excerpt sizes so a real
+  20-session run (which can serialise to hundreds of KB) always fits
+  `PROMPT_BUDGET_BYTES` (32 KB). Counts and session names on the retained
+  rows are preserved and per-kind totals are recomputed. Only a
+  pathological payload that still exceeds the budget after trimming
+  raises `ClassificationError`.
 - `runner` is injectable for deterministic tests (duck-typed:
   `returncode`/`stdout`/`stderr`).
 

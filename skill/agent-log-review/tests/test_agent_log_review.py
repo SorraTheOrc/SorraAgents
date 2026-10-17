@@ -1251,3 +1251,81 @@ def test_cli_dry_run_does_not_mutate_worklog(tmp_path):
     assert proc.returncode == 0, proc.stderr[:400]
     # dry-run prints "would comment" to stderr, never an actual mutation.
     assert "would comment" in proc.stderr
+
+
+# ── Prompt-budget regression (SA-0MVCAIMKL004HO8L) ─────────────────────────
+# First real 20-session run hit: "classification prompt of 663931 bytes
+# exceeds the 32768-byte budget". The per-session caps multiply; classify
+# must trim the TOTAL payload (deterministic) instead of hard-raising.
+
+def _large_signals_fixture() -> dict:
+    sessions = [f"s{i:02d}.jsonl" for i in range(20)]
+    hits = []
+    errors = []
+    for s in sessions:
+        for kw in alr.THINKING_KEYWORDS:
+            hits.append({"session": s, "keyword": kw, "count": 800,
+                         "context": "hmm " + ("error " * 300)})
+        for _ in range(25):
+            errors.append({"session": s, "tool": "bash", "kind": "traceback",
+                           "is_error": True,
+                           "excerpt": "Traceback (most recent call last): " + "x" * 1500})
+    return {
+        "session_count": len(sessions),
+        "session_files": sessions,
+        "tool_distribution": {
+            "total_calls": 5000, "total_error_results": 900,
+            "by_tool": {"bash": {"calls": 4500, "error_results": 900, "error_rate": 0.2}},
+        },
+        "thinking_signals": {"total_hits": len(hits) * 2, "hits": hits},
+        "tool_errors": {"total": len(errors), "errors": errors},
+        "retry_patterns": {
+            "total": 1,
+            "patterns": [{"session": "s00.jsonl", "kind": "repeated_call",
+                          "tool": "bash", "arguments": "x", "count": 3}],
+        },
+    }
+
+
+def test_classify_large_signals_stays_under_budget():
+    """A real-scale signals dict must not raise; the prompt fits the budget."""
+    result = alr.classify_patterns(_large_signals_fixture(), runner=_Runner(stdout=WELL_FORMED_RESPONSE))
+    assert result["error"] is None
+    assert result["prompt_bytes"] <= alr.PROMPT_BUDGET_BYTES
+    assert result["categories"][0]["name"] == "shell quoting issues"
+
+
+def test_trim_signals_preserves_counts_and_session_names():
+    trimmed = alr._trim_signals_for_prompt(_large_signals_fixture())
+    assert trimmed["session_count"] == 20
+    assert len(trimmed["session_files"]) == 20
+    # Totals are recomputed from the retained rows (not wrong or stale).
+    assert trimmed["thinking_signals"]["total_hits"] == sum(
+        h["count"] for h in trimmed["thinking_signals"]["hits"]
+    )
+    assert trimmed["tool_errors"]["total"] == len(trimmed["tool_errors"]["errors"])
+    # Retained rows still carry session names for evidence citations.
+    assert all(h["session"] in [f"s{i:02d}.jsonl" for i in range(20)]
+               for h in trimmed["thinking_signals"]["hits"])
+
+
+def test_trim_signals_is_deterministic():
+    a = alr._trim_signals_for_prompt(_large_signals_fixture())
+    b = alr._trim_signals_for_prompt(_large_signals_fixture())
+    assert a == b
+    ra = alr.classify_patterns(_large_signals_fixture(), runner=_Runner(stdout=WELL_FORMED_RESPONSE))
+    rb = alr.classify_patterns(_large_signals_fixture(), runner=_Runner(stdout=WELL_FORMED_RESPONSE))
+    assert ra["prompt_bytes"] == rb["prompt_bytes"]
+
+
+def test_trim_signals_does_not_mutate_input():
+    fixture = _large_signals_fixture()
+    before = json.dumps(fixture)
+    alr._trim_signals_for_prompt(fixture)
+    assert json.dumps(fixture) == before
+
+
+def test_prompt_budget_overflow_still_raises_on_pathological_input():
+    # Even trimmed, an absurd budget below the floor must still hard-fail.
+    with pytest.raises(alr.ClassificationError):
+        alr.classify_patterns(_large_signals_fixture(), runner=_Runner(stdout=WELL_FORMED_RESPONSE), prompt_budget=100)

@@ -66,7 +66,9 @@ are never sent to the model and never persisted.
    patterns (deterministic, side-effect free).
 3. **Classify** — `classify_patterns()` makes exactly **one** `pi --print
    --no-tools` call with the distilled signals and parses the JSON response
-   into categories and recommendations (fail-soft on malformed output).
+   into categories and recommendations (fail-soft on malformed output). The
+   signals are deterministically trimmed to the 32 KB prompt budget so real
+   20-session runs always fit.
 4. **Render** — `render_report()` emits the deterministic Markdown or JSON
    report with secrets redaction.
 5. **File** — with `--parent-id`, `file_recommendations()` posts the report
