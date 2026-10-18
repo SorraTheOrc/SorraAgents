@@ -35,6 +35,15 @@ by the autoplan decision logic).
 - **Vertical slice phasing**: tracer-bullet approach — each phase cuts through ALL layers end-to-end, not a single horizontal layer. Between phases, review and update next items' descriptions.
 - When recommending next steps, the first must progress to the next process step with a summary.
 
+## Background jobs
+
+If planning or a proposed implementation step launches a long-running
+background process (audit, build, release, batch job, test sweep), follow the
+shared [background job etiquette](../shared/background-job-etiquette.md) —
+launch → prepare other work → **one completion-aware wait with progress** via
+`../shared/wait_for_job.py` → collect. Fixed-length `sleep N` polling of
+background processes is deprecated.
+
 ## Status lifecycle (first action)
 
 See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#workflow-for-ai-agents) for the claim-first pattern.

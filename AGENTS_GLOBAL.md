@@ -135,6 +135,14 @@ Agents must **never** invoke test commands directly — no ad-hoc `pytest`, `npm
 
 Automated infrastructure gates (pre-push hook, `implement.py finish`, audit F3 cache miss) execute test commands directly as part of their own logic; these are **infrastructure**, not agent runs, and are **out of scope** for this policy.
 
+## Background job etiquette
+
+Long-running background processes (audit, build, release, batch test) follow
+the shared [background-job etiquette](skill/shared/background-job-etiquette.md):
+launch → prepare other work → one completion-aware wait with progress via
+`skill/shared/wait_for_job.py` → collect. Fixed `sleep N` polling of background
+processes is deprecated.
+
 ## Work-Item Management
 
 Run `wl --help` / `wl <cmd> --help` for full docs (create, update, comment, close, dep, sync, github import/push, plugins). **NEVER run `wl list` without a search term** — use `wl list <term> --json` (substring, matches filenames/paths/ids) or `wl search <keywords> --json` (FTS).

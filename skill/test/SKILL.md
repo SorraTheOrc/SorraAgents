@@ -63,6 +63,13 @@ An empty resolved set (no extension file, no npm test script, no pytest suite, n
 
 Output: JSON with per-suite results and a flat `failures` array (`test_name`, `stdout_excerpt`, `stack_trace`).
 
+**Background test runs.** When a suite is launched in the background (rather
+than run in the foreground by `run_tests.py`), wait for it completion-aware
+via `../shared/wait_for_job.py` per the shared [background job
+etiquette](../shared/background-job-etiquette.md) — never a fixed `sleep N`
+poll. The runner's own foreground subprocess calls already honour their
+per-command timeout.
+
 ### 1a. Typed runs (`--type`) — fast feedback vs release evidence
 
 `--type <T>` selects the command **profile**; `--scope full|changed` selects

@@ -153,7 +153,7 @@ only as the cwd-derived fallback for direct/unit callers.
 Audits can run for **hours**; the **launch → monitor → abort** contract is in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Summary:
 
 - **Launch:** detached, unique log under `~/.audit_debug/<project>/`; **180-min budget**.
-- **Monitor:** every 3 min — `kill -0 <pid>`, `tail -50 <log>` (markers: `Phase 1 passed: running Phase 2 deep code analysis...`, `Skipping Phase 2 deep analysis: effort=... risk=...`, `Per-call timing:`); confirm log growth.
+- **Monitor:** follow the shared [background job etiquette](../shared/background-job-etiquette.md) — one completion-aware wait with progress via `wait_for_job.py`, then `kill -0 <pid>` + `tail -50 <log>` (markers: `Phase 1 passed: running Phase 2 deep code analysis...`, `Skipping Phase 2 deep analysis: effort=... risk=...`, `Per-call timing:`); confirm log growth.
 - **Abort:** stale log ≥10 min, ≥3 provider-error retries w/o progress, unexpected exits/loops, or 180-min budget → kill tree (`pkill -TERM -P` → `kill` → `-KILL`); restore pre-audit status/stage only if the runner didn't complete its lifecycle (never demote `in_review`→`open`); append failure notice (progress summary: elapsed time, last phase marker, trigger) and **report the outcome to the operator** (run id, log path, trigger, restored status/stage). Never fabricate a report or override a completed verdict.
 
 ### In-process per-call safeguards (complementary to the external monitor)

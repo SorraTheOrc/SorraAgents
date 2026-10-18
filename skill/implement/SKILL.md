@@ -123,6 +123,12 @@ anything. Every test must assert observable behaviour via the public API.
 
 ## Background Job Etiquette
 
+The canonical guidance for running and waiting on long-running background
+processes lives in the shared doc
+[`../shared/background-job-etiquette.md`](../shared/background-job-etiquette.md)
+(SA-0MVCX570P003VLBK), which this section mirrors and must stay consistent
+with (SA-0MVDP5JTK009HWOT AC4).
+
 When a step needs to run a long-running background process (audit, build,
 release, batch job), follow this pattern:
 

@@ -49,6 +49,10 @@ This is **guidance for the agent invoking the runner** — it does not change
      path (e.g. never `/tmp/audit.log`).
    - Record the PID and the absolute log path; both are needed by the
      monitor step.
+   - This is the **launch** step of the shared [background job
+     etiquette](../../skill/shared/background-job-etiquette.md) pattern;
+     the **wait** step is completion-aware via `wait_for_job.py` (see
+     [Monitor](#monitor) below), never a fixed `sleep N` poll.
 
 3. **Enforce a 180-minute hard budget.** The whole run must finish within
    **10800s (180 min)** of launch. This is the agent-side outer budget —
@@ -67,19 +71,28 @@ This is **guidance for the agent invoking the runner** — it does not change
 
 ### Monitor
 
-While the run is active, **report progress every 3 minutes**:
+While the run is active, follow the shared
+[background job etiquette](../../skill/shared/background-job-etiquette.md):
+launch → prepare other work → **one completion-aware wait with progress** via
+`wait_for_job.py` → collect the result. Do not fixed `sleep N`-poll the run
+(SA-0MVCX570P003VLBK). In practice:
 
-1. **Alive check** — `kill -0 <pid>` (exit 0 = still running).
-2. **Tail the log** — `tail -50 <log>` and look for the runner's stderr
+1. **Wait completion-aware** — `python3 ../../skill/shared/wait_for_job.py
+   --pid <pid> --log <log> --timeout 10800 --interval 60 --message
+   "audit <work-item-id>"` returns the moment the run exits (and emits a
+   timestamped heartbeat once a minute so the pane shows progress).
+2. **Alive check** (between heartbeats, on interest) — `kill -0 <pid>`
+   (exit 0 = still running).
+3. **Tail the log** — `tail -50 <log>` and look for the runner's stderr
    progress markers:
    - `Phase 1 passed: running Phase 2 deep code analysis...`
      (Phase 1 → Phase 2 transition),
    - `Per-call timing: issue_id=... context=... elapsed_seconds=...` lines
      (per-call instrumentation; a run stuck on one long call shows a
      growing elapsed_seconds with no new context).
-3. **Confirm log growth** — the log file must grow between checks; a log
+4. **Confirm log growth** — the log file must grow between checks; a log
    that stopped growing is a stall signal (see Abort & Mitigate).
-4. **Report to the operator** — on each check, report the elapsed time since
+5. **Report to the operator** — on each check, report the elapsed time since
    launch and the current phase (e.g. "Phase 1", "Phase 2 deep analysis",
    "child audit cascade").
 
