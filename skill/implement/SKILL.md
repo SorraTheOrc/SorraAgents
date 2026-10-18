@@ -117,6 +117,40 @@ anything. Every test must assert observable behaviour via the public API.
 - Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev ([AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
 - Use `StatusLifecycle` for all status transitions — never ad-hoc `wl update --status` commands.
 
+## Background Job Etiquette
+
+When a step needs to run a long-running background process (audit, build,
+release, batch job), follow this pattern:
+
+**launch → prepare other work → one completion-driven wait with progress → collect result**
+
+1. **Launch** the job with a redirect to a tailable log, e.g.
+   `nohup python3 ... > /tmp/job.log 2>&1 &`; record the PID and log path.
+2. **Prepare other work** while it runs — read context, draft docs, update
+   the work item. Do **not** idle-sleep.
+3. **Wait once, completion-aware**, with the shared helper
+   `../shared/wait_for_job.py` (SA-0MVCX570P003VLBK):
+
+   ```bash
+   python3 ../shared/wait_for_job.py --pid $PID \
+     --log /tmp/job.log --pattern "Audit complete" \
+     --timeout 3600 --interval 60 --message "audit SA-XXXX"
+   ```
+
+   It polls at the configured interval (default ≤ 60 s), emits a timestamped
+   heartbeat at least once per poll interval (tailable in a herdr pane), and
+   returns **as soon as** the job's completion marker appears (process exit /
+   checkpoint ``--marker`` / ``--log``+``--pattern``), never after a fixed
+   sleep. With ``HERDR_SOCKET_PATH``/``HERDR_PANE_ID`` set it reports
+   ``working``/``blocked`` to the herdr sidebar (silently optional).
+4. **Collect** the result from the log / exit code and continue.
+
+> **Deprecated:** fixed-length ``sleep N`` polling of background processes
+> (`sleep 900; grep <log>; ps aux | grep` loops) is deprecated. A 23.7 h
+> session spent 88.6% of its time sleeping (95 ``sleep`` calls totalling
+> 21.0 h); each wake-up costs a full model round-trip and nearly always
+> returns "no change". Use the completion-driven wait above instead.
+
 ## Test Timeout Configuration
 
 The finish step runs the project test suite through `implement.py finish` with a
