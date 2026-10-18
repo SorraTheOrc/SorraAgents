@@ -142,8 +142,33 @@ release, batch job), follow this pattern:
    returns **as soon as** the job's completion marker appears (process exit /
    checkpoint ``--marker`` / ``--log``+``--pattern``), never after a fixed
    sleep. With ``HERDR_SOCKET_PATH``/``HERDR_PANE_ID`` set it reports
-   ``working``/``blocked`` to the herdr sidebar (silently optional).
+   ``working``/``blocked`` to the herdr sidebar (silently optional). A
+   ``herdr_status`` startup line shows whether sidebar reporting is enabled
+   (and for which pane), so an operator can see at a glance why a sidebar is
+   (not) updating. On completion the final line is followed by a terminal
+   bell; set ``WAIT_NOTIFY=1`` (with ``notify-send`` on PATH) for a desktop
+   notification (fail-soft, disabled by default).
 4. **Collect** the result from the log / exit code and continue.
+
+**Feedback channels** (which interface shows what):
+
+- **Interactive pi TUI:** the bash tool streams partial output live into the
+  tool box (heartbeats appear as ``[ts] heartbeat: waiting …`` lines, with a
+  live elapsed timer); expand with Tab to see more than the last 5 lines.
+- **Herdr sidebar:** with ``HERDR_SOCKET_PATH`` + ``HERDR_PANE_ID`` exported
+  into the wait process, the helper sends ``pane.report_agent``
+  (``working``/``blocked`` + message) every poll interval; without them it
+  silently degrades — check the ``herdr_status`` startup line to confirm.
+- **Completion:** terminal bell in text mode; ``notify-send`` desktop
+  notification when ``WAIT_NOTIFY=1`` and the binary is present.
+
+To watch a wait live in a pane:
+
+```bash
+python3 ../shared/wait_for_job.py --pid $PID --timeout 3600 --interval 60 \
+  --message "audit SA-XXXX" > /tmp/wait.log 2>&1 &
+tail -f /tmp/wait.log
+```
 
 > **Deprecated:** fixed-length ``sleep N`` polling of background processes
 > (`sleep 900; grep <log>; ps aux | grep` loops) is deprecated. A 23.7 h

@@ -22,7 +22,15 @@ is required; any marker completing ends the wait. Exit codes: 0 on completion,
 Herdr sidebar: when ``HERDR_SOCKET_PATH`` and ``HERDR_PANE_ID`` are set, the
 helper sends ``pane.report_agent`` messages (``working``/``blocked`` +
 human-readable status) per ``herdr-agent-state-protocol.md`` so the sidecar
-shows live progress; without those env vars it silently degrades.
+shows live progress; without those env vars it silently degrades. A startup
+``herdr_status`` line reports whether sidebar reporting is enabled (and for
+which pane), so an operator can see at a glance why a sidebar is (not)
+updating.
+
+Completion feedback: the final line is followed by a terminal bell (``\a``)
+in text mode, and — when ``WAIT_NOTIFY=1`` and a ``notify-send`` binary is on
+``PATH`` — a desktop notification is fired (non-blocking, fail-soft; disabled
+by default so headless automation is never spammed).
 """
 
 from __future__ import annotations
@@ -31,8 +39,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import socket
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -47,6 +57,8 @@ EXIT_USAGE = 2
 
 #: Herdr protocol identity for this helper.
 HERDR_SOURCE = "wait_for_job"
+#: Env var that opts into a desktop notification on completion (fail-closed).
+NOTIFY_ENV = "WAIT_NOTIFY"
 
 
 def utc_now() -> str:
@@ -211,6 +223,52 @@ class HerdrReporter:
 
 
 # ---------------------------------------------------------------------------
+# Completion notification (fail-soft, opt-in desktop) — SA-0MVDQF3VW002PKCA
+# ---------------------------------------------------------------------------
+
+
+class CompletionNotifier:
+    """End-of-wait user feedback: a terminal bell + optional desktop notification.
+
+    The terminal bell (``\\a``) is always emitted in text mode so an operator
+    watching the pane sees/hears the wait end. A desktop notification is fired
+    only when ``WAIT_NOTIFY=1`` **and** a ``notify-send`` binary is on ``PATH``;
+    it is fire-and-forget with a short socket timeout and never crashes the
+    helper (fail-soft). Default is fail-closed: no desktop notification without
+    an explicit opt-in, so headless automation is never spammed.
+    """
+
+    def __init__(self, env=None, json_output: bool = False):
+        env = os.environ if env is None else env
+        self.json_output = json_output
+        self.desktop_enabled = env.get(NOTIFY_ENV, "") == "1"
+
+    def bell(self) -> None:
+        """Emit the terminal bell in text mode (no-op for --json output)."""
+        if self.json_output:
+            return
+        print("\a", end="", flush=True)
+
+    def desktop(self, title: str, message: str) -> bool:
+        """Fire a notify-send notification; returns whether it was dispatched."""
+        if not self.desktop_enabled:
+            return False
+        binary = shutil.which("notify-send")
+        if not binary:
+            return False
+        try:
+            subprocess.Popen(
+                [binary, title, message],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except OSError:
+            return False
+
+
+# ---------------------------------------------------------------------------
 # The wait loop
 # ---------------------------------------------------------------------------
 
@@ -223,18 +281,22 @@ def wait_for_job(
     message: str = "",
     reporter: HerdrReporter | None = None,
     json_output: bool = False,
+    notifier: CompletionNotifier | None = None,
 ) -> int:
     """Wait until any *markers* completes, the *timeout* elapses, or SIGINT.
 
     Emits a timestamped heartbeat at least once per poll *interval* while
     waiting. Returns the process exit code (0 completed / 1 timeout / 130
-    interrupted).
+    interrupted). On completion/timeout/interrupt a terminal bell and (when
+    opted in) a desktop notification announce the end of the wait.
     """
     reporter = reporter or HerdrReporter()
+    notifier = notifier or CompletionNotifier(json_output=json_output)
     start = time.monotonic()
     description = message or "job completion"
 
-    def emit(event: str, text: str, elapsed: float | None = None) -> None:
+    def emit(event: str, text: str, elapsed: float | None = None,
+             extra: dict | None = None) -> None:
         if json_output:
             row = {
                 "ts": utc_now(),
@@ -243,9 +305,16 @@ def wait_for_job(
             }
             if elapsed is not None:
                 row["elapsed"] = round(elapsed, 1)
+            if extra:
+                row.update(extra)
             print(json.dumps(row), flush=True)
         else:
             print(_stamp(f"{event}: {text}"), flush=True)
+
+    def finish(event: str, text: str, elapsed: float, title: str) -> None:
+        emit(event, text, elapsed)
+        notifier.bell()
+        notifier.desktop(title, text)
 
     def interrupted(_sig, _frame):
         raise KeyboardInterrupt
@@ -253,18 +322,28 @@ def wait_for_job(
     old_int = signal.signal(signal.SIGINT, interrupted)
     old_term = signal.signal(signal.SIGTERM, interrupted)
     try:
+        if reporter.enabled:
+            emit("herdr_status",
+                 f"herdr reporting enabled (pane {reporter.pane_id})",
+                 extra={"enabled": True, "pane_id": reporter.pane_id})
+        else:
+            emit("herdr_status",
+                 "herdr reporting disabled (set HERDR_SOCKET_PATH and "
+                 "HERDR_PANE_ID to show sidebar progress)",
+                 extra={"enabled": False})
         emit("started", f"waiting for {description}")
         reporter.report("working", f"waiting for {description}")
 
         while True:
             elapsed = time.monotonic() - start
             if any(m.done() for m in markers):
-                emit("completed", f"{description} completed after {elapsed:.1f}s", elapsed)
+                text = f"{description} completed after {elapsed:.1f}s"
+                finish("completed", text, elapsed, "wait_for_job: completed")
                 return EXIT_COMPLETED
             if elapsed >= timeout:
                 text = f"timed out after {timeout:g}s waiting for {description}"
-                emit("timeout", text, elapsed)
                 reporter.report("blocked", text)
+                finish("timeout", text, elapsed, "wait_for_job: timed out")
                 return EXIT_TIMEOUT
             emit("heartbeat", f"waiting for {description} "
                               f"(elapsed {elapsed:.0f}s / timeout {timeout:g}s)", elapsed)
@@ -273,6 +352,9 @@ def wait_for_job(
             time.sleep(min(interval, timeout - elapsed))
     except KeyboardInterrupt:
         emit("interrupted", f"wait interrupted after {time.monotonic() - start:.1f}s")
+        notifier.bell()
+        notifier.desktop("wait_for_job: interrupted",
+                         f"wait interrupted after {time.monotonic() - start:.1f}s")
         return 130
     finally:
         signal.signal(signal.SIGINT, old_int)
@@ -292,7 +374,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exit codes: 0 completed, 1 timeout, 2 usage error.\n"
                "Herdr: set HERDR_SOCKET_PATH + HERDR_PANE_ID to report "
-               "working/blocked to the sidebar (silently optional).",
+               "working/blocked to the sidebar (silently optional).\n"
+               "Notification: the final line is followed by a terminal bell; "
+               f"set {NOTIFY_ENV}=1 (with notify-send on PATH) for a desktop notification.",
     )
     parser.add_argument("--pid", type=int, action="append", default=[],
                         help="wait until this process exits (repeatable)")

@@ -6,8 +6,9 @@ appears (process exit / checkpoint file / log pattern) and emits a timestamped
 progress heartbeat at least once per poll interval, optionally reporting
 ``working``/``blocked`` to the herdr sidebar. These tests exercise the
 observable CLI behaviour: exit codes, early exit, timeout bound, heartbeat
-cadence, herdr reporting, and silent degradation when herdr env vars are
-absent.
+cadence, herdr reporting, silent degradation when herdr env vars are absent,
+the ``herdr_status`` startup diagnostic, and the completion notification
+channels (terminal bell + opt-in desktop notification, SA-0MVDQF3VW002PKCA).
 """
 
 from __future__ import annotations
@@ -304,6 +305,147 @@ class TestHerdrReporting:
                 assert result.returncode == EXIT_COMPLETED, result.stderr
             finally:
                 job.wait(timeout=15)
+
+
+# ---------------------------------------------------------------------------
+# AC7 — completion notification: terminal bell + optional notify-send (SA-0MVDQF3VW002PKCA)
+# ---------------------------------------------------------------------------
+
+
+class TestCompletionNotification:
+    def test_bell_emitted_on_completion(self):
+        """A completed wait emits a terminal bell char in text mode."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "done.marker"
+            marker.write_text("ok")
+            result = _run(["--marker", str(marker), "--timeout", "10"])
+            assert result.returncode == EXIT_COMPLETED, result.stderr
+            assert "\a" in result.stdout, "no terminal bell on completion"
+
+    def test_bell_emitted_on_timeout(self):
+        """A timed-out wait emits a terminal bell char (still audible as failure)."""
+        with tempfile.TemporaryDirectory() as td:
+            never = Path(td) / "never.marker"
+            result = _run(["--marker", str(never), "--timeout", "2", "--interval", "1"])
+            assert result.returncode == EXIT_TIMEOUT, result.stdout
+            assert "\a" in result.stdout, "no terminal bell on timeout"
+
+    def test_no_bell_in_json_mode(self):
+        """--json stays pure newline-delimited JSON — no stray bell char."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "done.marker"
+            marker.write_text("ok")
+            result = _run(["--marker", str(marker), "--timeout", "10", "--json"])
+            assert result.returncode == EXIT_COMPLETED, result.stderr
+            assert "\a" not in result.stdout, "bell leaked into JSON output"
+            for line in result.stdout.splitlines():
+                if line.strip():
+                    json.loads(line)  # every line must parse as JSON
+
+    def test_notify_send_fired_when_enabled_and_binary_present(self):
+        """WAIT_NOTIFY=1 + notify-send on PATH → a desktop notification is fired."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "done.marker"
+            marker.write_text("ok")
+            shim_dir = Path(td) / "bin"
+            shim_dir.mkdir()
+            notify_log = Path(td) / "notify.log"
+            shim = shim_dir / "notify-send"
+            shim.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$NOTIFY_LOG\"\n"
+            )
+            shim.chmod(0o755)
+            env = dict(os.environ)
+            env["WAIT_NOTIFY"] = "1"
+            env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["NOTIFY_LOG"] = str(notify_log)
+            result = _run(["--marker", str(marker), "--timeout", "10"], env=env)
+            assert result.returncode == EXIT_COMPLETED, result.stderr
+            time.sleep(0.3)  # allow the fire-and-forget subprocess to write
+            assert notify_log.exists(), "notify-send shim was never invoked"
+            text = notify_log.read_text()
+            assert "wait_for_job" in text
+            assert "completed" in text
+
+    def test_notify_send_fail_soft_without_binary(self):
+        """WAIT_NOTIFY=1 but no notify-send on PATH → wait still completes, no crash."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "done.marker"
+            marker.write_text("ok")
+            empty_dir = Path(td) / "emptybin"
+            empty_dir.mkdir()
+            env = dict(os.environ)
+            env["WAIT_NOTIFY"] = "1"
+            env["PATH"] = str(empty_dir)
+            result = _run(["--marker", str(marker), "--timeout", "10"], env=env)
+            assert result.returncode == EXIT_COMPLETED, result.stderr
+
+    def test_notify_send_disabled_by_default(self):
+        """No WAIT_NOTIFY → no desktop notification fires (fail-closed by default)."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "done.marker"
+            marker.write_text("ok")
+            shim_dir = Path(td) / "bin"
+            shim_dir.mkdir()
+            notify_log = Path(td) / "notify.log"
+            shim = shim_dir / "notify-send"
+            shim.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$NOTIFY_LOG\"\n"
+            )
+            shim.chmod(0o755)
+            env = dict(os.environ)
+            env.pop("WAIT_NOTIFY", None)
+            env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["NOTIFY_LOG"] = str(notify_log)
+            result = _run(["--marker", str(marker), "--timeout", "10"], env=env)
+            assert result.returncode == EXIT_COMPLETED, result.stderr
+            time.sleep(0.3)
+            assert not notify_log.exists(), "notify-send fired without WAIT_NOTIFY=1"
+
+
+# ---------------------------------------------------------------------------
+# AC8 — herd status diagnostic: startup line shows whether sidebar reporting is live
+# ---------------------------------------------------------------------------
+
+
+class TestHerdrStatusDiagnostic:
+    def test_status_reports_enabled_when_env_vars_set(self):
+        """HERDR_SOCKET_PATH + HERDR_PANE_ID set → startup line reports enabled + pane."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "done.marker"
+            marker.write_text("ok")
+            env = dict(os.environ)
+            env["HERDR_SOCKET_PATH"] = str(Path(td) / "herdr.sock")
+            env["HERDR_PANE_ID"] = "w1:p1"
+            result = _run(["--marker", str(marker), "--timeout", "10"], env=env)
+            assert result.returncode == EXIT_COMPLETED, result.stderr
+            assert "herdr reporting enabled" in result.stdout
+            assert "w1:p1" in result.stdout
+
+    def test_status_reports_disabled_without_env(self):
+        """No HERDR_* env vars → startup line explains the sidebar will not update."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "done.marker"
+            marker.write_text("ok")
+            env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+            result = _run(["--marker", str(marker), "--timeout", "10"], env=env)
+            assert result.returncode == EXIT_COMPLETED, result.stderr
+            assert "herdr reporting disabled" in result.stdout
+            assert "HERDR_SOCKET_PATH" in result.stdout
+
+    def test_herdr_status_is_structured_in_json_mode(self):
+        """--json carries the herd status as a structured event (no parse break)."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "done.marker"
+            marker.write_text("ok")
+            env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+            result = _run(["--marker", str(marker), "--timeout", "10", "--json"], env=env)
+            assert result.returncode == EXIT_COMPLETED, result.stderr
+            payloads = [json.loads(l) for l in result.stdout.splitlines() if l.strip()]
+            statuses = [p for p in payloads if p.get("event") == "herdr_status"]
+            assert statuses, "no herdr_status event emitted"
+            assert statuses[0]["enabled"] is False
+            assert payloads[-1]["event"] == "completed"
 
 
 # ---------------------------------------------------------------------------
