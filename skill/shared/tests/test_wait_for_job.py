@@ -449,6 +449,180 @@ class TestHerdrStatusDiagnostic:
 
 
 # ---------------------------------------------------------------------------
+# AC7/AC8/AC9 — live job output: auto-detected source, incremental last-N, vitals
+# ---------------------------------------------------------------------------
+
+
+def _spawn_writing_job(log_path, lines=6, delay=0.4):
+    """Start a job that writes numbered lines to *log_path* via redirect."""
+    script = (
+        "import sys,time\n"
+        "handles = [open(sys.argv[1], 'w', buffering=1)]\n"
+        "for i in range(1, int(sys.argv[2]) + 1):\n"
+        "    for h in handles:\n"
+        "        h.write(f'job output line {i}\\n')\n"
+        "    time.sleep(float(sys.argv[3]))\n"
+        "for h in handles:\n"
+        "    h.close()\n"
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", script, str(log_path), str(lines), str(delay)],
+        stdout=open(log_path, "a"),
+        stderr=subprocess.STDOUT,
+    )
+
+
+class TestLiveOutput:
+    def test_explicit_log_is_tailed(self):
+        """AC7: --log names the tailed source and its lines appear in the output."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "job.log"
+            log.write_text("")
+            job = _spawn_writing_job(log, lines=4, delay=0.4)
+            try:
+                result = _run(
+                    ["--log", str(log), "--pattern", "never-matches",
+                     "--timeout", "12", "--interval", "1", "--message", "job"]
+                )
+                assert "output: tailing" in result.stdout, result.stdout
+                assert str(log) in result.stdout
+                assert "job output line 1" in result.stdout, result.stdout
+            finally:
+                job.wait(timeout=20)
+
+    def test_pid_stdout_log_is_auto_detected(self):
+        """AC7: for --pid, the job's redirected stdout log is discovered and tailed."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "auto.log"
+            job = _spawn_writing_job(log, lines=6, delay=0.5)
+            try:
+                time.sleep(0.2)  # let the child open its redirect
+                result = _run(
+                    ["--pid", str(job.pid), "--timeout", "30", "--interval", "1",
+                     "--message", "job"]
+                )
+                assert "output: tailing" in result.stdout, result.stdout
+                assert str(log) in result.stdout, result.stdout
+                assert "job output line 1" in result.stdout, result.stdout
+            finally:
+                job.wait(timeout=20)
+
+    def test_no_tail_disables_output(self):
+        """AC7: --no-tail suppresses the output source line and tailed lines."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "job.log"
+            log.write_text("job output line 1\n")
+            result = _run(
+                ["--log", str(log), "--pattern", "never-matches", "--no-tail",
+                 "--timeout", "2", "--interval", "1"]
+            )
+            assert "output: tailing" not in result.stdout
+            assert "job output line 1" not in result.stdout
+
+    def test_only_new_lines_are_emitted(self):
+        """AC8: each poll emits only lines written since the previous poll."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "inc.log"
+            log.write_text("")
+            job = _spawn_writing_job(log, lines=8, delay=1.0)
+            try:
+                result = _run(
+                    ["--log", str(log), "--pattern", "never-matches",
+                     "--timeout", "6", "--interval", "2"]
+                )
+                # Line 1 was emitted once, not repeated by every subsequent poll.
+                assert result.stdout.count("job output line 1\n") == 1, result.stdout
+                assert "job output line 5" in result.stdout, result.stdout
+            finally:
+                job.kill()
+                job.wait(timeout=20)
+
+    def test_tail_output_is_capped_at_tail_lines(self):
+        """AC8: a burst larger than --tail-lines emits at most that many lines."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "burst.log"
+            log.write_text("")
+            job = _spawn_writing_job(log, lines=40, delay=0.01)
+            job.wait(timeout=30)
+            result = _run(
+                ["--log", str(log), "--pattern", "never-matches",
+                 "--timeout", "2", "--interval", "1", "--tail-lines", "10"]
+            )
+            tailed = [l for l in result.stdout.splitlines() if "job output line" in l]
+            assert len(tailed) <= 10, f"cap not applied: {len(tailed)} lines"
+            assert any("line 40" in l for l in tailed), tailed
+
+    def test_block_buffered_job_gets_streaming_hint(self):
+        """AC7: a tail with no output yet explains block-buffering and how to fix it."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "buffered.log"
+            log.write_text("")
+            # Default (block-buffered) stdout: nothing reaches the file for a while.
+            job = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import time\nfor i in range(5):\n    print('buffered line')\n    time.sleep(1)"],
+                stdout=open(log, "w"),
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                result = _run(
+                    ["--pid", str(job.pid), "--timeout", "3", "--interval", "1"]
+                )
+                assert "block-buffering" in result.stdout, result.stdout
+                assert "python3 -u" in result.stdout or "stdbuf" in result.stdout
+            finally:
+                job.kill()
+                job.wait(timeout=20)
+
+    def test_progress_line_reports_process_vitals(self):
+        """AC9: each poll emits a compact progress line with state/cpu/rss/threads/elapsed."""
+        job = _spawn_job("import time; time.sleep(6)")
+        try:
+            result = _run(
+                ["--pid", str(job.pid), "--timeout", "3", "--interval", "1"]
+            )
+            progress = [l for l in result.stdout.splitlines() if "progress:" in l]
+            assert progress, result.stdout
+            line = progress[0]
+            for field in ("state=", "cpu=", "rss=", "threads=", "children=", "elapsed "):
+                assert field in line, f"missing {field} in: {line}"
+        finally:
+            job.kill()
+            job.wait(timeout=20)
+
+    def test_unreadable_output_hints_at_log_flag(self):
+        """AC9: a pipe-backed stdout is explained, and --log is suggested."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "never.marker"
+            job = _spawn_job("import time; time.sleep(5)")
+            try:
+                result = _run(
+                    ["--pid", str(job.pid), "--marker", str(marker),
+                     "--timeout", "2", "--interval", "1"]
+                )
+                assert "no readable output" in result.stdout, result.stdout
+                assert "--log" in result.stdout
+            finally:
+                job.kill()
+                job.wait(timeout=20)
+
+    def test_output_tail_is_available_in_json_mode(self):
+        """AC8: --json emits structured output events rather than breaking the stream."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "j.log"
+            log.write_text("alpha line\nbeta line\n")
+            result = _run(
+                ["--log", str(log), "--pattern", "never-matches",
+                 "--timeout", "2", "--interval", "1", "--json"]
+            )
+            payloads = [json.loads(l) for l in result.stdout.splitlines() if l.strip()]
+            output_events = [p for p in payloads if p.get("event") == "output"]
+            assert output_events, payloads
+            joined = "\n".join(e.get("message", "") for e in output_events)
+            assert "alpha line" in joined and "beta line" in joined
+
+
+# ---------------------------------------------------------------------------
 # AC6 — the implement skill documents the background-job etiquette pattern
 # ---------------------------------------------------------------------------
 

@@ -152,9 +152,16 @@ release, batch job), follow this pattern:
 
 **Feedback channels** (which interface shows what):
 
-- **Interactive pi TUI:** the bash tool streams partial output live into the
-  tool box (heartbeats appear as ``[ts] heartbeat: waiting …`` lines, with a
-  live elapsed timer); expand with Tab to see more than the last 5 lines.
+- **Live job output (on by default):** the helper tails the job's output and
+  prints only the lines written since the previous poll (last 10,
+  `--tail-lines N`). The source is an explicit `--log FILE`, otherwise for a
+  `--pid` wait the file that process' stdout/stderr is redirected to
+  (`/proc/<pid>/fd/1`). `--no-tail` disables it.
+- **Process vitals:** every poll emits `progress: elapsed … state=… cpu=…
+  rss=… threads=… children=…`, so a wait whose output is unreadable (pipe or
+  socket) still shows liveness.
+- **Interactive pi TUI:** the bash tool streams this partial output live into
+  the tool box (live elapsed timer; Tab expands beyond the last 5 lines).
 - **Herdr sidebar:** with ``HERDR_SOCKET_PATH`` + ``HERDR_PANE_ID`` exported
   into the wait process, the helper sends ``pane.report_agent``
   (``working``/``blocked`` + message) every poll interval; without them it
@@ -162,13 +169,17 @@ release, batch job), follow this pattern:
 - **Completion:** terminal bell in text mode; ``notify-send`` desktop
   notification when ``WAIT_NOTIFY=1`` and the binary is present.
 
-To watch a wait live in a pane:
-
-```bash
-python3 ../shared/wait_for_job.py --pid $PID --timeout 3600 --interval 60 \
-  --message "audit SA-XXXX" > /tmp/wait.log 2>&1 &
-tail -f /tmp/wait.log
-```
+> **Make the job's output visible.** Redirect job output to a file and run it
+> unbuffered, otherwise the tail stays silent until the process flushes:
+>
+> ```bash
+> nohup python3 -u my_job.py > /tmp/job.log 2>&1 &
+> python3 ../shared/wait_for_job.py --pid $! --timeout 3600 --interval 60 \
+>   --message "audit SA-XXXX"
+> ```
+>
+> Any other program works too (`stdbuf -oL <cmd>`); when a tail stays silent the
+> helper says so explicitly and suggests the fix.
 
 > **Deprecated:** fixed-length ``sleep N`` polling of background processes
 > (`sleep 900; grep <log>; ps aux | grep` loops) is deprecated. A 23.7 h

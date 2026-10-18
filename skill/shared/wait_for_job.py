@@ -31,6 +31,14 @@ Completion feedback: the final line is followed by a terminal bell (``\a``)
 in text mode, and — when ``WAIT_NOTIFY=1`` and a ``notify-send`` binary is on
 ``PATH`` — a desktop notification is fired (non-blocking, fail-soft; disabled
 by default so headless automation is never spammed).
+
+Live job output: by default the helper tails the job's output — an explicit
+``--log FILE``, otherwise the file a ``--pid`` process' stdout/stderr is
+redirected to (``/proc/<pid>/fd/1``) — and prints only the lines written since
+the previous poll, capped at ``--tail-lines`` (default 10). Every poll also
+prints a compact ``progress:`` line with process vitals (state/cpu/rss/
+threads/children/elapsed), so an unreadable (pipe/socket) stdout still shows
+liveness. ``--no-tail`` disables output tailing.
 """
 
 from __future__ import annotations
@@ -223,6 +231,129 @@ class HerdrReporter:
 
 
 # ---------------------------------------------------------------------------
+# Live job output: source discovery + incremental tail (SA-0MVDQF3VW002PKCA)
+# ---------------------------------------------------------------------------
+
+#: Default number of output lines shown per poll.
+DEFAULT_TAIL_LINES = 10
+
+
+def _readable_log_for_pid(pid: int) -> str:
+    """Return the file a process' stdout/stderr is redirected to, if any.
+
+    Background jobs are usually launched as ``nohup cmd > /tmp/job.log 2>&1 &``,
+    so ``/proc/<pid>/fd/1`` resolves to the log path. Pipe- or socket-backed
+    stdio cannot be read retroactively and yields an empty string.
+    """
+    for fd in (1, 2):
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith("/") and os.path.isfile(target):
+            return target
+    return ""
+
+
+class JobOutputTail:
+    """Tails a job's output file, emitting only lines written since the last poll.
+
+    Polling is offset-based: the first call reports the last *tail_lines* lines,
+    and each later call reports only newly appended lines (capped at
+    *tail_lines*). Truncation/rotation (size shrink) restarts from the current
+    tail instead of failing. ``source`` is empty when no readable output was
+    found, in which case :meth:`new_lines` always returns an empty list.
+    """
+
+    def __init__(self, source: str = "", tail_lines: int = DEFAULT_TAIL_LINES):
+        self.source = Path(source) if source else None
+        self.tail_lines = max(1, int(tail_lines))
+        self._offset = 0
+
+    @classmethod
+    def for_job(cls, logs, pids, tail_lines: int = DEFAULT_TAIL_LINES) -> JobOutputTail:
+        """Build a tail preferring an explicit --log, else a --pid's redirect."""
+        for path in logs:
+            return cls(path, tail_lines)
+        for pid in pids:
+            found = _readable_log_for_pid(pid)
+            if found:
+                return cls(found, tail_lines)
+        return cls("", tail_lines)
+
+    def new_lines(self) -> list:
+        """Return output lines appended since the previous call (capped)."""
+        if self.source is None:
+            return []
+        try:
+            size = self.source.stat().st_size
+        except OSError:
+            return []
+        if size < self._offset:
+            # Rotated/truncated — start over from the current tail.
+            self._offset = 0
+        if size == self._offset:
+            return []
+        try:
+            with self.source.open("r", errors="replace") as fh:
+                if self._offset == 0:
+                    # First poll: seed with the current tail rather than history.
+                    fh.seek(0, os.SEEK_END)
+                    head = max(0, fh.tell() - 64 * 1024)
+                    fh.seek(head)
+                else:
+                    fh.seek(self._offset)
+                chunk = fh.read()
+                self._offset = fh.tell()
+        except OSError:
+            return []
+        lines = [line for line in chunk.splitlines() if line.strip()]
+        return lines[-self.tail_lines:]
+
+
+class ProcessVitals:
+    """Best-effort process vitals from /proc, for waits whose output is unreadable."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+
+    def summary(self) -> str:
+        """Return ``state=… cpu=… rss=… threads=… children=…`` or \"\" if gone."""
+        try:
+            with open(f"/proc/{self.pid}/stat", "r") as fh:
+                fields = fh.read().rsplit(")", 1)[-1].split()
+        except OSError:
+            return ""
+        if not fields:
+            return ""
+        state = fields[0]
+        try:
+            ticks = int(fields[11]) + int(fields[12])
+            cpu = ticks / (os.sysconf("SC_CLK_TCK") or 100)
+        except (ValueError, IndexError, OSError):
+            cpu = 0.0
+        rss = threads = 0
+        try:
+            with open(f"/proc/{self.pid}/status", "r") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        rss = int(line.split()[1]) // 1024
+                    elif line.startswith("Threads:"):
+                        threads = int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        return (f"state={state} cpu={cpu:.1f}s rss={rss}MB "
+                f"threads={threads} children={self._children()}")
+
+    def _children(self) -> int:
+        try:
+            with open(f"/proc/{self.pid}/task/{self.pid}/children", "r") as fh:
+                return len(fh.read().split())
+        except OSError:
+            return 0
+
+
+# ---------------------------------------------------------------------------
 # Completion notification (fail-soft, opt-in desktop) — SA-0MVDQF3VW002PKCA
 # ---------------------------------------------------------------------------
 
@@ -282,6 +413,8 @@ def wait_for_job(
     reporter: HerdrReporter | None = None,
     json_output: bool = False,
     notifier: CompletionNotifier | None = None,
+    output: JobOutputTail | None = None,
+    vitals: ProcessVitals | None = None,
 ) -> int:
     """Wait until any *markers* completes, the *timeout* elapses, or SIGINT.
 
@@ -332,6 +465,14 @@ def wait_for_job(
                  "HERDR_PANE_ID to show sidebar progress)",
                  extra={"enabled": False})
         emit("started", f"waiting for {description}")
+        seen_output = False
+        warned_buffering = False
+        if output is not None:
+            if output.source is not None:
+                emit("output", f"tailing {output.source}")
+            else:
+                emit("output",
+                     "no readable output (pass --log FILE to see job output)")
         reporter.report("working", f"waiting for {description}")
 
         while True:
@@ -345,6 +486,24 @@ def wait_for_job(
                 reporter.report("blocked", text)
                 finish("timeout", text, elapsed, "wait_for_job: timed out")
                 return EXIT_TIMEOUT
+            # AC9: always emit a liveness/vitals line, even with no readable log.
+            vitals_text = vitals.summary() if vitals is not None else ""
+            progress = f"elapsed {elapsed:.0f}s / timeout {timeout:g}s"
+            if vitals_text:
+                progress = f"{progress} {vitals_text}"
+            emit("progress", progress, elapsed)
+            # AC8: only lines written since the previous poll, capped.
+            if output is not None and output.source is not None:
+                for line in output.new_lines():
+                    emit("output", line)
+                    seen_output = True
+                # A tail that stays silent is usually block-buffered stdout;
+                # say so once, with the fix, instead of showing nothing.
+                if not seen_output and not warned_buffering and elapsed >= interval:
+                    emit("output",
+                         "no output yet — the job may be block-buffering "
+                         "(run it with `python3 -u`, or `stdbuf -oL <cmd>`)")
+                    warned_buffering = True
             emit("heartbeat", f"waiting for {description} "
                               f"(elapsed {elapsed:.0f}s / timeout {timeout:g}s)", elapsed)
             reporter.report("working", f"waiting for {description} "
@@ -373,6 +532,9 @@ def build_parser() -> argparse.ArgumentParser:
                     "heartbeat (SA-0MVCX570P003VLBK).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exit codes: 0 completed, 1 timeout, 2 usage error.\n"
+               "Output: the job's output is tailed by default (explicit --log, or the "
+               "--pid process' redirected stdout); see only new lines, capped by "
+               "--tail-lines (--no-tail disables).\n"
                "Herdr: set HERDR_SOCKET_PATH + HERDR_PANE_ID to report "
                "working/blocked to the sidebar (silently optional).\n"
                "Notification: the final line is followed by a terminal bell; "
@@ -393,6 +555,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="hard timeout in seconds (required)")
     parser.add_argument("--message", default="",
                         help="human-readable job description for the heartbeat")
+    parser.add_argument("--tail-lines", type=int, default=DEFAULT_TAIL_LINES,
+                        help=f"show at most this many new job-output lines per poll "
+                             f"(default {DEFAULT_TAIL_LINES})")
+    parser.add_argument("--no-tail", action="store_true",
+                        help="do not show the job's output (tailing is on by default)")
     parser.add_argument("--json", action="store_true",
                         help="emit newline-delimited JSON progress lines")
     return parser
@@ -417,11 +584,18 @@ def main(argv=None) -> int:
     if args.interval <= 0:
         print("error: --interval must be positive", file=sys.stderr)
         return EXIT_USAGE
+    if args.tail_lines <= 0:
+        print("error: --tail-lines must be positive", file=sys.stderr)
+        return EXIT_USAGE
     try:
         markers = build_markers(args)  # compiles --pattern regexes (raises re.error)
     except re.error as exc:
         print(f"error: invalid regex: {exc}", file=sys.stderr)
         return EXIT_USAGE
+
+    output = None if args.no_tail else JobOutputTail.for_job(
+        args.log, args.pid, tail_lines=args.tail_lines)
+    vitals = ProcessVitals(args.pid[0]) if args.pid else None
 
     return wait_for_job(
         markers,
@@ -429,6 +603,8 @@ def main(argv=None) -> int:
         interval=args.interval,
         message=args.message,
         json_output=args.json,
+        output=output,
+        vitals=vitals,
     )
 
 
