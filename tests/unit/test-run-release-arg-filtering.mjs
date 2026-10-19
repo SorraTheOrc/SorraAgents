@@ -171,11 +171,19 @@ describe('run-release: --skip-checks forwarding', () => {
     );
   });
 
-  test('merge script receives flags unchanged when no wrapper-only flags present', () => {
-    const { recorded } = runRunReleaseWithRecordingScript(['--dry-run']);
+  test('merge script forwards non-wrapper flags alongside --skip-checks', () => {
+    // Use --skip-checks so the test stays focused on arg forwarding without
+    // paying the cost of the full gating-check suite (git/wl commands) —
+    // that avoids the flakiness observed under full-suite parallel load
+    // (SA-0MVE01JCJ00243W1).
+    const { recorded } = runRunReleaseWithRecordingScript(['--skip-checks', '--dry-run']);
     assert.ok(
       recorded.includes('--dry-run'),
       `Merge script should receive --dry-run, got argv: "${recorded}"`,
+    );
+    assert.ok(
+      !recorded.includes('--skip-checks'),
+      `Merge script must not receive --skip-checks, got argv: "${recorded}"`,
     );
   });
 });

@@ -661,6 +661,16 @@ The rule:
   use the shared stub for the `discord-notify.js` dependency;
 - `tests/unit/test-run-release-discord-notify.mjs` is the reference pattern.
 
+Integration tests that only assert **argument forwarding** (e.g. the
+`--skip-checks` forwarding suite in `test-run-release-arg-filtering.mjs`) must
+invoke `run-release.js` with `--skip-checks` so the wrapper's full gating-check
+suite (git/`wl`/audit subprocesses) does not run inside the test's short spawn
+window. Without it the gates contend with the rest of a parallel full-suite run
+and can exceed the spawnSync timeout, making the merge script never run and the
+assertion fail — flaky standalone-green, parallel-red (SA-0MVE01JCJ00243W1).
+The gating behaviour itself is covered by dedicated gate tests; forwarding tests
+stay fast and deterministic.
+
 Production behaviour is unchanged — real releases still post the Discord
 notification. The ship-skill detail lives in
 [`skill/ship/docs/dev/ship-skill-reference.md`](../../skill/ship/docs/dev/ship-skill-reference.md#test-isolation).
