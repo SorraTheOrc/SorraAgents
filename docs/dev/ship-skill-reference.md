@@ -198,6 +198,8 @@ Steps:
 4. **Merge commit** — fetch latest dev/main, create `--no-ff` merge commit.
 5. **PR creation** — push to `release/dev-to-main-<timestamp>`, create PR targeting `main`.
 6. **Status check wait & merge** — if the PR has status checks, waits for them to pass (default 10 min), then `gh pr merge --merge --delete-branch`. If the PR has **no** status checks (no CI configured), the merge proceeds immediately. `--force` skips the wait.
+
+   The wait is **completion-aware** (SA-0MVDP9B83004UD5E): the wrapper launches the background poller [`wait_for_pr_checks.py`](../../skill/ship/scripts/release/wait_for_pr_checks.py) (which polls `gh pr view --json statusCheckRollup` and writes a terminal outcome marker), then waits on it with the shared helper [`wait_for_job.py`](../../skill/shared/wait_for_job.py) — returning the moment the poller completes, with a heartbeat, rather than after a fixed `sleep 10` poll loop. See [background-job etiquette](../../skill/shared/background-job-etiquette.md). When the background-job tooling is absent (a pre-SA-0MVCX570P003VLBK install) the wrapper falls back to a single bounded `gh` query — never a fixed-sleep loop.
 7. **Audit logging** — records merge hash, PR URL in worklog.
 8. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push.
    > Release ops run from **main checkout**, not worktrees.

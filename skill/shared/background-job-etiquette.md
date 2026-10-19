@@ -94,3 +94,21 @@ Any skill step that launches a long-running process in the background, or
 waits on an external job (a CI/PR status check, a merge wait, a batch run),
 should follow this pattern. Steps that are already synchronous/foreground (a
 blocking subprocess call with a timeout) need no change.
+
+## Script wiring decisions
+
+Per-script decisions from the wiring investigation (SA-0MVDP9B83004UD5E).
+Each candidate that waits on a background subprocess/job is either **wired**
+(invokes `wait_for_job.py`, grep-verifiable) or **not appropriate**, with a
+reason.
+
+| Script | Decision | Reason |
+|---|---|---|
+| `skill/ship/scripts/run-release.js` | **wired** | `waitForPRMerge()` polled external CI with a fixed `execSync('sleep 10')` loop. It now launches the background poller [`wait_for_pr_checks.py`](../ship/scripts/release/wait_for_pr_checks.py) and waits on it completion-aware with `wait_for_job.py`. |
+| `skill/audit/scripts/audit_runner.py` | not appropriate | Its sleeps (`AUDIT_QUEUE_POLL_SECONDS = 0.05`, `_PI_RETRY_BACKOFF_SECONDS`) are intra-process queue-admission and provider-error retry backoffs — explicitly out of scope above. It launches no detached background job of its own; its `pi` subprocess is waited on synchronously with stall detection. |
+| `skill/implement/scripts/implement.py` | not appropriate | `git_push_to_dev()` waits on the pre-push hook with a bounded `communicate(timeout=…)` (foreground, synchronous); the `time.sleep(2)` in `cleanup_worktree_processes()` is a SIGTERM→SIGKILL grace period, not a job wait. |
+| `skill/shared/git_sandbox.py` | not appropriate | Every `git` invocation is a synchronous `subprocess.run(…, timeout=…)`; there is no background job to wait on. |
+| `skill/test/scripts/run_tests.py` | not appropriate | Suite commands run via synchronous `subprocess.run(…, timeout=…)`; the runner is itself the long job other callers wait on, not a launcher that then polls. |
+
+Re-investigate with `rg 'time\\.sleep|execSync\\(.sleep|nohup' skill/` before
+adding a new background-and-wait step.

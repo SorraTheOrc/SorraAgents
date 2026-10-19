@@ -157,7 +157,45 @@ exit 0
   });
 });
 
-// ── SKILL.md / script doc consistency ────────────────────────────────────────
+// ── Completion-aware wiring (SA-0MVDP9B83004UD5E) ──────────────────────────
+
+describe('waitForPRMerge — completion-aware background-job wiring', () => {
+  const RUN_RELEASE_SRC = readFileSync(RUN_RELEASE_PATH, 'utf8');
+  const POLLER_PATH = join(
+    REPO_ROOT, 'skill', 'ship', 'scripts', 'release', 'wait_for_pr_checks.py',
+  );
+  const HELPER_PATH = join(REPO_ROOT, 'skill', 'shared', 'wait_for_job.py');
+
+  test('release wrapper invokes the shared wait_for_job helper', () => {
+    assert.ok(
+      RUN_RELEASE_SRC.includes('wait_for_job.py'),
+      'run-release.js must invoke the shared wait_for_job.py helper',
+    );
+  });
+
+  test('release wrapper launches the PR status-check poller', () => {
+    assert.ok(
+      RUN_RELEASE_SRC.includes('wait_for_pr_checks.py'),
+      'run-release.js must launch the background PR status-check poller',
+    );
+    assert.ok(
+      readFileSync(POLLER_PATH, 'utf8').includes('statusCheckRollup'),
+      'the poller must query the PR status check rollup',
+    );
+  });
+
+  test('release wrapper no longer uses a fixed-length sleep poll loop', () => {
+    assert.ok(
+      !/execSync\(\s*['\"`]sleep\s+\d+/.test(RUN_RELEASE_SRC),
+      'run-release.js must not poll a background job with a fixed `sleep N`',
+    );
+  });
+
+  test('the shared helper it invokes exists and is the completion-aware one', () => {
+    const helper = readFileSync(HELPER_PATH, 'utf8');
+    assert.ok(/completion-aware/i.test(helper), 'helper should document completion-aware waiting');
+  });
+});
 
 describe('ship skill docs — no hard CI gate', () => {
   test('SKILL.md does not reference dev-full-suite or dev-smoke as gates', () => {

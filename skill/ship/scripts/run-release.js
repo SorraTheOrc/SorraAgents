@@ -6,8 +6,11 @@
 // (merge-dev-to-main.sh) and controls which part of the semver is
 // incremented before the merge. Default is 'patch'.
 
-import { existsSync, realpathSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { spawnSync, execSync } from 'node:child_process';
+import {
+  existsSync, realpathSync, mkdirSync, writeFileSync, rmSync, readFileSync,
+  mkdtempSync, openSync, closeSync,
+} from 'node:fs';
+import { spawnSync, spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
@@ -19,7 +22,6 @@ import { checkWorklogRefs } from './check-worklog-refs.js';
 import { sendReleaseNotification } from './discord-notify.js';
 import { Timer } from './timing.js';
 import { tmpdir } from 'node:os';
-import { mkdtempSync } from 'node:fs';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -31,6 +33,21 @@ const SKILL_RELEASE_SCRIPT = join(skillDir, 'scripts', 'release', 'merge-dev-to-
 
 // Path to the cleanup scripts (relative to repository root)
 const SKILL_CLEANUP_DIR = join(skillDir, '..', 'cleanup', 'scripts');
+
+// Background-job wiring (SA-0MVDP9B83004UD5E). The PR status-check wait is a
+// background job: `wait_for_pr_checks.py` polls `gh` and writes a terminal
+// outcome marker, and the shared completion-aware helper `wait_for_job.py`
+// waits on it (returning the moment the marker/process completes, with a
+// heartbeat) instead of the deprecated fixed `sleep 10` poll loop.
+// See skill/shared/background-job-etiquette.md.
+const SKILL_WAIT_HELPER_CANDIDATES = [
+  join(skillDir, '..', 'shared', 'wait_for_job.py'),
+  join(skillDir, '..', '..', 'skill', 'shared', 'wait_for_job.py'),
+];
+const SKILL_PR_POLLER_CANDIDATES = [
+  join(skillDir, 'scripts', 'release', 'wait_for_pr_checks.py'),
+  join(skillDir, '..', '..', 'skill', 'ship', 'scripts', 'release', 'wait_for_pr_checks.py'),
+];
 
 // Timeout (ms) for the release-script subprocess. A hung git/gh operation
 // must fail the release loudly after a bounded time instead of blocking
@@ -1340,75 +1357,157 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
 
   console.log(`\nWaiting for status checks on ${prUrl}...`);
 
-  const startTime = Date.now();
-  const maxWait = timeoutSeconds * 1000;
   const prNumber = prUrl.split('/').pop();
+  const outcome = waitForPRChecksOutcome(prNumber, timeoutSeconds);
 
-  // Poll for status checks every 10 seconds
-  while (Date.now() - startTime < maxWait) {
+  // No CI configured on this repo/branch — proceed without a CI gate.
+  if (outcome === 'no_checks') {
+    console.log('No CI status checks present on the PR — proceeding without a CI gate.');
+    mergePR(prNumber);
+    return {
+      success: true,
+      message: `PR ${prUrl} merged successfully.`,
+    };
+  }
+
+  if (outcome === 'failed') {
+    return {
+      success: false,
+      message: 'Some CI checks failed on the PR. Manual intervention required.',
+    };
+  }
+
+  if (outcome === 'passed') {
+    console.log('All status checks passed. Merging PR...');
+    mergePR(prNumber);
+    return {
+      success: true,
+      message: `PR ${prUrl} merged successfully.`,
+    };
+  }
+
+  return {
+    success: false,
+    message: `Timed out waiting for status checks on ${prUrl} after ${timeoutSeconds} seconds. Merge the PR manually.`,
+  };
+}
+
+/**
+ * Merge a PR once its checks (if any) are green.
+ *
+ * @param {string} prNumber - The PR number extracted from the URL.
+ */
+function mergePR(prNumber) {
+  execSync(`gh pr merge ${prNumber} --merge --delete-branch`, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'inherit', 'pipe'],
+  });
+}
+
+/**
+ * Wait completion-aware for a PR's status checks via the shared helper.
+ *
+ * Resolves the first existing candidate path from *candidates*, so both the
+ * repository layout (`skill/ship/scripts/...`) and the installed global skill
+ * layout (`~/.pi/agent/skills/ship/...`) resolve.
+ *
+ * @param {string[]} candidates - Absolute candidate paths.
+ * @returns {string|null} The first existing path, or null.
+ */
+function resolveExistingPath(candidates) {
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Launch the PR status-check poller in the background and wait on it
+ * completion-aware with `wait_for_job.py` (SA-0MVDP9B83004UD5E).
+ *
+ * The poller (`wait_for_pr_checks.py`) polls `gh pr view` until the checks
+ * settle and writes a terminal outcome marker. `wait_for_job.py` waits on
+ * that marker/process — returning as soon as it completes (with a heartbeat)
+ * instead of the deprecated fixed `sleep 10` poll loop. Returns the poller's
+ * outcome string, or `'timeout'` when it did not settle in time.
+ *
+ * @param {string} prNumber - The PR number to poll.
+ * @param {number} timeoutSeconds - Maximum time to wait for checks.
+ * @returns {'no_checks'|'passed'|'failed'|'timeout'}
+ */
+function waitForPRChecksOutcome(prNumber, timeoutSeconds) {
+  const python = process.env.PYTHON || 'python3';
+  const poller = resolveExistingPath(SKILL_PR_POLLER_CANDIDATES);
+  const helper = resolveExistingPath(SKILL_WAIT_HELPER_CANDIDATES);
+
+  // Fall back to a bounded, single-shot query when the background-job
+  // tooling is unavailable (e.g. an install predating SA-0MVCX570P003VLBK).
+  // The fallback is intentionally NOT a fixed-sleep poll loop: the release
+  // must never regress to blind polling.
+  if (!poller || !helper) {
     try {
       const statusJson = execSync(
         `gh pr view ${prNumber} --json statusCheckRollup`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       );
-      const status = JSON.parse(statusJson);
-
-      const checks = status.statusCheckRollup || [];
-
-      // No CI configured on this repo/branch — proceed without a CI gate.
-      if (checks.length === 0) {
-        console.log('No CI status checks present on the PR — proceeding without a CI gate.');
-        execSync(`gh pr merge ${prNumber} --merge --delete-branch`, {
-          encoding: 'utf-8',
-          stdio: ['pipe', 'inherit', 'pipe'],
-        });
-        return {
-          success: true,
-          message: `PR ${prUrl} merged successfully.`,
-        };
+      const checks = (JSON.parse(statusJson).statusCheckRollup) || [];
+      if (checks.length === 0) return 'no_checks';
+      if (checks.some((c) => c.conclusion === 'FAILURE' || c.conclusion === 'CANCELLED')) {
+        return 'failed';
       }
-
-      const allCompleted = checks.every(
-        (c) => c.status === 'COMPLETED',
-      );
-      const anyFailed = checks.some(
-        (c) => c.conclusion === 'FAILURE' || c.conclusion === 'CANCELLED',
-      );
-
-      if (anyFailed) {
-        return {
-          success: false,
-          message: 'Some CI checks failed on the PR. Manual intervention required.',
-        };
-      }
-
-      if (allCompleted) {
-        console.log('All status checks passed. Merging PR...');
-        execSync(`gh pr merge ${prNumber} --merge --delete-branch`, {
-          encoding: 'utf-8',
-          stdio: ['pipe', 'inherit', 'pipe'],
-        });
-        return {
-          success: true,
-          message: `PR ${prUrl} merged successfully.`,
-        };
-      }
-
-      // Wait 10 seconds before polling again
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      process.stdout.write(`\rWaiting for status checks... (${elapsed}s)`);
+      if (checks.every((c) => c.status === 'COMPLETED')) return 'passed';
     } catch {
-      // If gh command fails temporarily, retry
+      // fall through to timeout
     }
-
-    execSync('sleep 10', { stdio: 'ignore' });
+    return 'timeout';
   }
 
-  console.log(''); // newline after progress dots
-  return {
-    success: false,
-    message: `Timed out waiting for status checks on ${prUrl} after ${timeoutSeconds} seconds. Merge the PR manually.`,
-  };
+  const workDir = mkdtempSync(join(tmpdir(), 'ship-pr-checks-'));
+  const markerPath = join(workDir, 'outcome.json');
+  const logPath = join(workDir, 'poller.log');
+  // Poll/heartbeat cadence: keep the historical 10 s for long waits but stay
+  // responsive for short timeouts (and tests).
+  const interval = Math.max(0.2, Math.min(10, timeoutSeconds / 5));
+
+  try {
+    const logFd = openSync(logPath, 'a');
+    let child;
+    try {
+      child = spawn(
+        python,
+        [poller, '--pr', String(prNumber), '--timeout', String(timeoutSeconds),
+          '--interval', String(interval), '--marker', markerPath],
+        { detached: true, stdio: ['ignore', logFd, logFd] },
+      );
+    } finally {
+      closeSync(logFd);
+    }
+    child.unref();
+
+    // Completion-aware wait: --pid (poller exit) + --marker (outcome file) +
+    // --log/--pattern (terminal line) — whichever happens first wins.
+    spawnSync(
+      python,
+      [helper,
+        '--pid', String(child.pid),
+        '--marker', markerPath,
+        '--log', logPath, '--pattern', 'outcome:',
+        '--timeout', String(timeoutSeconds + 15),
+        '--interval', String(interval),
+        '--message', `PR status checks for ${prNumber}`],
+      { stdio: ['ignore', 'inherit', 'inherit'] },
+    );
+
+    try {
+      const parsed = JSON.parse(readFileSync(markerPath, 'utf-8'));
+      if (parsed && typeof parsed.outcome === 'string') return parsed.outcome;
+    } catch {
+      // marker missing/unreadable — treat as timeout
+    }
+    return 'timeout';
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
 }
 
 // ── runRelease ───────────────────────────────────────────────────────────────
