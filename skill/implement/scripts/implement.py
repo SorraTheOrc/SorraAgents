@@ -2606,8 +2606,10 @@ def _run_cached_paced(command: str, **kwargs: Any) -> dict[str, Any]:
     except _TestConcurrencyTimeout as exc:
         LOG.error(
             "Implement run_tests: could not acquire a test-run slot — %s. "
-            "Another suite is executing; retry later, or raise "
-            "TEST_LOCK_TIMEOUT to wait longer.",
+            "Another suite is executing; wait a STAGGERED delay (e.g. "
+            "30-120s, do NOT re-run immediately — concurrent waiters re-enter "
+            "the pool in lockstep otherwise), or raise TEST_LOCK_TIMEOUT to "
+            "wait longer.",
             exc,
         )
         return {

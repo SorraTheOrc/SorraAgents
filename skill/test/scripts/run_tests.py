@@ -139,6 +139,12 @@ TEST_MAX_CONCURRENCY_ENV = "TEST_MAX_CONCURRENCY"
 TEST_MAX_CONCURRENCY_DEFAULT = 2
 TEST_LOCK_TIMEOUT_ENV = "TEST_LOCK_TIMEOUT"
 TEST_LOCK_TIMEOUT_DEFAULT = 600.0
+#: Per-waiter stagger fraction of the bounded wait (SA-0MVEDOF7A004TSWD):
+#: concurrent waiters expire at slightly different instants within the
+#: TEST_LOCK_TIMEOUT bound instead of all timing out together and re-entering
+#: the pool in lockstep (the thundering-herd wave). 0.0 disables the stagger.
+TEST_LOCK_JITTER_ENV = "TEST_LOCK_JITTER"
+TEST_LOCK_JITTER_DEFAULT = 0.1
 
 #: Recursion marker shared with the pytest conftest guard (F5). Set by
 #: whichever guard owns the checkout first; nested pytest/run_tests stand down.
@@ -1341,6 +1347,38 @@ def _test_lock_timeout() -> float:
     return TEST_LOCK_TIMEOUT_DEFAULT
 
 
+def _test_lock_jitter() -> float:
+    """Resolve the per-waiter deadline-stagger fraction.
+
+    Precedence: ``TEST_LOCK_JITTER`` env var > default 0.1. A value is
+    clamped to ``[0, 1)`` (an invalid value is ignored with a warning). The
+    jitter spreads concurrent waiters' deadlines within the
+    ``TEST_LOCK_TIMEOUT`` bound so a herd does not time out — and retry —
+    in lockstep (SA-0MVEDOF7A004TSWD AC1/AC2). ``0`` disables the stagger
+    (restoring exact historical behaviour); the configured bound is never
+    extended, only staggered earlier.
+    """
+    env_value = os.environ.get(TEST_LOCK_JITTER_ENV)
+    if env_value:
+        try:
+            value = float(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {TEST_LOCK_JITTER_ENV} value "
+                f"{env_value!r}; using default jitter",
+                file=sys.stderr,
+            )
+            return TEST_LOCK_JITTER_DEFAULT
+        if 0.0 <= value < 1.0:
+            return value
+        print(
+            f"Warning: {TEST_LOCK_JITTER_ENV} value {value!r} out of range "
+            "[0, 1); using default jitter",
+            file=sys.stderr,
+        )
+    return TEST_LOCK_JITTER_DEFAULT
+
+
 @contextmanager
 def _test_concurrency_slot() -> Iterator[None]:
     """Hold a shared test-run slot for the duration of an actual execution.
@@ -1368,6 +1406,10 @@ def _test_concurrency_slot() -> Iterator[None]:
         TEST_SEMAPHORE_NAME,
         max_workers=max_workers,
         timeout=lock_timeout,
+        # Per-waiter stagger within the bound so a herd of concurrent
+        # waiters desynchronises instead of timing out (and retrying) at
+        # one shared instant (SA-0MVEDOF7A004TSWD).
+        jitter=_test_lock_jitter(),
     )
     try:
         with sem:
@@ -1375,7 +1417,10 @@ def _test_concurrency_slot() -> Iterator[None]:
     except TimeoutError as exc:
         raise TestConcurrencyTimeout(
             f"test concurrency slot busy: no free slot within "
-            f"{lock_timeout:.0f}s (TEST_MAX_CONCURRENCY={max_workers})"
+            f"{lock_timeout:.0f}s (TEST_MAX_CONCURRENCY={max_workers}) "
+            f"— wait a staggered delay before retrying (do not re-run "
+            f"immediately; concurrent waiters re-enter the pool in lockstep "
+            f"otherwise), or raise TEST_LOCK_TIMEOUT to wait longer."
         ) from exc
 
 

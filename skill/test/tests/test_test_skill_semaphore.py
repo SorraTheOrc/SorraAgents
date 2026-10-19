@@ -45,6 +45,8 @@ if str(_RUNNER_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNNER_DIR))
 
 from run_tests import (
+    TEST_LOCK_JITTER_DEFAULT,
+    TEST_LOCK_JITTER_ENV,
     TEST_LOCK_TIMEOUT_DEFAULT,
     TEST_LOCK_TIMEOUT_ENV,
     TEST_MAX_CONCURRENCY_DEFAULT,
@@ -52,6 +54,7 @@ from run_tests import (
     TEST_SEMAPHORE_NAME,
     TestConcurrencyTimeout,
     _cached_runner,
+    _test_lock_jitter,
     _test_lock_timeout,
     _test_semaphore_max_workers,
     paced_runner,
@@ -69,6 +72,7 @@ def _isolate_semaphore_dir(tmp_path, monkeypatch):
     monkeypatch.setenv(ENV_LOCK_DIR, str(tmp_path / "locks"))
     monkeypatch.delenv(TEST_MAX_CONCURRENCY_ENV, raising=False)
     monkeypatch.delenv(TEST_LOCK_TIMEOUT_ENV, raising=False)
+    monkeypatch.delenv(TEST_LOCK_JITTER_ENV, raising=False)
     monkeypatch.delenv("AUDIT_MAX_CONCURRENCY", raising=False)
     monkeypatch.delenv("AUDIT_LOCK_TIMEOUT", raising=False)
 
@@ -191,6 +195,42 @@ def test_lock_timeout_resolution(monkeypatch):
     assert _test_lock_timeout() == 0.25
     monkeypatch.setenv(TEST_LOCK_TIMEOUT_ENV, "bogus")
     assert _test_lock_timeout() == TEST_LOCK_TIMEOUT_DEFAULT
+
+
+def test_lock_jitter_resolution(monkeypatch):
+    """TEST_LOCK_JITTER drives the deadline stagger; invalid/out-of-range
+    values fall back to the default (SA-0MVEDOF7A004TSWD)."""
+    assert _test_lock_jitter() == TEST_LOCK_JITTER_DEFAULT
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "0.25")
+    assert _test_lock_jitter() == 0.25
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "0")
+    assert _test_lock_jitter() == 0.0  # explicit opt-out is honoured
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "bogus")
+    assert _test_lock_jitter() == TEST_LOCK_JITTER_DEFAULT
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "1.5")
+    assert _test_lock_jitter() == TEST_LOCK_JITTER_DEFAULT
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "-0.1")
+    assert _test_lock_jitter() == TEST_LOCK_JITTER_DEFAULT
+
+
+def test_saturation_notice_has_stagger_guidance(monkeypatch, tmp_path):
+    """AC3: the saturation notice tells callers to wait a staggered delay
+    before retrying (so a herd does not re-enter the pool in lockstep)."""
+    monkeypatch.setenv(TEST_MAX_CONCURRENCY_ENV, "1")
+    monkeypatch.setenv(TEST_LOCK_TIMEOUT_ENV, "0.2")
+
+    holder = Semaphore(TEST_SEMAPHORE_NAME, max_workers=1, timeout=5)
+    holder.acquire()
+    try:
+        result = run_suite("pytest", cwd=tmp_path, use_cache=False, force=True)
+    finally:
+        holder.release()
+
+    assert result["success"] is False
+    notice = result["notice"]
+    assert "no free slot within 0s" in notice, notice
+    assert "staggered delay" in notice, notice
+    assert "retrying" in notice, notice
 
 
 # ---------------------------------------------------------------------------

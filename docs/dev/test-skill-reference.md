@@ -130,8 +130,9 @@ never blocks a test run and vice-versa. Each workload has its own ceiling.
 |---|---|---|
 | `TEST_MAX_CONCURRENCY` | `2` | Maximum concurrent test-suite executions |
 | `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot |
+| `TEST_LOCK_JITTER` | `0.1` | Per-waiter stagger fraction of the bounded wait (`0` = off) — see *Staggered-wait contract* below |
 
-Both env vars are validated at runtime: invalid values produce a stderr
+The first two env vars are validated at runtime: invalid values produce a stderr
 warning and fall back to the documented default (never breaking the test run).
 Values below 1 are clamped to 1.
 
@@ -142,6 +143,30 @@ within `TEST_LOCK_TIMEOUT`, the run reports a clear failure notice (e.g.
 immediately or crashing. This means multiple agents running tests concurrently
 will serialize gracefully — each waits its turn and succeeds once a slot
 becomes free.
+
+**Staggered-wait contract (SA-0MVEDOF7A004TSWD):** under a saturated pool,
+\*concurrent* waiters all enqueue with the same `TEST_LOCK_TIMEOUT` bound and,
+without measures, would poll the slot pool at a fixed cadence and expire at one
+shared wall-clock instant — then all report failure and re-run the suite in
+lockstep, re-storming the pool (a thundering-herd wave). To break this, the
+bounded wait is staggered per waiter:
+
+- **Jittered deadline:** each waiter's deadline is reduced by a uniform random
+  fraction of `TEST_LOCK_TIMEOUT` (default `TEST_LOCK_JITTER=0.1`, i.e.
+  deadlines land in the final 10% of the bound). The configured bound is
+  never extended — only staggered earlier — so no waiter ever waits longer
+  than `TEST_LOCK_TIMEOUT`, and a herd that enqueues together expires across
+  a spread of instants instead of one.
+- **Jittered polling:** each retry sleeps `[0.5, 1.5] ×` the base 50ms cadence,
+  so waiters do not hammer the flock in lockstep.
+- **Retry guidance (AC3):** the saturation notice and `implement.py`'s pacer
+  log explicitly instruct callers to wait a staggered delay (e.g. 30–120s)
+  before retrying, rather than re-running immediately.
+
+`TEST_LOCK_JITTER` accepts `[0, 1)`; `0` restores exact historical timing
+(no stagger) for callers that prefer it. The jitter only affects the `"test"`
+semaphore namespace — audit/`audit-host` semaphores keep `jitter=0.0`
+byte-identical behaviour unless a caller opts in explicitly.
 
 **Cache hits never block:** the semaphore is acquired ONLY when an actual
 execution is about to happen (cache miss path). A cached result is served
