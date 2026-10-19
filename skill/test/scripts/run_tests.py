@@ -27,6 +27,15 @@ for a free slot. Only ACTUAL executions acquire a slot — cache hits are
 served without executing and never block on the semaphore
 (SA-0MTG5U75A001F1RG).
 
+Per-suite worker pools are bounded independently of that suite ceiling
+(SA-0MVE98T1M006A17T): a single vitest suite otherwise sizes its tinypool to
+the CPU count (15+ forks were observed from one suite, SA-0MSAEKOQE009TEB4),
+so the host-wide ceiling alone cannot bound total load. Every suite command
+the runner executes inherits ``VITEST_MAX_WORKERS`` (default 4) in its child
+environment, which vitest's config resolution honours and ``npm test``
+propagates. The cap is env-only — command strings are never rewritten, so the
+per-repo cache key is unchanged.
+
 Nested-run isolation (SA-0MUY6U05F008RG86): a test that runs inside the full
 suite already sits under an outer run that holds a host-wide slot. If it
 invokes ``run_tests.py`` again (in-process or as a subprocess), the nested
@@ -145,6 +154,19 @@ TEST_LOCK_TIMEOUT_DEFAULT = 600.0
 #: the pool in lockstep (the thundering-herd wave). 0.0 disables the stagger.
 TEST_LOCK_JITTER_ENV = "TEST_LOCK_JITTER"
 TEST_LOCK_JITTER_DEFAULT = 0.1
+
+#: Per-suite vitest/tinypool worker-pool bound (SA-0MVE98T1M006A17T): the
+#: complement to the host-wide suite ceiling. A single vitest suite normally
+#: sizes its pool to the CPU count (15+ tinypool forks observed from one
+#: suite, SA-0MSAEKOQE009TEB4), so bounding concurrent *suites* alone leaves
+#: per-suite fan-out unbounded. Every suite command the runner executes gets
+#: this value in its child environment; vitest's config resolution reads it
+#: (``resolved.maxWorkers``) and ``npm test`` propagates it to the vitest
+#: process. The default matches the measured per-suite cap already applied to
+#: the consumer repos (ContextHub / Tableau-Card-Engine, SA-0MSAK2ZH6009Z3TW)
+#: and keeps one vitest run to ~4 node workers on the 16-core host.
+TEST_VITEST_MAX_WORKERS_ENV = "VITEST_MAX_WORKERS"
+TEST_VITEST_MAX_WORKERS_DEFAULT = 4
 
 #: Recursion marker shared with the pytest conftest guard (F5). Set by
 #: whichever guard owns the checkout first; nested pytest/run_tests stand down.
@@ -1379,6 +1401,32 @@ def _test_lock_jitter() -> float:
     return TEST_LOCK_JITTER_DEFAULT
 
 
+def _test_vitest_max_workers() -> int:
+    """Resolve the per-suite vitest worker-pool bound.
+
+    Precedence: ``VITEST_MAX_WORKERS`` env var > default 4, mirroring the
+    host-wide ``TEST_MAX_CONCURRENCY`` contract. Values below 1 are clamped
+    to 1 (serial — a zero/negative pool would mean "unbounded" to vitest);
+    an invalid (non-integer) value is ignored with a warning so a
+    misconfigured environment cannot break test runs.
+
+    The resolved value is exported to every suite-command child environment
+    (see :func:`_suite_command_env`), which is how a single vitest suite is
+    kept from fanning out to the whole CPU count (SA-0MVE98T1M006A17T).
+    """
+    env_value = os.environ.get(TEST_VITEST_MAX_WORKERS_ENV)
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {TEST_VITEST_MAX_WORKERS_ENV} value "
+                f"{env_value!r}; using default worker cap",
+                file=sys.stderr,
+            )
+    return TEST_VITEST_MAX_WORKERS_DEFAULT
+
+
 @contextmanager
 def _test_concurrency_slot() -> Iterator[None]:
     """Hold a shared test-run slot for the duration of an actual execution.
@@ -1424,13 +1472,37 @@ def _test_concurrency_slot() -> Iterator[None]:
         ) from exc
 
 
+def _suite_command_env() -> dict[str, str]:
+    """Return the child environment for a suite command.
+
+    Layers, in order:
+
+    1. The shared repository-override scrub + ``~/.local/bin`` PATH injection
+       (:func:`test_runner.subprocess_env_with_scrubbed_overrides`) — a leaked
+       ``GIT_DIR`` must not redirect real-git fixtures at the live checkout
+       (F2, SA-0MUIA3OE40001QJX).
+    2. The resolved per-suite vitest worker bound as ``VITEST_MAX_WORKERS``
+       (SA-0MVE98T1M006A17T). An ambient value wins (it is re-exported
+       normalised); otherwise the calibrated default applies. This is the
+       only mutation, and it never leaks back into ``os.environ``.
+
+    ``NODE_OPTIONS`` and every other unrelated variable are preserved, so
+    consumer-provided vitest/NODE_OPTIONS plumbing keeps working.
+    """
+    env = subprocess_env_with_scrubbed_overrides()
+    env[TEST_VITEST_MAX_WORKERS_ENV] = str(_test_vitest_max_workers())
+    return env
+
+
 def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
     """Run a suite command capturing stdout/stderr.
 
     The environment is the shared repository-override scrub (F2,
     SA-0MUIA3OE40001QJX): passing an explicit ``env=`` replaces the previous
     bare inherit of the parent environment, so a leaked ``GIT_DIR`` cannot
-    redirect real-git test fixtures at the live checkout.
+    redirect real-git test fixtures at the live checkout. It additionally
+    carries the per-suite ``VITEST_MAX_WORKERS`` bound
+    (SA-0MVE98T1M006A17T) — see :func:`_suite_command_env`.
     """
     log_repository_override_scrub()
     return subprocess.run(
@@ -1440,7 +1512,7 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
         text=True,
         timeout=timeout,
         check=False,
-        env=subprocess_env_with_scrubbed_overrides(),
+        env=_suite_command_env(),
     )
 
 

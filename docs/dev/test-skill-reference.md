@@ -131,10 +131,31 @@ never blocks a test run and vice-versa. Each workload has its own ceiling.
 | `TEST_MAX_CONCURRENCY` | `2` | Maximum concurrent test-suite executions |
 | `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot |
 | `TEST_LOCK_JITTER` | `0.1` | Per-waiter stagger fraction of the bounded wait (`0` = off) — see *Staggered-wait contract* below |
+| `VITEST_MAX_WORKERS` | `4` | Maximum workers in a single vitest suite (per-suite fan-out bound) — resolved value is **exported** to every suite command; see *Per-suite vitest worker bound* below |
 
-The first two env vars are validated at runtime: invalid values produce a stderr
+The numeric env vars are validated at runtime: invalid values produce a stderr
 warning and fall back to the documented default (never breaking the test run).
 Values below 1 are clamped to 1.
+
+**Per-suite vitest worker bound (SA-0MVE98T1M006A17T):** the host-wide
+`TEST_MAX_CONCURRENCY` ceiling bounds how many *suites* run at once, but a
+single vitest suite normally sizes its tinypool to the CPU count (15+ forks
+were observed from one suite, SA-0MSAEKOQE009TEB4). Every suite command the
+runner executes therefore inherits `VITEST_MAX_WORKERS` in its **child
+environment** — vitest's config resolution applies it as
+`resolved.maxWorkers`, and `npm test` propagates it to the vitest process. The
+default (`4`) matches the measured per-suite cap already applied to the
+consumer repos (ContextHub / Tableau-Card-Engine, SA-0MSAK2ZH6009Z3TW).
+
+- **Precedence:** an ambient `VITEST_MAX_WORKERS` (operator- or consumer-set)
+  wins; the default applies only when it is unset. Values below 1 clamp to 1
+  (serial); a non-numeric value warns and falls back to the default.
+- **Env-only:** command strings are never rewritten, so the per-repo test
+  cache key is unchanged and read-only consumers (the audit skill) still reuse
+  entries. `NODE_OPTIONS` and every other consumer-set variable are preserved.
+- **Escape hatch:** set `VITEST_MAX_WORKERS=1` for a suite that must run
+  serially, or raise it for a repo whose tests are I/O-bound (env-var mechanism
+  only; no config file).
 
 **Bounded wait semantics:** unlike the audit runner's fail-fast slot wait, a
 test run under saturation WAITS (bounded) for a free slot. If no slot frees
