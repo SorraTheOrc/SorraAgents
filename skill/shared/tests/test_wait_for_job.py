@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MVF58V4Z003V59S
+# smell: simplification
+# severity: medium
+# description: Use a context manager for opening files
+# -->
 """Tests for the shared completion-aware wait helper (SA-0MVCX570P003VLBK).
 
 The helper replaces fixed-length ``sleep N`` polling of background jobs with a

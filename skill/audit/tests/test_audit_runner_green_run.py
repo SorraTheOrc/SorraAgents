@@ -634,8 +634,8 @@ class TestAuditAcceptanceWindow:
         classified GREEN by the audit — no F3 re-execution."""
         import time
 
-        from test_cache import compute_git_state, store
         from test.scripts.run_tests import full_suite_commands
+        from test_cache import compute_git_state, store
 
         _with_pytest_config(tmp_path)
         _make_suite_dirs(tmp_path)
@@ -660,8 +660,13 @@ class TestAuditAcceptanceWindow:
         generic 2h TTL, so the audit window is what extends it."""
         import time
 
-        from test_cache import DEFAULT_TTL_SECONDS, compute_git_state, store, query_cached
         from test.scripts.run_tests import full_suite_commands
+        from test_cache import (
+            DEFAULT_TTL_SECONDS,
+            compute_git_state,
+            query_cached,
+            store,
+        )
 
         _with_pytest_config(tmp_path)
         _make_suite_dirs(tmp_path)

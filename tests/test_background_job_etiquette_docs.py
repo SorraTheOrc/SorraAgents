@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MVF595KS003KTNG
+# smell: simplification
+# severity: medium
+# description: Use a single `if` statement instead of nested `if` statements
+# -->
 """Tests for the background-job etiquette docs rollout (SA-0MVDP5JTK009HWOT).
 
 Asserts the observable deliverables of the rollout: the canonical shared doc
