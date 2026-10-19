@@ -4246,47 +4246,22 @@ def phase_finish(
             LOG.error(msg)
         return report
 
-    # ── Step 3b: Final full-suite gate (SA-0MT6CENPW004V2JN) ───────
-    # Changed-scope validation passed. Before committing and pushing to dev
-    # (the release gate), run the FULL suite so (a) a red full tree can never
-    # be pushed, and (b) the full-suite cache is populated at the pushed
-    # commit, making the pre-push hook's full check a cheap cache hit. The
-    # result records scope=full so consumers never mistake it for the
-    # partial changed-scope validation.
-    if test_result["success"] and not test_result.get("skipped"):
-        LOG.info("Running final full-suite gate (scope=full) before commit...")
-        full_result = run_tests(worktree_path, scope="full")
-        report["steps"]["tests"].append({
-            "attempt": "final-full",
-            "success": full_result["success"],
-            "failures": full_result.get("failures", []),
-            "skipped": full_result.get("skipped", False),
-            "tooling": full_result.get("tooling"),
-            "scope": "full",
-        })
-        if not full_result["success"]:
-            failures = full_result.get("failures", [])
-            failure_summary = "\n".join(failures[:20]) if failures else full_result["stderr"][:1000]
-            msg = (
-                "Full-suite gate failed after changed-scope validation passed "
-                f"(scope=full). Failures:\n{failure_summary}\n\n"
-                "Fix the failures and re-run implement.py finish; the pre-push "
-                "hook also enforces the full suite at push."
-            )
-            report["success"] = False
-            report["message"] = msg
-            wl_add_comment(work_item_id, msg)
-            try:
-                StatusLifecycle.update_status(work_item_id, "open")
-            except RuntimeError:
-                LOG.error("Failed to reset work item %s status to open", work_item_id)
-            if json_output:
-                print(format_json_output(report))
-            else:
-                print(f"\n{msg}")
-            return report
-
-    LOG.info("All tests passed")
+    # ── Step 3b: Full-suite coverage moved to the dev-push gate ─────
+    # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) No
+    # full suite runs here: the changed-scope validation above is the
+    # development-time (pre-commit) gate, kept fast so finish holds a
+    # host-wide "test" slot only for the affected tests. The FULL suite
+    # first runs at the dev-push integration gate — the pre-push hook
+    # (`.githooks/pre-push`) executes `run_tests.py --scope full
+    # --strict-git-env` on pushes to dev/main, and the ship release gate
+    # re-runs it on the merged dev→main tree — and that run populates the
+    # main-checkout `.worklog/cache` that post-push verification and the
+    # audit skill consume read-only. Running the full suite here instead
+    # would (a) burn a slot for the whole suite duration per work item,
+    # (b) cache the result under a pre-commit dirty git-state fingerprint
+    # that no later consumer ever looks up, and (c) duplicate the push
+    # gate.
+    LOG.info("Changed-scope validation passed — full suite deferred to the dev-push gate")
 
     try:
         with StatusLifecycle(work_item_id, target_stage="in_review"):
@@ -5143,8 +5118,8 @@ def _resolve_child_session_timeout() -> int:
 
     ``IMPLEMENT_DRIVE_CHILD_TIMEOUT`` overrides the default. The test-command
     timeout is not reused directly because a child session runs the whole
-    implement workflow (changed-scope tests, the full-suite gate, and the
-    pre-push hook) — several test runs, not one.
+    implement workflow (changed-scope tests, the dev-push full-suite gate,
+    and the pre-push hook) — several test runs, not one.
 
     Returns:
         Timeout in seconds.

@@ -75,7 +75,7 @@ and relevant context.
 - Keep work-items up to date — update descriptions, ACs, stages, comments throughout the lifecycle.
 - Every work-item must have a clear goal (user story) with measurable, testable ACs.
 - When writing content, escape only backticks; use Markdown formatting as needed.
-- Never commit without: a work item association, a clean build, and all tests passing (build → test → commit order, never reversed).
+- Never commit without: a work item association, a clean build, and the changed-scope test gate passing (build → test → commit order, never reversed); the full suite is enforced at the dev-push gate, so a red tree is never pushed.
 - Always record the commit message and hash in a comment on the relevant work item(s).
 - If push fails, resolve and retry until it succeeds.
 - When displaying a work-item ID, always include the title: `Title Text (ID)`.
@@ -127,7 +127,7 @@ Two lifecycle axes, managed independently:
 
 ## Test-failure triage policy
 
-Before `in_review`, run the full suite via `/skill:test`; triage failures into critical `test-failure` work items ([triage skill](/home/rgardler/.pi/agent/skills/triage/SKILL.md)). **All tests must pass** before `in_review`.
+Before `in_review`, the full suite is enforced by the dev-push gate and cached for audits; triage gate-reported failures into critical `test-failure` items ([triage skill](/home/rgardler/.pi/agent/skills/triage/SKILL.md)). **All tests must pass before a push to `dev` succeeds** — don't run ad-hoc full suites during implementation (slot contention).
 
 ## Test execution policy
 

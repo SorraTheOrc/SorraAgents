@@ -155,6 +155,19 @@ from test.scripts.run_tests import (
 )
 from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
+#: Audit-specific acceptance window for GREEN cached full-suite runs.
+#: The generic ``DEFAULT_TTL_SECONDS`` (2h) is kept for suite runs elsewhere;
+#: the audit instead accepts gate-produced evidence (the dev-push pre-push
+#: hook/`ship` release gate full runs, SA-0MVECQUGF0064U81) for up to 24h at
+#: the SAME git state, so auditing an item pushed yesterday — or a re-audit,
+#: or an audit after HEAD drifted — reuses the cached green run instead of
+#: F3 auto-executing a fresh full suite. The git-state key still guarantees
+#: the tree is byte-identical to the proven run; the window only guards
+#: environmental drift (deps/infra). Failed runs are NOT extended: the cache
+#: trims non-zero-exit entries to the short 5-minute TTL
+#: (FAILED_RUN_TTL_SECONDS) regardless of this value.
+AUDIT_CACHE_TTL_SECONDS = 24 * 60 * 60
+
 # ---------------------------------------------------------------------------
 # Recursion guard: LIVE_REPO_GUARD_ACTIVE propagation (SA-0MUG47DYG006TV40)
 # ---------------------------------------------------------------------------
@@ -3004,7 +3017,7 @@ def _classify_full_suite_cache(
     problems: list[str] = []
     for command in commands:
         entry = query_cached(
-            command, cwd=str(project_root), ttl=DEFAULT_TTL_SECONDS,
+            command, cwd=str(project_root), ttl=AUDIT_CACHE_TTL_SECONDS,
         )
         if entry is None:
             problems.append(

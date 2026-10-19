@@ -149,7 +149,9 @@ Result JSON and `--summary` output carry `scope` per suite. Pre-push
 enforcement (`.githooks/pre-push`): pushes to `refs/heads/dev`/`main` run the
 full suite (`--scope full`), feature-branch pushes skip tests
 (`TEST_SCOPE_SKIP=1` bypasses); the implement skill validates the worktree
-with changed scope and runs a final `--scope full` gate before commit.
+with **changed scope only** during implementation — the full suite first runs
+at the dev-push integration gate (pre-push hook), and the ship release gate
+re-runs it on the merged dev→main tree (SA-0MVECQUGF0064U81).
 Details: [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
 
 ### 1b. Live-repo mutation guard (detect-only)

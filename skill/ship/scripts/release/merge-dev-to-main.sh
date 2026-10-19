@@ -238,6 +238,41 @@ elif [[ "$DRY_RUN" == "true" ]]; then
   echo "Dry-run: derived version files would be regenerated for v${NEW_VERSION:-<version>}"
 fi
 
+# ── Full-suite gate on the merged dev→main tree (SA-0MVECQUGF0064U81) ──
+# The dev→main merge is the integration point: assert the merged tree is
+# full green BEFORE the release is made (tag created, branch pushed, PR
+# opened/merged). The release branch push is a feature-branch push, so the
+# pre-push hook skips its test gate — this gate is the only full-suite
+# assertion for the release. It runs AFTER the tree-modifying steps above
+# (version bump, CHANGELOG, derived files) so the asserted tree is exactly
+# the tree that lands on main. Mirrors the pre-push hook's invocation
+# (`--scope full --strict-git-env`); the cached runner makes repeat
+# verification cheap. SHIP_TEST_SKIP=1 bypasses (not recommended).
+if [[ "$DRY_RUN" != "true" && "${SHIP_TEST_SKIP:-}" != "1" ]]; then
+  TEST_RUNNER=""
+  if [[ -f "$REPO_ROOT/skill/test/scripts/run_tests.py" ]]; then
+    TEST_RUNNER="$REPO_ROOT/skill/test/scripts/run_tests.py"
+  elif [[ -f "$HOME/.pi/agent/skills/test/scripts/run_tests.py" ]]; then
+    TEST_RUNNER="$HOME/.pi/agent/skills/test/scripts/run_tests.py"
+  fi
+  if [[ -z "$TEST_RUNNER" ]]; then
+    echo "ERROR: full-suite gate cannot run — run_tests.py not found." >&2
+    echo "  Refusing to release without a full-suite assertion on the merged tree." >&2
+    echo "  Set SHIP_TEST_SKIP=1 to bypass (not recommended)." >&2
+    exit 1
+  fi
+  echo "Release gate: running the full suite on the merged dev→main tree (--scope full --strict-git-env)..." >&2
+  if python3 "$TEST_RUNNER" --scope full --strict-git-env 2>&1; then
+    echo "Release gate: full suite green on the merged tree." >&2
+  else
+    echo "ERROR: Full test suite failed on the merged dev→main tree — the release is blocked." >&2
+    echo "  Fix the failures on dev and re-run the release. SHIP_TEST_SKIP=1 bypasses (not recommended)." >&2
+    exit 1
+  fi
+elif [[ "$DRY_RUN" == "true" ]]; then
+  echo "Dry-run: full-suite gate would run on the merged tree (--scope full --strict-git-env)"
+fi
+
 # ── Create git tag (only on actual release) ───────────────────────
 if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
   git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"

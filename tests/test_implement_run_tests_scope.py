@@ -1,11 +1,14 @@
 """Tests for implement.py run_tests() scope-aware execution.
 
-Covers SA-0MT6CENPW004V2JN:
+Covers SA-0MT6CENPW004V2JN / the scope-aware finish workflow
+(SA-0MVECQUGF0064U81):
 
 - AC1: the worktree test loop runs changed-scope (affected tests only).
-- AC2: finish runs a final full-suite gate before commit (scope=full), so
-  the pre-push hook's full check is a cheap cache hit and a red full tree
-  is never pushed.
+- AC2: the finish gate validates with changed-scope; the library's
+  scope=full path remains supported for the changed-scope fallback and
+  direct callers, but the finish workflow runs NO full-suite gate before
+  commit — the full suite first runs at the dev-push integration gate
+  (pre-push hook) and at the ship release gate.
 - AC3: test results passed to the "blocked by test failures" gate carry
   ``scope`` info.
 - AC4: when changed-scope selection yields nothing (all changed files are

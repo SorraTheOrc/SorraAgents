@@ -29,15 +29,19 @@ credential exists for those actions). Pushing the feature branch into `dev`
 (Step 9) is **pre-authorized by this workflow** — the repo's pre-push hook
 enforces the same policy, blocking `main`/`master`/`HEAD` only — and requires
 no additional approval, provided the build passes and the test gate is green:
-`implement.py finish` validates the worktree with **changed scope** (tests
-affected by the change — fast iteration), then runs a **final `--scope full`
-gate** before commit, and the **pre-push hook re-runs the full suite**
-(`--scope full`) on the actual push to `dev`/`main` (SA-0MT6BYQHB008DOGC).
-Changed-scope selection ignores deleted/non-existent test paths and falls
-back to the full suite when nothing selectable remains; a scoped pytest
-exit 4 ("file or directory not found") is likewise treated as selection
-unavailable and falls back to full scope, while a genuine failure (exit 1)
-still blocks the gate (LP-0MTZYRTNF0092JKW).
+`implement.py finish` validates the worktree with **changed scope only**
+(tests affected by the change — fast iteration). The **full suite first runs
+at the dev-push integration gate**, not during implementation: the
+**pre-push hook** executes `run_tests.py --scope full` on the actual push to
+`dev`/`main`, and the **ship release gate** re-runs the full suite on the
+merged dev→main tree before a release (SA-0MVECQUGF0064U81,
+SA-0MT6BYQHB008DOGC). The pushed-commit full run populates the per-repo test
+cache that post-push verification and audits consume read-only. Changed-scope
+selection ignores deleted/non-existent test paths and falls back to the full
+suite when nothing selectable remains; a scoped pytest exit 4 ("file or
+directory not found") is likewise treated as selection unavailable and falls
+back to full scope, while a genuine failure (exit 1) still blocks the gate
+(LP-0MTZYRTNF0092JKW).
 When in doubt, produce the exact
 `git`/`gh`/`wl` commands for a human to run.
 
@@ -189,7 +193,7 @@ release, batch job), follow this pattern:
 
 ## Test Timeout Configuration
 
-The finish step runs the project test suite through `implement.py finish` with a
+The finish step's changed-scope validation runs through `implement.py finish` with a
 per-command timeout (default **600 seconds**). Repos with slow test suites can
 override this via `.pi/test-config.json`:
 
@@ -698,7 +702,7 @@ parent itself gets no worktree.
   - External constraints prevent complete tests → harnesses/mocks/placeholders,
     documented; follow project style; comment on significant decisions.
   - Discovered additional work → `wl create "<title>" --deps discovered-from:<work-item-id> --json`
-- Once all ACs are met: **build** (no errors); **validate via the [test skill](../test/SKILL.md) — the loop is scope-aware (SA-0MT6BYQHB008DOGC)**: `implement.py finish` first runs a **changed-scope** validation (only the tests affected by this change — fast iteration), then a **final full-suite gate** (`--scope full`) before commit, and the **pre-push hook enforces the full suite again on the push to `dev`**. The finish gate's suite execution delegates to the test skill's canonical `guarded_run_all` (the single source of truth for the outer live-repo guard, SA-0MUH1MJL6003767Q), so a green gate always implies the checkout was verified for mutation regardless of which entry point ran it. `run_tests.py` execution must go through the test-skill runner (`/skill:test`, `run_tests.py --scope full`): only the test-skill runner records runs in the per-repo test cache (keyed by git state + scope, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run (`npx vitest run`, `pytest`, …) is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). Failures outside scope → triage helper (`python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
+- Once all ACs are met: **build** (no errors); **validate via the [test skill](../test/SKILL.md) — the loop is scope-aware (SA-0MT6BYQHB008DOGC)**: `implement.py finish` runs a **changed-scope** validation (only the tests affected by this change — fast iteration). No full suite runs here: it is **deferred to the dev-push integration gate**, where the **pre-push hook enforces the full suite** (`--scope full`) on the push to `dev`, and the **ship release gate** re-runs it on the merged dev→main tree (SA-0MVECQUGF0064U81). The changed-scope execution delegates to the test skill's canonical `guarded_run_all` (the single source of truth for the outer live-repo guard, SA-0MUH1MJL6003767Q), so a green gate always implies the checkout was verified for mutation regardless of which entry point ran it. `run_tests.py` execution must go through the test-skill runner (`/skill:test`, `run_tests.py --scope full`): only the test-skill runner records runs in the per-repo test cache (keyed by git state + scope, 2h TTL) that the audit skill reads read-only via `query_cached()` to auto-verify execution-dependent ACs — an ad-hoc run (`npx vitest run`, `pytest`, …) is invisible to the audit, so the audit either auto-executes the suite itself on a cache miss (F3, SA-0MSTN5KRF0097TVP) or the operator attests with `--green-run HEAD` (it never hard-blocks — F4, SA-0MSTN8CWM003AAU9). If a gate reports full-suite failures: triage helper (`python3 $(skill_path triage)/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
 
 7. Automated self-review
 
@@ -764,22 +768,28 @@ See ``../refactor/SKILL.md``.
 
   > The item stays `in_review` until release promotes `dev` to `main` (see `../ship/SKILL.md`).
 
-- **Final validation — belt-and-suspenders (post-push, post-`in_review`):** run
-  the full test suite against the committed state and ensure all tests pass.
-  If any tests fail: create critical `test-failure` work items with the triage
-  helper, fix the failures, and re-run until green before closing the response.
+- **Read-only post-push verification (belt-and-suspenders, post-push,
+  post-`in_review`):** verify, WITHOUT executing a suite, that the full
+  suite is green at the exact pushed commit. The dev-push pre-push hook ran
+  it moments ago (full suite, `--scope full`) and cached it in the
+  main-checkout `.worklog/cache`; this step asserts that green entry exists
+  (SA-0MVECQUGF0064U81):
 
   ```bash
-  /skill:test
+  python3 $(skill_path test)/scripts/run_tests.py --summary --suite all --json
   ```
 
-  - This runs the full suite (not just changed-scope) against the exact pushed
-    commit, catching any regression the pre-push gate missed.
-  - Failures → triage helper:
+  - A `missing` result means no cached full-suite entry exists for HEAD
+    (e.g. TTL expired or the push bypassed the hook) — then, and only then,
+    run the suite to generate the evidence:
+    `python3 $(skill_path test)/scripts/run_tests.py --scope full --json`
+    (or `/skill:test`).
+  - A non-green summary (cached failures) or a genuinely failing run →
+    triage helper:
     `python3 $(skill_path triage)/scripts/check_or_create.py
     '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...",
     "parent_work_item_id":"<this-work-item-id>"}'` → fix → re-run.
-  - All tests green → close your response.
+  - All green → close your response.
   - **Parent/epic runs:** parent/epic items are validated per child at each
     child's Step 9; the parent itself is covered by the per-child test runs
     at Step 6.1.
@@ -787,12 +797,17 @@ See ``../refactor/SKILL.md``.
 Pre-push blocking check
 -----------------------
 
-Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`).
-If any tests fail: (1) create a critical `test-failure` work item with
+The dev-push pre-push hook enforces the full suite **deterministically** at
+push time — a push to `dev`/`main` with a red full tree is refused (see
+`.githooks/pre-push`). You therefore do **not** pre-run the full suite during
+implementation: `implement.py finish`'s changed-scope validation is the
+development-time gate, and the full suite first runs at the push (integration)
+(SA-0MVECQUGF0064U81). If the hook reports failures on your push: (1) create
+a critical `test-failure` work item with
 `python3 $(skill_path triage)/scripts/check_or_create.py
 '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...",
-"parent_work_item_id":"<this-work-item-id>"}'`; (2) fix the failures; (3)
-re-run until green. Only then proceed to commit/push.
+"parent_work_item_id":"<this-work-item-id>"}'`; (2) fix the failures in the
+worktree; (3) re-run `implement.py finish` until the push succeeds.
 
 Final cleanup (belt-and-suspenders)
 ---------------------------------------
