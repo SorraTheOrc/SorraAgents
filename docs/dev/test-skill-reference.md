@@ -63,10 +63,13 @@ hit the same entries because both resolve the same project root.
 
 - **Storage**: `<repo>/.worklog/cache/` (fallback `<repo>/.git/test-cache/`,
   resolved worktree-aware). Gitignored; never committed.
-- **Invalidation**: git-state fingerprint (HEAD sha + working-tree changes) +
-  2-hour TTL. A changed tree, an expired TTL, or a corrupt entry triggers a
-  fresh run that replaces the stale entry. `--force` bypasses lookup (still
-  stores); `--no-cache` bypasses lookup and storage entirely.
+- **Invalidation**: git-state fingerprint (HEAD sha + the **content** of
+  every dirty tracked/untracked path, not just the `git status --porcelain`
+  path list) + 2-hour TTL. Any content change — including a second edit to a
+  file that is already dirty — an expired TTL, or a corrupt entry triggers a
+  fresh run that replaces the stale entry (AH-0MVFGIV6700329SZ).
+  `--force` bypasses lookup (still stores); `--no-cache` bypasses lookup and
+  storage entirely.
 - **Failed-run TTL (SA-0MSJELL44009XYIL)**: runs with a non-zero exit get a
   short 5-minute TTL instead of the full 2 hours, so a transient infra
   failure (e.g. `/tmp` disk quota) is never re-served as a current result for
