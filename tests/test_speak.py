@@ -14,7 +14,9 @@ These tests use mock executables for curl, pw-play, and aplay to avoid
 external dependencies.
 """
 
+import json
 import os
+import shlex
 import stat
 import subprocess
 from pathlib import Path
@@ -30,23 +32,32 @@ SCRIPT_PATH = REPO_ROOT / "skill" / "speak" / "scripts" / "speak.sh"
 _SYSTEM_PATH = os.environ.get("PATH", "")
 
 
-def _make_mock_curl(bindir):
-    """Create a mock curl that logs invocations and writes a dummy response."""
+def _make_mock_curl(bindir, http_status="200", response_body="mock-wav-content"):
+    """Create a mock curl that logs invocations, writes a dummy response, and records the -d payload.
+
+    Args:
+        bindir: Directory for the mock binary.
+        http_status: HTTP status string to output (default "200").
+        response_body: Body content written to -o files (default "mock-wav-content").
+    """
     script = bindir / "curl"
     script.write_text(
         "#!/bin/bash\n"
-        '# mock curl: logs args, writes dummy wav, outputs HTTP 200\n'
+        '# mock curl: logs args, writes response body, outputs HTTP status\n'
         'echo "CURL:$*" >> "$MOCK_LOG"\n'
         "while [[ $# -gt 0 ]]; do\n"
         '  case "$1" in\n'
+        "    -d) shift\n"
+        '        printf \'%s\' "$1" > "$MOCK_PAYLOAD_FILE"\n'
+        "        ;;\n"
         "    -o) shift\n"
-        '        echo "mock-wav-content" > "$1"\n'
+        f"        printf '%s' {shlex.quote(response_body)} > \"$1\"\n"
         "        ;;\n"
         "  esac\n"
         "  shift\n"
         "done\n"
         '# simulate curl -w "%{http_code}"\n'
-        'echo "200"\n'
+        f'echo {shlex.quote(http_status)}\n'
         "exit 0\n"
     )
     script.chmod(0o755)
@@ -77,12 +88,15 @@ def _make_mock_aplay(bindir):
     return script
 
 
-def _env_with_bindir(bindir, speak_dir, mock_log):
+def _env_with_bindir(bindir, speak_dir, mock_log, payload_file=None):
     """Create an environment dict with the given bin dir on PATH."""
     env = os.environ.copy()
     env["PATH"] = f"{bindir}:{_SYSTEM_PATH}"
     env["MOCK_LOG"] = str(mock_log)
     env["SPEAK_DIR"] = str(speak_dir)
+    env["MOCK_PAYLOAD_FILE"] = str(
+        payload_file if payload_file is not None else mock_log.parent / "payload.json"
+    )
     return env
 
 
@@ -589,3 +603,201 @@ class TestTimingWrapper:
         content = SCRIPT_PATH.read_text()
         assert "timing" not in content.lower()
         assert "hrtime" not in content.lower()
+
+
+# ===================================================================
+# Voice selection (TTS-0MVGRB71F006LQNX)
+# ===================================================================
+
+
+def _run_speak(args, env):
+    """Run speak.sh with *args* and return the completed process."""
+    return subprocess.run(  # noqa: PLW1510
+        ["bash", str(SCRIPT_PATH), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _voice_from_payload(payload_file):
+    """Read the JSON payload the mock curl recorded and return its voice field."""
+    assert payload_file.exists(), "mock curl did not record a payload (missing -d?)"
+    payload = json.loads(payload_file.read_text())
+    assert "voice" in payload, f"payload has no voice field: {payload}"
+    return payload["voice"]
+
+
+@pytest.fixture
+def error_env(tmp_path):
+    """Environment whose mock curl returns HTTP 400 with a JSON error body."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    body = (
+        '{"detail": "Voice \'bogus\' not found. '
+        'Available voices: ryan, default, nova, ginny_di"}'
+    )
+    _make_mock_curl(bindir, http_status="400", response_body=body)
+    _make_mock_pw_play(bindir)
+    _make_mock_aplay(bindir)
+
+    speak_dir = tmp_path / ".pi" / "speak"
+    mock_log = tmp_path / "mock.log"
+    mock_log.write_text("")
+    return _env_with_bindir(bindir, speak_dir, mock_log)
+
+
+class TestVoiceSelection:
+    """AC1: --voice selects the server-side voice; default stays ryan."""
+
+    def test_default_voice_is_ryan(self, mock_env, tmp_path):
+        """Omitting --voice keeps the backwards-compatible ryan default."""
+        result = _run_speak(["Hello"], mock_env)
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "ryan"
+
+    def test_voice_flag_selects_voice(self, mock_env, tmp_path):
+        """--voice nova sends voice=nova in the POST body."""
+        result = _run_speak(["--voice", "nova", "Hello"], mock_env)
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "nova"
+
+    def test_voice_flag_selects_voice_in_stream_mode(self, mock_env, tmp_path):
+        """--stream shares the same payload builder, so --voice applies there too."""
+        result = _run_speak(["--stream", "--voice", "nova", "Hello"], mock_env)
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "nova"
+
+    def test_voice_flag_before_stream_flag(self, mock_env, tmp_path):
+        """Options parse in any order: --voice before --stream works."""
+        result = _run_speak(["--voice", "ginny_di", "--stream", "Hello"], mock_env)
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "ginny_di"
+
+
+class TestVoiceEnvironmentFallback:
+    """AC2: TTS_VOICE is the fallback; --voice takes precedence."""
+
+    def test_tts_voice_env_fallback(self, mock_env, tmp_path):
+        """TTS_VOICE=nova selects nova when --voice is absent."""
+        env = dict(mock_env, TTS_VOICE="nova")
+        result = _run_speak(["Hello"], env)
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "nova"
+
+    def test_voice_flag_overrides_env(self, mock_env, tmp_path):
+        """--voice ginny_di wins over TTS_VOICE=nova."""
+        env = dict(mock_env, TTS_VOICE="nova")
+        result = _run_speak(["--voice", "ginny_di", "Hello"], env)
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "ginny_di"
+
+    def test_default_is_ryan_without_env_or_flag(self, mock_env, tmp_path):
+        """Neither TTS_VOICE nor --voice set: ryan (explicit backwards compatibility)."""
+        env = dict(mock_env)
+        env.pop("TTS_VOICE", None)
+        result = _run_speak(["Hello"], env)
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "ryan"
+
+
+class TestArgumentParsing:
+    """AC3: options parse in any order; missing --voice value is a usage error."""
+
+    def test_voice_first_then_text(self, mock_env, tmp_path):
+        result = _run_speak(["--voice", "nova", "Hello"], mock_env)
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "nova"
+
+    def test_missing_voice_value_exits_nonzero(self, mock_env):
+        """A trailing --voice with no value is a clear usage error."""
+        result = _run_speak(["--voice"], mock_env)
+        assert result.returncode != 0, (
+            f"--voice with no value should exit non-zero, got {result.returncode}"
+        )
+        combined = result.stdout + result.stderr
+        assert "Usage" in combined, f"usage should be shown, got: {combined[:300]}"
+        assert "voice" in combined.lower(), (
+            f"error should mention the missing voice value, got: {combined[:300]}"
+        )
+
+    def test_voice_followed_by_option_is_missing_value(self, mock_env):
+        """--voice followed by another option is treated as a missing value."""
+        result = _run_speak(["--voice", "--stream", "Hello"], mock_env)
+        assert result.returncode != 0, (
+            "--voice followed by an option should be a usage error"
+        )
+        combined = result.stdout + result.stderr
+        assert "Usage" in combined
+
+    def test_help_documents_voice_and_env(self, mock_env):
+        """AC4: --help documents --voice and TTS_VOICE."""
+        result = _run_speak(["--help"], mock_env)
+        assert result.returncode == 0
+        assert "--voice" in result.stdout
+        assert "TTS_VOICE" in result.stdout
+
+    def test_unknown_option_is_usage_error(self, mock_env):
+        """Unrecognised options fail clearly instead of being treated as text."""
+        result = _run_speak(["--bogus", "Hello"], mock_env)
+        assert result.returncode != 0
+        assert "Usage" in (result.stdout + result.stderr)
+
+
+class TestUnknownVoiceErrorBody:
+    """AC5: non-2xx responses surface the server's error body on stderr."""
+
+    def test_save_mode_surfaces_server_error_body(self, error_env):
+        result = _run_speak(["--voice", "bogus", "Hello"], error_env)
+        assert result.returncode != 0
+        assert "HTTP 400" in result.stderr, (
+            f"status should be reported, got: {result.stderr[:300]}"
+        )
+        assert "Available voices:" in result.stderr, (
+            f"server error body should be surfaced, got: {result.stderr[:300]}"
+        )
+
+    def test_stream_mode_surfaces_server_error_body(self, error_env):
+        result = _run_speak(["--stream", "--voice", "bogus", "Hello"], error_env)
+        assert result.returncode != 0
+        assert "Available voices:" in result.stderr, (
+            f"server error body should be surfaced in stream mode, "
+            f"got: {result.stderr[:300]}"
+        )
+
+    def test_server_error_body_not_written_to_stdout(self, error_env):
+        """Stream mode must not emit an error body as if it were audio."""
+        result = _run_speak(["--stream", "--voice", "bogus", "Hello"], error_env)
+        assert result.returncode != 0
+        assert "Available voices:" not in result.stdout
+
+
+class TestVoiceDocumentation:
+    """AC4: SKILL.md documents --voice, TTS_VOICE, and a nova example."""
+
+    def test_skill_md_documents_voice_flag_and_env(self):
+        content = (REPO_ROOT / "skill" / "speak" / "SKILL.md").read_text()
+        assert "--voice" in content
+        assert "TTS_VOICE" in content
+
+    def test_skill_md_has_nova_example(self):
+        content = (REPO_ROOT / "skill" / "speak" / "SKILL.md").read_text()
+        assert "--voice nova" in content, (
+            "SKILL.md should include a working example selecting the nova voice"
+        )
+
+
+class TestTimingWrapperVoicePassthrough:
+    """AC6: speak.py forwards --voice unchanged to speak.sh."""
+
+    WRAPPER_PATH = REPO_ROOT / "skill" / "speak" / "scripts" / "speak.py"
+
+    def test_wrapper_passes_voice_through(self, mock_env, tmp_path):
+        result = subprocess.run(  # noqa: PLW1510
+            ["python3", str(self.WRAPPER_PATH), "--voice", "nova", "Hello"],
+            capture_output=True,
+            text=True,
+            env=mock_env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert _voice_from_payload(tmp_path / "payload.json") == "nova"
