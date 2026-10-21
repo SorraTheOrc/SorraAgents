@@ -564,15 +564,16 @@ class TestCmdIssueMergeGateFailClosed:
         assert "Merge gate" in out
         # Screening must NOT run: zero pi calls on the blocked path.
         pi_mock.assert_not_called()
-        # Lifecycle applies the fail-closed transition with the producer hold.
+        # Lifecycle applies the fail-closed transition with the restored
+        # needs-producer-review flag.
         updates = [c for c in recorded if "update" in " ".join(c)]
         assert updates, "expected a lifecycle wl update"
         producer_updates = [
             c for c in updates
-            if "--assignee" in c and "Map" in c
+            if "--needs-producer-review" in c and "yes" in c
         ]
         assert producer_updates, (
-            f"blocked gate must apply the producer hold, got {updates}"
+            f"blocked gate must flag needs-producer-review, got {updates}"
         )
         open_updates = [
             c for c in updates if "--status" in c and "open" in c
@@ -649,8 +650,8 @@ class TestMergeGateFailureReport:
 
 
 class TestLifecycleMergeGateBlocker:
-    """The 'no' verdict with a merge-gate blocker applies the producer hold
-    (--assignee Map) — replacing the retired needsProducerReview flag (AC3)."""
+    """The 'no' verdict with a merge-gate blocker flags needsProducerReview
+    (restored) and clears the audit claim (AC3)."""
 
     def test_lifecycle_flags_producer_review(self):
         ctx = _make_ctx()
@@ -688,9 +689,10 @@ class TestLifecycleMergeGateBlocker:
         audit_runner._apply_terminal_lifecycle(ctx)
         update_cmds = [c for c in calls if "update" in " ".join(c)]
         assert any(
-            "--assignee" in c and "Map" in c
+            "--needs-producer-review" in c and "yes" in c
+            and "Map" not in c
             for c in update_cmds
-        ), f"expected the producer hold (--assignee Map), got {update_cmds}"
+        ), f"expected the restored --needs-producer-review yes, got {update_cmds}"
 
 # ---------------------------------------------------------------------------
 # _audit_base_freshness — stale-audit-base guard (SA-0MT9EK1UU000DT1R)

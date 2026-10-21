@@ -83,10 +83,11 @@ item is both the largest and the highest-risk — effort t-shirt **Extra Large**
 (`PLAN_APPROVAL_EFFORT`) **AND** risk **High** or **Severe**
 (`PLAN_APPROVAL_RISK`). Every other effort/risk combination proceeds directly
 to the automated review stages without an approval pause. Absent effort and/or
-risk values default conservatively to requesting approval, so a human
-checkpoint is never silently skipped. The returned `reason` names both the
-effort scale and the risk level that triggered the gate
-(SA-0MUYG0HE6001YTEM).
+risk values, and present-but-unrecognised values (outside the canonical `wl`
+effort/risk vocabulary), default conservatively to requesting approval, so a
+human checkpoint is never silently skipped. The returned `reason` names both
+the effort scale and the risk level that triggered the gate
+(SA-0MUYG0HE6001YTEM, SA-0MUIUTJJS008W06Y).
 
 ## Appendix: Clarifying questions & answers (must include)
 

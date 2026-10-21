@@ -6,20 +6,22 @@
 // (merge-dev-to-main.sh) and controls which part of the semver is
 // incremented before the merge. Default is 'patch'.
 
-import { existsSync, realpathSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { spawnSync, execSync } from 'node:child_process';
+import {
+  existsSync, realpathSync, mkdirSync, writeFileSync, rmSync, readFileSync,
+  mkdtempSync, openSync, closeSync,
+} from 'node:fs';
+import { spawnSync, spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems, getTopLevelCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
-import { checkFinalValidation, resolveChildScope, getItemById, getItemLifecycle, shellQuote, PRODUCER_HOLD_ASSIGNEE, isProducerHeld } from './check-final-validation.js';
+import { checkFinalValidation, resolveChildScope, getItemById, getItemLifecycle, shellQuote } from './check-final-validation.js';
 import { runRefreshAuditsAction } from './refresh-audits.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 import { sendReleaseNotification } from './discord-notify.js';
 import { Timer } from './timing.js';
 import { tmpdir } from 'node:os';
-import { mkdtempSync } from 'node:fs';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -31,6 +33,21 @@ const SKILL_RELEASE_SCRIPT = join(skillDir, 'scripts', 'release', 'merge-dev-to-
 
 // Path to the cleanup scripts (relative to repository root)
 const SKILL_CLEANUP_DIR = join(skillDir, '..', 'cleanup', 'scripts');
+
+// Background-job wiring (SA-0MVDP9B83004UD5E). The PR status-check wait is a
+// background job: `wait_for_pr_checks.py` polls `gh` and writes a terminal
+// outcome marker, and the shared completion-aware helper `wait_for_job.py`
+// waits on it (returning the moment the marker/process completes, with a
+// heartbeat) instead of the deprecated fixed `sleep 10` poll loop.
+// See skill/shared/background-job-etiquette.md.
+const SKILL_WAIT_HELPER_CANDIDATES = [
+  join(skillDir, '..', 'shared', 'wait_for_job.py'),
+  join(skillDir, '..', '..', 'skill', 'shared', 'wait_for_job.py'),
+];
+const SKILL_PR_POLLER_CANDIDATES = [
+  join(skillDir, 'scripts', 'release', 'wait_for_pr_checks.py'),
+  join(skillDir, '..', '..', 'skill', 'ship', 'scripts', 'release', 'wait_for_pr_checks.py'),
+];
 
 // Timeout (ms) for the release-script subprocess. A hung git/gh operation
 // must fail the release loudly after a bounded time instead of blocking
@@ -391,7 +408,7 @@ export function verifyReleaseMerge(version, options = {}) {
  * (Step 9) and the final-validation gate (Step 3.7) apply identical
  * `covered` / `uncovered` / `excluded` semantics. Only a `covered` outcome
  * (nearest `in_review` ancestor with `readyToClose === true`) authorises
- * clearing the child's producer hold (AC1, AC3).
+ * clearing the child's `needsProducerReview` flag (AC1, AC3).
  *
  * Command boundaries are injectable for hermetic tests.
  *
@@ -536,14 +553,14 @@ function readCloseState(getCloseStateFn, itemId) {
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
- * Close candidate work items after a successful release, filtering by the
- * producer hold.
+ * Close candidate work items after a successful release, filtering by
+ * `needsProducerReview`.
  *
  * Uses `getCandidateItems()` from check-audit-gate.js to find items in
  * `in_review` stage or `completed` status (excluding `stage: done`).
- * Items not producer-held are closed. Producer-held items without a
- * covered passing parent audit are skipped and logged with
- * "Skipped (producer-owned: requires producer review)".
+ * Only items with `needsProducerReview === false` are closed. Items with
+ * `needsProducerReview = true`, `null`, or `undefined` are skipped and
+ * logged with "Skipped (needs producer review)".
  *
  * The existing audit gate (Step 2) already validates `audit.readyToClose`,
  * so this step does not re-check `readyToClose`.
@@ -561,7 +578,7 @@ function readCloseState(getCloseStateFn, itemId) {
  *
  * @param {string|null} version - The released semver version (e.g., "0.2.0").
  * @param {object} [options] - Optional injection point (used by unit tests).
- * @param {() => Array<{id: string, title: string, assignee: string|null}>} [options.getCandidateItemsFn] -
+ * @param {() => Array<{id: string, title: string, needsProducerReview: boolean|null}>} [options.getCandidateItemsFn] -
  *   Candidate-item query; defaults to `getCandidateItems()` from
  *   check-audit-gate.js (real `wl list`).
  * @param {(itemId: string, reason: string) => void} [options.runCloseCommand] -
@@ -578,11 +595,11 @@ function readCloseState(getCloseStateFn, itemId) {
  * @param {(item: object) => {outcome: string, ancestorId: string|null}} [options.getAncestorAuditFn] -
  *   Resolves whether a child is covered by an audit-ready `in_review`
  *   ancestor; defaults to {@link resolveCandidateCoverage}. Only a `covered`
- *   outcome authorises clearing a child's producer hold
+ *   outcome authorises clearing a child's `needsProducerReview` flag
  *   (SA-0MUJLWPB10038Z8Q AC1/AC3).
  * @param {(childId: string, ancestorId: string, reason: string) => void} [options.runOverrideCommand] -
- *   Clears the child's producer hold (assignee) and records the explanatory
- *   comment; defaults to `wl update <child> --assignee ""`
+ *   Clears the child's `needsProducerReview` flag and records the explanatory
+ *   comment; defaults to `wl update <child> --needs-producer-review false`
  *   followed by `wl comment add <child>` (AC1/AC4).
  * @param {(itemId: string) => ({readyToClose: boolean, auditedAt: string|null}|null)} [options.getParentAuditFn] -
  *   Resolves a candidate's own audit readiness. When a candidate has
@@ -603,7 +620,7 @@ function readCloseState(getCloseStateFn, itemId) {
  * @param {boolean} [options.dryRun=false] - When true, intended child
  *   overrides and cascades are reported but no `wl` mutation is performed
  *   (AC4).
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, unclosedCount: number, unclosedItems: Array<{id: string, title: string, reason: string}>, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], producerOwned: string[]}> }}
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, unclosedCount: number, unclosedItems: Array<{id: string, title: string, reason: string}>, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -618,7 +635,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     getAncestorAuditFn = (item) => resolveCandidateCoverage(item),
     runOverrideCommand = (childId, ancestorId, reason) => {
       execSync(
-        `wl update ${childId} --assignee "" --json`,
+        `wl update ${childId} --needs-producer-review false --json`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       );
       execSync(
@@ -692,23 +709,23 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
 
   console.log(`Found ${items.length} work item(s).`);
 
-  // Filter: close items that are not producer-held. A producer-held child
-  // whose nearest in_review ancestor is an
+  // Filter: close items where needsProducerReview === false. A child with
+  // needsProducerReview === true whose nearest in_review ancestor is an
   // audit-ready release candidate (readyToClose === true) is OVERRIDDEN:
   // its flag is cleared (with an explanatory comment) and it is closed
   // (SA-0MUJLWPB10038Z8Q AC1). The override is authorised ONLY by the
-  // parent's passing audit — never by status alone (AC3). Producer-held
-  // items without coverage are skipped.
+  // parent's passing audit — never by status alone (AC3). Items with
+  // needsProducerReview null/undefined, or true-but-uncovered, are skipped.
   const toClose = [];
   const overriddenItems = [];
   const skippedItems = [];
   for (const item of items) {
-    if (!isProducerHeld(item)) {
+    if (item.needsProducerReview === false) {
       toClose.push(item);
       continue;
     }
 
-    if (isProducerHeld(item) && item.parentId) {
+    if (item.needsProducerReview === true && item.parentId) {
       let coverage = null;
       try {
         coverage = getAncestorAuditFn(item);
@@ -717,18 +734,18 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       }
       if (coverage && coverage.outcome === 'covered') {
         const reason = `Auto-override by ship release (SA-0MUJLWPB10038Z8Q): `
-          + `producer hold cleared — this child is covered by the passing `
+          + `needsProducerReview cleared — this child is covered by the passing `
           + `audit of in_review ancestor ${coverage.ancestorId}.`;
         if (dryRun) {
           console.log(
             `  ○ ${item.title || item.id} (${item.id}) — dry-run: would override `
-            + `producer hold via ancestor ${coverage.ancestorId}`,
+            + `needsProducerReview via ancestor ${coverage.ancestorId}`,
           );
         } else {
           try {
             runOverrideCommand(item.id, coverage.ancestorId, reason);
             console.log(
-              `  ✓ ${item.title || item.id} (${item.id}) — cleared producer hold `
+              `  ✓ ${item.title || item.id} (${item.id}) — cleared needsProducerReview `
               + `(covered by ${coverage.ancestorId})`,
             );
           } catch (err) {
@@ -786,7 +803,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   const candidateIds = new Set(toClose.map((item) => item.id));
   // Full candidate set keyed by id. Used to classify a non-candidate,
   // non-terminal descendant that is held back solely because
-  // producer-held descendants separately from generic out-of-scope
+  // `needsProducerReview === true` separately from generic out-of-scope
   // collateral (SA-0MUJKPDAA002VVDP AC2).
   const candidateItemsById = new Map(items.map((item) => [item.id, item]));
   const refusedItems = [];
@@ -878,26 +895,26 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
         }
       }
     }
-    // AC2: a descendant held back solely because it is producer-held
+    // AC2: a descendant held back solely because `needsProducerReview=true`
     // (a candidate skipped with its producer-review flag still set) must be
     // reported with a distinct reason rather than lumped under the generic
     // collateral message. The parent is still refused either way — this
     // classifies the cause, it does not weaken the scope guard (AC3).
-    const producerOwned = collateral.filter((id) => {
+    const needsProducerReview = collateral.filter((id) => {
       const candidate = candidateItemsById.get(id);
-      return !!candidate && isProducerHeld(candidate);
+      return !!candidate && candidate.needsProducerReview === true;
     });
-    const producerOwnedIds = new Set(producerOwned);
-    const outsideSetCollateral = collateral.filter((id) => !producerOwnedIds.has(id));
+    const needsProducerReviewIds = new Set(needsProducerReview);
+    const outsideSetCollateral = collateral.filter((id) => !needsProducerReviewIds.has(id));
     if (collateral.length > 0) {
       let reason;
       if (outsideSetCollateral.length > 0) {
         reason = `Refused: --force close would sweep descendant(s) outside the candidate set: ${outsideSetCollateral.join(', ')}`;
-        if (producerOwned.length > 0) {
-          reason += `; descendant(s) need producer review: ${producerOwned.join(', ')}`;
+        if (needsProducerReview.length > 0) {
+          reason += `; descendant(s) need producer review: ${needsProducerReview.join(', ')}`;
         }
       } else {
-        reason = `Refused: descendant(s) need producer review: ${producerOwned.join(', ')}`;
+        reason = `Refused: descendant(s) need producer review: ${needsProducerReview.join(', ')}`;
       }
       console.log(`  ○ ${item.title || item.id} (${item.id}) — ${reason}`);
       refusedItems.push({
@@ -905,7 +922,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
         title: item.title,
         reason,
         collateral,
-        producerOwned,
+        needsProducerReview,
       });
     } else {
       closable.push(item);
@@ -1340,75 +1357,157 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
 
   console.log(`\nWaiting for status checks on ${prUrl}...`);
 
-  const startTime = Date.now();
-  const maxWait = timeoutSeconds * 1000;
   const prNumber = prUrl.split('/').pop();
+  const outcome = waitForPRChecksOutcome(prNumber, timeoutSeconds);
 
-  // Poll for status checks every 10 seconds
-  while (Date.now() - startTime < maxWait) {
+  // No CI configured on this repo/branch — proceed without a CI gate.
+  if (outcome === 'no_checks') {
+    console.log('No CI status checks present on the PR — proceeding without a CI gate.');
+    mergePR(prNumber);
+    return {
+      success: true,
+      message: `PR ${prUrl} merged successfully.`,
+    };
+  }
+
+  if (outcome === 'failed') {
+    return {
+      success: false,
+      message: 'Some CI checks failed on the PR. Manual intervention required.',
+    };
+  }
+
+  if (outcome === 'passed') {
+    console.log('All status checks passed. Merging PR...');
+    mergePR(prNumber);
+    return {
+      success: true,
+      message: `PR ${prUrl} merged successfully.`,
+    };
+  }
+
+  return {
+    success: false,
+    message: `Timed out waiting for status checks on ${prUrl} after ${timeoutSeconds} seconds. Merge the PR manually.`,
+  };
+}
+
+/**
+ * Merge a PR once its checks (if any) are green.
+ *
+ * @param {string} prNumber - The PR number extracted from the URL.
+ */
+function mergePR(prNumber) {
+  execSync(`gh pr merge ${prNumber} --merge --delete-branch`, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'inherit', 'pipe'],
+  });
+}
+
+/**
+ * Wait completion-aware for a PR's status checks via the shared helper.
+ *
+ * Resolves the first existing candidate path from *candidates*, so both the
+ * repository layout (`skill/ship/scripts/...`) and the installed global skill
+ * layout (`~/.pi/agent/skills/ship/...`) resolve.
+ *
+ * @param {string[]} candidates - Absolute candidate paths.
+ * @returns {string|null} The first existing path, or null.
+ */
+function resolveExistingPath(candidates) {
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Launch the PR status-check poller in the background and wait on it
+ * completion-aware with `wait_for_job.py` (SA-0MVDP9B83004UD5E).
+ *
+ * The poller (`wait_for_pr_checks.py`) polls `gh pr view` until the checks
+ * settle and writes a terminal outcome marker. `wait_for_job.py` waits on
+ * that marker/process — returning as soon as it completes (with a heartbeat)
+ * instead of the deprecated fixed `sleep 10` poll loop. Returns the poller's
+ * outcome string, or `'timeout'` when it did not settle in time.
+ *
+ * @param {string} prNumber - The PR number to poll.
+ * @param {number} timeoutSeconds - Maximum time to wait for checks.
+ * @returns {'no_checks'|'passed'|'failed'|'timeout'}
+ */
+function waitForPRChecksOutcome(prNumber, timeoutSeconds) {
+  const python = process.env.PYTHON || 'python3';
+  const poller = resolveExistingPath(SKILL_PR_POLLER_CANDIDATES);
+  const helper = resolveExistingPath(SKILL_WAIT_HELPER_CANDIDATES);
+
+  // Fall back to a bounded, single-shot query when the background-job
+  // tooling is unavailable (e.g. an install predating SA-0MVCX570P003VLBK).
+  // The fallback is intentionally NOT a fixed-sleep poll loop: the release
+  // must never regress to blind polling.
+  if (!poller || !helper) {
     try {
       const statusJson = execSync(
         `gh pr view ${prNumber} --json statusCheckRollup`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       );
-      const status = JSON.parse(statusJson);
-
-      const checks = status.statusCheckRollup || [];
-
-      // No CI configured on this repo/branch — proceed without a CI gate.
-      if (checks.length === 0) {
-        console.log('No CI status checks present on the PR — proceeding without a CI gate.');
-        execSync(`gh pr merge ${prNumber} --merge --delete-branch`, {
-          encoding: 'utf-8',
-          stdio: ['pipe', 'inherit', 'pipe'],
-        });
-        return {
-          success: true,
-          message: `PR ${prUrl} merged successfully.`,
-        };
+      const checks = (JSON.parse(statusJson).statusCheckRollup) || [];
+      if (checks.length === 0) return 'no_checks';
+      if (checks.some((c) => c.conclusion === 'FAILURE' || c.conclusion === 'CANCELLED')) {
+        return 'failed';
       }
-
-      const allCompleted = checks.every(
-        (c) => c.status === 'COMPLETED',
-      );
-      const anyFailed = checks.some(
-        (c) => c.conclusion === 'FAILURE' || c.conclusion === 'CANCELLED',
-      );
-
-      if (anyFailed) {
-        return {
-          success: false,
-          message: 'Some CI checks failed on the PR. Manual intervention required.',
-        };
-      }
-
-      if (allCompleted) {
-        console.log('All status checks passed. Merging PR...');
-        execSync(`gh pr merge ${prNumber} --merge --delete-branch`, {
-          encoding: 'utf-8',
-          stdio: ['pipe', 'inherit', 'pipe'],
-        });
-        return {
-          success: true,
-          message: `PR ${prUrl} merged successfully.`,
-        };
-      }
-
-      // Wait 10 seconds before polling again
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      process.stdout.write(`\rWaiting for status checks... (${elapsed}s)`);
+      if (checks.every((c) => c.status === 'COMPLETED')) return 'passed';
     } catch {
-      // If gh command fails temporarily, retry
+      // fall through to timeout
     }
-
-    execSync('sleep 10', { stdio: 'ignore' });
+    return 'timeout';
   }
 
-  console.log(''); // newline after progress dots
-  return {
-    success: false,
-    message: `Timed out waiting for status checks on ${prUrl} after ${timeoutSeconds} seconds. Merge the PR manually.`,
-  };
+  const workDir = mkdtempSync(join(tmpdir(), 'ship-pr-checks-'));
+  const markerPath = join(workDir, 'outcome.json');
+  const logPath = join(workDir, 'poller.log');
+  // Poll/heartbeat cadence: keep the historical 10 s for long waits but stay
+  // responsive for short timeouts (and tests).
+  const interval = Math.max(0.2, Math.min(10, timeoutSeconds / 5));
+
+  try {
+    const logFd = openSync(logPath, 'a');
+    let child;
+    try {
+      child = spawn(
+        python,
+        [poller, '--pr', String(prNumber), '--timeout', String(timeoutSeconds),
+          '--interval', String(interval), '--marker', markerPath],
+        { detached: true, stdio: ['ignore', logFd, logFd] },
+      );
+    } finally {
+      closeSync(logFd);
+    }
+    child.unref();
+
+    // Completion-aware wait: --pid (poller exit) + --marker (outcome file) +
+    // --log/--pattern (terminal line) — whichever happens first wins.
+    spawnSync(
+      python,
+      [helper,
+        '--pid', String(child.pid),
+        '--marker', markerPath,
+        '--log', logPath, '--pattern', 'outcome:',
+        '--timeout', String(timeoutSeconds + 15),
+        '--interval', String(interval),
+        '--message', `PR status checks for ${prNumber}`],
+      { stdio: ['ignore', 'inherit', 'inherit'] },
+    );
+
+    try {
+      const parsed = JSON.parse(readFileSync(markerPath, 'utf-8'));
+      if (parsed && typeof parsed.outcome === 'string') return parsed.outcome;
+    } catch {
+      // marker missing/unreadable — treat as timeout
+    }
+    return 'timeout';
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
 }
 
 // ── runRelease ───────────────────────────────────────────────────────────────

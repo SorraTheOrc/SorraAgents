@@ -50,7 +50,7 @@ def main():
 
     # Load thresholds from references file
     try:
-        with open("references/t-shirt_sizes.json", "r") as f:
+        with open("references/t-shirt_sizes.json") as f:
             tshirt_cfg = json.load(f)
             thresholds = tshirt_cfg.get("thresholds", {})
     except Exception:  # noqa: BLE001

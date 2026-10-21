@@ -118,7 +118,7 @@ from audit.scripts.persist_audit import (
 )
 from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
-from scripts.pi_utils import extract_pi_text
+from scripts.pi_utils import extract_pi_text, extract_pi_text_with_fallback
 
 try:
     from shared.git_sandbox import scrub_repository_overrides
@@ -154,6 +154,19 @@ from test.scripts.run_tests import (
     suite_timeout_per_command,
 )
 from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
+
+#: Audit-specific acceptance window for GREEN cached full-suite runs.
+#: The generic ``DEFAULT_TTL_SECONDS`` (2h) is kept for suite runs elsewhere;
+#: the audit instead accepts gate-produced evidence (the dev-push pre-push
+#: hook/`ship` release gate full runs, SA-0MVECQUGF0064U81) for up to 24h at
+#: the SAME git state, so auditing an item pushed yesterday — or a re-audit,
+#: or an audit after HEAD drifted — reuses the cached green run instead of
+#: F3 auto-executing a fresh full suite. The git-state key still guarantees
+#: the tree is byte-identical to the proven run; the window only guards
+#: environmental drift (deps/infra). Failed runs are NOT extended: the cache
+#: trims non-zero-exit entries to the short 5-minute TTL
+#: (FAILED_RUN_TTL_SECONDS) regardless of this value.
+AUDIT_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 # ---------------------------------------------------------------------------
 # Recursion guard: LIVE_REPO_GUARD_ACTIVE propagation (SA-0MUG47DYG006TV40)
@@ -855,6 +868,12 @@ _PI_RETRY_BACKOFF_SECONDS = 2.0
 Backoff grows linearly: 1x, 2x, ... base per retry attempt.
 """
 
+#: Maximum number of characters of raw pi stream embedded in an unparseable
+#: -output diagnostic. Bounds the evidence field so a huge stream never bloats
+#: a report; the head keeps the session preamble/event shapes and the tail
+#: keeps the terminating event (usually the informative one) for debugging.
+_UNPARSEABLE_RAW_MAX_CHARS = 4000
+
 # ---------------------------------------------------------------------------
 # Per-run reliability summary (SA-0MU32TH89000YHP9, R7)
 # ---------------------------------------------------------------------------
@@ -1137,6 +1156,12 @@ VERDICT_PARTIAL = "partial"
 VERDICT_ADJUSTED = "adjusted"
 VERDICT_WARNING = "warning"  # zero-AC sentinel / extraction failure (SA-0MSRLLQ0V008EW3J)
 _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
+
+# Child-assessment reason codes (SA-0MVAWFYZE0040SQ3 AC3): machine-parseable
+# diagnostics that distinguish an unserviced-in-main-slot child from a
+# genuine not-ready child.
+REASON_UNSERVICED_IN_MAIN_SLOT = "unserviced_in_main_slot"
+REASON_NOT_ASSESSED = "not_assessed"
 
 
 def _normalize_verdict(verdict: str | None) -> str:
@@ -1958,11 +1983,12 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     for the fingerprint computation and the time-gate ``updatedAt``. When
     omitted, the work item is fetched via ``wl show``.
 
-    *comments* is the item's already-fetched ``wl show`` comment list. It is
-    passed into the fingerprint computation so comment-recorded commit hashes
-    contribute to the touched-file set; callers must pass the SAME comments
-    at audit time and check time for the resolved set to be stable (see
-    ``_resolve_touched_files``).
+    *comments* is the item's comment list (fetched via ``wl show``). It is
+    optional: when supplied it is forwarded to the fingerprint computation;
+    when omitted, ``_compute_content_fingerprint`` fetches it itself
+    (deterministic comment source, SA-0MVAWFYKT002CQ3L), so the
+    audit-time and check-time computations agree even when the caller does
+    not hold the list (parent child-reuse gate, read-only freshness probe).
     """
 
     try:
@@ -2134,6 +2160,36 @@ def _normalise_repo_path(path: str) -> str:
     return p.strip()
 
 
+def _fetch_item_comments(runner: Runner, issue_id: str,
+                         worklog_dir: str | None = None) -> list[dict]:
+    """Best-effort fetch of a work item's comments for the fingerprint.
+
+    ``wl show --json`` returns the item's comments at the TOP level of the
+    payload (beside ``workItem`` — SA-0MSPZDALB000S18P), which is what
+    ``_bind_fetched_item`` binds into ``ctx.comments``. Used to make the
+    comment-recorded commit-hash source deterministic: callers that do not
+    already hold the comments list (the parent child-reuse gate and the
+    read-only freshness probe) fetch it here so the fingerprint they
+    compute matches the one the audit recorded at persist time
+    (SA-0MVAWFYKT002CQ3L).
+
+    Returns an empty list when the item has no comments or the fetch fails
+    (fail-open: the fingerprint then falls back to the item-id-grep and Key
+    Files sources).
+    """
+    if not issue_id:
+        return []
+    try:
+        data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except Exception:  # noqa: BLE001 -- best-effort; never fail the fingerprint
+        return []
+    if not isinstance(data, dict):
+        return []
+    comments = data.get("comments")
+    return list(comments) if isinstance(comments, list) else []
+
+
 def _extract_comment_commit_hashes(comments: Sequence[dict] | None) -> list[str]:
     """Extract candidate commit shas recorded in a work item's comments.
 
@@ -2168,9 +2224,7 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
        the item id in every commit message (``<WIP-id>: <summary>``);
     2. files in commits whose hashes are recorded in the item's *comments*
        (the implement skill records each change's commit hash there) — a
-       best-effort safety net for commits whose message lacks the id. Only
-       resolved when the caller supplies *comments* (see the determinism
-       note below);
+       best-effort safety net for commits whose message lacks the id;
     3. the ``Key Files`` entries parsed from the description.
 
     Paths are normalised, de-duplicated, and sorted. Returns ``None`` (the
@@ -2181,14 +2235,18 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
 
     **Determinism.** The fingerprint is recomputed on every freshness check,
     so the touched-file set must be identical at audit time and check time.
-    Comment-derived hashes are therefore used only when the caller explicitly
-    supplies *comments*; callers that hold the fetched item pass the same
-    comments list at both points. Callers that avoid an extra fetch (child
-    reuse paths, SA-0MSL1Z7E9005TLBA) pass ``None`` and rely on the grep +
-    Key Files sources, which keeps the two computations consistent.
+    The fingerprint layer (``_compute_content_fingerprint``) guarantees this
+    by supplying the item's comments at every call site: callers that hold
+    the fetched list pass it through, and callers that do not (child-reuse
+    paths, the read-only freshness probe) have it fetched there
+    (deterministic comment source, SA-0MVAWFYKT002CQ3L). This function
+    itself stays a pure resolver — the comment source contributes only when
+    *comments* is supplied; direct callers building the Phase-2 file-scope
+    manifest rely on the grep + Key Files sources, which is stable for their
+    use.
 
     *work_item* may be passed in to reuse an already-fetched item; when
-    omitted it is fetched via ``wl show`` (unless *comments* are supplied).
+    omitted it is fetched via ``wl show``.
     """
     if work_item is None:
         try:
@@ -2379,10 +2437,13 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
     artefact is treated as a genuine change (the safe direction — stale ⇒
     re-run). See ``docs/dev/audit-skill-reference.md``.
 
-    *work_item* / *comments* may be passed in to avoid a redundant ``wl show``
-    call when the caller already fetched the item (SA-0MSL1Z7E9005TLBA). Both
-    must be supplied consistently at audit time and check time so the resolved
-    touched-file set is stable (see ``_resolve_touched_files``).
+    *work_item* / *comments* may be passed in to avoid redundant ``wl show``
+    calls when the caller already fetched the item (SA-0MSL1Z7E9005TLBA). Both
+    are determined automatically when omitted: the fingerprint always resolves
+    the item's comments itself (deterministic comment source,
+    SA-0MVAWFYKT002CQ3L), so the comment-recorded commit-hash component of
+    the touched-file set contributes identically at audit/persist time,
+    parent child-reuse check time, and the read-only freshness probe.
 
     Returns a sha256 hex digest of the canonical JSON payload, or ``None``
     when the fingerprint cannot be determined (touched set unresolved, git
@@ -2396,6 +2457,17 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
         except Exception:  # noqa: BLE001 -- fail open on any wl/runner failure
             return None
         work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
+        if comments is None and isinstance(data, dict):
+            # Reuse the comments from the same payload — no second fetch.
+            fetched = data.get("comments")
+            if isinstance(fetched, list):
+                comments = fetched
+    if comments is None and issue_id:
+        # Check-time callers (child-reuse gate, freshness probe) do not hold
+        # the comments list, so fetch it here. This keeps the touched-file
+        # set — and therefore the fingerprint — identical to the one the
+        # audit recorded at persist time (SA-0MVAWFYKT002CQ3L).
+        comments = _fetch_item_comments(runner, issue_id, worklog_dir=worklog_dir)
     description = work_item.get("description", "") or ""
     key_files = _extract_key_files(description)
     touched = _resolve_touched_files(
@@ -2945,7 +3017,7 @@ def _classify_full_suite_cache(
     problems: list[str] = []
     for command in commands:
         entry = query_cached(
-            command, cwd=str(project_root), ttl=DEFAULT_TTL_SECONDS,
+            command, cwd=str(project_root), ttl=AUDIT_CACHE_TTL_SECONDS,
         )
         if entry is None:
             problems.append(
@@ -4474,7 +4546,33 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     # Parse JSON lines looking for the final agent_end message
     text = extract_pi_text(raw)
     if not text:
-        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds, **retry_meta}
+        # Recovery pass: tolerate alternative stream shapes the canonical
+        # parser may have skipped (e.g. a string-encoded assistant event)
+        # before declaring the output unparseable. This is what lets a child
+        # Phase-1 screen subprocess recover a valid verdict instead of
+        # silently degrading to 'partial' (WL-0MU0FHSEP003PCDY AC1).
+        text = extract_pi_text_with_fallback(raw)
+    if not text:
+        # Diagnostic path (WL-0MU0FHSEP003PCDY AC3): the subprocess stream
+        # genuinely could not be parsed. Record the raw output (truncated)
+        # plus explicit provenance so callers can distinguish a parse failure
+        # from a provider error/timeout and log it into the AC evidence.
+        return {
+            "verdict": "unmet",
+            "evidence": "",
+            "raw_stdout": stdout,
+            "raw_stderr": stderr,
+            "extracted_text": "",
+            "_unparseable_output": True,
+            "_unparseable_raw_stdout": _truncate_raw_output(
+                stdout, _UNPARSEABLE_RAW_MAX_CHARS,
+            ),
+            "_unparseable_raw_stderr": _truncate_raw_output(
+                stderr, _UNPARSEABLE_RAW_MAX_CHARS,
+            ),
+            "elapsed_seconds": elapsed_seconds,
+            **retry_meta,
+        }
 
     # Input-token capture (AC2 of SA-0MSISKM8F004NW1U): the pi JSON stream's
     # agent_end message carries the provider usage block, so each call's
@@ -4502,6 +4600,42 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
 
     # If Pi returned free-form text, use it as evidence and default to met
     return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds, "input_tokens": input_tokens, **retry_meta}
+
+
+def _truncate_raw_output(raw: str | None, limit: int) -> str:
+    """Bound a raw stream string for embedding in a diagnostic field.
+
+    When the string exceeds *limit* characters the head and tail are kept
+    (joined by a marker) so the stream's session preamble and its terminating
+    event both survive — the two ends an operator needs to identify a format
+    mismatch. ``None``/empty input yields an empty string.
+    """
+    if not raw:
+        return ""
+    if len(raw) <= limit:
+        return raw
+    head = raw[: limit // 2]
+    tail = raw[-(limit - limit // 2):]
+    return f"{head}\n... [truncated {len(raw) - limit} chars] ...\n{tail}"
+
+
+def _parse_failure_evidence(result: dict, phase: str) -> str:
+    """Build diagnostic evidence for a response that could not be parsed.
+
+    Names the failure phase and, when ``_call_pi`` captured the subprocess
+    stream, embeds a truncated head+tail of the raw pi output so operators can
+    see the actual format that failed to parse (WL-0MU0FHSEP003PCDY AC3). The
+    raw output is only present for genuine parse failures — provider errors and
+    timeouts carry their own dedicated evidence and never reach this helper.
+    """
+    base = "Pi model output could not be parsed — raw output logged."
+    raw = result.get("_unparseable_raw_stdout") if isinstance(result, dict) else None
+    if raw:
+        return (
+            f"{base} Phase: {phase}. "
+            f"Raw output (truncated): {raw[: _UNPARSEABLE_RAW_MAX_CHARS]}"
+        )
+    return f"{base} Phase: {phase}."
 
 
 def _extract_input_tokens(raw: str) -> int | None:
@@ -4670,23 +4804,26 @@ def _reask_json_array_once(
     timeout: int | None,
     instruction: str,
     priority: int | None = None,
+    child_screen: bool = False,
 ) -> list | None:
     """Issue exactly one bounded 'return only the JSON array' re-ask.
 
     Called at a Phase 1/2 parse site when the first response could not be
     parsed into an index-bearing verdict array. The re-ask is observable
-    under the ``verdict_reask`` context and bounded by the per-call budget.
-    Returns the recovered batch, or ``None`` when the single re-ask also
-    fails (timeout, provider error, or unparseable output) — the caller then
-    falls back to the conservative ``partial`` verdict, never ``met``
-    (SA-0MU32TCFM003B78I AC3/AC5).
+    under the ``verdict_reask`` context and bounded by the per-call budget
+    (child Phase-1 screens keep their short budget when *child_screen* is
+    True, so the retry is as bounded as the call it retries —
+    WL-0MU0FHSEP003PCDY AC4). Returns the recovered batch, or ``None`` when
+    the single re-ask also fails (timeout, provider error, or unparseable
+    output) — the caller then falls back to the conservative ``partial``
+    verdict, never ``met`` (SA-0MU32TCFM003B78I AC3/AC5).
     """
     prompt = _JSON_REASK_PREFIX + _JSON_REASK_SCHEMA + "\n\n" + instruction
     try:
         result = _call_pi_and_maybe_log(
             issue_id, "verdict_reask", prompt,
             model=model, pi_bin=pi_bin, debug_log=debug_log,
-            timeout=timeout, json_expected=True,
+            timeout=timeout, json_expected=True, child_screen=child_screen,
             priority=priority if priority is not None else Priority.MEDIUM,
         )
     except RuntimeError:
@@ -5233,6 +5370,121 @@ def _write_pending_screens_signal(
         pass
 
 
+def _is_unserviced_main_slot_child(
+    child: dict,
+    stale_pending_ids: set[str] | None,
+) -> bool:
+    """True when *child* is an UN-SERVICED in-main-slot child from a previous run.
+
+    Reads the persisted ``<issue_id>.pending-screens.json`` signal written
+    by the PREVIOUS run (the *stale* pending ids, see
+    :func:`_read_pending_screens_signal`) plus the child's own pending
+    state: a child named in the stale signal whose ``ac_results`` still
+    carry the unserviced in-main-slot pending marker (``partial`` +
+    :data:`MAIN_SLOT_PENDING_EVIDENCE`) was left pending by an invoking
+    session that never serviced its ``[AUDIT_IN_MAIN_SLOT_WORK]`` screens.
+    The parent must not re-block its readiness decision on such a child
+    (SA-0MVAWFUU0004VW45 AC2). Whether the child INHERITS a previously
+    stored verdict or is reported NOT-ASSESSED is decided by the caller via
+    :func:`_child_has_stored_verdict`.
+    """
+    cid = str(child.get("id", "") or "")
+    if not cid or not stale_pending_ids or cid not in stale_pending_ids:
+        return False
+    acs = child.get("ac_results") or []
+    return any(
+        a.get("verdict") == VERDICT_PARTIAL
+        and MAIN_SLOT_PENDING_EVIDENCE in str(a.get("evidence", ""))
+        for a in acs
+    )
+
+
+def _child_has_stored_verdict(child: dict) -> bool:
+    """True when *child* carries a previously stored child-audit verdict.
+
+    The child-verdict reuse path (LP-0MSQ32MF200675AR) records
+    ``reused_from`` (the child audit's audited-at timestamp) plus an
+    explicit ``child_audit_ready`` bool when it reuses a persisted child
+    audit. An unserviced in-main-slot child carrying such markers INHERITS
+    the stored verdict instead of being reported not-assessed
+    (SA-0MVAWFUU0004VW45 AC2).
+    """
+    return bool(child.get("reused_from")) or child.get("child_audit_ready") is not None
+
+
+def _unserviced_main_slot_child_ids(
+    child_results: list[dict],
+    stale_pending_ids: set[str] | None,
+) -> set[str]:
+    """Ids of *child_results* that are un-serviced in-main-slot children.
+
+    The stale-signal subtraction point shared by the report-assembly and
+    JSON-payload paths: every such child is subtracted from the pending
+    gate before the readiness calculation (SA-0MVAWFUU0004VW45 AC2).
+    """
+    return {
+        str(c.get("id", "") or "")
+        for c in child_results or []
+        if _is_unserviced_main_slot_child(c, stale_pending_ids)
+    }
+
+
+def _classify_child_assessment_reason(
+    child: dict,
+    stale_pending_ids: set[str] | None,
+) -> str | None:
+    """Return a machine-parseable reason code for a child's assessment state.
+
+    Reasons (SA-0MVAWFYZE0040SQ3 AC3):
+
+    * ``unserviced_in_main_slot`` — the child is an un-serviced in-main-slot
+      child from a previous run (stale pending-screens signal present, ac_results
+      carry the unserviced pending marker).  Whether the parent inherits a
+      stored verdict or not is a separate concern; the reason always names the
+      unserviced-in-main-slot origin.
+    * ``not_assessed`` — the child is genuinely not-ready and has no stored
+      verdict (a normal "not ready" verdict).
+    * ``None`` — the child is assessed (stored-verdict-inherited, in_review,
+      done, exempt, etc.) and does not need a diagnostic.
+
+    The caller decides whether to surface the code in the report or JSON payload.
+    """
+    if _is_unserviced_main_slot_child(child, stale_pending_ids):
+        return REASON_UNSERVICED_IN_MAIN_SLOT
+    # A child whose child_audit_ready is False and which is not unserviced
+    # is genuinely not-ready / not-assessed.
+    if child.get("child_audit_ready") is False:
+        return REASON_NOT_ASSESSED
+    return None
+
+
+def _read_pending_screens_signal(
+    issue_id: str,
+    owning_root: str | Path | None,
+    explicit_dir: str | None = None,
+) -> set[str]:
+    """Read the resumable in-main-slot pending-screens signal of a previous run.
+
+    Returns the set of child ids whose in-main-slot screens were left
+    pending by the PREVIOUS run (the *stale* pending ids), or an empty set
+    when no signal exists (no previous in-main-slot run, checkpointing
+    disabled, or all screens serviced/cleared). Best-effort: a missing or
+    unreadable file yields an empty set, never an error
+    (SA-0MVAWFUU0004VW45 AC2).
+    """
+    directory = resolve_checkpoint_dir(owning_root, explicit_dir)
+    if directory is None:
+        return set()
+    signal = Path(directory) / f"{issue_id}{PENDING_SCREENS_SIGNAL_SUFFIX}"
+    try:
+        if not signal.is_file():
+            return set()
+        payload = json.loads(signal.read_text(encoding="utf-8"))
+        return set(payload.get("pending_child_screens") or [])
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
 def _format_blocking_children(children: list[dict]) -> str:
     """Render pre-review children for the report's summary line.
 
@@ -5263,7 +5515,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            test_skill_run_sha: str | None = None,
                            content_fingerprint: str | None = None,
                            merge_gate_evidence: str | None = None,
-                           snapshot_exempt: set[str] | None = None) -> str:
+                           snapshot_exempt: set[str] | None = None,
+                           stale_pending_ids: set[str] | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -5335,9 +5588,37 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         ("Ready to close: No"). Medium and low findings produce warnings
         but do NOT block closure.
     """
+    # UN-SERVICED in-main-slot children (SA-0MVAWFUU0004VW45 AC2): a child
+    # whose screens were left pending by a PREVIOUS run (stale
+    # pending-screens signal) and whose ac_results still carry the unserviced
+    # pending marker is subtracted from the pending gate below. With a
+    # previously STORED verdict the parent INHERITS it — the child's partial
+    # acs no longer count against all_ac_acceptable (the stored verdict
+    # governs); without one the child is NOT-ASSESSED — its acs still count
+    # (partial ⇒ not acceptable ⇒ the parent is never reported ready).
+    unserviced_ids = _unserviced_main_slot_child_ids(child_results, stale_pending_ids)
+
+    # Child-assessment reason diagnostics (SA-0MVAWFYZE0040SQ3 AC3): classify
+    # every child and collect greppable diagnostic lines.
+    child_reasons: dict[str, str] = {}
+    for c in child_results:
+        cid = str(c.get("id", "") or "")
+        reason = _classify_child_assessment_reason(c, stale_pending_ids)
+        if reason:
+            child_reasons[cid] = reason
+
+    child_acs = [
+        a
+        for c in child_results
+        if (
+            str(c.get("id", "") or "") not in unserviced_ids
+            or not _child_has_stored_verdict(c)
+        )
+        for a in c.get("ac_results", [])
+    ]
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
-        for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+        for r in ac_results + child_acs
     )
     # Check that all active children are in in_review or done stage.
     # The stage check is independent of inherited_pass (parent-first
@@ -5381,7 +5662,10 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     # Explicit child-audit execution gate (SA-0MU32TE120012T49): in-main-slot
     # pending child screens are never presented as a normal result. The gate
     # names the child ids and how to complete them, and forces Ready=No.
-    pending_child_screens = _pending_main_slot_child_ids(child_results)
+    pending_child_screens = [
+        cid for cid in _pending_main_slot_child_ids(child_results)
+        if cid not in unserviced_ids
+    ]
     gate_lines: list[str] = []
     if pending_child_screens:
         ready = "No"
@@ -5618,6 +5902,18 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     lines.append("")
     lines.append("## Children Status")
     lines.append("")
+
+    # Child-assessment reason diagnostics (SA-0MVAWFYZE0040SQ3 AC3): emit a
+    # greppable diagnostic line for every child that is unserviced-in-main-slot
+    # or genuinely not-ready.  The line is machine-parseable (``REASON_*``
+    # tokens) and human-readable.
+    if child_reasons:
+        reason_parts = [
+            f"[{reason}] {cid}"
+            for cid, reason in sorted(child_reasons.items())
+        ]
+        lines.append("Child assessment reasons: " + ", ".join(reason_parts))
+        lines.append("")
 
     if not child_results:
         lines.append("No children.")
@@ -6638,9 +6934,14 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                         "issue_id": child.get("id"),
                         "child_id": child.get("id"),
                         "context": "child_ac_fallback",
+                        "phase": "Phase 1 child screening",
                         "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
                         "parse_ok": False if not result.get("_provider_error") else None,
                         "raw_text": raw_text,
+                        "raw_stdout_truncated": _truncate_raw_output(
+                            result.get("_unparseable_raw_stdout") or "",
+                            _UNPARSEABLE_RAW_MAX_CHARS,
+                        ),
                         "result_verdict": result.get("verdict"),
                         "result_evidence": result.get("evidence", "")[:500],
                         "provider_error": result.get("_provider_error_message"),
@@ -6665,7 +6966,12 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                         f"Root-level diagnostic: {outer_evidence[:500]}"
                     )
                 else:
-                    evidence = "Pi model output could not be parsed — raw output logged"
+                    # AC3 (WL-0MU0FHSEP003PCDY): include the truncated raw
+                    # subprocess stream so the Phase-1 child screen failure is
+                    # diagnosable from the persisted AC evidence alone.
+                    evidence = _parse_failure_evidence(
+                        result, "Phase 1 child screening",
+                    )
             for ac in child_acs:
                 child_ac_results.append({
                     "text": ac,
@@ -6908,6 +7214,7 @@ def _build_issue_json(
     phase2_completed: bool = False,
     phase2_skip_note: str | None = None,
     snapshot_exempt: set[str] | None = None,
+    stale_pending_ids: set[str] | None = None,
 ) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
@@ -6922,9 +7229,39 @@ def _build_issue_json(
         do NOT block closure — only pre-review stages (``idea``,
         ``intake_complete``, ``plan_complete``) block.
     """
+    # UN-SERVICED in-main-slot children (SA-0MVAWFUU0004VW45 AC2): a child
+    # whose screens were left pending by a PREVIOUS run (stale
+    # pending-screens signal) and whose ac_results still carry the unserviced
+    # pending marker is subtracted from the pending gate below. With a
+    # previously STORED verdict the parent INHERITS it — the child's partial
+    # acs no longer count against all_ac_acceptable; without one the child is
+    # NOT-ASSESSED — its acs still count (partial ⇒ not acceptable ⇒ the
+    # parent is never reported ready).
+    unserviced_ids = _unserviced_main_slot_child_ids(child_results, stale_pending_ids)
+
+    # Child-assessment reason codes (SA-0MVAWFYZE0040SQ3 AC3): classify every
+    # child and emit machine-parseable diagnostics.
+    child_reasons: dict[str, str] = {}
+    not_assessed_children: list[dict] = []
+    for c in child_results:
+        cid = str(c.get("id", "") or "")
+        reason = _classify_child_assessment_reason(c, stale_pending_ids)
+        if reason:
+            child_reasons[cid] = reason
+            not_assessed_children.append({"id": cid, "reason": reason})
+
+    child_acs = [
+        a
+        for c in child_results
+        if (
+            str(c.get("id", "") or "") not in unserviced_ids
+            or not _child_has_stored_verdict(c)
+        )
+        for a in c.get("ac_results", [])
+    ]
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
-        for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+        for r in ac_results + child_acs
     )
     # Check that all active children are in in_review or done stage.
     # The stage check is independent of inherited_pass (parent-first
@@ -6956,7 +7293,10 @@ def _build_issue_json(
         cq_findings, fp_screen_results or []
     ))
 
-    pending_child_screens = _pending_main_slot_child_ids(child_results)
+    pending_child_screens = [
+        cid for cid in _pending_main_slot_child_ids(child_results)
+        if cid not in unserviced_ids
+    ]
     ready = (
         all_ac_acceptable
         and all_children_reviewed
@@ -7000,6 +7340,11 @@ def _build_issue_json(
         "summary": summary,
         "acceptance_criteria": ac_results,
         "children": child_results,
+        # Child-assessment reason diagnostics (SA-0MVAWFYZE0040SQ3 AC3):
+        # mapping of child id → reason code, and a compact list of
+        # not-assessed children with their reasons.
+        "child_reasons": child_reasons,
+        "not_assessed_children": not_assessed_children,
         "code_quality": {
             "total_findings": len(cq_findings),
             "fixes_applied": code_quality_fixes_applied,
@@ -7204,19 +7549,20 @@ def _deep_analyze_child(
             # Child Phase 2 output unparseable — disclose it explicitly
             # rather than silently keeping stale Phase 1 verdicts.  A valid
             # empty array is not a parse failure (existing contract).
+            # AC3 (WL-0MU0FHSEP003PCDY): when the subprocess stream was
+            # captured, embed a truncated head+tail of it in the evidence so
+            # the Phase-2 child deep failure is diagnosable from the report.
             if ac_fallback_used is not None:
                 ac_fallback_used.set()
+            diag = _parse_failure_evidence(
+                child_result, "Phase 2 child deep analysis",
+            )
             for i in range(len(updated_child_acs)):
                 prev_evidence = _evidence_text(updated_child_acs[i].get("evidence"))
                 updated_child_acs[i] = {
                     "text": updated_child_acs[i]["text"],
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": (
-                        (f"{prev_evidence} " if prev_evidence else "")
-                        + "Phase 2 child deep analysis did not return "
-                        "parseable results (model output could not be "
-                        "parsed). Phase: Phase 2 child deep analysis."
-                    ),
+                    "evidence": ((f"{prev_evidence} " if prev_evidence else "") + diag),
                 }
         else:
             reviewed = {
@@ -10184,6 +10530,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
     reasked = _reask_json_array_once(
         issue_id, model, pi_bin, debug_log, timeout, prompt,
         priority=effective_priority,
+        child_screen=child_screen,
     )
     if reasked:
         return result, reasked, raw_text
@@ -11678,6 +12025,16 @@ def _phase_report(ctx: _AuditContext) -> int:
         # Assemble and output report. The assembly is reusable: the bounded
         # re-ask path (SA-0MSF3RXUB000NLOI) reassembles the report after a
         # single model re-emit of the verdict array.
+        # UN-SERVICED in-main-slot children (SA-0MVAWFUU0004VW45 AC2): read
+        # the pending-screens signal written by the PREVIOUS run so children
+        # whose in-main-slot screens were never serviced are treated as
+        # not-assessed/inherited instead of re-blocking the parent's
+        # readiness decision. Read once here and shared by the report and the
+        # JSON payload (and by the signal rewrite below).
+        stale_pending_ids = _read_pending_screens_signal(
+            issue_id, ctx.owning_root, ctx.checkpoint_dir,
+        )
+
         def _assemble_report() -> str:
             assembled = _assemble_issue_report(
                 work_item, ac_results, child_results,
@@ -11696,6 +12053,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 content_fingerprint=content_fingerprint,
                 merge_gate_evidence=ctx.merge_gate_evidence,
                 snapshot_exempt=ctx.snapshot_exempt_children,
+                stale_pending_ids=stale_pending_ids,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if ctx.script_failure:
@@ -11741,6 +12099,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 phase2_completed=phase2_completed,
                 phase2_skip_note=phase2_skip_note,
                 snapshot_exempt=ctx.snapshot_exempt_children,
+                stale_pending_ids=stale_pending_ids,
             )
             payload["child_persist_results"] = child_persist_results
             # Include script failure info in JSON output
@@ -11922,15 +12281,6 @@ _STATUS_STAGE_COMPAT: dict[str, frozenset[str]] = {
     "deleted": frozenset({"idea", "intake_complete", "plan_complete", "done"}),
 }
 _DEFAULT_SAFE_STAGE = "plan_complete"
-
-#: Reserved assignee value that marks the producer's per-item scheduling hold.
-#: Mirrors ContextHub's ``PRODUCER_HOLD_ASSIGNEE`` in
-#: ``packages/herdr/src/downtime-worker.ts`` (WL-0MV85WDOM007BKF8; epic
-#: WL-0MV82CHGQ000HAZZ Q2). Assigning an item to the producer pauses
-#: auto-dispatch and marks the item producer-owned for the release gate —
-#: this replaces the retired ``needsProducerReview`` flag
-#: (WL-0MV85WE7Q00044P9).
-_PRODUCER_HOLD_ASSIGNEE = "Map"
 
 
 def _coerce_valid_status_stage(status, stage):
@@ -12309,15 +12659,16 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             expected_status, expected_stage = safe_status, safe_stage
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
-            # Producer hold (Option A; WL-0MV85WE7Q00044P9): a top-level item
-            # is assigned to the producer sentinel so the release gate blocks
-            # it until the producer reviews it. Child items are covered by
-            # their parent's review, so their assignee is CLEARED instead — a
-            # non-empty assignee would act as a scheduling hold and stop the
-            # item being re-dispatched (epic Q2; replaces the retired
-            # --needs-producer-review flag, SA-0MSSVKYEW008PJ9H). Either way
-            # the audit agent's own claim is released. The flag is inserted
-            # before the trailing --json (file convention: --json last).
+            # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6 / Q2=C): a
+            # top-level item is flagged `--needs-producer-review yes` so the
+            # release gate blocks it until the producer explicitly reviews
+            # it. Child items are covered by their parent's review, so they
+            # are NOT flagged — the flag would flood the producer queue with
+            # redundant approvals (SA-0MSSVKYEW008PJ9H). In both cases the
+            # audit agent's own assignee claim is CLEARED (status-neutral
+            # claim, WL-0MV85WCJJ0087VMP / WL-0MV7W77AY005MGBL fix). Flags
+            # are inserted before the trailing --json (file convention:
+            # --json last).
             # This is the sole authorisation for the descendant cascade
             # below — a passing verdict, not status/stage (AC3).
             cascade_authorised = True
@@ -12326,10 +12677,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                 cmd += ["--status", "completed"]
             else:
                 cmd += ["--status", "completed", "--stage", "in_review"]
+            cmd += ["--assignee", ""]
             if not ctx.wi or not ctx.wi.get("parentId"):
-                cmd += ["--assignee", _PRODUCER_HOLD_ASSIGNEE]
-            else:
-                cmd += ["--assignee", ""]
+                cmd += ["--needs-producer-review", "yes"]
             cmd.append("--json")
             restore_cmd = cmd
             # Stage is kept as the pre-existing 'done' when the item already
@@ -12383,13 +12733,14 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                 # integration fails the audit closed and flags the item for
                 # producer review so the producer investigates and integrates
                 # manually — never proceed past Phase 1 with unmerged work.
-                # The producer-review flag is re-homed onto the producer-hold
-                # assignee (WL-0MV85WE7Q00044P9).
+                # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6): flag the
+                # item for producer review, and clear the audit claim.
                 if ctx.merge_gate_blocker:
                     restore_cmd = [
                         "wl", "update", ctx.issue_id,
                         "--status", "open", "--stage", "plan_complete",
-                        "--assignee", _PRODUCER_HOLD_ASSIGNEE, "--json",
+                        "--assignee", "",
+                        "--needs-producer-review", "yes", "--json",
                     ]
     except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
         print(

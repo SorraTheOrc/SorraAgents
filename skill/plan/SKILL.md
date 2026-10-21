@@ -35,6 +35,15 @@ by the autoplan decision logic).
 - **Vertical slice phasing**: tracer-bullet approach — each phase cuts through ALL layers end-to-end, not a single horizontal layer. Between phases, review and update next items' descriptions.
 - When recommending next steps, the first must progress to the next process step with a summary.
 
+## Background jobs
+
+If planning or a proposed implementation step launches a long-running
+background process (audit, build, release, batch job, test sweep), follow the
+shared [background job etiquette](../shared/background-job-etiquette.md) —
+launch → prepare other work → **one completion-aware wait with progress** via
+`../shared/wait_for_job.py` → collect. Fixed-length `sleep N` polling of
+background processes is deprecated.
+
 ## Status lifecycle (first action)
 
 See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#workflow-for-ai-agents) for the claim-first pattern.
@@ -139,7 +148,10 @@ requests approval only for the largest and highest-risk work items — effort
 risk, or High/Severe risk with smaller effort) skips the approval pause and
 proceeds directly to the automated review stages. Absent effort/risk →
 default conservatively to requesting approval (a human checkpoint is never
-silently skipped).
+silently skipped); a value that is present but unrecognised (outside the
+canonical `wl` effort/risk vocabulary) likewise defaults conservatively to
+requesting approval, so a future vocabulary addition never silently skips
+the checkpoint (SA-0MUIUTJJS008W06Y).
 
 - **`request_approval == true`**: present the plan and ask the user to
   accept, edit, reorder, or split/merge — iterating until approved. State

@@ -27,8 +27,10 @@ MAX_DESC_BYTES = 140
 # SA-0MSRFTP2Y008BH6L) adds at most one more ≤140 B description; the
 # shared interview skill (SA-0MUBVM6FR000NDI1) adds a further one;
 # the machine-hygiene skill (WL-0MUJLCVRS0093EJJ) adds a 121 B one;
-# the test-churn skill (SA-0MV28WS5G004YNNS) adds a further 121 B one.
-MAX_TOTAL_PROSE_BYTES = 2341
+# the test-churn skill (SA-0MV28WS5G004YNNS) adds a further 121 B one;
+# the agent-log-review skill (SA-0MUEKTJRD0010CGC) adds a further 129 B one
+# (post-baseline prose, excluded from the 48% compaction AC like the others).
+MAX_TOTAL_PROSE_BYTES = 2500
 
 
 def _prose() -> dict[str, str]:
@@ -48,8 +50,9 @@ class TestDescriptionTemplate:
         # (SA-0MTOMCML900254CI); 18 after adding the shared interview skill
         # (SA-0MUBVM6FR000NDI1); 19 after adding machine-hygiene
         # (WL-0MUJLCVRS0093EJJ); 20 after adding the test-churn analyser
-        # (SA-0MV28WS5G004YNNS).
-        assert len(prose) == 20, f"expected 20 skills, got {len(prose)}"
+        # (SA-0MV28WS5G004YNNS); 21 after adding agent-log-review
+        # (SA-0MUEKTJRD0010CGC).
+        assert len(prose) == 21, f"expected 21 skills, got {len(prose)}"
 
     def test_each_description_within_140_chars(self):
         for name, desc in _prose().items():
@@ -88,13 +91,17 @@ class TestDescriptionTemplate:
         # (WL-0MUJLCVRS0093EJJ) is likewise new post-baseline prose and is
         # excluded for the same reason. Exclude these to keep the AC anchored
         # to the skills that were actually compacted.
+        # variable to the skills that were actually compacted.
         # test-churn (SA-0MV28WS5G004YNNS) is likewise new post-baseline
         # prose that never existed at intake, so it is excluded for the same
         # reason; its compactness is enforced by the per-description and
         # total-prose budgets above.
+        # agent-log-review (SA-0MUEKTJRD0010CGC) is likewise new post-baseline
+        # prose and is excluded; its compactness is enforced by the
+        # per-description and total-prose budgets above.
         compacted_total = sum(
             len(d) for k, d in prose.items()
-            if k not in ("report", "interview", "machine-hygiene", "test-churn")
+            if k not in ("report", "interview", "machine-hygiene", "test-churn", "agent-log-review")
         )
         reduction = 1 - compacted_total / baseline
         assert reduction >= 0.48, (

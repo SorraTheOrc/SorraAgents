@@ -46,6 +46,17 @@ Timeout semantics
 - ``timeout=0`` — fail fast: raise ``TimeoutError`` immediately if full.
 - ``timeout>0`` — bounded wait; raise ``TimeoutError`` at the deadline.
 
+Staggered-wait jitter (SA-0MVEDOF7A004TSWD)
+-------------------------------------------
+Bounded-wait consumers under a herd (the test skill's ``"test"`` semaphore)
+pass ``jitter`` (a fraction of the timeout, default ``0.0`` = off) so
+concurrent waiters do not all expire at one shared wall-clock instant and
+re-enter the pool in lockstep. With ``jitter>0`` each waiter's deadline is
+reduced by a uniform random fraction of the timeout (never extended past the
+configured bound) and each retry sleeps a jittered cadence. ``jitter=0.0``
+(the default) keeps historical byte-identical behaviour — audit
+semaphores do not opt in.
+
 Usage
 -----
 .. code-block:: python
@@ -55,6 +66,12 @@ Usage
     with Semaphore("audit", max_workers=2, timeout=30):
         run_heavy_work()
 
+    # Staggered bounded wait (test skill):
+    from shared.process_semaphore import Semaphore
+
+    with Semaphore("test", max_workers=2, timeout=600, jitter=0.1):
+        run_suite()
+
 The context manager releases the slot on normal exit **and** on exception.
 """
 
@@ -62,6 +79,7 @@ from __future__ import annotations
 
 import errno
 import os
+import random
 import re
 import sys
 import tempfile
@@ -131,6 +149,51 @@ def nested_semaphore_dir(base_dir: str | os.PathLike[str]) -> Path:
     return Path(base_dir) / NESTED_SEMAPHORE_SUBDIR
 
 
+def jittered_deadline(
+    start_time: float,
+    timeout: float,
+    jitter: float,
+    rng: random.Random,
+) -> float:
+    """Return a per-waiter staggered deadline within the configured bound.
+
+    Bounded-wait callers (e.g. the test skill's ``test`` semaphore) let a
+    herd of concurrent waiters expire at one shared wall-clock instant, so
+    they all report failure and retry together — a thundering herd that
+    keeps re-entering the pool in lockstep (SA-0MVEDOF7A004TSWD). *jitter*
+    is the maximum *fraction of the timeout* reduced per waiter: with
+    ``jitter=0.1`` the deadline lands uniformly in the final 10% of the
+    bound (``[start + 0.9*T, start + T]``), so waiters that enqueue at the
+    same moment expire at different instants. A jitter of ``0.0`` returns
+    the exact bound (historical byte-identical behaviour); larger waiters
+    are never delayed past the bound — the offset only ever staggers
+    earlier, satisfying the "never extends the deadline" invariant.
+
+    Args:
+        start_time: Monotonic timestamp when the wait began.
+        timeout: The configured bounded wait (seconds).
+        jitter: Stagger fraction in ``[0, 1)`` of *timeout*.
+        rng: Random source (inject a seeded ``random.Random`` in tests).
+
+    Returns:
+        The absolute deadline (monotonic seconds).
+    """
+    if jitter <= 0:
+        return start_time + timeout
+    return start_time + timeout * (1.0 - rng.random() * jitter)
+
+
+def _jittered_retry_delay(rng: random.Random) -> float:
+    """A per-attempt sleep spread within +/-50% of the base cadence.
+
+    Fixed-cadence polling keeps every waiter waking at the same instant,
+    compounding the lockstep herd. The uniform ``[0.5, 1.5] * base`` spread
+    desynchronises the retries so waiters do not storm the slot pool in
+    lockstep (SA-0MVEDOF7A004TSWD AC1).
+    """
+    return _RETRY_DELAY_SECONDS * (0.5 + rng.random())
+
+
 class Semaphore:
     """A flock-based counting semaphore usable across processes.
 
@@ -140,6 +203,11 @@ class Semaphore:
             argument > ``AUDIT_MAX_CONCURRENCY`` env var > default (6).
         timeout: Bounded wait in seconds (``None`` = block indefinitely,
             ``0`` = fail fast). Default 30.
+        jitter: Per-waiter stagger fraction of the bounded wait in
+            ``[0, 1)`` (0.0 = off, historical behaviour). See
+            :func:`jittered_deadline`.
+        rng: Random source for the jitter (a seeded ``random.Random`` for
+            deterministic tests; default module-level ``random``).
     """
 
     def __init__(
@@ -147,6 +215,8 @@ class Semaphore:
         name: str,
         max_workers: int | None = None,
         timeout: float | None = 30.0,
+        jitter: float = 0.0,
+        rng: random.Random | None = None,
     ) -> None:
         if fcntl is None:  # pragma: no cover - non-POSIX
             raise RuntimeError("process_semaphore requires fcntl (POSIX)")
@@ -155,6 +225,11 @@ class Semaphore:
         self._slot_dir = _default_lock_dir() / _sanitize_name(name)
         self._held_fd: int | None = None
         self.timeout = timeout
+
+        self.jitter = float(jitter)
+        if not (0.0 <= self.jitter < 1.0):
+            raise ValueError("jitter must be in [0, 1)")
+        self._rng = rng if rng is not None else random
 
         if max_workers is not None:
             self.max_workers = int(max_workers)
@@ -223,11 +298,16 @@ class Semaphore:
         effective_timeout = self.timeout if timeout is None else timeout
         self._ensure_slots()
 
-        deadline = (
-            None
-            if effective_timeout is None
-            else time.monotonic() + float(effective_timeout)
-        )
+        if effective_timeout is None:
+            deadline: float | None = None
+        else:
+            now = time.monotonic()
+            # Per-waiter stagger within the configured bound: a herd of
+            # concurrent waiters no longer expires at one shared wall-clock
+            # instant, so they do not all report failure and retry in
+            # lockstep (SA-0MVEDOF7A004TSWD AC1/AC2). The jittered deadline
+            # never exceeds the configured bound — it only staggers earlier.
+            deadline = jittered_deadline(now, float(effective_timeout), self.jitter, self._rng)
 
         while True:
             fd = self._try_acquire_slot()
@@ -240,7 +320,10 @@ class Semaphore:
                     f"semaphore '{self.name}' busy: no slot free within "
                     f"{effective_timeout}s (max_workers={self.max_workers})"
                 )
-            time.sleep(_RETRY_DELAY_SECONDS)
+            if self.jitter > 0:
+                time.sleep(_jittered_retry_delay(self._rng))
+            else:
+                time.sleep(_RETRY_DELAY_SECONDS)
 
     def release(self) -> None:
         """Release the held slot. Idempotent (safe to call after failure)."""

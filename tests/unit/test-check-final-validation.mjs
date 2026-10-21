@@ -243,20 +243,20 @@ function withWlMock({ workItems, fail = false }, fn) {
 }
 
 describe('getInReviewItems', () => {
-  test('projects id/title/assignee/parentId/updatedAt for all items', async () => {
+  test('projects id/title/needsProducerReview/parentId/updatedAt for all items', async () => {
     const mod = await import(MODULE_PATH);
     const workItems = [
       {
         id: 'SA-TOP-1',
         title: 'Top',
-        assignee: '',
+        needsProducerReview: false,
         parentId: null,
         updatedAt: '2026-09-04T10:00:00Z',
       },
       {
         id: 'SA-CHILD-1',
         title: 'Child',
-        assignee: 'Map',
+        needsProducerReview: true,
         parentId: 'SA-TOP-1',
         updatedAt: '2026-09-04T11:00:00Z',
       },
@@ -267,7 +267,7 @@ describe('getInReviewItems', () => {
     assert.deepEqual(items[0], {
       id: 'SA-TOP-1',
       title: 'Top',
-      assignee: '',
+      needsProducerReview: false,
       parentId: null,
       updatedAt: '2026-09-04T10:00:00Z',
     });
@@ -287,14 +287,14 @@ describe('getInReviewItems', () => {
 const ITEM = {
   id: 'SA-1',
   title: 'Item One',
-  assignee: '',
+  needsProducerReview: false,
   parentId: null,
   updatedAt: '2026-09-04T10:00:00Z',
 };
 const CHILD_ITEM = {
   id: 'SA-CHILD-1',
   title: 'Child One',
-  assignee: '',
+  needsProducerReview: false,
   parentId: 'SA-1',
   updatedAt: '2026-09-04T10:00:00Z',
 };
@@ -443,26 +443,26 @@ describe('checkFinalValidation - genuine failing audit', () => {
 });
 
 describe('checkFinalValidation - producer-review flag', () => {
-  test('producer-held (assignee Map) blocks with remediation guidance', async () => {
-    const flagged = { ...ITEM, assignee: 'Map' };
+  test('needsProducerReview === true blocks with remediation guidance', async () => {
+    const flagged = { ...ITEM, needsProducerReview: true };
     const { report } = await runGate({ items: [flagged], auditShowResults: [AUDIT_PASSING] });
     assert.equal(report.hasBlockingItems, true);
     assert.equal(report.blockingItems.length, 1);
-    assert.match(report.blockingItems[0].reason, /producer/i);
+    assert.match(report.blockingItems[0].reason, /producer review/i);
     assert.ok(report.blockingItems[0].remediation.includes('wl update SA-1'));
     assert.ok(
       report.blockingItems[0].remediation.includes(
-        'wl update SA-1 --assignee "" --json',
+        'wl update SA-1 --needs-producer-review false --json',
       ),
-      'AC2: exit-12 remediation must surface the assignee-release wl command',
+      'AC2: exit-12 remediation must surface the kebab-case wl command',
     );
     assert.ok(
-      !report.blockingItems[0].remediation.includes('--needs-producer-review'),
-      'AC2: remediation must not emit the retired needsProducerReview flag',
+      !report.blockingItems[0].remediation.includes('--needsProducerReview'),
+      'AC2: remediation must not emit the camelCase wl flag',
     );
   });
 
-  test('unassigned item does not block', async () => {
+  test('needsProducerReview === false does not block', async () => {
     const { report } = await runGate({ auditShowResults: [AUDIT_PASSING] });
     assert.equal(report.hasBlockingItems, false);
   });
@@ -486,7 +486,7 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
   const SCOPED_CHILD = {
     id: 'SA-CHILD-1',
     title: 'Child One',
-    assignee: '',
+    needsProducerReview: false,
     parentId: 'SA-P1',
     updatedAt: '2026-09-04T10:00:00Z',
   };
@@ -527,7 +527,7 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
 
   test('a covered child with a producer-review flag is skipped (does not block)', async () => {
     const report = await runScopedGate({
-      items: [{ ...SCOPED_CHILD, assignee: 'Map' }],
+      items: [{ ...SCOPED_CHILD, needsProducerReview: true }],
       parents: { 'SA-P1': PARENT_IN_REVIEW },
       audits: { 'SA-P1': AUDIT_PASSING },
     });
@@ -617,7 +617,7 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
     const grandchild = {
       id: 'SA-GC1',
       title: 'Grandchild',
-      assignee: '',
+      needsProducerReview: false,
       parentId: 'SA-CHILD-1',
       updatedAt: '2026-09-04T10:00:00Z',
     };
@@ -641,7 +641,7 @@ describe('checkFinalValidation - parent coverage and out-of-scope children', () 
     const cyclic = {
       id: 'SA-C1',
       title: 'Cyclic',
-      assignee: '',
+      needsProducerReview: false,
       parentId: 'SA-C2',
       updatedAt: '2026-09-04T10:00:00Z',
     };
@@ -721,8 +721,8 @@ describe('checkFinalValidation - bounded remediation budget', () => {
       join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js'),
     );
     const items = [
-      { id: 'SA-T1', title: 'Top One', assignee: '', parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
-      { id: 'SA-T2', title: 'Top Two', assignee: '', parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      { id: 'SA-T1', title: 'Top One', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      { id: 'SA-T2', title: 'Top Two', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
     ];
     let remediationCalls = 0;
     let t1Shows = 0;
@@ -766,7 +766,7 @@ describe('checkFinalValidation - narrow --skip-audit-remediation bypass', () => 
     const report = await mod.checkFinalValidation({
       skipRemediation: true,
       getItemsFn: () => [
-        { id: 'SA-S', title: 'Skip', assignee: '', parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+        { id: 'SA-S', title: 'Skip', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
       ],
       runAuditShow: () => JSON.stringify({ audit: null }),
       runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
@@ -786,7 +786,7 @@ describe('checkFinalValidation - content-fingerprint fast path', () => {
     const raw = 'Ready to close: Yes\nAudit content fingerprint: deadbeef';
     const report = await mod.checkFinalValidation({
       getItemsFn: () => [
-        { id: 'SA-CF', title: 'CF', assignee: '', parentId: null, updatedAt: '2026-09-05T10:00:00Z' },
+        { id: 'SA-CF', title: 'CF', needsProducerReview: false, parentId: null, updatedAt: '2026-09-05T10:00:00Z' },
       ],
       runAuditShow: () => JSON.stringify({
         audit: { readyToClose: true, auditedAt: '2026-09-04T08:00:00Z', rawOutput: raw },

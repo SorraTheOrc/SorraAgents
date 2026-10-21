@@ -111,16 +111,17 @@ def _is_test_skill_runner_doc(path: Path) -> bool:
     This file documents the runner the policy *mandates* — the commands it
     resolves (`pytest -q -r a --disable-warnings`, `npm --silent test`,
     `node --test "tests/**"` etc.) and the pre-push/`implement.py finish`
-    gates. Infrastructure, not agent directives.
+    (changed-scope) gates. Infrastructure, not agent directives.
     """
     return path.parts[-3:] == ("skill", "test", "SKILL.md")
 
 
 def _is_hook_or_ci_context(line: str) -> bool:
-    """Whitelist: git hooks / CI gates (the pre-push hook and
-    `implement.py finish` running `--scope full`) are infrastructure — the
-    policy explicitly calls them "infrastructure, not agent runs, and out of
-    scope" (AGENTS_GLOBAL.md, Test execution policy).
+    """Whitelist: git hooks / CI gates (the pre-push hook's `--scope full`
+    runs, and `implement.py finish`'s changed-scope gate — the full suite is
+    deferred to the dev-push integration gate, SA-0MVECQUGF0064U81) are
+    infrastructure — the policy explicitly calls them "infrastructure, not
+    agent runs, and out of scope" (AGENTS_GLOBAL.md, Test execution policy).
     """
     return "pre-push hook" in line or "--scope full" in line
 

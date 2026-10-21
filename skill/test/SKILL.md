@@ -63,6 +63,13 @@ An empty resolved set (no extension file, no npm test script, no pytest suite, n
 
 Output: JSON with per-suite results and a flat `failures` array (`test_name`, `stdout_excerpt`, `stack_trace`).
 
+**Background test runs.** When a suite is launched in the background (rather
+than run in the foreground by `run_tests.py`), wait for it completion-aware
+via `../shared/wait_for_job.py` per the shared [background job
+etiquette](../shared/background-job-etiquette.md) — never a fixed `sleep N`
+poll. The runner's own foreground subprocess calls already honour their
+per-command timeout.
+
 ### 1a. Typed runs (`--type`) — fast feedback vs release evidence
 
 `--type <T>` selects the command **profile**; `--scope full|changed` selects
@@ -149,7 +156,9 @@ Result JSON and `--summary` output carry `scope` per suite. Pre-push
 enforcement (`.githooks/pre-push`): pushes to `refs/heads/dev`/`main` run the
 full suite (`--scope full`), feature-branch pushes skip tests
 (`TEST_SCOPE_SKIP=1` bypasses); the implement skill validates the worktree
-with changed scope and runs a final `--scope full` gate before commit.
+with **changed scope only** during implementation — the full suite first runs
+at the dev-push integration gate (pre-push hook), and the ship release gate
+re-runs it on the merged dev→main tree (SA-0MVECQUGF0064U81).
 Details: [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
 
 ### 1b. Live-repo mutation guard (detect-only)

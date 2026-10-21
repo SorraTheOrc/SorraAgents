@@ -490,10 +490,10 @@ def classify_finding(linter: str, raw_severity: Any) -> str:
 
 def _classify_markdownlint(severity: Any) -> str:
     """Classify a markdownlint severity to normalised level.
-    
+
     Args:
         severity: The severity value (typically "error" or "warning").
-    
+
     Returns:
         One of "high", "medium", "low".
     """
@@ -507,10 +507,10 @@ def _classify_markdownlint(severity: Any) -> str:
 
 def _classify_shellcheck(severity: Any) -> str:
     """Classify a shellcheck severity to normalised level.
-    
+
     Args:
         severity: The severity value (typically "error" or "warning").
-    
+
     Returns:
         One of "high", "medium", "low".
     """

@@ -189,6 +189,66 @@ def test_compute_git_state_changes_when_tree_dirty(git_repo: Path) -> None:
     assert compute_git_state(str(git_repo)) != dirty
 
 
+def test_already_dirty_file_content_edit_changes_git_state(git_repo: Path) -> None:
+    """Two edits to the same already-dirty file must produce different keys.
+
+    ``git status --porcelain`` reports only the path for an already-dirty
+    file, so a status-text fingerprint is identical for both edits and could
+    serve the first edit's cached result for the second (AH-0MVFGIV6700329SZ).
+    """
+    (git_repo / "tracked.txt").write_text("two\n")
+    first = compute_git_state(str(git_repo))
+
+    (git_repo / "tracked.txt").write_text("three\n")
+    second = compute_git_state(str(git_repo))
+    assert first != second
+
+    # Restoring the same content is stable: the fingerprint tracks content,
+    # not edit ordering.
+    (git_repo / "tracked.txt").write_text("two\n")
+    assert compute_git_state(str(git_repo)) == first
+
+
+def test_untracked_file_content_edit_changes_git_state(git_repo: Path) -> None:
+    """Editing an untracked file's content must change the fingerprint."""
+    (git_repo / "new_file.txt").write_text("one\n")
+    first = compute_git_state(str(git_repo))
+
+    (git_repo / "new_file.txt").write_text("two\n")
+    second = compute_git_state(str(git_repo))
+    assert first != second
+
+    (git_repo / "new_file.txt").write_text("one\n")
+    assert compute_git_state(str(git_repo)) == first
+
+
+def test_deleted_tracked_file_fingerprint_is_stable(git_repo: Path) -> None:
+    """A missing dirty path must not raise and must fingerprint stably."""
+    (git_repo / "tracked.txt").unlink()
+    assert compute_git_state(str(git_repo)) == compute_git_state(str(git_repo))
+
+
+def test_second_edit_to_already_dirty_file_is_not_served_from_cache(
+    git_repo: Path,
+) -> None:
+    """A re-edit of an already-dirty file must force a fresh run."""
+    calls: list[str] = []
+    runner = make_runner(calls)
+    (git_repo / "tracked.txt").write_text("two\n")
+    first = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert first["cached"] is False
+
+    (git_repo / "tracked.txt").write_text("three\n")
+    second = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert second["cached"] is False
+    assert len(calls) == 2
+
+    # Unchanged content afterwards is a cache hit again.
+    third = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert third["cached"] is True
+    assert len(calls) == 2
+
+
 def test_git_state_is_cwd_aware_worktree_fingerprint(git_repo: Path) -> None:
     """The fingerprint must reflect the repo containing cwd (worktree-aware).
 

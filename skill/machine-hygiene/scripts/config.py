@@ -95,7 +95,7 @@ def load_config() -> dict[str, Any]:
 
     path = _config_path()
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             file_cfg = yaml.safe_load(fh) or {}
     except FileNotFoundError:
         return cfg

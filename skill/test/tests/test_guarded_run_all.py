@@ -238,3 +238,74 @@ def test_marker_restored_after_the_previous_test():
     # The repo-root conftest arms the guard for the whole session, so the
     # marker must survive the previous test's monkeypatch teardown.
     assert os.environ.get(MARKER_ENV) == "1"
+
+
+# ---------------------------------------------------------------------------
+# WL-0MV5MYBKJ0033P8U — concurrent dev / remote-tracking ref movement is not a
+# live-repo mutation (shared helper fix propagates to the outer guard)
+# ---------------------------------------------------------------------------
+
+
+def _advance_refs(repo, *refs):
+    """Move each *ref* to a fresh tree-identical commit (only refs differ)."""
+    from shared import git_sandbox as gs
+
+    for ref in refs:
+        parent = gs.run_git(repo, ["rev-parse", "HEAD"]).stdout.strip()
+        tree = gs.run_git(repo, ["rev-parse", "HEAD^{tree}"]).stdout.strip()
+        fresh = gs.run_git(
+            repo, ["commit-tree", tree, "-p", parent, "-m", "advance"], check=True
+        ).stdout.strip()
+        gs.run_git(repo, ["update-ref", ref, fresh], check=True)
+
+
+def test_outer_guard_detection_ignores_only_dev_and_origin_ref_moves(tmp_path):
+    """The outer guard's mutation detector inherits the shared helper fix.
+
+    Snapshots that differ ONLY in ``refs/heads/dev`` and ``refs/remotes/origin/*``
+    (concurrent sibling finish fast-forward / fetch-push) must not produce a
+    ``live_repo_mutation`` — the shared ``git_sandbox`` helper excludes those
+    namespaces, so there is no consumer-side drift (AC4)."""
+    from run_tests import _detect_live_repo_mutation
+    from shared import git_sandbox as gs
+
+    repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    origin = gs.init_bare_remote(tmp_path / "origin.git")
+    gs.add_remote(repo, "origin", str(origin))
+    gs.run_git(repo, ["push", "-u", "origin", "dev"], check=True)
+    gs.run_git(
+        repo,
+        ["update-ref", "refs/remotes/origin/feature-x", "HEAD"],
+        check=True,
+    )
+
+    before = gs.snapshot_repo_state(repo)
+    _advance_refs(
+        repo,
+        "refs/heads/dev",
+        "refs/remotes/origin/dev",
+        "refs/remotes/origin/feature-x",
+    )
+
+    detected = _detect_live_repo_mutation(repo, before)
+
+    assert detected is None, detected
+
+
+def test_outer_guard_detection_still_fires_on_new_non_excluded_branch(tmp_path):
+    """A genuine ref addition outside the excluded namespaces still fails."""
+    from run_tests import _detect_live_repo_mutation
+    from shared import git_sandbox as gs
+
+    repo = gs.init_repo(tmp_path / "adv", default_branch="dev")
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    before = gs.snapshot_repo_state(repo)
+    gs.run_git(repo, ["branch", "feature-x"], check=True)
+
+    detected = _detect_live_repo_mutation(repo, before)
+
+    assert detected is not None
+    assert "feature-x" in detected

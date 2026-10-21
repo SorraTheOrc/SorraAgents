@@ -65,6 +65,8 @@ DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 # (High or Severe, the top of the wl risk scale) — an AND gate
 # (SA-0MUYG0HE6001YTEM). Every other effort/risk combination proceeds
 # straight to the automated review stages without an approval pause.
+# Absent or unrecognised effort/risk values default conservatively to
+# requesting approval (SA-0MUIUTJJS008W06Y).
 # Effort values are normalised to the full-label spelling before comparison
 # (see DEFAULT_AUTOPLAN_EFFORT_SKIP note — same abbreviation parity).
 PLAN_APPROVAL_EFFORT: frozenset[str] = frozenset({"Extra Large"})
@@ -93,6 +95,13 @@ _EFFORT_LABEL_TO_CANONICAL: dict[str, str] = {
     "Large": "Large",
     "Extra Large": "Extra Large",
 }
+
+# Canonical vocabulary values accepted by the threshold gates. A value that is
+# present but outside these sets is treated conservatively as "unrecognised"
+# (see ``should_request_plan_approval``) so a future vocabulary addition never
+# silently skips a human checkpoint (SA-0MUIUTJJS008W06Y).
+_KNOWN_EFFORT_LABELS: frozenset[str] = frozenset(_EFFORT_LABEL_TO_CANONICAL.values())
+_KNOWN_RISK_LEVELS: frozenset[str] = frozenset({"Low", "Medium", "High", "Severe"})
 
 
 def normalise_effort_label(value: str | None) -> str:
@@ -351,7 +360,13 @@ def resolve_complexity_tier(item: dict, config: dict) -> str:
     Mapping:
     - Low: Effort XS or S AND risk Low
     - Medium: Effort M OR risk Medium
-    - High: Effort L or XL OR risk High
+    - High: Effort L or XL OR risk High or Severe
+
+    Effort is normalised via ``normalise_effort_label()`` so both the
+    abbreviated wl spelling (``XL``) and the full label (``Extra Large``)
+    resolve to the same tier; config thresholds accept both spellings too.
+    ``Severe`` is ranked above ``High`` in the risk scale
+    (SA-0MUIUTJJS008W06Y).
 
     Thresholds are configurable via config["complexity_tier"].
     Defaults to 'low' when both effort and risk are absent, otherwise
@@ -374,11 +389,12 @@ def resolve_complexity_tier(item: dict, config: dict) -> str:
     high_min_effort = high_cfg.get("min_effort", "Large")
     high_min_risk = high_cfg.get("min_risk", "High")
 
-    # T-shirt size order for comparison
+    # T-shirt size order for comparison (Severe is the top of the wl risk
+    # scale, above High)
     effort_order = {"Extra Small": 0, "Small": 1, "Medium": 2, "Large": 3, "Extra Large": 4}
-    risk_order = {"Low": 0, "Medium": 1, "High": 2}
+    risk_order = {"Low": 0, "Medium": 1, "High": 2, "Severe": 3}
 
-    item_effort_val = effort_order.get(effort)
+    item_effort_val = effort_order.get(normalise_effort_label(effort))
     item_risk_val = risk_order.get(risk)
 
     # Fallback for missing values: treat as Medium (safe middle ground)
@@ -388,12 +404,12 @@ def resolve_complexity_tier(item: dict, config: dict) -> str:
         item_risk_val = risk_order["Medium"]
 
     # High tier check (OR)
-    if item_effort_val >= effort_order.get(high_min_effort, 3) or \
+    if item_effort_val >= effort_order.get(normalise_effort_label(high_min_effort), 3) or \
        item_risk_val >= risk_order.get(high_min_risk, 2):
         return "high"
 
     # Low tier check (AND)
-    if item_effort_val <= effort_order.get(low_max_effort, 1) and \
+    if item_effort_val <= effort_order.get(normalise_effort_label(low_max_effort), 1) and \
        item_risk_val <= risk_order.get(low_max_risk, 0):
         return "low"
 
@@ -418,8 +434,10 @@ def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
       when approval is not needed.
 
     Missing effort and/or risk values default conservatively to requesting
-    approval (mirroring ``resolve_complexity_tier``'s Medium default), so a
-    human checkpoint is never silently skipped.
+    approval (mirroring ``resolve_complexity_tier``'s Medium default), and a
+    value that is present but unrecognised (outside the canonical ``wl``
+    vocabulary) likewise defaults conservatively to requesting approval, so a
+    human checkpoint is never silently skipped (SA-0MUIUTJJS008W06Y).
 
     Effort is normalised via ``normalise_effort_label()`` so both the
     abbreviated wl spelling (``XL``) and the full label (``Extra Large``)
@@ -429,7 +447,8 @@ def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
         work_item: The work item dict (from ``wl show --json``) with
             ``effort`` (t-shirt size) and ``risk`` (level) fields.
     """
-    effort = normalise_effort_label(work_item.get("effort"))
+    effort_raw = (work_item.get("effort") or "").strip()
+    effort = normalise_effort_label(effort_raw)
     risk = (work_item.get("risk") or "").strip()
 
     # Missing values default conservatively to requesting approval.
@@ -439,6 +458,14 @@ def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
         return True, f"its effort is not set and its risk is {risk}"
     if not risk:
         return True, f"its effort is {effort} and its risk is not set"
+
+    # Present-but-unrecognised values also default conservatively to approval:
+    # an unknown value could be a future, potentially higher, level, so the
+    # checkpoint must never be silently skipped (SA-0MUIUTJJS008W06Y).
+    if effort not in _KNOWN_EFFORT_LABELS:
+        return True, f"its effort {effort_raw!r} is not a recognised t-shirt size"
+    if risk not in _KNOWN_RISK_LEVELS:
+        return True, f"its risk {risk!r} is not a recognised risk level"
 
     if effort in PLAN_APPROVAL_EFFORT and risk in PLAN_APPROVAL_RISK:
         return True, f"its effort is {effort} scale and its risk is {risk}"

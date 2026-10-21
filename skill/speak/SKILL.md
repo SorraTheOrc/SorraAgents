@@ -43,6 +43,7 @@ clean for `--stream` mode.
 | Argument | Description |
 |----------|-------------|
 | `text`   | Text string to be spoken (enclose in quotes for multi-word phrases) |
+| `--voice <name>` | Server-side voice name to synthesise with (default: `$TTS_VOICE` or `ryan`). Use any voice the endpoint exposes, e.g. `nova`, `ginny_di`, `default`. |
 | `--stream` | Write raw audio to stdout (pipe over SSH to a remote player) |
 | `--help` | Show usage instructions and exit |
 
@@ -51,6 +52,7 @@ clean for `--stream` mode.
 | Variable      | Default                                       | Description                              |
 |---------------|-----------------------------------------------|------------------------------------------|
 | `TTS_API_URL` | `http://100.79.231.101:8000/v1/audio/speech`  | Override the TTS API endpoint            |
+| `TTS_VOICE`   | `ryan`                                        | Default voice name when `--voice` is not given (an explicit `--voice` takes precedence) |
 | `SPEAK_DIR`   | `<repo-root>/.pi/speak/`                      | Override the output directory            |
 
 ## Rolling Buffer
@@ -95,11 +97,21 @@ payload:
 {
   "model": "tts-1",
   "input": "Text to speak",
-  "voice": "alloy"
+  "voice": "ryan"
 }
 ```
 
+The `voice` field defaults to `ryan` for backwards compatibility and can be
+selected per invocation with `--voice <name>` or globally with the
+`TTS_VOICE` environment variable (`--voice` wins). The local CosyVoice server
+exposes `ryan`, `default`, `nova`, and `ginny_di`; any other
+OpenAI-compatible endpoint may expose different names.
+
 A 60-second timeout is applied to the API call.
+
+When the endpoint returns a non-2xx status, the script prints the HTTP status
+**and** the server's response body on stderr, so an unknown voice reports the
+available voices instead of an opaque HTTP error.
 
 ## Exit Codes
 
@@ -127,6 +139,15 @@ ssh user@host "$(skill_path speak)/scripts/speak.py --stream 'hi'" | aplay
 
 # Custom API endpoint
 TTS_API_URL="http://localhost:8000/v1/audio/speech" $(skill_path speak)/scripts/speak.py "Test"
+
+# Select a specific server-side voice
+$(skill_path speak)/scripts/speak.py --voice nova "Hi, I'm Nova."
+
+# Default voice via the environment (an explicit --voice overrides it)
+TTS_VOICE=ginny_di $(skill_path speak)/scripts/speak.py "Hello from ginny_di."
+
+# Voice selection also works with --stream
+$(skill_path speak)/scripts/speak.py --voice nova --stream "Hello" | aplay
 
 # Custom output directory
 SPEAK_DIR="/tmp/my-speech" $(skill_path speak)/scripts/speak.py "Custom output"

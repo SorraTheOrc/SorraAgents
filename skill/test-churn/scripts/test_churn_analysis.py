@@ -161,7 +161,7 @@ class ChurnConfig:
     @classmethod
     def from_file(cls, path: str | Path) -> ChurnConfig:
         """Load a config JSON file, merging over the defaults."""
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
         if not isinstance(data, dict):
             raise TypeError("Config file must contain a JSON object")

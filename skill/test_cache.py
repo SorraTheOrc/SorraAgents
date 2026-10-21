@@ -10,8 +10,12 @@ module adds a caching layer so repeated verification is cheap:
   (resolved worktree-aware via ``git rev-parse --git-dir``). Non-git repos
   fall back to ``<repo>/.test-cache/``.
 - **Keyed by normalized command + git-state fingerprint**: the fingerprint is
-  HEAD sha plus a hash of ``git status --porcelain`` output, resolved against
-  the repo containing the working directory (worktree-aware).
+  HEAD sha plus a content hash of every path ``git status --porcelain``
+  reports as dirty (tracked modifications, staged changes, deletions and
+  untracked files), resolved against the repo containing the working
+  directory (worktree-aware). Hashing file **contents** — not just the
+  status text, which lists paths only — means editing a file that is
+  *already* dirty yields a new fingerprint too (AH-0MVFGIV6700329SZ).
 - **2-hour TTL** (configurable): expired entries are re-run and replaced.
   Failed (non-zero-exit) runs use a short 5-minute TTL instead
   (SA-0MSJELL44009XYIL) so transient infra failures are not re-served as
@@ -113,11 +117,17 @@ def _run_git(cwd: str, *args: str) -> str | None:
 def compute_git_state(cwd: str | Path | None = None) -> str:
     """Return a fingerprint of the git state at *cwd*.
 
-    The fingerprint combines the HEAD commit sha with the full working-tree
-    status (tracked modifications plus untracked files) so that any code or
-    test change invalidates the cache. Git commands run with ``cwd`` as the
-    working directory, so the fingerprint reflects the *worktree containing
-    cwd* (implement loops run suites inside git worktrees).
+    The fingerprint combines the HEAD commit sha with the **content** of every
+    path the working tree reports as dirty — tracked modifications, staged
+    changes, deletions and untracked files alike. ``git status --porcelain``
+    alone is not enough: it records paths and status codes only, so a second
+    edit to a file that is already dirty leaves the status text unchanged and
+    would otherwise serve a stale cached result (AH-0MVFGIV6700329SZ).
+
+    Git commands run with ``cwd`` as the working directory, so the fingerprint
+    reflects the *worktree containing cwd* (implement loops run suites inside
+    git worktrees). Porcelain paths are repository-root relative, so content is
+    resolved against ``git rev-parse --show-toplevel``.
 
     For non-git directories a stable per-directory fingerprint is returned so
     the cache still works (TTL-only invalidation), documented fallback.
@@ -128,9 +138,88 @@ def compute_git_state(cwd: str | Path | None = None) -> str:
         # Not a git repository: stable per-directory key.
         digest = hashlib.sha256(f"no-git:{cwd}".encode()).hexdigest()
         return digest[:16]
-    status = _run_git(cwd, "status", "--porcelain") or ""
-    raw = f"{head.strip()}\n{status}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+
+    hasher = hashlib.sha256()
+    hasher.update(head.strip().encode())
+    base = Path((_run_git(cwd, "rev-parse", "--show-toplevel") or cwd).strip())
+    for status, path in sorted(_status_entries(cwd)):
+        hasher.update(b"\0status\0" + status.encode("utf-8", "surrogateescape"))
+        _update_with_path_content(hasher, base, path)
+    return hasher.hexdigest()
+
+
+def _status_entries(cwd: str) -> list[tuple[str, str]]:
+    """Return ``(status, path)`` for every dirty path in *cwd*.
+
+    ``--untracked-files=all`` expands untracked directories into individual
+    files so each file's content is fingerprinted. ``-z`` keeps paths
+    NUL-terminated (no quoting) and places a rename/copy's original path in
+    the field following the entry.
+    """
+    output = _run_git(
+        cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all"
+    )
+    if output is None:
+        return []
+    fields = output.split("\0")
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if not entry:
+            continue
+        status = entry[:2]
+        path = entry[3:]
+        if "R" in status or "C" in status:
+            index += 1  # the rename/copy source path follows the entry
+        entries.append((status, path))
+    return entries
+
+
+def _update_with_path_content(
+    hasher: Any, base: Path, relpath: str
+) -> None:
+    """Feed the content at ``base/relpath`` into *hasher*.
+
+    A missing or unreadable path contributes a stable marker instead of
+    raising (a deleted dirty file is a legitimate state). Symlinks hash their
+    target. A directory (a submodule gitlink) hashes its own HEAD and status
+    rather than walking into another repository; a plain directory falls back
+    to a sorted recursive walk.
+    """
+    path = base / relpath
+    hasher.update(b"\0path\0" + relpath.encode("utf-8", "surrogateescape"))
+    try:
+        if path.is_symlink():
+            target = os.readlink(path)
+            hasher.update(b"\0link\0" + target.encode("utf-8", "surrogateescape"))
+            return
+        if path.is_dir():
+            sub_head = _run_git(str(path), "rev-parse", "HEAD")
+            if sub_head is not None:
+                hasher.update(b"\0gitlink\0" + sub_head.strip().encode())
+                sub_status = _run_git(str(path), "status", "--porcelain=v1") or ""
+                hasher.update(
+                    b"\0gitlink-status\0"
+                    + sub_status.encode("utf-8", "surrogateescape")
+                )
+                return
+            for child in sorted(path.rglob("*")):
+                if child.is_dir() and not child.is_symlink():
+                    continue
+                _update_with_path_content(
+                    hasher, base, child.relative_to(base).as_posix()
+                )
+            return
+        if path.is_file():
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            return
+        hasher.update(b"\0missing")
+    except OSError:
+        hasher.update(b"\0unreadable")
 
 
 # ---------------------------------------------------------------------------
