@@ -117,6 +117,24 @@ except ModuleNotFoundError:
     class _TestConcurrencyTimeout(RuntimeError):  # type: ignore[no-redef]
         """Fallback when the test skill is unavailable (never raised)."""
 
+try:
+    # Stable gate-failure notice contract (WL-0MVGUT787000LNDG). Imported
+    # separately so an older test skill without the constants degrades to
+    # the literal fallbacks instead of breaking the whole delegation import.
+    from test.scripts.run_tests import (
+        NOTICE_SLOT_BUSY as _NOTICE_SLOT_BUSY,
+    )
+    from test.scripts.run_tests import (
+        SLOT_BUSY_NOTICE_PREFIX as _SLOT_BUSY_NOTICE_PREFIX,
+    )
+except ImportError:
+    # Older test skill without the notice-code contract — degrade to the
+    # literal fallbacks (never break the delegation import chain).
+    _NOTICE_SLOT_BUSY = "slot_busy"  # type: ignore[assignment]
+    _SLOT_BUSY_NOTICE_PREFIX = (  # type: ignore[assignment]
+        "test concurrency slot busy:"
+    )
+
 from test_cache import run_cached
 from test_runner import canonicalize_quiet_test_command
 
@@ -2641,6 +2659,46 @@ def _guarded_exit_code(guarded: dict[str, Any]) -> int:
     return 0 if guarded.get("success") else 1
 
 
+#: Bound for the output tail carried into implement.py's gate diagnostics
+#: (WL-0MVGUT787000LNDG): a failed suite can print megabytes; the operator
+#: message only ever sees this tail.
+GATE_OUTPUT_TAIL_CHARS = 1200
+
+
+def _tail_text(text: str | None, max_chars: int = GATE_OUTPUT_TAIL_CHARS) -> str:
+    """Return a bounded tail of *text* (last ``max_chars`` characters).
+
+    Empty/None input yields an empty string; short text is returned whole.
+    """
+    if not text:
+        return ""
+    text = text.rstrip()
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:].lstrip()
+
+
+def _guarded_output(guarded: dict[str, Any], key: str) -> str:
+    """Aggregate the *key* output of a guarded run.
+
+    Prefers the aggregate field (newer test skill); falls back to
+    concatenating the per-suite fields so a legacy ``run_all`` shape still
+    yields a diagnostic output tail (WL-0MVGUT787000LNDG).
+    """
+    direct = guarded.get(key)
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    parts: list[str] = []
+    suites = guarded.get("suites")
+    if isinstance(suites, dict):
+        for suite in suites.values():
+            if isinstance(suite, dict):
+                value = suite.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value)
+    return "\n".join(parts)
+
+
 def _adapt_guarded_result(
     guarded: dict[str, Any], tooling: str | None, scope: str
 ) -> dict[str, Any]:
@@ -2651,6 +2709,12 @@ def _adapt_guarded_result(
     of strings, an ``exit_code``, ``skipped`` and ``tooling``. The
     ``live_repo_mutation`` key (set by the canonical outer guard) is carried
     through so a mutated checkout always fails the gate.
+
+    The guarded run's diagnostics are carried through additive-only (never
+    dropped): ``notices``/``notice_codes`` (slot contention, command-not-found,
+    suite timeout) and bounded ``stdout``/``stderr`` tails, so ``phase_finish``
+    can explain WHY the gate failed instead of emitting an empty ``Failures:``
+    message (WL-0MVGUT787000LNDG).
     """
     failures: list[str] = []
     for failure in guarded.get("failures", []):
@@ -2658,13 +2722,25 @@ def _adapt_guarded_result(
             failures.append(str(failure.get("test_name") or failure))
         else:
             failures.append(str(failure))
+    notices = [
+        str(n).strip()
+        for n in guarded.get("notices", [])
+        if str(n).strip()
+    ]
+    notice_codes = [
+        str(c).strip()
+        for c in guarded.get("notice_codes", [])
+        if str(c).strip()
+    ]
     exit_code = _guarded_exit_code(guarded)
     result: dict[str, Any] = {
         "success": bool(guarded.get("success")) and exit_code == 0,
-        "stdout": "",
-        "stderr": "",
+        "stdout": _tail_text(_guarded_output(guarded, "stdout")),
+        "stderr": _tail_text(_guarded_output(guarded, "stderr")),
         "exit_code": exit_code,
         "failures": failures,
+        "notices": notices,
+        "notice_codes": notice_codes,
         "skipped": False,
         "tooling": tooling,
         "scope": guarded.get("scope", scope),
@@ -2674,6 +2750,114 @@ def _adapt_guarded_result(
         result["live_repo_mutation"] = mutation
         result["success"] = False
     return result
+
+
+#: Classification of a test-gate failure (WL-0MVGUT787000LNDG). ``phase_finish``
+#: must distinguish a retryable infrastructure condition (no free test slot)
+#: from a genuine code failure so the operator does not burn a blind retry.
+GATE_FAILURE_SLOT_CONTENTION = "slot_contention"
+GATE_FAILURE_INFRASTRUCTURE = "infrastructure"
+GATE_FAILURE_TESTS = "test_failure"
+GATE_FAILURE_UNKNOWN = "unknown"
+
+
+def _gate_failure_kind(test_result: dict[str, Any]) -> str:
+    """Classify why the test gate failed.
+
+    Genuine structured failures always win: a real test failure must never be
+    reported as (or fixed by retrying instead of fixing) an infrastructure
+    condition. Slot contention is identified by the stable ``notice_code``
+    first, with a narrow legacy fallback on the slot-busy notice prefix (only
+    used when there are no structured failures), matching the constraint in
+    WL-0MVGUT787000LNDG — never a generic substring match.
+    """
+    if test_result.get("failures"):
+        return GATE_FAILURE_TESTS
+    notice_codes = [str(c) for c in (test_result.get("notice_codes") or [])]
+    if _NOTICE_SLOT_BUSY in notice_codes:
+        return GATE_FAILURE_SLOT_CONTENTION
+    for notice in test_result.get("notices") or []:
+        if str(notice).startswith(_SLOT_BUSY_NOTICE_PREFIX):
+            return GATE_FAILURE_SLOT_CONTENTION
+    if test_result.get("live_repo_mutation"):
+        return GATE_FAILURE_INFRASTRUCTURE
+    if notice_codes or test_result.get("notices"):
+        return GATE_FAILURE_INFRASTRUCTURE
+    return GATE_FAILURE_UNKNOWN
+
+
+def _gate_failure_detail(test_result: dict[str, Any]) -> str:
+    """Render the root-cause detail for a failed test gate.
+
+    Never returns an empty string (WL-0MVGUT787000LNDG): structured failures
+    first, then runner notices (slot contention / command-not-found / suite
+    timeout), then the command output tail (unparsed vitest/node failures),
+    and finally an explicit "no diagnostics" message so the operator is never
+    shown a blank ``Failures:`` block.
+    """
+    failures = [str(f) for f in (test_result.get("failures") or [])]
+    if failures:
+        return "Failures:\n" + "\n".join(failures[:20])
+
+    sections: list[str] = []
+    notices = [
+        str(n).strip()
+        for n in (test_result.get("notices") or [])
+        if str(n).strip()
+    ]
+    if notices:
+        sections.append("Runner notices:\n" + "\n".join(notices))
+    mutation = test_result.get("live_repo_mutation")
+    if mutation:
+        sections.append(
+            "Live-repo mutation detected:\n" + _tail_text(str(mutation))
+        )
+    output_tail = _tail_text(test_result.get("stderr")) or _tail_text(
+        test_result.get("stdout")
+    )
+    if output_tail:
+        sections.append("Command output (tail):\n" + output_tail)
+    if not sections:
+        sections.append(
+            "The test gate failed but the runner reported no failures, "
+            "notices or command output. Check the test-runner logs."
+        )
+    return "No structured test failures were parsed.\n\n" + "\n\n".join(sections)
+
+
+def _gate_failure_message(
+    test_result: dict[str, Any],
+    attempt: int,
+    max_retry: int,
+    work_item_id: str,
+) -> str:
+    """Build the operator-facing message for a failed changed-scope run.
+
+    Distinguishes "no free test slot" (a retryable infrastructure condition,
+    with the longer-``TEST_LOCK_TIMEOUT`` remedy) from genuine test failures
+    (WL-0MVGUT787000LNDG) and always includes the root-cause detail.
+    """
+    kind = _gate_failure_kind(test_result)
+    detail = _gate_failure_detail(test_result)
+    if kind == GATE_FAILURE_SLOT_CONTENTION:
+        headline = (
+            f"Test run {attempt}/{max_retry} could not start: no free test "
+            "slot (infrastructure condition, not a code failure). Wait for a "
+            "slot to free up, then retry — or raise TEST_LOCK_TIMEOUT "
+            "(e.g. TEST_LOCK_TIMEOUT=1800) to wait longer."
+        )
+    elif kind == GATE_FAILURE_INFRASTRUCTURE:
+        headline = (
+            f"Test run {attempt}/{max_retry} failed for an infrastructure "
+            "reason (not a code failure)."
+        )
+    else:
+        headline = f"Test run {attempt}/{max_retry} failed."
+    return (
+        f"{headline}\n\n{detail}\n\n"
+        f"Please fix the failures and re-run:\n"
+        f"  python3 scripts/implement.py finish {work_item_id}"
+    )
 
 
 def _run_guarded_suite(
@@ -4159,15 +4343,19 @@ def phase_finish(
     while not test_result["success"] and test_attempts < max_retry:
         test_attempts += 1
         failures = test_result.get("failures", [])
-        failure_summary = "\n".join(failures[:20]) if failures else test_result["stderr"][:1000]
-
-        msg = (
-            f"Test run {test_attempts}/{max_retry} failed.\n"
-            f"Failures:\n{failure_summary}\n\n"
-            f"Please fix the failures and re-run:\n"
-            f"  python3 scripts/implement.py finish {work_item_id}"
+        failure_reason = _gate_failure_kind(test_result)
+        # The message always explains WHY the gate failed — slot contention
+        # and unparsed output included, never an empty `Failures:` block
+        # (WL-0MVGUT787000LNDG).
+        msg = _gate_failure_message(
+            test_result, test_attempts, max_retry, work_item_id
         )
-        LOG.warning("Test run %d/%d failed", test_attempts, max_retry)
+        LOG.warning(
+            "Test run %d/%d failed (%s)",
+            test_attempts,
+            max_retry,
+            failure_reason,
+        )
 
         if json_output:
             # Report current state and let the agent loop externally
@@ -4177,6 +4365,8 @@ def phase_finish(
                 "attempt": test_attempts,
                 "max_retry": max_retry,
                 "failures": failures,
+                "notices": list(test_result.get("notices") or []),
+                "reason": failure_reason,
             }
             print(format_json_output(report))
             return report
@@ -4186,9 +4376,8 @@ def phase_finish(
         print("=" * 60)
         print(f"  ⚠  Test run {test_attempts}/{max_retry} failed")
         print("=" * 60)
-        print("  Failures:")
-        for f in failures[:10]:
-            print(f"    • {f}")
+        for line in _gate_failure_detail(test_result).splitlines():
+            print(f"  {line}")
         print()
         print("  Fix the failures and press Enter to re-run tests.")
         print("  Type 'abort' to abort the finish phase, or 'skip' to skip tests.")
@@ -4232,7 +4421,11 @@ def phase_finish(
         })
 
     if not test_result["success"]:
-        msg = f"Tests failed after {max_retry} retries. Aborting finish phase."
+        msg = (
+            f"Tests failed after {max_retry} retries.\n\n"
+            f"{_gate_failure_detail(test_result)}\n\n"
+            "Aborting finish phase."
+        )
         report["success"] = False
         report["message"] = msg
         wl_add_comment(work_item_id, msg)

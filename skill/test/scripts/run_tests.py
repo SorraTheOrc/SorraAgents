@@ -155,6 +155,42 @@ TEST_LOCK_TIMEOUT_DEFAULT = 600.0
 TEST_LOCK_JITTER_ENV = "TEST_LOCK_JITTER"
 TEST_LOCK_JITTER_DEFAULT = 0.1
 
+#: Stable, machine-readable notice codes carried on a suite result that fails
+#: WITHOUT structured test failures (WL-0MVGUT787000LNDG): no free test slot,
+#: command-not-found, suite timeout. Consumers (e.g. ``implement.py``'s finish
+#: gate) classify on the code — never on the human-readable notice text — so
+#: rewording a notice can never silently reclassify a genuine test failure as
+#: an infrastructure condition.
+NOTICE_SLOT_BUSY = "slot_busy"
+NOTICE_COMMAND_NOT_FOUND = "command_not_found"
+NOTICE_SUITE_TIMEOUT = "suite_timeout"
+
+#: Prefix of the no-free-slot notice produced by :func:`_test_concurrency_slot`.
+#: Exposed as a stable constant so a consumer handling a legacy result that
+#: predates ``notice_code`` can classify slot contention without duplicating
+#: the wording (WL-0MVGUT787000LNDG).
+SLOT_BUSY_NOTICE_PREFIX = "test concurrency slot busy:"
+
+#: Bound for the stdout/stderr tail carried on a suite result
+#: (WL-0MVGUT787000LNDG): large enough to include a stack trace, small enough
+#: that JSON reports stay readable. ``implement.py`` re-tails the aggregate to
+#: its own smaller bound for the operator message.
+NOTICE_OUTPUT_TAIL_CHARS = 4000
+
+
+def _output_tail(text: str | None, limit: int = NOTICE_OUTPUT_TAIL_CHARS) -> str:
+    """Return a bounded tail of *text* — the last ``limit`` characters.
+
+    Empty/None input yields an empty string; short text is returned whole.
+    """
+    if not text:
+        return ""
+    text = text.rstrip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
 #: Per-suite vitest/tinypool worker-pool bound (SA-0MVE98T1M006A17T): the
 #: complement to the host-wide suite ceiling. A single vitest suite normally
 #: sizes its pool to the CPU count (15+ tinypool forks observed from one
@@ -1464,7 +1500,7 @@ def _test_concurrency_slot() -> Iterator[None]:
             yield
     except TimeoutError as exc:
         raise TestConcurrencyTimeout(
-            f"test concurrency slot busy: no free slot within "
+            f"{SLOT_BUSY_NOTICE_PREFIX} no free slot within "
             f"{lock_timeout:.0f}s (TEST_MAX_CONCURRENCY={max_workers}) "
             f"— wait a staggered delay before retrying (do not re-run "
             f"immediately; concurrent waiters re-enter the pool in lockstep "
@@ -1634,7 +1670,9 @@ def run_suite(
     (SA-0MUJKF2HP001BR51).
 
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
-    ``cached``, ``scope``, ``type`` and (on missing binary) ``notice``.
+    ``cached``, ``scope``, ``type``; on a failure WITHOUT structured failures a
+    ``notice`` (human-readable) plus a stable ``notice_code`` and bounded
+    ``stdout``/``stderr`` tails (WL-0MVGUT787000LNDG).
     """
     cwd = cwd or REPO_ROOT
     resolvable_scope = "full"
@@ -1701,6 +1739,8 @@ def run_suite(
     all_failures: list[dict[str, str]] = []
     overall_returncode = 0
     cached_flags: list[bool] = []
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
     for cmd in commands:
         try:
             if use_cache:
@@ -1734,6 +1774,9 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"command not found: {exc.filename}",
+                "notice_code": NOTICE_COMMAND_NOT_FOUND,
+                "stdout": _output_tail("\n".join(stdout_parts)),
+                "stderr": _output_tail("\n".join(stderr_parts)),
                 "scope": resolvable_scope,
                 "type": test_type,
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
@@ -1745,6 +1788,9 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"suite timed out after {timeout}s: {name}",
+                "notice_code": NOTICE_SUITE_TIMEOUT,
+                "stdout": _output_tail("\n".join(stdout_parts)),
+                "stderr": _output_tail("\n".join(stderr_parts)),
                 "scope": resolvable_scope,
                 "type": test_type,
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
@@ -1759,12 +1805,17 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": str(exc),
+                "notice_code": NOTICE_SLOT_BUSY,
+                "stdout": _output_tail("\n".join(stdout_parts)),
+                "stderr": _output_tail("\n".join(stderr_parts)),
                 "scope": resolvable_scope,
                 "type": test_type,
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
 
         output = f"{proc.stdout}\n{proc.stderr}"
+        stdout_parts.append(proc.stdout or "")
+        stderr_parts.append(proc.stderr or "")
         if "pytest" in cmd:
             failures = parse_pytest_failures(output)
         else:
@@ -1783,6 +1834,9 @@ def run_suite(
         "type": test_type,
         "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
         "notice": "",
+        "notice_code": "",
+        "stdout": _output_tail("\n".join(stdout_parts)),
+        "stderr": _output_tail("\n".join(stderr_parts)),
     }
 
 
@@ -1821,6 +1875,9 @@ def run_all(
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
     notices: list[str] = []
+    notice_codes: list[str] = []
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
     resolved_scopes: list[str] = []
     with Timer("run_all") as _all_timer:
         for name in suites:
@@ -1844,11 +1901,20 @@ def run_all(
                 all_failures.append({**failure, "suite": name})
             if result.get("notice"):
                 notices.append(result["notice"])
+            if result.get("notice_code"):
+                notice_codes.append(result["notice_code"])
+            if result.get("stdout"):
+                stdout_parts.append(result["stdout"])
+            if result.get("stderr"):
+                stderr_parts.append(result["stderr"])
     return {
         "success": all(r["success"] for r in results.values()),
         "suites": results,
         "failures": all_failures,
         "notices": notices,
+        "notice_codes": notice_codes,
+        "stdout": "\n".join(stdout_parts),
+        "stderr": "\n".join(stderr_parts),
         "scope": scope,
         "type": test_type,
         "resolved_scopes": resolved_scopes,

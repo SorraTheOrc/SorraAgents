@@ -229,8 +229,32 @@ configured runner):
   (SA-0MUY6U05F008RG86 — see
   [test-skill-reference.md](test-skill-reference.md#06-nested-run-isolation-sa-0muy6u05f008rg86)).
 
+**Gate-failure diagnostics (WL-0MVGUT787000LNDG):** a failed changed-scope
+run is never reported as an empty `Failures:` block. `_adapt_guarded_result`
+carries the guarded run's `notices`/`notice_codes` (slot contention,
+command-not-found, suite timeout) and bounded `stdout`/`stderr` tails into
+`phase_finish`'s message builder, which renders:
+
+- **No free test slot** — classified on the stable `notice_code`
+  (`slot_busy`), with a narrow legacy fallback on the slot-busy notice
+  prefix only when there are no structured failures. The message says the
+  gate *could not start* (an infrastructure condition, not a code failure)
+  and suggests raising `TEST_LOCK_TIMEOUT` to wait longer.
+- **Unparsed failures** (e.g. vitest output that no parser matches) — the
+  command's output tail is included so the operator sees the actual error.
+- **Structured failures** — unchanged: the first 20 failures are listed.
+
+Genuine structured failures always win the classification, so a real test
+failure is never misreported as (or retried as) an infrastructure
+condition. The classification uses the stable notice codes exported by
+`run_tests.py` (`NOTICE_SLOT_BUSY`, `NOTICE_COMMAND_NOT_FOUND`,
+`NOTICE_SUITE_TIMEOUT`), never string matching on the human-readable notice
+text.
+
 The returned dict includes `skipped` (bool) and `tooling` (str | None) in
-addition to `success`/`stdout`/`stderr`/`exit_code`/`failures`.
+addition to `success`/`stdout`/`stderr`/`exit_code`/`failures` — and, for a
+guarded (test-skill) run, `notices`/`notice_codes` so callers can explain a
+failure without any structured failures.
 
 ## Push timeout (SA-0MUH9R74O002MQDU)
 

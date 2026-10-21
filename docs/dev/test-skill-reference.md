@@ -168,6 +168,19 @@ immediately or crashing. This means multiple agents running tests concurrently
 will serialize gracefully — each waits its turn and succeeds once a slot
 becomes free.
 
+**Failure-notice contract (WL-0MVGUT787000LNDG):** a suite that fails
+WITHOUT structured test failures reports a stable machine-readable
+`notice_code` alongside the human-readable `notice` — `slot_busy`
+(`NOTICE_SLOT_BUSY`), `command_not_found` (`NOTICE_COMMAND_NOT_FOUND`) or
+`suite_timeout` (`NOTICE_SUITE_TIMEOUT`). `run_suite` also carries bounded
+`stdout`/`stderr` tails (`_output_tail`, 4000 chars) and `run_all`
+aggregates them into top-level `notice_codes`/`stdout`/`stderr`. Consumers
+(e.g. `implement.py`'s finish gate) classify failures on the codes — never
+by string-matching the notice text — so rewording a notice can never
+silently reclassify a genuine test failure as infrastructure contention.
+The slot-busy notice text itself is anchored to the exported
+`SLOT_BUSY_NOTICE_PREFIX` constant.
+
 **Staggered-wait contract (SA-0MVEDOF7A004TSWD):** under a saturated pool,
 \*concurrent* waiters all enqueue with the same `TEST_LOCK_TIMEOUT` bound and,
 without measures, would poll the slot pool at a fixed cadence and expire at one
