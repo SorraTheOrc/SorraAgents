@@ -1,0 +1,3 @@
+Per-call timing: issue_id=SA-5 context=parent elapsed_seconds=300.0 model=mock
+Per-call timing: issue_id=SA-5 context=child:SA-5 elapsed_seconds=90.0 model=mock
+Per-call timing: issue_id=SA-5 context=phase2_deep elapsed_seconds=600.0 ac_count=2 avg_ac_elapsed_seconds=300.0 model=mock

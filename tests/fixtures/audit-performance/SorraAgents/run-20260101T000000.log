@@ -1,0 +1,4 @@
+# Synthetic audit debug log (fixture corpus, SA-0MVI6VET100337TW)
+Per-call timing: issue_id=SA-1 context=parent elapsed_seconds=100.0 input_tokens=10 model=mock
+Per-call timing: issue_id=SA-1 context=phase2_deep elapsed_seconds=90.0 input_tokens=20 ac_count=3 avg_ac_elapsed_seconds=30.0 model=mock
+Per-call timing: issue_id=SA-1 context=false-positive-screen elapsed_seconds=120.0 model=mock

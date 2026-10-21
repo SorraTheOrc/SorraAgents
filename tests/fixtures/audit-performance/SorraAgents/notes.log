@@ -1,0 +1,5 @@
+| 2 | SKILL.md instructs the agent to report progress every 3 minutes while using `Per-call timing:` lines — this markdown row must not be parsed.
+{"text": "A helper function parses `Per-call timing:` debug log lines."}
+Per-call timing: issue_id=SA-9 context=parent elapsed_seconds=not-a-number model=mock
+Per-call timing: issue_id=SA-9 context=child:SA-9 model=mock
+[AUDIT_IN_MAIN_SLOT_WORK] phase1_parent_screen SA-9 Per-call timing: issue_id=SA-9 context=parent elapsed_seconds=9999.0 model=mock
