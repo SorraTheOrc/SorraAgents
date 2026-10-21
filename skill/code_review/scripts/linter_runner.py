@@ -36,6 +36,18 @@ Severity mapping
 
 *dotnet-format severity mapping:*
   - All findings → medium (formatting issues)
+
+Non-Python exclusion (ruff)
+----------------------------
+Ruff only ever lints Python. Any other file it scans — explicitly passed or
+pulled in by a project's ruff config (``include``) — is mis-parsed as Python
+and emits false-positive ``invalid-syntax`` findings. Both ruff paths
+(explicit-file scope and whole-project scan, read-only and ``--fix``) are
+therefore guarded by :data:`RUFF_NON_PYTHON_EXCLUDE`: a project-agnostic,
+additive list of ``**/*.<ext>`` globs (TS/JS + ``.yaml``/``.yml``/``.json``/
+``.toml``/``.md``) passed via ``--extend-exclude`` with ``--force-exclude``.
+Genuine ``.py`` findings are never suppressed (CG-0MSXL2L0T009CA3I,
+SA-0MT2Q10PX0078DEM).
 """
 
 from __future__ import annotations
@@ -89,6 +101,39 @@ _RUFF_DEFAULT_SEVERITY = "medium"
 #: blocking high-severity finding (SA-0MUA6W7P1007H2AU). Mirrors the ruff
 #: extension guard in ``_run_ruff_check``.
 ESLINT_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
+#: Python source extensions ruff is allowed to lint. ``_run_ruff_check`` and
+#: ``_run_ruff_fix_mode`` narrow any explicit file list down to these before
+#: building the ruff command.
+PYTHON_SOURCE_EXTENSIONS = (".py", ".pyi", ".pyx")
+
+#: Non-Python file extensions ruff must NEVER lint (SA-0MT2Q10PX0078DEM).
+#:
+#: Ruff is a Python linter: it only parses Python sources, but (a) a
+#: project's ruff config may route other files into the checker (e.g.
+#: ``include = ["*.py", "*.yaml"]``) and (b) explicitly passed paths are
+#: linted as Python regardless of extension unless ``--force-exclude`` is
+#: given. Either way a YAML/JSON/TOML/Markdown file mis-parsed as Python
+#: emits false-positive ``invalid-syntax`` findings — e.g. the llm
+#: project's ``proxy/config-cheap.yaml`` accumulated 155 of them in
+#: LP-0MT1F4IQU00828FC.
+#:
+#: The value is pure gitignore-style globs — a deliberately additive,
+#: project-agnostic list with no project-specific paths or names, so it
+#: applies to ANY project root (same non-Python config extensions
+#: everywhere). It is passed to BOTH ruff paths: the explicit-file scope
+#: (``files=[...]``) and the whole-project scan (``files=None``). Genuine
+#: ``.py`` findings are never suppressed — ``.py`` is not in the list.
+RUFF_NON_PYTHON_EXCLUDE = ",".join(
+    f"**/*{ext}"
+    for ext in (
+        # TS/JS are JavaScript, not Python (CG-0MSXL2L0T009CA3I: 627
+        # false positives on a .ts file).
+        ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+        # Non-Python configuration/docs files (SA-0MT2Q10PX0078DEM).
+        ".yaml", ".yml", ".json", ".toml", ".md",
+    )
+)
 
 
 def _classify_ruff(code: str) -> str:
@@ -389,38 +434,51 @@ def _run_ruff_check(
 ) -> list[dict[str, Any]]:
     """Run ruff check (without fix) and return structured findings.
 
-    Explicitly excludes non-Python extensions (TypeScript/JavaScript) to
-    prevent ruff from mis-parsing them as Python and producing
-    false-positive lint findings (see CG-0MSXL2L0T009CA3I: 627 false
-    positives on a .ts file).
+    Excludes every non-Python extension in :data:`RUFF_NON_PYTHON_EXCLUDE`
+    (TS/JS, plus YAML/YML/JSON/TOML/Markdown config and docs files) via
+    ``--extend-exclude`` + ``--force-exclude`` so ruff never mis-parses them
+    as Python and emits false-positive ``invalid-syntax`` findings
+    (CG-0MSXL2L0T009CA3I: 627 false positives on a .ts file;
+    SA-0MT2Q10PX0078DEM: 155 on a .yaml file).
+
+    Both paths are guarded, additively and independently of the project:
+
+    * **Explicit-file scope** (``files=[...]``) — the list is narrowed to
+      :data:`PYTHON_SOURCE_EXTENSIONS` AND the exclusion is passed with
+      ``--force-exclude`` (ruff lints explicitly-passed paths regardless of
+      ``exclude`` unless ``--force-exclude`` is given).
+    * **Whole-project scan** (``files`` empty/None) — ruff is pointed at
+      ``root`` with the same ``--extend-exclude``/``--force-exclude``, so a
+      project whose ruff config routes ``*.yaml`` (or any other non-Python
+      extension) into the checker is still safe.
 
     Args:
         root: The project root path.
         runner: Subprocess runner callable.
+        files: Optional explicit file scope.
 
     Returns:
         A list of finding dicts.
     """
     findings: list[dict[str, Any]] = []
 
-    # Exclude known non-Python extensions as a belt-and-braces guard.
-    # Prevents false-positives when ruff mis-parses TypeScript/JavaScript
-    # as Python (see CG-0MSXL2L0T009CA3I: 627 false positives on .ts).
-    _TS_EXCLUDE = "**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.mjs,**/*.cjs"
-
     # Only pass Python files explicitly: ruff lints explicitly-passed paths
     # regardless of `exclude` unless `--force-exclude` is given, so filter
     # the file list down to Python extensions AND force-exclude.
     if files:
-        py_files = [f for f in files if str(f).endswith((".py", ".pyi", ".pyx"))]
+        py_files = [
+            f for f in files
+            if str(f).endswith(PYTHON_SOURCE_EXTENSIONS)
+        ]
         if not py_files:
             return []
         cmd = ["ruff", "check", *[str(f) for f in py_files],
-               "--extend-exclude", _TS_EXCLUDE,
+               "--extend-exclude", RUFF_NON_PYTHON_EXCLUDE,
                "--force-exclude",
                "--output-format", "json", "--quiet"]
     else:
-        cmd = ["ruff", "check", str(root), "--extend-exclude", _TS_EXCLUDE,
+        cmd = ["ruff", "check", str(root),
+               "--extend-exclude", RUFF_NON_PYTHON_EXCLUDE,
                "--force-exclude",
                "--output-format", "json", "--quiet"]
     result = runner(cmd)
@@ -655,32 +713,37 @@ def _run_ruff_fix_mode(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Run ruff check --fix and return remaining findings.
 
-    Explicitly excludes non-Python extensions (TypeScript/JavaScript) to
-    prevent ruff from mis-parsing them as Python.
+    Excludes every non-Python extension in :data:`RUFF_NON_PYTHON_EXCLUDE`
+    on BOTH the fix pass and the rescan pass, for the explicit-file scope
+    and the whole-project scan alike (see :func:`_run_ruff_check` for the
+    rationale — ruff must never parse YAML/JSON/TOML/Markdown/TS/JS as
+    Python).
     """
-    _TS_EXCLUDE = "**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.mjs,**/*.cjs"
 
     # Only pass Python files explicitly (see _run_ruff_check note).
-    _py_files = [f for f in (files or []) if str(f).endswith((".py", ".pyi", ".pyx"))]
+    _py_files = [
+        f for f in (files or []) if str(f).endswith(PYTHON_SOURCE_EXTENSIONS)
+    ]
 
     def fix_cmd(root: Path) -> list[str]:
         if _py_files:
             return ["ruff", "check", *[str(f) for f in _py_files], "--fix",
-                    "--extend-exclude", _TS_EXCLUDE,
+                    "--extend-exclude", RUFF_NON_PYTHON_EXCLUDE,
                     "--force-exclude",
                     "--output-format", "json", "--quiet"]
         return ["ruff", "check", str(root), "--fix",
-                "--extend-exclude", _TS_EXCLUDE,
+                "--extend-exclude", RUFF_NON_PYTHON_EXCLUDE,
                 "--force-exclude",
                 "--output-format", "json", "--quiet"]
 
     def rescan_cmd(root: Path) -> list[str]:
         if _py_files:
             return ["ruff", "check", *[str(f) for f in _py_files],
-                    "--extend-exclude", _TS_EXCLUDE,
+                    "--extend-exclude", RUFF_NON_PYTHON_EXCLUDE,
                     "--force-exclude",
                     "--output-format", "json", "--quiet"]
-        return ["ruff", "check", str(root), "--extend-exclude", _TS_EXCLUDE,
+        return ["ruff", "check", str(root),
+                "--extend-exclude", RUFF_NON_PYTHON_EXCLUDE,
                 "--force-exclude",
                 "--output-format", "json", "--quiet"]
 
@@ -803,9 +866,11 @@ def run_ruff(
     """Run ruff check on the given project root and return structured findings.
 
     Only runs if the linter is available on PATH and Python files are detected.
-    Explicitly excludes non-Python extensions (TypeScript/JavaScript) to
-    prevent false-positive lint findings — ruff mis-parses them as Python
-    (see CG-0MSXL2L0T009CA3I: 627 false positives on .ts file).
+    All non-Python extensions (:data:`RUFF_NON_PYTHON_EXCLUDE` — TS/JS plus
+    YAML/YML/JSON/TOML/Markdown) are excluded from BOTH the explicit-file
+    scope and the whole-project scan to prevent false-positive lint findings:
+    ruff would otherwise mis-parse those files as Python
+    (CG-0MSXL2L0T009CA3I, SA-0MT2Q10PX0078DEM).
 
     Args:
         project_root: Path to the project root (default: cwd).
