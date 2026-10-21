@@ -209,10 +209,16 @@ def test_concurrency_ceiling_respected_with_serialization(monkeypatch):
 
 
 def test_default_ceiling_documented(monkeypatch):
-    """Without env override, the audit semaphore uses the documented default."""
+    """Without env override and with a failed slot query, the static default stands."""
     from shared.process_semaphore import DEFAULT_MAX_WORKERS
 
     monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    # Slot discovery unavailable → the static default is the documented
+    # fallback (SA-0MVI6VJCP006XNA2 AC3). With a reachable proxy the ceiling
+    # derives from live slots instead, so this test pins the fallback path.
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (None, None)
+    )
     with _mock_popen():
         audit_runner._call_pi("prompt", model="m", pi_bin="pi")
     # The audit ceiling helper must report the default.
@@ -234,19 +240,24 @@ def test_invalid_env_ceiling_falls_back(monkeypatch, capsys):
     assert "invalid" in capsys.readouterr().err.lower()
 
 
-def test_default_ceiling_right_sized_to_proxy_pool():
-    """The default audit concurrency ceiling is right-sized (SA-0MUSZJRB9006ZCHE).
+def test_default_ceiling_right_sized_to_proxy_pool(monkeypatch):
+    """The static fallback ceiling is right-sized (SA-0MUSZJRB9006ZCHE).
 
     The F7 harness measured the host's real audit-slot capacity and the
     3-slot local LLM proxy pool bounds useful inference concurrency. The
-    default must be at least 3 (so N >= 3 concurrent audits are admitted
-    without queueing) and bounded (so it does not exceed the host's CPU
-    headroom; 6 = 2x the proxy pool).
+    static fallback must be at least 3 (so N >= 3 concurrent audits are
+    admitted without queueing) and bounded (so it does not exceed the host's
+    CPU headroom; 6 = 2x the proxy pool). Pin the fallback by mocking the
+    slot query to fail (SA-0MVI6VJCP006XNA2 AC3); against a live proxy the
+    ceiling derives from the reported slot capacity instead.
     """
     from shared.process_semaphore import DEFAULT_MAX_WORKERS
 
     assert DEFAULT_MAX_WORKERS >= 3, "must admit at least 3 concurrent audits"
     assert DEFAULT_MAX_WORKERS <= 8, "must stay within measured host headroom"
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (None, None)
+    )
     assert audit_runner._audit_semaphore_max_workers() == DEFAULT_MAX_WORKERS
 
 
