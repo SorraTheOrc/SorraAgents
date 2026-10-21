@@ -4,7 +4,7 @@
 **Type:** Root-cause analysis
 **Observed:** 2026-10-21, ContextHub, work item `WL-0MVFNMSRW002FI6B` (11-child epic)
 **Recurrence of:** SA-0MUJAPC680078396 (completed — "re-auditing an `in_review` child demotes it and can cascade a parent block") and SA-0MSGMR7CX00588TZ (completed — "flag infra-fallback verdicts, never demote")
-**Status of findings:** F1 and F2 are proven from code + persisted state. F3 is proven as a code inconsistency; its role in the observed verdict is **not yet confirmed** (see §5).
+**Status of findings:** F1, F2 and F3 are proven from code + persisted state. F3 (corrected on 2026-10-21 after source inspection — see §5) is the reason the parent's own verdict was `No` **and** the reason the report blamed the wrong cause.
 
 ---
 
@@ -22,7 +22,6 @@ Two previously-closed fixes were supposed to prevent exactly this:
   parent-triggered re-screen of an `in_review` child cannot block or demote it.
 * **SA-0MSGMR7CX00588TZ** established that an infra-fallback verdict is not an
   explicit model "No" and must take the *restore* path, never the demote path.
-
 Both guarantees are implemented **only in the runner's own lifecycle for the item
 under audit** (`_apply_terminal_lifecycle`). Child audits persisted by a parent run
 travel a completely different path — `_persist_child_audit()` → `persist_audit.py` →
@@ -34,6 +33,13 @@ The demotion was fed by a second, independent weakness: the 600 s child-screen
 budget is **marginal** on a loaded host (5 of 11 child screens landed exactly on the
 cap), so 8 of the 11 persisted child verdicts were `No` on infra-fallback-tainted
 evidence (7 timeouts / 7 parse failures of 27 calls).
+
+A third, independent weakness turned that taint into the parent's `No`: the parent's
+closure folds **child AC verdicts** into `all_ac_acceptable` with **no exemption
+filter**, so fallback-tainted `partial` child ACs force `No` even though every child
+was `in_review` at audit start and every parent AC was `met`/`adjusted`. The report
+then names the wrong cause — the children's *stages* — which is what made this
+incident hard to read.
 
 ---
 
@@ -158,39 +164,74 @@ downstream consumer (`wl audit-set`) acts on the verdict regardless.
 
 ---
 
-## 5. Finding F3 — report text and closure verdict use different exemption sources — **CONFIRMED as inconsistency; role in this run unconfirmed**
+## 5. Finding F3 — child ACs bypass the snapshot, and the resulting blocker is misattributed — **CONFIRMED (corrected)**
 
-Inside `_assemble_issue_report`:
+> **Correction.** An earlier draft of this RCA claimed that `not_reviewed` (~L5759) ignores
+> `snapshot_exempt` and therefore contradicts the verdict. That claim is **wrong**: every
+> `not_reviewed` reference (~L5780, ~L5811-5815, ~L5827-5830) is inside the **`No`**
+> branch, i.e. it only ever explains a verdict that has already been decided. The
+> observation was right; the mechanism was not. This section records the verified mechanism.
+
+### F3a — child AC verdicts bypass the exemption snapshot
+
+`all_ac_acceptable` folds **every child's** AC results into the parent's verdict:
 
 ```python
-# audit_runner.py ~L5633 — VERDICT path: honours the snapshot
-all_children_reviewed = all(
-    _child_is_exempt(c, snapshot_exempt) or c.get("stage") in ("in_review", "done")
-    for c in active_children
-)
-
-# audit_runner.py ~L5759 — TEXT path: ignores the snapshot
-not_reviewed = [
-    c for c in child_results
-    if c.get("stage") not in ("in_review", "done", "")
+# audit_runner.py ~L5609-5621
+child_acs = [
+    a
+    for c in child_results
+    if (str(c.get("id", "") or "") not in unserviced_ids
+        or not _child_has_stored_verdict(c))
+    for a in c.get("ac_results", [])
 ]
+all_ac_acceptable = all(
+    r["verdict"] in _ACCEPTABLE_VERDICTS          # {met, adjusted}  (~L1158)
+    for r in ac_results + child_acs
+)
 ```
 
-`not_reviewed` feeds the "N children not yet in in_review/done stage" summary line.
-Because it ignores `snapshot_exempt`, the report text can contradict the closure
-decision it accompanies — an operator reading "11 children not yet in
-in_review/done stage" cannot tell whether or not the snapshot was applied.
+There is **no `_child_is_exempt` filter on `child_acs`**. The two exemption-aware
+checks that sit immediately below it — `all_children_reviewed` (~L5633) and
+`any_child_audit_not_ready` (~L5643) — are therefore defeated by the AC aggregation
+that precedes them: a child that *was* `in_review` at audit start, and was re-screened
+as a side effect into `partial` on infra-fallback evidence, still forces
+`ready_before_cq = "No"`.
 
-**Unconfirmed sub-question.** With a correctly populated snapshot, the parent's
-`ready_before_cq` should have been `Yes` (all ACs acceptable, children
-snapshot-exempt). It was `No`, so either the snapshot was empty (children already
-demoted *before* `_capture_exempt_children_snapshot` ran), the snapshot was not
-propagated to the closure path, or an additional exemption term failed. This is
-called out as an acceptance criterion on SA-0MVI35BIU002MTZQ rather than asserted
-here. Note the one-way nature of the reversion: `audit-set` reverts on `no` but
-**never promotes on `yes`**, so any earlier tainted `no` write for a child is not
-undone by a later passing persist — which is the most likely explanation for F1
-reaching `open`/`plan_complete` despite a stored `readyToClose=true`.
+That is exactly this run: all 11 children were snapshot-exempt, the parent's own six
+ACs were `met`/`adjusted`, yet the verdict was `No` because the children's
+**timeout-tainted `partial`** ACs were folded in.
+
+The existing regression test does not cover this path: `TestChildExemptionSnapshot::
+ test_snapshot_keeps_parent_yes_when_child_demoted`
+(`skill/audit/tests/test_audit_runner_review.py:88`) passes a demoted child with
+`child_audit_ready=False` but **no `ac_results`**, so the AC-aggregation path is never
+exercised. The snapshot invariant is tested for the *stage* channel and untested for
+the *AC* channel.
+
+### F3b — the reported blocker is misattributed to children's stages
+
+Because the verdict is `No` and `unmet_count == 0` and `partial_count == 0` (parent ACs
+are all `met`/`adjusted`), the report falls through to:
+
+```python
+# audit_runner.py ~L5827-5830
+elif not_reviewed:
+    lines.append(
+        f"{len(not_reviewed)} children not yet in in_review/done stage: "
+        f"{_format_blocking_children(not_reviewed)}."
+    )
+```
+
+and prints *"11 children not yet in in_review/done stage: … (plan_complete)"* —
+blaming the children's **stages**, when the actual driver was the children's
+**AC verdicts** (F3a) plus the demotion (F1). The report therefore misdirects any
+operator or agent reading it: this RCA's own first reading of the incident went
+looking for a stage problem that the exemption had already neutralised.
+
+**Recommendation:** when the parent's own ACs are all acceptable and the blocker comes
+from child AC aggregation, the report must say so explicitly (e.g. "N child ACs not
+acceptable: <ids>, M from infra-fallback"), and must name the fallback provenance.
 
 ---
 
@@ -202,7 +243,7 @@ reaching `open`/`plan_complete` despite a stored `readyToClose=true`.
 | **Runner boundary** | The skill's lifecycle guards live in `_apply_terminal_lifecycle` (for the audited item) and `_cascade_suppress_demotion` (cascade-marker only), not on the child-persistence path | The invariant is enforced in one of three write paths |
 | **Budget** | 600 s child-screen cap ≈ the p95 of completed screens on a loaded host | 45 % of screens tainted; verdicts are infra-fallback 'No's |
 | **Observability** | A capped screen is recorded as a plain `partial`; `AUDIT_RELIABILITY_SUMMARY` counts `timeouts` only in aggregate | Downstream cannot quarantine tainted verdicts |
-| **Report assembly** | `not_reviewed` (~L5759) ignores `snapshot_exempt` while `all_children_reviewed` (~L5633) honours it | Text and verdict can disagree; misleads operators |
+| **Report assembly** | `all_ac_acceptable` (~L5609-5621) folds child ACs in with no `_child_is_exempt` filter, defeating the exemption checks that follow it; the resulting blocker is then attributed to children's *stages* (~L5827-5830) | A parent with only fallback-tainted child ACs reports `No` and misdirects the reader about why |
 
 The shared structural cause is the same one identified in
 [`audit-reliability-rca.md`](audit-reliability-rca.md) §5, in a different guise:
@@ -220,7 +261,7 @@ a *child being screened as a side effect of its parent*.
 | R1 | **High** | Make child-audit persistence lifecycle-neutral: persist via a path that writes the audit **without** the `audit-set` reversion (e.g. `--ready-to-close` omitted, or an explicit `--no-revert`), then let the runner's `_apply_terminal_lifecycle` own any transition — with the snapshot/fallback guards | Removes the demotion class entirely in both child-audit modes | SA-0MVI35BIU002MTZQ AC1 |
 | R2 | **High** | Extend the "infra-fallback never demotes" rule (SA-0MSGMR7CX00588TZ) to child verdicts, and carry fallback provenance into `persist_audit` so a tainted 'No' cannot demote | Tainted runs become observable restores, not silent regressions | SA-0MVI35BIU002MTZQ AC2 |
 | R3 | **High** | Add a regression test that snapshots every child's `(status, stage)` before a parent audit and asserts an identical set afterwards, including a `blocked`-cascade assertion | Makes the invariant executable; the observable signal is "zero lifecycle deltas" | SA-0MVI35BIU002MTZQ AC3/AC5 |
-| R4 | Medium | Make `not_reviewed` (~L5759) honour `snapshot_exempt`, i.e. one `_child_is_exempt` helper for both the verdict and the text | Report text can no longer contradict the closure decision | SA-0MVI35BIU002MTZQ AC4 |
+| R4 | **High** | Filter `child_acs` (~L5609-5621) through `_child_is_exempt` (and treat infra-fallback child ACs as diagnostics, not verdicts), and make the report name the real blocker — child ACs plus their fallback provenance — instead of blaming children's stages (~L5827-5830) | A parent whose children were exempt at audit start can no longer be forced to `No` by fallback-tainted child ACs; the report states the true cause | SA-0MVI35BIU002MTZQ AC4 |
 | R5 | Medium | Derive the child-screen budget from measured p95 × a documented safety factor (≈2× ⇒ 1,000–1,200 s here) and re-measure the cap-hit rate | Cuts capped screens from 45 % → ≤ 5 %, removing the main source of tainted child verdicts | SA-0MVI3608M0080QLW AC1/AC2 |
 | R6 | Medium | Surface `child_screen_timeouts` in `AUDIT_RELIABILITY_SUMMARY` and name the timeout in the affected AC evidence | Lets operators and gates quarantine tainted verdicts | SA-0MVI3608M0080QLW AC3 |
 | R7 | Low | Record the AC-count/FILE-SCOPE-width correlation for capped screens, to inform a future manifest-width bound | Data for the parent epic's Phase-1 reduction work | SA-0MVI3608M0080QLW AC5 |
@@ -244,6 +285,29 @@ overridden — the audit skill treats the runner's verdict as authoritative — 
 parent remains blocked on this defect rather than on outstanding work. Once R1–R4
 land, a single parent re-audit should return `Ready to close: Yes` with **no code
 changes** to the audited project.
+
+### Coordination note — this area is already red on `dev`
+
+While validating this RCA the full suite on `dev` (commit `4fb03ed2`, docs-only) failed
+with **5 failures, all in the audit skill** (load-driven, not caused by the RCA commit):
+
+| Failing test | Area |
+|---|---|
+| `test_audit_runner_review.py::TestChildExemptionSnapshot::test_report_text_honours_snapshot_for_not_reviewed_children` | the report-text/snapshot path (F3) |
+| `test_audit_runner_child_in_main_slot.py::TestChildScreensPendingGate::test_report_surfaces_pending_gate_and_blocks_yes` | child-screen pending gate |
+| `test_audit_runner_child_in_main_slot.py::TestUnservicedMainSlotVerdicts::test_not_assessed_without_stored_verdict_no_gate_never_ready` | unserviced main-slot verdicts |
+| `test_audit_runner_child_in_main_slot.py::TestUnservicedMainSlotVerdicts::test_fresh_pending_without_stale_signal_still_gate_blocks` | unserviced main-slot verdicts |
+| `test_audit_runner_child_in_main_slot.py::TestInteractiveRegressionGuard::test_interactive_service_then_rerun_reports_ready` | interactive re-run reporting |
+
+All five are in the exact code paths this RCA covers, and the first one names the
+text/snapshot behaviour directly, so **in-flight work already targets part of F3**.
+Before implementing R1–R4, check the current state of these tests and coordinate with
+their owner rather than duplicating: the snapshot contract is currently partial
+(covers child *stages*, not child *ACs* — F3a) and the reporting path is mid-change.
+
+Because `dev` is red, the RCA commit could not be pushed at the time of writing: the
+`dev` pre-push gate runs the full suite and fails closed. That is correct behaviour —
+the commit is local until the audit-skill tests are green.
 
 ---
 
@@ -296,11 +360,14 @@ rg -n "ready-to-close|_extract_ready_to_close" skill/audit/scripts/persist_audit
 
 * `skill/audit/scripts/audit_runner.py`
   * `_persist_child_audit` (~L6206) — the in-process child-audit persistence path.
+  * `all_ac_acceptable` / `child_acs` (~L5609-5621) — child ACs folded in with no exemption filter (F3a).
+  * Blocker attribution (~L5827-5830) — blames children's stages when child ACs are the driver (F3b).
   * `_cascade_suppress_demotion` / `_is_cascade_audit` (~L12700) — suppression keyed to the `AUDIT_CASCADE_AUDIT` marker only.
   * `_capture_exempt_children_snapshot` (~L8568) and `_child_is_exempt` (~L7105).
-  * `_assemble_issue_report`: `all_children_reviewed` (~L5633) vs `not_reviewed` (~L5759).
+  * `all_children_reviewed` (~L5633) / `any_child_audit_not_ready` (~L5643) / `not_reviewed` (~L5759).
   * `_CHILD_SCREEN_TIMEOUT_DEFAULT` / `_resolve_child_screen_timeout` (~L631–642, ~L2770).
   * `_apply_terminal_lifecycle` (~L12640–12750) — where the guards actually live.
+* `skill/audit/tests/test_audit_runner_review.py:88` — `TestChildExemptionSnapshot` covers the stage channel only (no `ac_results` on the demoted child), which is why F3a slipped through.
 * `skill/audit/scripts/persist_audit.py` — `_extract_ready_to_close` (~L321), `audit-set` invocation (~L515–533).
 * `src/commands/audit-result.ts:207-214` — reversion trigger.
 * `packages/shared` — `database.revertToPlanComplete`.
