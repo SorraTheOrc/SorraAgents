@@ -3301,35 +3301,124 @@ def _run_tests_via_test_skill(
     }
 
 
+AUDIT_CEILING_SOURCE_CLI = "cli"
+"""Ceiling source: explicit ``--max-concurrency`` CLI flag."""
+
+AUDIT_CEILING_SOURCE_ENV = "env"
+"""Ceiling source: explicit ``AUDIT_MAX_CONCURRENCY`` environment variable."""
+
+AUDIT_CEILING_SOURCE_SLOTS = "slots"
+"""Ceiling source: derived from the live proxy slot status."""
+
+AUDIT_CEILING_SOURCE_STATIC = "static"
+"""Ceiling source: configured static fallback (slot query failed)."""
+
+#: Guards the once-per-run derivation log (see
+#: :func:`_reset_audit_ceiling_log`).
+_AUDIT_CEILING_LOG_EMITTED = False
+
+
+def _reset_audit_ceiling_log() -> None:
+    """Re-arm the once-per-run audit-ceiling derivation log.
+
+    Exists so tests can observe the log deterministically; production code
+    never calls it (the guard is per process, and a process is one run).
+    """
+    global _AUDIT_CEILING_LOG_EMITTED
+    _AUDIT_CEILING_LOG_EMITTED = False
+
+
+def _log_audit_ceiling(
+    ceiling: int,
+    source: str,
+    available: int | None = None,
+    total: int | None = None,
+) -> None:
+    """Log the derived audit ceiling once per run (slot state + source).
+
+    A single line per run makes the decision observable in the audit log
+    without flooding it: the helper is called from every pi-call launch, so
+    an unguarded print would emit once per call.
+    """
+    global _AUDIT_CEILING_LOG_EMITTED
+    if _AUDIT_CEILING_LOG_EMITTED:
+        return
+    _AUDIT_CEILING_LOG_EMITTED = True
+    print(
+        "Audit ceiling: "
+        f"ceiling={ceiling} source={source} "
+        f"available_slots={available} total_slots={total}",
+        file=sys.stderr,
+    )
+
+
+def _audit_ceiling_from_slots() -> tuple[int, str, int | None, int | None]:
+    """Derive the audit ceiling from the live proxy slot capacity.
+
+    Queries the slot-status endpoint (see :func:`_query_slot_status`) and
+    returns ``(ceiling, source, available_slots, total_slots)`` where the
+    ceiling is ``max(1, min(available_slots, total_slots))`` — never above
+    the proxy's reported capacity, and never below 1 so a saturated pool
+    degrades to sequential execution instead of stalling.
+
+    The historical static ceiling (``DEFAULT_MAX_WORKERS``) is used when the
+    query fails: slot discovery is an optimisation, so an unreachable
+    endpoint must never block or fail an audit (fail-open).
+    """
+    try:
+        available, total = _query_slot_status()
+    except Exception:  # noqa: BLE001 — fail-open, mirrors _query_slot_status
+        available, total = None, None
+    if available is None or total is None:
+        return DEFAULT_MAX_WORKERS, AUDIT_CEILING_SOURCE_STATIC, None, None
+    capacity = max(0, min(int(available), int(total)))
+    return max(1, capacity), AUDIT_CEILING_SOURCE_SLOTS, available, total
+
+
 def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
-    """Resolve the audit concurrency ceiling.
+    """Resolve the audit concurrency ceiling (pi-call semaphore size).
 
     Precedence:
-      1. ``--max-concurrency`` CLI flag (explicit override)
-      2. ``AUDIT_MAX_CONCURRENCY`` environment variable
-      3. ``DEFAULT_MAX_WORKERS`` (6)
+      1. ``--max-concurrency`` CLI flag (explicit override, authoritative)
+      2. ``AUDIT_MAX_CONCURRENCY`` environment variable (authoritative)
+      3. live proxy slot status: ``max(1, min(available_slots, total_slots))``
+      4. ``DEFAULT_MAX_WORKERS`` (6) static fallback when the query fails
 
-    Right-sized via the F7 harness to the host's measured audit-slot capacity
-    (SA-0MUSZJRB9006ZCHE): 6 = 2x the 3-slot local LLM proxy pool; the
-    harness drained a burst of 8 audits with a batch-attributable load delta
-    <= 1.63 on the 16-core host and no swap growth.
+    Sizing the ceiling from the live slot capacity removes the queue-induced
+    timeout inflation that a hardcoded 6 against a 2-slot proxy produced
+    (SA-0MVF1NKZQ009P3ZG AC3): six concurrent pi sessions queued behind two
+    slots and the queue wait was charged against each call's own timeout
+    budget. Explicit operator intent is never overridden — the CLI and env
+    layers keep precedence, so a deliberate ceiling always wins.
+
+    The derivation is logged once per run (slot status, ceiling, source).
 
     An invalid (non-integer) env value is ignored with a warning so a
-    misconfigured environment cannot break the audit run.
+    misconfigured environment cannot break the audit run; it degrades to the
+    static ceiling rather than consulting the slot endpoint, because the
+    operator clearly intended an explicit ceiling.
     """
     if cli_value is not None:
-        return max(1, int(cli_value))
+        ceiling = max(1, int(cli_value))
+        _log_audit_ceiling(ceiling, AUDIT_CEILING_SOURCE_CLI)
+        return ceiling
     env_value = os.environ.get(ENV_MAX_WORKERS)
     if env_value:
         try:
-            return max(1, int(env_value))
+            ceiling = max(1, int(env_value))
         except ValueError:
             print(
                 f"Warning: invalid {ENV_MAX_WORKERS} value {env_value!r}; "
                 "using default ceiling",
                 file=sys.stderr,
             )
-    return DEFAULT_MAX_WORKERS
+            _log_audit_ceiling(DEFAULT_MAX_WORKERS, AUDIT_CEILING_SOURCE_STATIC)
+            return DEFAULT_MAX_WORKERS
+        _log_audit_ceiling(ceiling, AUDIT_CEILING_SOURCE_ENV)
+        return ceiling
+    ceiling, source, available, total = _audit_ceiling_from_slots()
+    _log_audit_ceiling(ceiling, source, available, total)
+    return ceiling
 
 
 def _audit_lock_timeout() -> float:
