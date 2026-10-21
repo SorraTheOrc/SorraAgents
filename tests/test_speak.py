@@ -801,3 +801,233 @@ class TestTimingWrapperVoicePassthrough:
         )
         assert result.returncode == 0, result.stderr
         assert _voice_from_payload(tmp_path / "payload.json") == "nova"
+
+
+# ===================================================================
+# Endpoint selection (TTS-0MVH8TM11003AUZZ)
+# ===================================================================
+
+DEFAULT_ENDPOINT = "http://100.79.231.101:8000/v1/audio/speech"
+LOCAL_ENDPOINT = "http://127.0.0.1:8000/v1/audio/speech"
+ALT_ENDPOINT = "http://192.0.2.10:9000/v1/audio/speech"
+
+
+def _curl_request_urls(mock_log):
+    """Return the request URLs the mock curl was invoked with, in call order.
+
+    The mock logs one ``CURL:<args>`` line per invocation; the request URL is
+    the token immediately following the ``-X <method>`` pair.
+    """
+    assert mock_log.exists(), "mock curl never ran (no log file)"
+    urls = []
+    for line in mock_log.read_text().splitlines():
+        if not line.startswith("CURL:"):
+            continue
+        tokens = line[len("CURL:"):].split()
+        if "POST" not in tokens:
+            continue
+        urls.append(tokens[tokens.index("POST") + 1])
+    return urls
+
+
+def _endpoint_env(mock_env, **overrides):
+    """Copy *mock_env* with inherited TTS_* overrides removed for determinism."""
+    env = dict(mock_env)
+    env.pop("TTS_API_URL", None)
+    env.pop("TTS_VOICE", None)
+    env.update(overrides)
+    return env
+
+
+class TestEndpointSelection:
+    """AC1: --endpoint selects the endpoint; the default is unchanged."""
+
+    def test_endpoint_flag_selects_url(self, mock_env, tmp_path):
+        """--endpoint posts to the given URL in save-to-file mode."""
+        result = _run_speak(["--endpoint", LOCAL_ENDPOINT, "Hello"], _endpoint_env(mock_env))
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [LOCAL_ENDPOINT]
+
+    def test_endpoint_flag_selects_url_in_stream_mode(self, mock_env, tmp_path):
+        """--stream shares the endpoint variable, so --endpoint applies there too."""
+        result = _run_speak(
+            ["--stream", "--endpoint", LOCAL_ENDPOINT, "Hello"],
+            _endpoint_env(mock_env),
+        )
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [LOCAL_ENDPOINT]
+
+    def test_default_endpoint_unchanged(self, mock_env, tmp_path):
+        """Omitting both --endpoint and TTS_API_URL keeps the remote default."""
+        result = _run_speak(["Hello"], _endpoint_env(mock_env))
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [DEFAULT_ENDPOINT]
+
+    def test_endpoint_streamed_audio_still_on_stdout(self, mock_env, tmp_path):
+        """Selecting an endpoint must not disturb --stream's raw-audio stdout."""
+        result = _run_speak(
+            ["--endpoint", LOCAL_ENDPOINT, "--stream", "Hello"],
+            _endpoint_env(mock_env),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "mock-wav-content" in result.stdout
+
+
+class TestEndpointPrecedence:
+    """AC2: --endpoint > TTS_API_URL > built-in default."""
+
+    def test_tts_api_url_env_fallback(self, mock_env, tmp_path):
+        """TTS_API_URL selects the endpoint when --endpoint is absent."""
+        env = _endpoint_env(mock_env, TTS_API_URL=ALT_ENDPOINT)
+        result = _run_speak(["Hello"], env)
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [ALT_ENDPOINT]
+
+    def test_endpoint_flag_overrides_env(self, mock_env, tmp_path):
+        """--endpoint wins over TTS_API_URL."""
+        env = _endpoint_env(mock_env, TTS_API_URL=ALT_ENDPOINT)
+        result = _run_speak(["--endpoint", LOCAL_ENDPOINT, "Hello"], env)
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [LOCAL_ENDPOINT]
+
+    def test_endpoint_flag_overrides_env_in_stream_mode(self, mock_env, tmp_path):
+        """Flag-over-env precedence holds in stream mode too."""
+        env = _endpoint_env(mock_env, TTS_API_URL=ALT_ENDPOINT)
+        result = _run_speak(
+            ["--stream", "--endpoint", LOCAL_ENDPOINT, "Hello"], env
+        )
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [LOCAL_ENDPOINT]
+
+class TestEndpointArgumentParsing:
+    """AC3: --endpoint parses in any order; bad forms are usage errors."""
+
+    def test_endpoint_before_voice(self, mock_env, tmp_path):
+        """--endpoint then --voice (both before the text) works."""
+        result = _run_speak(
+            ["--endpoint", LOCAL_ENDPOINT, "--voice", "nova", "Hello"],
+            _endpoint_env(mock_env),
+        )
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [LOCAL_ENDPOINT]
+        assert _voice_from_payload(tmp_path / "payload.json") == "nova"
+
+    def test_voice_before_endpoint(self, mock_env, tmp_path):
+        """--voice then --endpoint (both before the text) works."""
+        result = _run_speak(
+            ["--voice", "ginny_di", "--endpoint", ALT_ENDPOINT, "Hello"],
+            _endpoint_env(mock_env),
+        )
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [ALT_ENDPOINT]
+        assert _voice_from_payload(tmp_path / "payload.json") == "ginny_di"
+
+    def test_endpoint_stream_and_voice_any_order(self, mock_env, tmp_path):
+        """--stream, --endpoint and --voice parse in any order."""
+        result = _run_speak(
+            ["--endpoint", LOCAL_ENDPOINT, "--stream", "--voice", "nova", "Hello"],
+            _endpoint_env(mock_env),
+        )
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [LOCAL_ENDPOINT]
+        assert _voice_from_payload(tmp_path / "payload.json") == "nova"
+
+    def test_missing_endpoint_value_exits_nonzero(self, mock_env):
+        """A trailing --endpoint with no value is a clear usage error."""
+        result = _run_speak(["--endpoint"], _endpoint_env(mock_env))
+        assert result.returncode != 0, (
+            f"--endpoint with no value should exit non-zero, got {result.returncode}"
+        )
+        combined = result.stdout + result.stderr
+        assert "Usage" in combined, f"usage should be shown, got: {combined[:300]}"
+        assert "endpoint" in combined.lower(), (
+            f"error should mention the missing endpoint value, got: {combined[:300]}"
+        )
+
+    def test_endpoint_followed_by_option_is_missing_value(self, mock_env):
+        """--endpoint followed by another option is a missing value."""
+        result = _run_speak(["--endpoint", "--stream", "Hello"], _endpoint_env(mock_env))
+        assert result.returncode != 0, (
+            "--endpoint followed by an option should be a usage error"
+        )
+        combined = result.stdout + result.stderr
+        assert "Usage" in combined
+        assert "endpoint" in combined.lower()
+
+    def test_endpoint_equals_form_rejected(self, mock_env):
+        """--endpoint=<url> is rejected with space-separated guidance."""
+        result = _run_speak(
+            [f"--endpoint={LOCAL_ENDPOINT}", "Hello"], _endpoint_env(mock_env)
+        )
+        assert result.returncode != 0, (
+            "--endpoint=<url> should be rejected in favour of --endpoint <url>"
+        )
+        combined = result.stdout + result.stderr
+        assert "space-separated" in combined.lower(), (
+            f"error should point at the space-separated form, got: {combined[:300]}"
+        )
+        assert "Usage" in combined
+
+    def test_equals_form_does_not_reach_curl(self, mock_env, tmp_path):
+        """A rejected --endpoint=<url> must not call the API."""
+        _run_speak([f"--endpoint={LOCAL_ENDPOINT}", "Hello"], _endpoint_env(mock_env))
+        log = tmp_path / "mock.log"
+        assert not log.exists() or _curl_request_urls(log) == []
+
+
+class TestEndpointHelpAndDocs:
+    """AC4: --help and SKILL.md document --endpoint."""
+
+    def test_help_documents_endpoint_flag(self, mock_env):
+        result = _run_speak(["--help"], mock_env)
+        assert result.returncode == 0
+        assert "--endpoint" in result.stdout, (
+            f"--help should document --endpoint, got: {result.stdout[:500]}"
+        )
+
+    def test_help_documents_endpoint_example_and_env(self, mock_env):
+        """Help keeps documenting TTS_API_URL and gains an --endpoint example."""
+        result = _run_speak(["--help"], mock_env)
+        assert result.returncode == 0
+        assert "TTS_API_URL" in result.stdout
+        assert "--endpoint http" in result.stdout, (
+            f"--help should include an --endpoint example, got: {result.stdout[:800]}"
+        )
+
+    def test_skill_md_documents_endpoint_flag_and_env(self):
+        content = (REPO_ROOT / "skill" / "speak" / "SKILL.md").read_text()
+        assert "--endpoint" in content
+        assert "TTS_API_URL" in content
+
+    def test_skill_md_has_local_endpoint_example(self):
+        content = (REPO_ROOT / "skill" / "speak" / "SKILL.md").read_text()
+        assert "--endpoint" in content and LOCAL_ENDPOINT in content, (
+            "SKILL.md should show --endpoint pointing at the local server"
+        )
+
+
+class TestTimingWrapperEndpointPassthrough:
+    """AC5: speak.py forwards --endpoint unchanged to speak.sh."""
+
+    WRAPPER_PATH = REPO_ROOT / "skill" / "speak" / "scripts" / "speak.py"
+
+    def test_wrapper_passes_endpoint_through(self, mock_env, tmp_path):
+        result = subprocess.run(  # noqa: PLW1510
+            ["python3", str(self.WRAPPER_PATH), "--endpoint", LOCAL_ENDPOINT, "Hello"],
+            capture_output=True,
+            text=True,
+            env=_endpoint_env(mock_env),
+        )
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [LOCAL_ENDPOINT]
+
+    def test_wrapper_keeps_default_endpoint_when_flag_absent(self, mock_env, tmp_path):
+        """Wrapper passthrough must not change the default behaviour."""
+        result = subprocess.run(  # noqa: PLW1510
+            ["python3", str(self.WRAPPER_PATH), "Hello"],
+            capture_output=True,
+            text=True,
+            env=_endpoint_env(mock_env),
+        )
+        assert result.returncode == 0, result.stderr
+        assert _curl_request_urls(tmp_path / "mock.log") == [DEFAULT_ENDPOINT]
