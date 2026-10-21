@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.1.23 (2026-10-21)
+> **Release focus:** This release focuses on strengthening release safety and audit reliability, ensuring unreviewed items are blocked, audits run faster and more consistently, and test results always reflect the latest code. It also improves agent task handling, background job visibility, and overall stability through internal code cleanup.
+### Features
+- Release safety checks now reliably block shipping unreviewed items. (SA-0MVB1Q6DR007I49R)
+- Items flagged for producer review now show correctly at the release gate. (SA-0MVB1QFXI004T4G5)
+- Worklog syncs from agent checkouts now merge cleanly instead of failing. (SA-0MVGSB63F00803HK)
+- Audits now automatically run one call at a time during cheap proxy hours, avoiding stalls and failures. (SA-0MSN04X2S006ONH0)
+- Audits now finish faster with the same verdict quality, thanks to tighter evidence limits. (SA-0MSTA3G4S001M6A2)
+- Audits no longer get blocked by false-positive lint warnings, so releases move faster. (SA-0MSSSNOZN000LQKR)
+- Agents now wait for background tasks to finish instead of idling, so work completes faster. (SA-0MVCX570P003VLBK)
+- Tests no longer stall or fail in waves when many run at once, so the game stays responsive under heavy load. (SA-0MVEDOF7A004TSWD)
+- Test runs now use fewer CPU workers, so the game stays smooth while tests run. (SA-0MVE98T1M006A17T)
+- Faster parallel development with fewer timeouts; full tests still gate every push and release. (SA-0MVECQUGF0064U81)
+- Agents now claim tasks without changing their status, keeping boards accurate. (SA-0MVA79DNT001HQBB)
+- Long-running jobs now show live progress, output, and a completion alert so you're never left guessing. (SA-0MVDQF3VW002PKCA)
+- Improved internal tooling reliability for smoother gameplay updates. (SA-0MSAFWEHT002RI72)
+### Bug Fixes
+- Test results now always reflect your latest code changes, so you won't see outdated pass or fail results. (SA-0MVGKZN8C006YNV8)
+- New projects set up with the installer no longer have their pushes blocked by a missing test runner. (SA-0MV8M4OVX000QHSM)
+- Session reports now correctly show whether an audit passed or failed instead of always saying "not run". (SA-0MUI6VA1B00793ZN)
+- Audits no longer get stuck reporting "Ready to close: No" due to a code-quality error. (SA-0MVBDAGEO003RNU2)
+- Deleted tasks no longer block progress on their parent epics. (SA-0MSRVN28E009OL5S)
+- Audits now complete reliably without blocking on stale or unserviced child checks. (SA-0MUH6H87Z001HYJ7)
+- Acceptance criteria reports now correctly show adjusted and partial results instead of marking them unmet. (SA-0MSYYCTPV004MVB1)
+- High-risk, large-effort plans now always require human approval before proceeding. (SA-0MUIUTJJS008W06Y)
+### Other
+- Improved game stability and performance through internal code cleanup. (SA-0MVAT0PR3006HNMY)
+- Improved game stability and performance through behind-the-scenes code cleanup. (SA-0MSX6XX1A007IN9R)
+- Internal code cleanup to keep future updates stable and bug-free. (SA-0MUMEJVW00096MA8)
+- Simplified internal test code for more reliable game updates. (SA-0MUMEJY2P009KWKS)
+- Improved reliability of audit checks to prevent rare errors during gameplay. (SA-0MUMEJV3U001FBT4)
+- Keeps automated code checks running smoothly so future updates stay stable. (SA-0MSGIQVGG003FXQV)
+- Planning reviews now catch requirement mismatches earlier, leading to better-planned updates. (SA-0MSG15D59006T5MK)
+- Cleaned up behind-the-scenes code for smoother, more reliable gameplay. (SA-0MSCDW0WR008WBLM)
+
 ## v0.1.22 (2026-10-15)
 > **Release focus:** This release focuses on making agent work more reliable and trustworthy, with improvements to release safety checks, version syncing, test runner consistency, and audit accuracy. It also reduces wasted effort by having agents skip already-completed work, refining task planning, and preventing false failures from aborted releases or concurrent updates. Standup reports and audits are now saved and displayed more dependably, so daily summaries and results are easier to track.
 ### Features
