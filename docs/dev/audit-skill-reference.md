@@ -320,6 +320,55 @@ Decision rules:
 This is the agent-facing brief; the agent-facing summary lives in
 [`skill/audit/SKILL.md`](../../skill/audit/SKILL.md).
 
+## Parent-persisted child audits are lifecycle-neutral (SA-0MVI35BIU002MTZQ)
+
+A child audit persisted by a **parent** run is a read-only side effect of the
+parent's assessment: it must never change the child's lifecycle. This is a
+recurrence of the demotion class fixed by SA-0MUJAPC680078396 and
+SA-0MSGMR7CX00588TZ — both of which only guarded the item *under audit*, not
+the separate `audit-set` write path used for children.
+
+**Mechanism.** `_persist_child_audit` → `persist_audit.py` → `wl audit-set
+--ready-to-close no` calls `db.revertToPlanComplete`, which unconditionally
+rewrites `completed`/`in_review` → `open`/`plan_complete`. That primitive has
+no notion of child exemptions, cascade suppression, or fallback provenance,
+and its reversion cascades `blocked` through the worklog dependency engine.
+
+**Contract.**
+
+- `_persist_child_audit` captures the child's pre-audit `(status, stage)` and,
+  immediately after persisting, calls `_restore_child_pre_audit_lifecycle`.
+  The restore is readback-verified and only issues `wl update` when the live
+  state actually diverged (which can only be the reversion), so a passing
+  `Yes` persist stays byte-identically untouched.
+- After the child phases finish, `_restore_children_lifecycle_snapshot(ctx)`
+  walks the **whole** child set against the pre-audit snapshot in
+  `ctx.children` and restores any child that diverged. This cleans up the
+  transient cascade (dependents blocked between the revert and the restore)
+  and guarantees the full child set is byte-identical after a parent run.
+- Both paths are best-effort and never fatal: the audit report is
+  authoritative even if a restore could not be confirmed (a warning names the
+  child for manual follow-up).
+- **Tainted verdicts take the same restore path.** An infra-fallback `No`
+  (parse failure, timeout, provider error, concurrency limit) is not an
+  explicit model assessment and must never demote a child — the same rule
+  SA-0MSGMR7CX00588TZ applies to the audited item.
+- **Child AC verdicts honour the exemption (F3a, corrected RCA §5).**
+  `all_ac_acceptable` folds child AC verdicts into the parent's closure, so
+  the aggregation itself must exclude *assessed exempt* children
+  (in_review/done/deleted or snapshot-exempt **and** carrying a stored
+  verdict). A child with no stored verdict (e.g. an unserviced in-main-slot
+  screen) is not assessed and still counts, so it can never report the parent
+  ready. Without this filter the exemption-aware `all_children_reviewed` and
+  `any_child_audit_not_ready` checks are defeated by the aggregation that
+  precedes them.
+- **The report names the real blocker (F3b).** When the parent's own ACs are
+  acceptable and closure is blocked by child AC aggregation, the report says
+  so explicitly — the child ids plus the count of infra-fallback-tainted ACs
+  — instead of blaming the children's *stages*. `not_reviewed` only ever
+  appears inside the `Ready to close: No` branch, so it cannot drive the
+  verdict (the earlier "text contradicts the verdict" claim was disproven).
+
 ## Batch drain (SA-0MTG5TP5Z008QBL5)
 
 The runner can process MULTIPLE queued work items per dispatch window

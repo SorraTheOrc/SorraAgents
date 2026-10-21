@@ -5607,15 +5607,32 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if reason:
             child_reasons[cid] = reason
 
-    child_acs = [
-        a
-        for c in child_results
-        if (
-            str(c.get("id", "") or "") not in unserviced_ids
-            or not _child_has_stored_verdict(c)
-        )
-        for a in c.get("ac_results", [])
-    ]
+    # F3a (SA-0MVI35BIU002MTZQ, corrected RCA §5): child AC verdicts
+    # contribute to the parent's closure ONLY when the child is not an
+    # ASSESSED exempt child. An assessed exempt child (in_review/done/deleted
+    # or snapshot-exempt AND carrying a stored verdict) must not block the
+    # parent through a tainted/incorrect AC verdict produced by a
+    # parent-triggered re-screen — otherwise the exemption-aware checks that
+    # follow (`all_children_reviewed`, `any_child_audit_not_ready`) are
+    # defeated by this aggregation. A child with NO stored verdict (e.g. an
+    # unserviced in-main-slot screen) is NOT assessed and still counts, so it
+    # can never be reported ready.
+    child_acs: list[dict] = []
+    blocking_child_acs: list[tuple[str, dict]] = []
+    for c in child_results:
+        cid = str(c.get("id", "") or "")
+        # Un-serviced children whose stored verdict the parent INHERITS
+        # contribute no ACs (the stored verdict governs); un-serviced
+        # children without one are NOT-ASSESSED and still count.
+        if cid in unserviced_ids and _child_has_stored_verdict(c):
+            continue
+        # Assessed exempt children do not block through their AC verdicts.
+        if _child_is_exempt(c, snapshot_exempt) and _child_has_stored_verdict(c):
+            continue
+        for a in c.get("ac_results", []):
+            child_acs.append(a)
+            if a.get("verdict") not in _ACCEPTABLE_VERDICTS:
+                blocking_child_acs.append((cid, a))
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
         for r in ac_results + child_acs
@@ -5756,12 +5773,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if "Pi provider error" in _evidence_text(r.get("evidence"))
     )
 
+    # NOTE (SA-0MVI35BIU002MTZQ, corrected RCA §5): every ``not_reviewed``
+    # reference below is inside the Ready=No branch, so it cannot DRIVE the
+    # verdict — an earlier draft's claim that it contradicts the verdict was
+    # disproven. The verified misattribution (F3b) is handled explicitly by
+    # the ``blocking_child_acs`` branch in the narrative below.
     not_reviewed = [
         c for c in child_results
         if c.get("stage") not in ("in_review", "done", "")
     ]
 
-    if ready_before_cq == "Yes":
+    # A pending in-main-slot child screen forces Ready=No and must be
+    # presented as the child-audit execution gate (not as a normal result),
+    # even when the parent's own ACs pass — the gate text lives in the
+    # Ready=No branch below.
+    if ready_before_cq == "Yes" and not pending_child_screens:
         if has_blocking_cq:
             lines.append(
                 "All acceptance criteria are met and children are reviewed, "
@@ -5823,6 +5849,33 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"{partial_count} of {len(ac_results)} acceptance criteria are "
                 f"only partially met."
+            )
+        elif blocking_child_acs:
+            # F3b (SA-0MVI35BIU002MTZQ, corrected RCA §5): when the parent's
+            # own ACs are all acceptable, the blocker comes from child AC
+            # aggregation — name it explicitly (ids + fallback provenance)
+            # instead of blaming the children's stages, which misdirects the
+            # operator to a stage problem the exemption already neutralised.
+            blocking_ids: list[str] = []
+            for cid, _ac in blocking_child_acs:
+                if cid and cid not in blocking_ids:
+                    blocking_ids.append(cid)
+            tainted = [
+                ac for _cid, ac in blocking_child_acs
+                if any(marker in _evidence_text(ac.get("evidence"))
+                       for marker in _INFRA_FALLBACK_MARKERS)
+            ]
+            provenance = ""
+            if tainted:
+                provenance = (
+                    f" {len(tainted)} of these came from an infrastructure "
+                    "fallback (timeout/parse/provider error), not a model "
+                    "assessment, so they do not reflect an explicit 'No'."
+                )
+            lines.append(
+                f"{len(blocking_child_acs)} child acceptance criteria not "
+                f"acceptable ({', '.join(blocking_ids)}); the children's own "
+                f"stages are not the blocker.{provenance}"
             )
         elif not_reviewed:
             lines.append(
@@ -6214,6 +6267,7 @@ def _persist_child_audit(
     model_source: str | None = None,
     worklog_dir: str | None = None,
     content_fingerprint: str | None = None,
+    runner: Runner | None = None,
 ) -> tuple[bool, str]:
     """Assemble and persist an audit report for a single child work item.
 
@@ -6224,6 +6278,19 @@ def _persist_child_audit(
     *content_fingerprint* (when provided) is embedded in the child report so
     parent-persisted child audits stay content-gate-able on future runs
     (LP-0MSQ32MF200675AR).
+
+    **Lifecycle neutrality (SA-0MVI35BIU002MTZQ AC1/AC2).** A child audit
+    persisted by a parent run is a read-only side effect of the parent: it
+    must never change the child's lifecycle. ``wl audit-set
+    --ready-to-close no`` unconditionally reverts a ``completed``/
+    ``in_review`` item to ``open``/``plan_complete`` (a deliberate primitive
+    for independently re-audited items, WL-0MSKHYI5U0069FVV), so after
+    persisting we restore the captured pre-persist (status, stage) when the
+    readback shows the primitive changed it. *runner* (the parent's
+    injectable runner) is used for the readback/restore; when omitted (unit
+    tests / callers without one) no restore is attempted. The restore also
+    un-blocks any dependent the transient reversion cascaded to ``blocked``
+    (the worklog dependency engine reconciles on the child's update).
 
     Returns (rc, report_text).
     rc == 0 on success; rc == PERSIST_CONTENT_INVALID (4) when only the
@@ -6245,7 +6312,89 @@ def _persist_child_audit(
     )
 
     rc = persist_audit(child_id, report, worklog_dir=worklog_dir)
+    if runner is not None:
+        # Undo the `audit-set` reversion side effect immediately so the
+        # demotion window is as short as possible (dependents blocked by the
+        # transient revert are un-blocked by the restore via the worklog's
+        # dependency reconcile). Tainted verdicts take the same restore path
+        # — an infra-fallback 'No' must never demote a child
+        # (SA-0MVI35BIU002MTZQ AC2).
+        _restore_child_pre_audit_lifecycle(
+            child_id, child_status, child_stage,
+            runner=runner, worklog_dir=worklog_dir,
+        )
     return rc, report
+
+
+def _restore_child_pre_audit_lifecycle(
+    child_id: str,
+    pre_status: str,
+    pre_stage: str,
+    runner: Runner,
+    worklog_dir: str | None = None,
+) -> bool:
+    """Restore a child's pre-audit lifecycle after a parent-persisted audit.
+
+    ``wl audit-set --ready-to-close no`` reverts ``completed``/``in_review``
+    to ``open``/``plan_complete`` with no knowledge of audit exemptions or
+    fallback provenance (SA-0MVI35BIU002MTZQ). A parent-persisted child
+    audit is a read-only side effect of the parent run, so the captured
+    pre-audit (status, stage) is restored when the readback shows it changed
+    (which can only be a demotion — ``audit-set`` never promotes).
+
+    The restore is best-effort but verified: a ``wl update`` is only issued
+    when the live state actually diverged, and the result is read back.
+    Failures are logged, never fatal — the audit itself already persisted.
+
+    Returns True when the child's live state equals the captured pre-audit
+    state after the restore (or was never changed), False when the state
+    could not be verified/restored.
+    """
+    if not pre_status or not pre_stage:
+        return True
+    safe_status, safe_stage = _coerce_valid_status_stage(pre_status, pre_stage)
+    actual = _read_item_lifecycle_state(runner, child_id, worklog_dir)
+    if actual is None:
+        # Unverifiable readback: never blind-write a restore that could
+        # clobber a concurrent change.
+        print(
+            f"Warning: could not verify child {child_id} lifecycle after "
+            "parent-persisted audit (wl show failed); skipping restore.",
+            file=sys.stderr,
+        )
+        return False
+    if actual == (safe_status, safe_stage):
+        return True
+    try:
+        _run_wl(
+            runner,
+            ["wl", "update", child_id,
+             "--status", safe_status, "--stage", safe_stage, "--json"],
+            worklog_dir=worklog_dir,
+        )
+    except RuntimeError as exc:
+        print(
+            f"Warning: failed to restore child {child_id} to its pre-audit "
+            f"lifecycle ({safe_status}/{safe_stage}): {exc}",
+            file=sys.stderr,
+        )
+        return False
+    after = _read_item_lifecycle_state(runner, child_id, worklog_dir)
+    if after != (safe_status, safe_stage):
+        print(
+            f"Warning: child {child_id} lifecycle restore to "
+            f"({safe_status}/{safe_stage}) not confirmed (readback "
+            f"{after}); manual check recommended.",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        f"Parent-persisted child audit left {child_id} lifecycle-neutral: "
+        f"restored {actual[0]}/{actual[1]} -> "
+        f"{safe_status}/{safe_stage}.",
+        file=sys.stderr,
+    )
+    return True
 
 
 def _assemble_project_report(summary: str, recommendation: str) -> str:
@@ -7257,6 +7406,14 @@ def _build_issue_json(
             str(c.get("id", "") or "") not in unserviced_ids
             or not _child_has_stored_verdict(c)
         )
+        # An ASSESSED exempt child does not contribute blocking AC verdicts
+        # — its lifecycle is already on the review queue (or closed) and a
+        # parent-triggered re-screen must not block the parent through a
+        # tainted/incorrect child verdict (SA-0MVI35BIU002MTZQ AC5, mirrored
+        # in the markdown report path). A child with NO stored verdict is NOT
+        # assessed and still counts.
+        and not (_child_is_exempt(c, snapshot_exempt)
+                 and _child_has_stored_verdict(c))
         for a in c.get("ac_results", [])
     ]
     all_ac_acceptable = all(
@@ -10797,6 +10954,7 @@ def _reaudit_budget_exceeded_children(
                 model_source=ctx.model_source,
                 worklog_dir=ctx.worklog_dir,
                 content_fingerprint=fingerprint,
+                runner=ctx.runner,
             )
             child_persist_results.append({
                 "id": child_id,
@@ -11527,6 +11685,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                             model_source=model_source,
                             worklog_dir=worklog_dir,
                             content_fingerprint=child_fingerprint,
+                            runner=runner,
                         )
                         child_persist_results.append({
                             "id": child["id"],
@@ -11929,6 +12088,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         model_source=model_source,
                         worklog_dir=worklog_dir,
                         content_fingerprint=child_fingerprint,
+                        runner=runner,
                     )
                     child_persist_results.append({
                         "id": child["id"],
