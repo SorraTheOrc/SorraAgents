@@ -168,14 +168,14 @@ def test_priority_ordering_under_contention(monkeypatch, capsys):
     assert all(r.get("verdict") == "met" for r in results.values()), results
 
     lines = [
-        l
-        for l in capsys.readouterr().err.splitlines()
-        if "Audit slot acquired" in l
+        ln
+        for ln in capsys.readouterr().err.splitlines()
+        if "Audit slot acquired" in ln
     ]
     assert len(lines) == 4, f"expected 4 admission logs, got {len(lines)}"
     seq = [
-        re.search(r"priority=(\w+)", l).group(1)
-        for l in lines
+        re.search(r"priority=(\w+)", ln).group(1)
+        for ln in lines
     ]
     assert seq[0] == "low", f"slot holder must admit first: {seq}"
     assert seq[1:] == ["high", "medium", "low"], (
@@ -215,13 +215,13 @@ def test_same_priority_stays_fifo(monkeypatch, capsys):
     assert all(r.get("verdict") == "met" for r in results)
 
     lines = [
-        l
-        for l in capsys.readouterr().err.splitlines()
-        if "Audit slot acquired" in l
+        ln
+        for ln in capsys.readouterr().err.splitlines()
+        if "Audit slot acquired" in ln
     ]
     assert len(lines) == 2
     # The first enqueued thread must own the first ticket slot in the log.
-    tickets = [l.split("ticket=")[-1] for l in lines]
+    tickets = [ln.split("ticket=")[-1] for ln in lines]
     # Counter order == enqueue order; admission order must match it.
     counters = [int(t.split(":")[-1]) for t in tickets]
     assert counters == sorted(counters), f"FIFO violated: {counters}"
@@ -280,7 +280,7 @@ def test_admission_log_fields_are_complete(monkeypatch, capsys):
         )
 
     err = capsys.readouterr().err
-    line = next(l for l in err.splitlines() if "Audit slot acquired" in l)
+    line = next(ln for ln in err.splitlines() if "Audit slot acquired" in ln)
     assert re.search(r"queued_at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", line), line
     assert "priority=high" in line, line
     assert re.search(r"queue_position=\d+", line), line
@@ -335,15 +335,15 @@ def test_admission_log_queue_position_matches_ordering(monkeypatch, capsys):
     assert all(r.get("verdict") == "met" for r in results.values())
 
     lines = [
-        l
-        for l in capsys.readouterr().err.splitlines()
-        if "Audit slot acquired" in l
+        ln
+        for ln in capsys.readouterr().err.splitlines()
+        if "Audit slot acquired" in ln
     ]
     assert len(lines) == 3, lines
     # Admission order: holder (low), then high, then low.
-    seq = [re.search(r"priority=(\w+)", l).group(1) for l in lines]
+    seq = [re.search(r"priority=(\w+)", ln).group(1) for ln in lines]
     assert seq == ["low", "high", "low"], f"admission order: {seq}"
-    positions = [int(re.search(r"queue_position=(\d+)", l).group(1)) for l in lines]
+    positions = [int(re.search(r"queue_position=(\d+)", ln).group(1)) for ln in lines]
     # Holder saw an empty queue (position 1); high queued first among the
     # waiters (1); low queued behind high (2).
     assert positions == [1, 1, 2], f"positions: {positions}"

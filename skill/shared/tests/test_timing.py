@@ -227,7 +227,7 @@ class TestHumanReadableReport:
             pass
         report = t.render()
         lines = report.splitlines()
-        header_line = next(l for l in lines if "Elapsed" in l)
+        header_line = next(ln for ln in lines if "Elapsed" in ln)
         assert "Step" in header_line
         assert "Elapsed" in header_line
         assert "%" in header_line

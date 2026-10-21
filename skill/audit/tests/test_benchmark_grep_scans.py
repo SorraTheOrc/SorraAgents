@@ -15,6 +15,7 @@ Covers:
 """  # noqa: EXE001
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 import sys
@@ -28,6 +29,38 @@ if str(REPO_ROOT) not in sys.path:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import benchmark_grep_scans as bench
+import pytest
+
+
+@contextlib.contextmanager
+def _benchmark_scratch(prefix: str = "bench-grep-scan-"):
+    """Yield a writable benchmark scratch dir, skipping the test when full.
+
+    The harness fixture defaults to 1 GiB (see ``AUDIT_BENCH_FIXTURE_BYTES``)
+    and can exceed the system temp dir's capacity — tmpfs ``usrquota``
+    surfaces as ``OSError: [Errno 122] Disk quota exceeded`` (observed under
+    concurrent agent test load). Rather than failing CI on a resource-constrained
+    machine, the test is skipped with a clear reason; set
+    ``AUDIT_BENCH_SCRATCH_DIR`` (or ``TMPDIR``) to a roomier filesystem to run
+    it. The temp dir is always cleaned up by the context manager exit.
+    """
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=prefix, dir=bench.AUDIT_BENCH_SCRATCH_DIR
+        ) as tmp:
+            yield Path(tmp)
+    except OSError as exc:
+        pytest.skip(f"benchmark scratch allocation failed: {exc}")
+
+
+def _quota_skip(returncode: int, stderr: str) -> None:
+    """Skip (rather than fail) when a benchmark run hit a quota limit."""
+    if returncode != 0 and "Disk quota exceeded" in (stderr or ""):
+        pytest.skip(
+            "benchmark scratch space exhausted (Disk quota exceeded) — set "
+            "AUDIT_BENCH_SCRATCH_DIR to a roomier filesystem to run this test"
+        )
+
 
 # ===========================================================================
 # Fixture generation
@@ -36,8 +69,7 @@ import benchmark_grep_scans as bench
 
 def test_fixture_generation_creates_expected_tree() -> None:
     """The generated fixture has worklog jsonl, source files and traps."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+    with _benchmark_scratch() as root:
         meta = bench.generate_fixture(root, 2 * 1024 * 1024)
         assert meta["worklog_files"] == bench.FAKE_DEBUG_FILES
         worklog = root / ".worklog"
@@ -55,8 +87,7 @@ def test_fixture_generation_creates_expected_tree() -> None:
 
 def test_needle_is_rare_in_fixture() -> None:
     """Only the first debug file contains the needle (scans must read all)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+    with _benchmark_scratch() as root:
         bench.generate_fixture(root, 2 * 1024 * 1024)
         hits = []
         for p in (root / ".worklog").glob("*.jsonl"):
@@ -97,8 +128,7 @@ def _recipe_matches(recipe: dict, root: Path) -> set[str]:
 
 def test_replacement_recipes_match_legacy_recipes() -> None:
     """Replacement recipes find the same needle files as the legacy ones."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+    with _benchmark_scratch() as root:
         bench.generate_fixture(root, 2 * 1024 * 1024)
         legacy_worklog = _recipe_matches(bench.RECIPES["legacy:grep-r-worklog"], root)
         repl_worklog = _recipe_matches(bench.RECIPES["replacement:rg-worklog"], root)
@@ -112,8 +142,7 @@ def test_replacement_recipes_match_legacy_recipes() -> None:
 
 def test_replacement_recipes_prune_traps() -> None:
     """Bounded recipes do not scan node_modules/.git (pruning is effective)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+    with _benchmark_scratch() as root:
         bench.generate_fixture(root, 2 * 1024 * 1024)
         # Put the needle in a node_modules file: bounded recipes must NOT find it.
         (root / "node_modules" / "evil.jsonl").write_text(f"// {bench.NEEDLE}\n")
@@ -126,8 +155,7 @@ def test_replacement_recipes_prune_traps() -> None:
 
 def test_legacy_worklog_recipe_finds_needle() -> None:
     """The legacy worklog recipe returns the matching debug file."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+    with _benchmark_scratch() as root:
         bench.generate_fixture(root, 2 * 1024 * 1024)
         matches = _recipe_matches(bench.RECIPES["legacy:grep-r-worklog"], root)
         assert matches == {"audit_debug_WL-0MS4FHW290053SH4_00.jsonl"}
@@ -140,8 +168,7 @@ def test_legacy_worklog_recipe_finds_needle() -> None:
 
 def test_harness_emits_json_with_timings() -> None:
     """The harness runs offline and emits wall-clock + CPU seconds as JSON."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+    with _benchmark_scratch() as root:
         bench.generate_fixture(root, 2 * 1024 * 1024)
         results: list[dict] = []
         for name, recipe in bench.RECIPES.items():
@@ -168,6 +195,7 @@ def test_main_json_flag_outputs_parseable_json() -> None:
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
         check=False,
     )
+    _quota_skip(proc.returncode, proc.stderr)
     assert proc.returncode == 0, proc.stderr[:500]
     report = json.loads(proc.stdout)
     assert report["work_item"] == "SA-0MSBR06GX0051T1Q"

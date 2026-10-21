@@ -61,7 +61,7 @@ def _load_thresholds() -> dict:
         A dict mapping size codes to {"min": float, "max": float | None}.
     """
     try:
-        with open("references/t-shirt_sizes.json", "r") as f:
+        with open("references/t-shirt_sizes.json") as f:
             tshirt_cfg = json.load(f)
             return tshirt_cfg.get("thresholds", {})
     except Exception:  # noqa: BLE001

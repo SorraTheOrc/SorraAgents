@@ -213,10 +213,13 @@ configured runner):
 - `IMPLEMENT_TEST_COMMAND` overrides detection entirely (per-repo test
   command, e.g. a Unity test runner invoked via a repo-local script).
 - **Paced execution (SA-0MUKHCO02009EQFG):** every real suite execution
-  triggered by `implement.py` (changed- and full-scope, all tooling
-  branches) acquires the shared `"test"` semaphore from the test skill via
+  triggered by `implement.py` (changed-scope by the finish workflow;
+  full-scope remains supported by the library for fallbacks and direct
+  callers) acquires the shared `"test"` semaphore from the test skill via
   `paced_runner`, before spawning. Cache hits never invoke the runner and so
-  never consume a slot (parity with `run_tests.py`). The ceiling and bounded
+  never consume a slot (parity with `run_tests.py`). The finish workflow
+  itself runs changed-scope only — the full suite is deferred to the
+  dev-push integration gate (SA-0MVECQUGF0064U81). The ceiling and bounded
   wait come from `TEST_MAX_CONCURRENCY` / `TEST_LOCK_TIMEOUT`; on saturation
   the gate returns a clear failed result (logged with an actionable retry
   hint) and stores no cache entry, so a saturated host cannot be

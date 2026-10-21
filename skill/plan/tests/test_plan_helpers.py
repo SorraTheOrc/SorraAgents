@@ -6,11 +6,12 @@ t-shirt "Extra Large") AND the highest risk (High/Severe) — an AND gate.
 Every other effort/risk combination proceeds directly to the automated
 review stages without an approval pause (SA-0MUYG0HE6001YTEM).
 
-Missing effort/risk values default conservatively to requesting approval
-(mirroring ``resolve_complexity_tier``'s Medium default) so a human
-checkpoint is never silently skipped.
+Missing *or unrecognised* effort/risk values default conservatively to
+requesting approval (mirroring ``resolve_complexity_tier``'s Medium default)
+so a human checkpoint is never silently skipped.
 
-Related work items: SA-0MSHID94D009P0TL, SA-0MUYG0HE6001YTEM
+Related work items: SA-0MSHID94D009P0TL, SA-0MUYG0HE6001YTEM,
+SA-0MUIUTJJS008W06Y
 """
 
 
@@ -35,6 +36,7 @@ from skill.plan.plan_helpers import (
     normalise_effort_label,
     plan_approval_gate,
     plan_if_needed,
+    resolve_complexity_tier,
     should_request_plan_approval,
 )
 
@@ -178,6 +180,89 @@ class TestShouldRequestPlanApproval:
         request, reason = should_request_plan_approval(item)
         assert request is True
         assert reason  # the reason must explain the conservative default
+
+    @pytest.mark.parametrize(
+        ("effort", "risk"),
+        [
+            ("Huge", "Low"),
+            ("Gigantic", "Medium"),
+            ("Small", "Extreme"),
+            ("Small", "Critical"),
+            ("Extra Large", "Critical"),
+            ("Huge", "Severe"),
+        ],
+    )
+    def test_unrecognised_values_default_to_approval(self, effort, risk):
+        """A present-but-unrecognised effort or risk defaults conservatively to
+        approval — a future vocabulary addition must never silently skip the
+        human checkpoint (SA-0MUIUTJJS008W06Y)."""
+        request, reason = should_request_plan_approval(
+            {"effort": effort, "risk": risk}
+        )
+        assert request is True, f"effort={effort!r} risk={risk!r}"
+        assert reason  # the reason must explain the conservative default
+
+    @pytest.mark.parametrize(
+        ("item", "unrecognised"),
+        [
+            ({"effort": "Huge", "risk": "Low"}, "Huge"),
+            ({"effort": "Small", "risk": "Critical"}, "Critical"),
+        ],
+    )
+    def test_unrecognised_reason_names_the_offending_value(self, item, unrecognised):
+        """The conservative reason identifies which value was unrecognised."""
+        request, reason = should_request_plan_approval(item)
+        assert request is True
+        assert unrecognised in reason
+
+
+class TestResolveComplexityTierVocabularyParity:
+    """``resolve_complexity_tier`` accepts the canonical ``wl`` vocabularies.
+
+    The ``wl`` risk scale includes ``Severe`` (above ``High``) and effort is
+    stored either abbreviated (``XS``/``S``/``M``/``L``/``XL``) or as a full
+    label (``Extra Small`` … ``Extra Large``). Both spellings must resolve to
+    the same tier, and ``Severe`` must rank above ``High``
+    (SA-0MUIUTJJS008W06Y).
+    """
+
+    @pytest.mark.parametrize(
+        ("effort", "risk", "expected"),
+        [
+            ("Small", "Severe", "high"),
+            ("Extra Small", "Severe", "high"),
+            ("Small", "High", "high"),
+            ("XL", "Low", "high"),
+            ("Extra Large", "Low", "high"),
+            ("L", "Low", "high"),
+            ("Large", "Low", "high"),
+            ("M", "Low", "medium"),
+            ("Medium", "Low", "medium"),
+            ("S", "Low", "low"),
+            ("Small", "Low", "low"),
+            ("XS", "Low", "low"),
+            ("Extra Small", "Low", "low"),
+        ],
+    )
+    def test_canonical_vocabulary_resolves_expected_tier(self, effort, risk, expected):
+        assert resolve_complexity_tier({"effort": effort, "risk": risk}, {}) == expected
+
+    @pytest.mark.parametrize("effort", ["XL", "Extra Large"])
+    def test_abbreviated_and_full_effort_agree_for_severe_risk(self, effort):
+        """Stored ``XL`` and ``Extra Large`` agree when risk is ``Severe``."""
+        assert resolve_complexity_tier({"effort": effort, "risk": "Severe"}, {}) == "high"
+
+    def test_config_thresholds_accept_abbreviated_effort(self):
+        """Custom thresholds written with wl abbreviations behave like full labels."""
+        config = {
+            "complexity_tier": {
+                "low": {"max_effort": "S"},
+                "high": {"min_effort": "XL"},
+            }
+        }
+        assert resolve_complexity_tier({"effort": "S", "risk": "Low"}, config) == "low"
+        assert resolve_complexity_tier({"effort": "L", "risk": "Low"}, config) == "medium"
+        assert resolve_complexity_tier({"effort": "XL", "risk": "Low"}, config) == "high"
 
 
 # =========================================================================

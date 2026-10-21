@@ -82,7 +82,7 @@ def list_critical_issues() -> list[dict[str, Any]]:
 
 def create_issue(title: str, body: str, parent_id: str | None = None) -> dict[str, Any] | None:
     """Create a critical test-failure work item via wl create.
-    
+
     If parent_id is provided, the created issue will be a child of the parent.
     """
     args = [
@@ -130,7 +130,7 @@ def add_comment(issue_id: str, comment: str) -> None:
 
 def add_dependency(parent_id: str, child_id: str) -> None:
     """Add a blocking dependency: parent depends on child being completed.
-    
+
     This ensures the parent work item cannot be closed until the child
     (test-failure fix) is completed.
     """
@@ -361,7 +361,7 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
     """Core logic: search for or create a critical test-failure issue.
 
     Returns a structured dict with issueId, created, matchedId, reason.
-    
+
     Supports parent_work_item_id to create child work items for test failures.
     """
     # Parse input — support both flat and nested failure_signature formats
@@ -414,7 +414,7 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
         if commit_hash:
             comment_lines.append(f"\nFailing commit: {commit_hash}")
         add_comment(issue_id, "\n".join(comment_lines))
-        
+
         # If parent_work_item_id is provided, add dependency so the existing
         # issue blocks the parent work item (ensures it gets fixed)
         if parent_work_item_id:

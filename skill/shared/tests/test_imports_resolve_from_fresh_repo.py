@@ -164,8 +164,8 @@ def test_all_affected_scripts_resolve_from_real_copy_install(tmp_path: Path) -> 
 
         if has_import_error:
             error_lines = [
-                l for l in stderr.splitlines()
-                if "ModuleNotFoundError" in l or "ImportError" in l
+                ln for ln in stderr.splitlines()
+                if "ModuleNotFoundError" in ln or "ImportError" in ln
             ]
             error_summary = error_lines[-1] if error_lines else stderr.strip()
             results.append(f"FAIL {info['path']}: {error_summary}")

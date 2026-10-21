@@ -128,7 +128,7 @@ def load_rules(config_path: str | None = None) -> dict[str, Any]:
         try:
             path = Path(config_path)
             if path.is_file():
-                with open(path, "r") as f:
+                with open(path) as f:
                     custom = json.load(f)
                 if isinstance(custom, dict):
                     rules = _deep_merge(rules, custom)

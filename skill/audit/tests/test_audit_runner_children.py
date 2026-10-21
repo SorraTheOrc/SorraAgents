@@ -14,6 +14,11 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 from audit.scripts import audit_runner
+from audit.tests.test_audit_runner_child_in_main_slot import (
+    genuinely_not_ready_child,
+    unserviced_child_no_verdict,
+    unserviced_child_with_stored_verdict,
+)
 from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
@@ -1349,6 +1354,47 @@ class TestParentFirstChildPassThrough:
             changed = ar._child_content_changed(mock.MagicMock(), "CHILD-1")
         assert changed is False
 
+    def test_child_content_changed_fresh_audit_survives_newer_updated_at(self):
+        """_child_content_changed: a content-fresh audit stays unchanged even
+        when the child's updatedAt is far newer than the persisted auditedAt.
+
+        The content fingerprint is the PRIMARY gate: once it matches, the
+        child's own persistence writes (comments, status/stage bumps as it
+        moves to in_review) must not trigger a spurious re-audit. The legacy
+        60s time floor would have declared this child changed — this guards
+        the gate ordering (content before time).
+        """
+        from audit.scripts import audit_runner as ar
+        child_desc = "## Acceptance Criteria\n- CAC1: child criterion"
+        fp = ar._compute_content_fingerprint(
+            mock.MagicMock(), "CHILD-1",
+            work_item={"description": child_desc},
+        )
+        assert fp is not None
+        stored = (
+            f"Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
+            f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}\n\n## Summary\nok"
+        )
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {"success": True, "audit": {
+                    "workItemId": "CHILD-1",
+                    "auditedAt": "2026-08-01T00:00:00.000Z",
+                    "rawOutput": stored,
+                }}
+            if "show" in cmd_str:
+                return {"success": True, "workItem": {
+                    "id": "CHILD-1", "description": child_desc,
+                    "updatedAt": "2026-08-10T00:00:00.000Z",
+                }}
+            raise AssertionError(f"unexpected wl cmd: {cmd_str}")
+
+        with mock.patch.object(ar, "_run_wl", side_effect=_fake_run_wl):
+            changed = ar._child_content_changed(mock.MagicMock(), "CHILD-1")
+        assert changed is False
+
     def test_child_content_changed_stale_audit_true(self):
         """_child_content_changed: an audit whose fingerprint no longer
         matches (a touched file changed) → content changed."""
@@ -1860,4 +1906,103 @@ class TestCascadeDescendantsTerminal:
             "LEAF", self.AUDIT_TS, runner=runner,
         ) == 0
         assert runner.updates == []
+
+
+def fresh_pending_child():
+    """A freshly emitted in-main-slot child (no stale pending-screens signal)
+    — the same fixture shape as an unserviced-no-verdict child; re-exported
+    here for the agreement matrix."""
+    return unserviced_child_no_verdict()
+
+
+#: Parent ACs (all met) shared by the unserviced-verdict agreement fixtures.
+_UNSERVICED_PARENT_ACS = [
+    {"text": "AC one", "verdict": "met", "evidence": "parent.py:1"},
+]
+
+
+class TestUnservicedVerdictGuardAndAgreement:
+    """The unserviced in-main-slot verdict contract that is GREEN against the
+    current runner (parent AC2/AC4, SA-0MUH6H87Z001HYJ7): a genuinely
+    not-ready child still blocks, and the markdown report and the JSON payload
+    agree on the assessment for the same child fixtures. The RED
+    (``xfail(strict)``) unserviced fixtures live in
+    ``test_audit_runner_child_in_main_slot.py::TestUnservicedMainSlotVerdicts``;
+    the agreement matrix reuses those fixture builders.
+
+    Asserts on ``_build_issue_json`` / ``_assemble_issue_report`` directly
+    with fixture child results (this item's Minimal Implementation).
+    """
+
+    def test_genuinely_not_ready_child_still_blocks(self):
+        """A genuinely NOT-READY child — a blocking verdict whose evidence
+        carries NO in-main-slot pending marker — still blocks
+        ``ready_to_close``. The unserviced handling must never exempt it:
+        without the pending marker it is neither pending nor unserviced, so
+        its blocking verdict keeps the parent at ``Ready to close: No``."""
+        child = genuinely_not_ready_child()
+
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        assert payload["ready_to_close"] is False
+        assert "CHILD-1" not in payload["pending_child_screens"]
+
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        assert "Ready to close: No" in report
+        assert "Child screens pending" not in report
+
+    @pytest.mark.parametrize(
+        "child_builder",
+        [
+            genuinely_not_ready_child,
+            unserviced_child_with_stored_verdict,
+            unserviced_child_no_verdict,
+            fresh_pending_child,
+        ],
+    )
+    def test_report_and_json_agree_on_same_fixtures(self, child_builder):
+        """The markdown report and the JSON payload agree on the assessment
+        for the same child fixtures: the ``Ready to close:`` header matches
+        ``ready_to_close`` and the report's gate line names exactly the same
+        children as ``pending_child_screens``.
+
+        The agreement holds regardless of which era the fixtures land in: the
+        unserviced fixtures are pinned RED today (both channels consistently
+        report the current pending-gate state) and both channels flip to the
+        inherited/not-assessed state together once SA-0MVAWFUU0004VW45
+        lands — the test pins CONSISTENCY, never a static direction.
+        """
+        child = child_builder()
+
+        payload = audit_runner._build_issue_json(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, _UNSERVICED_PARENT_ACS, [child],
+        )
+
+        # Ready-to-close agreement (markdown header ↔ JSON boolean).
+        verdict = audit_runner._parse_ready_to_close(report)
+        assert verdict is not None, "report must carry a Ready to close verdict"
+        assert (verdict == "yes") is (payload["ready_to_close"] is True), (
+            "markdown Ready to close and JSON ready_to_close disagree: "
+            f"{verdict!r} vs {payload['ready_to_close']!r}"
+        )
+
+        # Pending-screens-gate agreement (report ids ↔ JSON list).
+        gate_ids: list[str] = []
+        for line in report.splitlines():
+            if line.startswith("Child screens pending:"):
+                # Format: ``Child screens pending: N (main-slot) — id1, id2. <advice>``
+                after_dash = line.split("—", 1)[1]
+                ids_part = after_dash.split(".", 1)[0]
+                gate_ids = [t.strip() for t in ids_part.split(",") if t.strip()]
+        assert len(gate_ids) == len(payload["pending_child_screens"]), (
+            "markdown gate line and JSON pending_child_screens disagree: "
+            f"{gate_ids} vs {payload['pending_child_screens']}"
+        )
+        assert set(gate_ids) == set(payload["pending_child_screens"])
 

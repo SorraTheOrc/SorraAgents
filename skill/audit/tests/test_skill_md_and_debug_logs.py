@@ -271,10 +271,17 @@ class TestSkillMdMonitoredRunGuidance:
         assert "10800" in section
         assert "180-minute" in section
 
-    def test_monitor_reports_every_3_minutes_with_alive_check(self) -> None:
-        """Monitor specifies the 3-minute cadence and kill -0 alive check."""
+    def test_monitor_reports_completion_aware_with_alive_check(self) -> None:
+        """Monitor is completion-aware (wait_for_job) with a kill -0 alive check.
+
+        The old fixed 3-minute polling cadence was deprecated by the
+        background-job etiquette rollout (SA-0MVDP5JTK009HWOT): the monitor
+        now waits completion-aware via wait_for_job.py instead of a fixed
+        ``sleep N`` poll.
+        """
         section = self._section()
-        assert "every 3 minutes" in section
+        assert "every 3 minutes" not in section
+        assert "wait_for_job" in section
         assert "kill -0" in section
 
     def test_monitor_tails_log_for_phase_markers(self) -> None:

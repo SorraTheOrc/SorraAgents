@@ -337,11 +337,24 @@ context surface changes intentionally.
 
 ### New projects via install_pi.sh
 
-`scripts/install_pi.sh` (v2 hook wiring, SA-0MT1WUEIT006U1HC) automates the
-gate for **future** projects. When run inside a git project, it:
+`scripts/install_pi.sh` (hook wiring, SA-0MT1WUEIT006U1HC;
+SA-0MV8M4OVX000QHSM) automates the gate for **future** projects. When run
+inside a git project, it installs the hook variant appropriate to that project:
 
-1. copies the v2 `pre-push` hook from the source SorraAgents checkout into
-   the project's `.githooks/pre-push` (idempotent);
+- **Canonical source repo (SorraAgents)** — the repo ships the repo-local
+  full-suite runner (`skill/test/scripts/run_tests.py`), so it receives the
+  **v3** `.githooks/pre-push` (context-budget gate + worklog sync + branch
+  policy + full-suite test gate).
+- **Every other project** — no repo-local runner exists, so it receives the
+  **framework v2** `.githooks/pre-push.v2` (context-budget gate + worklog sync
+  + branch policy, **no** full-suite gate). The v3 full-suite gate hard-fails a
+  `dev`/`main` push when `skill/test/scripts/run_tests.py` is absent, which
+  would block every push in a freshly wired sibling project.
+
+In both cases it:
+
+1. copies the selected hook from the source SorraAgents checkout into the
+   project's `.githooks/pre-push` (idempotent — only when absent);
 2. sets `core.hooksPath=.githooks` if not already configured;
 3. verifies the global context-audit skill symlink path
    (`~/.pi/agent/skills/context-audit/scripts/measure_context.py`);
@@ -353,7 +366,10 @@ Bypass hook installation with `PI_SKIP_HOOK_INSTALL=1`.
 > **Note:** `install_pi.sh` only *creates* `.githooks/pre-push` when it is
 > absent; it never overwrites an existing hook. A project that already ships an
 > older (e.g. v1 sync-only) `.githooks/pre-push` therefore needs its hook
-> replaced explicitly — as AI_Hell did in SA-0MSN2ULOF007JJ35.
+> replaced explicitly — as AI_Hell did in SA-0MSN2ULOF007JJ35. Likewise, a
+> non-SorraAgents project that was wired with a v3 hook before
+> SA-0MV8M4OVX000QHSM must replace `.githooks/pre-push` with the framework v2
+> template (or set `TEST_SCOPE_SKIP=1`) manually.
 
 ### End-to-end verification (real project)
 

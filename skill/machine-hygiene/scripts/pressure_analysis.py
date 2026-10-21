@@ -61,7 +61,7 @@ _PRESSURE_METRICS = (
 
 def _read(relpath: str, proc_root: str) -> str | None:
     try:
-        with open(os.path.join(proc_root, relpath), "r", encoding="utf-8",
+        with open(os.path.join(proc_root, relpath), encoding="utf-8",
                   errors="replace") as fh:
             return fh.read()
     except (FileNotFoundError, PermissionError, OSError):

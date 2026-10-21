@@ -129,14 +129,14 @@ function escalationItems() {
     {
       id: 'SA-P1',
       title: 'Parent One',
-      assignee: '',
+      needsProducerReview: false,
       parentId: null,
       updatedAt: '2026-09-04T09:00:00Z',
     },
     {
       id: 'SA-C1',
       title: 'Child One',
-      assignee: 'Map',
+      needsProducerReview: true,
       parentId: 'SA-P1',
       updatedAt: '2026-09-04T10:00:00Z',
     },
@@ -167,9 +167,9 @@ describe('checkFinalValidation - uncovered child escalation', () => {
     assert.ok(updateCall, 'expected a wl update call to escalate to the parent');
     assert.equal(updateCall.itemId, 'SA-P1');
     assert.ok(
-      updateCall.args.includes('--assignee') &&
-        updateCall.args.includes('Map'),
-      'escalation must set --assignee Map on the parent',
+      updateCall.args.includes('--needs-producer-review') &&
+        updateCall.args.includes('true'),
+      'escalation must set --needs-producer-review true on the parent',
     );
     const commentArg = updateCall.args[updateCall.args.indexOf('--comment') + 1] || '';
     assert.ok(
@@ -189,8 +189,8 @@ describe('checkFinalValidation - uncovered child escalation', () => {
     const mod = await import(FINAL_VALIDATION_PATH);
     const report = await mod.checkFinalValidation({
       getItemsFn: () => [
-        { id: 'SA-C1', title: 'Child One', assignee: 'Map', parentId: 'SA-P1', updatedAt: '2026-09-04T10:00:00Z' },
-        { id: 'SA-C2', title: 'Child Two', assignee: 'Map', parentId: 'SA-P1', updatedAt: '2026-09-04T10:00:00Z' },
+        { id: 'SA-C1', title: 'Child One', needsProducerReview: true, parentId: 'SA-P1', updatedAt: '2026-09-04T10:00:00Z' },
+        { id: 'SA-C2', title: 'Child Two', needsProducerReview: true, parentId: 'SA-P1', updatedAt: '2026-09-04T10:00:00Z' },
       ],
       getItemByIdFn: (id) => (id === 'SA-P1' ? PARENT_IN_REVIEW : null),
       runAuditShow: (id) => JSON.stringify(id === 'SA-P1' ? AUDIT_NOT_READY : AUDIT_READY),
@@ -216,7 +216,7 @@ describe('checkFinalValidation - uncovered child escalation', () => {
         {
           id: 'SA-C1',
           title: 'Child One',
-          assignee: 'Map',
+          needsProducerReview: true,
           parentId: 'SA-P1',
           updatedAt: '2026-09-04T10:00:00Z',
         },
@@ -261,7 +261,7 @@ describe('checkFinalValidation - uncovered child escalation', () => {
         {
           id: 'SA-TOP1',
           title: 'Top Level',
-          assignee: 'Map',
+          needsProducerReview: true,
           parentId: null,
           updatedAt: '2026-09-04T10:00:00Z',
         },
@@ -286,7 +286,7 @@ describe('checkFinalValidation - covered child planned override (AC1 reporting)'
         {
           id: 'SA-C1',
           title: 'Child One',
-          assignee: 'Map',
+          needsProducerReview: true,
           parentId: 'SA-P1',
           updatedAt: '2026-09-04T10:00:00Z',
         },
@@ -317,8 +317,8 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const closes = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
       getCandidateItemsFn: () => [
-        { id: 'SA-P1', title: 'Parent One', assignee: '', parentId: null },
-        { id: 'SA-C1', title: 'Child One', assignee: 'Map', parentId: 'SA-P1' },
+        { id: 'SA-P1', title: 'Parent One', needsProducerReview: false, parentId: null },
+        { id: 'SA-C1', title: 'Child One', needsProducerReview: true, parentId: 'SA-P1' },
       ],
       getDescendantsFn: () => [],
       getAncestorAuditFn: () => ({ outcome: 'covered', ancestorId: 'SA-P1' }),
@@ -355,8 +355,8 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const closes = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
       getCandidateItemsFn: () => [
-        { id: 'SA-P1', title: 'Parent One', assignee: '', parentId: null },
-        { id: 'SA-C1', title: 'Child One', assignee: 'Map', parentId: 'SA-P1' },
+        { id: 'SA-P1', title: 'Parent One', needsProducerReview: false, parentId: null },
+        { id: 'SA-C1', title: 'Child One', needsProducerReview: true, parentId: 'SA-P1' },
       ],
       getDescendantsFn: () => [],
       getAncestorAuditFn: () => ({ outcome: 'uncovered', ancestorId: 'SA-P1' }),
@@ -377,7 +377,7 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const overrides = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
       getCandidateItemsFn: () => [
-        { id: 'SA-C1', title: 'Child One', assignee: 'Map', parentId: 'SA-P1' },
+        { id: 'SA-C1', title: 'Child One', needsProducerReview: true, parentId: 'SA-P1' },
       ],
       getDescendantsFn: () => [],
       getAncestorAuditFn: () => { throw new Error('wl show failed'); },
@@ -397,8 +397,8 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
       dryRun: true,
       getCandidateItemsFn: () => [
-        { id: 'SA-P1', title: 'Parent One', assignee: '', parentId: null },
-        { id: 'SA-C1', title: 'Child One', assignee: 'Map', parentId: 'SA-P1' },
+        { id: 'SA-P1', title: 'Parent One', needsProducerReview: false, parentId: null },
+        { id: 'SA-C1', title: 'Child One', needsProducerReview: true, parentId: 'SA-P1' },
       ],
       getDescendantsFn: () => [],
       getAncestorAuditFn: () => ({ outcome: 'covered', ancestorId: 'SA-P1' }),
@@ -413,26 +413,22 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     assert.equal(result.closedCount, 0);
   });
 
-  test('an unassigned covered child is closed directly (no hold, no override)', async () => {
+  test('a covered child with a null/undefined flag is not overridden (only true is)', async () => {
     const mod = await import(RUN_RELEASE_PATH);
     const overrides = [];
-    const closes = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
       getCandidateItemsFn: () => [
-        { id: 'SA-C1', title: 'Child One', assignee: null, parentId: 'SA-P1' },
+        { id: 'SA-C1', title: 'Child One', needsProducerReview: null, parentId: 'SA-P1' },
       ],
       getDescendantsFn: () => [],
       getAncestorAuditFn: () => ({ outcome: 'covered', ancestorId: 'SA-P1' }),
       runOverrideCommand: (childId) => { overrides.push(childId); },
-      runCloseCommand: (childId) => { closes.push(childId); },
-      getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
+      runCloseCommand: () => {},
     });
 
-    assert.equal(overrides.length, 0, 'no hold means no override is needed');
+    assert.equal(overrides.length, 0);
     assert.equal(result.overriddenCount, 0);
-    assert.equal(result.skippedCount, 0);
-    assert.equal(result.closedCount, 1);
-    assert.deepEqual(closes, ['SA-C1']);
+    assert.equal(result.skippedCount, 1);
   });
 });
 

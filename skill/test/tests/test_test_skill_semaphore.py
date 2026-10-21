@@ -14,6 +14,13 @@ concurrency primitive):
   gates actual executions, so cache read/write/dedup/TTL are unchanged.
 - AC5: concurrent test-style runs are bounded cross-process (real
   subprocesses through the real `_test_concurrency_slot` context manager).
+
+Also pins the *calibrated default* (SA-0MVE995PV0077QB5.3): the resolved
+ceiling is 3 with no env override, its rationale cites the calibration
+artifact, and an un-overridden cross-process batch never exceeds 3 active
+slots. The pinning test stays inert until the constant raise lands
+(SA-0MVF796SL006XV80), then activates permanently so a silent reversion to 2
+fails.
 """
 
 from __future__ import annotations
@@ -45,6 +52,8 @@ if str(_RUNNER_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNNER_DIR))
 
 from run_tests import (
+    TEST_LOCK_JITTER_DEFAULT,
+    TEST_LOCK_JITTER_ENV,
     TEST_LOCK_TIMEOUT_DEFAULT,
     TEST_LOCK_TIMEOUT_ENV,
     TEST_MAX_CONCURRENCY_DEFAULT,
@@ -52,6 +61,7 @@ from run_tests import (
     TEST_SEMAPHORE_NAME,
     TestConcurrencyTimeout,
     _cached_runner,
+    _test_lock_jitter,
     _test_lock_timeout,
     _test_semaphore_max_workers,
     paced_runner,
@@ -69,6 +79,7 @@ def _isolate_semaphore_dir(tmp_path, monkeypatch):
     monkeypatch.setenv(ENV_LOCK_DIR, str(tmp_path / "locks"))
     monkeypatch.delenv(TEST_MAX_CONCURRENCY_ENV, raising=False)
     monkeypatch.delenv(TEST_LOCK_TIMEOUT_ENV, raising=False)
+    monkeypatch.delenv(TEST_LOCK_JITTER_ENV, raising=False)
     monkeypatch.delenv("AUDIT_MAX_CONCURRENCY", raising=False)
     monkeypatch.delenv("AUDIT_LOCK_TIMEOUT", raising=False)
 
@@ -103,16 +114,21 @@ sys.exit(0 if result["acquired"] is not None else 1)
 """
 
 
-def _run_workers(n, hold=0.3, timeout=30):
+def _run_workers(n, hold=0.3, timeout=30, *, use_default_ceiling=False):
     """Launch *n* concurrent worker subprocesses sharing the "test" slot.
 
     Each worker goes through the real ``_test_concurrency_slot`` context
-    manager (the exact path run_tests.py uses to bound executions) with
-    ``TEST_MAX_CONCURRENCY`` inherited from the test environment.
+    manager (the exact path run_tests.py uses to bound executions). By default
+    ``TEST_MAX_CONCURRENCY`` is inherited from the test environment; with
+    *use_default_ceiling* the variable is removed from the child environment
+    so the calibrated default is resolved with no override
+    (SA-0MVE995PV0077QB5.3).
     """
     procs = []
     for _ in range(n):
         env = dict(os.environ)
+        if use_default_ceiling:
+            env.pop(TEST_MAX_CONCURRENCY_ENV, None)
         env.update(
             {
                 "RUNNER_DIR": str(_RUNNER_DIR),
@@ -191,6 +207,42 @@ def test_lock_timeout_resolution(monkeypatch):
     assert _test_lock_timeout() == 0.25
     monkeypatch.setenv(TEST_LOCK_TIMEOUT_ENV, "bogus")
     assert _test_lock_timeout() == TEST_LOCK_TIMEOUT_DEFAULT
+
+
+def test_lock_jitter_resolution(monkeypatch):
+    """TEST_LOCK_JITTER drives the deadline stagger; invalid/out-of-range
+    values fall back to the default (SA-0MVEDOF7A004TSWD)."""
+    assert _test_lock_jitter() == TEST_LOCK_JITTER_DEFAULT
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "0.25")
+    assert _test_lock_jitter() == 0.25
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "0")
+    assert _test_lock_jitter() == 0.0  # explicit opt-out is honoured
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "bogus")
+    assert _test_lock_jitter() == TEST_LOCK_JITTER_DEFAULT
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "1.5")
+    assert _test_lock_jitter() == TEST_LOCK_JITTER_DEFAULT
+    monkeypatch.setenv(TEST_LOCK_JITTER_ENV, "-0.1")
+    assert _test_lock_jitter() == TEST_LOCK_JITTER_DEFAULT
+
+
+def test_saturation_notice_has_stagger_guidance(monkeypatch, tmp_path):
+    """AC3: the saturation notice tells callers to wait a staggered delay
+    before retrying (so a herd does not re-enter the pool in lockstep)."""
+    monkeypatch.setenv(TEST_MAX_CONCURRENCY_ENV, "1")
+    monkeypatch.setenv(TEST_LOCK_TIMEOUT_ENV, "0.2")
+
+    holder = Semaphore(TEST_SEMAPHORE_NAME, max_workers=1, timeout=5)
+    holder.acquire()
+    try:
+        result = run_suite("pytest", cwd=tmp_path, use_cache=False, force=True)
+    finally:
+        holder.release()
+
+    assert result["success"] is False
+    notice = result["notice"]
+    assert "no free slot within 0s" in notice, notice
+    assert "staggered delay" in notice, notice
+    assert "retrying" in notice, notice
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +390,93 @@ def test_single_ceiling_serializes_cross_process(monkeypatch):
     acquired = [r for r in results if r.get("acquired") is not None]
     assert len(acquired) == 3, f"starvation/deadlock: {results}"
     assert _max_concurrent(results) == 1, f"not serialized: {results}"
+
+
+# ---------------------------------------------------------------------------
+# Calibrated default ceiling (SA-0MVE995PV0077QB5.3)
+# ---------------------------------------------------------------------------
+
+#: Calibration artifact cited by the raised constant's rationale. Its citation
+#: in ``run_tests.py`` lands with the constant raise (SA-0MVF796SL006XV80);
+#: until then the pinning test is inert so this test-first slice keeps the
+#: tree green. Once present the test stays active, so reverting the constant
+#: to 2 fails instead of silently skipping.
+CALIBRATION_ARTIFACT = "docs/dev/test-ceiling-validation.json"
+CALIBRATION_ARTIFACT_NAME = CALIBRATION_ARTIFACT.rsplit("/", 1)[-1]
+CALIBRATED_WORK_ITEM = "SA-0MVE995PV0077QB5"
+RUNNER_SOURCE_PATH = _RUNNER_DIR / "run_tests.py"
+
+
+def _runner_source_text() -> str:
+    return RUNNER_SOURCE_PATH.read_text(encoding="utf-8")
+
+
+#: Activation marker computed once at import: the constant raise
+#: (SA-0MVF796SL006XV80) introduces the work-item id and calibration-artifact
+#: citation into ``run_tests.py``. Before that the pinning test is red against
+#: the pre-change tree (resolved default 2), so it is skipped to keep this
+#: test-first slice green. After either citation lands the guard is permanently
+#: inert, and the test asserts *both* citations adjacent to the constant, so a
+#: reversion to 2 (or a citation removed from the rationale) fails instead of
+#: silently skipping.
+_RUNNER_SOURCE = _runner_source_text()
+_CALIBRATED_DEFAULT_LANDED = (
+    CALIBRATED_WORK_ITEM in _RUNNER_SOURCE
+    or CALIBRATION_ARTIFACT_NAME in _RUNNER_SOURCE
+)
+
+
+def _adjacent_constant_comment(source: str, name: str) -> str:
+    """Return the constant's adjacent comment block and its constant group.
+
+    The concurrency constants share one commented group (``TEST_SEMAPHORE_NAME``,
+    ``TEST_MAX_CONCURRENCY_ENV``, ``TEST_MAX_CONCURRENCY_DEFAULT``), so walk up
+    from *name* through the group to the blank line that separates the block
+    from the preceding code.
+    """
+    lines = source.splitlines()
+    index = next(i for i, line in enumerate(lines) if line.startswith(name))
+    block_start = index
+    while block_start > 0 and lines[block_start - 1].strip():
+        block_start -= 1
+    return "\n".join(lines[block_start : index + 1])
+
+
+@pytest.mark.skipif(
+    not _CALIBRATED_DEFAULT_LANDED,
+    reason=(
+        "calibrated default not yet landed (SA-0MVF796SL006XV80): "
+        f"{RUNNER_SOURCE_PATH.name} does not yet cite {CALIBRATED_WORK_ITEM}"
+    ),
+)
+def test_default_is_calibrated_ceiling():
+    """Without TEST_MAX_CONCURRENCY the resolved ceiling is the calibrated 3.
+
+    The rationale (constant's adjacent comment) must cite the parent work item
+    and the calibration artifact, so the value stays evidence-backed. Reverting
+    the constant to 2 while keeping the citation fails here.
+    """
+    source = _runner_source_text()
+    assert _test_semaphore_max_workers() == 3
+    assert TEST_MAX_CONCURRENCY_DEFAULT == 3
+    rationale = _adjacent_constant_comment(source, "TEST_MAX_CONCURRENCY_DEFAULT")
+    assert CALIBRATED_WORK_ITEM in rationale, rationale
+    assert CALIBRATION_ARTIFACT_NAME in rationale, rationale
+
+
+def test_default_ceiling_bounded_cross_process():
+    """The un-overridden default bounds concurrency to at most 3 slots.
+
+    Mirrors ``test_concurrent_runs_bounded_cross_process`` but never sets
+    ``TEST_MAX_CONCURRENCY``: six real subprocess workers resolve the default,
+    so the ceiling is exercised rather than incidental.
+    """
+    assert TEST_MAX_CONCURRENCY_ENV not in os.environ
+    results = _run_workers(6, hold=0.3, timeout=30, use_default_ceiling=True)
+    acquired = [r for r in results if r.get("acquired") is not None]
+    assert len(acquired) == 6, f"not all workers acquired: {results}"
+    assert _max_concurrent(results) <= 3, f"default ceiling exceeded: {results}"
+    assert all(r.get("error") is None for r in results), results
 
 
 # ---------------------------------------------------------------------------

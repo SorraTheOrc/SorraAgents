@@ -421,6 +421,14 @@ Harnesses covered:
 - `tests/unit/test-run-release-discord-notify.mjs` — the reference pattern:
   records `sendReleaseNotification` arguments without sending.
 
+Forwarding-only integration tests (e.g. the `--skip-checks` forwarding suite in
+`test-run-release-arg-filtering.mjs`) must run `run-release.js` with
+`--skip-checks` so the gating-check suite (git/`wl`/audit subprocesses) does not
+run inside the test's spawn window. Without it the gates contend with the rest
+of a parallel full-suite run and can exceed the spawnSync timeout, flaking the
+test (green standalone, red under full-suite parallel load;
+SA-0MVE01JCJ00243W1). Gate behaviour is covered by dedicated gate tests.
+
 Production behaviour is unchanged: real releases still post the Discord
 notification.
 

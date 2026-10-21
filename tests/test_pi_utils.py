@@ -1,4 +1,10 @@
-"""Tests for skill/scripts/pi_utils.py — shared Pi JSON-stream parsing."""
+"""Tests for skill/scripts/pi_utils.py — shared Pi JSON-stream parsing.
+
+Imports via the unambiguous ``skill.scripts`` path rather than ``scripts``:
+this repo also ships a root-level ``scripts/`` package, so the short name
+resolves to the wrong module whenever the repo root precedes the skills root
+on ``sys.path`` (single-file changed-scope runs fail collection otherwise).
+"""
 
 import sys
 from pathlib import Path
@@ -7,7 +13,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts.pi_utils import extract_pi_text, parse_pi_json_line
+from skill.scripts.pi_utils import (
+    extract_pi_text,
+    parse_pi_json_line,
+)
 
 # ---------------------------------------------------------------------------
 # Tests: parse_pi_json_line

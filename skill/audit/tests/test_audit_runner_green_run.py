@@ -618,6 +618,73 @@ def _with_pytest_config(tmp_path) -> Path:
     (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
     return tmp_path
 
+
+class TestAuditAcceptanceWindow:
+    """Read-only cache acceptance window (SA-0MVECQUGF0064U81).
+
+    The audit accepts GREEN cached full-suite evidence within its own 24h
+    window (``AUDIT_CACHE_TTL_SECONDS``) rather than the generic 2h
+    (``DEFAULT_TTL_SECONDS``): the dev-push gate proved the suite green at
+    the same git state, so a backdated-but-fresh entry must be reuseable
+    without F3 re-executing the whole suite.
+    """
+
+    def test_green_entry_older_than_2h_within_24h_is_accepted(self, tmp_path):
+        """A green entry backdated 3h (beyond the generic 2h TTL) is still
+        classified GREEN by the audit — no F3 re-execution."""
+        import time
+
+        from test.scripts.run_tests import full_suite_commands
+        from test_cache import compute_git_state, store
+
+        _with_pytest_config(tmp_path)
+        _make_suite_dirs(tmp_path)
+        commands = full_suite_commands(tmp_path)
+        assert commands, "expected a pytest+node command set"
+        state = compute_git_state(str(tmp_path))
+        for cmd in commands:
+            store(
+                cmd, state, cwd=str(tmp_path),
+                stdout="1 passed", stderr="", exit_code=0,
+                completed_at=time.time() - 3 * 3600,  # beyond the 2h generic TTL
+                scope="full",
+            )
+
+        status, _, problems = audit_runner._classify_full_suite_cache(
+            _green_run_git_runner(), cwd=str(tmp_path),
+        )
+        assert status == audit_runner._FULL_SUITE_CACHE_GREEN, problems
+
+    def test_same_entry_is_a_miss_under_generic_2h_ttl(self, tmp_path):
+        """Mechanism check: the backdated entry is NOT accepted by the
+        generic 2h TTL, so the audit window is what extends it."""
+        import time
+
+        from test.scripts.run_tests import full_suite_commands
+        from test_cache import (
+            DEFAULT_TTL_SECONDS,
+            compute_git_state,
+            query_cached,
+            store,
+        )
+
+        _with_pytest_config(tmp_path)
+        _make_suite_dirs(tmp_path)
+        commands = full_suite_commands(tmp_path)
+        state = compute_git_state(str(tmp_path))
+        for cmd in commands:
+            store(
+                cmd, state, cwd=str(tmp_path),
+                stdout="1 passed", stderr="", exit_code=0,
+                completed_at=time.time() - 3 * 3600, scope="full",
+            )
+
+        for cmd in commands:
+            assert query_cached(cmd, cwd=str(tmp_path), ttl=DEFAULT_TTL_SECONDS) is None, (
+                "backdated entry must expire under the generic 2h TTL"
+            )
+
+
 class TestAutoGreenRunResolution:
     """Unit tests for the read-only automatic green-run resolution."""
 
@@ -759,7 +826,7 @@ class TestAutoGreenRunResolution:
         assert mock_q.call_count == 4  # pytest + 3 node suite commands
         for call in mock_q.call_args_list:
             assert call.kwargs["cwd"] == str(tmp_path.resolve())
-            assert call.kwargs["ttl"] == audit_runner.DEFAULT_TTL_SECONDS
+            assert call.kwargs["ttl"] == audit_runner.AUDIT_CACHE_TTL_SECONDS
 
     # -----------------------------------------------------------------------
     # Diagnostic output (SA-0MSJELL44009XYIL AC: clear diagnostic on failure)

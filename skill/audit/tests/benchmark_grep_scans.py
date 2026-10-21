@@ -28,6 +28,17 @@ Run (from repo root):
 
 No network access is required. The fixture is generated in a temp dir and
 removed on exit.
+
+The default 1 GiB fixture needs that much free space in the scratch area
+(default: the system temp dir, e.g. ``/tmp``). On filesystems with a small
+per-user quota (a tmpfs configured with ``usrquota`` surfaces as
+``OSError: [Errno 122] Disk quota exceeded``), point the scratch area at a
+roomier filesystem instead of shrinking the fixture:
+
+    AUDIT_BENCH_SCRATCH_DIR=/var/tmp python3 skill/audit/tests/benchmark_grep_scans.py
+
+The tests skip gracefully (rather than fail) when the scratch area cannot
+accommodate the fixture.
 """  # noqa: EXE001
 from __future__ import annotations
 
@@ -47,6 +58,11 @@ from pathlib import Path
 NEEDLE = "WL-0MS4FHW290053SH4"
 
 DEFAULT_FIXTURE_BYTES = int(os.environ.get("AUDIT_BENCH_FIXTURE_BYTES", "1073741824"))
+
+# Base directory for the benchmark's scratch area. When set, the fixture is
+# written here instead of the system temp dir (escape hatch for filesystems
+# with a small per-user quota, e.g. tmpfs ``usrquota``).
+AUDIT_BENCH_SCRATCH_DIR = os.environ.get("AUDIT_BENCH_SCRATCH_DIR") or None
 
 # Number of fake audit_debug jsonl "files" (each entry mirrors a debug-log line).
 FAKE_DEBUG_FILES = 12
@@ -215,7 +231,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    with tempfile.TemporaryDirectory(prefix="audit-grep-bench-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="audit-grep-bench-", dir=AUDIT_BENCH_SCRATCH_DIR) as tmp:
         root = Path(tmp)
         fixture = generate_fixture(root, DEFAULT_FIXTURE_BYTES)
 

@@ -6,7 +6,8 @@
 #    when the startup context surface exceeds committed thresholds.
 # 4. Scope-aware test gate (SA-0MT6CEN8D0073F61): run the FULL suite when
 #    pushing to refs/heads/dev|main; feature-branch pushes skip tests
-#    (worktree validation already ran changed-scope).
+#    (implementation validated changed-scope only; the full suite first runs
+#    at this dev-push integration gate — SA-0MVECQUGF0064U81).
 #
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).

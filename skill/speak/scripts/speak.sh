@@ -9,13 +9,19 @@
 # Usage:
 #   ./skill/speak/scripts/speak.sh "Text to speak"
 #   ./skill/speak/scripts/speak.sh --stream "Text to speak"
+#   ./skill/speak/scripts/speak.sh --voice nova "Text to speak"
 #   ./skill/speak/scripts/speak.sh --help
+#
+# Environment:
+#   TTS_API_URL  Override the TTS API endpoint.
+#   TTS_VOICE    Default voice name when --voice is not given (default: ryan).
+#   SPEAK_DIR    Override the output directory.
 #
 # Dependencies:
 #   - curl (required for API call)
 #   - pw-play or aplay (optional, for playback)
 #
-# Environment:
+# Platform:
 #   Works in native Linux (ALSA/PipeWire) and WSL environments.
 #
 # Rolling buffer:
@@ -40,6 +46,9 @@ set -euo pipefail
 TTS_API_URL="${TTS_API_URL:-http://100.79.231.101:8000/v1/audio/speech}"
 CURL_TIMEOUT=60
 
+# Default voice: explicit --voice wins over TTS_VOICE, which wins over "ryan".
+DEFAULT_VOICE="${TTS_VOICE:-ryan}"
+
 # Determine script directory and repository root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -60,17 +69,23 @@ Arguments:
   text    Text string to be spoken (enclose in quotes for multi-word phrases)
 
 Options:
-  --stream  Write raw audio to stdout instead of saving to file.
-            Useful for piping over SSH to a remote audio player.
-  --help    Show this help message and exit
+  --stream       Write raw audio to stdout instead of saving to file.
+                 Useful for piping over SSH to a remote audio player.
+  --voice <name> Server-side voice name to synthesise with
+                 (default: \$TTS_VOICE or "ryan"). Use any voice the TTS
+                 endpoint exposes, e.g. nova, ginny_di, default.
+  --help         Show this help message and exit
 
 Environment variables:
   SPEAK_DIR    Override the output directory (default: <repo-root>/.pi/speak/)
   TTS_API_URL  Override the TTS API endpoint (default: $TTS_API_URL)
+  TTS_VOICE    Default voice name when --voice is not given (default: ryan)
 
 Examples:
   $(basename "$0") "Hello, world!"
   $(basename "$0") 'The TTS system is now working.'
+  $(basename "$0") --voice nova "Hi, I'm Nova."
+  TTS_VOICE=ginny_di $(basename "$0") "Hello from ginny_di."
   $(basename "$0") --stream "Hello" | aplay
   ssh user@host "cd /project && ./skill/speak/scripts/speak.sh --stream 'hi'" | aplay
   TTS_API_URL="http://localhost:8000/v1/audio/speech" $(basename "$0") "Test"
@@ -82,30 +97,53 @@ EOF
 # ---------------------------------------------------------------------------
 
 STREAM_MODE=false
+VOICE="$DEFAULT_VOICE"
+TEXT=""
 
-if [[ $# -eq 0 ]]; then
+# Parse options in any order before the text argument. The first non-option
+# argument is the text to speak; parsing stops there.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --stream)
+            STREAM_MODE=true
+            shift
+            ;;
+        --voice)
+            if [[ $# -lt 2 || -z "${2:-}" || "$2" == --* ]]; then
+                echo "Error: --voice requires a voice name (e.g. --voice nova)." >&2
+                usage >&2
+                exit 1
+            fi
+            VOICE="$2"
+            shift 2
+            ;;
+        --voice=*)
+            echo "Error: use --voice <name> (space-separated), not $1." >&2
+            usage >&2
+            exit 1
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --*)
+            echo "Error: Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+        *)
+            TEXT="$1"
+            shift
+            break
+            ;;
+    esac
+done
+
+if [[ -z "$TEXT" ]]; then
     echo "Error: No text argument provided." >&2
     usage >&2
     exit 1
 fi
-
-if [[ "$1" == "--help" ]]; then
-    usage
-    exit 0
-fi
-
-if [[ "$1" == "--stream" ]]; then
-    STREAM_MODE=true
-    shift
-fi
-
-if [[ $# -eq 0 ]]; then
-    echo "Error: No text argument provided." >&2
-    usage >&2
-    exit 1
-fi
-
-TEXT="$1"
 
 # Build JSON payload (OpenAI-compatible audio/speech format)
 # (needed before any curl call, so hoisted here)
@@ -113,7 +151,7 @@ JSON_PAYLOAD=$(cat <<EOF
 {
   "model": "tts-1",
   "input": $(echo "$TEXT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))"),
-  "voice": "ryan"
+  "voice": $(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$VOICE")
 }
 EOF
 )
@@ -145,6 +183,11 @@ if $STREAM_MODE; then
 
     if [[ -z "$HTTP_STATUS" || "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
         echo "Error: TTS API returned HTTP $HTTP_STATUS" >&2
+        if [[ -s "$TMP_FILE" ]]; then
+            echo "Server response:" >&2
+            cat "$TMP_FILE" >&2
+            echo >&2
+        fi
         rm -f "$TMP_FILE"
         exit 1
     fi
@@ -210,6 +253,11 @@ fi
 
 if [[ -z "$HTTP_STATUS" || "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
     echo "Error: TTS API returned HTTP $HTTP_STATUS" >&2
+    if [[ -s "$OUTPUT_FILE" ]]; then
+        echo "Server response:" >&2
+        cat "$OUTPUT_FILE" >&2
+        echo >&2
+    fi
     rm -f "$OUTPUT_FILE"
     exit 1
 fi

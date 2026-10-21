@@ -63,10 +63,13 @@ hit the same entries because both resolve the same project root.
 
 - **Storage**: `<repo>/.worklog/cache/` (fallback `<repo>/.git/test-cache/`,
   resolved worktree-aware). Gitignored; never committed.
-- **Invalidation**: git-state fingerprint (HEAD sha + working-tree changes) +
-  2-hour TTL. A changed tree, an expired TTL, or a corrupt entry triggers a
-  fresh run that replaces the stale entry. `--force` bypasses lookup (still
-  stores); `--no-cache` bypasses lookup and storage entirely.
+- **Invalidation**: git-state fingerprint (HEAD sha + the **content** of
+  every dirty tracked/untracked path, not just the `git status --porcelain`
+  path list) + 2-hour TTL. Any content change — including a second edit to a
+  file that is already dirty — an expired TTL, or a corrupt entry triggers a
+  fresh run that replaces the stale entry (AH-0MVFGIV6700329SZ).
+  `--force` bypasses lookup (still stores); `--no-cache` bypasses lookup and
+  storage entirely.
 - **Failed-run TTL (SA-0MSJELL44009XYIL)**: runs with a non-zero exit get a
   short 5-minute TTL instead of the full 2 hours, so a transient infra
   failure (e.g. `/tmp` disk quota) is never re-served as a current result for
@@ -130,10 +133,32 @@ never blocks a test run and vice-versa. Each workload has its own ceiling.
 |---|---|---|
 | `TEST_MAX_CONCURRENCY` | `2` | Maximum concurrent test-suite executions |
 | `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot |
+| `TEST_LOCK_JITTER` | `0.1` | Per-waiter stagger fraction of the bounded wait (`0` = off) — see *Staggered-wait contract* below |
+| `VITEST_MAX_WORKERS` | `4` | Maximum workers in a single vitest suite (per-suite fan-out bound) — resolved value is **exported** to every suite command; see *Per-suite vitest worker bound* below |
 
-Both env vars are validated at runtime: invalid values produce a stderr
+The numeric env vars are validated at runtime: invalid values produce a stderr
 warning and fall back to the documented default (never breaking the test run).
 Values below 1 are clamped to 1.
+
+**Per-suite vitest worker bound (SA-0MVE98T1M006A17T):** the host-wide
+`TEST_MAX_CONCURRENCY` ceiling bounds how many *suites* run at once, but a
+single vitest suite normally sizes its tinypool to the CPU count (15+ forks
+were observed from one suite, SA-0MSAEKOQE009TEB4). Every suite command the
+runner executes therefore inherits `VITEST_MAX_WORKERS` in its **child
+environment** — vitest's config resolution applies it as
+`resolved.maxWorkers`, and `npm test` propagates it to the vitest process. The
+default (`4`) matches the measured per-suite cap already applied to the
+consumer repos (ContextHub / Tableau-Card-Engine, SA-0MSAK2ZH6009Z3TW).
+
+- **Precedence:** an ambient `VITEST_MAX_WORKERS` (operator- or consumer-set)
+  wins; the default applies only when it is unset. Values below 1 clamp to 1
+  (serial); a non-numeric value warns and falls back to the default.
+- **Env-only:** command strings are never rewritten, so the per-repo test
+  cache key is unchanged and read-only consumers (the audit skill) still reuse
+  entries. `NODE_OPTIONS` and every other consumer-set variable are preserved.
+- **Escape hatch:** set `VITEST_MAX_WORKERS=1` for a suite that must run
+  serially, or raise it for a repo whose tests are I/O-bound (env-var mechanism
+  only; no config file).
 
 **Bounded wait semantics:** unlike the audit runner's fail-fast slot wait, a
 test run under saturation WAITS (bounded) for a free slot. If no slot frees
@@ -142,6 +167,30 @@ within `TEST_LOCK_TIMEOUT`, the run reports a clear failure notice (e.g.
 immediately or crashing. This means multiple agents running tests concurrently
 will serialize gracefully — each waits its turn and succeeds once a slot
 becomes free.
+
+**Staggered-wait contract (SA-0MVEDOF7A004TSWD):** under a saturated pool,
+\*concurrent* waiters all enqueue with the same `TEST_LOCK_TIMEOUT` bound and,
+without measures, would poll the slot pool at a fixed cadence and expire at one
+shared wall-clock instant — then all report failure and re-run the suite in
+lockstep, re-storming the pool (a thundering-herd wave). To break this, the
+bounded wait is staggered per waiter:
+
+- **Jittered deadline:** each waiter's deadline is reduced by a uniform random
+  fraction of `TEST_LOCK_TIMEOUT` (default `TEST_LOCK_JITTER=0.1`, i.e.
+  deadlines land in the final 10% of the bound). The configured bound is
+  never extended — only staggered earlier — so no waiter ever waits longer
+  than `TEST_LOCK_TIMEOUT`, and a herd that enqueues together expires across
+  a spread of instants instead of one.
+- **Jittered polling:** each retry sleeps `[0.5, 1.5] ×` the base 50ms cadence,
+  so waiters do not hammer the flock in lockstep.
+- **Retry guidance (AC3):** the saturation notice and `implement.py`'s pacer
+  log explicitly instruct callers to wait a staggered delay (e.g. 30–120s)
+  before retrying, rather than re-running immediately.
+
+`TEST_LOCK_JITTER` accepts `[0, 1)`; `0` restores exact historical timing
+(no stagger) for callers that prefer it. The jitter only affects the `"test"`
+semaphore namespace — audit/`audit-host` semaphores keep `jitter=0.0`
+byte-identical behaviour unless a caller opts in explicitly.
 
 **Cache hits never block:** the semaphore is acquired ONLY when an actual
 execution is about to happen (cache miss path). A cached result is served

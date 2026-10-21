@@ -254,7 +254,7 @@ describe('audit staleness — Step 2 shares Step 3.7 semantics', () => {
   const STALE_ITEM = {
     id: 'SA-STALE-1',
     title: 'Stale Item',
-    assignee: '',
+    needsProducerReview: false,
     parentId: null,
     updatedAt: '2026-09-05T10:00:00Z',
   };
@@ -389,7 +389,7 @@ test('check-audit-gate: checkAuditReadyToClose returns expected structure', asyn
   let remediationCalls = 0;
   const report = await mod.checkAuditReadyToClose({
     getCandidateItemsFn: () => [
-      { id: 'SA-TOP-1', title: 'Top Level Item', assignee: '', parentId: null },
+      { id: 'SA-TOP-1', title: 'Top Level Item', needsProducerReview: false, parentId: null },
     ],
     runAuditShow: () => JSON.stringify({
       success: true,
@@ -527,24 +527,24 @@ describe('getCandidateItems - needsProducerReview field', () => {
   // contract (returns {id, title, needsProducerReview, parentId} per item).
   // We use a minimal mock to avoid live wl queries during the combined suite.
   const mockItems = [
-    { id: 'SA-MOCK-1', title: 'Mock Item 1', assignee: 'Map', parentId: null },
-    { id: 'SA-MOCK-2', title: 'Mock Item 2', assignee: '', parentId: 'SA-PARENT' },
-    { id: 'SA-MOCK-3', title: 'Mock Item 3', assignee: null, parentId: null },
+    { id: 'SA-MOCK-1', title: 'Mock Item 1', needsProducerReview: true, parentId: null },
+    { id: 'SA-MOCK-2', title: 'Mock Item 2', needsProducerReview: false, parentId: 'SA-PARENT' },
+    { id: 'SA-MOCK-3', title: 'Mock Item 3', needsProducerReview: null, parentId: null },
   ];
 
   test('returns needsProducerReview field for each item', async () => {
     for (const item of mockItems) {
       assert.ok('id' in item, 'item should have id');
       assert.ok('title' in item, 'item should have title');
-      assert.ok('assignee' in item, 'item should have needsProducerReview');
+      assert.ok('needsProducerReview' in item, 'item should have needsProducerReview');
     }
   });
 
-  test('assignee is a string or null', async () => {
+  test('needsProducerReview is boolean or null', async () => {
     for (const item of mockItems) {
-      if (item.assignee !== null) {
-        assert.equal(typeof item.assignee, 'string',
-          `assignee should be a string, got ${typeof item.assignee} for ${item.id}`);
+      if (item.needsProducerReview !== null) {
+        assert.equal(typeof item.needsProducerReview, 'boolean',
+          `needsProducerReview should be boolean or null, got ${typeof item.needsProducerReview} for ${item.id}`);
       }
     }
   });
@@ -571,11 +571,11 @@ describe('checkProducerReviewStatus', () => {
     assert.equal(result.hasBlockingItems, false);
   });
 
-  test('flags producer-held items (assignee Map) as blocking', async () => {
+  test('flags items with needsProducerReview = true as blocking', async () => {
     const mod = await import(MODULE_PATH);
     const items = [
-      { id: 'SA-001', title: 'Needs Review', assignee: 'Map' },
-      { id: 'SA-002', title: 'Ready', assignee: '' },
+      { id: 'SA-001', title: 'Needs Review', needsProducerReview: true },
+      { id: 'SA-002', title: 'Ready', needsProducerReview: false },
     ];
     const result = mod.checkProducerReviewStatus(items);
     assert.equal(result.hasBlockingItems, true);
@@ -584,31 +584,33 @@ describe('checkProducerReviewStatus', () => {
     assert.ok(result.blockingItems[0].remediation.includes('wl update'));
   });
 
-  test('does NOT block an unassigned item (assignee null)', async () => {
+  test('flags items with needsProducerReview = null as blocking', async () => {
     const mod = await import(MODULE_PATH);
     const items = [
-      { id: 'SA-003', title: 'Unassigned', assignee: null },
+      { id: 'SA-003', title: 'Unknown', needsProducerReview: null },
     ];
     const result = mod.checkProducerReviewStatus(items);
-    assert.equal(result.hasBlockingItems, false);
-    assert.equal(result.blockingItems.length, 0);
+    assert.equal(result.hasBlockingItems, true);
+    assert.equal(result.blockingItems.length, 1);
+    assert.equal(result.blockingItems[0].workItemId, 'SA-003');
   });
 
-  test('does NOT block an item with no assignee field', async () => {
+  test('flags items with needsProducerReview = undefined as blocking', async () => {
     const mod = await import(MODULE_PATH);
     const items = [
       { id: 'SA-004', title: 'Missing Field' },
     ];
     const result = mod.checkProducerReviewStatus(items);
-    assert.equal(result.hasBlockingItems, false);
-    assert.equal(result.blockingItems.length, 0);
+    assert.equal(result.hasBlockingItems, true);
+    assert.equal(result.blockingItems.length, 1);
+    assert.equal(result.blockingItems[0].workItemId, 'SA-004');
   });
 
   test('passes when all items have needsProducerReview = false', async () => {
     const mod = await import(MODULE_PATH);
     const items = [
-      { id: 'SA-005', title: 'Ready 1', assignee: '' },
-      { id: 'SA-006', title: 'Ready 2', assignee: '' },
+      { id: 'SA-005', title: 'Ready 1', needsProducerReview: false },
+      { id: 'SA-006', title: 'Ready 2', needsProducerReview: false },
     ];
     const result = mod.checkProducerReviewStatus(items);
     assert.equal(result.hasBlockingItems, false);
@@ -618,17 +620,17 @@ describe('checkProducerReviewStatus', () => {
   test('blockingItems entries have expected fields', async () => {
     const mod = await import(MODULE_PATH);
     const items = [
-      { id: 'SA-007', title: 'Blocked', assignee: 'Map' },
+      { id: 'SA-007', title: 'Blocked', needsProducerReview: true },
     ];
     const result = mod.checkProducerReviewStatus(items);
     const entry = result.blockingItems[0];
     assert.ok('workItemId' in entry);
     assert.ok('title' in entry);
-    assert.ok('assignee' in entry);
+    assert.ok('needsProducerReview' in entry);
     assert.ok('reason' in entry);
     assert.ok('remediation' in entry);
     assert.equal(entry.workItemId, 'SA-007');
-    assert.equal(entry.assignee, 'Map');
+    assert.equal(entry.needsProducerReview, true);
   });
 });
 
@@ -641,30 +643,30 @@ describe('buildProducerReviewRemediationCommand', () => {
     assert.equal(typeof mod.buildProducerReviewRemediationCommand, 'function');
   });
 
-  test('emits the exact --assignee release command (AC1)', async () => {
+  test('emits the exact kebab-case --needs-producer-review command (AC1)', async () => {
     const mod = await import(MODULE_PATH);
     const cmd = mod.buildProducerReviewRemediationCommand('SA-001');
     assert.equal(typeof cmd, 'string');
     assert.ok(
-      cmd.includes('wl update SA-001 --assignee "" --json'),
-      'Should emit the exact assignee-release wl command',
+      cmd.includes('wl update SA-001 --needs-producer-review false --json'),
+      'Should emit the exact kebab-case wl command',
     );
   });
 
-  test('does not emit the retired needsProducerReview flag', async () => {
+  test('does not emit the camelCase --needsProducerReview flag (AC1)', async () => {
     const mod = await import(MODULE_PATH);
     const cmd = mod.buildProducerReviewRemediationCommand('SA-001');
     assert.ok(
-      !cmd.includes('--needs-producer-review'),
-      'Must not emit the retired needsProducerReview flag',
+      !cmd.includes('--needsProducerReview'),
+      'Must not emit the camelCase CLI flag that wl rejects',
     );
   });
 
   test('emitted flag is accepted by the installed wl CLI (AC3)', async () => {
     const mod = await import(MODULE_PATH);
     const cmd = mod.buildProducerReviewRemediationCommand('SA-001');
-    const flag = cmd.match(/--assignee/);
-    assert.ok(flag, 'remediation should contain --assignee');
+    const flag = cmd.match(/--needs-producer-review/);
+    assert.ok(flag, 'remediation should contain --needs-producer-review');
 
     let help;
     try {
@@ -678,8 +680,12 @@ describe('buildProducerReviewRemediationCommand', () => {
       throw err;
     }
     assert.ok(
-      help.includes('--assignee'),
-      'wl update --help should document --assignee',
+      help.includes('--needs-producer-review'),
+      'wl update --help should document --needs-producer-review',
+    );
+    assert.ok(
+      !help.includes('--needsProducerReview'),
+      'wl update does not accept the camelCase flag',
     );
   });
 });
@@ -770,7 +776,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
     const mod = await import(MODULE_PATH);
     const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
     const argsLogPath = join(tmpDir, 'args.log');
-    const workItems = [{ id: 'SA-1', title: 'One', assignee: '' }];
+    const workItems = [{ id: 'SA-1', title: 'One', needsProducerReview: false }];
     const binDir = createWlMock({ workItems, argsLogPath });
 
     const items = withWlMock(binDir, () => mod.getCandidateItems());
@@ -780,7 +786,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
     assert.ok(calls[0].includes('--stage in_review'), `should filter stage, got: ${calls[0]}`);
     assert.ok(!calls[0].includes('--status completed'), `should drop redundant status filter (completed-minus-done == in_review), got: ${calls[0]}`);
     assert.ok(calls[0].includes('--json'), `should request JSON, got: ${calls[0]}`);
-    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', assignee: '', parentId: null, updatedAt: null }]);
+    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false, parentId: null, updatedAt: null }]);
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -792,7 +798,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
     const workItems = Array.from({ length: 200 }, (_, i) => ({
       id: `SA-LARGE-${i}`,
       title: `Large item ${i}`,
-      assignee: '',
+      needsProducerReview: false,
       description: 'x'.repeat(6000),
     }));
     const binDir = createWlMock({ workItems, argsLogPath });
@@ -801,7 +807,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
 
     assert.equal(items.length, 200, 'all items should be returned without ENOBUFS');
     for (const item of items) {
-      assert.ok('id' in item && 'title' in item && 'assignee' in item);
+      assert.ok('id' in item && 'title' in item && 'needsProducerReview' in item);
     }
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -830,7 +836,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
     const payloadPath = join(tmpDir, 'payload.json');
     writeFileSync(payloadPath, JSON.stringify({
       success: true,
-      workItems: [{ id: 'SA-1', title: 'Dash-safe', assignee: '' }],
+      workItems: [{ id: 'SA-1', title: 'Dash-safe', needsProducerReview: false }],
     }));
     const wlPath = join(tmpDir, 'wl');
     // This script checks its parent process name; it only emits payload
@@ -845,7 +851,7 @@ describe('getCandidateItems - single stage query + jq projection', () => {
     assert.deepEqual(items, [{
       id: 'SA-1',
       title: 'Dash-safe',
-      assignee: '',
+      needsProducerReview: false,
       parentId: null,
       updatedAt: null,
     }], 'query must run under bash so set -o pipefail works on dash');
@@ -880,8 +886,8 @@ describe('getCandidateItems - parentId projection', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
     const argsLogPath = join(tmpDir, 'args.log');
     const workItems = [
-      { id: 'SA-TOP-1', title: 'Top', assignee: '', parentId: null },
-      { id: 'SA-CHILD-1', title: 'Child', assignee: '', parentId: 'SA-TOP-1' },
+      { id: 'SA-TOP-1', title: 'Top', needsProducerReview: false, parentId: null },
+      { id: 'SA-CHILD-1', title: 'Child', needsProducerReview: false, parentId: 'SA-TOP-1' },
     ];
     const binDir = createWlMock({ workItems, argsLogPath });
 
@@ -891,7 +897,7 @@ describe('getCandidateItems - parentId projection', () => {
     for (const item of items) {
       assert.ok('id' in item, 'item should have id');
       assert.ok('title' in item, 'item should have title');
-      assert.ok('assignee' in item, 'item should have needsProducerReview');
+      assert.ok('needsProducerReview' in item, 'item should have needsProducerReview');
       assert.ok('parentId' in item, 'item should have parentId');
     }
     rmSync(tmpDir, { recursive: true, force: true });
@@ -912,10 +918,10 @@ describe('getTopLevelCandidateItems - top-level filtering', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
     const argsLogPath = join(tmpDir, 'args.log');
     const workItems = [
-      { id: 'SA-TOP-1', title: 'Top 1', assignee: '', parentId: null },
-      { id: 'SA-CHILD-1', title: 'Child 1', assignee: '', parentId: 'SA-TOP-1' },
-      { id: 'SA-TOP-2', title: 'Top 2', assignee: '', parentId: null },
-      { id: 'SA-CHILD-2', title: 'Child 2', assignee: '', parentId: 'SA-TOP-2' },
+      { id: 'SA-TOP-1', title: 'Top 1', needsProducerReview: false, parentId: null },
+      { id: 'SA-CHILD-1', title: 'Child 1', needsProducerReview: false, parentId: 'SA-TOP-1' },
+      { id: 'SA-TOP-2', title: 'Top 2', needsProducerReview: false, parentId: null },
+      { id: 'SA-CHILD-2', title: 'Child 2', needsProducerReview: false, parentId: 'SA-TOP-2' },
     ];
     const binDir = createWlMock({ workItems, argsLogPath });
 
@@ -934,7 +940,7 @@ describe('getTopLevelCandidateItems - top-level filtering', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
     const argsLogPath = join(tmpDir, 'args.log');
     const workItems = [
-      { id: 'SA-ORPHAN-1', title: 'Orphan', assignee: '', parentId: null },
+      { id: 'SA-ORPHAN-1', title: 'Orphan', needsProducerReview: false, parentId: null },
     ];
     const binDir = createWlMock({ workItems, argsLogPath });
 
@@ -953,7 +959,7 @@ describe('getTopLevelCandidateItems - top-level filtering', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
     const argsLogPath = join(tmpDir, 'args.log');
     const workItems = [
-      { id: 'SA-TOP-1', title: 'Top', assignee: '', parentId: null },
+      { id: 'SA-TOP-1', title: 'Top', needsProducerReview: false, parentId: null },
     ];
     const binDir = createWlMock({ workItems, argsLogPath });
 
@@ -997,7 +1003,7 @@ describe('checkAuditReadyToClose - top-level-only blocking', () => {
     // Only children are in_review; each would fail an audit if queried, but
     // because the gate scopes to top-level they must be excluded entirely.
     const workItems = [
-      { id: 'SA-CHILD-1', title: 'Child Blocking', assignee: '', parentId: 'SA-TOP-1' },
+      { id: 'SA-CHILD-1', title: 'Child Blocking', needsProducerReview: false, parentId: 'SA-TOP-1' },
     ];
     const { report, binDir } = await runGateWithWlMock(workItems);
 
@@ -1009,7 +1015,7 @@ describe('checkAuditReadyToClose - top-level-only blocking', () => {
 
   test('does not list children in the transient-warning report', async () => {
     const workItems = [
-      { id: 'SA-CHILD-T', title: 'Child Transient', assignee: '', parentId: 'SA-TOP-1' },
+      { id: 'SA-CHILD-T', title: 'Child Transient', needsProducerReview: false, parentId: 'SA-TOP-1' },
     ];
     const { report, binDir } = await runGateWithWlMock(workItems);
 
@@ -1030,14 +1036,14 @@ describe('checkProducerReviewStatus - top-level scoping', () => {
     // pass a top-level-only list (children excluded upstream) and verify a
     // child flag does not appear because it was filtered out of the input.
     const result = mod.checkProducerReviewStatus([
-      { id: 'SA-TOP-1', title: 'Top Ready', assignee: '', parentId: null },
+      { id: 'SA-TOP-1', title: 'Top Ready', needsProducerReview: false, parentId: null },
     ]);
     assert.equal(result.hasBlockingItems, false, 'top-level list with no flagged items passes');
     assert.equal(result.blockingItems.length, 0);
 
     // And a top-level item still blocks as before.
     const blocking = mod.checkProducerReviewStatus([
-      { id: 'SA-TOP-2', title: 'Top Flagged', assignee: 'Map', parentId: null },
+      { id: 'SA-TOP-2', title: 'Top Flagged', needsProducerReview: true, parentId: null },
     ]);
     assert.equal(blocking.hasBlockingItems, true, 'top-level flagged item still blocks');
     assert.equal(blocking.blockingItems[0].workItemId, 'SA-TOP-2');
@@ -1049,7 +1055,7 @@ describe('checkProducerReviewStatus - top-level scoping', () => {
     // items (parentId set) have already been filtered out, so their flags
     // cannot block.
     const items = [
-      { id: 'SA-TOP-1', title: 'Top', assignee: '', parentId: null },
+      { id: 'SA-TOP-1', title: 'Top', needsProducerReview: false, parentId: null },
     ];
     const result = mod.checkProducerReviewStatus(items);
     assert.equal(result.hasBlockingItems, false);
@@ -1067,7 +1073,7 @@ describe('checkProducerReviewStatus - top-level scoping', () => {
 const TOP_LEVEL_ITEM = {
   id: 'SA-TOP-1',
   title: 'Top Level Item',
-  assignee: '',
+  needsProducerReview: false,
   parentId: null,
 };
 
@@ -1251,8 +1257,8 @@ describe('checkAuditReadyToClose - bounded remediation budget', () => {
       join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js'),
     );
     const items = [
-      { id: 'SA-A', title: 'Item A', assignee: '', parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
-      { id: 'SA-B', title: 'Item B', assignee: '', parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      { id: 'SA-A', title: 'Item A', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+      { id: 'SA-B', title: 'Item B', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
     ];
     let remediationCalls = 0;
     let aShows = 0;
@@ -1295,7 +1301,7 @@ describe('checkAuditReadyToClose - bounded remediation budget', () => {
     timeoutErr.code = 'ETIMEDOUT';
     const report = await mod.checkAuditReadyToClose({
       getCandidateItemsFn: () => [
-        { id: 'SA-TO', title: 'Timeout Item', assignee: '', parentId: null },
+        { id: 'SA-TO', title: 'Timeout Item', needsProducerReview: false, parentId: null },
       ],
       runAuditShow: () => JSON.stringify({ audit: null }),
       runAuditCommand: () => { throw timeoutErr; },
@@ -1314,7 +1320,7 @@ describe('checkAuditReadyToClose - narrow --skip-audit-remediation bypass', () =
     const report = await mod.checkAuditReadyToClose({
       skipRemediation: true,
       getCandidateItemsFn: () => [
-        { id: 'SA-S', title: 'Skip', assignee: '', parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+        { id: 'SA-S', title: 'Skip', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
       ],
       runAuditShow: () => JSON.stringify({ audit: null }),
       runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
@@ -1332,7 +1338,7 @@ describe('checkAuditReadyToClose - narrow --skip-audit-remediation bypass', () =
     const report = await mod.checkAuditReadyToClose({
       skipRemediation: true,
       getCandidateItemsFn: () => [
-        { id: 'SA-F', title: 'Fail', assignee: '', parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
+        { id: 'SA-F', title: 'Fail', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
       ],
       runAuditShow: () => JSON.stringify({
         audit: { readyToClose: false, auditedAt: '2026-09-04T09:59:55Z', rawOutput: 'Ready to close: No\n\n2 not met.' },
@@ -1348,7 +1354,7 @@ describe('checkAuditReadyToClose - narrow --skip-audit-remediation bypass', () =
 
 describe('checkAuditReadyToClose - content-fingerprint fast path', () => {
   const FP_LINE = 'Audit content fingerprint: deadbeef';
-  const ITEM = { id: 'SA-CF', title: 'CF', assignee: '', parentId: null, updatedAt: '2026-09-05T10:00:00Z' };
+  const ITEM = { id: 'SA-CF', title: 'CF', needsProducerReview: false, parentId: null, updatedAt: '2026-09-05T10:00:00Z' };
   const fpAudit = (readyToClose) => JSON.stringify({
     audit: {
       readyToClose,

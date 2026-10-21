@@ -112,7 +112,7 @@ class RefactorConfig:
             try:
                 path = Path(config_path)
                 if path.is_file():
-                    with open(path, "r") as f:
+                    with open(path) as f:
                         raw = json.load(f)
                     if not isinstance(raw, dict):
                         LOG.warning("Config file %s is not a dict; using defaults", config_path)
