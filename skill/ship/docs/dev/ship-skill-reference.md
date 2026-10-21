@@ -437,8 +437,23 @@ notification.
 Close-work-items tests must **never mutate the live worklog** (SA-0MSJ2XMQL006CVQS):
 
 - `closeWorkItemsAfterRelease` accepts injectable `getCandidateItemsFn` /
-  `runCloseCommand` / `getDescendantsFn` boundaries.
+  `runCloseCommand` / `getDescendantsFn` / `getCommentsFn` boundaries.
 - Tests inject fakes (or mock `wl`) and never call with the default boundary.
+
+**Idempotency (SA-0MUECDK14002J37J):** the close sweep is safe to re-run. An
+item whose comments already carry this version's `Shipped in v<version>` marker
+is skipped — never re-closed, never re-annotated — and reported in
+`alreadyShippedCount` / `alreadyShippedItems`. The marker match is
+version-exact (`v0.1.1` never matches a `v0.1.18` marker). Marker discovery goes
+through the injectable `getCommentsFn` boundary (default: a read-only
+`wl comment list <id> --json`); a throwing/unreadable boundary is fail-safe — it
+warns and leaves the existing close behaviour intact so a release is never
+blocked by the check. Additionally, `wl close --force` already annotates every
+descendant, so only the topmost closable item of a subtree issues a close
+command; its swept descendants are verified via `getCloseStateFn` but never
+re-closed. A single sweep therefore produces exactly one close comment per
+item (the 2026-10-09 incident produced 99 close comments for 74 items through
+both double annotation paths).
 
 **Candidate-set scoping (SA-0MU2OY1N9000XL2H AC9/AC10):** because `wl close
 --force` recursively closes ALL descendants, a candidate whose subtree
