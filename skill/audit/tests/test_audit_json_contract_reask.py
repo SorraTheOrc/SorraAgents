@@ -225,3 +225,183 @@ class TestCorpusReplay:
         assert post_failure_rate == 0.0
         # Exactly one bounded re-ask per genuine failure.
         assert reask_calls == baseline
+
+
+# ---------------------------------------------------------------------------
+# AC4 (SA-0MVF1NKZQ009P3ZG / SA-0MVI6VNDF001VE1S): harden the JSON contract so
+# a well-formed-but-unusually-formatted response is accepted on the FIRST call
+# instead of paying for a second (p50 461 s) re-ask:
+#   - tolerant extraction for trailing commas (a common model formatting slip)
+#   - a strict schema instruction carried on the FIRST call, not only the retry
+#   - exactly one re-ask, and only on a genuine parse/schema failure
+#   - re-asks counted in the per-run reliability summary
+# ---------------------------------------------------------------------------
+
+
+class TestTrailingCommaTolerance:
+    """A trailing comma must not cost a full re-ask (AC4)."""
+
+    def test_trailing_comma_in_object_and_array_is_parsed(self):
+        text = '[{"index": 0, "verdict": "met", "evidence": "x.py:1",},]'
+        parsed = audit_runner._extract_json_array(text)
+        assert parsed is not None, "trailing commas must be tolerated"
+        assert parsed[0]["verdict"] == "met"
+
+    def test_trailing_comma_inside_fenced_block_is_parsed(self):
+        text = (
+            "Here is the verdict array:\n\n"
+            "```json\n"
+            '[\n  {"index": 0, "verdict": "unmet", "evidence": "y.py:2",},\n]\n'
+            "```\n"
+        )
+        parsed = audit_runner._extract_json_array(text)
+        assert parsed is not None
+        assert parsed[0]["verdict"] == "unmet"
+
+    def test_trailing_comma_does_not_change_verdict_semantics(self):
+        """Repair must never invent or alter verdict values."""
+        text = '[{"index": 3, "verdict": "partial", "evidence": "z.py:9",},]'
+        parsed = audit_runner._extract_json_array(text)
+        assert parsed == [{"index": 3, "verdict": "partial", "evidence": "z.py:9"}]
+
+    def test_trailing_comma_inside_a_string_is_preserved(self):
+        """A comma before ']' INSIDE a JSON string is data, not a separator."""
+        text = '[{"index": 0, "verdict": "met", "evidence": "list: [a,]"}]'
+        parsed = audit_runner._extract_json_array(text)
+        assert parsed is not None
+        assert parsed[0]["evidence"] == "list: [a,]"
+
+    def test_genuinely_broken_json_is_still_not_parsed(self):
+        """Repair must not become lenient enough to accept real corruption."""
+        assert audit_runner._extract_json_array('{"index": 0,,,}') is None
+        assert audit_runner._extract_json_array("[not json at all]") is None
+
+
+class TestNoReAskForToleratedFormats:
+    """Each tolerated format is accepted on the first call — zero re-asks."""
+
+    @staticmethod
+    def _run(first_text: str):
+        calls: list[str] = []
+
+        def fake(issue_id, context, prompt, **kwargs):
+            calls.append(context)
+            return {"extracted_text": first_text}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=fake
+        ):
+            _result, batch, _raw = audit_runner._call_phase1_screen(
+                "SA-X", "parent", "screen these criteria", "test-model", "pi",
+                None, None, None, lambda *a: None, "test screen",
+            )
+        return calls, batch
+
+    def test_fenced_block_is_not_reasked(self):
+        calls, batch = self._run(
+            f"Analysis done.\n\n```json\n{_VALID_ARRAY}\n```\n"
+        )
+        assert batch and batch[0]["index"] == 0
+        assert calls.count("verdict_reask") == 0
+
+    def test_prose_prefixed_json_is_not_reasked(self):
+        calls, batch = self._run(f"I reviewed the code carefully.\n\n{_VALID_ARRAY}")
+        assert batch and batch[0]["index"] == 0
+        assert calls.count("verdict_reask") == 0
+
+    def test_trailing_comma_json_is_not_reasked(self):
+        calls, batch = self._run(
+            '[{"index": 0, "verdict": "met", "evidence": "x.py:1",},]'
+        )
+        assert batch and batch[0]["verdict"] == "met"
+        assert calls.count("verdict_reask") == 0
+
+    def test_well_formed_response_is_never_reasked(self):
+        """AC4 regression: the happy path must never enter the retry path."""
+        calls, batch = self._run(_VALID_ARRAY)
+        assert batch and batch[0]["verdict"] == "met"
+        assert "verdict_reask" not in calls
+
+
+class TestStrictSchemaInstruction:
+    """The FIRST call must carry the strict JSON-only schema instruction."""
+
+    def test_phase1_first_call_prompt_demands_bare_json(self):
+        prompts: list[tuple[str, str]] = []
+
+        def fake(issue_id, context, prompt, **kwargs):
+            prompts.append((context, prompt))
+            return {"extracted_text": _VALID_ARRAY}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=fake
+        ):
+            audit_runner._call_phase1_screen(
+                "SA-X", "parent", "screen these criteria", "test-model", "pi",
+                None, None, None, lambda *a: None, "test screen",
+            )
+        first_context, first_prompt = prompts[0]
+        assert first_context == "parent"
+        lowered = first_prompt.lower()
+        assert "json" in lowered
+        # The contract must rule out the formatting that forces a re-ask.
+        assert "no markdown" in lowered or "no code fence" in lowered
+        assert "trailing comma" in lowered
+
+    def test_reask_prompt_keeps_the_strict_schema(self):
+        prompts: list[tuple[str, str]] = []
+
+        def fake(issue_id, context, prompt, **kwargs):
+            prompts.append((context, prompt))
+            if context == "verdict_reask":
+                return {"extracted_text": _VALID_ARRAY}
+            return {"extracted_text": "no json"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=fake
+        ):
+            audit_runner._call_phase1_screen(
+                "SA-X", "parent", "screen these criteria", "test-model", "pi",
+                None, None, None, lambda *a: None, "test screen",
+            )
+        reask_prompts = [p for c, p in prompts if c == "verdict_reask"]
+        assert len(reask_prompts) == 1
+        assert "trailing comma" in reask_prompts[0].lower()
+
+
+class TestReAskCounting:
+    """Re-asks are counted in the reliability summary so the rate is visible."""
+
+    def test_reask_increments_reliability_counter(self):
+        audit_runner._rel_reset()
+
+        def fake(issue_id, context, prompt, **kwargs):
+            if context == "verdict_reask":
+                return {"extracted_text": _VALID_ARRAY}
+            return {"extracted_text": "no json here"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=fake
+        ):
+            audit_runner._call_phase1_screen(
+                "SA-X", "parent", "screen these criteria", "test-model", "pi",
+                None, None, None, lambda *a: None, "test screen",
+            )
+        assert audit_runner._rel_snapshot().get("verdict_reasks") == 1
+        line = audit_runner.render_reliability_summary()
+        assert "verdict_reasks=1" in line
+
+    def test_no_reask_leaves_counter_at_zero(self):
+        audit_runner._rel_reset()
+
+        def fake(issue_id, context, prompt, **kwargs):
+            return {"extracted_text": _VALID_ARRAY}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=fake
+        ):
+            audit_runner._call_phase1_screen(
+                "SA-X", "parent", "screen these criteria", "test-model", "pi",
+                None, None, None, lambda *a: None, "test screen",
+            )
+        assert audit_runner._rel_snapshot().get("verdict_reasks") == 0

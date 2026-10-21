@@ -707,7 +707,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 
 **Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
 
-**Bounded JSON re-ask (SA-0MU32TCFM003B78I):** the Phase 1 parent/child screens and Phase 2 parent/child deep-analysis prompts are JSON-first ("Return ONLY a structured JSON array", with the `index`/`verdict`/`evidence` schema restated) and the extractor tolerates leading/trailing prose and complete Markdown code fences. When a response still cannot be parsed into an index-bearing verdict array, the runner issues **exactly one** bounded "[JSON RE-ASK] return only the JSON array" call, observable under the `verdict_reask` context and bounded by the per-call timeout, before falling back to the conservative `partial` verdict. A persistent failure therefore never becomes `met`/`Yes`; the re-ask only recovers a usable array when the model can re-emit it. Genuine parse failures in the 48-day SorraAgents corpus were 7/272 (2.6%), dominated by empty/narrative/truncated responses that the re-ask targets.
+**Bounded JSON re-ask (SA-0MU32TCFM003B78I / SA-0MVI6VNDF001VE1S):** the Phase 1 parent/child screens and Phase 2 parent/child deep-analysis prompts are JSON-first — a strict **JSON contract** instruction is carried on the **first** call of every JSON-expecting phase: ``Return ONLY a single valid JSON array and nothing else: no prose before or after it, no Markdown code fences, and no trailing comma before a closing ']' or '}'``, with the ``index``/``verdict``/``evidence`` schema restated. Historically the strict schema was only on the re-ask, so a first response that used a fence or a trailing comma paid for a second full-length call (p50 461 s). The extractor tolerates leading/trailing prose, complete Markdown code fences, and — new — **trailing commas outside string literals** (a common model formatting slip; repaired in-place without reinterpreting values). When a response still cannot be parsed into an index-bearing verdict array, the runner issues **exactly one** bounded "[JSON RE-ASK] return only the JSON array" call, observable under the `verdict_reask` context, counted in the reliability summary as `verdict_reasks`, and bounded by the per-call timeout, before falling back to the conservative `partial` verdict. A persistent failure therefore never becomes `met`/`Yes`; the re-ask only recovers a usable array when the model can re-emit it. Genuine parse failures in the 48-day SorraAgents corpus were 7/272 (2.6%), dominated by empty/narrative/truncated responses that the re-ask targets.
 
 **Context reduction:** every Pi call (`_call_pi`) runs with `--no-context-files --no-skills`, in both tool-enabled and tool-less modes. Audit prompts are fully self-contained — they carry the read-only mandate, JSON output format, FILE SCOPE manifest, SCANNING block, and criteria — so the global+project AGENTS.md load (~40KB, byte-identical duplication) and the skills section (~7KB) are dropped from each session's static context, cutting per-call startup from ~49KB (~12.3K tokens) to ~2KB. Prompts must never depend on AGENTS.md or skill descriptions: that is an invariant of this skill (context-reduction item SA-0MSISKM8F004NW1U).
 
@@ -835,7 +835,7 @@ issue` run emits **exactly one** machine-greppable summary line to stderr and
 appends it to the persisted report:
 
 ```
-AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> elapsed_seconds=<x>
+AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> elapsed_seconds=<x>
 ```
 
 The keys (and their order) are the stable contract `RELIABILITY_SUMMARY_KEYS`;
@@ -844,8 +844,10 @@ all Pi calls in the run, including re-asks: `calls` (Pi calls),
 `parse_ok`/`parse_failed` (JSON-array extraction outcomes where a JSON array
 was expected), `timeouts` (`_timeout` results), `child_skips` (children
 recorded `partial (budget exceeded)`), `provider_errors` (`_provider_error`
-results), and `concurrency_waits` (audit-slot `_concurrency_timeout` results).
-The line is emitted once per run via `emit_reliability_summary()` — from the
+results), `concurrency_waits` (audit-slot `_concurrency_timeout` results),
+and `verdict_reasks` (bounded JSON-contract re-asks issued —
+SA-0MVI6VNDF001VE1S). The line is emitted once per run via
+`emit_reliability_summary()` — from the
 normal report path and, where possible, from an early-exit `finally` (timeout
 or abort before report assembly) so partial runs are still measurable. It
 contains counts only — never prompts, secrets, or credentials.

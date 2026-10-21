@@ -880,6 +880,9 @@ _UNPARSEABLE_RAW_MAX_CHARS = 4000
 
 #: Stable key order for the per-run reliability summary. Operators and
 #: dashboards grep this line, so the key set and order are a contract.
+#: ``verdict_reasks`` counts the bounded JSON-contract re-asks
+#: (SA-0MVI6VNDF001VE1S) so the re-ask rate is measurable from the log
+#: instead of inferred from debug-log forensics.
 RELIABILITY_SUMMARY_KEYS = (
     "calls",
     "parse_ok",
@@ -888,6 +891,7 @@ RELIABILITY_SUMMARY_KEYS = (
     "child_skips",
     "provider_errors",
     "concurrency_waits",
+    "verdict_reasks",
 )
 #: Machine-greppable prefix; the full line is ``<prefix> <key=value> ...``.
 RELIABILITY_SUMMARY_PREFIX = "AUDIT_RELIABILITY_SUMMARY"
@@ -4808,11 +4812,92 @@ def _extract_provider_error(raw: str) -> str | None:
 # Acceptance-criteria extractor
 # ---------------------------------------------------------------------------
 
+def _strip_trailing_commas(text: str) -> str:
+    """Remove JSON trailing commas that are outside string literals.
+
+    Models routinely emit ``{"a": 1,}`` or ``[1, 2,]`` — valid in JavaScript,
+    invalid in JSON. Without this repair such a response fails to parse and
+    costs a full re-ask (p50 461 s measured), so it is repaired in place.
+
+    Only commas that are followed (after whitespace) by ``]`` or ``}`` are
+    removed, and only when they appear outside a string literal, so a comma
+    that is part of a value (``"list: [a,]"``) is preserved as data.
+    """
+    out: list[str] = []
+    in_string = False
+    escape_next = False
+    i = 0
+    length = len(text)
+    while i < length:
+        char = text[i]
+        if escape_next:
+            escape_next = False
+            out.append(char)
+            i += 1
+            continue
+        if char == "\\" and in_string:
+            escape_next = True
+            out.append(char)
+            i += 1
+            continue
+        if char == '"':
+            in_string = not in_string
+            out.append(char)
+            i += 1
+            continue
+        if char == "," and not in_string:
+            # Look ahead past whitespace for a closing bracket.
+            j = i + 1
+            while j < length and text[j] in " \t\r\n":
+                j += 1
+            if j < length and text[j] in "]}":
+                i += 1  # drop the trailing comma, keep the whitespace
+                continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+def _tolerant_json_array_loads(candidate: str) -> list | None:
+    """Parse *candidate* as a JSON array, repairing common model slips.
+
+    Attempts, in order:
+      1. a strict ``json.loads`` of the candidate;
+      2. the same after removing trailing commas outside string literals,
+         plus Markdown code-fence lines (``` / ```json) that survived
+         extraction.
+
+    Returns the list on success, ``None`` when the text is genuinely not a
+    JSON array. Repair never reinterprets values — it only removes syntax
+    that JSON forbids — so verdict semantics are untouched
+    (SA-0MVI6VNDF001VE1S AC4).
+    """
+    try:
+        result = json.loads(candidate)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+    repaired = _strip_trailing_commas(candidate)
+    if repaired != candidate:
+        try:
+            result = json.loads(repaired)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def _extract_json_array(text: str) -> list | None:
     """Extract the last JSON array from text that may contain analysis before the array.
 
     Pi often returns analysis text followed by a JSON array at the end.
     This function finds the last `[` that is NOT inside a string and tries to parse.
+
+    Tolerance (AC4, SA-0MVI6VNDF001VE1S): prose around the array, Markdown
+    code fences, and trailing commas outside string literals are all accepted
+    so an unusual-but-well-formed response never costs a re-ask.
 
     Returns the parsed list if found, otherwise None.
     """
@@ -4848,23 +4933,17 @@ def _extract_json_array(text: str) -> list | None:
     for start in reversed(possible_starts):
         candidate = text[start:].strip()
 
-        # Try the full candidate first
-        try:
-            result = json.loads(candidate)
-            if isinstance(result, list):
-                return result
-        except json.JSONDecodeError:
-            pass
+        # Try the full candidate first (tolerating trailing commas)
+        result = _tolerant_json_array_loads(candidate)
+        if result is not None:
+            return result
 
         # If that failed, try to find where the JSON array ends
         for end_search in range(len(candidate) - 1, 0, -1):
             if candidate[end_search] == ']':
-                try:
-                    result = json.loads(candidate[:end_search + 1])
-                    if isinstance(result, list):
-                        return result
-                except json.JSONDecodeError:
-                    continue
+                result = _tolerant_json_array_loads(candidate[:end_search + 1])
+                if result is not None:
+                    return result
 
     return None
 
@@ -4881,7 +4960,21 @@ _JSON_REASK_PREFIX = (
 _JSON_REASK_SCHEMA = (
     "Each element MUST be an object with keys 'index' (integer), 'verdict' "
     "(one of met, unmet, partial, adjusted) and 'evidence' (a one-line note "
-    "with a file:line reference)."
+    "with a file:line reference). No Markdown code fences, no prose before or "
+    "after the array, and no trailing comma before a closing ']' or '}'."
+)
+
+#: Strict JSON contract carried on the FIRST call of every JSON-expecting
+#: phase (SA-0MVI6VNDF001VE1S AC4). Historically only the re-ask carried the
+#: strict schema, so the first response often used a code fence or a trailing
+#: comma and paid for a second full-length call (p50 461 s). Stating the
+#: contract up front removes most re-asks at zero extra cost.
+_JSON_CONTRACT_INSTRUCTION = (
+    "JSON CONTRACT — Return ONLY a single valid JSON array and nothing else: "
+    "no prose before or after it, no Markdown code fences, and no trailing "
+    "comma before a closing ']' or '}'. "
+    + _JSON_REASK_SCHEMA
+    + " "
 )
 
 
@@ -4908,6 +5001,7 @@ def _reask_json_array_once(
     verdict, never ``met`` (SA-0MU32TCFM003B78I AC3/AC5).
     """
     prompt = _JSON_REASK_PREFIX + _JSON_REASK_SCHEMA + "\n\n" + instruction
+    _rel_incr("verdict_reasks")
     try:
         result = _call_pi_and_maybe_log(
             issue_id, "verdict_reask", prompt,
@@ -7051,7 +7145,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
             f"[READ-ONLY AUDIT] You are performing a read-only audit. "
             f"Do NOT close, modify, create, or delete any work items. "
             f"Do NOT execute any wl, git, or other state-modifying commands. "
-            f"Return ONLY a structured JSON array.\n\n"
+            f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
             f"Review the following acceptance criteria for child work item '{child.get('title', '')}' "
             f"against the codebase. "
             f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
@@ -7667,7 +7761,7 @@ def _deep_analyze_child(
     child_prompt = (
         "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHILD] "
         "Do NOT close, modify, create, or delete any work items. "
-        "Return ONLY a structured JSON array.\n\n"
+        f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
         f"Deep code analysis for child: {child.get('title', '')} ({child.get('id', '')})\n\n"
         "FILE SCOPE — Read ONLY the files listed in the manifest below. "
         "Do not explore the whole repository. If a criterion requires a "
@@ -7954,7 +8048,7 @@ def _run_batch_phase2(
     batch_prompt = (
         "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — BATCH] "
         "Do NOT close, modify, create, or delete any work items. "
-        "Return ONLY a structured JSON array.\n\n"
+        f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
         "Deep code analysis for the parent work item and its active children. "
         "The criteria below form ONE indexed list: the parent's acceptance "
         "criteria first, then each child's criteria in order. Return one "
@@ -8227,7 +8321,7 @@ def _run_phase2_deep_analysis(
             "You are performing a deep code analysis. "
             "Do NOT close, modify, create, or delete any work items. "
             "Do NOT execute any wl, git, or other state-modifying commands. "
-            "Return ONLY a structured JSON array.\n\n"
+            f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
             "Phase 1 automated screening has PASSED. You must now perform deep code analysis.\n\n"
             "FILE SCOPE — Read ONLY the files listed in the manifest below. "
             "Do not explore the whole repository (no unbounded `find`, `grep -r`, "
@@ -10025,7 +10119,7 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
         "a chore work item to track a false-positive finding (config-fix "
         "remediation). "
         "Do NOT execute any wl, git, or other state-modifying commands. "
-        "Return ONLY a structured JSON array.\n\n"
+        f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
         "Classify each ruff lint finding below as either 'genuine' (a real "
         "defect that should stay), 'confident-false-positive' (the rule "
         "misfires for this file and the finding is not a real defect), or "
@@ -10746,6 +10840,12 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
     effective_priority = priority
     if context == "parent":
         effective_priority = Priority.CRITICAL
+    # The strict JSON contract is enforced HERE so every Phase 1 screen carries
+    # it regardless of which caller built the prompt: the first call is the one
+    # that most often drifts into a code fence or a trailing comma, and each
+    # such drift used to cost a full re-ask (SA-0MVI6VNDF001VE1S AC4).
+    if _JSON_CONTRACT_INSTRUCTION not in prompt:
+        prompt = _JSON_CONTRACT_INSTRUCTION + prompt
     try:
         result = _call_pi_and_maybe_log(
             issue_id, context, prompt, model=model, pi_bin=pi_bin,
@@ -11157,7 +11257,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"[READ-ONLY AUDIT] You are performing a read-only audit. "
             f"Do NOT close, modify, create, or delete any work items. "
             f"Do NOT execute any wl, git, or other state-modifying commands. "
-            f"Return ONLY a structured JSON array.\n\n"
+            f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
             f"Review the following acceptance criteria against the codebase. "
             f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
             f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "

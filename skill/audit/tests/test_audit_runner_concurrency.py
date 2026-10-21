@@ -281,7 +281,18 @@ def test_default_ceiling_admits_n_ge_3_without_saturation(monkeypatch):
     and complete with real `met` verdicts — zero `unmet`
     (bounded-queue/host-wide saturation) verdicts. Mirrors
     SA-0MTG5RYH8005RQNM AC1 and this item's AC3.
+
+    The static default is pinned by mocking the slot query to fail: since
+    SA-0MVI6VJCP006XNA2 the ceiling derives from live slot capacity when the
+    query succeeds, so without this the assertion would instead measure the
+    host's momentary free-slot count (flaky under concurrent audits).
     """
+    from shared.process_semaphore import DEFAULT_MAX_WORKERS
+
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (None, None)
+    )
+    assert DEFAULT_MAX_WORKERS >= 3
     lock = threading.Lock()
     active = 0
     peak = 0

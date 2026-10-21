@@ -164,6 +164,54 @@ either basis.
   epic brief's Phase 2 figures within the same growth tolerance (observed
   +6–8 %).
 
+## JSON-contract re-ask measurement (SA-0MVI6VNDF001VE1S)
+
+The baseline above records **148 `verdict_reask` calls out of 1,750 total
+(8.5 %, 24.5 h)** — calls that exist only because a first response was not a
+parseable, index-bearing JSON array. The parent epic quote of ~7.4 % was the
+same phenomenon on the slightly smaller corpus.
+
+### What changed
+
+1. **Strict JSON contract on the FIRST call.** Every JSON-expecting phase now
+   carries `_JSON_CONTRACT_INSTRUCTION`: *return only a single valid JSON
+   array, no prose, no Markdown code fences, no trailing comma before a
+   closing `]`/`}`*, with the `index`/`verdict`/`evidence` schema restated.
+   Previously only the re-ask carried the strict schema, so the first response
+   drifted into prose/fences/trailing commas and paid for a second full-length
+   call (p50 531 s in this corpus).
+2. **Tolerant extraction.** `_extract_json_array()` now also repairs
+   **trailing commas outside string literals** (in addition to the prose and
+   complete-fence tolerance it already had). The repair never reinterprets
+   values — it only removes syntax JSON forbids — so verdict semantics are
+   untouched.
+3. **Single retry, genuine failures only, and counted.** `_reask_json_array_once()`
+   still fires at most once and only when no parseable index-bearing array was
+   found; it now increments the `verdict_reasks` key in
+   `AUDIT_RELIABILITY_SUMMARY`, so the per-run re-ask count is directly
+   observable instead of requiring debug-log forensics.
+
+### Re-measuring the rate
+
+The corpus is append-only, so the post-change rate is measured on **new**
+audit traffic rather than by re-parsing history (history cannot show a fix):
+
+```bash
+# 1. Run audits after the change lands, then:
+python3 scripts/measure_audit_performance.py --root ~/.audit_debug
+# 2. Take the verdict_reask row's `calls` over the TOTAL row's `calls`.
+```
+
+**Gate: `verdict_reask` ≤ 2 % of all calls** (from 8.5 % at this baseline).
+The per-run `verdict_reasks` counter lets a single audit self-report the same
+ratio without the corpus. Offline evidence at merge time: the re-ask replay
+suite (`skill/audit/tests/test_audit_json_contract_reask.py`) proves a
+well-formed response is never re-asked, that fenced / prose-prefixed /
+trailing-comma responses are each accepted **without** a re-ask, and that the
+retry fires exactly once on genuine failures only. The end-to-end ≥ 50 %
+wall-clock verification on a live audit belongs to the post-change
+measurement child item (SA-0MVI6VVC00029XO4).
+
 ## Using the baseline to verify a performance change
 
 To verify that a pipeline change actually helped (parent epic AC6 — ≥ 50 %
@@ -198,3 +246,7 @@ wall-clock reduction on a representative audit):
 - **2026-10-21** — Baseline committed with the harness (SA-0MVI6VET100337TW).
   First committed snapshot; reconciles with the parent epic brief and
   documents the Phase 2 per-AC undercount in the brief's ad hoc figures.
+- **2026-10-21** — Added the JSON-contract re-ask measurement section and the
+  ≤ 2 % re-ask gate (SA-0MVI6VNDF001VE1S). The baseline figures above are
+  unchanged (the corpus is historical); the section states how the post-change
+  rate is re-measured on new traffic and what offline evidence backs it.
