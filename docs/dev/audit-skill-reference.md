@@ -904,6 +904,16 @@ Runner performs code quality checks before AC verification (invokes `../code_rev
 4. Critical/high findings → "Ready to close: No"; medium/low are warnings
 5. Quality epics ("Quality Improvement - Refactoring") created/reused for findings
 6. If `code_quality` module unavailable, continues with warning
+7. **Non-Python changed files never reach ruff** (SA-0MSTMAPL40019JX5): the
+   scoped file list is narrowed to Python extensions (`.py`, `.pyi`, `.ipynb`)
+   before ruff is invoked, because ruff parses every explicitly passed path as
+   Python and ignores `exclude` for explicit arguments — a YAML changed file
+   once produced 121 false-positive `invalid-syntax` findings that were
+   auto-created as work items. When nothing lintable changed, ruff is not
+   invoked at all (no whole-project fallback for a scoped run, including
+   `--fix` mode). As defence in depth, the epic creator drops any
+   Python-only-linter finding on a non-Python file, so such a finding can
+   never become a work item.
 
 - Persist from stdin: `cat report.md | python3 ./scripts/persist_audit.py --issue-id SA-123`
 - Persist from a file: `python3 ./scripts/persist_audit.py --issue-id SA-123 --file report.md`

@@ -191,6 +191,75 @@ class TestRuffWholeProjectScanExclude:
         assert "src/missing.rs" not in calls[0]
 
 
+class TestRuffExplicitFileExtensionFilter:
+    """AC1: explicit-file scope is narrowed to Python extensions.
+
+    Ruff lints every explicitly-passed path as Python and ignores
+    ``exclude`` for explicit arguments, so the file list itself must be
+    filtered. ``.ipynb`` is a supported ruff target; ``.pyx`` is not (ruff
+    parses it as Python and emits ``invalid-syntax``), so it is excluded.
+    """
+
+    def test_python_source_extensions_match_the_contract(self):
+        assert linter_runner.PYTHON_SOURCE_EXTENSIONS == (
+            ".py", ".pyi", ".ipynb",
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        ["config.yaml", "service/config.yml", "data.json", "pyproject.toml",
+         "README.md", "legacy.ts", "notes.txt", "ext.pyx"],
+    )
+    @pytest.mark.parametrize("fix", [False, True])
+    def test_non_python_target_is_never_passed(self, target, fix):
+        calls = _recorded_ruff_calls(
+            linter_runner, Path("/proj"), files=["src/app.py", target],
+            fix=fix,
+        )
+        assert calls
+        for cmd in calls:
+            assert target not in cmd, f"{target} leaked into ruff: {cmd}"
+            assert "src/app.py" in cmd
+
+    @pytest.mark.parametrize("fix", [False, True])
+    def test_python_targets_including_notebooks_are_passed(self, fix):
+        calls = _recorded_ruff_calls(
+            linter_runner, Path("/proj"),
+            files=["src/app.py", "src/app.pyi", "analysis.ipynb"], fix=fix,
+        )
+        assert calls
+        for cmd in calls:
+            assert "src/app.py" in cmd
+            assert "src/app.pyi" in cmd
+            assert "analysis.ipynb" in cmd
+
+    @pytest.mark.parametrize("fix", [False, True])
+    def test_non_python_only_scope_does_not_invoke_ruff(self, fix):
+        calls = _recorded_ruff_calls(
+            linter_runner, Path("/proj"),
+            files=["config.yaml", "service/config.yml", "README.md"],
+            fix=fix,
+        )
+        assert calls == []
+
+    @pytest.mark.skipif(
+        shutil.which("ruff") is None, reason="ruff not on PATH"
+    )
+    def test_run_ruff_with_non_python_scope_returns_no_findings(self):
+        """End-to-end through run_ruff: nothing to lint, nothing to report."""
+        root = Path(__file__)
+        runner = _RecordingRunner(
+            stdout='[{"code": "invalid-syntax", "message": "Expected a '
+                   'statement", "location": {"row": 1, "column": 1}}]',
+            returncode=1,
+        )
+        result = linter_runner.run_ruff(
+            root, runner=runner, files=["config.yaml", "README.md"],
+        )
+        assert runner.calls == []
+        assert result["findings"] == []
+
+
 class TestRuffFixModeExclude:
     """_run_ruff_fix_mode excludes non-Python config files on both passes."""
 

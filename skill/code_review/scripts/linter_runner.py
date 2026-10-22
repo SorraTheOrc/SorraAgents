@@ -46,8 +46,11 @@ and emits false-positive ``invalid-syntax`` findings. Both ruff paths
 therefore guarded by :data:`RUFF_NON_PYTHON_EXCLUDE`: a project-agnostic,
 additive list of ``**/*.<ext>`` globs (TS/JS + ``.yaml``/``.yml``/``.json``/
 ``.toml``/``.md``) passed via ``--extend-exclude`` with ``--force-exclude``.
+In addition, an explicit file scope (``files=[...]`` — e.g. the audit's git
+changed-file list) is narrowed to :data:`PYTHON_SOURCE_EXTENSIONS`, because
+``--extend-exclude`` alone does not cover explicitly-passed paths.
 Genuine ``.py`` findings are never suppressed (CG-0MSXL2L0T009CA3I,
-SA-0MT2Q10PX0078DEM).
+SA-0MT2Q10PX0078DEM, SA-0MSTMAPL40019JX5).
 """
 
 from __future__ import annotations
@@ -104,8 +107,33 @@ ESLINT_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
 
 #: Python source extensions ruff is allowed to lint. ``_run_ruff_check`` and
 #: ``_run_ruff_fix_mode`` narrow any explicit file list down to these before
-#: building the ruff command.
-PYTHON_SOURCE_EXTENSIONS = (".py", ".pyi", ".pyx")
+#: building the ruff command (SA-0MSTMAPL40019JX5).
+#:
+#: Ruff natively targets ``.py``, ``.pyi`` and ``.ipynb`` notebooks. Other
+#: extensions are NOT included even when they look Python-adjacent: ruff
+#: parses an explicitly-passed ``.pyx`` (Cython) file as Python and emits
+#: false-positive ``invalid-syntax`` findings, exactly like a YAML file, so
+#: it belongs on the exclusion side, not here.
+PYTHON_SOURCE_EXTENSIONS = (".py", ".pyi", ".ipynb")
+
+
+def _python_source_files(files: list[str] | None) -> list[str]:
+    """Narrow an explicit file scope down to lintable Python sources.
+
+    Ruff lints explicitly-passed paths as Python regardless of extension
+    (unless ``--force-exclude`` is given), so the audit's git changed-file
+    list — which contains YAML/JSON/Markdown/… config files — must be
+    filtered to :data:`PYTHON_SOURCE_EXTENSIONS` before any path is handed
+    to ``ruff check`` (SA-0MSTMAPL40019JX5: a YAML changed file produced
+    121 false-positive ``invalid-syntax`` findings). Shared by the read-only
+    check and the ``--fix`` mode so the two can never diverge.
+
+    Returns an empty list when nothing is lintable — callers skip ruff
+    entirely in that case.
+    """
+    if not files:
+        return []
+    return [f for f in files if str(f).endswith(PYTHON_SOURCE_EXTENSIONS)]
 
 #: Non-Python file extensions ruff must NEVER lint (SA-0MT2Q10PX0078DEM).
 #:
@@ -466,10 +494,7 @@ def _run_ruff_check(
     # regardless of `exclude` unless `--force-exclude` is given, so filter
     # the file list down to Python extensions AND force-exclude.
     if files:
-        py_files = [
-            f for f in files
-            if str(f).endswith(PYTHON_SOURCE_EXTENSIONS)
-        ]
+        py_files = _python_source_files(files)
         if not py_files:
             return []
         cmd = ["ruff", "check", *[str(f) for f in py_files],
@@ -721,9 +746,14 @@ def _run_ruff_fix_mode(
     """
 
     # Only pass Python files explicitly (see _run_ruff_check note).
-    _py_files = [
-        f for f in (files or []) if str(f).endswith(PYTHON_SOURCE_EXTENSIONS)
-    ]
+    _py_files = _python_source_files(files)
+
+    # An explicit scope with nothing lintable must NOT fall back to a
+    # whole-project scan: --fix would then rewrite files outside the
+    # caller's scope (the audit's changed-file list). Same early exit as
+    # _run_ruff_check.
+    if files and not _py_files:
+        return [], False
 
     def fix_cmd(root: Path) -> list[str]:
         if _py_files:

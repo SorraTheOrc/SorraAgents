@@ -47,6 +47,43 @@ SEVERITY_TO_PRIORITY: dict[str, str] = {
 # Priority order from highest to lowest
 PRIORITY_ORDER = ["critical", "high", "medium", "low"]
 
+#: Linters that never produce findings on non-source files. A finding from
+#: one of these on a file the linter cannot parse is always a false
+#: positive and must never become a work item (SA-0MSTMAPL40019JX5: ruff
+#: forced on a YAML path emitted 121 ``invalid-syntax`` findings that were
+#: auto-created as items). The extension set is imported lazily from
+#: :mod:`code_review.scripts.linter_runner` to avoid any import cycle.
+_PYTHON_ONLY_LINTERS = ("ruff",)
+
+
+def _is_lintable_finding(finding: dict[str, Any]) -> bool:
+    """True unless a Python-only linter reported a non-Python file.
+
+    Defence in depth: the audit's linter runner already filters non-Python
+    files before invoking ruff, but this guard lives at the damage boundary
+    (work-item creation) so that even a stray non-Python finding — e.g.
+    from a future ruff exit-code/format regression — cannot auto-create a
+    work item for a file ruff could never genuinely lint.
+
+    Findings from other linters (``eslint`` on TS/JS, ``markdownlint`` on
+    Markdown, …) and findings on a Python extension (or with no file path)
+    are always lintable.
+    """
+    linter = str(finding.get("linter") or "").strip().lower()
+    if linter not in _PYTHON_ONLY_LINTERS:
+        return True
+    file_path = str(finding.get("file") or "")
+    if not file_path:
+        return True
+    try:
+        from code_review.scripts.linter_runner import PYTHON_SOURCE_EXTENSIONS
+    except ImportError:
+        # Fallback: never judged lintable, so such findings are safely
+        # skipped rather than auto-created.
+        return False
+    return file_path.endswith(PYTHON_SOURCE_EXTENSIONS)
+
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -399,17 +436,43 @@ def create_epics_for_findings(
     Args:
         findings: List of finding dicts (must have ``severity``, ``file``,
                   ``line``, ``message``, ``linter``, ``code`` keys).
+                  Findings that a Python-only linter could not genuinely
+                  produce (e.g. a ruff finding on a ``.yaml`` file) are
+                  dropped — no work item is ever created for them.
         runner: Optional injectable subprocess runner.
 
     Returns:
         A dict with keys:
-          - ``epic_id``: the epic work item ID
+          - ``epic_id``: the epic work item ID (``None`` when every finding
+            was dropped as unlintable)
           - ``epic_created``: bool — True if a new epic was created
           - ``children_created``: int — number of child tasks created
           - ``epic_priority``: str — the priority assigned to the epic
+          - ``findings_skipped``: int — findings dropped as unlintable
     """
     if runner is None:
         runner = _default_runner
+
+    # 0a. Drop findings a Python-only linter could not have produced
+    # (SA-0MSTMAPL40019JX5). Nothing to track → create neither epic nor
+    # children, so a non-Python file can never seed finding work items.
+    lintable = [f for f in findings if _is_lintable_finding(f)]
+    skipped = len(findings) - len(lintable)
+    if skipped:
+        print(
+            f"Warning: skipped {skipped} finding(s) reported by a "
+            "Python-only linter on non-Python files.",
+            file=sys.stderr,
+        )
+    findings = lintable
+    if not findings:
+        return {
+            "epic_id": None,
+            "epic_created": False,
+            "children_created": 0,
+            "epic_priority": None,
+            "findings_skipped": skipped,
+        }
 
     # 0. Compute the highest priority from findings
     highest_priority = _highest_priority(findings)
@@ -435,6 +498,7 @@ def create_epics_for_findings(
         "epic_created": was_created,
         "children_created": children_created,
         "epic_priority": highest_priority,
+        "findings_skipped": skipped,
     }
 
 
