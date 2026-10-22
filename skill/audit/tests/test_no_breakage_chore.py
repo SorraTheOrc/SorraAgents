@@ -396,8 +396,8 @@ class TestNoBreakagePersistence:
         assert rc == 0
         assert audit_text_path.exists()
         text = audit_text_path.read_text()
-        # The persisted audit should contain the fingerprint line.
-        assert "Audit content fingerprint:" in text
+        # The persisted audit should contain the versioned fingerprint line.
+        assert audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX in text
         assert "Ready to close: Yes" in text
 
 
@@ -412,8 +412,8 @@ class TestNoBreakageFreshness:
 
     def test_fingerprint_unchanged_after_wl_create(self, tmp_path):
         """`_compute_content_fingerprint` after a simulated `wl create`
-        (which does NOT modify the working tree) returns the same value
-        as before the create.
+        (which does NOT modify the work item's own data) returns the same
+        value as before the create.
         """
         mock_runner = _make_mock_runner(
             extra_wl_create=_ok_json({
@@ -422,9 +422,9 @@ class TestNoBreakageFreshness:
             }),
         )
 
-        # Simulate a pre-creation fingerprint (git HEAD sha + desc hash +
-        # Key Files + working-tree state — all stable since no tree change).
-        fp_before = "abc123def456-worktree-stable"
+        # Simulate a pre-creation fingerprint (item-data-only: title +
+        # description hash — stable since `wl create` changes neither).
+        fp_before = "abc123def456-item-data-stable"
 
         # The work item dict (required by _compute_content_fingerprint).
         work_item = {"id": "TEST-1", "description": "## AC\n- AC1: verify"}
@@ -439,7 +439,7 @@ class TestNoBreakageFreshness:
             )
 
         assert fp_after == fp_before, (
-            "Fingerprint should be unchanged when the tree is not modified"
+            "Fingerprint should be unchanged when the item data is not modified"
         )
 
     def test_fingerprint_in_report_matches_after_wl_create(self, capsys):
@@ -479,7 +479,7 @@ class TestNoBreakageFreshness:
 
         assert rc == 0
         out = capsys.readouterr().out
-        assert "Audit content fingerprint:" in out
+        assert audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX in out
 
 
 # ---------------------------------------------------------------------------

@@ -346,46 +346,42 @@ class TestTouchedFileResolution:
 
 
 class TestContentFreshnessGate:
-    """Tests for the per-touched-file content freshness gate
-    (SA-0MSPZDALB000S18P AC1-AC7).
+    """Tests for the item-data-only content freshness gate
+    (SA-0MVIDI8E00063OOP, superseding SA-0MSPZDALB000S18P).
 
-    The gate fingerprints the work item's OWN files (not the whole repo), so
-    re-auditing an item whose touched files, description, and Key Files are
-    unchanged returns the existing report in seconds — even when unrelated
-    commits or working-tree changes happened elsewhere. A change to any
-    touched file (committed or uncommitted) or to the item's description /
-    Key Files invalidates freshness. Legacy audits without a fingerprint fall
-    back to the 60s time floor.
+    The gate fingerprints the work item's OWN data only — title + description
+    (the description carries the ACs and the Key Files section) — with zero
+    git invocations. A stored audit survives unrelated commits, working-tree
+    churn, edits to files the item touched, comment changes and lifecycle-field
+    changes; only a change to the title/description invalidates it. Legacy
+    (unversioned) fingerprint lines fall back to the 60s time floor.
     """
 
+    _TITLE = "Content freshness gate"
     _DESC = "## Acceptance Criteria\n- AC1: do the thing\n\n## Key Files\n- `src/a.py`"
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _repo(self, **kwargs) -> _FakeGitRepo:
-        """Build a repo touching ``src/a.py`` by default."""
-        defaults: dict = {
-            "grep_files": ["src/a.py"], "blobs": {"src/a.py": "blob-a"},
-        }
-        defaults.update(kwargs)
-        return _FakeGitRepo(**defaults)
+    def _fp(self, work_item=None, *, title=None, desc=None,
+            fetch_comments=None) -> str | None:
+        """Compute the fingerprint for the default item (hermetic).
 
-    def _fp(self, repo, desc=None, comments=None, run_wl_comments=None) -> str | None:
-        """Compute the fingerprint against *repo* for the default item.
-
-        ``_run_wl`` is mocked so the deterministic comment fetch (performed
-        when *comments* is omitted) is hermetic: the fake ``wl show`` payload
-        carries *run_wl_comments* (empty by default, mirroring the
-        pre-fetch resolved set). Tests that exercise the comment source pass
-        explicit *comments* (audit/persist time) or *run_wl_comments*
-        (check-time fetch).
+        *work_item* (when supplied) is used verbatim; otherwise a default item
+        built from *title*/*desc* is passed. When the caller does not pass a
+        ``work_item`` to the production function the mocked ``wl show``
+        payload supplies it — *fetch_comments* seeds that payload's comments
+        (proving comments never contribute).
         """
+        item = work_item if work_item is not None else {
+            "title": title if title is not None else self._TITLE,
+            "description": desc if desc is not None else self._DESC,
+        }
         show_payload = {
             "success": True,
-            "workItem": {"id": "TEST-1"},
-            "comments": list(run_wl_comments or []),
+            "workItem": dict(item),
+            "comments": list(fetch_comments or []),
         }
 
         def _run_wl(runner, cmd, worklog_dir=None):
@@ -393,22 +389,22 @@ class TestContentFreshnessGate:
 
         with mock.patch.object(audit_runner, "_run_wl", side_effect=_run_wl):
             return audit_runner._compute_content_fingerprint(
-                repo, "TEST-1",
-                work_item={"description": desc if desc is not None else self._DESC},
-                comments=comments,
+                _FakeGitRepo(), "TEST-1", work_item=item,
             )
 
     def _make_run_wl(self, audit_raw=None, audit_audited_at="2026-08-01T00:00:00.000Z",
-                     work_item_desc=_DESC, work_item_updated_at="2026-07-01T00:00:00.000Z",
-                     work_item_comments=None):
+                     work_item_desc=_DESC, work_item_title=None,
+                     work_item_updated_at="2026-07-01T00:00:00.000Z",
+                     work_item_comments=None, show_failure=False):
         """Build a ``_run_wl`` fake returning a stored audit + work item.
 
         *work_item_comments* seeds the top-level ``comments`` list of the
-        ``wl show`` payload so the fingerprint's deterministic comment fetch
-        (SA-0MVAWFYKT002CQ3L) sees the same comments at check time that the
-        audit recorded.
+        ``wl show`` payload (comments are not a fingerprint input — the gate
+        must stay fresh when only comments changed). *show_failure* makes the
+        ``wl show`` call raise, exercising the fail-open path.
         """
         comments = list(work_item_comments or [])
+        title = self._TITLE if work_item_title is None else work_item_title
 
         def _fake(runner, cmd, worklog_dir=None):
             cmd_str = " ".join(cmd)
@@ -421,10 +417,13 @@ class TestContentFreshnessGate:
                     },
                 }
             if "show" in cmd_str and "--children" not in cmd_str:
+                if show_failure:
+                    raise RuntimeError("wl show failed")
                 return {
                     "success": True,
                     "workItem": {
                         "id": "TEST-1",
+                        "title": title,
                         "description": work_item_desc,
                         "updatedAt": work_item_updated_at,
                     },
@@ -435,7 +434,7 @@ class TestContentFreshnessGate:
         return _fake
 
     def _report_with_fingerprint(self, fingerprint, verdict="Yes"):
-        """Assemble a report body carrying a fingerprint line."""
+        """Assemble a report body carrying a versioned fingerprint line."""
         return (
             f"Ready to close: {verdict}\n\n"
             f"Audit report for work item TEST-1\n\n"
@@ -443,47 +442,29 @@ class TestContentFreshnessGate:
             "## Summary\nAll criteria acceptable."
         )
 
-    def _check(self, run_wl_fake, repo):
-        """Run _check_audit_freshness with mocked wl and a fake git repo."""
+    def _repo(self, **kwargs) -> _FakeGitRepo:
+        """Repository double; may describe arbitrary state (never consulted)."""
+        defaults: dict = {
+            "grep_files": ["src/a.py"], "blobs": {"src/a.py": "blob-a"},
+        }
+        defaults.update(kwargs)
+        return _FakeGitRepo(**defaults)
+
+    def _check(self, run_wl_fake, repo=None):
+        """Run _check_audit_freshness with mocked wl and a fake repo."""
         with mock.patch.object(audit_runner, "_run_wl", side_effect=run_wl_fake):
-            return audit_runner._check_audit_freshness(repo, "TEST-1")
+            return audit_runner._check_audit_freshness(repo or self._repo(), "TEST-1")
 
     # ------------------------------------------------------------------
-    # Fingerprint computation — AC1: unrelated repo state is ignored
+    # Fingerprint computation — AC1: exact item-data-only payload
     # ------------------------------------------------------------------
 
-    def test_fingerprint_stable_for_unrelated_commit(self):
-        """AC1: a commit that changes only unrelated files (different HEAD,
-        untouched files) leaves the fingerprint unchanged."""
-        f1 = self._fp(self._repo(head_sha="a" * 40))
-        f2 = self._fp(self._repo(head_sha="b" * 40))
-        assert f1 is not None and len(f1) == 64
-        assert f1 == f2
+    def test_fingerprint_payload_is_item_data_only(self):
+        """AC1: the payload is exactly {schema: 2, title_hash,
+        description_hash} — no path_states, no key_files, no comment input.
 
-    def test_fingerprint_ignores_unrelated_dirty_files(self):
-        """AC1: a dirty file outside the touched set does not invalidate."""
-        f_clean = self._fp(self._repo(status=[]))
-        f_unrelated = self._fp(self._repo(status=[" M src/unrelated.py"]))
-        assert f_clean == f_unrelated
-
-    def test_fingerprint_does_not_query_bare_head(self):
-        """AC1: the whole-repo HEAD sha is no longer a fingerprint input."""
-        repo = self._repo()
-        self._fp(repo)
-        assert ["git", "rev-parse", "HEAD"] not in [
-            [str(a) for a in call] for call in repo.calls
-        ]
-
-    def test_fingerprint_payload_keys_exclude_global_head(self):
-        """AC1/AC4: the fingerprint payload carries exactly the scoped keys
-        (path_states, description_hash, key_files) — it never embeds the
-        global git HEAD sha, whose movement would otherwise invalidate every
-        stored audit regardless of the item's own content.
-
-        Asserts directly on the serialized payload (captured before the
-        final digest): the key set is exactly the scoped triple, the global
-        HEAD sha appears nowhere, and two different HEAD shas produce a
-        byte-identical payload.
+        Asserts the serialized payload directly (captured at the final hash),
+        including the canonical schema value and the per-field hashes.
         """
         captured: list[str] = []
         real_sha256 = audit_runner.hashlib.sha256
@@ -495,129 +476,231 @@ class TestContentFreshnessGate:
         with mock.patch.object(
             audit_runner.hashlib, "sha256", side_effect=_capture
         ):
-            fp_a = self._fp(
-                self._repo(head_sha="b" * 40, blobs={"src/a.py": "blob-a"})
-            )
-            fp_b = self._fp(
-                self._repo(head_sha="c" * 40, blobs={"src/a.py": "blob-a"})
-            )
-        assert fp_a is not None and fp_b is not None
-        assert fp_a == fp_b  # payload is HEAD-independent
+            fp = self._fp()
+
+        assert fp is not None and len(fp) == 64
         assert captured, "the fingerprint payload must have been serialized"
         payload = json.loads(captured[-1])
-        assert set(payload) == {"path_states", "description_hash", "key_files"}
-        assert "b" * 40 not in captured[-1]
-        assert "c" * 40 not in captured[-1]
-        assert payload["path_states"] == {
-            "src/a.py": {"head": "blob-a", "worktree": ""},
-        }
-        assert payload["key_files"] == ["src/a.py"]
-        assert len(payload["description_hash"]) == 64
+        assert set(payload) == {"schema", "title_hash", "description_hash"}
+        assert payload["schema"] == 2
+        assert payload["title_hash"] == real_sha256(
+            self._TITLE.encode("utf-8")).hexdigest()
+        assert payload["description_hash"] == real_sha256(
+            self._DESC.encode("utf-8")).hexdigest()
+        assert "path_states" not in captured[-1]
+        assert "key_files" not in captured[-1]
+
+    def test_fingerprint_is_stable_across_calls(self):
+        """AC1: identical item data yields an identical digest (canonical JSON)."""
+        assert self._fp() == self._fp()
 
     # ------------------------------------------------------------------
-    # Fingerprint computation — AC2: touched-file changes invalidate
+    # Fingerprint computation — AC2: zero git invocations
     # ------------------------------------------------------------------
 
-    def test_fingerprint_changes_when_touched_file_committed_change(self):
-        """AC2: a new commit changing a touched file changes its blob hash."""
-        f1 = self._fp(self._repo(blobs={"src/a.py": "blob-a"}))
-        f2 = self._fp(self._repo(blobs={"src/a.py": "blob-b"}))
-        assert f1 != f2
+    def test_fingerprint_performs_zero_git_invocations(self):
+        """AC2: the fingerprint never calls the git-executing helpers or any
+        ``git`` subprocess — patch them to raise and the computation still
+        produces a hash."""
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("git machinery must not run for the fingerprint")
 
-    def test_fingerprint_changes_when_touched_file_dirty(self):
-        """AC2: an uncommitted change to a touched file invalidates."""
-        f_clean = self._fp(self._repo(status=[]))
-        f_dirty = self._fp(self._repo(status=[" M src/a.py"]))
-        assert f_clean != f_dirty
+        with (
+            mock.patch.object(
+                audit_runner, "_resolve_touched_files", side_effect=_forbidden,
+            ),
+            mock.patch.object(
+                audit_runner, "_compute_path_fingerprints", side_effect=_forbidden,
+            ),
+            mock.patch.object(
+                audit_runner.subprocess, "run", side_effect=_forbidden,
+            ),
+        ):
+            fp = self._fp()
+        assert fp is not None and len(fp) == 64
 
-    def test_fingerprint_changes_when_touched_staged_change(self):
-        """AC2: a staged change reported by git diff --name-only counts too."""
-        f_clean = self._fp(self._repo(diff=[]))
-        f_staged = self._fp(self._repo(diff=["src/a.py"]))
-        assert f_clean != f_staged
-
-    def test_fingerprint_stable_for_untouched_tree(self):
-        """AC2 (control): an untouched touched-file set keeps its fingerprint."""
-        assert self._fp(self._repo()) == self._fp(self._repo())
+    def test_fingerprint_does_not_query_bare_head(self):
+        """AC2: a bare-HEAD query is never issued (the repo double records
+        zero calls)."""
+        repo = self._repo()
+        self._fp()
+        assert repo.calls == []
 
     # ------------------------------------------------------------------
-    # Fingerprint computation — AC3: description / Key Files invalidate
+    # Fingerprint computation — AC3/AC4: repo state never participates
+    # ------------------------------------------------------------------
+
+    def test_fingerprint_stable_for_unrelated_commit(self):
+        """AC1: a commit that changes only unrelated files (different HEAD)
+        leaves the fingerprint unchanged — HEAD is not an input."""
+        assert self._fp() == self._fp()
+
+    def test_fingerprint_stable_for_touched_file_edits(self):
+        """AC3 (strict rule): touching a file this item references does NOT
+        invalidate — repository state is not part of the fingerprint."""
+        desc = "## Key Files\n- `ProjectSettings/ProjectSettings.asset`"
+        f_clean = self._fp(desc=desc)
+        # A dirty / rewritten touched artefact would previously invalidate.
+        f_rewritten = self._fp(desc=desc)
+        assert f_clean is not None
+        assert f_clean == f_rewritten
+
+    def test_fingerprint_stable_across_comments(self):
+        """AC5: comments are not fingerprint input (caller-supplied comments
+        cannot change the digest; comment-only work-item updates never
+        invalidate a stored audit)."""
+        with_comments = self._fp(
+            fetch_comments=[{"comment": f"committed as {'c' * 40}"}],
+        )
+        without_comments = self._fp()
+        assert with_comments == without_comments
+
+    def test_fingerprint_ignores_lifecycle_fields(self):
+        """AC5: status/stage/priority/assignee/sortIndex/updatedAt are not
+        audited content and do not move the fingerprint."""
+        base = self._fp()
+        lifecycle = self._fp(
+            work_item={
+                "title": self._TITLE,
+                "description": self._DESC,
+                "status": "completed",
+                "stage": "in_review",
+                "priority": "critical",
+                "assignee": "someone",
+                "sortIndex": 1,
+                "updatedAt": "2030-01-01T00:00:00.000Z",
+            },
+        )
+        assert base is not None
+        assert base == lifecycle
+
+    # ------------------------------------------------------------------
+    # Fingerprint computation — AC4: own-data changes invalidate
     # ------------------------------------------------------------------
 
     def test_fingerprint_changes_with_description(self):
-        """AC3: a different description (ACs) yields a different fingerprint."""
-        f1 = self._fp(self._repo(), desc=self._DESC)
-        f2 = self._fp(self._repo(), desc=self._DESC + "\n- AC2: more")
+        """AC4: a different description (ACs) yields a different fingerprint."""
+        f1 = self._fp(desc=self._DESC)
+        f2 = self._fp(desc=self._DESC + "\n- AC2: more")
         assert f1 != f2
+
+    def test_fingerprint_changes_with_title(self):
+        """AC4: a different title yields a different fingerprint."""
+        assert self._fp(title="one title") != self._fp(title="another title")
 
     def test_fingerprint_changes_with_key_files(self):
-        """AC3: a different Key Files list yields a different fingerprint."""
-        f1 = self._fp(self._repo(), desc=self._DESC)
-        f2 = self._fp(self._repo(), desc=self._DESC + "\n- `src/b.py`")
+        """AC4: the Key Files section lives in the description, so adding a
+        key file changes ``description_hash`` and therefore the fingerprint."""
+        f1 = self._fp(desc=self._DESC)
+        f2 = self._fp(desc=self._DESC + "\n- `src/b.py`")
         assert f1 != f2
 
     # ------------------------------------------------------------------
-    # Fingerprint computation — AC4: fail-open
+    # Fingerprint computation — AC3: fail-open only on fetch/build failure
     # ------------------------------------------------------------------
 
-    def test_fingerprint_none_when_git_unavailable(self):
-        """AC4: git log failure → no fingerprint (pipeline re-runs)."""
-        assert self._fp(self._repo(grep_rc=128)) is None
+    def test_fingerprint_none_when_wl_show_fails(self):
+        """AC3: a failing ``wl show`` (fetch failure) → None (pipeline re-runs)."""
+        def _boom(runner, cmd, worklog_dir=None):
+            raise RuntimeError("wl show failed")
 
-    def test_fingerprint_none_when_no_touched_files(self):
-        """AC4: no recorded commits and no Key Files → no fingerprint."""
-        repo = _FakeGitRepo(grep_files=[])
-        assert audit_runner._compute_content_fingerprint(
-            repo, "TEST-1", work_item={"description": "no key files"},
-        ) is None
+        with mock.patch.object(audit_runner, "_run_wl", side_effect=_boom):
+            assert audit_runner._compute_content_fingerprint(
+                _FakeGitRepo(), "TEST-1",
+            ) is None
 
-    def test_fingerprint_none_when_worktree_query_fails(self):
-        """AC4: a failing status/diff call → no fingerprint (pipeline re-runs)."""
-        assert self._fp(self._repo(worktree_rc=1)) is None
+    def test_fingerprint_none_when_wl_show_has_no_work_item(self):
+        """AC3: an unsuccessful ``wl show`` payload → None."""
+        with mock.patch.object(
+            audit_runner, "_run_wl",
+            side_effect=lambda *a, **k: {"success": False},
+        ):
+            assert audit_runner._compute_content_fingerprint(
+                _FakeGitRepo(), "TEST-1",
+            ) is None
 
-    # ------------------------------------------------------------------
-    # Fingerprint computation — AC5: tool artefacts are always-invalidating
-    # ------------------------------------------------------------------
+    def test_fingerprint_deterministic_for_missing_and_garbage_fields(self):
+        """AC3: a missing/garbage title or description still yields a
+        deterministic hash (never an exception)."""
+        missing = self._fp(work_item={"id": "TEST-1"})
+        assert missing is not None and len(missing) == 64
+        assert missing == self._fp(work_item={"id": "TEST-1"})
 
-    def test_tool_artefact_rewrite_invalidates(self):
-        """AC5: a touched Unity ProjectSettings artefact has NO ignore-list
-        exemption — a rewrite is treated as a genuine change (fail-stale)."""
-        desc = "## Key Files\n- `ProjectSettings/ProjectSettings.asset`"
-        f_clean = audit_runner._compute_content_fingerprint(
-            _FakeGitRepo(grep_files=["ProjectSettings/ProjectSettings.asset"],
-                         blobs={"ProjectSettings/ProjectSettings.asset": "blob-1"},
-                         status=[]),
-            "TEST-1", work_item={"description": desc},
+        garbage = {"id": "TEST-1", "title": 123, "description": ["a", "b"]}
+        assert self._fp(work_item=garbage) == self._fp(work_item=garbage)
+        # Non-string garbage still hashes deterministically through JSON.
+        assert self._fp(work_item=garbage) == self._fp(
+            work_item={"id": "TEST-1", "title": 123,
+                       "description": json.loads('["a", "b"]')},
         )
-        f_rewritten = audit_runner._compute_content_fingerprint(
-            _FakeGitRepo(grep_files=["ProjectSettings/ProjectSettings.asset"],
-                         blobs={"ProjectSettings/ProjectSettings.asset": "blob-1"},
-                         status=[" M ProjectSettings/ProjectSettings.asset"]),
-            "TEST-1", work_item={"description": desc},
-        )
-        assert f_clean != f_rewritten
+        # `None` and missing are equivalent (coerced to the empty string).
+        assert self._fp(work_item={"title": None, "description": None}) == missing
+
+    def test_fingerprint_uses_fetched_item_when_not_supplied(self):
+        """AC3: when no work item is supplied the fingerprint fetches it via
+        ``wl show`` and matches the explicit-work-item computation."""
+        expected = self._fp()
+        with mock.patch.object(
+            audit_runner, "_run_wl",
+            side_effect=lambda *a, **k: {
+                "success": True,
+                "workItem": {
+                    "id": "TEST-1", "title": self._TITLE,
+                    "description": self._DESC,
+                },
+                "comments": [],
+            },
+        ):
+            fetched = audit_runner._compute_content_fingerprint(
+                _FakeGitRepo(), "TEST-1",
+            )
+        assert fetched == expected
 
     # ------------------------------------------------------------------
-    # Fingerprint extraction / embedding
+    # Versioned line — extraction / embedding (AC4)
     # ------------------------------------------------------------------
+
+    def test_prefix_is_versioned(self):
+        """AC4: the emitted line carries the version marker."""
+        assert audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX == (
+            "Audit content fingerprint (v2): "
+        )
 
     def test_extract_fingerprint_roundtrip(self):
-        """The fingerprint line is extracted back from a stored report."""
+        """AC4: the versioned fingerprint line is extracted back."""
         fp = "f" * 64
         report = self._report_with_fingerprint(fp)
         assert audit_runner._extract_content_fingerprint(report) == fp
 
     def test_extract_fingerprint_none_for_legacy_report(self):
-        """Legacy reports without the line yield None (time floor applies)."""
+        """AC4: reports without any fingerprint line yield None."""
         assert audit_runner._extract_content_fingerprint(
             "Ready to close: Yes\n\n## Summary\nok"
         ) is None
 
-    def test_report_embeds_fingerprint_line(self):
-        """The assembled report embeds the fingerprint metadata line."""
+    def test_extract_fingerprint_ignores_unversioned_legacy_line(self):
+        """AC4: an unversioned legacy line (``Audit content fingerprint:
+        <hex>``) is ignored so the report falls through to the time floor."""
+        assert audit_runner._extract_content_fingerprint(
+            "Ready to close: Yes\n\nAudit content fingerprint: abc123\n"
+        ) is None
+
+    def test_report_embeds_versioned_fingerprint_line(self):
+        """AC4: the assembled report embeds the versioned metadata line."""
         report = audit_runner._assemble_issue_report(
             {"id": "TEST-1"}, [], [],
             model="Local Proxy/plan", model_source="local",
+            content_fingerprint="f" * 64,
+        )
+        assert f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{'f' * 64}" in report
+        assert "Audit content fingerprint: " not in report
+
+    def test_child_report_embeds_versioned_fingerprint_line(self):
+        """AC4: parent-persisted child reports embed the versioned line."""
+        report = audit_runner._assemble_child_audit_report(
+            {"id": "CHILD-1", "title": "Child", "status": "open",
+             "stage": "plan_complete"},
+            [{"text": "AC1", "verdict": "met", "evidence": "ok"}],
             content_fingerprint="f" * 64,
         )
         assert f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{'f' * 64}" in report
@@ -631,38 +714,45 @@ class TestContentFreshnessGate:
         assert "Audit content fingerprint" not in report
 
     # ------------------------------------------------------------------
-    # Freshness gate decisions (AC1, AC2, AC3, AC4)
+    # Freshness gate decisions (AC1-AC5, AC8)
     # ------------------------------------------------------------------
 
     def test_unchanged_fingerprint_skips(self):
-        """AC1: unchanged fingerprint → existing report returned (skip)."""
-        fp = self._fp(self._repo())
+        """AC1: unchanged item data → existing report returned (skip)."""
+        fp = self._fp()
         assert fp is not None
         report = self._report_with_fingerprint(fp)
         run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
         assert self._check(run_wl, self._repo()) == report
 
     def test_unrelated_commit_does_not_reauth(self):
-        """AC1/AC7: an unrelated commit at a different HEAD reuses the audit."""
-        fp = self._fp(self._repo(head_sha="a" * 40))
+        """AC2/AC3: a different HEAD plus unrelated dirty files still reuses
+        the stored audit (repo state is not an input)."""
+        fp = self._fp()
         assert fp is not None
         report = self._report_with_fingerprint(fp)
         run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
-        # Different HEAD + unrelated dirty file → still fresh.
         repo = self._repo(head_sha="b" * 40, status=[" M src/unrelated.py"])
         assert self._check(run_wl, repo) == report
 
-    def test_child_content_changed_fresh_survives_unrelated_head_movement(self):
-        """AC1 at the child gate: a child whose individually-persisted audit
-        is content-fresh is NOT re-audited by the parent even after the
-        repository HEAD moved elsewhere with only unrelated files dirty.
+    def test_touched_file_change_does_not_reauth(self):
+        """AC3 (strict rule): an uncommitted change to a file the item
+        references does NOT invalidate the stored audit."""
+        fp = self._fp()
+        assert fp is not None
+        report = self._report_with_fingerprint(fp)
+        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
+        repo = self._repo(
+            grep_files=["src/a.py"], blobs={"src/a.py": "blob-changed"},
+            status=[" M src/a.py"], diff=["src/a.py"],
+        )
+        assert self._check(run_wl, repo) == report
 
-        ``_child_content_changed`` must return False (the parent reuses the
-        child); the pre-scoping whole-repo HEAD-based fingerprint would have
-        declared the child changed and re-audited it (NV-0MSP7P2PN009FT9U
-        false re-audit scenario).
-        """
-        stored_fp = self._fp(self._repo(head_sha="a" * 40))
+    def test_child_content_changed_fresh_survives_repo_churn(self):
+        """AC2/AC3 at the child gate: a child whose individually-persisted
+        audit is item-data-fresh is NOT re-audited by the parent even when the
+        repository HEAD moved and a touched file is dirty."""
+        stored_fp = self._fp()
         assert stored_fp is not None
         stored = self._report_with_fingerprint(stored_fp)
         run_wl = self._make_run_wl(
@@ -672,45 +762,63 @@ class TestContentFreshnessGate:
         )
         with mock.patch.object(audit_runner, "_run_wl", side_effect=run_wl):
             changed = audit_runner._child_content_changed(
-                self._repo(head_sha="b" * 40, status=[" M src/unrelated.py"]),
+                self._repo(
+                    head_sha="b" * 40, blobs={"src/a.py": "blob-changed"},
+                    status=[" M src/a.py"],
+                ),
                 "TEST-1",
             )
         assert changed is False
 
-    def test_touched_file_change_reauths(self):
-        """AC2: an uncommitted change to a touched file → re-audit (None)."""
-        fp = self._fp(self._repo(status=[]))
-        assert fp is not None
-        report = self._report_with_fingerprint(fp)
-        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
-        assert self._check(run_wl, self._repo(status=[" M src/a.py"])) is None
-
     def test_description_changed_reauths(self):
-        """AC3: changed description → fingerprint mismatch → re-audit."""
-        fp = self._fp(self._repo())
+        """AC4: changed description → fingerprint mismatch → re-audit."""
+        fp = self._fp()
         report = self._report_with_fingerprint(fp)
         changed_desc = self._DESC + "\n- AC2: added later"
         run_wl = self._make_run_wl(audit_raw=report, work_item_desc=changed_desc)
         assert self._check(run_wl, self._repo()) is None
 
+    def test_title_changed_reauths(self):
+        """AC4: changed title → fingerprint mismatch → re-audit."""
+        fp = self._fp()
+        report = self._report_with_fingerprint(fp)
+        run_wl = self._make_run_wl(
+            audit_raw=report, work_item_title="A renamed item",
+        )
+        assert self._check(run_wl, self._repo()) is None
+
     def test_key_files_changed_reauths(self):
-        """AC3: changed Key Files → fingerprint mismatch → re-audit."""
-        fp = self._fp(self._repo())
+        """AC4: changed Key Files (inside the description) → re-audit."""
+        fp = self._fp()
         report = self._report_with_fingerprint(fp)
         changed_desc = self._DESC + "\n- `src/other.py`"
         run_wl = self._make_run_wl(audit_raw=report, work_item_desc=changed_desc)
         assert self._check(run_wl, self._repo()) is None
 
-    def test_fingerprint_unavailable_reauths_fail_open(self):
-        """AC4: a stored fingerprint that cannot be recomputed → re-audit."""
-        fp = self._fp(self._repo())
+    def test_comments_only_change_does_not_reauth(self):
+        """AC5: comments are not audited content — a comment-only item update
+        keeps the stored audit fresh."""
+        fp = self._fp()
         report = self._report_with_fingerprint(fp)
-        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
-        assert self._check(run_wl, self._repo(grep_rc=128)) is None
+        run_wl = self._make_run_wl(
+            audit_raw=report,
+            work_item_desc=self._DESC,
+            work_item_updated_at="2026-08-05T00:00:00.000Z",
+            work_item_comments=[{"comment": f"recorded commit {'c' * 40}"}],
+        )
+        assert self._check(run_wl, self._repo()) == report
+
+    def test_fingerprint_unavailable_reauths_fail_open(self):
+        """AC3: a stored fingerprint that cannot be recomputed (``wl show``
+        failure) → re-audit (fail open)."""
+        fp = self._fp()
+        report = self._report_with_fingerprint(fp)
+        run_wl = self._make_run_wl(audit_raw=report, show_failure=True)
+        assert self._check(run_wl, self._repo()) is None
 
     def test_ready_no_verdict_not_masked_by_skip(self):
-        """AC7: a stored 'Ready to close: No' verdict is returned verbatim."""
-        fp = self._fp(self._repo())
+        """AC8: a stored 'Ready to close: No' verdict is returned verbatim."""
+        fp = self._fp()
         report = self._report_with_fingerprint(fp, verdict="No")
         run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
         result = self._check(run_wl, self._repo())
@@ -720,7 +828,7 @@ class TestContentFreshnessGate:
     def test_fingerprint_gate_not_blocked_by_recent_update(self):
         """The content gate skips even when updatedAt moved after the audit
         (e.g. a comment added) — the 60s floor only applies to legacy audits."""
-        fp = self._fp(self._repo())
+        fp = self._fp()
         report = self._report_with_fingerprint(fp)
         run_wl = self._make_run_wl(
             audit_raw=report,
@@ -729,216 +837,24 @@ class TestContentFreshnessGate:
         )
         assert self._check(run_wl, self._repo()) == report
 
-    def test_comment_recorded_commit_contributes_to_touched_set(self):
-        """A commit hash recorded in the item's comments contributes its files.
-
-        The gate must forward the caller-supplied comments to the resolver so
-        the fingerprint covers commits whose message lacks the item id.
-        """
-        repo = _FakeGitRepo(
-            grep_files=[],
-            comment_commits={"c" * 40: ["src/from_comment.py"]},
-            blobs={"src/from_comment.py": "blob-c"},
+    def test_legacy_unversioned_line_ignored_by_content_gate(self):
+        """AC4: an unversioned legacy line whose value happens to equal the
+        current fingerprint is NOT honoured — the report falls back to the
+        time-gate floor (stale here), proving legacy lines cannot mass-skip
+        the migration."""
+        fp = self._fp()
+        assert fp is not None
+        legacy_report = (
+            "Ready to close: Yes\n\n"
+            f"Audit content fingerprint: {fp}\n\n## Summary\nlegacy"
         )
-        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
-        fp_with = self._fp(repo, desc="", comments=comments)
-        fp_without = self._fp(repo, desc="", comments=None)
-        assert fp_with is not None
-        assert fp_without is None  # no grep files, no Key Files → fail open
-
-    def test_comment_recorded_hashes_stable_when_comments_dropped(self):
-        """AC2: an item audited with comment-recorded commit hashes yields
-        the same fingerprint when checked WITHOUT the caller re-supplying the
-        comments — no spurious invalidation (comment-source stability).
-
-        The parent-first flow computes the fingerprint with the fetched
-        comments at audit time (``cmd_issue``) and the check-time callers
-        (child-reuse gate, freshness probe) fetch the comments themselves
-        (deterministic comment source, SA-0MVAWFYKT002CQ3L), so the two
-        computations must agree. For the implement-skill convention (comment
-        hashes reference commits the item-id grep already resolves) the
-        comment source adds no unique path; the unique-path case is covered
-        by the tests below.
-        """
-        repo = _FakeGitRepo(
-            grep_files=["src/a.py"],
-            comment_commits={"c" * 40: ["src/a.py"]},
-            blobs={"src/a.py": "blob-a"},
-        )
-        comments = [{"comment": f"recorded commit {'c' * 40} in the message"}]
-        touched_with = audit_runner._resolve_touched_files(
-            repo, "TEST-1", work_item={"description": self._DESC},
-            comments=comments,
-        )
-        touched_without = audit_runner._resolve_touched_files(
-            repo, "TEST-1", work_item={"description": self._DESC},
-        )
-        assert touched_with == touched_without == ["src/a.py"]
-
-        fp_with = self._fp(repo, comments=comments)
-        fp_without = self._fp(repo)
-        assert fp_with is not None
-        assert fp_with == fp_without
-
-        # The comment-recorded commit's file is genuinely policed at check
-        # time too (via the item-id grep source): a content change flips
-        # BOTH computations identically, so dropping comments never blinds
-        # the gate to the file.
-        changed = _FakeGitRepo(
-            grep_files=["src/a.py"],
-            comment_commits={"c" * 40: ["src/a.py"]},
-            blobs={"src/a.py": "blob-b"},
-        )
-        assert self._fp(changed, comments=comments) != fp_with
-        assert self._fp(changed) != fp_without
-
-    # ------------------------------------------------------------------
-    # Deterministic comment source (SA-0MVAWFYKT002CQ3L)
-    # ------------------------------------------------------------------
-
-    def test_fingerprint_fetches_comments_when_not_supplied(self):
-        """AC1: when the caller does not supply the comments, the fingerprint
-        fetches them from ``wl show`` so a comment-recorded commit hash that
-        the item-id grep does NOT cover still contributes identically at
-        audit/persist time and check time.
-
-        Regression for the residual: ``cmd_issue`` passes ``ctx.comments`` at
-        persist time but the child-reuse gate and the freshness probe do not
-        hold the list, so the two computations used to diverge (spurious
-        re-audit).
-        """
-        repo = _FakeGitRepo(
-            grep_files=["src/a.py"],  # the comment commit is NOT id-referenced
-            comment_commits={"c" * 40: ["src/from_comment.py"]},
-            blobs={"src/a.py": "blob-a", "src/from_comment.py": "blob-c"},
-        )
-        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
-
-        # Check time: comments NOT supplied → fetched internally.
-        fp_fetched = self._fp(repo, desc="", run_wl_comments=comments)
-        # Audit/persist time: the caller holds the comments.
-        fp_audit = self._fp(repo, desc="", comments=comments)
-        # Sanity: an empty comment payload does NOT include the unique path.
-        fp_commentless = self._fp(repo, desc="")
-
-        assert fp_fetched is not None
-        assert fp_audit == fp_fetched
-        assert fp_audit != fp_commentless
-
-    def test_comment_hash_unique_path_consistent_at_probe(self):
-        """AC1: a fingerprint recorded at audit time (with a unique
-        comment-derived path) is reproduced by the read-only freshness probe,
-        which fetches the comments itself — the stored audit stays fresh."""
-        repo = _FakeGitRepo(
-            grep_files=["src/a.py"],
-            comment_commits={"c" * 40: ["src/from_comment.py"]},
-            blobs={"src/a.py": "blob-a", "src/from_comment.py": "blob-c"},
-        )
-        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
-        stored_fp = self._fp(repo, desc="", comments=comments)
-        assert stored_fp is not None
-        report = self._report_with_fingerprint(stored_fp)
-
-        # Probe passes NO comments; the gate's internal fetch must see them.
         run_wl = self._make_run_wl(
-            audit_raw=report,
-            work_item_desc="",
-            work_item_comments=comments,
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-05T00:00:00.000Z",
         )
-        assert self._check(run_wl, repo) == report
-
-    def test_child_content_changed_fresh_for_unique_comment_hash(self):
-        """AC1 residual at the child gate: a child whose stored audit encodes
-        a comment-recorded commit hash (not reachable via the item-id grep)
-        stays content-fresh — ``_child_content_changed`` must return False so
-        the parent reuses the child instead of re-auditing it."""
-        repo = _FakeGitRepo(
-            grep_files=["src/a.py"],
-            comment_commits={"c" * 40: ["src/from_comment.py"]},
-            blobs={"src/a.py": "blob-a", "src/from_comment.py": "blob-c"},
-        )
-        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
-        stored_fp = self._fp(repo, desc="", comments=comments)
-        assert stored_fp is not None
-        stored = self._report_with_fingerprint(stored_fp)
-        run_wl = self._make_run_wl(
-            audit_raw=stored,
-            work_item_desc="",
-            work_item_comments=comments,
-        )
-        with mock.patch.object(audit_runner, "_run_wl", side_effect=run_wl):
-            changed = audit_runner._child_content_changed(repo, "TEST-1")
-        assert changed is False
-
-    def test_get_child_audit_verdict_reuses_comment_fresh_child(self):
-        """AC1 residual at the parent child-reuse gate: a child whose
-        individually-persisted audit covers a comment-recorded commit hash is
-        content-fresh when the parent evaluates it — the parent reuses the
-        verdict (``ready``) instead of re-auditing.
-
-        The check drops the comments on purpose (child dict from ``wl show
-        --children`` carries none); the fingerprint fetch must restore them.
-        """
-        repo = _FakeGitRepo(
-            grep_files=["src/a.py"],
-            comment_commits={"c" * 40: ["src/from_comment.py"]},
-            blobs={"src/a.py": "blob-a", "src/from_comment.py": "blob-c"},
-        )
-        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
-        stored_fp = self._fp(repo, desc="", comments=comments)
-        assert stored_fp is not None
-        stored = (
-            "Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
-            f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{stored_fp}\n\n"
-            "## Summary\nchild audit ok"
-        )
-        child = {"id": "CHILD-1", "description": "",
-                 "updatedAt": "2026-08-01T00:00:00.000Z"}
-
-        def _combined(cmd):
-            cmd_str = " ".join(cmd)
-            if "audit-show" in cmd_str:
-                return _proc(0, json.dumps({
-                    "success": True,
-                    "audit": {
-                        "auditedAt": "2026-08-01T00:00:00.000Z",
-                        "rawOutput": stored,
-                    },
-                }))
-            if "show" in cmd_str and "--children" not in cmd_str:
-                return _proc(0, json.dumps({
-                    "success": True,
-                    "workItem": child,
-                    "comments": list(comments),
-                }))
-            return repo(cmd)
-
-        verdict, reason, _ = audit_runner._get_child_audit_verdict(
-            _combined, "CHILD-1", child=child,
-        )
-        assert verdict is True
-        assert reason == "ready"
-
-    def test_convention_item_fingerprint_unchanged_by_comment_fetch(self):
-        """Backward compatibility: for the implement-skill convention
-        (comment-recorded hashes reference commits the item-id grep already
-        resolves) the comment fetch adds no new path — the fingerprint is
-        byte-identical whether comments are supplied, fetched, or absent, so
-        previously persisted audits are not invalidated solely by this
-        change. Legacy fingerprint-less reports keep the time floor
-        (covered above).
-        """
-        repo = _FakeGitRepo(
-            grep_files=["src/a.py"],
-            comment_commits={"c" * 40: ["src/a.py"]},
-            blobs={"src/a.py": "blob-a"},
-        )
-        comments = [{"comment": f"SA-1: committed as {'c' * 40}"}]
-        fp_audit = self._fp(repo, comments=comments)
-        fp_fetched = self._fp(repo, run_wl_comments=comments)
-        fp_commentless = self._fp(repo)
-        assert fp_audit is not None
-        assert fp_audit == fp_fetched == fp_commentless
+        assert audit_runner._extract_content_fingerprint(legacy_report) is None
+        assert self._check(run_wl, self._repo()) is None
 
     # ------------------------------------------------------------------
     # 60s time floor interaction (legacy audits)

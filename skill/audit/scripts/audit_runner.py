@@ -1149,16 +1149,28 @@ with a fingerprint are gated on content match instead (see
 ``_check_audit_freshness``).
 """
 
-AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint: "
-"""Prefix of the content-fingerprint metadata line embedded in audit reports.
+AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint (v2): "
+"""Prefix of the versioned content-fingerprint metadata line in audit reports.
 
-The content fingerprint (per-work-item touched-file state + work-item
-description hash + Key Files list, captured at audit time) is embedded in the
-persisted report so a re-audit of an unchanged item can skip the pipeline in
-seconds instead of re-running it (SA-0MSKB6US1009CNHT,
-SA-0MSPZDALB000S18P). The line is parsed back out by
-``_extract_content_fingerprint``.
+The content fingerprint is computed from the work item's OWN data only — a
+sha256 over the canonical ``{"schema": 2, "title_hash", "description_hash"}``
+payload, with **zero git invocations** (SA-0MVIDI8E00063OOP, superseding the
+per-touched-path formula of SA-0MSPZDALB000S18P). The description already
+contains the acceptance criteria and the Key Files section, so those are
+covered by ``description_hash``; comments and repository state never
+contribute. The line is embedded in the persisted report so a re-audit of an
+unchanged item can skip the pipeline in seconds instead of re-running it
+(SA-0MSKB6US1009CNHT).
+
+The ``v2`` version marker lets ``_extract_content_fingerprint`` distinguish
+this formula from the unversioned legacy lines written by earlier formulas,
+whose fingerprints cannot be recomputed. Legacy lines are ignored (→ ``None``)
+so those reports fall through to the existing time-gate floor instead of
+triggering a silent mass re-audit wave.
 """
+
+_AUDIT_CONTENT_FINGERPRINT_SCHEMA = 2
+"""Schema version embedded in the fingerprint payload (item-data-only)."""
 
 #: Marker prefix used to separate commit headers from file names in
 #: ``git log --name-only`` output (SA-0MSPZDALB000S18P).
@@ -1989,27 +2001,28 @@ def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
 
 def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None,
-                           work_item: dict | None = None,
-                           comments: Sequence[dict] | None = None) -> str | None:
+                           work_item: dict | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
 
     1. **Content-based gate (primary, SA-0MSKB6US1009CNHT):** when the
-       stored audit report carries a content fingerprint (the work item's
-       per-touched-file state + description hash + Key Files list captured
-       at audit time, SA-0MSPZDALB000S18P), the audit is fresh iff the
-       fingerprint is unchanged. This makes re-audits of unchanged items
-       return the existing report in seconds instead of re-running the
-       pipeline, even when ``updatedAt`` moved for non-content reasons
-       (e.g. a comment was added), or when an UNRELATED file was committed
-       or left dirty. A change to any file the item itself touched (or to
-       its description / Key Files) invalidates freshness and re-runs.
-    2. **Time gate (floor):** when the stored report carries no fingerprint
-       (e.g. legacy audits persisted before the fingerprint feature), the
-       existing 60s time gate is retained as the freshness floor: compare
-       the audit's ``auditedAt`` against the work item's ``updatedAt`` plus
-       ``AUDIT_FRESHNESS_BUFFER_SECONDS``.
+       stored audit report carries a **v2** content fingerprint (a sha256
+       over the item's own ``{schema: 2, title_hash, description_hash}``
+       payload, computed with zero git calls, SA-0MVIDI8E00063OOP), the
+       audit is fresh iff the fingerprint is unchanged. This makes re-audits
+       of unchanged items return the existing report in seconds instead of
+       re-running the pipeline, even when ``updatedAt`` moved for
+       non-content reasons (e.g. a comment was added). Only a change to this
+       item's own title or description (which contains the ACs and Key Files)
+       invalidates freshness; repository state, touched-file edits, comments
+       and lifecycle fields never do.
+    2. **Time gate (floor):** when the stored report carries no v2
+       fingerprint (legacy audits persisted by earlier formulas, whose
+       unversioned ``Audit content fingerprint:`` line is deliberately
+       ignored, or manual reports), the 60s time gate is retained as the
+       freshness floor: compare the audit's ``auditedAt`` against the work
+       item's ``updatedAt`` plus ``AUDIT_FRESHNESS_BUFFER_SECONDS``.
 
     Returns the ``rawOutput`` of the existing audit if still fresh, ``None``
     otherwise (no prior audit, stale audit, or command failure).
@@ -2022,13 +2035,6 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     caller already fetched the work item (SA-0MSL1Z7E9005TLBA): it is used
     for the fingerprint computation and the time-gate ``updatedAt``. When
     omitted, the work item is fetched via ``wl show``.
-
-    *comments* is the item's comment list (fetched via ``wl show``). It is
-    optional: when supplied it is forwarded to the fingerprint computation;
-    when omitted, ``_compute_content_fingerprint`` fetches it itself
-    (deterministic comment source, SA-0MVAWFYKT002CQ3L), so the
-    audit-time and check-time computations agree even when the caller does
-    not hold the list (parent child-reuse gate, read-only freshness probe).
     """
 
     try:
@@ -2050,19 +2056,18 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return None
 
     # ── Content-based freshness gate (SA-0MSKB6US1009CNHT) ─────────────
-    # When the stored audit carries a content fingerprint, freshness is
-    # decided by content match: re-auditing an item whose touched-file
-    # state, description hash, and Key Files are unchanged returns the
-    # existing report in seconds instead of re-running the pipeline
-    # (SA-0MSPZDALB000S18P: unrelated repo changes no longer invalidate it).
+    # When the stored audit carries a v2 content fingerprint, freshness is
+    # decided by item-data match: re-auditing an item whose title and
+    # description are unchanged returns the existing report in seconds
+    # instead of re-running the pipeline (SA-0MVIDI8E00063OOP: only the
+    # item's own data participates — no git calls, no comments).
     stored_fingerprint = _extract_content_fingerprint(raw_output)
     if stored_fingerprint is not None:
         current_fingerprint = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
-            comments=comments,
         )
         if current_fingerprint is None:
-            # Fingerprint cannot be computed now (e.g. git unavailable) —
+            # Fingerprint cannot be computed now (e.g. wl show failed) —
             # fail open and let the pipeline re-run.
             return None
         if current_fingerprint == stored_fingerprint:
@@ -2111,12 +2116,15 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
 
 
 def _extract_content_fingerprint(report_text: str) -> str | None:
-    """Extract the content fingerprint from a persisted audit report.
+    """Extract the v2 content fingerprint from a persisted audit report.
 
-    The fingerprint is stored as a metadata line in the report:
-    ``Audit content fingerprint: <sha256-hex>``. Returns the fingerprint
-    value, or ``None`` when the report carries no fingerprint (e.g. legacy
-    audits persisted before SA-0MSKB6US1009CNHT, or manual reports).
+    The fingerprint is stored as a versioned metadata line in the report:
+    ``Audit content fingerprint (v2): <sha256-hex>`` (the item-data-only
+    formula, SA-0MVIDI8E00063OOP). Returns the fingerprint value only for
+    ``v2`` lines. Unversioned legacy lines (``Audit content fingerprint:
+    <hex>``) written by earlier formulas are **not** returned: their
+    fingerprints cannot be recomputed, so ``None`` lets the caller fall
+    through to the time-gate floor instead of triggering a mass re-audit.
     """
     if not report_text:
         return None
@@ -2452,79 +2460,77 @@ def _compute_path_fingerprints(runner: Runner,
 def _compute_content_fingerprint(runner: Runner, issue_id: str,
                                  worklog_dir: str | None = None,
                                  work_item: dict | None = None,
-                                 comments: Sequence[dict] | None = None,
                                  ) -> str | None:
-    """Compute the content fingerprint for a work item at the current state.
+    """Compute the content fingerprint from the work item's OWN data only.
 
-    The fingerprint is taken over the work item's OWN scope — the files it
-    touched — instead of the whole repository, so an unrelated commit or an
-    unrelated working-tree change no longer invalidates a still-valid stored
-    audit (SA-0MSPZDALB000S18P). It combines (a change in ANY invalidates):
+    The fingerprint is a sha256 hex digest of the canonical JSON payload::
 
-    1. **per-touched-path state** — each touched path's committed state (blob
-       hash at HEAD, else latest touching commit) plus its narrowed
-       working-tree state (``_compute_path_fingerprints``), so a committed OR
-       uncommitted change to a touched file invalidates freshness;
-    2. **work-item description hash** — the audited acceptance-criteria text;
-    3. **Key Files list** — the file-scope manifest of the audited item.
+        {"schema": 2, "title_hash": <sha256(title)>,
+         "description_hash": <sha256(description)>}
 
-    The touched-file set is resolved by ``_resolve_touched_files`` (commits
-    referencing the item id + comment-recorded commit hashes + Key Files).
+    serialised with ``sort_keys=True`` (**exactly** these three keys). The
+    description contains the acceptance criteria AND the Key Files section, so
+    both are already covered by ``description_hash``; no comment-derived
+    input and no repository state are hashed. The computation performs
+    **zero git invocations** — it never calls ``_resolve_touched_files``,
+    ``_compute_path_fingerprints`` or any ``git`` subprocess — so only a
+    change to this work item's own title/description invalidates a stored
+    audit (SA-0MVIDI8E00063OOP). Unrelated commits, working-tree changes,
+    touched-file edits, comments and lifecycle-field changes never do.
 
-    Tool-generated artefacts (e.g. Unity ``ProjectSettings/**`` or ``*.meta``
-    churn from batch runs) are **always invalidating** when they fall inside
-    the touched-file set: no ignore-list is applied, so a rewrite of a touched
-    artefact is treated as a genuine change (the safe direction — stale ⇒
-    re-run). See ``docs/dev/audit-skill-reference.md``.
+    *work_item* may be passed in to avoid a redundant ``wl show`` when the
+    caller already fetched the item (SA-0MSL1Z7E9005TLBA); when omitted it is
+    fetched via ``wl show <id> --json``. A missing/garbage title or
+    description still yields a deterministic hash (empty string for missing,
+    canonical JSON for non-string values).
 
-    *work_item* / *comments* may be passed in to avoid redundant ``wl show``
-    calls when the caller already fetched the item (SA-0MSL1Z7E9005TLBA). Both
-    are determined automatically when omitted: the fingerprint always resolves
-    the item's comments itself (deterministic comment source,
-    SA-0MVAWFYKT002CQ3L), so the comment-recorded commit-hash component of
-    the touched-file set contributes identically at audit/persist time,
-    parent child-reuse check time, and the read-only freshness probe.
-
-    Returns a sha256 hex digest of the canonical JSON payload, or ``None``
-    when the fingerprint cannot be determined (touched set unresolved, git
-    unavailable, wl show failure, or missing data) so callers fail open and
-    re-run the pipeline.
+    Returns the sha256 hex digest, or ``None`` (fail open → the caller re-runs
+    the full audit pipeline) ONLY when the work item cannot be fetched
+    (``wl show`` failure) or the payload cannot be built.
     """
     if work_item is None:
+        if not issue_id:
+            return None
         try:
             data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                            worklog_dir=worklog_dir)
         except Exception:  # noqa: BLE001 -- fail open on any wl/runner failure
             return None
-        work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
-        if comments is None and isinstance(data, dict):
-            # Reuse the comments from the same payload — no second fetch.
-            fetched = data.get("comments")
-            if isinstance(fetched, list):
-                comments = fetched
-    if comments is None and issue_id:
-        # Check-time callers (child-reuse gate, freshness probe) do not hold
-        # the comments list, so fetch it here. This keeps the touched-file
-        # set — and therefore the fingerprint — identical to the one the
-        # audit recorded at persist time (SA-0MVAWFYKT002CQ3L).
-        comments = _fetch_item_comments(runner, issue_id, worklog_dir=worklog_dir)
-    description = work_item.get("description", "") or ""
-    key_files = _extract_key_files(description)
-    touched = _resolve_touched_files(
-        runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
-        comments=comments,
-    )
-    if touched is None:
+        if not isinstance(data, dict) or data.get("success") is False:
+            return None
+        work_item = data.get("workItem")
+        if not isinstance(work_item, dict):
+            return None
+    try:
+        title = _fingerprint_text(work_item.get("title"))
+        description = _fingerprint_text(work_item.get("description"))
+        payload = json.dumps({
+            "schema": _AUDIT_CONTENT_FINGERPRINT_SCHEMA,
+            "title_hash": hashlib.sha256(title.encode("utf-8")).hexdigest(),
+            "description_hash": hashlib.sha256(
+                description.encode("utf-8")).hexdigest(),
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    except Exception:  # noqa: BLE001 -- payload build failure → fail open
         return None
-    path_states = _compute_path_fingerprints(runner, touched)
-    if path_states is None:
-        return None
-    payload = json.dumps({
-        "path_states": path_states,
-        "description_hash": hashlib.sha256(description.encode("utf-8")).hexdigest(),
-        "key_files": key_files,
-    }, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_text(value: object) -> str:
+    """Coerce a work-item field to a deterministic string for hashing.
+
+    Strings pass through; ``None`` becomes the empty string; other values are
+    canonicalised via JSON (``sort_keys=True``) so a garbage title/description
+    still yields a deterministic hash, falling back to the type name for
+    non-JSON-able objects.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        return type(value).__name__
 
 
 def _default_parent_timeout(n_children: int) -> int:
@@ -5840,12 +5846,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       line is emitted near the header so the report records the evidence
       source distinctly from the cache-consumption path.
 
-    *content_fingerprint* is the content fingerprint (per-touched-file state
-      + description hash + Key Files, see ``_compute_content_fingerprint``)
-      captured at audit time. When provided, an
-      ``Audit content fingerprint: <hex>`` line is emitted near the header so
-      the persisted report carries the freshness gate data
-      (SA-0MSKB6US1009CNHT). The line is parsed back by
+    *content_fingerprint* is the content fingerprint (a sha256 over the work
+      item's own title + description payload, zero git calls, see
+      ``_compute_content_fingerprint``) captured at audit time. When provided,
+      a versioned ``Audit content fingerprint (v2): <hex>`` line is emitted
+      near the header so the persisted report carries the freshness gate data
+      (SA-0MSKB6US1009CNHT, SA-0MVIDI8E00063OOP). The line is parsed back by
       ``_extract_content_fingerprint``.
 
     Ready-to-close logic:
@@ -6455,12 +6461,12 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict],
       no model line is emitted. When ``None`` or empty, the fallback
       ``Model: manual (no provider)`` is used.
     *model_source* is the source of the model (``"local"`` or ``"remote"``).
-    *content_fingerprint* is the content fingerprint (per-touched-file state
-      + description hash + Key Files, see ``_compute_content_fingerprint``)
-      captured at audit time. When provided, an
-      ``Audit content fingerprint: <hex>`` line is emitted near the header so
-      the persisted child report stays content-gate-able on future parent
-      runs (LP-0MSQ32MF200675AR).
+    *content_fingerprint* is the content fingerprint (a sha256 over the child's
+      own title + description payload, zero git calls, see
+      ``_compute_content_fingerprint``) captured at audit time. When provided,
+      a versioned ``Audit content fingerprint (v2): <hex>`` line is emitted
+      near the header so the persisted child report stays content-gate-able on
+      future parent runs (LP-0MSQ32MF200675AR, SA-0MVIDI8E00063OOP).
 
     Ready-to-close logic:
       - All acceptance criteria must be ``met`` or ``adjusted``.
@@ -6974,12 +6980,12 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
 
     Freshness (LP-0MSQ32MF200675AR) uses the CONTENT-fingerprint gate
     FIRST — same logic as the item-level gate (_check_audit_freshness,
-    SA-0MSKB6US1009CNHT): when the stored report carries a content
-    fingerprint (the child's touched-file state + description hash + Key
-    Files captured at audit time, SA-0MSPZDALB000S18P), the audit is fresh
-    iff the fingerprint is unchanged, so a child whose updatedAt moved for
-    non-content reasons (comments, status bumps), or whose unrelated repo
-    files changed, is reused instead of re-audited. The legacy TIME gate
+    SA-0MSKB6US1009CNHT): when the stored report carries a **v2** content
+    fingerprint (a sha256 over the child's own title + description payload,
+    zero git calls — SA-0MVIDI8E00063OOP), the audit is fresh iff the
+    fingerprint is unchanged, so a child whose updatedAt moved for
+    non-content reasons (comments, status bumps), or whose repo files
+    changed, is reused instead of re-audited. The legacy TIME gate
     (auditedAt vs updatedAt + AUDIT_FRESHNESS_BUFFER_SECONDS) is kept as
     the floor for fingerprint-less legacy reports. When *force* is set,
     BOTH gates are bypassed and every child is re-audited.
@@ -10074,7 +10080,6 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     original_status: str = "open"  # safe default
     original_stage: str = ""       # safe default (unknown)
     wi: dict | None = None
-    wi_comments: list = []
     try:
         item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                             worklog_dir=worklog_dir)
@@ -10084,10 +10089,6 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             wi = item_data.get("workItem")
             if not isinstance(wi, dict):
                 wi = item_data
-            # Comments live beside ``workItem`` at the top level; they carry
-            # the commit hashes the implement skill recorded, which feed the
-            # touched-file fingerprint (SA-0MSPZDALB000S18P).
-            wi_comments = item_data.get("comments", []) or []
             original_status = wi.get("status", "open")
             original_stage = wi.get("stage", "")
     except RuntimeError:
@@ -10100,8 +10101,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     if not force:
         fresh_report = _check_audit_freshness(runner, issue_id,
                                               worklog_dir=worklog_dir,
-                                              work_item=wi,
-                                              comments=wi_comments)
+                                              work_item=wi)
         if fresh_report is not None:
             # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
             # the fresh audit so a redundant re-audit is stopped before the
@@ -10709,7 +10709,6 @@ def _run_remediation_loop(
     worklog_dir: str | None,
     work_item: dict,
     content_fingerprint: str | None,
-    comments: Sequence[dict] | None = None,
 ) -> dict:
     """Confident-false-positive config remediation loop (F2 scope).
 
@@ -10805,7 +10804,6 @@ def _run_remediation_loop(
             })
         new_fp = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
-            comments=comments,
         )
         results["commits"].append({
             "sha": sha,
@@ -10981,17 +10979,16 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         return None
 
     # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT,
-    # SA-0MSPZDALB000S18P): per-touched-file state + work-item description
-    # hash + Key Files list. The fingerprint is embedded in the persisted
-    # report so a re-audit of an unchanged item skips the pipeline
-    # (content-based freshness gate), while unrelated commits / working-tree
-    # changes elsewhere no longer invalidate it.
-    # Fail-open: if the fingerprint cannot be computed (touched set
-    # unresolved, git unavailable, wl failure), the audit proceeds and
-    # simply stores no fingerprint.
+    # SA-0MVIDI8E00063OOP): a sha256 over the item's own title + description
+    # payload (zero git calls — unrelated commits / working-tree changes /
+    # touched-file edits never invalidate). The fingerprint is embedded in
+    # the persisted report as a versioned ``Audit content fingerprint (v2):``
+    # line so a re-audit of an unchanged item skips the pipeline
+    # (content-based freshness gate).
+    # Fail-open: if the fingerprint cannot be computed (wl show failure),
+    # the audit proceeds and simply stores no fingerprint.
     content_fingerprint = _compute_content_fingerprint(
         runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
-        comments=ctx.comments,
     )
 
     # ------------------------------------------------------------------
@@ -11084,7 +11081,6 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         worklog_dir=worklog_dir,
         work_item=work_item,
         content_fingerprint=content_fingerprint,
-        comments=ctx.comments,
     )
     cq_findings = remediation_results.get("cq_findings", cq_findings)
     fp_screen_results = remediation_results.get(

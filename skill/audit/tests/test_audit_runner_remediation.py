@@ -707,7 +707,10 @@ class TestRemediationLoop:
         # what the report embeds (freshness gate stable after remediation).
         report = capsys.readouterr().out
         assert "fp-post-remediation" in report
-        assert "Audit content fingerprint: fp-post-remediation" in report
+        assert (
+            f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}"
+            "fp-post-remediation" in report
+        )
 
 
 # ===========================================================================

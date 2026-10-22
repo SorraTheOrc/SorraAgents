@@ -41,34 +41,6 @@ def _free_audit_slot():
         yield
 
 
-#: Default touched-file fingerprint state for the child-reuse tests.
-_DEFAULT_TOUCHED = ["src/child.py"]
-_DEFAULT_STATES = {"src/child.py": {"head": "blob", "worktree": ""}}
-
-
-@pytest.fixture(autouse=True)
-def _deterministic_fingerprint(monkeypatch):
-    """Pin the per-touched-file fingerprint state for child-reuse tests.
-
-    These tests exercise the freshness GATE (stored fingerprint vs the
-    runtime recomputation), not the git plumbing (covered by
-    ``test_audit_runner_freshness.py``). Pinning the resolver and the
-    per-path states keeps a fingerprint built via ``_fingerprinted_raw``
-    equal to the one recomputed at runtime (SA-0MSPZDALB000S18P).
-    """
-    monkeypatch.setattr(
-        audit_runner, "_resolve_touched_files",
-        lambda *args, **kwargs: list(_DEFAULT_TOUCHED),
-    )
-    monkeypatch.setattr(
-        audit_runner, "_compute_path_fingerprints",
-        lambda runner, paths: {
-            p: dict(_DEFAULT_STATES.get(p, {"head": "", "worktree": ""}))
-            for p in paths
-        },
-    )
-    yield
-
 class TestOptInChildAuditCascade:
     """Tests for the opt-in recursive child-audit cascade (AC1-AC6).
 
@@ -292,8 +264,11 @@ class TestOptInChildAuditCascade:
         child_desc = "## Acceptance Criteria\n- CAC1: child criterion"
         with mock.patch.object(ar, "_resolve_audited_head", return_value=head):
             fp = ar._compute_content_fingerprint(
-                mock.MagicMock(), "CHILD-1", work_item={"description": child_desc},
+                mock.MagicMock(), "CHILD-1",
+                work_item={"title": "Child Issue 1",
+                           "description": child_desc},
             )
+        assert fp is not None
         stored = (
             f"Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
             f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}\n\n## Summary\nok"
@@ -345,24 +320,30 @@ class TestChildVerdictReuseInParentAudits:
     AUDITED_AT = "2026-08-01T00:00:00.000Z"
 
     def _fingerprinted_raw(self, ar, child_id, verdict="Yes",
-                           states=None, acs=None):
-        """Build a child audit rawOutput carrying a content fingerprint.
+                           desc=None, title=None, acs=None):
+        """Build a child audit rawOutput carrying a v2 content fingerprint.
 
-        The fingerprint is computed over the pinned touched-file state so a
-        stored report built here counts as content-fresh when the runner
-        evaluates it (see the ``_deterministic_fingerprint`` fixture).
-        *states* overrides the per-path state to simulate a changed child.
+        The fingerprint is computed from the child's OWN data (title +
+        description, zero git calls — SA-0MVIDI8E00063OOP), so a stored
+        report built here counts as content-fresh when the runner recomputes
+        it from the same ``wl show`` data. *desc*/*title* override the item's
+        data to simulate a changed child.
         """
-        with mock.patch.object(
-            ar, "_compute_path_fingerprints",
-            return_value=states or {
-                "src/child.py": {"head": "blob", "worktree": ""},
-            },
-        ):
-            fp = ar._compute_content_fingerprint(
-                mock.MagicMock(), child_id,
-                work_item={"description": self.CHILD_DESC},
-            )
+        child_desc = self.CHILD_DESC if desc is None else desc
+        if title is None:
+            # The child list returned by ``wl show --children`` carries the
+            # display title (``Child Issue N``); the fingerprint hashes it, so
+            # the stored report must be built over the same title or the gate
+            # would (correctly) see a data change.
+            suffix = child_id[len("CHILD-"):] if child_id.startswith("CHILD-") else ""
+            child_title = f"Child Issue {suffix}" if suffix.isdigit() else ""
+        else:
+            child_title = title
+        fp = ar._compute_content_fingerprint(
+            mock.MagicMock(), child_id,
+            work_item={"title": child_title, "description": child_desc},
+        )
+        assert fp is not None
         lines = [
             f"Audit report for work item {child_id}",
             f"Ready to close: {verdict}",
@@ -627,10 +608,10 @@ class TestChildVerdictReuseInParentAudits:
             for i in range(1, 6)
         }
         # CHILD-1 is stale: its stored report carries a fingerprint over a
-        # DIFFERENT touched-file state (content changed) → content gate rejects it.
+        # DIFFERENT description (child data changed) → content gate rejects it.
         raw["CHILD-1"] = self._fingerprinted_raw(
             ar, "CHILD-1",
-            states={"src/child.py": {"head": "changed", "worktree": ""}},
+            desc=self.CHILD_DESC + "\n- CAC2: added later",
         )
         child_pi_contexts: list[str] = []
         triggered: list[str] = []
@@ -810,6 +791,7 @@ class TestChildVerdictReuseInParentAudits:
                         "success": True,
                         "workItem": {
                             "id": "CHILD-1",
+                            "title": "Child Issue 1",
                             "description": self.CHILD_DESC,
                         },
                     }),
@@ -856,12 +838,12 @@ class TestChildVerdictReuseInParentAudits:
         assert audited_at == self.AUDITED_AT
 
     def test_verdict_content_changed_stale(self):
-        """F2 AC1: a fingerprint mismatch (content changed) means stale — the
-        child is re-audited."""
+        """F2 AC1: a fingerprint mismatch (item data changed) means stale —
+        the child is re-audited."""
         ar = audit_runner
         raw = self._fingerprinted_raw(
             ar, "CHILD-1",
-            states={"src/child.py": {"head": "changed", "worktree": ""}},
+            desc=self.CHILD_DESC + "\n- CAC2: added later",
         )
         verdict, reason, audited_at = ar._get_child_audit_verdict(
             self._verdict_runner(raw), "CHILD-1",
@@ -1107,9 +1089,9 @@ class TestParentFirstChildPassThrough:
         silently inherited-passed — it is audited even though it is already
         in review."""
         child = self._child("CHILD-1", stage="in_review")
-        # The runner returns a stored (stale) audit for the child; combined
-        # with a different git HEAD the content fingerprint will not match →
-        # the child's content changed → audited, not inherited.
+        # The runner returns a stored audit WITHOUT a v2 fingerprint; it is
+        # stale by the time-gate floor (the child's updatedAt is newer than
+        # the audit), so the child is audited rather than inherited-passed.
         runner = mock.MagicMock()
 
         def _side_effect(cmd):
@@ -1397,18 +1379,14 @@ class TestParentFirstChildPassThrough:
 
     def test_child_content_changed_stale_audit_true(self):
         """_child_content_changed: an audit whose fingerprint no longer
-        matches (a touched file changed) → content changed."""
+        matches (the child's own description changed) → content changed."""
         from audit.scripts import audit_runner as ar
-        # Store the fingerprint with an old per-path state, then re-check
-        # against the pinned current state (different head blob).
-        with mock.patch.object(
-            ar, "_compute_path_fingerprints",
-            return_value={"src/child.py": {"head": "old", "worktree": ""}},
-        ):
-            fp = ar._compute_content_fingerprint(
-                mock.MagicMock(), "CHILD-1",
-                work_item={"description": "## Acceptance Criteria\n- CAC1: x"},
-            )
+        # Store the fingerprint over the OLD description, then re-check
+        # against the NEW description.
+        fp = ar._compute_content_fingerprint(
+            mock.MagicMock(), "CHILD-1",
+            work_item={"description": "## Acceptance Criteria\n- CAC1: x"},
+        )
         stored = (
             f"Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
             f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}\n\n## Summary\nok"
@@ -1425,7 +1403,7 @@ class TestParentFirstChildPassThrough:
             if "show" in cmd_str:
                 return {"success": True, "workItem": {
                     "id": "CHILD-1",
-                    "description": "## Acceptance Criteria\n- CAC1: x",
+                    "description": "## Acceptance Criteria\n- CAC1: x\n- CAC2: y",
                 }}
             raise AssertionError(f"unexpected wl cmd: {cmd_str}")
 
