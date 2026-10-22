@@ -241,6 +241,84 @@ wall-clock reduction on a representative audit):
   the full budget duration, which is correct for wall-clock accounting and
   why the at-budget columns exist.
 
+## Post-change measurement (SA-0MVI6VVC00029XO4) — gate NOT met
+
+A clean-room single-item audit was re-measured after every code child of the
+epic landed (F1 harness/baseline, F2 slot-sized ceiling, F3 JSON re-ask
+elimination, F4 Phase 1 child batching + model surface, EX child-screen
+budget + quarantine). The result **does not** meet the parent epic's AC6
+gate. It is recorded here unchanged rather than weakening the gate.
+
+### Measured run
+
+| Field | Value |
+|---|---|
+| Commit | `89aba34c5` (all five code children on `dev`) |
+| Command | `python3 skill/audit/scripts/audit_runner.py issue SA-0MVI3608M0080QLW --do-not-persist --force --json --max-concurrency 2 --debug-log /tmp/audit_after` |
+| Target | 5 acceptance criteria, no children (single item) |
+| Host | `rgardler-AI-Laptop`, load ~1.5 at launch (single audit, no concurrent audits; the audit's own slot wait was 0.00 s on every acquire) |
+| Model actually served | `Local Proxy/plan` (the proxy's fallback model at that moment, not the `code` model) |
+
+Per-call profile (from the run's `Per-call timing:` lines):
+
+| Context | calls | elapsed | note |
+|---|---:|---:|---|
+| `false-positive-screen` | 1 | 247.4 s | |
+| `parent` (Phase 1 parent screen) | 1 | **1800.0 s** | hit the 1800 s budget exactly |
+| `verdict_reask` | 1 | **1147.4 s** | the parent screen's JSON was unparseable |
+| `phase2_deep` | 1 | 541.1 s | (per-AC mean 90.2 s — the brief's undercount trap) |
+| **Total** | **4** | **4419.8 s = 73.7 min** | |
+
+`AUDIT_RELIABILITY_SUMMARY calls=4 parse_ok=1 parse_failed=3 timeouts=2
+child_skips=0 provider_errors=0 concurrency_waits=0 verdict_reasks=1
+child_screen_timeouts=0 elapsed_seconds=4419.81`
+
+### Gate assessment
+
+| Gate (parent AC6) | Required | Measured | Verdict |
+|---|---|---|---|
+| Overall LLM wall clock vs baseline | ≥ 50 % reduction | 73.7 min for ONE item, with a single call at the 1800 s cap | **NOT MET** |
+| `partial`-fallback rate | not increased | `parse_failed=3` of 4 calls, `timeouts=2` | **NOT MET** |
+| Closure criteria unchanged | no relaxation | no verdict/closure code changed by any child; `met`/`unmet`/`partial`/`adjusted` vocabulary and the ready-to-close gate are byte-identical (`git diff` of the verdict/closure paths: none) | **MET** |
+| Single item ≤ 10 min | ≤ 10 min | 73.7 min | **NOT MET** |
+
+### Why (measured, specific)
+
+The residual cost is the **parent Phase-1 screen** — the `+1` of the N+1
+structure:
+
+1. It keeps the full 1800 s budget (only *child* screens were right-sized to
+   1080 s), and it consumed all of it.
+2. It is **not** covered by `--batch-phase1`, which folds the *pending child*
+   screens into one call; the parent screen is still its own call.
+3. It is not covered by the `--phase1-model` surface by default (unset ⇒ the
+   resolved model).
+4. Its unparseable output then triggered a 1147 s `verdict_reask`, i.e. the
+   most expensive call in the run was in service of the likeliest-to-fail one.
+
+The child-path levers the epic delivered (slot-sized ceiling, trailing-comma /
+contract hardening, child batching, 1080 s child budget + quarantine) address
+the *child* calls; this item's run had **no child screens at all** (single-item
+audit), so none of them could fire. A single-item audit is therefore the worst
+case for this epic's levers, and the epic's own user story ("single-item audit
+≤ 10 minutes") is gated on the parent screen, which no child owned.
+
+**Environment caveat (not an excuse):** the proxy served its `plan` fallback
+model, whose p50 on this corpus is already ~300 s and which produced the
+1800 s cap and the unparseable output. A re-run on a healthy `code` model would
+be faster — but the gate must be judged on reproducible data, so the shortfall
+stands and a follow-up child is raised (see below) rather than re-running until
+a favourable number appears.
+
+### Follow-up raised
+
+`SA-0MVJ3Q662006RDJR` — *Parent Phase-1 screen: budget, batching and JSON
+robustness* (child of the epic). Scope: fold the parent screen into the same
+`phase1_batch` call (or give it its own right-sized budget and a fast-model
+default), assert the ≤ 10 min single-item target from the harness, and re-run
+this measurement. The AC6 gate is **not** waived: it stays unmet until that
+child lands and a re-measurement passes.
+
 ## Changelog
 
 - **2026-10-21** — Baseline committed with the harness (SA-0MVI6VET100337TW).
@@ -250,3 +328,8 @@ wall-clock reduction on a representative audit):
   ≤ 2 % re-ask gate (SA-0MVI6VNDF001VE1S). The baseline figures above are
   unchanged (the corpus is historical); the section states how the post-change
   rate is re-measured on new traffic and what offline evidence backs it.
+- **2026-10-21** — Post-change measurement recorded (SA-0MVI6VVC00029XO4):
+  the ≥ 50 % / ≤ 10 min gate is NOT met on a clean-room single-item audit
+  (4 calls, 4419.8 s, parent Phase-1 screen at its 1800 s cap plus a 1147 s
+  re-ask). Closure criteria confirmed unchanged. Follow-up child raised for
+  the parent Phase-1 screen; the gate is not waived.
