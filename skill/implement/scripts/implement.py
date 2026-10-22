@@ -59,6 +59,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from collections.abc import Callable, Iterator
@@ -344,6 +345,7 @@ def run_cmd(
     check: bool = False,
     timeout: int = 300,
     env: dict[str, str] | None = None,
+    start_new_session: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run a shell command and return the result.
 
@@ -354,6 +356,10 @@ def run_cmd(
         check: If True, raise CalledProcessError on non-zero exit.
         timeout: Timeout in seconds.
         env: Optional environment variable overrides.
+        start_new_session: If True, spawn the child in its own session /
+            process group so process-group kills performed inside it can
+            never reach the caller or its siblings
+            (SA-0MVJC5KNT0044L2B).
 
     Returns:
         ``subprocess.CompletedProcess``
@@ -371,6 +377,7 @@ def run_cmd(
         check=check,
         timeout=timeout,
         env={**os.environ, **(env or {})},
+        start_new_session=start_new_session,
     )
 
 
@@ -2127,11 +2134,116 @@ def _sync_parent_branch(
 # ---------------------------------------------------------------------------
 
 
+def _main_checkout_for(worktree_path: str) -> str:
+    """Resolve a cwd guaranteed to be OUTSIDE the given worktree.
+
+    ``wl cleanup-worktree`` must not be spawned from inside the worktree it
+    targets: ContextHub's ``wl`` CLI auto-registers its own PID under a
+    worktree whenever its cwd is inside ``.worklog/worktrees/`` and then
+    reaps it — including the registering process itself
+    (SA-0MVJC5KNT0044L2B). Prefer the git-derived main checkout root, then
+    the canonical ``<main>/.worklog/worktrees/<slug>`` layout, and finally
+    the system temp dir (neutral — can never be inside a managed worktree).
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+
+    Returns:
+        An absolute directory path outside *worktree_path*.
+    """
+    try:
+        git_main = _get_repo_root(worktree_path)
+    except OSError:
+        # The worktree path no longer exists (e.g. cleanup during abort
+        # after removal): fall through to the neutral fallbacks.
+        git_main = None
+    if git_main:
+        return git_main
+    parts = Path(worktree_path).resolve().parts
+    if len(parts) >= 3 and parts[-3] == ".worklog" and parts[-2] == "worktrees":
+        return str(Path(*parts[:-3]))
+    return tempfile.gettempdir()
+
+
+def _ppid_of(pid: int) -> int | None:
+    """Return the parent PID of *pid* (Linux ``/proc``), else None."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            data = fh.read()
+        rparen = data.rfind(")")
+        if rparen == -1:
+            return None
+        fields = data[rparen + 2:].split()
+        return int(fields[1])  # field 4 overall == ppid
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _pid_is_invoker_related(pid: int) -> bool:
+    """True when *pid* must never be signalled by the worktree cleanup.
+
+    The cleanup runs *inside* the worktree being reaped (``implement.py
+    finish`` uses the worktree as cwd), so excluding only ``os.getpid()``
+    is insufficient: the invoking process shares its process group and
+    ancestry with the wrapper shell it was launched from and with any
+    subprocesses it spawned. Signalling any of those lands on the finish
+    process itself, stranding the dev push (SA-0MVJC5KNT0044L2B).
+
+    A PID is considered invoker-related when it is the invoking process
+    itself, belongs to the invoking process's process group, or is an
+    ancestor or descendant of it.
+    """
+    if pid == os.getpid():
+        return True
+    try:
+        if os.getpgid(pid) == os.getpgrp():
+            return True
+    except OSError:
+        pass  # Concurrently-exited process; the individual kill will ESRCH.
+    # Ancestry walk (bounded against pid-reuse loops): ancestors (a wrapper
+    # shell even if reparented into another group) and descendants we
+    # spawned (even if they moved to their own session, e.g. the push) both
+    # resolve to us.
+    seen: set[int] = set()
+    current = pid
+    while current not in seen and len(seen) < 64:
+        seen.add(current)
+        parent = _ppid_of(current)
+        if parent is None or parent <= 1 or parent == current:
+            break
+        if parent == os.getpid():
+            return True
+        current = parent
+    return False
+
+
 def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
     """Terminate processes associated with the given worktree path.
 
     Attempts ``wl cleanup-worktree <path>`` first. Falls back to finding
     and killing processes with the worktree path in their cwd.
+
+    **Self-exclusion contract (SA-0MVJC5KNT0044L2B).** This function may be
+    invoked *from inside* the worktree it targets (``implement.py finish``
+    runs with the worktree as cwd). The cleanup must therefore never signal
+    the invoking process, its wrapper shell, or anything in its process
+    group — a SIGTERM landing on the finish process mid-workflow previously
+    reset the item to ``open`` and stranded the dev push. Three independent
+    guards enforce this:
+
+    1. ``wl cleanup-worktree`` is spawned with ``cwd`` outside the worktree
+       (``_main_checkout_for``) so ContextHub's ``wl`` CLI does not
+       auto-register the invoking tree's own PID (``cli.js`` /
+       ``process-lifecycle.js`` register any process whose cwd is inside
+       ``.worklog/worktrees/`` and then reap it — including the registering
+       process itself); the kill set then only contains genuinely stray
+       PIDs registered by other sessions.
+    2. The ``wl`` subprocess runs in its own session (``start_new_session``)
+       so even a register-then-kill inside it can only reach its own
+       session/group, never the caller's.
+    3. The pgrep fallback excludes the invoking process's whole process
+       group and its ancestor/descendant chain — not merely
+       ``os.getpid()`` — via ``_pid_is_invoker_related``.
 
     Args:
         worktree_path: Absolute path to the worktree directory.
@@ -2147,9 +2259,14 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
 
     abs_path = str(Path(worktree_path).resolve())
 
-    # Try wl cleanup-worktree first
+    # Try wl cleanup-worktree first — from a cwd OUTSIDE the worktree and in
+    # its own session (guards 1 & 2 above). ``--json`` is required: without
+    # it the CLI prints human text and the kill count below would always
+    # fall through to the assume-success branch.
     wl_result = run_cmd(
-        ["wl", "cleanup-worktree", abs_path],
+        ["wl", "cleanup-worktree", abs_path, "--json"],
+        cwd=_main_checkout_for(worktree_path),
+        start_new_session=True,
         check=False,
         timeout=30,
     )
@@ -2157,7 +2274,13 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
         result["method"] = "wl_cleanup_worktree"
         try:
             data = json.loads(wl_result.stdout.strip())
-            result["terminated"] = data.get("terminated", 0)
+            # cleanup-worktree.js reports the kill count as
+            # ``processesKilled`` (single path) / ``worktreesCleaned``
+            # (``--all``); tolerate the legacy ``terminated`` key.
+            result["terminated"] = data.get(
+                "processesKilled",
+                data.get("terminated", data.get("worktreesCleaned", 0)),
+            )
             result["warning"] = data.get("warning", "")
         except (json.JSONDecodeError, ValueError):
             result["terminated"] = 1  # Assume success if exit code is 0
@@ -2185,11 +2308,14 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
                 int(pid) for pid in pgrep_result.stdout.strip().split()
                 if pid.isdigit()
             ]
-            # Exclude the current process
-            current_pid = os.getpid()
-            for pid in pids:
-                if pid == current_pid:
-                    continue
+            # Guard 3: exclude the invoking process, its whole process group
+            # and its ancestor/descendant chain — not merely ``os.getpid()``
+            # (the wrapper shell the finish was launched from is frequently
+            # exec'd into the finish process itself).
+            targets = [
+                pid for pid in pids if not _pid_is_invoker_related(pid)
+            ]
+            for pid in targets:
                 try:
                     os.kill(pid, signal.SIGTERM)
                     result["terminated"] += 1
@@ -2201,9 +2327,7 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
                 time.sleep(2)
 
             # Force kill any remaining
-            for pid in pids:
-                if pid == current_pid:
-                    continue
+            for pid in targets:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except (OSError, PermissionError):
@@ -4200,8 +4324,9 @@ def phase_finish(
     4. Test (with fix-and-re-run loop)
     5. Commit
     6. Fast-forward dev in the main checkout (AC1 — context-budget fix)
-    7. Clean up worktree processes
-    8. Push to dev (rebase + retry on concurrent advance)
+    7. Push to dev (rebase + retry on concurrent advance)
+    8. Clean up worktree processes (post-push, before removal —
+       self-exclusion-safe, SA-0MVJC5KNT0044L2B)
     9. Remove worktree
     10. Sync local parent branch (post-push, AC1/AC2)
     11. Mark in_review
@@ -4532,13 +4657,6 @@ def phase_finish(
                     exc,
                 )
 
-            # ── Step 5b: Clean up worktree processes ───────────────────────
-            LOG.info("Cleaning up worktree processes...")
-            cleanup_result = cleanup_worktree_processes(worktree_path)
-            report["steps"]["cleanup"] = cleanup_result
-            if cleanup_result.get("warning"):
-                LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
-
             # ── Step 6: Push to dev ────────────────────────────────────────
             # The push runs *before* the worktree is removed: a
             # non-fast-forward recovery must rebase the feature branch where
@@ -4583,6 +4701,20 @@ def phase_finish(
 
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
+
+            # ── Step 6b: Clean up worktree processes ───────────────────────
+            # Runs *after* the push (historically it ran before, at Step 5b):
+            # a cleanup that misbehaves can no longer pre-empt the push,
+            # which is the failure mode that stranded commits local-only
+            # (SA-0MVJC5KNT0044L2B). The cleanup still precedes the worktree
+            # removal so stray sessions holding cwd in the tree do not block
+            # ``git worktree remove``. cleanup_worktree_processes itself is
+            # additionally self-exclusion-safe (see its docstring).
+            LOG.info("Cleaning up worktree processes...")
+            cleanup_result = cleanup_worktree_processes(worktree_path)
+            report["steps"]["cleanup"] = cleanup_result
+            if cleanup_result.get("warning"):
+                LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
 
             # ── Step 7: Remove worktree ───────────────────────────────────
             # Only after a successful push — a failed push keeps the
