@@ -37,11 +37,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isAuditStale } from './audit-freshness.js';
 
-// Prefix of the content-fingerprint metadata line embedded in persisted audit
-// reports by the audit runner (`audit_runner.py`). Mirrored here so the gate
-// can detect a fingerprint-bearing audit without spawning the runner
-// (SA-0MUOO5W8J001DYTI).
-export const AUDIT_CONTENT_FINGERPRINT_PREFIX = 'Audit content fingerprint: ';
+// Prefix of the versioned content-fingerprint metadata line embedded in
+// persisted audit reports by the audit runner (`audit_runner.py`). Mirrored
+// here so the gate can detect a v2-bearing audit without spawning the runner
+// (SA-0MUOO5W8J001DYTI, SA-0MVIDICGZ0030DXC). Legacy unversioned lines
+// (`Audit content fingerprint: <hex>`) are deliberately NOT matched: their
+// fingerprints were computed with superseded formulas and cannot be recomputed,
+// so they fall back to the local time gate instead of spawning a probe that
+// would only reproduce it.
+export const AUDIT_CONTENT_FINGERPRINT_PREFIX = 'Audit content fingerprint (v2): ';
 import {
   RemediationBudget,
   classifyRemediationError,
@@ -463,14 +467,20 @@ export function queryContentFreshness(workItemId, options = {}) {
 // ── hasContentFingerprint ────────────────────────────────────────────────────
 
 /**
- * Whether a stored audit's report carries a content fingerprint.
+ * Whether a stored audit's report carries a **v2 content fingerprint**.
  *
- * The audit runner embeds a metadata line ``Audit content fingerprint: <sha>``
- * in the persisted report when the fingerprint feature captured one. Only
- * fingerprint-bearing audits can be resolved by content (the `check-freshness`
- * probe); legacy audits fall back to the time gate. Detecting it here keeps the
- * gates hermetic — no runner invocation for fingerprint-less audits — and
- * implements the AC3 fallback.
+ * The audit runner embeds a versioned metadata line
+ * ``Audit content fingerprint (v2): <sha256-hex>`` in the persisted report
+ * when the item-data-only fingerprint feature captured one (SA-0MVIDI8E00063OOP).
+ * Only v2-bearing audits can be resolved by content (the `check-freshness`
+ * probe); legacy unversioned reports (``Audit content fingerprint: <hex>``)
+ * and fingerprint-less reports fall back to the local time gate. A legacy
+ * line is deliberately NOT matched here — its fingerprint cannot be recomputed,
+ * so spawning the probe would only reproduce the time gate — and the v2
+ * prefix is not a substring of the legacy form, so the detection is
+ * version-aware by construction. Detecting it here keeps the gates hermetic —
+ * no runner invocation for legacy/fingerprint-less audits — and implements
+ * the AC3 fallback (SA-0MVIDICGZ0030DXC).
  *
  * @param {object|null} auditData - Parsed `wl audit-show <id> --json` payload.
  * @returns {boolean}

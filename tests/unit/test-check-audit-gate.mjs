@@ -1353,7 +1353,7 @@ describe('checkAuditReadyToClose - narrow --skip-audit-remediation bypass', () =
 });
 
 describe('checkAuditReadyToClose - content-fingerprint fast path', () => {
-  const FP_LINE = 'Audit content fingerprint: deadbeef';
+  const FP_LINE = 'Audit content fingerprint (v2): deadbeef';
   const ITEM = { id: 'SA-CF', title: 'CF', needsProducerReview: false, parentId: null, updatedAt: '2026-09-05T10:00:00Z' };
   const fpAudit = (readyToClose) => JSON.stringify({
     audit: {
@@ -1419,10 +1419,18 @@ describe('checkAuditReadyToClose - content-fingerprint fast path', () => {
     assert.equal(report.hasBlockingItems, false);
   });
 
-  test('hasContentFingerprint detects the metadata line', async () => {
+  test('hasContentFingerprint detects v2 in rawOutput and summary', async () => {
     const mod = await import(MODULE_PATH);
     assert.equal(mod.hasContentFingerprint({ audit: { rawOutput: `x\n${FP_LINE}` } }), true);
-    assert.equal(mod.hasContentFingerprint({ audit: { rawOutput: 'no fp' } }), false);
+    assert.equal(mod.hasContentFingerprint({ audit: { summary: `x\n${FP_LINE}` } }), true);
+  });
+
+  test('hasContentFingerprint ignores legacy unversioned and absent fingerprints', async () => {
+    const mod = await import(MODULE_PATH);
+    const LEGACY_LINE = 'Audit content fingerprint: deadbeef';
+    assert.equal(mod.hasContentFingerprint({ audit: { rawOutput: `x\n${LEGACY_LINE}` } }), false);
+    assert.equal(mod.hasContentFingerprint({ audit: { summary: `x\n${LEGACY_LINE}` } }), false);
+    assert.equal(mod.hasContentFingerprint({ audit: { rawOutput: 'no fp', summary: 'no fp' } }), false);
     assert.equal(mod.hasContentFingerprint({ audit: null }), false);
     assert.equal(mod.hasContentFingerprint(null), false);
   });
