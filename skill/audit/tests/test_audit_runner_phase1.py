@@ -981,3 +981,289 @@ class TestExtractAcsHeadingVariantsIntegration:
             capsys, "First criterion", "Second criterion",
         )
 
+
+
+# ---------------------------------------------------------------------------
+# AC5 (SA-0MVF1NKZQ009P3ZG / SA-0MVI6VRJT005M650): reduce the Phase 1 screening
+# call count. A 10-child parent currently issues N+1 serial screens (one parent
+# + one per child); batch mode folds all pending child screens into ONE call.
+# ---------------------------------------------------------------------------
+
+
+def _fake_runner():
+    """A benign wl runner that succeeds on every call (no real wl needed)."""
+    runner = mock.MagicMock()
+    runner.side_effect = lambda cmd, **kw: mock.MagicMock(
+        returncode=0, stdout=json.dumps({"success": True}), stderr=""
+    )
+    return runner
+
+
+def _make_child(idx: int, acs: int = 3) -> dict:
+    """A synthetic pending child with *acs* acceptance criteria."""
+    bullets = "\n".join(f"- Criterion {i} for child {idx}" for i in range(acs))
+    return {
+        "id": f"SA-CHILD{idx:02d}",
+        "title": f"Child {idx}",
+        "status": "open",
+        "stage": "in_progress",
+        "priority": "medium",
+        "description": f"## Acceptance Criteria\n\n{bullets}\n",
+    }
+
+
+def _phase1_children(ten: list[dict]):
+    """Pending-children pairs as the dispatcher builds them."""
+    return [(i, child) for i, child in enumerate(ten)]
+
+
+def test_phase1_batch_issues_fewer_calls_than_n_plus_one(monkeypatch):
+    """AC5: batching a 10-child parent issues materially fewer Phase 1 calls."""
+    ten = [_make_child(i) for i in range(10)]
+    pending = _phase1_children(ten)
+    contexts: list[str] = []
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        contexts.append(context)
+        # One verdict per requested AC, keyed by child + index.
+        return {"extracted_text": json.dumps([
+            {"child": ci, "index": j, "verdict": "met", "evidence": "x.py:1"}
+            for ci, _child in pending
+            for j in range(3)
+        ])}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ):
+        results = audit_runner._phase1_review_children_batched(
+            pending, "fast-model", "full-model", "pi", None, None,
+            _fake_runner(), lambda *a: None,
+        )
+
+    batched_calls = len(contexts)
+    n_plus_one_children = len(pending)  # one screen per child
+    # The N+1 structure also spends one parent screen; batching must beat it.
+    assert batched_calls < n_plus_one_children + 1, (
+        f"batched Phase 1 issued {batched_calls} calls, "
+        f"N+1 would be {n_plus_one_children + 1}"
+    )
+    assert batched_calls == 1, "all pending children must fold into ONE call"
+    # Every child still gets its own per-AC verdicts.
+    assert len(results) == len(pending)
+    for ci, _child in pending:
+        assert [r["verdict"] for r in results[ci]] == ["met", "met", "met"]
+
+
+def test_phase1_batch_preserves_verdict_semantics(monkeypatch):
+    """AC5: batching must not change met/unmet/partial/adjusted meanings."""
+    ten = [_make_child(i, acs=2) for i in range(3)]
+    pending = _phase1_children(ten)
+    scripted = {
+        0: ["met", "unmet"],
+        1: ["partial", "adjusted"],
+        2: ["unmet", "met"],
+    }
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        return {"extracted_text": json.dumps([
+            {"child": ci, "index": j, "verdict": v, "evidence": f"f{ci}.py:{j}"}
+            for ci, verdicts in scripted.items()
+            for j, v in enumerate(verdicts)
+        ])}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ):
+        results = audit_runner._phase1_review_children_batched(
+            pending, "fast-model", "full_model", "pi", None, None,
+            _fake_runner(), lambda *a: None,
+        )
+    for ci, verdicts in scripted.items():
+        assert [r["verdict"] for r in results[ci]] == verdicts
+
+
+def test_phase1_batch_missing_child_falls_back_to_partial(monkeypatch):
+    """A child absent from the batch response is 'partial', never 'met'."""
+    ten = [_make_child(0, acs=2), _make_child(1, acs=2)]
+    pending = _phase1_children(ten)
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        # Only child 0 is answered.
+        return {"extracted_text": json.dumps([
+            {"child": 0, "index": 0, "verdict": "met", "evidence": "a.py:1"},
+            {"child": 0, "index": 1, "verdict": "met", "evidence": "a.py:2"},
+        ])}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ):
+        results = audit_runner._phase1_review_children_batched(
+            pending, "fast-model", "full_model", "pi", None, None,
+            _fake_runner(), lambda *a: None,
+        )
+    assert [r["verdict"] for r in results[0]] == ["met", "met"]
+    assert [r["verdict"] for r in results[1]] == ["partial", "partial"]
+
+
+def test_phase1_batch_unparseable_response_degrades_all_to_partial(monkeypatch):
+    """A wholly unparseable batch response never yields 'met'."""
+    pending = _phase1_children([_make_child(0, acs=2)])
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        return {"extracted_text": "the model rambled instead"}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ):
+        results = audit_runner._phase1_review_children_batched(
+            pending, "fast-model", "full_model", "pi", None, None,
+            _fake_runner(), lambda *a: None,
+        )
+    assert [r["verdict"] for r in results[0]] == ["partial", "partial"]
+
+
+def test_phase1_batch_prompt_lists_every_child(monkeypatch):
+    """The batch prompt must enumerate all children with their ACs."""
+    ten = [_make_child(i, acs=1) for i in range(3)]
+    pending = _phase1_children(ten)
+    prompts: list[str] = []
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        prompts.append(prompt)
+        return {"extracted_text": json.dumps([
+            {"child": ci, "index": 0, "verdict": "met", "evidence": "x.py:1"}
+            for ci, _c in pending
+        ])}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ):
+        audit_runner._phase1_review_children_batched(
+            pending, "fast-model", "full_model", "pi", None, None,
+            _fake_runner(), lambda *a: None,
+        )
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    for child in ten:
+        assert child["id"] in prompt
+    assert "child" in prompt.lower()
+    assert "index" in prompt
+
+
+# ---------------------------------------------------------------------------
+# AC5: CLI/env surface for the Phase 1 model (defaults to current behaviour).
+# ---------------------------------------------------------------------------
+
+
+def test_phase1_batch_gate_defaults_off(monkeypatch):
+    """Batching is opt-in so no existing invocation changes behaviour."""
+    monkeypatch.delenv(audit_runner.AUDIT_PHASE1_BATCH_ENV, raising=False)
+    assert audit_runner._phase1_batch_enabled() is False
+    assert audit_runner._phase1_batch_enabled(True) is True
+    assert audit_runner._phase1_batch_enabled(False) is False
+
+
+def test_phase1_batch_gate_env_on(monkeypatch):
+    monkeypatch.setenv(audit_runner.AUDIT_PHASE1_BATCH_ENV, "1")
+    assert audit_runner._phase1_batch_enabled() is True
+
+
+def test_phase1_model_env_surface(monkeypatch):
+    """AUDIT_PHASE1_MODEL selects the Phase 1 model without touching Phase 2."""
+    monkeypatch.setenv(audit_runner.AUDIT_PHASE1_MODEL_ENV, "fast-phase1")
+    assert audit_runner._resolve_phase1_model(None) == "fast-phase1"
+    # Explicit CLI wins over the env var.
+    assert audit_runner._resolve_phase1_model("cli-model") == "cli-model"
+
+
+def test_phase1_model_defaults_to_resolved_model(monkeypatch):
+    """Absent any override, Phase 1 keeps using the resolved audit model."""
+    monkeypatch.delenv(audit_runner.AUDIT_PHASE1_MODEL_ENV, raising=False)
+    assert audit_runner._resolve_phase1_model(None) is None
+
+
+def test_cli_exposes_batch_phase1_and_phase1_model():
+    parser = audit_runner.build_parser()
+    args = parser.parse_args([
+        "issue", "SA-X", "--batch-phase1", "--phase1-model", "fast-model",
+    ])
+    assert args.batch_phase1 is True
+    assert args.phase1_model == "fast-model"
+
+
+def test_phase1_batch_parity_with_per_child_on_fixed_item_set(monkeypatch):
+    """AC5: batched and per-child screening give equivalent verdicts.
+
+    Fixed item set of 4 children x 2 ACs with a scripted model answer. The
+    per-child path (N calls) and the batched path (1 call) must produce
+    identical verdict/evidence per criterion — the batching-on/off comparison
+    recorded for the frozen-semantics constraint.
+    """
+    children = [_make_child(i, acs=2) for i in range(4)]
+    # Deterministic answers keyed by (child, index); reused by BOTH paths.
+    answer = {
+        (0, 0): ("met", "a.py:1"),
+        (0, 1): ("unmet", "a.py:2"),
+        (1, 0): ("partial", "b.py:1"),
+        (1, 1): ("adjusted", "b.py:2"),
+        (2, 0): ("met", "c.py:1"),
+        (2, 1): ("met", "c.py:2"),
+        (3, 0): ("unmet", "d.py:1"),
+        (3, 1): ("met", "d.py:2"),
+    }
+
+    # --- per-child path: one call per child, indexes are per-child ---
+    per_child_calls = 0
+
+    def per_child_call(issue_id, context, prompt, **kwargs):
+        nonlocal per_child_calls
+        per_child_calls += 1
+        child_idx = int(str(context).split(":")[-1].replace("SA-CHILD", ""))
+        return {"extracted_text": json.dumps([
+            {"index": j, "verdict": v, "evidence": e}
+            for (ci, j), (v, e) in answer.items() if ci == child_idx
+        ])}
+
+    per_child: dict[int, list[dict]] = {}
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=per_child_call
+    ):
+        for ci, child in enumerate(children):
+            _ci, acs = audit_runner._phase1_review_child_acs(
+                ci, child, "m", "m", "pi", None, None,
+                _fake_runner(), lambda *a: None,
+            )
+            per_child[_ci] = acs
+
+    # --- batched path: ONE call, answers carry the child index ---
+    batch_calls = 0
+
+    def batched_call(issue_id, context, prompt, **kwargs):
+        nonlocal batch_calls
+        batch_calls += 1
+        return {"extracted_text": json.dumps([
+            {"child": ci, "index": j, "verdict": v, "evidence": e}
+            for (ci, j), (v, e) in answer.items()
+        ])}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=batched_call
+    ):
+        batched = audit_runner._phase1_review_children_batched(
+            list(enumerate(children)), "m", "m", "pi", None, None,
+            _fake_runner(), lambda *a: None,
+        )
+
+    assert per_child_calls == 4, "baseline is one call per child (plus parent)"
+    assert batch_calls == 1, "batching must fold all children into one call"
+    # Recorded equivalence: identical verdict + evidence per criterion.
+    for ci in range(4):
+        assert [r["verdict"] for r in batched[ci]] == [
+            r["verdict"] for r in per_child[ci]
+        ]
+        assert [r["evidence"] for r in batched[ci]] == [
+            r["evidence"] for r in per_child[ci]
+        ]
+        assert [r["text"] for r in batched[ci]] == [
+            r["text"] for r in per_child[ci]
+        ]

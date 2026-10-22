@@ -1518,10 +1518,12 @@ class TestCanonicalScanningBlock:
             f"inline SCANNING string literals: {inline}"
 
     def test_canonical_block_used_at_every_prompt_site(self):
-        """AC1: the constant is referenced at all 5 prompt sites."""
+        """AC1: the constant is referenced at all 6 prompt sites."""
         src = Path(audit_runner.__file__).read_text()
         refs = re.findall(r'\{_SCANNING_BLOCK\}', src)
-        assert len(refs) == 5, f"prompt-site references: {refs}"
+        # Phase 1 parent, Phase 1 child, Phase 1 batch (SA-0MVI6VRJT005M650),
+        # Phase 2 parent, Phase 2 child, Phase 2 batch.
+        assert len(refs) == 6, f"prompt-site references: {refs}"
 
     def test_canonical_block_is_the_full_version(self):
         """The canonical block carries list-files and the .worklog grep note."""

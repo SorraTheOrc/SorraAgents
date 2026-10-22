@@ -4214,6 +4214,62 @@ def _phase2_batch_enabled(cli_value: bool | None = None) -> bool:
     return env_value.strip().lower() in ("1", "true", "yes", "on")
 
 
+AUDIT_PHASE1_BATCH_ENV = "AUDIT_PHASE1_BATCH"
+"""Environment variable enabling Phase 1 batch screening (SA-0MVI6VRJT005M650).
+
+When set to a truthy value (and ``--batch-phase1`` is not passed), the
+pending child Phase-1 AC screens are folded into ONE indexed ``pi`` call
+(``phase1_batch``) instead of one full-prompt session per child. Phase 1 is
+the dominant cost centre (44 % of measured call time on the committed
+baseline; 62 % on the epic brief's accounting), and its per-child calls are
+the N of the N+1 structure.
+
+Off by default so no existing invocation changes behaviour until the
+batching-on/off parity evidence is reviewed (frozen-verdict-semantics
+constraint, SA-0MVF1NKZQ009P3ZG §Constraints).
+"""
+
+AUDIT_PHASE1_MODEL_ENV = "AUDIT_PHASE1_MODEL"
+"""Environment variable selecting the Phase 1 screening model.
+
+Phase 1 screening is structurally shallow (read the manifest, map each AC to
+a verdict) and is 44-62 % of audit call time, so routing it to a faster model
+is the cheapest per-call win available. Unset by default: Phase 1 keeps the
+resolved audit model so no invocation silently changes model
+(SA-0MVI6VRJT005M650 AC5).
+"""
+
+
+def _phase1_batch_enabled(cli_value: bool | None = None) -> bool:
+    """Resolve whether Phase 1 batch screening is enabled.
+
+    Precedence:
+      1. ``--batch-phase1`` CLI flag (explicit override)
+      2. ``AUDIT_PHASE1_BATCH`` environment variable (truthy)
+      3. ``False`` (default — preserves the existing N+1 per-child pattern)
+    """
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(AUDIT_PHASE1_BATCH_ENV, "")
+    return env_value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_phase1_model(cli_value: str | None = None) -> str | None:
+    """Resolve the Phase 1 screening model override, if any.
+
+    Precedence:
+      1. ``--phase1-model`` CLI flag (explicit override)
+      2. ``AUDIT_PHASE1_MODEL`` environment variable
+      3. ``None`` — callers fall back to the resolved audit model, so an
+         existing invocation never silently changes model
+         (SA-0MVI6VRJT005M650 AC5).
+    """
+    if cli_value:
+        return cli_value
+    env_value = os.environ.get(AUDIT_PHASE1_MODEL_ENV)
+    return env_value or None
+
+
 AUDIT_CHILD_IN_MAIN_SLOT_ENV = "AUDIT_CHILD_IN_MAIN_SLOT"
 """Environment variable for the child-audit execution mode gate.
 
@@ -7100,6 +7156,171 @@ def _child_acs_from_own_audit(child: dict, runner: Runner,
     return fallback if fallback is not None else fallback_met
 
 
+def _phase1_review_children_batched(
+    pending_children: list[tuple[int, dict]],
+    phase1_model: str,
+    full_model: str,
+    pi_bin: str,
+    debug_log: str | None,
+    timeout: int | None,
+    runner: Runner,
+    script_failure_callback: Callable[[str, Exception], None],
+    ac_fallback_used: threading.Event | None = None,
+) -> dict[int, list[dict]]:
+    """Screen ALL pending children's ACs in ONE indexed Phase 1 call.
+
+    Collapses the N child screens of the N+1 Phase 1 structure into a single
+    ``pi`` call (context ``phase1_batch``). Each child contributes a
+    ``child`` index and its ACs keep their per-child ``index``, so the reply
+    is a flat array of ``{child, index, verdict, evidence}`` objects that map
+    deterministically back onto the per-child AC lists.
+
+    Verdict semantics are unchanged (SA-0MVF1NKZQ009P3ZG §Constraints): a
+    child whose entries are missing from the reply — or a reply that is not
+    parseable at all — degrades that child's ACs to the conservative
+    ``partial`` verdict, exactly as a failed single-child screen does. A
+    batch can therefore never turn an unexamined AC into ``met``.
+
+    Returns ``{child_index: [ac_result, ...]}`` for every pending child.
+    Never raises: a Pi ``RuntimeError`` records a script failure and degrades
+    every child to ``partial``.
+    """
+    prepared: list[tuple[int, dict, list[str]]] = []
+    for ci, child in pending_children:
+        acs = _extract_acs(child.get("description", ""))
+        if acs and acs[0] != "No acceptance criteria defined.":
+            prepared.append((ci, child, acs))
+
+    # A child with no ACs needs no model call; start from its own result.
+    results: dict[int, list[dict]] = {
+        ci: [
+            {"text": ac, "verdict": VERDICT_PARTIAL,
+             "evidence": "No acceptance criteria to screen."}
+            for ac in _extract_acs(child.get("description", ""))
+        ]
+        for ci, child in pending_children
+        if not (_extract_acs(child.get("description", ""))
+                and _extract_acs(child.get("description", ""))[0]
+                != "No acceptance criteria defined.")
+    }
+    if not prepared:
+        return results
+
+    entries = [
+        {"child": ci, "index": j, "text": ac}
+        for ci, _child, acs in prepared
+        for j, ac in enumerate(acs)
+    ]
+    children_block = "\n\n".join(
+        f"### child={ci} — {child.get('id', '')}: {child.get('title', '')}\n"
+        f"{_build_file_scope_manifest(child, [], runner=runner)}"
+        for ci, child, _acs in prepared
+    )
+    prompt = (
+        f"[READ-ONLY AUDIT] You are performing a read-only audit. "
+        f"Do NOT close, modify, create, or delete any work items. "
+        f"Do NOT execute any wl, git, or other state-modifying commands. "
+        f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
+        f"Review the acceptance criteria of EVERY child work item below "
+        f"against the codebase in ONE pass. Return a SINGLE flat JSON array of "
+        f"objects, each with keys 'child' (integer, the child index shown "
+        f"below), 'index' (integer, the criterion's index within that child), "
+        f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
+        f"(a one-line note with a file:line reference). Return exactly one "
+        f"object per criterion listed.\n\n"
+        f"FILE SCOPE — Read ONLY the files listed in the per-child manifests "
+        f"below. Do not explore the whole repository. If a criterion requires "
+        f"a file not listed, state that in the evidence instead of searching "
+        f"for it.\n\n"
+        f"{children_block}\n\n"
+        f"{_SCANNING_BLOCK}"
+        f"If a criterion has acceptable variance (implementation differs from "
+        f"original spec but still satisfies user story intent), use verdict "
+        f"'adjusted' instead of 'unmet'. Include justification in the "
+        f"evidence field.\n\n"
+        f"Criteria: {json.dumps(entries)}"
+    )
+
+    try:
+        result = _call_pi_and_maybe_log(
+            "", "phase1_batch", prompt,
+            model=phase1_model, pi_bin=pi_bin, debug_log=debug_log,
+            timeout=timeout, ac_fallback_used=ac_fallback_used,
+            json_expected=True,
+        )
+    except RuntimeError as exc:
+        script_failure_callback("pi (phase1 batch review)", exc)
+        print(
+            f"Warning: Pi call failed for batched Phase 1 child review: {exc}",
+            file=sys.stderr,
+        )
+        result = {}
+    raw_text = (
+        result.get("extracted_text", "") or result.get("evidence", "")
+        or result.get("text", "")
+    )
+    batch = _extract_json_array(raw_text)
+    if batch is None:
+        try:
+            parsed = json.loads(raw_text)
+            batch = parsed if isinstance(parsed, list) else None
+        except (json.JSONDecodeError, TypeError):
+            batch = None
+    if not batch:
+        # AC4 safe fallback: a retry with the full model only when a distinct
+        # fast model was used, then conservative 'partial' for every child.
+        if phase1_model != full_model:
+            print(
+                "Warning: fast Phase 1 model produced unparseable output — "
+                "retrying batched child review with the full audit model",
+                file=sys.stderr,
+            )
+            try:
+                result = _call_pi_and_maybe_log(
+                    "", "phase1_batch", prompt,
+                    model=full_model, pi_bin=pi_bin, debug_log=debug_log,
+                    timeout=timeout, ac_fallback_used=ac_fallback_used,
+                    json_expected=True,
+                )
+                raw_text = (
+                    result.get("extracted_text", "")
+                    or result.get("evidence", "")
+                    or result.get("text", "")
+                )
+                batch = _extract_json_array(raw_text)
+            except RuntimeError:
+                batch = None
+    answers: dict[tuple[int, int], dict] = {}
+    for item in batch or []:
+        if not isinstance(item, dict):
+            continue
+        child_idx = item.get("child")
+        ac_idx = item.get("index")
+        if isinstance(child_idx, int) and isinstance(ac_idx, int):
+            answers[(child_idx, ac_idx)] = item
+    for ci, child, acs in prepared:
+        ac_results: list[dict] = []
+        for j, ac in enumerate(acs):
+            item = answers.get((ci, j), {})
+            if item:
+                ac_results.append({
+                    "text": ac,
+                    "verdict": _normalize_verdict(item.get("verdict", "unmet")),
+                    "evidence": _evidence_text(item.get("evidence")),
+                })
+            else:
+                ac_results.append({
+                    "text": ac,
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": (
+                        "Batched Phase-1 screen returned no verdict for this "
+                        "criterion — treated as partial (never met)."
+                    ),
+                })
+        results[ci] = ac_results
+    return results
+
+
 def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                              full_model: str, pi_bin: str,
                              debug_log: str | None,
@@ -9669,8 +9890,10 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # Tiered Phase 1 model (SA-0MSKB697P000T3HG): when a distinct phase-1
     # model is supplied it screens Phase 1 (parent + child AC screening)
     # while Phase 2 deep analysis keeps the full model; otherwise both phases
-    # share the resolved model.
-    phase1_model = ctx.phase1_model or resolved_model
+    # share the resolved model. The override comes from --phase1-model /
+    # AUDIT_PHASE1_MODEL (SA-0MVI6VRJT005M650 AC5) and defaults to the
+    # resolved audit model so no invocation silently changes model.
+    phase1_model = ctx.phase1_model or _resolve_phase1_model() or resolved_model
 
     if runner is None:
         runner = _default_runner
@@ -11662,7 +11885,26 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     # forced to 1; the separate-process path keeps the slot-aware
                     # parallel ceiling.
                     parallelism = 1 if ctx.child_in_main_slot else _resolve_child_concurrency()
-                    if parallelism > 1 and len(pending_children) > 1:
+                    # Phase 1 batch screening (SA-0MVI6VRJT005M650 AC5): fold
+                    # every pending child screen into ONE call instead of the
+                    # N child calls of the N+1 structure. Opt-in (default off)
+                    # and never used in-main-slot mode, which is inherently
+                    # sequential by design.
+                    if (
+                        len(pending_children) > 1
+                        and not ctx.child_in_main_slot
+                        and _phase1_batch_enabled()
+                    ):
+                        _batched = _phase1_review_children_batched(
+                            pending_children,
+                            ctx.resolved_phase1_model, ctx.resolved_model,
+                            pi_bin, debug_log, timeout,
+                            runner, ctx.record_script_failure,
+                            ac_fallback_used=ac_fallback_used,
+                        )
+                        for _ci, _acs in _batched.items():
+                            child_results[_ci]["ac_results"] = _acs
+                    elif parallelism > 1 and len(pending_children) > 1:
                         with ThreadPoolExecutor(max_workers=parallelism) as executor:
                             futures = [
                                 executor.submit(
@@ -12187,7 +12429,26 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     # forced to 1; the separate-process path keeps the slot-aware
                     # parallel ceiling.
                     parallelism = 1 if ctx.child_in_main_slot else _resolve_child_concurrency()
-                    if parallelism > 1 and len(pending_children) > 1:
+                    # Phase 1 batch screening (SA-0MVI6VRJT005M650 AC5): fold
+                    # every pending child screen into ONE call instead of the
+                    # N child calls of the N+1 structure. Opt-in (default off)
+                    # and never used in-main-slot mode, which is inherently
+                    # sequential by design.
+                    if (
+                        len(pending_children) > 1
+                        and not ctx.child_in_main_slot
+                        and _phase1_batch_enabled()
+                    ):
+                        _batched = _phase1_review_children_batched(
+                            pending_children,
+                            ctx.resolved_phase1_model, ctx.resolved_model,
+                            pi_bin, debug_log, timeout,
+                            runner, ctx.record_script_failure,
+                            ac_fallback_used=ac_fallback_used,
+                        )
+                        for _ci, _acs in _batched.items():
+                            child_results[_ci]["ac_results"] = _acs
+                    elif parallelism > 1 and len(pending_children) > 1:
                         with ThreadPoolExecutor(max_workers=parallelism) as executor:
                             futures = [
                                 executor.submit(
@@ -14046,6 +14307,21 @@ def build_parser() -> argparse.ArgumentParser:
                              "pending child ACs into ONE indexed pi call (env: "
                              "AUDIT_PHASE2_BATCH; default off)"
                          ))
+    p_issue.add_argument("--batch-phase1", action="store_true", default=None,
+                         help=(
+                             "Enable Phase 1 batch screening: fold every pending "
+                             "child's AC screen into ONE indexed pi call instead "
+                             "of one session per child (env: AUDIT_PHASE1_BATCH; "
+                             "default off — preserves the N+1 behaviour) "
+                             "(SA-0MVI6VRJT005M650)"
+                         ))
+    p_issue.add_argument("--phase1-model", default=None,
+                         help=(
+                             "Model used for Phase 1 parent/child AC screening "
+                             "(env: AUDIT_PHASE1_MODEL). Default: the resolved "
+                             "audit model, so no invocation silently changes "
+                             "model (SA-0MVI6VRJT005M650)"
+                         ))
     p_issue.add_argument("--child-in-main-slot", action="store_true",
                          default=None,
                          help=(
@@ -14428,6 +14704,17 @@ def _run_session_cleanup(args) -> None:
 
 def _run_issue_command(args) -> int:
     """Run the ``issue`` subcommand body (extracted for the F5 host gate)."""
+    # CLI flags for the Phase 1 levers are exported to their env vars for this
+    # process (mirrors the --max-concurrency pattern): _phase1_batch_enabled()
+    # and _resolve_phase1_model() read them at the dispatch sites, and the
+    # values are inherited by every spawned pi subprocess
+    # (SA-0MVI6VRJT005M650 AC5).
+    batch_phase1_flag = getattr(args, "batch_phase1", None)
+    if batch_phase1_flag is not None:
+        os.environ[AUDIT_PHASE1_BATCH_ENV] = "1" if batch_phase1_flag else "0"
+    phase1_model_flag = getattr(args, "phase1_model", None)
+    if phase1_model_flag:
+        os.environ[AUDIT_PHASE1_MODEL_ENV] = phase1_model_flag
     with SharedTimer("audit_runner_issue") as _root_timer:
         try:
             _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,
