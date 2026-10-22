@@ -186,14 +186,14 @@ class TestBudgetExhaustionRecording:
         diagnostic naming the budget + remediation, and the checkpoint file is
         written with the marker and kept for resume."""
         h = _Harness(tmp_path)
-        rc, out, err = h.run(elapsed=800.0)
+        rc, out, err = h.run(elapsed=1400.0)
 
         assert rc == 0
         payload = json.loads(out)
         ac = payload["children"][0]["ac_results"][0]
         assert ac["verdict"] == "partial"
         assert ac["text"] == "partial (budget exceeded)"
-        assert "710s" in ac["evidence"]
+        assert "1310s" in ac["evidence"]
         assert "--parent-timeout" in ac["evidence"]
         assert "AUDIT_PARENT_TIMEOUT" in ac["evidence"]
         assert payload["children"][0]["budget_exceeded"] is True
@@ -202,7 +202,7 @@ class TestBudgetExhaustionRecording:
         assert _checkpoint_path(tmp_path).exists()
         markers = _read_markers(tmp_path)
         assert "CHILD-1" in markers
-        assert markers["CHILD-1"]["budget_s"] == 710.0
+        assert markers["CHILD-1"]["budget_s"] == 1310.0
 
         # AC3 (no bare skip): the old hidden-cause message is gone.
         assert "Skipped due to audit timeout" not in err
@@ -212,7 +212,7 @@ class TestBudgetExhaustionRecording:
         """The prior run records phase1_parent/phase1_children/phase2 so a
         resume can skip them (AC4 prerequisite)."""
         h = _Harness(tmp_path)
-        h.run(elapsed=800.0)
+        h.run(elapsed=1400.0)
         store = CheckpointStore("TEST-1", HEAD, tmp_path)
         assert store.is_resuming is True
         assert store.phase_status(PHASE_PARENT) == STATUS_COMPLETED
@@ -229,7 +229,7 @@ class TestBudgetExceededResume:
         """AC3: a resumed run re-audits the budget-exceeded child to a real
         verdict and clears the checkpoint on success."""
         h = _Harness(tmp_path)
-        h.run(elapsed=800.0)  # run 1: budget trip
+        h.run(elapsed=1400.0)  # run 1: budget trip
         assert _read_markers(tmp_path)  # marker persisted
 
         h.screen_contexts.clear()
@@ -249,7 +249,7 @@ class TestBudgetExceededResume:
         """AC4: the resumed run does NOT re-run the completed parent Phase 1
         screening and does NOT re-run the parent Phase 2 deep analysis."""
         h = _Harness(tmp_path)
-        h.run(elapsed=800.0)
+        h.run(elapsed=1400.0)
 
         h.screen_contexts.clear()
         h.deep_calls.clear()
@@ -266,7 +266,7 @@ class TestBudgetExceededResume:
         """After a successful resume the checkpoint is gone; a third run is a
         fresh (non-resuming) run — no stale state is reused."""
         h = _Harness(tmp_path)
-        h.run(elapsed=800.0)
+        h.run(elapsed=1400.0)
         h.run(elapsed=30.0)
         assert not _checkpoint_path(tmp_path).exists()
 

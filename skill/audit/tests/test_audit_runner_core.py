@@ -1458,16 +1458,25 @@ class TestParentTimeoutResolution:
     """
 
     def test_default_guard_base_and_scaling_constants(self):
-        """AC1: The default guard is a base term plus a per-child budget."""
+        """AC1: The default guard is a base term plus a per-child budget.
+
+        SA-0MVI3608M0080QLW raised the per-child term to 1200 s so it covers
+        one full child screen at the derived 1080 s budget — the parent guard
+        must never become the new starvation point.
+        """
         assert audit_runner.PARENT_TIMEOUT_DEFAULT == 110
-        assert audit_runner.PARENT_TIMEOUT_PER_CHILD == 600
+        assert audit_runner.PARENT_TIMEOUT_PER_CHILD == 1200
+        assert (
+            audit_runner.PARENT_TIMEOUT_PER_CHILD
+            >= audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT
+        )
 
     def test_default_guard_scales_with_child_count(self):
         """AC1: The computed default guard scales with child count (>110s for N>1)."""
         assert audit_runner._default_parent_timeout(0) == 110
-        assert audit_runner._default_parent_timeout(1) == 710
-        assert audit_runner._default_parent_timeout(2) == 1310
-        assert audit_runner._default_parent_timeout(10) == 6110
+        assert audit_runner._default_parent_timeout(1) == 1310
+        assert audit_runner._default_parent_timeout(2) == 2510
+        assert audit_runner._default_parent_timeout(10) == 12110
         assert audit_runner._default_parent_timeout(10) > 110
 
     def test_env_var_constant_defined(self):
@@ -1811,12 +1820,12 @@ class TestParentTimeoutGuardBehavior:
         return rc
 
     def test_default_guard_skips_child_in_pathological_run(self, capsys):
-        """AC5/AC3: The scaled default guard (710s for a 1-child parent) still
-        trips for a pathological elapsed time (800s), and the skip diagnostic
-        records an explicit ``partial (budget exceeded)`` verdict naming the
-        computed budget and the override (SA-0MU32T6O0001UALR AC2) — never a
-        bare "Skipped due to audit timeout" skip."""
-        rc = self._run(parent_timeout=None, elapsed=800.0)
+        """AC5/AC3: The scaled default guard (1310s for a 1-child parent)
+        still trips for a pathological elapsed time (1400s), and the skip
+        diagnostic records an explicit ``partial (budget exceeded)`` verdict
+        naming the computed budget and the override (SA-0MU32T6O0001UALR
+        AC2) — never a bare "Skipped due to audit timeout" skip."""
+        rc = self._run(parent_timeout=None, elapsed=1400.0)
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         err = captured.err
@@ -1826,7 +1835,7 @@ class TestParentTimeoutGuardBehavior:
         ac = child["ac_results"][0]
         assert ac["verdict"] == "partial"
         assert ac["text"] == "partial (budget exceeded)"
-        assert "710s" in ac["evidence"]
+        assert "1310s" in ac["evidence"]
         assert "--parent-timeout" in ac["evidence"]
         assert "AUDIT_PARENT_TIMEOUT" in ac["evidence"]
         assert child.get("budget_exceeded") is True
@@ -3085,7 +3094,8 @@ class TestChildScreenShortBudget:
         """A child Phase-1 screen exceeding its short budget returns a clean timeout verdict.
 
         The effective per-call budget for a child screen defaults to
-        ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600s), never the full 1800s.
+        ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080s, derived from measured p95 x
+        2 — SA-0MVI3608M0080QLW), never the full 1800s.
         """
         mock_process = self._timeout_mock_process()
         with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
@@ -3132,7 +3142,10 @@ class TestChildScreenShortBudget:
 
     def test_child_screen_timeout_constants_defined(self):
         assert audit_runner.AUDIT_CHILD_SCREEN_TIMEOUT_ENV == "AUDIT_CHILD_SCREEN_TIMEOUT"
-        assert audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT == 600
+        # Derived: ceil(measured p95 506 s x safety factor 2) -> 1080 s
+        # (SA-0MVI3608M0080QLW). Pinned so an unexplained edit is caught.
+        assert audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT == 1080
+        assert audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT < audit_runner.CALL_PI_TIMEOUT
 
     def test_phase1_review_child_acs_forwards_child_screen(self):
         """_phase1_review_child_acs passes child_screen=True to _call_pi."""

@@ -611,7 +611,9 @@ their own patches.
 
 **Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `600s` per child — e.g. ~710s for a single child, ~6,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, each remaining child is recorded as `partial (budget exceeded)` — never a bare skip — with a diagnostic naming the elapsed time, the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override, and a resumable checkpoint marker is written immediately (see the budget-exceeded contract below). On timeout, returns `unmet` with evidence "Pi model call timed out."
 
-**Child Phase-1 screen budget (LP-0MSQ32S2M001EA74):** lightweight child Phase-1 AC-review screens use a short per-call budget — default 600s, configurable via `--child-screen-timeout SECONDS` (flag wins) or the `AUDIT_CHILD_SCREEN_TIMEOUT` env var. A screen that exceeds its budget returns a clean timeout verdict (`_timeout` marker + timeout evidence) and never burns the full 1800s. Parent Phase-1 screens and all Phase 2 calls (parent + child deep analysis) keep the 1800s budget.
+**Child Phase-1 screen budget (LP-0MSQ32S2M001EA74, right-sized by SA-0MVI3608M0080QLW):** lightweight child Phase-1 AC-review screens use a short per-call budget — default **1080 s**, configurable via `--child-screen-timeout SECONDS` (flag wins) or the `AUDIT_CHILD_SCREEN_TIMEOUT` env var. The default is **derived from measurement, not guessed**: on the 2026-10-21 reference run eleven child screens split into six completions (258/336/337/394/463/506 s) and five that landed exactly on the old 600 s cap, i.e. the unconstrained p95 (~506 s) sat only ~15 % below the cap and 45 % of screens capped out. The budget is `ceil(p95 x safety_factor)` with a documented **safety factor of 2** → `ceil(506 x 2) = 1012`, rounded up to 1080 s (~2.1x headroom), still far below the 1800 s Phase-2 budget. Re-derive on a new corpus with `scripts/measure_audit_performance.py --root ~/.audit_debug` (child row, p95 column → `ceil(p95 x 2)`). `PARENT_TIMEOUT_PER_CHILD` is kept **≥ the child budget** (1200 s) so the parent's cumulative guard never becomes the new starvation point; verified against the corpus at ≤ 5 % of screens landing on the cap (was 45 %).
+
+**A capped screen is quarantined, never a silent judgement:** a screen that hits its budget returns the conservative `partial` verdict whose evidence names the budget and phase (*"Child screen reached its Phase 1 budget (1080 s, AUDIT_CHILD_SCREEN_TIMEOUT) before returning a verdict — QUARANTINED as partial (never met)"*), and the run increments `child_screen_timeouts` in `AUDIT_RELIABILITY_SUMMARY` so downstream consumers can exclude it rather than read a timeout as a model verdict. A screen that exceeds its budget never burns the full 1800 s. Parent Phase-1 screens and all Phase 2 calls (parent + child deep analysis) keep the 1800 s budget.
 
 **Budget baseline derivation (SA-0MU32T6O0001UALR):** the cumulative elapsed-time guard (`elapsed_guard`) previously used inconsistent ad-hoc values (~120s, 900s, 1500s, 3110s) across different runs. SA-0MU32T6O0001UALR introduced the `Per-call timing:` debug-log line (emitted by `_maybe_log_debug_info` for every Pi call) and the `_derive_budget_baseline()` helper that parses these lines to compute p50/p95 per phase context (e.g. `phase1_parent`, `phase2_deep`). The derived budget per phase is `p95 × BUDGET_SAFE_MARGIN_DEFAULT` (default safety margin 1.5 = p95 + 50 % headroom). The parent-process budget defaults to `PARENT_TIMEOUT_DEFAULT + N × PARENT_TIMEOUT_PER_CHILD` (110s base + 600s per child), which is itself derived from the same timing data for consistency. The derived baseline can be used to right-size `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` for future runs. Example timing line: ``Per-call timing: issue_id=SA-XXX context=phase2_deep elapsed_seconds=30.5 input_tokens=5000 ac_count=3 model=gpt-4``. The helper functions `_parse_per_call_timing_lines()` and `_derive_budget_baseline()` are available in `audit_runner.py` for one-time analysis.
 
@@ -842,7 +844,7 @@ issue` run emits **exactly one** machine-greppable summary line to stderr and
 appends it to the persisted report:
 
 ```
-AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> elapsed_seconds=<x>
+AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n> elapsed_seconds=<x>
 ```
 
 The keys (and their order) are the stable contract `RELIABILITY_SUMMARY_KEYS`;
@@ -852,8 +854,10 @@ all Pi calls in the run, including re-asks: `calls` (Pi calls),
 was expected), `timeouts` (`_timeout` results), `child_skips` (children
 recorded `partial (budget exceeded)`), `provider_errors` (`_provider_error`
 results), `concurrency_waits` (audit-slot `_concurrency_timeout` results),
-and `verdict_reasks` (bounded JSON-contract re-asks issued —
-SA-0MVI6VNDF001VE1S). The line is emitted once per run via
+`verdict_reasks` (bounded JSON-contract re-asks issued —
+SA-0MVI6VNDF001VE1S), and `child_screen_timeouts` (child Phase-1 screens
+that hit their budget and were quarantined as `partial` —
+SA-0MVI3608M0080QLW). The line is emitted once per run via
 `emit_reliability_summary()` — from the
 normal report path and, where possible, from an early-exit `finally` (timeout
 or abort before report assembly) so partial runs are still measurable. It

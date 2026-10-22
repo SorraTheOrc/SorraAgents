@@ -612,7 +612,14 @@ CLI flag or the ``AUDIT_PARENT_TIMEOUT`` environment variable (see
 ``_resolve_parent_timeout``) for harnesses that allow longer parent runs.
 """
 
-PARENT_TIMEOUT_PER_CHILD = 600
+PARENT_TIMEOUT_PER_CHILD = 1200
+"""Per-child term (seconds) added to the parent cumulative guard.
+
+Must be >= ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s): raising the child
+budget would otherwise make the parent guard the new starvation point and
+skip children that could still have completed
+(SA-0MVI3608M0080QLW). Kept at 1200 s for ~10 % slack over one full screen.
+"""
 """Per-child budget (seconds) added to ``PARENT_TIMEOUT_DEFAULT`` when the
 default elapsed-time guard is scaled by the number of active children (see
 ``_default_parent_timeout``). ~10 min per child accommodates typical child
@@ -639,12 +646,38 @@ timeout evidence) — never a full 1800 s burn. Overridable via the
 ``--child-screen-timeout`` CLI flag (flag wins) or this env var.
 """
 
-_CHILD_SCREEN_TIMEOUT_DEFAULT = 600
+_CHILD_SCREEN_TIMEOUT_DEFAULT = 1080
 """Default per-call budget (seconds) for child Phase-1 AC-review screens.
 
-Set conservatively above healthy child Phase-1 durations (30-190 s) but far
-below the 1800 s Phase-2 budget, so a stalled lightweight child screen fails
-fast instead of burning a full 30-min budget (LP-0MSQ32S2M001EA74 AC1).
+**Derivation (SA-0MVI3608M0080QLW, measured — not guessed).** On the 2026-10-21
+reference run (ContextHub, 16-core host, load ~3) eleven child screens split
+into six completions and five that landed exactly on the old 600 s cap:
+
+    completions: 258, 336, 337, 394, 463, 506 s
+    p95 of completions: ~506 s   (median 389 s, max 506 s)
+
+So the old 600 s cap left only ~15 % headroom over the unconstrained p95 — any
+host-load increase converted completions into timeouts, and 5 of 11 screens
+(45 %) capped out. The budget is therefore derived as
+``ceil(p95 x safety_factor)`` with a documented **safety factor of 2**:
+``ceil(506 x 2) = 1012`` s, rounded up to **1080 s** (18 min) for a round value
+with a little extra slack. That keeps ~2.1x headroom over measured p95 while
+staying far below the 1800 s Phase-2 budget, so a genuinely stalled screen
+still fails fast.
+
+Re-derivation on a new corpus::
+
+    python3 scripts/measure_audit_performance.py --root ~/.audit_debug
+    # child row, p95 column -> ceil(p95 x 2)
+
+A capped screen is quarantinable, not silent: it degrades to ``partial`` with
+evidence naming the budget and phase, and increments the run's
+``child_screen_timeouts`` reliability counter
+(``AUDIT_RELIABILITY_SUMMARY``), so downstream consumers can exclude it
+instead of treating a timeout as a model judgement.
+
+``PARENT_TIMEOUT_PER_CHILD`` is kept >= this budget so the parent's cumulative
+guard never becomes the new starvation point.
 """
 
 AUDIT_STALL_TIMEOUT_ENV = "AUDIT_STALL_TIMEOUT"
@@ -892,6 +925,7 @@ RELIABILITY_SUMMARY_KEYS = (
     "provider_errors",
     "concurrency_waits",
     "verdict_reasks",
+    "child_screen_timeouts",
 )
 #: Machine-greppable prefix; the full line is ``<prefix> <key=value> ...``.
 RELIABILITY_SUMMARY_PREFIX = "AUDIT_RELIABILITY_SUMMARY"
@@ -7290,6 +7324,17 @@ def _phase1_review_children_batched(
                 batch = _extract_json_array(raw_text)
             except RuntimeError:
                 batch = None
+    # A capped child screen is quarantined, not silently treated as a model
+    # judgement (SA-0MVI3608M0080QLW): the result keeps the conservative
+    # `partial` verdict but its evidence names the budget and phase, and the
+    # run counts it in `child_screen_timeouts` so downstream consumers can
+    # exclude it.
+    capped = bool(
+        isinstance(result, dict)
+        and (result.get("_timeout") or result.get("_concurrency_timeout"))
+    )
+    if capped:
+        _rel_incr("child_screen_timeouts")
     answers: dict[tuple[int, int], dict] = {}
     for item in batch or []:
         if not isinstance(item, dict):
@@ -7309,13 +7354,23 @@ def _phase1_review_children_batched(
                     "evidence": _evidence_text(item.get("evidence")),
                 })
             else:
+                if capped:
+                    evidence = (
+                        "Child screen reached its Phase 1 budget "
+                        f"({_CHILD_SCREEN_TIMEOUT_DEFAULT} s, "
+                        "AUDIT_CHILD_SCREEN_TIMEOUT) before returning a "
+                        "verdict — QUARANTINED as partial (never met); raise "
+                        "the budget and re-run to verify this criterion."
+                    )
+                else:
+                    evidence = (
+                        "Batched Phase-1 screen returned no verdict for this "
+                        "criterion — treated as partial (never met)."
+                    )
                 ac_results.append({
                     "text": ac,
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": (
-                        "Batched Phase-1 screen returned no verdict for this "
-                        "criterion — treated as partial (never met)."
-                    ),
+                    "evidence": evidence,
                 })
         results[ci] = ac_results
     return results
@@ -7525,6 +7580,19 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                     evidence = _parse_failure_evidence(
                         result, "Phase 1 child screening",
                     )
+            # A screen that hit its Phase 1 budget is QUARANTINED, not a
+            # model judgement (SA-0MVI3608M0080QLW): the evidence names the
+            # budget and phase, and the run counts it in the reliability
+            # summary so downstream consumers can exclude it.
+            if result.get("_timeout") or result.get("_concurrency_timeout"):
+                _rel_incr("child_screen_timeouts")
+                evidence = (
+                    f"Child screen reached its Phase 1 budget "
+                    f"({_CHILD_SCREEN_TIMEOUT_DEFAULT} s, "
+                    f"AUDIT_CHILD_SCREEN_TIMEOUT) before returning a verdict — "
+                    f"QUARANTINED as partial (never met); raise the budget and "
+                    f"re-run to verify this criterion. {evidence}"
+                )
             for ac in child_acs:
                 child_ac_results.append({
                     "text": ac,

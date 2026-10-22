@@ -1267,3 +1267,87 @@ def test_phase1_batch_parity_with_per_child_on_fixed_item_set(monkeypatch):
         assert [r["text"] for r in batched[ci]] == [
             r["text"] for r in per_child[ci]
         ]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MVI3608M0080QLW: right-size the child-screen budget and quarantine
+# capped screens so a budget-exhausted screen is never indistinguishable from
+# a model judgement.
+# ---------------------------------------------------------------------------
+
+
+def test_child_screen_budget_derived_from_measured_p95(monkeypatch):
+    """The default budget is derived from measured data, not a bare constant.
+
+    Recorded corpus (2026-10-21, ContextHub): completed child screens
+    min 258 s / median 389 s / p95 ~506 s / max 506 s, i.e. the unconstrained
+    p95 already sat just 15 % below the old 600 s cap. The budget must carry a
+    documented safety factor over that p95 (proposal >= 2x) so host-load
+    noise does not convert completions into timeouts.
+    """
+    measured_p95 = 506
+    safety_factor = 2
+    budget = audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT
+    assert budget >= measured_p95 * safety_factor * 0.99, (
+        f"child-screen budget {budget}s must cover {safety_factor}x the "
+        f"measured p95 ({measured_p95}s)"
+    )
+    assert budget <= 1800, "must stay below the Phase-2 budget"
+
+
+def test_parent_timeout_scaling_covers_the_child_budget():
+    """AC: raising the child budget must not make the parent guard the new
+    starvation point — the per-child term must cover one full child screen."""
+    assert (
+        audit_runner.PARENT_TIMEOUT_PER_CHILD
+        >= audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT
+    ), (
+        f"parent per-child term {audit_runner.PARENT_TIMEOUT_PER_CHILD}s must "
+        f"cover a {audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT}s child screen"
+    )
+
+
+def test_capped_child_screen_is_quarantined_not_plain_partial():
+    """A child screen that hits its budget carries distinct, quarantinable
+    evidence (timeout + phase) rather than an indistinguishable 'partial'."""
+    children = [_make_child(0, acs=2)]
+    pending = [(0, children[0])]
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        return {
+            "_timeout": True,
+            "evidence": "timed out after 600s",
+            "extracted_text": "",
+        }
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ):
+        results = audit_runner._phase1_review_children_batched(
+            pending, "m", "m", "pi", None, None,
+            _fake_runner(), lambda *a: None,
+        )
+    verdicts = [r["verdict"] for r in results[0]]
+    assert verdicts == [audit_runner.VERDICT_PARTIAL, audit_runner.VERDICT_PARTIAL]
+    for r in results[0]:
+        assert "budget" in r["evidence"].lower() or "timeout" in r["evidence"].lower()
+
+
+def test_capped_child_screen_increments_reliability_counter():
+    """child_screen_timeouts surfaces capped screens in the summary line."""
+    audit_runner._rel_reset()
+    children = [_make_child(0, acs=1)]
+    pending = [(0, children[0])]
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        return {"_timeout": True, "evidence": "timed out", "extracted_text": ""}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ):
+        audit_runner._phase1_review_children_batched(
+            pending, "m", "m", "pi", None, None,
+            _fake_runner(), lambda *a: None,
+        )
+    assert audit_runner._rel_snapshot().get("child_screen_timeouts") == 1
+    assert "child_screen_timeouts=1" in audit_runner.render_reliability_summary()
