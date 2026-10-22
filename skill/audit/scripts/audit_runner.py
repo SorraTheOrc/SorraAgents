@@ -638,12 +638,14 @@ Pi model calls (e.g. ``AUDIT_PI_TIMEOUT=3600``) without changing defaults.
 AUDIT_CHILD_SCREEN_TIMEOUT_ENV = "AUDIT_CHILD_SCREEN_TIMEOUT"
 """Environment variable name for the child Phase-1 AC-review screen budget.
 
-Child Phase-1 AC-review screens are lightweight (30-190 s healthy) so they
-use a short per-call budget (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 600 s)
-instead of the full 1800 s Phase-2 budget. A screen that exceeds this
-budget returns a clean timeout verdict (existing ``_timeout`` marker +
-timeout evidence) — never a full 1800 s burn. Overridable via the
-``--child-screen-timeout`` CLI flag (flag wins) or this env var.
+Child Phase-1 AC-review screens use a right-sized per-call budget
+(``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, derived as
+``ceil(measured p95 x 2)`` — see that constant's docstring) instead of the
+full 1800 s Phase-2 budget. A screen that exceeds its budget is quarantined
+— the conservative ``partial`` verdict with evidence naming the budget and
+phase, plus a ``child_screen_timeouts`` count in the reliability summary —
+never a full 1800 s burn and never an unqualified judgement. Overridable via
+the ``--child-screen-timeout`` CLI flag (flag wins) or this env var.
 """
 
 _CHILD_SCREEN_TIMEOUT_DEFAULT = 1080
@@ -2806,8 +2808,8 @@ def _resolve_child_screen_timeout(cli_timeout: int | None) -> int | None:
     Precedence:
       1. ``--child-screen-timeout`` CLI flag (explicit override)
       2. ``AUDIT_CHILD_SCREEN_TIMEOUT`` environment variable (seconds)
-      3. ``None`` — falls back to ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600 s)
-         inside ``_call_pi`` for child screens
+      3. ``None`` — falls back to ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s,
+         derived from measured p95 x 2) inside ``_call_pi`` for child screens
 
     An invalid value (non-integer) is ignored with a warning so a
     misconfigured environment cannot break the audit run.
@@ -4394,9 +4396,10 @@ def _resolve_call_timeout(timeout: int | None, child_screen: bool = False) -> in
     Precedence:
       1. explicit ``timeout`` arg (from ``--timeout`` / ``AUDIT_PI_TIMEOUT``)
       2. child Phase-1 AC-review screens: ``AUDIT_CHILD_SCREEN_TIMEOUT``
-         env or ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600 s) — a lightweight
-         child screen that exceeds its short budget fails fast instead of
-         burning the full 1800 s (LP-0MSQ32S2M001EA74 AC1)
+         env or ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s, derived from
+         measured p95 x 2) — a child screen that exceeds its budget is
+         quarantined instead of burning the full 1800 s
+         (LP-0MSQ32S2M001EA74 AC1, SA-0MVI3608M0080QLW)
       3. all other calls: ``CALL_PI_TIMEOUT`` (1800 s)
     """
     if timeout is not None:
@@ -4542,7 +4545,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
 
         child_screen: If True, this is a lightweight child Phase-1 AC-review
             screen; it uses the short per-call budget
-            (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 600 s, configurable via
+            (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, derived from measured
+            p95 x 2, configurable via
             ``AUDIT_CHILD_SCREEN_TIMEOUT`` / ``--child-screen-timeout``)
             instead of the 1800 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
 
@@ -14357,7 +14361,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help=(
                              "Override the per-call Pi timeout for child Phase-1 "
                              "AC-review screens in seconds (default: "
-                             "AUDIT_CHILD_SCREEN_TIMEOUT env or 600; lightweight "
+                             "AUDIT_CHILD_SCREEN_TIMEOUT env or 1080; lightweight "
                              "child screens fail fast instead of burning the full "
                              "1800s budget)"
                          ))
@@ -14451,7 +14455,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_issue.add_argument("--max-concurrency", type=int, default=None,
-                         help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 6)")
+                         help=("Max concurrent pi/audit subprocesses. Precedence: this "
+                               "flag > AUDIT_MAX_CONCURRENCY env > live proxy slot "
+                               "capacity (max(1, min(available_slots, total_slots))) > "
+                               "static 6 fallback"))
     p_issue.add_argument("--green-run", default=None, metavar="SHA|HEAD",
                          help=(
                              "Operator-attested green test run: the full project test "
@@ -14597,7 +14604,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_project.add_argument("--worklog-dir", default=None,
                            help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_project.add_argument("--max-concurrency", type=int, default=None,
-                           help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 6)")
+                           help=("Max concurrent pi/audit subprocesses. Precedence: this "
+                               "flag > AUDIT_MAX_CONCURRENCY env > live proxy slot "
+                               "capacity (max(1, min(available_slots, total_slots))) > "
+                               "static 6 fallback"))
     p_project.add_argument("--max-citations-per-ac", type=int, default=None,
                            help=(
                                "Accepted for CLI parity with the issue subcommand; "
