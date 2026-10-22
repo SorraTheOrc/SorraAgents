@@ -5353,6 +5353,42 @@ def _extract_key_files(description: str) -> list[str]:
     return files
 
 
+def _filter_existing_paths(paths: Sequence[str],
+                           project_root: Path | None = None) -> list[str]:
+    """Keep only *paths* that exist on disk (bounded, de-duplicated order).
+
+    Deleted and transient paths are dropped so that lint-scoped runs never
+    target ghost paths — without this filter, ``ruff check`` fails with
+    ``E902`` (IO error) and the remediation loop then writes junk
+    per-file-ignores for machine-absolute paths (SA-0MSXVXVUL0011JKX).
+
+    *project_root* is the base for repo-relative paths; it defaults to the
+    cwd-derived ``TARGET_PROJECT_ROOT`` (the launch-root fallback).
+    """
+    root = (
+        Path(project_root).resolve() if project_root is not None
+        else Path(TARGET_PROJECT_ROOT).resolve()
+    )
+    existing: list[str] = []
+    for path in paths:
+        # The ghost-path stat is best-effort: a pathological entry (e.g. a
+        # path component longer than NAME_MAX, an unreadable link, or a
+        # non-path payload returned by a mocked runner) raises OSError from
+        # ``Path.exists()``. Skip such entries rather than letting the
+        # manifest build abort (SA-0MUERWHED002FNQ4 regression: 13 audit
+        # tests failed with "File name too long").
+        try:
+            p = Path(path)
+            if p.is_absolute():
+                if p.exists():
+                    existing.append(path)
+            elif (root / p).exists() or Path(path).exists():
+                existing.append(path)
+        except OSError:
+            continue
+    return existing[:_FILE_SCOPE_MAX_FILES]
+
+
 def _git_changed_files(runner: Runner) -> list[str]:
     """Return the list of changed/untracked files from git (bounded).
 
@@ -5390,29 +5426,62 @@ def _git_changed_files(runner: Runner) -> list[str]:
 
     # ------------------------------------------------------------------
     # Drop ghost paths (deleted / transient files) that git reports but
-    # that no longer exist on disk.  Without this filter, ``ruff check``
-    # fails with E902 (IO error) and the remediation loop writes junk
-    # per-file-ignores for machine-absolute ghost paths (SA-0MSXVXVUL0011JKX).
+    # that no longer exist on disk (SA-0MSXVXVUL0011JKX).
     # ------------------------------------------------------------------
-    root = Path(TARGET_PROJECT_ROOT).resolve()
-    existing: list[str] = []
-    for path in changed:
-        # The ghost-path stat is best-effort: a pathological entry (e.g. a
-        # path component longer than NAME_MAX, an unreadable link, or a
-        # non-path payload returned by a mocked runner) raises OSError from
-        # ``Path.exists()``. Skip such entries rather than letting the
-        # manifest build abort (SA-0MUERWHED002FNQ4 regression: 13 audit
-        # tests failed with "File name too long").
-        try:
-            p = Path(path)
-            if p.is_absolute():
-                if p.exists():
-                    existing.append(path)
-            elif (root / p).exists() or Path(path).exists():
-                existing.append(path)
-        except OSError:
-            continue
-    return existing[:_FILE_SCOPE_MAX_FILES]
+    return _filter_existing_paths(changed)
+
+
+_CODE_QUALITY_SCOPE_EMPTY_REASON = (
+    "no in-scope files could be resolved (the git changed-file list is empty "
+    "and no committed touched files or Key Files resolved to existing paths) "
+    "— the whole-repository scan is deliberately not run "
+    "(SA-0MUI5ZYO6002W3KD)"
+)
+"""Documented skip reason for an empty code-quality scope.
+
+The audit must never silently widen an empty scope to a whole-repository
+lint: on the normal post-merge state (the item's work is already committed
+and the checkout is clean) that would report unrelated pre-existing findings
+against this item (SA-0MUI5ZYO6002W3KD).
+"""
+
+
+def _resolve_code_quality_scope(
+    runner: Runner,
+    issue_id: str,
+    work_item: dict | None = None,
+    comments: Sequence[dict] | None = None,
+    project_root: Path | None = None,
+) -> list[str]:
+    """Resolve the file scope for the audit's code-quality scans.
+
+    Both code-quality call sites (the Phase 1 scan and the remediation
+    re-scan) MUST resolve scope through this helper so neither can fall back
+    to the whole repository (SA-0MUI5ZYO6002W3KD AC5).
+
+    Resolution order:
+
+    1. the git changed-file list (``git diff --name-only HEAD`` +
+       ``git status --porcelain``) — the working-tree changes; then
+    2. the item's committed *touched* files (``_resolve_touched_files``:
+       files in commits referencing the item id, commit shas recorded in
+       its comments, and its Key Files). This is the source that keeps an
+       already-merged item in scope: its work is committed and the checkout
+       is clean, so (1) is empty.
+
+    Returns ``[]`` when no scope can be resolved. An empty result means
+    "lint nothing": callers MUST skip the scan with a documented reason
+    (``_CODE_QUALITY_SCOPE_EMPTY_REASON``), because ``_run_ruff_check``
+    treats a falsy ``files`` argument as a WHOLE-PROJECT scan — passing
+    ``None`` or ``[]`` would scan the entire repository.
+    """
+    changed = _git_changed_files(runner)
+    if changed:
+        return changed
+    touched = _resolve_touched_files(
+        runner, issue_id, work_item=work_item, comments=comments,
+    ) or []
+    return _filter_existing_paths(touched, project_root)
 
 
 def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
@@ -10812,21 +10881,35 @@ def _run_remediation_loop(
             "fingerprint_after": new_fp,
         })
         # Re-run the code-quality scan ONLY (no phase re-entry): same
-        # scoped changed-file list, fix=False (T2 AC4).
-        cq_scope_files = _git_changed_files(runner)
-        try:
-            cq_result = run_code_quality(
-                project_root=project_root, runner=runner, fix=False,
-                files=cq_scope_files or None,
-            )
-            if cq_result.get("success", False):
-                results["cq_findings"] = cq_result.get("findings", [])
-        except Exception as exc:  # noqa: BLE001 -- scan failure keeps prior findings
+        # scope resolution as the Phase 1 scan, fix=False (T2 AC4,
+        # SA-0MUI5ZYO6002W3KD AC5). An empty scope skips the re-scan
+        # (keeping the prior findings) rather than widening to the whole
+        # repository.
+        cq_scope_files = _resolve_code_quality_scope(
+            runner, issue_id, work_item=work_item,
+            project_root=project_root,
+        )
+        if not cq_scope_files:
             print(
-                f"Warning: remediation re-scan failed: {exc} — "
-                "keeping prior findings.",
+                f"Warning: remediation re-scan skipped: "
+                f"{_CODE_QUALITY_SCOPE_EMPTY_REASON} — keeping prior "
+                "findings.",
                 file=sys.stderr,
             )
+        else:
+            try:
+                cq_result = run_code_quality(
+                    project_root=project_root, runner=runner, fix=False,
+                    files=cq_scope_files,
+                )
+                if cq_result.get("success", False):
+                    results["cq_findings"] = cq_result.get("findings", [])
+            except Exception as exc:  # noqa: BLE001 -- scan failure keeps prior findings
+                print(
+                    f"Warning: remediation re-scan failed: {exc} — "
+                    "keeping prior findings.",
+                    file=sys.stderr,
+                )
         # Re-classify remaining ruff findings via the screen.
         results["fp_screen_results"] = _screen_ruff_findings(
             issue_id, results["cq_findings"], pi_bin, resolved_model,
@@ -11000,21 +11083,34 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     try:
         from code_review.scripts.code_quality import run_code_quality
         # Scoped, read-only code-quality scan (SA-0MSKB6VWU000RT58): the
-        # audit lints only the git changed-file list (already computed for
-        # the Phase 1/2 file-scope manifest) instead of the whole repo, and
-        # never mutates files (fix=False — audits are read-only). The
-        # changed-file list doubles as the scoping manifest, so no extra
-        # git scan is issued here.
-        cq_scope_files = _git_changed_files(runner)
-        cq_result = run_code_quality(
-            project_root=per_audit_root, runner=runner, fix=False,
-            files=cq_scope_files or None,
+        # audit lints only the resolved file scope instead of the whole
+        # repo, and never mutates files (fix=False — audits are read-only).
+        # The scope is the git changed-file list, falling back to the item's
+        # committed touched files (Key Files + its delivered commits): on the
+        # normal post-merge checkout the working tree is clean, so the
+        # changed-file list is empty and the committed files are the only
+        # accurate scope (SA-0MUI5ZYO6002W3KD).
+        cq_scope_files = _resolve_code_quality_scope(
+            runner, issue_id, work_item=work_item, comments=ctx.comments,
+            project_root=per_audit_root,
         )
-        if cq_result.get("success", False):
-            cq_findings = cq_result.get("findings", [])
-            cq_fixes_applied = cq_result.get("fixes_applied", 0)
+        if not cq_scope_files:
+            # An empty scope lints NOTHING — never the whole repository.
+            # ``files`` is not passed as [] / None because the linter runner
+            # treats a falsy list as a whole-project scan.
+            cq_skipped_reason = _CODE_QUALITY_SCOPE_EMPTY_REASON
         else:
-            cq_skipped_reason = cq_result.get("error", "Code quality check failed")
+            cq_result = run_code_quality(
+                project_root=per_audit_root, runner=runner, fix=False,
+                files=cq_scope_files,
+            )
+            if cq_result.get("success", False):
+                cq_findings = cq_result.get("findings", [])
+                cq_fixes_applied = cq_result.get("fixes_applied", 0)
+            else:
+                cq_skipped_reason = cq_result.get(
+                    "error", "Code quality check failed"
+                )
     except ImportError:
         # code_quality module not available — skip gracefully
         cq_skipped_reason = "code_quality module not available"

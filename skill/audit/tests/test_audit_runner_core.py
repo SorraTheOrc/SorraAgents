@@ -207,6 +207,10 @@ class TestCodeQualityUsesTargetProjectRoot:
 
         with mock.patch(
             "code_review.scripts.code_quality.run_code_quality", mock_cq
+        ), mock.patch.object(
+            # A non-empty scope is required for the scan to run at all: an
+            # empty scope is skipped by design (SA-0MUI5ZYO6002W3KD).
+            audit_runner, "_git_changed_files", return_value=["src/x.py"]
         ):
             audit_runner.cmd_issue(
                 "TEST-1",
@@ -237,6 +241,10 @@ class TestCodeQualityUsesTargetProjectRoot:
 
         with mock.patch(
             "code_review.scripts.code_quality.run_code_quality", mock_cq
+        ), mock.patch.object(
+            # A non-empty scope is required for the scan to run at all: an
+            # empty scope is skipped by design (SA-0MUI5ZYO6002W3KD).
+            audit_runner, "_git_changed_files", return_value=["src/x.py"]
         ):
             audit_runner.cmd_issue(
                 "TEST-1",

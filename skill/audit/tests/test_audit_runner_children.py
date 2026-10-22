@@ -1235,6 +1235,11 @@ class TestParentFirstChildPassThrough:
         with (
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
+            # A non-empty code-quality scope is required for the findings to
+            # exist: an empty scope skips the scan by design
+            # (SA-0MUI5ZYO6002W3KD) and the blocking gate would never fire.
+            mock.patch.object(audit_runner, "_git_changed_files",
+                              return_value=["src/bad.py"]),
             mock.patch(
                 "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": blocking,

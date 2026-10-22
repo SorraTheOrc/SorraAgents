@@ -682,6 +682,13 @@ class TestRemediationLoop:
         with (
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
+            # The audit runs on a clean checkout (the item's work is
+            # committed), so the code-quality scope resolves from the git
+            # changed-file list. Supply one changed file — the pipeline must
+            # NOT fall back to a whole-repo scan (SA-0MUI5ZYO6002W3KD) — and
+            # the findings flow into the screen + remediation loop.
+            mock.patch.object(audit_runner, "_git_changed_files",
+                              return_value=["src/bad.py"]),
             mock.patch(
                 "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [finding],
@@ -790,3 +797,67 @@ class TestRemediationReport:
         assert rem["iterations"] == 1
         assert rem["commits"][0]["sha"] == "abc123"
         assert rem["exhausted"] is False
+
+
+class TestRemediationRescanScope:
+    """SA-0MUI5ZYO6002W3KD AC5 — the remediation re-scan resolves its file
+    scope through the same helper as the Phase 1 scan, so an already-merged
+    item (empty git changed-file list) never triggers a whole-repo re-scan.
+    """
+
+    def _run(self, tmp_path, *, git_changed, touched, cq_returns=None):
+        finding = _finding()
+        fp_results = [_screen_entry(finding)]
+        (tmp_path / "src").mkdir(exist_ok=True)
+        (tmp_path / "src" / "bad.py").write_text("x = 1\n", encoding="utf-8")
+        runner = _git_runner()
+        with (
+            mock.patch.object(audit_runner, "_git_changed_files",
+                              return_value=git_changed),
+            mock.patch.object(audit_runner, "_resolve_touched_files",
+                              return_value=touched),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value=cq_returns
+                or {"success": True, "findings": [], "fixes_applied": 0},
+            ) as cq,
+            mock.patch.object(audit_runner, "_screen_ruff_findings",
+                              return_value=[]),
+            mock.patch.object(audit_runner, "_compute_content_fingerprint",
+                              return_value="fp-1"),
+            mock.patch.object(audit_runner, "_commit_config_remediation",
+                              return_value="sha-1"),
+        ):
+            results = audit_runner._run_remediation_loop(
+                "TEST-1", [finding], fp_results, runner, "pi", "m",
+                None, None, mock.Mock(), tmp_path, None, {"id": "TEST-1"},
+                "fp-before",
+            )
+        return results, cq
+
+    def test_rescan_scopes_to_committed_touched_files_when_diff_empty(
+        self, tmp_path,
+    ):
+        """AC1/AC5: with an empty changed-file list the re-scan lints the
+        item's committed touched files — never ``files=None``."""
+        results, cq = self._run(
+            tmp_path, git_changed=[], touched=["src/bad.py"],
+        )
+        assert results["iterations"] == 1
+        cq.assert_called_once()
+        assert cq.call_args.kwargs.get("files") == ["src/bad.py"]
+        assert cq.call_args.kwargs.get("fix") is False
+
+    def test_rescan_is_skipped_when_the_scope_is_empty(self, tmp_path):
+        """AC2/AC5: an empty effective scope skips the re-scan (keeping the
+        prior findings) instead of widening to the whole repository."""
+        prior = [_finding()]
+        results, cq = self._run(
+            tmp_path, git_changed=[], touched=None,
+            cq_returns={"success": True, "findings": [], "fixes_applied": 0},
+        )
+        cq.assert_not_called()
+        assert results["iterations"] == 1
+        assert results["cq_findings"] == prior, (
+            "prior findings must survive a skipped re-scan"
+        )

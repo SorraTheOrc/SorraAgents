@@ -1351,3 +1351,203 @@ def test_capped_child_screen_increments_reliability_counter():
         )
     assert audit_runner._rel_snapshot().get("child_screen_timeouts") == 1
     assert "child_screen_timeouts=1" in audit_runner.render_reliability_summary()
+
+
+# ----------------------------------------------------------------------
+# Code-quality scan scope (SA-0MUI5ZYO6002W3KD)
+#
+# The Phase 1 code-quality scan is documented (SA-0MSKB6VWU000RT58 AC1) to
+# lint ONLY the work item's changed files — never the whole repository.
+# Previously the runner passed ``cq_scope_files or None`` to
+# ``run_code_quality``, and ``None`` means a whole-project lint; for an item
+# whose work is already committed (the normal post-merge audit state) the
+# git changed-file list is EMPTY, so every audit linted the whole repo and
+# unrelated critical findings blocked it.
+#
+# The contract these tests pin:
+#   AC1 — a clean checkout resolves scope from the item's committed touched
+#         files (and its Key Files), not the whole repo.
+#   AC2 — an empty effective scope SKIPS the scan with a documented reason
+#         (rendered through ``code_quality_skipped_reason``); it never runs
+#         the whole-repository scan. ``files=[]`` is not a valid skip either
+#         (linter_runner treats a falsy list as a whole-project scan).
+#   AC3 — ``run_code_quality`` is never invoked with ``files=None`` for an
+#         already-merged item.
+#   AC4 — unrelated critical findings in the same repo are not attributed to
+#         the item under audit.
+# ----------------------------------------------------------------------
+
+_PROJECT_FILE = "skill/audit/scripts/audit_runner.py"
+_PROJECT_FILE_2 = "skill/audit/scripts/persist_audit.py"
+
+
+def _cq_scope_ctx(runner, **overrides):
+    """Build an ``_AuditContext`` suitable for a direct ``_phase_fetch_and_cq``
+    call (mirrors the helper in ``test_audit_runner_core.py``)."""
+    defaults = {
+        "issue_id": "TEST-1", "persist": False, "timeout": None,
+        "parent_timeout": None, "pi_bin": "pi", "model": None,
+        "model_source": "default", "runner": runner,
+        "json_mode": False, "debug_log": None, "force": False,
+        "worklog_dir": None, "batch_phase2": False, "green_run": None,
+        "audit_children": False, "max_child_audits": None,
+        "run_tests": False,
+    }
+    defaults.update(overrides)
+    return audit_runner._AuditContext(**defaults)
+
+
+def _cq_scope_runner(description: str, *, committed=(),
+                     changed=(), untracked=()):
+    """Mock wl/git runner modelling an audit checkout.
+
+    *committed* are the paths returned by the ``git log --grep=<item id>``
+    touched-file source (the item's delivered commits); *changed* and
+    *untracked* feed ``git diff --name-only HEAD`` and
+    ``git status --porcelain=v1`` (both empty for an already-merged item on
+    a clean checkout).
+    """
+    commands: list[list[str]] = []
+
+    def _side(cmd):
+        commands.append(list(cmd))
+        cs = " ".join(cmd)
+        if "--children" in cs:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "TEST-1", "description": description},
+                    "children": [],
+                    "comments": [],
+                }),
+                stderr="",
+            )
+        if cs.startswith("git log --all"):
+            lines = [f"{audit_runner._TOUCHED_FILES_COMMIT_MARKER}abc1234"]
+            lines.extend(committed)
+            return SimpleNamespace(
+                returncode=0, stdout="\n".join(lines) + "\n", stderr="",
+            )
+        if cs.startswith("git diff --name-only"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="".join(f"{p}\n" for p in changed),
+                stderr="",
+            )
+        if cs.startswith("git status --porcelain"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="".join(f"?? {p}\n" for p in untracked),
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"success": True}), stderr="",
+        )
+
+    runner = mock.MagicMock()
+    runner.side_effect = stateful_wl_side_effect(_side)
+    runner.commands = commands
+    return runner
+
+
+class TestCodeQualityScanScope:
+    """SA-0MUI5ZYO6002W3KD — the code-quality scan never silently widens to
+    the whole repository."""
+
+    def _run_fetch(self, description, *, committed=(), changed=(),
+                   untracked=(), cq_return=None):
+        runner = _cq_scope_runner(
+            description, committed=committed, changed=changed,
+            untracked=untracked,
+        )
+        ctx = _cq_scope_ctx(runner)
+        cq = mock.MagicMock(
+            return_value=cq_return
+            or {"success": True, "findings": [], "fixes_applied": 0}
+        )
+        with mock.patch(
+            "code_review.scripts.code_quality.run_code_quality", cq
+        ):
+            rc = audit_runner._phase_fetch_and_cq(ctx)
+        assert rc is None
+        return ctx, cq
+
+    def test_committed_item_scopes_scan_to_its_delivered_files(self):
+        """AC1/AC3: clean checkout ⇒ the scanned file list is the item's
+        committed touched files, never ``None`` (whole repo)."""
+        description = (
+            "## Key Files\n\n"
+            f"- `{_PROJECT_FILE_2}` — the touched helper\n"
+        )
+        ctx, cq = self._run_fetch(
+            description, committed=(_PROJECT_FILE,),
+        )
+
+        cq.assert_called_once()
+        _, kwargs = cq.call_args
+        assert kwargs.get("files") == sorted([_PROJECT_FILE, _PROJECT_FILE_2])
+        assert kwargs.get("files") is not None
+        assert kwargs.get("fix") is False
+        assert ctx.cq_findings == []
+        assert ctx.cq_skipped_reason is None
+
+    def test_empty_scope_skips_scan_instead_of_scanning_whole_repo(self):
+        """AC2/AC3: with no changed, committed or Key Files evidence the scan
+        is SKIPPED (documented reason), never run over the whole repo."""
+        ctx, cq = self._run_fetch("No key files here.")
+
+        cq.assert_not_called()
+        assert ctx.cq_findings == []
+        assert ctx.cq_skipped_reason
+        reason = ctx.cq_skipped_reason.lower()
+        assert "no in-scope files" in reason
+        assert "whole-repository scan" in reason
+
+    def test_skip_reason_is_rendered_in_the_report(self):
+        """AC2: the skip is surfaced through the existing
+        ``code_quality_skipped_reason`` report field."""
+        ctx, _ = self._run_fetch("No key files here.")
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1", "title": "T"},
+            [{"index": 1, "text": "AC1: x", "verdict": "met",
+              "evidence": "x"}],
+            [],
+            code_quality_findings=ctx.cq_findings,
+            code_quality_skipped_reason=ctx.cq_skipped_reason,
+            model="test-model", model_source="remote",
+        )
+        assert "Code quality check skipped:" in report
+        assert "whole-repository scan" in report
+
+    def test_unrelated_critical_findings_are_not_attributed(self):
+        """AC4: findings that a WHOLE-REPO scan would report (unrelated
+        files) never reach this item's audit."""
+        unrelated = {
+            "severity": "critical", "file": "proxy/tests/unrelated.py",
+            "line": 197, "message": "F841 message", "linter": "ruff",
+            "code": "F841",
+        }
+
+        def _side_effect(*, files=None, **kwargs):
+            # The pre-fix call passed files=None and linted everything.
+            if files is None:
+                return {"success": True, "findings": [unrelated],
+                        "fixes_applied": 0}
+            return {"success": True, "findings": [], "fixes_applied": 0}
+
+        runner = _cq_scope_runner(
+            f"## Key Files\n\n- `{_PROJECT_FILE}`\n",
+            committed=(_PROJECT_FILE,),
+        )
+        ctx = _cq_scope_ctx(runner)
+        with mock.patch(
+            "code_review.scripts.code_quality.run_code_quality",
+            side_effect=_side_effect,
+        ) as cq:
+            assert audit_runner._phase_fetch_and_cq(ctx) is None
+
+        cq.assert_called_once()
+        assert ctx.cq_findings == [], (
+            "unrelated whole-repo findings must not be attributed to the item"
+        )

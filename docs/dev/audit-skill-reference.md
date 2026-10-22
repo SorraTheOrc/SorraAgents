@@ -899,7 +899,7 @@ See `docs/dev/audit-phase1-performance-evaluation.md`
 Runner performs code quality checks before AC verification (invokes `../code_review/scripts/code_quality.py`):
 
 1. Language detection → linter probing (ruff, eslint, markdownlint, shellcheck) → findings classified by severity
-2. **Scoped to the git changed-file list** (SA-0MSKB6VWU000RT58): the scan lints only the changed files (the same file-scope manifest used for Phase 1/2) instead of the whole repo, bounding the dominant full-repo lint cost.
+2. **Scoped to the work item's files** (SA-0MSKB6VWU000RT58, SA-0MUI5ZYO6002W3KD): the scan lints only the resolved file scope instead of the whole repo, bounding the dominant full-repo lint cost. Scope resolution (single helper, `_resolve_code_quality_scope`) is: the **git changed-file list** (`git diff --name-only HEAD` + `git status --porcelain`); when that list is empty — the normal post-merge state, where the item's work is already committed to `dev` and the checkout is clean — the item's **committed touched files** (files in commits referencing the item id, commit shas recorded in its comments, plus its **Key Files**, resolved via `_resolve_touched_files`). An **empty effective scope lints nothing**: the scan is skipped and the reason surfaces through `code_quality_skipped_reason` (rendered as `Code quality check skipped: …`). The scan is never widened to the whole repository — `_run_ruff_check` treats a falsy `files` argument as a whole-project scan, so neither `None` nor `[]` may be passed. Both code-quality call sites (the Phase 1 scan and the remediation re-scan) resolve scope through this one helper, so an unrelated pre-existing critical finding in the same repo can never be reported against the item under audit.
 3. **Read-only (never auto-fixes)**: audits call with `fix=False` — linters may not mutate files during an audit. Findings that were previously auto-fixed now surface as findings (severity classification unchanged).
 4. Critical/high findings → "Ready to close: No"; medium/low are warnings
 5. Quality epics ("Quality Improvement - Refactoring") created/reused for findings
@@ -1033,9 +1033,12 @@ surgical ruff config change, then re-scanned:
    `git commit` (never `git push`), message referencing the work item.
 4. **Fingerprint re-hash** AFTER the commit (working tree clean → freshness gate
    stable).
-5. **Code-quality-only re-run**: `run_code_quality(fix=False, files=<same
-   changed-file scope>)` — the pipeline is never restarted; remaining findings
-   flow back through the screen.
+5. **Code-quality-only re-run**: `run_code_quality(fix=False, files=<the same
+   resolved scope as the Phase 1 scan>)` — the pipeline is never restarted;
+   remaining findings flow back through the screen. The re-scan uses the same
+   scope helper as Phase 1 (SA-0MUI5ZYO6002W3KD AC5), so it cannot widen to the
+   whole repository; an empty scope skips the re-scan and keeps the prior
+   findings.
 6. **Cap**: at most 3 config-fix iterations per audit run by default,
    env-configurable via `AUDIT_REMEDIATION_MAX_ITERATIONS` (default `3`;
    invalid values fail closed). A finding persisting past the cap stays blocking
