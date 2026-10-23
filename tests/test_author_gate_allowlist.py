@@ -17,6 +17,8 @@ reimplementation of its decision logic:
 * ``pi@local`` passes when (and only when) it is in the allow-list.
 * An arbitrary foreign email is still refused.
 * An empty author email is refused even with ``allowForeignAuthor``.
+* Incident-era sentinel identities (``t@t.com`` et al., the leaked-``GIT_DIR``
+  incident) stay refused and are never allow-listed (SA-0MV9JVLBQ0090RNC AC4).
 
 Everything is hermetic: the gate is a pure function over the commit list and
 the options, so no git repository, remote, or real ``wl sync`` is involved.
@@ -27,6 +29,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -241,3 +244,61 @@ def test_gate_decision_needs_no_git_repository(tmp_path):
     )
 
     assert decision["allowed"] is True, decision["message"]
+
+
+def _incident_sentinel_emails() -> frozenset[str]:
+    """Return ``INCIDENT_ERA_EMAILS`` from ``scripts/check_git_identity.py``.
+
+    Imported from the identity guard so the quarantine list has a single
+    source of truth (a duplicated literal could drift from the guard).
+    """
+    scripts_dir = str(REPO_ROOT / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+
+    import check_git_identity
+
+    return check_git_identity.INCIDENT_ERA_EMAILS
+
+
+def test_incident_sentinel_emails_are_absent_from_the_project_allowlist():
+    """AC4: the quarantine is preserved — no incident sentinel is whitelisted.
+
+    ``t@t.com`` (and the other leaked-``GIT_DIR`` sentinels) must stay out of
+    ``syncAllowedAuthors``: whitelisting one would silently admit incident-era
+    worklog history the gate is designed to refuse.
+    """
+    allowlist = {entry.strip().lower() for entry in _project_allowlist()}
+    sentinels = _incident_sentinel_emails()
+
+    assert not (allowlist & set(sentinels)), (
+        f"incident-era sentinel emails must never be allow-listed, found "
+        f"{sorted(allowlist & set(sentinels))} in {sorted(allowlist)}"
+    )
+
+
+def test_incident_sentinel_authored_commit_is_refused_by_the_project_allowlist():
+    """AC4: the real gate refuses a ``t@t.com`` commit on this allow-list.
+
+    Complements ``test_arbitrary_foreign_email_is_still_refused``: that test
+    would keep passing if ``t@t.com`` were added to the allow-list, whereas
+    this one fails — it pins the quarantine itself, not just "some foreign
+    email is refused".
+    """
+    decision = _run_gate(
+        [{"hash": "345ea15", "authorEmail": "t@t.com"}],
+        allowed_authors=_project_allowlist(),
+    )
+
+    assert decision["allowed"] is False
+    assert [v["reason"] for v in decision["violations"]] == ["foreign-email"]
+    assert decision["violations"][0]["authorEmail"] == "t@t.com"
+
+    # Red-before evidence: the very same commit IS admitted when a sentinel is
+    # (wrongly) allow-listed, so this test fails if the quarantine is broken —
+    # it is not vacuously green because "some foreign email" is refused.
+    sentinel_allowlisted = _run_gate(
+        [{"hash": "345ea15", "authorEmail": "t@t.com"}],
+        allowed_authors=["t@t.com"],
+    )
+    assert sentinel_allowlisted["allowed"] is True
