@@ -166,9 +166,9 @@ class TestOptInChildAuditCascade:
                     stderr="",
                 )
 
-            # Working-tree fingerprint (SA-0MSL1YXG7004F2BZ): a clean tree
-            # yields an empty marker — matches the stored fingerprint computed
-            # with a MagicMock runner (no git output).
+            # Clean checkout for the file-scope manifest's changed-file
+            # query. The content fingerprint itself issues no git calls
+            # (SA-0MVIDI8E00063OOP), so it never reaches this branch.
             if cmd_str.startswith(("git status", "git diff")):
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -476,8 +476,8 @@ class TestChildVerdictReuseInParentAudits:
                     stderr="",
                 )
 
-            # Working-tree fingerprint (SA-0MSL1YXG7004F2BZ): a clean tree
-            # yields the empty marker — matches the stored fingerprint.
+            # Clean checkout for the file-scope manifest's changed-file
+            # query; the item-data-only fingerprint never issues git calls.
             if cmd_str.startswith(("git status", "git diff")):
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -752,6 +752,7 @@ class TestChildVerdictReuseInParentAudits:
                     }),
                     stderr="",
                 )
+            # Clean checkout for the file-scope manifest's changed-file query.
             if cmd_str.startswith(("git status", "git diff")):
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(
@@ -797,6 +798,7 @@ class TestChildVerdictReuseInParentAudits:
                     }),
                     stderr="",
                 )
+            # Clean checkout for the file-scope manifest's changed-file query.
             if cmd_str.startswith(("git status", "git diff")):
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(

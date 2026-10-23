@@ -2208,36 +2208,6 @@ def _normalise_repo_path(path: str) -> str:
     return p.strip()
 
 
-def _fetch_item_comments(runner: Runner, issue_id: str,
-                         worklog_dir: str | None = None) -> list[dict]:
-    """Best-effort fetch of a work item's comments for the fingerprint.
-
-    ``wl show --json`` returns the item's comments at the TOP level of the
-    payload (beside ``workItem`` — SA-0MSPZDALB000S18P), which is what
-    ``_bind_fetched_item`` binds into ``ctx.comments``. Used to make the
-    comment-recorded commit-hash source deterministic: callers that do not
-    already hold the comments list (the parent child-reuse gate and the
-    read-only freshness probe) fetch it here so the fingerprint they
-    compute matches the one the audit recorded at persist time
-    (SA-0MVAWFYKT002CQ3L).
-
-    Returns an empty list when the item has no comments or the fetch fails
-    (fail-open: the fingerprint then falls back to the item-id-grep and Key
-    Files sources).
-    """
-    if not issue_id:
-        return []
-    try:
-        data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
-                       worklog_dir=worklog_dir)
-    except Exception:  # noqa: BLE001 -- best-effort; never fail the fingerprint
-        return []
-    if not isinstance(data, dict):
-        return []
-    comments = data.get("comments")
-    return list(comments) if isinstance(comments, list) else []
-
-
 def _extract_comment_commit_hashes(comments: Sequence[dict] | None) -> list[str]:
     """Extract candidate commit shas recorded in a work item's comments.
 
@@ -2278,19 +2248,18 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
     Paths are normalised, de-duplicated, and sorted. Returns ``None`` (the
     fail-open signal for callers) when the set cannot be determined: git is
     unavailable / the ``git log`` call fails, or no paths are recorded. An
-    empty set is never returned, because it would make the fingerprint blind
-    to any file change (a correctness hazard — fail stale, never fail fresh).
+    empty set is never returned: ``None`` tells callers the scope could not be
+    determined so they skip the scan rather than fall back to a whole-repo
+    scan (fail stale, never fail fresh).
 
-    **Determinism.** The fingerprint is recomputed on every freshness check,
-    so the touched-file set must be identical at audit time and check time.
-    The fingerprint layer (``_compute_content_fingerprint``) guarantees this
-    by supplying the item's comments at every call site: callers that hold
-    the fetched list pass it through, and callers that do not (child-reuse
-    paths, the read-only freshness probe) have it fetched there
-    (deterministic comment source, SA-0MVAWFYKT002CQ3L). This function
-    itself stays a pure resolver — the comment source contributes only when
-    *comments* is supplied; direct callers building the Phase-2 file-scope
-    manifest rely on the grep + Key Files sources, which is stable for their
+    **Retained for the file-scope manifest.** The content fingerprint is
+    item-data-only and no longer consults this resolver; it remains the
+    source of an item's committed touched files for the Phase-2 file-scope
+    manifest and the code-quality scope resolution (SA-0MUI5ZYO6002W3KD).
+    This function stays a pure resolver — the comment source contributes only
+    when *comments* is supplied; callers that pass them
+    (``_resolve_file_scope``) get the extra safety net, while the Phase-2
+    manifest relies on the grep + Key Files sources, which is stable for its
     use.
 
     *work_item* may be passed in to reuse an already-fetched item; when
@@ -2361,102 +2330,6 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
     return sorted(paths)
 
 
-def _parse_porcelain_path(line: str) -> str:
-    """Extract the path from a ``git status --porcelain`` entry.
-
-    Handles the rename/copy form (``R  old -> new`` → ``new``) and the plain
-    form (``XY path`` → ``path``). The leading status column is significant
-    (a leading space is part of the two-char status), so only trailing
-    whitespace is stripped. Returns ``""`` for malformed lines.
-    """
-    entry = line.rstrip()
-    if not entry:
-        return ""
-    if " -> " in entry:
-        entry = entry.split(" -> ", 1)[1]
-    elif len(entry) > 3:
-        entry = entry[3:]
-    else:
-        return ""
-    return _normalise_repo_path(entry)
-
-
-def _compute_path_fingerprints(runner: Runner,
-                               paths: Sequence[str]) -> dict | None:
-    """Capture the current state of each touched path for the fingerprint.
-
-    For every path this records:
-
-    * ``head`` — the path's committed state: its blob hash at HEAD
-      (``git rev-parse HEAD:<path>``) when present at HEAD, else the hash of
-      the latest commit touching it (``git log -1 --format=%H -- <path>``),
-      else ``""`` for a path never committed (e.g. an untracked new file).
-    * ``worktree`` — the path's narrowed working-tree state from
-      ``git status --porcelain -- <paths>`` and
-      ``git diff --name-only HEAD -- <paths>`` (empty when clean).
-
-    Returns a ``{path: {"head": ..., "worktree": ...}}`` dict, or ``None``
-    when a git call needed for the payload fails — callers fail open and
-    re-run the pipeline (SA-0MSPZDALB000S18P). The working-tree queries are
-    batched (two calls for all paths) and the per-path budget is one
-    ``rev-parse`` (plus one fallback ``log -1`` only when the path is not at
-    HEAD), honouring the bounded-cost constraint.
-    """
-    path_list = list(paths)
-    if not path_list:
-        return None
-
-    worktree: dict[str, list[str]] = {p: [] for p in path_list}
-    for cmd in (
-        ["git", "status", "--porcelain", "--", *path_list],
-        ["git", "diff", "--name-only", "HEAD", "--", *path_list],
-    ):
-        try:
-            proc = runner(cmd)
-        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
-            return None
-        if proc.returncode != 0:
-            return None  # cannot determine worktree state ⇒ fail open
-        diff_only = cmd[1] == "diff"
-        for line in proc.stdout.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if diff_only:
-                path = _normalise_repo_path(stripped)
-            else:
-                # Pass the RAW line: the leading status column is significant
-                # (a leading space is part of git's two-char status code).
-                path = _parse_porcelain_path(line)
-            if path and path in worktree:
-                worktree[path].append(stripped)
-
-    states: dict[str, dict] = {}
-    for path in path_list:
-        head_state = ""
-        try:
-            proc = runner(["git", "rev-parse", f"HEAD:{path}"])
-        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
-            return None
-        if proc.returncode == 0 and proc.stdout.strip():
-            head_state = proc.stdout.strip()
-        else:
-            # Not present at HEAD (deleted / untracked): fall back to the
-            # latest commit that touched the path (empty when never committed).
-            try:
-                proc = runner(["git", "log", "-1", "--format=%H", "--", path])
-            except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
-                return None
-            if proc.returncode != 0:
-                return None
-            head_state = proc.stdout.strip()
-        states[path] = {
-            "head": head_state,
-            "worktree": "\n".join(sorted(set(worktree.get(path, [])))),
-        }
-    return states
-
-
 def _compute_content_fingerprint(runner: Runner, issue_id: str,
                                  worklog_dir: str | None = None,
                                  work_item: dict | None = None,
@@ -2472,9 +2345,9 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
     description contains the acceptance criteria AND the Key Files section, so
     both are already covered by ``description_hash``; no comment-derived
     input and no repository state are hashed. The computation performs
-    **zero git invocations** — it never calls ``_resolve_touched_files``,
-    ``_compute_path_fingerprints`` or any ``git`` subprocess — so only a
-    change to this work item's own title/description invalidates a stored
+    **zero git invocations** — it never calls the touched-file resolvers or
+    any ``git`` subprocess — so only a change to this work item's own
+    title/description invalidates a stored
     audit (SA-0MVIDI8E00063OOP). Unrelated commits, working-tree changes,
     touched-file edits, comments and lifecycle-field changes never do.
 

@@ -28,37 +28,24 @@ _COMMIT_MARKER = audit_runner._TOUCHED_FILES_COMMIT_MARKER
 
 
 class _FakeGitRepo:
-    """In-memory git double for the touched-file fingerprint tests.
+    """In-memory git double for the retained touched-file resolver tests.
 
-    Models only the queries the production resolver makes:
+    Models only the queries the production resolver still makes:
 
     * ``git log --all --grep`` (files in commits referencing the item);
-    * ``git log --no-walk`` (files in comment-recorded commits);
-    * ``git status --porcelain -- <paths>`` and
-      ``git diff --name-only HEAD -- <paths>`` (narrowed worktree state);
-    * ``git rev-parse HEAD:<path>`` (per-path blob hash);
-    * ``git log -1 --format=%H -- <path>`` (latest touching commit).
+    * ``git log --no-walk`` (files in comment-recorded commits).
 
-    Unrelated repository state (``head_sha``, files outside the requested
-    path set) is tracked so tests can prove it does NOT affect the
-    fingerprint. Every command is recorded in ``calls``.
+    The content fingerprint is item-data-only and issues no git command, so
+    this double is used only where the retained Phase-2 file-scope resolver
+    (``_resolve_touched_files``) is exercised. Every command is recorded in
+    ``calls`` so a test can prove a code path never consulted the repository.
     """
 
-    def __init__(self, *, head_sha: str = "h" * 40,
-                 grep_files: list[str] | None = None, grep_rc: int = 0,
-                 blobs: dict[str, str] | None = None,
-                 touched_commits: dict[str, str] | None = None,
-                 status: list[str] | None = None,
-                 diff: list[str] | None = None, worktree_rc: int = 0,
+    def __init__(self, *, grep_files: list[str] | None = None,
+                 grep_rc: int = 0,
                  comment_commits: dict[str, list[str]] | None = None):
-        self.head_sha = head_sha
         self.grep_files = list(grep_files or [])
         self.grep_rc = grep_rc
-        self.blobs = dict(blobs or {})
-        self.touched_commits = dict(touched_commits or {})
-        self.status = list(status or [])
-        self.diff = list(diff or [])
-        self.worktree_rc = worktree_rc
         self.comment_commits = dict(comment_commits or {})
         self.calls: list[list[str]] = []
 
@@ -69,38 +56,13 @@ class _FakeGitRepo:
         if joined.startswith("git log --all"):
             if self.grep_rc != 0:
                 return _proc(self.grep_rc, "")
-            lines = [f"{_COMMIT_MARKER}{self.head_sha}", *self.grep_files]
+            lines = [f"{_COMMIT_MARKER}{'h' * 40}", *self.grep_files]
             return _proc(0, "\n".join(lines) + "\n")
         if joined.startswith("git log --no-walk"):
             lines: list[str] = []
             for sha in cmd[5:]:  # ["git","log","--no-walk","--name-only","--format=", sha...]
                 lines.extend(self.comment_commits.get(sha, []))
             return _proc(0, ("\n".join(lines) + "\n") if lines else "")
-        if joined.startswith("git status"):
-            if self.worktree_rc != 0:
-                return _proc(self.worktree_rc, "")
-            requested = set(cmd[cmd.index("--") + 1:])
-            lines = [
-                line for line in self.status
-                if audit_runner._parse_porcelain_path(line) in requested
-            ]
-            return _proc(0, ("\n".join(lines) + "\n") if lines else "")
-        if joined.startswith("git diff"):
-            if self.worktree_rc != 0:
-                return _proc(self.worktree_rc, "")
-            requested = set(cmd[cmd.index("--") + 1:])
-            lines = [line for line in self.diff if line in requested]
-            return _proc(0, ("\n".join(lines) + "\n") if lines else "")
-        if cmd[:2] == ["git", "rev-parse"] and cmd[2] == "HEAD":
-            return _proc(0, self.head_sha + "\n")
-        if cmd[:2] == ["git", "rev-parse"] and cmd[2].startswith("HEAD:"):
-            path = cmd[2][len("HEAD:"):]
-            if path in self.blobs:
-                return _proc(0, self.blobs[path] + "\n")
-            return _proc(128, "")
-        if joined.startswith("git log -1 --format=%H --"):
-            sha = self.touched_commits.get(cmd[-1], "")
-            return _proc(0, (sha + "\n") if sha else "")
         raise AssertionError(f"unexpected git command: {joined}")
 
 
@@ -188,12 +150,13 @@ class TestSharedFreshnessHelpers:
 
 
 class TestTouchedFileResolution:
-    """Unit tests for the per-work-item touched-file resolver
-    (SA-0MSPZDALB000S18P AC1/AC4).
+    """Unit tests for the retained per-work-item touched-file resolver
+    (``_resolve_touched_files``, SA-0MSPZDALB000S18P AC1/AC4).
 
-    The resolver is the foundation of the narrowed fingerprint: it decides
-    WHICH files the gate is allowed to care about, so an unrelated commit or
-    working-tree change elsewhere cannot invalidate a stored audit.
+    The content fingerprint no longer consults this resolver
+    (SA-0MVIDI8E00063OOP); it remains the source of an item's committed
+    touched files for the Phase-2 file-scope manifest and code-quality scope
+    resolution, so its behaviour must stay green.
     """
 
     def test_normalise_repo_path_strips_quotes_and_dot_slash(self):
@@ -221,12 +184,6 @@ class TestTouchedFileResolution:
         assert audit_runner._extract_comment_commit_hashes(None) == []
         assert audit_runner._extract_comment_commit_hashes([]) == []
 
-    def test_parse_porcelain_path_plain_and_rename(self):
-        """Porcelain worktree entries yield the path (rename → destination)."""
-        assert audit_runner._parse_porcelain_path(" M src/a.py") == "src/a.py"
-        assert audit_runner._parse_porcelain_path("?? src/new.py") == "src/new.py"
-        assert audit_runner._parse_porcelain_path("R  old.py -> new.py") == "new.py"
-
     def test_resolve_touched_files_unions_grep_comments_and_key_files(self):
         """AC1/AC4: the set is the union of grep, comment, and Key-Files paths."""
         repo = _FakeGitRepo(
@@ -251,11 +208,13 @@ class TestTouchedFileResolution:
 
     def test_resolve_touched_files_ignores_comments_when_not_supplied(self):
         """The resolver stays a PURE function: comment hashes are only used
-        when the caller supplies the comments. The fingerprint layer
-        (``_compute_content_fingerprint``) is responsible for supplying them
-        deterministically (it fetches them when omitted —
-        SA-0MVAWFYKT002CQ3L), so audit-time and check-time computations
-        agree."""
+        when the caller supplies the comments.
+
+        The Phase-2 file-scope manifest calls it without comments (grep +
+        Key Files only), while ``_resolve_file_scope`` passes them through as
+        an extra safety net, so each caller keeps a stable source set for its
+        own use.
+        """
         repo = _FakeGitRepo(
             grep_files=["src/a.py"],
             comment_commits={"c" * 40: ["src/c.py"]},
@@ -307,42 +266,6 @@ class TestTouchedFileResolution:
             _runner, "TEST-1", work_item={"description": ""},
             comments=[{"comment": "0" * 40}],
         ) == ["src/a.py"]
-
-    def test_compute_path_fingerprints_captures_head_and_worktree(self):
-        """Per-path state carries the HEAD blob and the narrowed worktree state."""
-        repo = _FakeGitRepo(
-            blobs={"src/a.py": "blob-a", "src/b.py": "blob-b"},
-            status=[" M src/a.py", " M src/unrelated.py"],
-        )
-        states = audit_runner._compute_path_fingerprints(repo, ["src/a.py", "src/b.py"])
-        assert states is not None
-        assert states["src/a.py"]["head"] == "blob-a"
-        assert "M src/a.py" in states["src/a.py"]["worktree"]
-        assert states["src/b.py"] == {"head": "blob-b", "worktree": ""}
-        # Unrelated dirty files never enter the payload.
-        assert "src/unrelated.py" not in states
-
-    def test_compute_path_fingerprints_falls_back_for_untracked_paths(self):
-        """A path absent at HEAD uses its latest touching commit (else "")."""
-        repo = _FakeGitRepo(
-            blobs={},
-            touched_commits={"src/new.py": "c" * 40},
-            status=["?? src/never.py"],
-        )
-        states = audit_runner._compute_path_fingerprints(
-            repo, ["src/new.py", "src/never.py"],
-        )
-        assert states is not None
-        assert states["src/new.py"]["head"] == "c" * 40
-        assert states["src/never.py"]["head"] == ""
-
-    def test_compute_path_fingerprints_fail_open_on_worktree_failure(self):
-        """AC4: a failing status/diff call → None (fail open)."""
-        repo = _FakeGitRepo(worktree_rc=1)
-        assert audit_runner._compute_path_fingerprints(repo, ["src/a.py"]) is None
-
-    def test_compute_path_fingerprints_empty_paths_returns_none(self):
-        assert audit_runner._compute_path_fingerprints(_FakeGitRepo(), []) is None
 
 
 class TestContentFreshnessGate:
@@ -442,13 +365,14 @@ class TestContentFreshnessGate:
             "## Summary\nAll criteria acceptable."
         )
 
-    def _repo(self, **kwargs) -> _FakeGitRepo:
-        """Repository double; may describe arbitrary state (never consulted)."""
-        defaults: dict = {
-            "grep_files": ["src/a.py"], "blobs": {"src/a.py": "blob-a"},
-        }
-        defaults.update(kwargs)
-        return _FakeGitRepo(**defaults)
+    def _repo(self) -> _FakeGitRepo:
+        """Repository double for the freshness gate (records any git call).
+
+        The gate is item-data-only, so no git query is expected; tests can
+        assert ``repo.calls == []`` to prove repository state never
+        participates.
+        """
+        return _FakeGitRepo()
 
     def _check(self, run_wl_fake, repo=None):
         """Run _check_audit_freshness with mocked wl and a fake repo."""
@@ -508,9 +432,6 @@ class TestContentFreshnessGate:
         with (
             mock.patch.object(
                 audit_runner, "_resolve_touched_files", side_effect=_forbidden,
-            ),
-            mock.patch.object(
-                audit_runner, "_compute_path_fingerprints", side_effect=_forbidden,
             ),
             mock.patch.object(
                 audit_runner.subprocess, "run", side_effect=_forbidden,
@@ -726,27 +647,27 @@ class TestContentFreshnessGate:
         assert self._check(run_wl, self._repo()) == report
 
     def test_unrelated_commit_does_not_reauth(self):
-        """AC2/AC3: a different HEAD plus unrelated dirty files still reuses
-        the stored audit (repo state is not an input)."""
+        """AC2/AC3: a moved HEAD plus unrelated dirty files still reuses
+        the stored audit (repo state is not an input; git is never queried)."""
         fp = self._fp()
         assert fp is not None
         report = self._report_with_fingerprint(fp)
         run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
-        repo = self._repo(head_sha="b" * 40, status=[" M src/unrelated.py"])
+        repo = self._repo()
         assert self._check(run_wl, repo) == report
+        assert repo.calls == []
 
     def test_touched_file_change_does_not_reauth(self):
         """AC3 (strict rule): an uncommitted change to a file the item
-        references does NOT invalidate the stored audit."""
+        references does NOT invalidate the stored audit (git is never
+        queried)."""
         fp = self._fp()
         assert fp is not None
         report = self._report_with_fingerprint(fp)
         run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
-        repo = self._repo(
-            grep_files=["src/a.py"], blobs={"src/a.py": "blob-changed"},
-            status=[" M src/a.py"], diff=["src/a.py"],
-        )
+        repo = self._repo()
         assert self._check(run_wl, repo) == report
+        assert repo.calls == []
 
     def test_child_content_changed_fresh_survives_repo_churn(self):
         """AC2/AC3 at the child gate: a child whose individually-persisted
@@ -760,15 +681,11 @@ class TestContentFreshnessGate:
             audit_audited_at="2026-08-01T00:00:00.000Z",
             work_item_desc=self._DESC,
         )
+        repo = self._repo()
         with mock.patch.object(audit_runner, "_run_wl", side_effect=run_wl):
-            changed = audit_runner._child_content_changed(
-                self._repo(
-                    head_sha="b" * 40, blobs={"src/a.py": "blob-changed"},
-                    status=[" M src/a.py"],
-                ),
-                "TEST-1",
-            )
+            changed = audit_runner._child_content_changed(repo, "TEST-1")
         assert changed is False
+        assert repo.calls == []
 
     def test_description_changed_reauths(self):
         """AC4: changed description → fingerprint mismatch → re-audit."""
@@ -910,22 +827,6 @@ class TestContentFreshnessGate:
     # calls on a fresh second audit).
     # ------------------------------------------------------------------
 
-    def _patch_fingerprint(self, touched=None, states=None):
-        """Patch the resolver + per-path states for deterministic cmd_issue
-        integration tests (no real git queries)."""
-        touched = touched if touched is not None else ["src/a.py"]
-        states = states if states is not None else {
-            "src/a.py": {"head": "blob-a", "worktree": ""},
-        }
-        return (
-            mock.patch.object(
-                audit_runner, "_resolve_touched_files", return_value=touched,
-            ),
-            mock.patch.object(
-                audit_runner, "_compute_path_fingerprints", return_value=states,
-            ),
-        )
-
     def test_force_bypasses_content_gate(self):
         """AC4: --force bypasses the content gate (fresh audit still runs)."""
         updates = []
@@ -986,9 +887,7 @@ class TestContentFreshnessGate:
             mock_runner.side_effect = _side_effect
             return mock_runner
 
-        p_touched, p_states = self._patch_fingerprint()
         with (
-            p_touched, p_states,
             mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log",
                 return_value={"extracted_text": "[]"},
@@ -1054,17 +953,13 @@ class TestContentFreshnessGate:
             mock_runner.side_effect = _side_effect
             return mock_runner
 
-        p_touched, p_states = self._patch_fingerprint()
-        with p_touched, p_states:
-            fp = audit_runner._compute_content_fingerprint(
-                _make_runner("f" * 64), "TEST-1",
-                work_item={"description": self._DESC},
-            )
+        fp = audit_runner._compute_content_fingerprint(
+            _make_runner("f" * 64), "TEST-1",
+            work_item={"description": self._DESC},
+        )
         assert fp is not None
 
-        p_touched2, p_states2 = self._patch_fingerprint()
         with (
-            p_touched2, p_states2,
             mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log",
                 return_value={"extracted_text": "[]"},
@@ -1144,17 +1039,13 @@ class TestContentFreshnessGate:
             mock_runner.side_effect = _side_effect
             return mock_runner
 
-        p_touched, p_states = self._patch_fingerprint()
-        with p_touched, p_states:
-            fp = audit_runner._compute_content_fingerprint(
-                _make_runner("f" * 64), "TEST-1",
-                work_item={"description": self._DESC},
-            )
+        fp = audit_runner._compute_content_fingerprint(
+            _make_runner("f" * 64), "TEST-1",
+            work_item={"description": self._DESC},
+        )
         assert fp is not None
 
-        p_touched2, p_states2 = self._patch_fingerprint()
         with (
-            p_touched2, p_states2,
             mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", side_effect=_pi,
             ),
@@ -1231,9 +1122,7 @@ class TestContentFreshnessGate:
             pi_calls.append(kwargs.get("prompt", "")[:50])
             return {"extracted_text": "[]"}
 
-        p_touched, p_states = self._patch_fingerprint()
         with (
-            p_touched, p_states,
             mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", side_effect=_pi,
             ),
