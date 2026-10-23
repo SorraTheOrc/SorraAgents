@@ -566,6 +566,7 @@ class TestPhase2TimingInstrumentation:
         def _fake_call_pi(prompt, model="test-model", pi_bin="pi",
                           enable_tools=False, timeout=None, max_retries=None,
                           ac_fallback_used=None, child_screen=False,
+                          parent_screen=False,
                           issue_id="", context="", priority=None):
             return {
                 "verdict": "met",
