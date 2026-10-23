@@ -336,6 +336,15 @@ if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
     #    (SA-0MUJ2VMF7000UHCX). A stale/foreign user.email makes `wl sync`'s
     #    author-identity gate refuse to merge Worklog data; surface it at
     #    install time so it is actionable. Non-fatal (fail-open).
+    #
+    #    The gate accepts commits authored by this checkout's `user.email` or
+    #    by an entry in `.worklog/config.yaml` `syncAllowedAuthors`, and always
+    #    refuses empty author emails. Set the canonical identity with
+    #    `git config --local user.email <email>`; a deliberately different
+    #    framework identity such as `pi@local` belongs in `syncAllowedAuthors`
+    #    (exact email only). One-off incident remedy: `wl sync
+    #    --allow-foreign-author`. Reference: docs/dev/worklog-sync.md
+    #    ("Author-identity gate").
     IDENTITY_GUARD="$CURRENT_REPO_ROOT/scripts/check_git_identity.py"
     if [ -f "$IDENTITY_GUARD" ]; then
       if identity_output="$(python3 "$IDENTITY_GUARD" --repo-root "$CURRENT_REPO_ROOT" 2>&1)"; then

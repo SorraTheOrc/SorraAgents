@@ -3,6 +3,84 @@
 This document covers `wl sync` behavior that skill scripts and agents should
 know, especially failure modes on unusual repositories.
 
+## Author-identity gate
+
+`wl sync` refuses to merge incoming worklog-data commits unless every author
+on the remote tracking ref (`refs/worklog/remotes/<remote>/worklog/data`,
+scanned since `.worklog/last-synced-ref`) passes the author-identity gate. The
+gate keeps foreign and incident-era history out of the project store
+(SA-0MUJ2VMF7000UHCX).
+
+### What the gate accepts
+
+A commit author is accepted when its email:
+
+- matches the store's configured `user.email` (trimmed, case-insensitive), or
+- appears verbatim in the project's `syncAllowedAuthors` allow-list in
+  `.worklog/config.yaml`.
+
+An **empty author email is always refused**, even with
+`--allow-foreign-author`. The allow-list is deliberately **exact-email** only:
+a YAML list of non-empty strings, with no wildcards and no allow-all entry.
+Incident-era sentinel identities (`t@t.com` and the other emails in
+`scripts/check_git_identity.py::INCIDENT_ERA_EMAILS`) must never be added to
+it — regression coverage pins this in `tests/test_author_gate_allowlist.py`.
+
+`pi@local` is allow-listed for this project (SA-0MVGSB63F00803HK): it is the
+framework identity used by agent checkouts, so their worklog-data commits
+merge instead of stranding every local Worklog mutation (incident
+SA-0MVB57M02008QPJS).
+
+### When the gate refuses
+
+The refusal names the remote tracking ref and each offending commit hash and
+author email, for example:
+
+```
+Refusing to merge worklog data from refs/worklog/remotes/origin/worklog/data: 1 incoming commit(s) fail the author-identity gate.
+- 4617ae25a: author email 'pi@local' does not match configured user.email 'you@example.com'
+```
+
+Data already merged is not re-gated: the scan starts at
+`.worklog/last-synced-ref`, so an offending commit that is an ancestor of that
+ref has converged and no longer blocks (as with `4617ae25a` above).
+
+Remediation, in order of preference:
+
+1. **Fix the checkout identity** (ongoing fix). Set the canonical identity the
+   store expects, verify it, then re-run `wl sync`:
+
+   ```bash
+   git config --local user.email "you@example.com"
+   git config --local user.name  "Your Name"
+   git config user.email          # verify
+   python3 scripts/check_git_identity.py --repo-root .   # pre-flight guard
+   wl sync
+   ```
+
+2. **Allow-list a legitimate identity** (project-scoped, reviewable fix). If a
+   known identity (for example the agent framework's `pi@local`) legitimately
+   authors worklog-data commits for this project, add it to
+   `syncAllowedAuthors` in `.worklog/config.yaml`, keeping the list
+   exact-email. Regression coverage: `tests/test_author_gate_allowlist.py`.
+
+3. **One-time escape hatch** (incident remediation only). Merge a single
+   inbound batch authored by an identity that is not — and should not be —
+   allow-listed:
+
+   ```bash
+   wl sync --allow-foreign-author
+   ```
+
+   This bypasses the foreign-email comparison for that run only. It never
+   bypasses the empty-email gate and it does not modify the allow-list.
+
+`scripts/check_git_identity.py` runs before `wl sync` in the pre-push hook and
+from `scripts/install_pi.sh`, so a mismatched local identity surfaces as an
+actionable error instead of a cryptic refusal (SA-0MUJ2VMF7000UHCX). For
+install/sync setup see [`scripts/install_pi.sh`](../../scripts/install_pi.sh)
+and §9.4 step 4 of [`docs/dev/test-isolation.md`](test-isolation.md).
+
 ## Worklog-dir resolution for skill scripts
 
 Skill scripts (intake, find-related, effort-and-risk, audit, implement) shell
