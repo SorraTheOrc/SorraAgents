@@ -854,6 +854,19 @@ class TestChildVerdictReuseInParentAudits:
         assert reason == "stale"
         assert audited_at == self.AUDITED_AT
 
+    def test_verdict_title_change_stale(self):
+        """F2 AC1 (item-data-only rule): a child whose own TITLE changed is
+        stale — title is audited content; the stored audit must not be
+        reused."""
+        ar = audit_runner
+        raw = self._fingerprinted_raw(ar, "CHILD-1", title="Old Title")
+        verdict, reason, audited_at = ar._get_child_audit_verdict(
+            self._verdict_runner(raw), "CHILD-1",
+        )
+        assert verdict is None
+        assert reason == "stale"
+        assert audited_at == self.AUDITED_AT
+
     def test_verdict_force_bypasses_reuse(self):
         """F2 AC1/AC4: --force bypasses BOTH gates — a content-fresh child
         verdict is not reused."""
@@ -1411,6 +1424,41 @@ class TestParentFirstChildPassThrough:
                 return {"success": True, "workItem": {
                     "id": "CHILD-1",
                     "description": "## Acceptance Criteria\n- CAC1: x\n- CAC2: y",
+                }}
+            raise AssertionError(f"unexpected wl cmd: {cmd_str}")
+
+        with mock.patch.object(ar, "_run_wl", side_effect=_fake_run_wl):
+            changed = ar._child_content_changed(mock.MagicMock(), "CHILD-1")
+        assert changed is True
+
+    def test_child_content_changed_title_change_true(self):
+        """_child_content_changed: a TITLE-only change is a content change —
+        the child must not silently inherit the parent's pass (AC6)."""
+        from audit.scripts import audit_runner as ar
+        fp = ar._compute_content_fingerprint(
+            mock.MagicMock(), "CHILD-1",
+            work_item={"title": "Original title",
+                       "description": "## Acceptance Criteria\n- CAC1: x"},
+        )
+        assert fp is not None
+        stored = (
+            f"Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
+            f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}\n\n## Summary\nok"
+        )
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {"success": True, "audit": {
+                    "workItemId": "CHILD-1",
+                    "auditedAt": "2026-08-01T00:00:00.000Z",
+                    "rawOutput": stored,
+                }}
+            if "show" in cmd_str:
+                return {"success": True, "workItem": {
+                    "id": "CHILD-1",
+                    "title": "Renamed title",
+                    "description": "## Acceptance Criteria\n- CAC1: x",
                 }}
             raise AssertionError(f"unexpected wl cmd: {cmd_str}")
 

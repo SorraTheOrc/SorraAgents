@@ -27,6 +27,46 @@ def _proc(returncode: int, stdout: str = ""):
 _COMMIT_MARKER = audit_runner._TOUCHED_FILES_COMMIT_MARKER
 
 
+class _StatefulRepo:
+    """Repository double that MODELS HEAD and working-tree state.
+
+    Unlike :class:`_FakeGitRepo` (which exists to exercise the retained
+    touched-file resolver), this double answers the git queries a freshness
+    implementation *would* make if it regressed to repository state: the HEAD
+    sha, ``git status --porcelain`` and ``git diff --name-only``. Every query
+    is recorded in ``calls`` and the modelled state can differ between two
+    "checkouts" of the same work item, so a test proving the content
+    fingerprint/gate never consulted the repository is meaningful — a
+    git-derived component would have to call this double to observe the
+    difference.
+    """
+
+    def __init__(self, *, head: str = "a" * 40, status: str = "",
+                 diff: str = "", grep_files: list[str] | None = None):
+        self.head = head
+        self.status = status
+        self.diff = diff
+        self.grep_files = list(grep_files or [])
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd):
+        cmd = [str(c) for c in cmd]
+        self.calls.append(cmd)
+        joined = " ".join(cmd)
+        if joined.startswith("git rev-parse HEAD"):
+            return _proc(0, self.head + "\n")
+        if joined.startswith("git status"):
+            return _proc(0, self.status)
+        if joined.startswith("git diff"):
+            return _proc(0, self.diff)
+        if joined.startswith("git log --all"):
+            lines = [f"{_COMMIT_MARKER}{self.head}", *self.grep_files]
+            return _proc(0, "\n".join(lines) + "\n")
+        if joined.startswith("git log --no-walk"):
+            return _proc(0, "")
+        raise AssertionError(f"unexpected git command: {joined}")
+
+
 class _FakeGitRepo:
     """In-memory git double for the retained touched-file resolver tests.
 
@@ -288,14 +328,16 @@ class TestContentFreshnessGate:
     # ------------------------------------------------------------------
 
     def _fp(self, work_item=None, *, title=None, desc=None,
-            fetch_comments=None) -> str | None:
+            fetch_comments=None, repo=None) -> str | None:
         """Compute the fingerprint for the default item (hermetic).
 
         *work_item* (when supplied) is used verbatim; otherwise a default item
         built from *title*/*desc* is passed. When the caller does not pass a
         ``work_item`` to the production function the mocked ``wl show``
         payload supplies it — *fetch_comments* seeds that payload's comments
-        (proving comments never contribute).
+        (proving comments never contribute). *repo* overrides the repository
+        double so a test can model different HEAD/working-tree states and
+        prove they do not move the fingerprint.
         """
         item = work_item if work_item is not None else {
             "title": title if title is not None else self._TITLE,
@@ -312,19 +354,24 @@ class TestContentFreshnessGate:
 
         with mock.patch.object(audit_runner, "_run_wl", side_effect=_run_wl):
             return audit_runner._compute_content_fingerprint(
-                _FakeGitRepo(), "TEST-1", work_item=item,
+                repo if repo is not None else _FakeGitRepo(), "TEST-1",
+                work_item=item,
             )
 
     def _make_run_wl(self, audit_raw=None, audit_audited_at="2026-08-01T00:00:00.000Z",
                      work_item_desc=_DESC, work_item_title=None,
                      work_item_updated_at="2026-07-01T00:00:00.000Z",
-                     work_item_comments=None, show_failure=False):
+                     work_item_comments=None, show_failure=False,
+                     work_item_fields=None):
         """Build a ``_run_wl`` fake returning a stored audit + work item.
 
         *work_item_comments* seeds the top-level ``comments`` list of the
         ``wl show`` payload (comments are not a fingerprint input — the gate
         must stay fresh when only comments changed). *show_failure* makes the
         ``wl show`` call raise, exercising the fail-open path.
+        *work_item_fields* is merged into the ``workItem`` payload so a test
+        can model lifecycle-field churn (status/stage/priority/assignee/
+        sortIndex) alongside a moved ``updatedAt``.
         """
         comments = list(work_item_comments or [])
         title = self._TITLE if work_item_title is None else work_item_title
@@ -342,14 +389,16 @@ class TestContentFreshnessGate:
             if "show" in cmd_str and "--children" not in cmd_str:
                 if show_failure:
                     raise RuntimeError("wl show failed")
+                work_item = {
+                    "id": "TEST-1",
+                    "title": title,
+                    "description": work_item_desc,
+                    "updatedAt": work_item_updated_at,
+                }
+                work_item.update(work_item_fields or {})
                 return {
                     "success": True,
-                    "workItem": {
-                        "id": "TEST-1",
-                        "title": title,
-                        "description": work_item_desc,
-                        "updatedAt": work_item_updated_at,
-                    },
+                    "workItem": work_item,
                     "comments": list(comments),
                 }
             raise AssertionError(f"unexpected wl command: {cmd_str}")
@@ -411,6 +460,13 @@ class TestContentFreshnessGate:
             self._TITLE.encode("utf-8")).hexdigest()
         assert payload["description_hash"] == real_sha256(
             self._DESC.encode("utf-8")).hexdigest()
+        # Reintroducing ANY repository- or comment-derived component must fail
+        # this test: no path/worktree/HEAD/comment input may appear.
+        for forbidden in ("path_states", "key_files", "head", "worktree",
+                          "comment", "touched"):
+            assert forbidden not in payload, (
+                f"payload must not contain {forbidden!r}"
+            )
         assert "path_states" not in captured[-1]
         assert "key_files" not in captured[-1]
 
@@ -434,7 +490,16 @@ class TestContentFreshnessGate:
                 audit_runner, "_resolve_touched_files", side_effect=_forbidden,
             ),
             mock.patch.object(
+                audit_runner, "_git_changed_files", side_effect=_forbidden,
+            ),
+            mock.patch.object(
                 audit_runner.subprocess, "run", side_effect=_forbidden,
+            ),
+            mock.patch.object(
+                audit_runner.subprocess, "check_output", side_effect=_forbidden,
+            ),
+            mock.patch.object(
+                audit_runner.subprocess, "Popen", side_effect=_forbidden,
             ),
         ):
             fp = self._fp()
@@ -452,19 +517,112 @@ class TestContentFreshnessGate:
     # ------------------------------------------------------------------
 
     def test_fingerprint_stable_for_unrelated_commit(self):
-        """AC1: a commit that changes only unrelated files (different HEAD)
-        leaves the fingerprint unchanged — HEAD is not an input."""
-        assert self._fp() == self._fp()
+        """AC1(a): HEAD moving because ANOTHER item's commit landed leaves the
+        fingerprint unchanged — the repository is never consulted.
+
+        The two computations model two checkouts at different HEADs; a
+        git-derived component would have to call the repo double to observe
+        the difference.
+        """
+        f_before = self._fp(repo=_StatefulRepo(head="a" * 40))
+        f_after = self._fp(repo=_StatefulRepo(head="b" * 40))
+        assert f_before is not None
+        assert f_before == f_after
+
+        # And the gate itself: a stored audit survives an unrelated HEAD move.
+        stored = self._report_with_fingerprint(f_before)
+        run_wl = self._make_run_wl(audit_raw=stored, work_item_desc=self._DESC)
+        repo = _StatefulRepo(head="c" * 40)
+        assert self._check(run_wl, repo) == stored
+        assert repo.calls == [], "the gate must never query git for freshness"
 
     def test_fingerprint_stable_for_touched_file_edits(self):
-        """AC3 (strict rule): touching a file this item references does NOT
-        invalidate — repository state is not part of the fingerprint."""
+        """AC1(c): uncommitted edits (and staged/dirty variants) to a file
+        this item itself touched do NOT invalidate — the fingerprint computed
+        against a clean checkout and against a dirty one is identical."""
         desc = "## Key Files\n- `ProjectSettings/ProjectSettings.asset`"
-        f_clean = self._fp(desc=desc)
-        # A dirty / rewritten touched artefact would previously invalidate.
-        f_rewritten = self._fp(desc=desc)
+        f_clean = self._fp(desc=desc, repo=_StatefulRepo())
+        f_rewritten = self._fp(
+            desc=desc,
+            repo=_StatefulRepo(
+                status=" M ProjectSettings/ProjectSettings.asset\n",
+                diff="ProjectSettings/ProjectSettings.asset\n",
+            ),
+        )
         assert f_clean is not None
         assert f_clean == f_rewritten
+
+    # ------------------------------------------------------------------
+    # AC1(c): direct reversal of the removed per-touched-path invalidation
+    # tests (test_fingerprint_changes_when_touched_file_committed_change /
+    # ..._dirty / ..._staged and test_tool_artefact_rewrite_invalidates).
+    # Each previously invalidated; under the item-data-only rule the stored
+    # audit must be REUSED and no git query may be made.
+    # ------------------------------------------------------------------
+
+    def _assert_gate_reuses_despite_repo_state(self, repo, stored):
+        """Assert the gate reuses *stored* and never consults *repo*."""
+        run_wl = self._make_run_wl(audit_raw=stored, work_item_desc=self._DESC)
+        assert self._check(run_wl, repo) == stored
+        assert repo.calls == [], (
+            "freshness must be item-data-only: no git query is permitted"
+        )
+
+    def test_reversal_touched_file_committed_change_does_not_invalidate(self):
+        """AC1(c): a COMMITTED change to a touched file (git log shows a
+        commit referencing the item touching ``src/a.py``) previously
+        invalidated; now the stored audit is reused."""
+        fp = self._fp()
+        assert fp is not None
+        stored = self._report_with_fingerprint(fp)
+        repo = _StatefulRepo(
+            head="b" * 40,
+            grep_files=["src/a.py"],  # committed change touching the item's file
+        )
+        self._assert_gate_reuses_despite_repo_state(repo, stored)
+
+    def test_reversal_touched_file_dirty_change_does_not_invalidate(self):
+        """AC1(c): an UNCOMMITTED change to a touched file previously
+        invalidated; now the stored audit is reused."""
+        fp = self._fp()
+        assert fp is not None
+        stored = self._report_with_fingerprint(fp)
+        repo = _StatefulRepo(status=" M src/a.py\n", diff="src/a.py\n")
+        self._assert_gate_reuses_despite_repo_state(repo, stored)
+
+    def test_reversal_touched_file_staged_change_does_not_invalidate(self):
+        """AC1(c): a STAGED change to a touched file previously invalidated;
+        now the stored audit is reused."""
+        fp = self._fp()
+        assert fp is not None
+        stored = self._report_with_fingerprint(fp)
+        repo = _StatefulRepo(status="M  src/a.py\n")
+        self._assert_gate_reuses_despite_repo_state(repo, stored)
+
+    def test_reversal_unrelated_dirty_files_do_not_invalidate(self):
+        """AC1(b): uncommitted/untracked changes anywhere in the repo (not
+        just touched files) never invalidate the stored audit."""
+        fp = self._fp()
+        assert fp is not None
+        stored = self._report_with_fingerprint(fp)
+        repo = _StatefulRepo(
+            status=" M src/unrelated.py\n?? docs/new.md\n",
+            diff="src/unrelated.py\n",
+        )
+        self._assert_gate_reuses_despite_repo_state(repo, stored)
+
+    def test_reversal_tool_artefact_rewrite_does_not_invalidate(self):
+        """AC1(c): rewriting a tool artefact the item touched (previously
+        ``test_tool_artefact_rewrite_invalidates``) no longer invalidates."""
+        desc = ("## Key Files\n"
+                "- `ProjectSettings/ProjectSettings.asset`")
+        fp = self._fp(desc=desc)
+        assert fp is not None
+        stored = self._report_with_fingerprint(fp)
+        repo = _StatefulRepo(status=" M ProjectSettings/ProjectSettings.asset\n")
+        run_wl = self._make_run_wl(audit_raw=stored, work_item_desc=desc)
+        assert self._check(run_wl, repo) == stored
+        assert repo.calls == []
 
     def test_fingerprint_stable_across_comments(self):
         """AC5: comments are not fingerprint input (caller-supplied comments
@@ -725,6 +883,27 @@ class TestContentFreshnessGate:
         )
         assert self._check(run_wl, self._repo()) == report
 
+    def test_lifecycle_field_changes_do_not_reauth(self):
+        """AC5: status/stage/priority/assignee/sortIndex all change (each
+        bumps ``updatedAt``) yet the stored audit stays fresh — none of these
+        are audited content."""
+        fp = self._fp()
+        assert fp is not None
+        report = self._report_with_fingerprint(fp)
+        run_wl = self._make_run_wl(
+            audit_raw=report,
+            work_item_desc=self._DESC,
+            work_item_updated_at="2026-08-05T00:00:00.000Z",
+            work_item_fields={
+                "status": "completed",
+                "stage": "in_review",
+                "priority": "critical",
+                "assignee": "another-agent",
+                "sortIndex": 9001,
+            },
+        )
+        assert self._check(run_wl, self._repo()) == report
+
     def test_fingerprint_unavailable_reauths_fail_open(self):
         """AC3: a stored fingerprint that cannot be recomputed (``wl show``
         failure) → re-audit (fail open)."""
@@ -771,6 +950,38 @@ class TestContentFreshnessGate:
             work_item_updated_at="2026-08-05T00:00:00.000Z",
         )
         assert audit_runner._extract_content_fingerprint(legacy_report) is None
+        assert self._check(run_wl, self._repo()) is None
+
+    def test_legacy_unversioned_line_within_time_floor_is_fresh(self):
+        """AC4 (migration): a legacy/unversioned report whose fingerprint is
+        ignored is still FRESH via the time floor when ``auditedAt`` exceeds
+        ``updatedAt`` + ``AUDIT_FRESHNESS_BUFFER_SECONDS`` — no re-audit wave
+        for legacy items whose data did not move."""
+        legacy_report = (
+            "Ready to close: Yes\n\n"
+            "Audit content fingerprint: deadbeef\n\n## Summary\nlegacy"
+        )
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-02T00:00:00.000Z",
+            work_item_updated_at="2026-08-01T00:00:00.000Z",
+        )
+        assert audit_runner._extract_content_fingerprint(legacy_report) is None
+        assert self._check(run_wl, self._repo()) == legacy_report
+
+    def test_legacy_unversioned_line_beyond_buffer_is_stale(self):
+        """AC4 (migration): a legacy report with an unversioned line is stale
+        once ``auditedAt`` no longer clears the buffer — the documented
+        one-time re-audit for legacy items whose ``updatedAt`` moved."""
+        legacy_report = (
+            "Ready to close: Yes\n\n"
+            "Audit content fingerprint: deadbeef\n\n## Summary\nlegacy"
+        )
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-03T00:00:00.000Z",
+        )
         assert self._check(run_wl, self._repo()) is None
 
     # ------------------------------------------------------------------
