@@ -193,9 +193,13 @@ audit whose content is unchanged is treated as trustworthy (no re-audit): a
 passing verdict is fresh; a failing verdict is a current genuine failure and
 blocks immediately. Legacy (fingerprint-less) audits, content changes, and
 probe errors fall back to the time gate / re-audit path. The probe is only
-attempted when the stored report actually carries an
-`Audit content fingerprint:` line (`hasContentFingerprint()`), so fingerprint-less
-items never spawn the runner.
+attempted when the stored report actually carries the **versioned**
+`Audit content fingerprint (v2):` line — mirroring the runner's
+`AUDIT_CONTENT_FINGERPRINT_PREFIX` constant — (`hasContentFingerprint()`), so
+fingerprint-less items never spawn the runner. Legacy unversioned reports
+(`Audit content fingerprint: <hex>`) are deliberately **not** matched: their
+fingerprints were computed with superseded formulas and cannot be recomputed,
+so they fall back to the time gate exactly like fingerprint-less audits.
 
 ### Step 3.7: Final validation sweep (exit 12)
 
