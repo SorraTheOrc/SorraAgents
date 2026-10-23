@@ -99,6 +99,29 @@ cwd, so shared skill helpers inject `--worklog-dir` with this precedence
 This means skill scripts resolve the correct worklog store regardless of which
 directory they are invoked from.
 
+## Post-pull sync hooks (central install)
+
+Every framework project commits three git hooks — `.githooks/post-checkout`,
+`post-merge`, `post-rewrite` (all `worklog:post-pull-hook:v1`) — that delegate
+`wl sync` to one **per-machine** script:
+
+```sh
+exec "$HOME/.config/pi/.githooks/worklog-post-pull" "$@"
+```
+
+`scripts/install_pi.sh` installs that central script (an executable symlink to
+the repo's committed `.githooks/worklog-post-pull`) as an idempotent,
+`PI_SKIP_HOOK_INSTALL=1`-gated step, so a fresh machine's checkouts/merges do
+not error with `exec: ... not found` and the post-pull `wl sync` runs
+(SA-0MU8CRX1X008IORP). The central script skips sync when
+`WORKLOG_SKIP_POST_PULL=1` and is fail-open when `wl` is not installed.
+
+> **Portability caveat (SA-0MVK1Q30O0067NXX):** the committed wrappers
+> hard-code the delegating path. `install_pi.sh` warns (fail-open) when the
+> current project's `.githooks/post-checkout` does not reference the central
+> path it just installed — on machines whose `$HOME` differs, the wrappers
+> must be made `$HOME`-relative before checkout/merge stops erroring.
+
 ## `wl sync` on a repo with no commits (unborn HEAD)
 
 `wl sync` pushes worklog data through a temporary git worktree created from
