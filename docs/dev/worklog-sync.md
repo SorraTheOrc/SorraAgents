@@ -161,3 +161,60 @@ Normal sync behavior on repos with commits is unchanged.
   overwrite `dist/sync.js` and silently drop the guard. After upgrading the
   worklog package, re-apply the patch (or verify the source change is
   shipped upstream). Regression coverage: `tests/test_wl_sync_no_commits.py`.
+
+## Held claims survive background syncs
+
+Background syncs (`wl sync --if-idle` from herdr's auto-sync timer, auto-sync
+spawns, `skill/shared/worklog_sync.py`) must never undo a claim. The invariant
+is *actively worked ⇒ `status: in-progress`* (SA-0MTFTFUIH000UWM9); before
+SA-0MVE34D9B005TUYJ a sync could write a pre-claim snapshot back over a held
+claim — four times in one implement run (SA-0MVDQF3VW002PKCA) — forcing the
+agent to re-claim between tool calls.
+
+**What a sync now guarantees** (ContextHub `dev`, `src/claim-hold.ts`):
+
+- An item that is `in-progress` — or carries a non-empty `assignee` while not
+  `completed`/`deleted` — and was active within `syncClaimHoldTtlHours`
+  (default 24 h; `0` disables) keeps its claimed `status`/`stage` pair when a
+  sync pulls a stale row for it.
+- The claim's `updatedAt`/`activityAt` are preserved: the losing stale row is
+  not re-stamped as the newest row by `import()` / `upsertItems()` (that
+  re-stamp is what made a reverted claim stick).
+- Newer, *more active* transitions still win (`→ completed`, `→ in_review`, a
+  close, an audit demotion of a completed item, a reassignment), attributed
+  deletes still propagate, and a claim older than the TTL is released.
+- Every refusal is recorded in the sync log (`~/.worklog/logs/sync.log`) and in
+  `wl --json sync` output as `sync.claimHolds[]`.
+
+**What agents should do:** nothing beyond the existing claim discipline —
+`wl update <id> --status in_progress --assignee <agent>` when starting work.
+If a claim *does* appear to revert, `wl --json sync` now names the store it
+operated on (`sync.store`) and every refused downgrade, so the next recurrence
+is diagnosable without source archaeology.
+
+## One store per repository (worktrees)
+
+`.worklog/config.yaml` is tracked, so every implement/audit worktree under
+`.worklog/worktrees/<name>` checks out a `.worklog/` directory that holds
+configuration but **no store**. Two stores for one project prefix do not
+serialise — the mutation lock (`worklog-data.jsonl.lock`) and the
+`last-synced-ref` watermark are both derived from the data path — so they hold
+different locks and watermarks while pushing to the same worklog ref.
+
+`wl` therefore binds a command run inside a managed worktree to the **main
+checkout's** store:
+
+- a worktree `.worklog/` is used only when it is a genuine store (`wl init`
+  wrote an `initialized` marker and/or `worklog.db`);
+- otherwise the command binds to the main checkout's `.worklog/`;
+- if neither exists the command fails with an actionable error naming
+  `--worklog-dir` instead of silently creating a second store.
+
+`wl --json sync` reports `sync.store.secondStore: true` (plus a warning in the
+sync log) when it detects a second store, so the condition is visible rather
+than silent.
+
+**Agent rule (unchanged, now enforced):** when running `wl` from inside a
+worktree, pass `--worklog-dir <main-checkout>/.worklog`
+(`skill/shared/status_lifecycle.py` already resolves and injects it). See
+[docs/dev/worktree-isolation.md](worktree-isolation.md).
