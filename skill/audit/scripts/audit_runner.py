@@ -682,6 +682,51 @@ instead of treating a timeout as a model judgement.
 guard never becomes the new starvation point.
 """
 
+AUDIT_PARENT_SCREEN_TIMEOUT_ENV = "AUDIT_PARENT_SCREEN_TIMEOUT"
+"""Environment variable name for the parent Phase-1 AC screen budget.
+
+The parent Phase-1 AC screen is the same structural screening call as a
+child screen (read the FILE SCOPE manifest, map each AC to a
+met/unmet/partial/adjusted verdict), so it shares the measured right-sized
+screening budget (``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s) instead of the
+full 1800 s Phase-2 budget — a parent screen that exceeds its budget is
+quarantined exactly like a capped child screen (SA-0MVJ3Q662006RDJR).
+Overridable via the ``--parent-screen-timeout`` CLI flag (flag wins) or this
+env var.
+"""
+
+_PARENT_SCREEN_TIMEOUT_DEFAULT = 1080
+"""Default per-call budget (seconds) for the parent Phase-1 AC screen.
+
+**Derivation (SA-0MVJ3Q662006RDJR, measured — not guessed).** Right-sizing
+follows the same derivation discipline as the child-screen budget
+(``ceil(p95 x safety factor)`` for Phase-1 *screening* — SA-0MVI3608M0080QLW):
+the parent screen is the same structural screening call as a child screen
+(FILE SCOPE manifest -> per-AC verdicts), so the measured screening-class p95
+(~506 s, 2026-10-21 reference run) x safety factor 2 -> 1012, rounded up to
+**1080 s**.
+
+Parent-specific corroboration on the current corpus
+(``scripts/measure_audit_performance.py --root ~/.audit_debug``,
+2026-10-23): 482 parent-screen calls; completions p50 224.8 s / p90 906.3 s /
+p95 1232.9 s (contention-inclusive — the p95 is inflated by queue wait behind
+the saturated 2-slot proxy), with **16 calls currently landing squarely on the
+old 1800 s cap**. The 1080 s budget therefore covers >= 90 % of parent
+completions while converting the cap-bound 16 into fast, quarantinable fails
+instead of 30-minute burns.
+
+Re-derivation on a new corpus::
+
+    python3 scripts/measure_audit_performance.py --root ~/.audit_debug
+    # parent row, completions only, p95 column -> ceil(p95 x 2)
+
+A capped parent screen never triggers the JSON re-ask and never burns a second
+call: it degrades to ``partial`` with evidence naming the budget and phase and
+increments ``parent_screen_timeouts`` in ``AUDIT_RELIABILITY_SUMMARY``. It
+stays far below the 1800 s Phase-2 budget, so a genuinely stalled parent
+screen still fails fast.
+"""
+
 AUDIT_STALL_TIMEOUT_ENV = "AUDIT_STALL_TIMEOUT"
 """Environment variable name for the in-process stall-abort threshold.
 
@@ -917,7 +962,10 @@ _UNPARSEABLE_RAW_MAX_CHARS = 4000
 #: dashboards grep this line, so the key set and order are a contract.
 #: ``verdict_reasks`` counts the bounded JSON-contract re-asks
 #: (SA-0MVI6VNDF001VE1S) so the re-ask rate is measurable from the log
-#: instead of inferred from debug-log forensics.
+#: instead of inferred from debug-log forensics. ``child_screen_timeouts``
+#: and ``parent_screen_timeouts`` count capped Phase-1 screens that were
+#: quarantined as ``partial`` (SA-0MVI3608M0080QLW, SA-0MVJ3Q662006RDJR); new
+#: keys are appended so existing dashboards keep their column positions.
 RELIABILITY_SUMMARY_KEYS = (
     "calls",
     "parse_ok",
@@ -928,6 +976,7 @@ RELIABILITY_SUMMARY_KEYS = (
     "concurrency_waits",
     "verdict_reasks",
     "child_screen_timeouts",
+    "parent_screen_timeouts",
 )
 #: Machine-greppable prefix; the full line is ``<prefix> <key=value> ...``.
 RELIABILITY_SUMMARY_PREFIX = "AUDIT_RELIABILITY_SUMMARY"
@@ -968,7 +1017,8 @@ def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
 
     The line is ``AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n>
     parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n>
-    concurrency_waits=<n> elapsed_seconds=<x>`` with stable keys in
+    concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n>
+    parent_screen_timeouts=<n> elapsed_seconds=<x>`` with stable keys in
     :data:`RELIABILITY_SUMMARY_KEYS`. When *elapsed_seconds* is omitted the
     value is derived from the run start clock set by :func:`_rel_reset`.
     """
@@ -2708,6 +2758,35 @@ def _resolve_child_screen_timeout(cli_timeout: int | None) -> int | None:
     return None
 
 
+def _resolve_parent_screen_timeout(cli_timeout: int | None) -> int | None:
+    """Resolve the per-call budget for the parent Phase-1 AC screen.
+
+    Precedence:
+      1. ``--parent-screen-timeout`` CLI flag (explicit override)
+      2. ``AUDIT_PARENT_SCREEN_TIMEOUT`` environment variable (seconds)
+      3. ``None`` — falls back to ``_PARENT_SCREEN_TIMEOUT_DEFAULT`` (1080 s,
+         the shared measured right-sized screening budget, derived as
+         ``ceil(p95 x 2)`` — SA-0MVJ3Q662006RDJR) inside ``_call_pi`` for
+         parent screens
+
+    An invalid value (non-integer) is ignored with a warning so a
+    misconfigured environment cannot break the audit run.
+    """
+    if cli_timeout is not None:
+        return cli_timeout
+    env_value = os.environ.get(AUDIT_PARENT_SCREEN_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_PARENT_SCREEN_TIMEOUT_ENV} value {env_value!r}; "
+                "using default parent-screen timeout",
+                file=sys.stderr,
+            )
+    return None
+
+
 def _resolve_stall_timeout() -> int:
     """Resolve the in-process stall-abort threshold in seconds.
 
@@ -4269,23 +4348,51 @@ def _normalize_model_source(source: str | None) -> str:
 # Pi integration
 # ---------------------------------------------------------------------------
 
-def _resolve_call_timeout(timeout: int | None, child_screen: bool = False) -> int:
+def _resolve_call_timeout(timeout: int | None, child_screen: bool = False,
+                          parent_screen: bool = False) -> int:
     """Resolve the effective per-call Pi timeout for a single call.
 
     Precedence:
       1. explicit ``timeout`` arg (from ``--timeout`` / ``AUDIT_PI_TIMEOUT``)
-      2. child Phase-1 AC-review screens: ``AUDIT_CHILD_SCREEN_TIMEOUT``
+      2. parent Phase-1 AC screen: ``AUDIT_PARENT_SCREEN_TIMEOUT`` env or
+         ``_PARENT_SCREEN_TIMEOUT_DEFAULT`` (1080 s — the same measured
+         screening budget as child screens, `ceil(p95 x 2)`), so a parent
+         screen that exceeds its budget is quarantined instead of burning
+         the full 1800 s (SA-0MVJ3Q662006RDJR)
+      3. child Phase-1 AC-review screens: ``AUDIT_CHILD_SCREEN_TIMEOUT``
          env or ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s, derived from
          measured p95 x 2) — a child screen that exceeds its budget is
          quarantined instead of burning the full 1800 s
          (LP-0MSQ32S2M001EA74 AC1, SA-0MVI3608M0080QLW)
-      3. all other calls: ``CALL_PI_TIMEOUT`` (1800 s)
+      4. all other calls: ``CALL_PI_TIMEOUT`` (1800 s)
     """
     if timeout is not None:
         return timeout
+    if parent_screen:
+        return (
+            _resolve_parent_screen_timeout(None)
+            or _PARENT_SCREEN_TIMEOUT_DEFAULT
+        )
     if child_screen:
         return _resolve_child_screen_timeout(None) or _CHILD_SCREEN_TIMEOUT_DEFAULT
     return CALL_PI_TIMEOUT
+
+
+def _screen_call_capped(result: dict | None) -> bool:
+    """Whether a Phase-1 screen call was capped (timeout / concurrency wait).
+
+    A capped screen is quarantined: it degrades to the conservative
+    ``partial`` verdict with evidence naming the budget and phase, and the
+    run counts it in the reliability summary. A cap must never trigger the
+    bounded JSON re-ask or a full-model retry — those would spend a second
+    full-length call in service of the call that already exhausted its
+    budget (the 1800 s parent cap + 1147 s re-ask of SA-0MVI6VVC00029XO4's
+    measurement; SA-0MVJ3Q662006RDJR AC2).
+    """
+    return bool(
+        isinstance(result, dict)
+        and (result.get("_timeout") or result.get("_concurrency_timeout"))
+    )
 
 
 def _communicate_with_stall(process, cmd: list[str],
@@ -4395,6 +4502,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              max_retries: int | None = None,
              ac_fallback_used: threading.Event | None = None,
              child_screen: bool = False,
+             parent_screen: bool = False,
              issue_id: str = "",
              context: str = "",
              priority: int = Priority.MEDIUM) -> dict:
@@ -4428,6 +4536,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             p95 x 2, configurable via
             ``AUDIT_CHILD_SCREEN_TIMEOUT`` / ``--child-screen-timeout``)
             instead of the 1800 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
+
+        parent_screen: If True, this is the parent Phase-1 AC screen; it uses
+            the same measured right-sized screening budget
+            (``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, configurable via
+            ``AUDIT_PARENT_SCREEN_TIMEOUT`` / ``--parent-screen-timeout``)
+            instead of the 1800 s Phase-2 budget, so a capped parent screen is
+            quarantined rather than burning 30 minutes
+            (SA-0MVJ3Q662006RDJR AC1/AC3).
 
         issue_id: Work-item ID used in the ``--session-id`` flag.
         context: Phase/context string used in the ``--session-id`` flag
@@ -4478,7 +4594,9 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     if issue_id:
         cmd.extend(["--session-id", _build_session_id(issue_id, context)])
 
-    effective_timeout = _resolve_call_timeout(timeout, child_screen=child_screen)
+    effective_timeout = _resolve_call_timeout(
+        timeout, child_screen=child_screen, parent_screen=parent_screen,
+    )
     stall_timeout = _resolve_stall_timeout()
     effective_max_retries = _PI_MAX_RETRIES if max_retries is None else max_retries
     attempt = 0
@@ -4960,6 +5078,7 @@ def _reask_json_array_once(
     instruction: str,
     priority: int | None = None,
     child_screen: bool = False,
+    parent_screen: bool = False,
 ) -> list | None:
     """Issue exactly one bounded 'return only the JSON array' re-ask.
 
@@ -4968,10 +5087,11 @@ def _reask_json_array_once(
     under the ``verdict_reask`` context and bounded by the per-call budget
     (child Phase-1 screens keep their short budget when *child_screen* is
     True, so the retry is as bounded as the call it retries —
-    WL-0MU0FHSEP003PCDY AC4). Returns the recovered batch, or ``None`` when
-    the single re-ask also fails (timeout, provider error, or unparseable
-    output) — the caller then falls back to the conservative ``partial``
-    verdict, never ``met`` (SA-0MU32TCFM003B78I AC3/AC5).
+    WL-0MU0FHSEP003PCDY AC4; the parent Phase-1 screen keeps the right-sized
+    parent budget when *parent_screen* is True). Returns the recovered batch,
+    or ``None`` when the single re-ask also fails (timeout, provider error, or
+    unparseable output) — the caller then falls back to the conservative
+    ``partial`` verdict, never ``met`` (SA-0MU32TCFM003B78I AC3/AC5).
     """
     prompt = _JSON_REASK_PREFIX + _JSON_REASK_SCHEMA + "\n\n" + instruction
     _rel_incr("verdict_reasks")
@@ -4980,6 +5100,7 @@ def _reask_json_array_once(
             issue_id, "verdict_reask", prompt,
             model=model, pi_bin=pi_bin, debug_log=debug_log,
             timeout=timeout, json_expected=True, child_screen=child_screen,
+            parent_screen=parent_screen,
             priority=priority if priority is not None else Priority.MEDIUM,
         )
     except RuntimeError:
@@ -6724,6 +6845,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            max_retries: int | None = None,
                            ac_fallback_used: threading.Event | None = None,
                            child_screen: bool = False,
+                           parent_screen: bool = False,
                            ac_count: int | None = None,
                            json_expected: bool = False,
                            priority: int | None = None,
@@ -6746,6 +6868,9 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         child_screen: If True, forwards to _call_pi() so child Phase-1
             AC-review screens use the short per-call budget
             (LP-0MSQ32S2M001EA74 AC1).
+        parent_screen: If True, forwards to _call_pi() so the parent Phase-1
+            AC screen uses the right-sized screening budget instead of the
+            1800 s Phase-2 budget (SA-0MVJ3Q662006RDJR AC1).
         ac_count: Number of acceptance criteria covered by this call. When
             supplied, the per-call timing line appends ``ac_count=N`` and
             ``avg_ac_elapsed_seconds`` (elapsed / N) so Phase-2 per-AC
@@ -6778,6 +6903,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools,
         timeout=timeout, max_retries=max_retries,
         ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+        parent_screen=parent_screen,
         issue_id=issue_id, context=context,
         priority=priority if priority is not None else Priority.MEDIUM,
     )
@@ -7254,8 +7380,11 @@ def _phase1_review_children_batched(
             batch = None
     if not batch:
         # AC4 safe fallback: a retry with the full model only when a distinct
-        # fast model was used, then conservative 'partial' for every child.
-        if phase1_model != full_model:
+        # fast model was used. A capped batch (budget / concurrency wait) is
+        # never retried — it is quarantined as 'partial' so the run does not
+        # spend a second full-length call after the budget is already gone
+        # (SA-0MVJ3Q662006RDJR AC2/AC3).
+        if phase1_model != full_model and not _screen_call_capped(result):
             print(
                 "Warning: fast Phase 1 model produced unparseable output — "
                 "retrying batched child review with the full audit model",
@@ -7281,10 +7410,7 @@ def _phase1_review_children_batched(
     # `partial` verdict but its evidence names the budget and phase, and the
     # run counts it in `child_screen_timeouts` so downstream consumers can
     # exclude it.
-    capped = bool(
-        isinstance(result, dict)
-        and (result.get("_timeout") or result.get("_concurrency_timeout"))
-    )
+    capped = _screen_call_capped(result)
     if capped:
         _rel_incr("child_screen_timeouts")
     answers: dict[tuple[int, int], dict] = {}
@@ -11079,6 +11205,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
                         on_runtime_error: Callable[[str, Exception], None],
                         failure_label: str,
                         child_screen: bool = False,
+                        parent_screen: bool = False,
                         enable_tools: bool = True,
                         priority: int | None = None) -> tuple[dict, list, str]:
     """Call Pi for one Phase 1 batched AC screen and parse the verdict JSON.
@@ -11094,6 +11221,11 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
     When *context* is ``"parent"``, the priority is forced to
     ``Priority.CRITICAL`` (SA-0MU32T8SH001R8MZ) so that Phase 1 parent
     screening is never starved by lower-priority concurrent audit calls.
+
+    A **capped** screen (per-call budget or concurrency wait) is never
+    re-asked: the caller quarantines it as ``partial`` with evidence naming
+    the budget and phase, so a capped call is one Phase 1 call to completion
+    instead of a second full-length retry (SA-0MVJ3Q662006RDJR AC2).
     """
     # Force CRITICAL priority for parent-screening calls so they are never
     # starved by lower-priority concurrent audits (SA-0MU32T8SH001R8MZ AC1).
@@ -11111,6 +11243,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
             issue_id, context, prompt, model=model, pi_bin=pi_bin,
             debug_log=debug_log, enable_tools=enable_tools, timeout=timeout,
             ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+            parent_screen=parent_screen,
             json_expected=True,
             priority=effective_priority,
         )
@@ -11130,6 +11263,12 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
         isinstance(item, dict) and "index" in item for item in batch
     ):
         return result, batch, raw_text
+    # A capped screen is quarantined, never re-asked (SA-0MVJ3Q662006RDJR
+    # AC2): the call already spent its whole budget, so a re-ask would buy a
+    # second full-length call for the likeliest-to-fail case. The caller
+    # degrades to the conservative 'partial' verdict with quarantine evidence.
+    if _screen_call_capped(result):
+        return result, [], raw_text
     # Bounded JSON re-ask (SA-0MU32TCFM003B78I AC3): exactly one
     # "return only the JSON array" retry before the caller falls back to the
     # conservative 'partial' verdict.
@@ -11137,6 +11276,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
         issue_id, model, pi_bin, debug_log, timeout, prompt,
         priority=effective_priority,
         child_screen=child_screen,
+        parent_screen=parent_screen,
     )
     if reasked:
         return result, reasked, raw_text
@@ -11539,7 +11679,8 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
         result, batch, raw_text = _call_phase1_screen(
             issue_id, "parent", prompt, phase1_model, pi_bin, debug_log,
             timeout, ac_fallback_used, ctx.record_script_failure,
-            failure_label="parent AC review", enable_tools=True,
+            failure_label="parent AC review", parent_screen=True,
+            enable_tools=True,
             priority=_resolve_audit_priority(ctx.work_item),
         )
         # AC4 safe fallback (SA-0MSKB697P000T3HG): when a distinct Phase 1
@@ -11548,8 +11689,11 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
         # retry the SAME Phase 1 screen with the full audit model before
         # falling back to 'partial' diagnostics. When no distinct phase-1
         # model is supplied, phase1_model == resolved_model and this retry
-        # is a no-op — zero behavior change.
-        if not batch and phase1_model != ctx.resolved_model:
+        # is a no-op — zero behavior change. A capped screen is never
+        # retried: it is quarantined (SA-0MVJ3Q662006RDJR AC2), not given a
+        # second full-length call.
+        if (not batch and phase1_model != ctx.resolved_model
+                and not _screen_call_capped(result)):
             print(
                 "Warning: fast Phase 1 model produced unparseable output — "
                 "retrying parent AC review with the full audit model",
@@ -11559,6 +11703,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                 issue_id, "parent", prompt, ctx.resolved_model, pi_bin,
                 debug_log, timeout, ac_fallback_used,
                 ctx.record_script_failure, failure_label="parent AC review",
+                parent_screen=True,
                 enable_tools=True,
                 priority=_resolve_audit_priority(ctx.work_item),
             )
@@ -11632,6 +11777,22 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                     )
                 else:
                     evidence = "Pi model output could not be parsed — raw output logged"
+            # A parent screen that hit its right-sized Phase-1 budget is
+            # QUARANTINED exactly like a capped child screen
+            # (SA-0MVJ3Q662006RDJR AC3): the evidence names the budget and
+            # phase, and the run counts it in the reliability summary so
+            # downstream consumers can exclude it rather than read a timeout
+            # as a model judgement.
+            if _screen_call_capped(result):
+                _rel_incr("parent_screen_timeouts")
+                parent_budget = _resolve_call_timeout(timeout, parent_screen=True)
+                evidence = (
+                    "Parent screen reached its Phase 1 budget "
+                    f"({parent_budget} s, "
+                    f"AUDIT_PARENT_SCREEN_TIMEOUT) before returning a verdict — "
+                    f"QUARANTINED as partial (never met); raise the budget and "
+                    f"re-run to verify this criterion. {evidence}"
+                )
             for ac in acs:
                 ac_results.append({
                     "text": ac,
@@ -14330,6 +14491,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "child screens fail fast instead of burning the full "
                              "1800s budget)"
                          ))
+    p_issue.add_argument("--parent-screen-timeout", type=int, default=None,
+                         help=(
+                             "Override the per-call Pi timeout for the parent "
+                             "Phase-1 AC screen in seconds (default: "
+                             "AUDIT_PARENT_SCREEN_TIMEOUT env or 1080; the parent "
+                             "screen uses the same right-sized screening budget "
+                             "as child screens and is quarantined, not retried, "
+                             "when it reaches it)"
+                         ))
     p_issue.add_argument("--parent-timeout", type=int, default=None,
                          help=(
                              "Override the cumulative elapsed-time guard in seconds "
@@ -14631,6 +14801,12 @@ def main(argv: list[str] | None = None) -> int:
     child_screen_timeout = getattr(args, "child_screen_timeout", None)
     if child_screen_timeout is not None:
         os.environ[AUDIT_CHILD_SCREEN_TIMEOUT_ENV] = str(child_screen_timeout)
+
+    # CLI --parent-screen-timeout overrides AUDIT_PARENT_SCREEN_TIMEOUT for this
+    # process (SA-0MVJ3Q662006RDJR; mirrors the --child-screen-timeout pattern).
+    parent_screen_timeout = getattr(args, "parent_screen_timeout", None)
+    if parent_screen_timeout is not None:
+        os.environ[AUDIT_PARENT_SCREEN_TIMEOUT_ENV] = str(parent_screen_timeout)
 
     # CLI --session-dir overrides PI_CODING_AGENT_SESSION_DIR for this process
     # (and, because the env var is inherited, for every spawned pi process).

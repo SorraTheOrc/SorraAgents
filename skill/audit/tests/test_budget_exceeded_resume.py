@@ -126,7 +126,8 @@ class _Harness:
 
     def _fake_screen(self, issue_id, context, prompt, model, pi_bin, debug_log,
                      timeout, ac_fallback_used, on_runtime_error, failure_label,
-                     child_screen=False, enable_tools=True, priority=None):
+                     child_screen=False, parent_screen=False,
+                     enable_tools=True, priority=None):
         self.screen_contexts.append(context)
         return (
             {"verdict": "met", "evidence": "x"},

@@ -613,7 +613,11 @@ their own patches.
 
 **Child Phase-1 screen budget (LP-0MSQ32S2M001EA74, right-sized by SA-0MVI3608M0080QLW):** lightweight child Phase-1 AC-review screens use a short per-call budget — default **1080 s**, configurable via `--child-screen-timeout SECONDS` (flag wins) or the `AUDIT_CHILD_SCREEN_TIMEOUT` env var. The default is **derived from measurement, not guessed**: on the 2026-10-21 reference run eleven child screens split into six completions (258/336/337/394/463/506 s) and five that landed exactly on the old 600 s cap, i.e. the unconstrained p95 (~506 s) sat only ~15 % below the cap and 45 % of screens capped out. The budget is `ceil(p95 x safety_factor)` with a documented **safety factor of 2** → `ceil(506 x 2) = 1012`, rounded up to 1080 s (~2.1x headroom), still far below the 1800 s Phase-2 budget. Re-derive on a new corpus with `scripts/measure_audit_performance.py --root ~/.audit_debug` (child row, p95 column → `ceil(p95 x 2)`). `PARENT_TIMEOUT_PER_CHILD` is kept **≥ the child budget** (1200 s) so the parent's cumulative guard never becomes the new starvation point; verified against the corpus at ≤ 5 % of screens landing on the cap (was 45 %).
 
-**A capped screen is quarantined, never a silent judgement:** a screen that hits its budget returns the conservative `partial` verdict whose evidence names the budget and phase (*"Child screen reached its Phase 1 budget (1080 s, AUDIT_CHILD_SCREEN_TIMEOUT) before returning a verdict — QUARANTINED as partial (never met)"*), and the run increments `child_screen_timeouts` in `AUDIT_RELIABILITY_SUMMARY` so downstream consumers can exclude it rather than read a timeout as a model verdict. A screen that exceeds its budget never burns the full 1800 s. Parent Phase-1 screens and all Phase 2 calls (parent + child deep analysis) keep the 1800 s budget.
+**A capped screen is quarantined, never a silent judgement:** a screen that hits its budget returns the conservative `partial` verdict whose evidence names the budget and phase (*"Child screen reached its Phase 1 budget (1080 s, AUDIT_CHILD_SCREEN_TIMEOUT) before returning a verdict — QUARANTINED as partial (never met)"*), and the run increments `child_screen_timeouts` in `AUDIT_RELIABILITY_SUMMARY` so downstream consumers can exclude it rather than read a timeout as a model verdict. A screen that exceeds its budget never burns the full 1800 s. All Phase 2 calls (parent + child deep analysis) keep the 1800 s budget.
+
+**Parent Phase-1 screen budget and quarantine (SA-0MVJ3Q662006RDJR):** the parent Phase-1 AC screen is the same structural *screening* call as a child screen (read the FILE SCOPE manifest, map each AC to a verdict), so it uses the same measured right-sized budget — default **1080 s**, configurable independently via `--parent-screen-timeout SECONDS` (flag wins) or the `AUDIT_PARENT_SCREEN_TIMEOUT` env var, with `--timeout` / `AUDIT_PI_TIMEOUT` still winning over both. Before this change the parent screen kept the full 1800 s Phase-2 budget, and the 2026-10-22 clean-room measurement (`SA-0MVI6VVC00029XO4`) showed it consuming the entire cap for a **single-item** audit and then driving a 1147 s `verdict_reask` — the `+1` of the N+1 structure that no child of the epic owned. On the 2026-10-23 corpus (482 parent screens) completions run p50 224.8 s / p90 906.3 s / p95 1232.9 s (contention-inclusive: the p95 is inflated by queue wait behind the saturated 2-slot proxy) with 16 calls landing exactly on the 1800 s cap, so the 1080 s screening budget covers ≥ 90 % of completions while converting the cap-bound remainder into fast quarantines. Re-derive with `scripts/measure_audit_performance.py --root ~/.audit_debug` (parent row, completions p95 → `ceil(p95 x 2)`; the screening-class value stays 1080 because parent and child screens are the same work).
+
+**A capped parent screen is quarantined exactly like a capped child screen:** it returns `partial` with evidence naming the budget and phase (*"Parent screen reached its Phase 1 budget (1080 s, AUDIT_PARENT_SCREEN_TIMEOUT) before returning a verdict — QUARANTINED as partial (never met)"*) and increments `parent_screen_timeouts` in `AUDIT_RELIABILITY_SUMMARY`. A capped screen — parent, child, or batched — is **never** JSON re-asked and never retried on the full model: the second full-length call would be spent on the likeliest-to-fail case after the budget is already gone. A single-item audit therefore issues exactly **one** Phase 1 call (its parent screen), which is what bounds the ≤ 10 minute user story (SA-0MVJ3Q662006RDJR AC2/AC3).
 
 **Budget baseline derivation (SA-0MU32T6O0001UALR):** the cumulative elapsed-time guard (`elapsed_guard`) previously used inconsistent ad-hoc values (~120s, 900s, 1500s, 3110s) across different runs. SA-0MU32T6O0001UALR introduced the `Per-call timing:` debug-log line (emitted by `_maybe_log_debug_info` for every Pi call) and the `_derive_budget_baseline()` helper that parses these lines to compute p50/p95 per phase context (e.g. `phase1_parent`, `phase2_deep`). The derived budget per phase is `p95 × BUDGET_SAFE_MARGIN_DEFAULT` (default safety margin 1.5 = p95 + 50 % headroom). The parent-process budget defaults to `PARENT_TIMEOUT_DEFAULT + N × PARENT_TIMEOUT_PER_CHILD` (110s base + 1200s per child, the per-child term kept >= the 1080 s child-screen budget — SA-0MVI3608M0080QLW), which is itself derived from the same timing data for consistency. The derived baseline can be used to right-size `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` for future runs. Example timing line: ``Per-call timing: issue_id=SA-XXX context=phase2_deep elapsed_seconds=30.5 input_tokens=5000 ac_count=3 model=gpt-4``. The helper functions `_parse_per_call_timing_lines()` and `_derive_budget_baseline()` are available in `audit_runner.py` for one-time analysis.
 
@@ -844,20 +848,23 @@ issue` run emits **exactly one** machine-greppable summary line to stderr and
 appends it to the persisted report:
 
 ```
-AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n> elapsed_seconds=<x>
+AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n> parent_screen_timeouts=<n> elapsed_seconds=<x>
 ```
 
 The keys (and their order) are the stable contract `RELIABILITY_SUMMARY_KEYS`;
-do not rename or reorder without a version bump. Counts are accumulated across
+do not rename or reorder without a version bump (new keys are appended). Counts
+are accumulated across
 all Pi calls in the run, including re-asks: `calls` (Pi calls),
 `parse_ok`/`parse_failed` (JSON-array extraction outcomes where a JSON array
 was expected), `timeouts` (`_timeout` results), `child_skips` (children
 recorded `partial (budget exceeded)`), `provider_errors` (`_provider_error`
 results), `concurrency_waits` (audit-slot `_concurrency_timeout` results),
 `verdict_reasks` (bounded JSON-contract re-asks issued —
-SA-0MVI6VNDF001VE1S), and `child_screen_timeouts` (child Phase-1 screens
+SA-0MVI6VNDF001VE1S), `child_screen_timeouts` (child Phase-1 screens
 that hit their budget and were quarantined as `partial` —
-SA-0MVI3608M0080QLW). The line is emitted once per run via
+SA-0MVI3608M0080QLW), and `parent_screen_timeouts` (parent Phase-1 screens
+that hit their right-sized budget and were quarantined as `partial` —
+SA-0MVJ3Q662006RDJR). The line is emitted once per run via
 `emit_reliability_summary()` — from the
 normal report path and, where possible, from an early-exit `finally` (timeout
 or abort before report assembly) so partial runs are still measurable. It

@@ -3132,13 +3132,20 @@ class TestChildScreenShortBudget:
         assert result.get("_timeout") is True
         assert str(audit_runner.CALL_PI_TIMEOUT) in result.get("evidence", "")
 
-    def test_parent_phase1_retains_1800_budget(self):
-        """Parent Phase-1 screens (child_screen=False) keep 1800s."""
+    def test_parent_phase1_screen_uses_right_sized_budget(self):
+        """Parent Phase-1 screens use the right-sized screening budget
+        (SA-0MVJ3Q662006RDJR) instead of the 1800 s Phase-2 budget."""
         mock_process = self._timeout_mock_process()
         with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
              mock.patch.dict(audit_runner.os.environ, {}, clear=True):
-            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=False)
-        assert str(audit_runner.CALL_PI_TIMEOUT) in result.get("evidence", "")
+            result = audit_runner._call_pi(
+                "test prompt", model="test-model", parent_screen=True
+            )
+        assert result.get("_timeout") is True
+        assert str(audit_runner._PARENT_SCREEN_TIMEOUT_DEFAULT) in result.get(
+            "evidence", ""
+        )
+        assert "1800" not in result.get("evidence", "")
 
     def test_explicit_timeout_arg_wins_over_short_budget(self):
         """An explicit timeout arg still wins over the child-screen default."""

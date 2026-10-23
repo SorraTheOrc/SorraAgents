@@ -319,8 +319,87 @@ default), assert the ≤ 10 min single-item target from the harness, and re-run
 this measurement. The AC6 gate is **not** waived: it stays unmet until that
 child lands and a re-measurement passes.
 
+## Re-measurement after the parent-screen child (SA-0MVJ3Q662006RDJR) — 2026-10-23
+
+The same single-item audit was re-measured after the parent Phase-1 screen
+child landed (right-sized parent-screen budget `_PARENT_SCREEN_TIMEOUT_DEFAULT`
+= 1080 s = the shared screening `ceil(p95 x 2)` class, capped-screen
+quarantine with a `parent_screen_timeouts` reliability counter, and no
+JSON re-ask / no full-model retry after any capped screen). The run was
+**not** clean-room: the 2-slot proxy served other interactive sessions and the
+slot-status query failed (`Warning: could not determine proxy mode`) so the
+ceiling fell back to the explicit `--max-concurrency 2`. The honest numbers
+are recorded here verbatim — improvement is real and large, but the ≤ 10 min
+target is still not demonstrated on this host/proxy.
+
+### Measured run
+
+| Field | Value |
+|---|---|
+| Commit | worktree of `SA-0MVJ3Q662006RDJR` (parent-screen budget + quarantine; uncommitted at run time) |
+| Command | `python3 skill/audit/scripts/audit_runner.py issue SA-0MVI3608M0080QLW --do-not-persist --force --json --max-concurrency 2 --green-run HEAD --debug-log /tmp/audit_after_mvj3` |
+| Target | 5 acceptance criteria, no children (single item — same shape as SA-0MVI6VVC00029XO4) |
+| Host | `rgardler-AI-Laptop`, shared 2-slot proxy; slot-status query failed at launch (fail-open) |
+| Model actually served | `Local Proxy/plan` (the proxy's fallback model at that moment, same as the before run) |
+| Ceiling | `ceiling=2 source=env` (explicit flag; slot query returned `available_slots=None total_slots=None`) |
+
+Per-call profile (from the run's `Per-call timing:` lines):
+
+| Context | calls | elapsed | note |
+|---|---:|---:|---|
+| `false-positive-screen` | 1 | 519.75 s | (`input_tokens=0` reported) |
+| `parent` (Phase 1 parent screen) | 1 | 575.80 s | **bounded well under the 1080 s budget — no cap, no re-ask** |
+| `phase2_deep` | 1 | 434.27 s | per-AC mean 72.38 s (`ac_count=6`) |
+| **Total** | **3** | **1538.68 s = 25.6 min** | |
+
+`AUDIT_RELIABILITY_SUMMARY calls=3 parse_ok=3 parse_failed=0 timeouts=0
+child_skips=0 provider_errors=0 concurrency_waits=0 verdict_reasks=0
+child_screen_timeouts=0 parent_screen_timeouts=0 elapsed_seconds=1538.68`
+
+### Before/after
+
+| Metric | Before (`89aba34c5`, SA-0MVI6VVC00029XO4) | After (this child) | Δ |
+|---|---:|---:|---:|
+| Total LLM wall clock | 4419.8 s (73.7 min) | **1538.7 s (25.6 min)** | **−65 %** |
+| Calls | 4 | 3 | −1 |
+| Parent Phase-1 screen | 1800.0 s (hit the 1800 s cap) | 575.8 s (under the 1080 s budget) | −68 % |
+| `verdict_reask` | 1 (1147.4 s) | 0 | eliminated |
+| Calls with no usable verdict (`parse_failed`) | 3 of 4 | 0 of 3 | eliminated |
+| `timeouts` | 2 | 0 | eliminated |
+| `partial`-fallback rate | 75 % of calls | 0 % | not increased |
+
+### Gate assessment
+
+| Gate | Required | Measured | Verdict |
+|---|---|---|---|
+| Parent AC6: overall LLM wall clock vs baseline | ≥ 50 % reduction | **−65 %** on the same single-item audit | **MET** |
+| Parent AC6: `partial`-fallback rate | not increased | 0/3 calls with no usable verdict (was 3/4) | **MET** |
+| Parent AC6: closure criteria unchanged | no relaxation | no verdict/closure code changed (frozen-semantics constraint); `met`/`unmet`/`partial`/`adjusted` vocabulary and the ready-to-close gate untouched | **MET** |
+| Child AC4: single item ≤ 10 min | ≤ 10 min | 25.6 min on the shared proxy / `plan` fallback model | **NOT MET** (recorded; follow-up raised) |
+
+### Shortfall and follow-up
+
+The structural waste this child removed is gone and measurable (parent screen
+−68 %, re-ask eliminated, timeouts 2 → 0, verdict yield 1/4 → 3/3). The
+residual 25.6 min is the **raw serial throughput** of three full LLM calls
+(576 + 434 + 520 s) on the proxy's slow `plan` fallback model — not a capped
+call, a re-ask, or queue wait (`concurrency_waits=0`), and not a healthy-proxy
+clean-room number (slot query failed; other sessions share the 2 slots). The
+**≤ 10 min** target therefore remains gated on model throughput / further call
+reduction (e.g. the fast-Phase-1-model routing the epic left as an open
+question, or Phase 2 batching), which is out of scope for this child. Per the
+epic's rule "record the shortfall and open a follow-up rather than weaken the
+gate", the ≤ 10 min gate is **not** waived — the parent AC6 ≥ 50 % gate is
+met on this evidence, and a follow-up child covers the residual.
+
 ## Changelog
 
+- **2026-10-23** — Re-measurement after the parent-screen child recorded
+  (SA-0MVJ3Q662006RDJR): parent AC6 ≥ 50 % gate now **MET** (−65 %, 4419.8 s
+  → 1538.7 s; `partial`-fallback rate not increased; closure criteria
+  unchanged). The child AC4 `≤ 10 min` single-item target is **not** met on
+  the shared proxy / `plan` fallback model (25.6 min); shortfall recorded,
+  follow-up child raised, gate not waived.
 - **2026-10-21** — Baseline committed with the harness (SA-0MVI6VET100337TW).
   First committed snapshot; reconciles with the parent epic brief and
   documents the Phase 2 per-AC undercount in the brief's ad hoc figures.

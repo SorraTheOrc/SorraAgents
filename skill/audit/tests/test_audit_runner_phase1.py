@@ -1353,6 +1353,276 @@ def test_capped_child_screen_increments_reliability_counter():
     assert "child_screen_timeouts=1" in audit_runner.render_reliability_summary()
 
 
+# ---------------------------------------------------------------------------
+# SA-0MVJ3Q662006RDJR: right-size the parent Phase-1 screen budget, quarantine
+# capped parent screens exactly like capped child screens, and never re-ask or
+# retry after a capped screen so a single-item audit issues exactly ONE Phase 1
+# call (the 1800 s parent cap + 1147 s re-ask of SA-0MVI6VVC00029XO4's run is
+# the residual cost this child removes).
+# ---------------------------------------------------------------------------
+
+
+def _parent_screen_ctx(**overrides) -> audit_runner._AuditContext:
+    """A minimal ``_AuditContext`` for direct ``_phase1_parent_screening``
+    unit tests (mirrors ``test_audit_runner_phase1_model._make_ctx``)."""
+    runner = mock.MagicMock()
+    runner.side_effect = None
+    defaults = {
+        "issue_id": "TEST-1", "persist": False, "timeout": None,
+        "parent_timeout": None,
+        "pi_bin": "pi", "model": None, "model_source": "local",
+        "runner": runner,
+        "json_mode": False, "debug_log": None, "force": False,
+        "worklog_dir": None, "batch_phase2": False, "green_run": None,
+        "audit_children": False, "max_child_audits": None, "run_tests": False,
+    }
+    defaults.update(overrides)
+    ctx = audit_runner._AuditContext(**defaults)
+    ctx.acs = ["AC one", "AC two"]
+    ctx.work_item = {
+        "id": "TEST-1", "title": "T",
+        "description": "## Acceptance Criteria\n1. AC one\n2. AC two\n",
+    }
+    ctx.ac_results = []
+    ctx.owning_root = "."
+    ctx.resolved_phase1_model = "fast-model"
+    ctx.resolved_model = "full-model"
+    return ctx
+
+
+def test_parent_screen_budget_uses_right_sized_screening_default(monkeypatch):
+    """AC1: the parent Phase-1 screen no longer keeps the 1800 s Phase-2
+    budget — it uses the right-sized screening budget derived with the same
+    documented discipline as the child budget (ceil(p95 x 2))."""
+    monkeypatch.delenv(audit_runner.AUDIT_PARENT_SCREEN_TIMEOUT_ENV, raising=False)
+    budget = audit_runner._PARENT_SCREEN_TIMEOUT_DEFAULT
+    assert budget == audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT
+    assert budget < audit_runner.CALL_PI_TIMEOUT, (
+        "parent screen must be bounded below the 1800 s Phase-2 budget"
+    )
+    assert budget >= 1080  # documented screening budget (ceil(506 x 2) -> 1080)
+    assert (
+        audit_runner._resolve_call_timeout(None, parent_screen=True) == budget
+    ), "parent screen resolves its own right-sized budget"
+    # A Phase-2 call (no parent_screen) is unchanged at 1800 s.
+    assert audit_runner._resolve_call_timeout(None) == audit_runner.CALL_PI_TIMEOUT
+    # Explicit --timeout still wins, exactly like the child-screen budget.
+    assert audit_runner._resolve_call_timeout(300, parent_screen=True) == 300
+
+
+def test_parent_screen_timeout_env_and_cli_surface(monkeypatch):
+    """AUDIT_PARENT_SCREEN_TIMEOUT / --parent-screen-timeout tune the parent
+    screen independently of the child budget; an invalid env is ignored."""
+    monkeypatch.setenv(audit_runner.AUDIT_PARENT_SCREEN_TIMEOUT_ENV, "900")
+    assert audit_runner._resolve_call_timeout(None, parent_screen=True) == 900
+    monkeypatch.setenv(audit_runner.AUDIT_PARENT_SCREEN_TIMEOUT_ENV, "nope")
+    assert (
+        audit_runner._resolve_call_timeout(None, parent_screen=True)
+        == audit_runner._PARENT_SCREEN_TIMEOUT_DEFAULT
+    )
+    parser = audit_runner.build_parser()
+    args = parser.parse_args(["issue", "SA-X", "--parent-screen-timeout", "840"])
+    assert args.parent_screen_timeout == 840
+
+
+def test_parent_screen_call_site_marks_parent_screen_budget():
+    """The parent Phase-1 call site flags ``parent_screen`` so the call is
+    bounded by the right-sized budget instead of the 1800 s Phase-2 budget."""
+    seen: dict = {}
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        seen.update(kwargs)
+        return {"extracted_text": json.dumps([
+            {"index": 0, "verdict": "met", "evidence": "a.py:1"},
+        ])}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ):
+        audit_runner._call_phase1_screen(
+            "SA-X", "parent", "p", "m", "pi", None, None, None,
+            lambda *a: None, "parent screen", parent_screen=True,
+        )
+    assert seen.get("parent_screen") is True
+
+
+def test_capped_parent_screen_issues_one_call_and_is_quarantined():
+    """AC2/AC3: a parent screen that hits its budget issues exactly ONE
+    Phase 1 call (no re-ask, no full-model retry), degrades to a quarantined
+    ``partial`` whose evidence names the budget and phase, increments
+    ``parent_screen_timeouts``, and never becomes ``met``."""
+    audit_runner._rel_reset()
+    ctx = _parent_screen_ctx()
+    calls: list[str] = []
+
+    def capped(issue_id, context, prompt, **kwargs):
+        calls.append(context)
+        return {
+            "_timeout": True,
+            "evidence": "Pi model call timed out after 1080s",
+            "extracted_text": "",
+        }
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=capped
+    ), mock.patch.object(
+        audit_runner, "_build_file_scope_manifest", return_value="manifest"
+    ), mock.patch.object(
+        audit_runner, "_validate_file_scope_manifest", return_value=None
+    ), mock.patch.object(
+        audit_runner, "_resolve_touched_files", return_value=[]
+    ):
+        audit_runner._phase1_parent_screening(ctx)
+
+    assert calls == ["parent"], (
+        f"capped parent screen issued calls {calls}; must be exactly ONE "
+        "('parent') — no verdict_reask, no full-model retry"
+    )
+    assert [r["verdict"] for r in ctx.ac_results] == ["partial", "partial"]
+    ev = ctx.ac_results[0]["evidence"].lower()
+    assert "budget" in ev and "quarantined" in ev
+    assert "audit_parent_screen_timeout" in ev, ev
+    assert "phase 1" in ev, ev  # the phase is named (Phase 1 budget)
+    # Partial never demotes/relaxes the ready-to-close gate: a gap remains.
+    assert audit_runner._parent_has_gaps(ctx.ac_results) is True
+    _snap = audit_runner._rel_snapshot()
+    assert _snap.get("parent_screen_timeouts") == 1
+    assert "parent_screen_timeouts=1" in audit_runner.render_reliability_summary()
+
+
+def test_capped_parent_screen_with_fast_model_still_single_call():
+    """AC2: even with a distinct fast Phase-1 model configured, a capped
+    parent screen is NOT retried on the full model — one Phase 1 call total."""
+    audit_runner._rel_reset()
+    ctx = _parent_screen_ctx()
+    calls: list[str] = []
+
+    def capped(issue_id, context, prompt, **kwargs):
+        calls.append(context)
+        return {"_timeout": True, "evidence": "timed out", "extracted_text": ""}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=capped
+    ), mock.patch.object(
+        audit_runner, "_build_file_scope_manifest", return_value="manifest"
+    ), mock.patch.object(
+        audit_runner, "_validate_file_scope_manifest", return_value=None
+    ), mock.patch.object(
+        audit_runner, "_resolve_touched_files", return_value=[]
+    ):
+        audit_runner._phase1_parent_screening(ctx)
+
+    assert calls == ["parent"]
+    assert ctx.resolved_phase1_model != ctx.resolved_model  # fast != full here
+    assert audit_runner._rel_snapshot().get("parent_screen_timeouts") == 1
+
+
+def test_capped_screen_is_never_reasked_helper_level():
+    """The bounded JSON re-ask fires only on genuine parse failures, never
+    after a capped screen — a capped call is one Phase 1 call to completion
+    (SA-0MVI6VVC00029XO4's 1800 s parent + 1147 s re-ask cannot recur)."""
+    audit_runner._rel_reset()
+    calls: list[str] = []
+
+    def capped(issue_id, context, prompt, **kwargs):
+        calls.append(context)
+        return {"_timeout": True, "evidence": "timed out", "extracted_text": ""}
+
+    with mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=capped
+    ):
+        _result, batch, _raw = audit_runner._call_phase1_screen(
+            "SA-X", "parent", "screen these", "m", "pi", None, None, None,
+            lambda *a: None, "parent screen",
+        )
+    assert calls == ["parent"], f"expected no re-ask after a cap, got {calls}"
+    assert batch == []
+    assert audit_runner._rel_snapshot().get("verdict_reasks") == 0
+
+
+def test_single_item_audit_under_batching_issues_one_phase1_call(capsys):
+    """AC2: a single-item (no children) audit under ``--batch-phase1`` issues
+    exactly ONE Phase 1 call (the parent screen) with verdict semantics and
+    the ready-to-close gate unchanged."""
+    description = (
+        "# Test\n\n## Acceptance Criteria\n\n- AC1: The first criterion\n"
+    )
+    mock_runner = mock.MagicMock()
+
+    def _side_effect(cmd):
+        cmd_str = " ".join(cmd)
+        if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "TEST-1", "status": "open"},
+                }),
+                stderr="",
+            )
+        if "update" in cmd_str:
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+        if "--children" in cmd_str:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": "TEST-1",
+                        "description": description,
+                        "status": "in_progress",
+                    },
+                    "children": [],
+                }),
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"success": True}), stderr="",
+        )
+
+    mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
+    contexts: list[str] = []
+
+    def fake_call(issue_id, context, prompt, **kwargs):
+        contexts.append(context)
+        if context == "parent":
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ])}
+        return {"extracted_text": "[]"}
+
+    mock_cq = mock.MagicMock(
+        return_value={"success": True, "findings": [], "fixes_applied": 0}
+    )
+    with mock.patch.dict(
+        audit_runner.os.environ,
+        {audit_runner.AUDIT_PHASE1_BATCH_ENV: "1"},
+        clear=False,
+    ), mock.patch.object(
+        audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call
+    ), mock.patch(
+        "code_review.scripts.code_quality.run_code_quality", mock_cq
+    ):
+        rc = audit_runner.cmd_issue(
+            "TEST-1", persist=False, force=True, runner=mock_runner,
+        )
+
+    assert rc == 0
+    phase1 = [
+        c for c in contexts
+        if c in ("parent", "phase1_batch", "verdict_reask")
+        or c.startswith("child:")
+    ]
+    assert phase1 == ["parent"], (
+        f"single-item audit issued Phase 1 calls {phase1}; expected exactly "
+        "ONE ('parent')"
+    )
+    out = capsys.readouterr().out
+    assert "Ready to close: Yes" in out
+
+
 # ----------------------------------------------------------------------
 # Code-quality scan scope (SA-0MUI5ZYO6002W3KD)
 #
