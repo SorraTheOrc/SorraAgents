@@ -35,9 +35,17 @@ Entry layout (stable, documented for read-only consumers)::
         metadata.json   {"version":1, "command":..., "git_state":...,
                          "scope": "full"|"changed",
                          "test_type": "full"|"unit"|...,
+                         "interpreter": "<pytest interpreter/exe>",
                          "exit_code":..., "completed_at": <epoch float>}
         stdout.txt      full stdout of the run
         stderr.txt      full stderr of the run
+
+``interpreter`` records the concrete interpreter/executable that actually ran
+pytest (empty for non-pytest commands and for older entries predating the
+field). The cache key stays git-state + command + type — the interpreter is
+informational metadata, so an entry produced under a different interpreter is
+still visible and auditable rather than silently invalidated
+(SA-0MVK154IE007OS3D AC2).
 
 ``scope`` records whether the run was a full-suite run (``"full"`` — the
 historical default, so older entries without the field read as full) or a
@@ -68,8 +76,11 @@ from pathlib import Path
 from typing import Any
 
 from test_runner import (
+    executable_test_command,
+    is_pytest_command,
     log_repository_override_scrub,
     normalize_test_command,
+    resolve_pytest_executable,
     subprocess_env_with_scrubbed_overrides,
 )
 
@@ -311,7 +322,9 @@ def lookup(
     (epoch float), ``command`` (normalized), ``git_state``, ``scope``
     (``"full"`` for historical entries lacking the field — see module docs),
     ``test_type`` (``"full"`` for historical entries lacking the field) and
-    ``cached: True``.
+    ``cached: True``. ``interpreter`` names the concrete interpreter/executable
+    recorded for a pytest run (empty for non-pytest commands and entries that
+    predate the field).
     """
     entry_dir = _entry_dir(command, git_state, cwd or os.getcwd(), test_type)
     meta_path = entry_dir / "metadata.json"
@@ -345,6 +358,7 @@ def lookup(
         "git_state": git_state,
         "scope": meta.get("scope", "full"),
         "test_type": meta.get("test_type", "full"),
+        "interpreter": meta.get("interpreter", ""),
         "cached": True,
     }
 
@@ -360,6 +374,7 @@ def store(
     completed_at: float | None = None,
     scope: str = "full",
     test_type: str = "full",
+    interpreter: str = "",
 ) -> Path:
     """Persist a run result, replacing any existing entry for the same key.
 
@@ -376,6 +391,11 @@ def store(
     types are keyed independently (see :func:`cache_key`) so they can never be
     mistaken for full-suite evidence.
 
+    *interpreter* records the concrete interpreter/executable that ran pytest
+    (empty for non-pytest commands). It is metadata only — it does not change
+    the cache key — so the choice of interpreter is auditable per entry
+    (SA-0MVK154IE007OS3D AC2).
+
     Returns the entry directory path.
     """
     entry_dir = _entry_dir(command, git_state, cwd or os.getcwd(), test_type)
@@ -388,6 +408,7 @@ def store(
         "git_state": git_state,
         "scope": scope,
         "test_type": test_type,
+        "interpreter": interpreter,
         "exit_code": int(exit_code),
         "completed_at": completed_at if completed_at is not None else time.time(),
     }
@@ -405,6 +426,15 @@ def store(
 def _default_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
     """Execute a normalized command string, capturing stdout/stderr.
 
+    The pytest executable prefix is resolved through
+    :func:`executable_test_command` so a bare canonical ``pytest`` command runs
+    under the interpreter selected by ``resolve_pytest_command()`` — the
+    runner's own interpreter when it can run pytest — instead of a PATH
+    ``pytest`` that may be bound to a foreign interpreter
+    (SA-0MVK154IE007OS3D). This is the path used by consumers that call
+    :func:`run_cached` directly (the audit F3 auto-run and the implement
+    finish gate), which previously spawned the bare command.
+
     The environment is the shared repository-override scrub (F2,
     SA-0MUIA3OE40001QJX): a leaked ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_CONFIG*``
     would otherwise override ``cwd`` in every ``git`` subprocess a test spawns
@@ -417,7 +447,7 @@ def _default_runner(command: str, cwd: str, timeout: int) -> subprocess.Complete
     log_repository_override_scrub()
     env = subprocess_env_with_scrubbed_overrides()
     return subprocess.run(
-        shlex.split(command),
+        shlex.split(executable_test_command(command)),
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -456,7 +486,9 @@ def run_cached(
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
     (epoch float), ``command`` (normalized), ``git_state``, ``scope``,
-    ``test_type`` and ``cached`` (True when served from cache).
+    ``test_type``, ``interpreter`` (the concrete interpreter/executable that
+    ran pytest, empty for non-pytest commands) and ``cached`` (True when
+    served from cache).
     """
     cwd_path = Path(cwd or os.getcwd()).resolve()
     cwd_str = str(cwd_path)
@@ -475,6 +507,11 @@ def run_cached(
     proc = runner(normalized, cwd_str, timeout)
     completed_at = time.time()
 
+    # Record which interpreter actually ran pytest (metadata only; the cache
+    # key is unchanged) so the choice is auditable after the fact
+    # (SA-0MVK154IE007OS3D AC2). Non-pytest commands record an empty string.
+    interpreter = resolve_pytest_executable() if is_pytest_command(normalized) else ""
+
     if not no_cache:
         store(
             normalized,
@@ -486,6 +523,7 @@ def run_cached(
             completed_at=completed_at,
             scope=scope,
             test_type=test_type,
+            interpreter=interpreter,
         )
 
     return {
@@ -497,6 +535,7 @@ def run_cached(
         "git_state": git_state,
         "scope": scope,
         "test_type": test_type,
+        "interpreter": interpreter,
         "cached": False,
     }
 

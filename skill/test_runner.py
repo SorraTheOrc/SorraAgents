@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,8 +22,13 @@ QUIET_PYTEST_FLAGS = ("-q", "-r", "a", "--disable-warnings")
 QUIET_NPM_FLAGS = ("--silent",)
 
 # Resolved pytest command — set by resolve_pytest_command() and then reused.
-# Kept as a module global so the PATH probe runs once per process.
+# Kept as a module global so the candidate probes run once per process.
 _PYTEST_COMMAND: str | None = None
+
+#: Per-candidate pytest availability probe bound (seconds). The probe is
+#: ``<candidate> --version`` — cheap, and memoised with the resolved command so
+#: the cost is paid at most once per process (SA-0MVK154IE007OS3D).
+PYTEST_PROBE_TIMEOUT_SECONDS = 30.0
 
 # Emit the repository-override scrub diagnostic at most once per process so a
 # long suite run does not repeat it for every spawned command.
@@ -55,51 +61,152 @@ def _reset_scrub_diagnostic() -> None:
     _SCRUB_DIAGNOSTIC_LOGGED = False
 
 
-def resolve_pytest_command() -> str:
-    """Return the pytest command actually usable in this environment.
+def _candidate_runs_pytest(candidate: list[str]) -> bool:
+    """Whether *candidate* can actually run pytest (probed, not assumed).
 
-    ``pytest`` may be installed in a user site-packages bin dir
-    (``~/.local/bin``) that is not on PATH in non-login shells (e.g. agent
-    tool shells, cron/nohup contexts), so a bare ``pytest`` invocation
-    fails with "command not found" (SA-0MSQ012QG005N22S). Resolution order:
+    The probe runs ``<candidate> --version`` with output suppressed and treats
+    any failure to start (``OSError``: missing file, not executable) or any
+    non-zero exit (including a timeout) as "cannot run pytest", so a broken
+    candidate — e.g. a ``pytest`` script whose shebang points at an
+    interpreter without pytest installed — is never selected while a later
+    candidate works.
 
-    1. ``pytest`` on PATH (via ``shutil.which``) → ``pytest``
-    2. ``~/.local/bin/pytest`` executable when the plain command is not on
-       PATH but the user-installed copy exists
-    3. ``python3 -m pytest`` — the most robust fallback since the Python
-       interpreter is almost always on PATH even when user bin dirs are not
-
-    The result is cached in ``_PYTEST_COMMAND`` so the PATH probes run once.
+    Args:
+        candidate: Command token list, e.g. ``["pytest"]`` or
+            ``["/usr/bin/python3", "-m", "pytest"]``.
 
     Returns:
-        A runnable command string (``pytest``, an absolute path, or
-        ``python3 -m pytest``).
+        True when the candidate exits 0 for ``--version``.
+    """
+    try:
+        proc = subprocess.run(
+            [*candidate, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=PYTEST_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _pytest_candidates() -> list[list[str]]:
+    """Return the ordered pytest candidate commands (SA-0MVK154IE007OS3D AC1).
+
+    Order: ``PYTEST_BIN`` → ``TEST_PYTHON`` → ``sys.executable -m pytest`` →
+    ``pytest`` on PATH (the concrete ``~/.local/bin/pytest`` user-install is
+    retained as its historical fallback) → ``python3 -m pytest``.
+
+    ``sys.executable`` precedes the PATH ``pytest`` deliberately: the runner
+    is started with the project's interpreter, so ``-m pytest`` runs the suite
+    with the interpreter that carries the project's dependencies even when a
+    PATH ``pytest`` script is bound to a different (e.g. system) interpreter.
+    """
+    candidates: list[list[str]] = []
+
+    explicit_bin = os.environ.get("PYTEST_BIN", "").strip()
+    if explicit_bin:
+        candidates.append(shlex.split(explicit_bin))
+
+    explicit_python = os.environ.get("TEST_PYTHON", "").strip()
+    if explicit_python:
+        candidates.append([*shlex.split(explicit_python), "-m", "pytest"])
+
+    if sys.executable:
+        candidates.append([sys.executable, "-m", "pytest"])
+
+    if shutil.which("pytest") is not None:
+        candidates.append(["pytest"])
+
+    home = os.environ.get("HOME", "")
+    if home:
+        local_pytest = Path(home).expanduser() / ".local" / "bin" / "pytest"
+        if local_pytest.is_file() and os.access(str(local_pytest), os.X_OK):
+            candidates.append([str(local_pytest)])
+
+    if shutil.which("python3") is not None:
+        candidates.append(["python3", "-m", "pytest"])
+
+    return candidates
+
+
+def resolve_pytest_command() -> str:
+    """Return the pytest command that actually works in this environment.
+
+    A bare ``pytest`` may be missing (user-site bin dirs such as
+    ``~/.local/bin`` are absent from non-login shells — SA-0MSQ012QG005N22S)
+    **or** may exist on PATH while being bound to an interpreter that cannot
+    import the project's dependencies (SA-0MVK154IE007OS3D). Resolution
+    therefore probes every candidate with ``--version`` and selects the first
+    one that runs, in this order (AC1):
+
+    1. ``PYTEST_BIN`` — explicit override, used verbatim when it runs.
+    2. ``TEST_PYTHON -m pytest`` — explicit interpreter override.
+    3. ``sys.executable -m pytest`` — the interpreter that started the runner,
+       which is the project's interpreter (matches the repository's canonical
+       ``python3 -m pytest`` runner).
+    4. ``pytest`` on PATH (via ``shutil.which``) — only when earlier forms
+       cannot run pytest, so a PATH ``pytest`` bound to a foreign interpreter
+       never shadows the runner's interpreter.
+    5. ``~/.local/bin/pytest`` — retained user-install fallback
+       (SA-0MSQ012QG005N22S).
+    6. ``python3 -m pytest`` — last resort when the runner's interpreter
+       cannot run pytest but PATH ``python3`` can.
+
+    Candidates that fail the probe are skipped, so a selected command never
+    refers to an executable that cannot run pytest. The resolved command is
+    cached in ``_PYTEST_COMMAND`` (probes run once per process) and keeps the
+    canonical ``python -m pytest`` / ``pytest`` shape consumed by
+    :func:`executable_test_command`.
+
+    Returns:
+        A runnable command string (``pytest``, an absolute pytest path, or
+        ``<python> -m pytest``); falls back to ``pytest`` when no candidate
+        probes successfully, leaving the caller to surface the spawn error.
     """
     global _PYTEST_COMMAND
     if _PYTEST_COMMAND is not None:
         return _PYTEST_COMMAND
 
-    # 1. pytest on PATH
-    if shutil.which("pytest") is not None:
-        _PYTEST_COMMAND = "pytest"
+    for candidate in _pytest_candidates():
+        if not candidate or not _candidate_runs_pytest(candidate):
+            continue
+        _PYTEST_COMMAND = shlex.join(candidate)
         return _PYTEST_COMMAND
 
-    # 2. ~/.local/bin/pytest (pip install --user)
-    home = os.environ.get("HOME", "")
-    if home:
-        local_pytest = Path(home).expanduser() / ".local" / "bin" / "pytest"
-        if local_pytest.is_file() and os.access(str(local_pytest), os.X_OK):
-            _PYTEST_COMMAND = str(local_pytest)
-            return _PYTEST_COMMAND
-
-    # 3. python3 -m pytest
-    if shutil.which("python3") is not None:
-        _PYTEST_COMMAND = "python3 -m pytest"
-        return _PYTEST_COMMAND
-
-    # All fallbacks exhausted — the caller will surface a FileNotFoundError.
+    # Every candidate failed the probe — the caller will surface a
+    # FileNotFoundError (or the interpreter's import error) on execution.
     _PYTEST_COMMAND = "pytest"
     return _PYTEST_COMMAND
+
+
+def is_pytest_command(command: str) -> bool:
+    """Whether *command* invokes pytest (``pytest`` or ``<python> -m pytest``)."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    return _is_pytest_command(parts) is not None
+
+
+def resolve_pytest_executable() -> str:
+    """Return the concrete interpreter/executable that runs pytest.
+
+    This is the auditable label recorded in the run output and in the test
+    cache entry (SA-0MVK154IE007OS3D AC2): the absolute ``python``
+    interpreter for ``-m pytest`` forms, or the absolute ``pytest`` path when
+    a bare ``pytest`` command was selected (falling back to the bare name when
+    it cannot be located, e.g. when every probe failed).
+    """
+    resolved = resolve_pytest_command()
+    parts = shlex.split(resolved)
+    if not parts:
+        return resolved
+    executable = parts[0]
+    if Path(executable).name == "pytest":
+        return shutil.which(executable) or executable
+    return executable
 
 
 def executable_test_command(command: str) -> str:
@@ -110,11 +217,15 @@ def executable_test_command(command: str) -> str:
     token is not on PATH the spawned subprocess would fail. This helper
     rewrites only the executable prefix at run time, e.g.:
 
-        pytest -q -r a  →  /home/user/.local/bin/pytest -q -r a
-        pytest -q -r a  →  python3 -m pytest -q -r a
+        pytest -q -r a           →  /home/user/.local/bin/pytest -q -r a
+        pytest -q -r a           →  /usr/bin/python3 -m pytest -q -r a
+        python3 -m pytest -q -r a →  /venv/bin/python3 -m pytest -q -r a
 
-    Explicit ``python -m pytest`` forms are left untouched (the interpreter
-    is resolvable). Non-pytest commands are returned unchanged.
+    Both prefix shapes are rewritten to the probed resolver selection, so an
+    explicit ``python3 -m pytest`` command also runs under the interpreter
+    carrying the project's dependencies (SA-0MVK154IE007OS3D). A command whose
+    prefix already matches the resolved selection is returned unchanged, which
+    makes the rewrite idempotent. Non-pytest commands are returned unchanged.
 
     Args:
         command: Shell command string (may be a canonical quiet form).
@@ -126,15 +237,15 @@ def executable_test_command(command: str) -> str:
         parts = shlex.split(command)
     except ValueError:
         return command
-    if not parts or _is_pytest_command(parts) != 1:
+    prefix_len = _is_pytest_command(parts)
+    if prefix_len is None:
         return command
 
-    resolved = resolve_pytest_command()
-    if resolved in (parts[0], "pytest"):
+    resolved = shlex.split(resolve_pytest_command())
+    if resolved[:prefix_len] == parts[:prefix_len]:
         return command
 
-    prefix = shlex.split(resolved)
-    return shlex.join(prefix + parts[1:])
+    return shlex.join(resolved + parts[prefix_len:])
 
 # Known output-filtering commands that may appear in a shell pipeline after a
 # test command (e.g. `npm test 2>&1 | tail -30`). These never change which
