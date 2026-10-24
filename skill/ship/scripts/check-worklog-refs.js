@@ -32,11 +32,12 @@ import { execSync } from 'node:child_process';
  * excluded — they are harmless bookkeeping maintained by `wl sync` and
  * are never merged by `git merge`/`git pull`.
  *
- * The worklog's own git-branch sync mechanism (refs/worklog/data) is also
- * excluded when it actually contains the worklog data file
- * (.worklog/worklog-data.jsonl): it is worklog DATA, never a code branch,
- * and is never merged into main/dev. Only genuinely dangerous orphan
- * worklog refs (no data file) are flagged.
+ * The worklog's own git-branch sync mechanism (refs/worklog/data,
+ * refs/worklog/fetched-check, refs/worklog/tmp-reauthor) is also excluded
+ * when any ref holds the worklog data file (.worklog/worklog-data.jsonl):
+ * it is worklog DATA, never a code branch, and is never merged into
+ * main/dev. Only genuinely dangerous orphan worklog refs (no data file)
+ * are flagged.
  *
  * @returns {{
  *   hasWorklogRefs: boolean,
@@ -57,21 +58,23 @@ export function checkWorklogRefs() {
       .filter((line) => line.length > 0);
 
     // Filter out remote-tracking mirror refs (refs/worklog/remotes/**) and
-    // the legitimate worklog data branch (refs/worklog/data) when it holds
-    // the worklog data file. These are harmless bookkeeping maintained by
-    // `wl sync` and are never merged by `git merge`/`git pull` of a branch.
+    // any refs/worklog/* ref that holds the worklog data file
+    // (.worklog/worklog-data.jsonl). `wl sync` maintains several such
+    // bookkeeping refs (refs/worklog/data, refs/worklog/fetched-check,
+    // refs/worklog/tmp-reauthor — SA-0MVMD7NTC0086HWK): they are worklog
+    // DATA, never code branches, and are never merged by
+    // `git merge`/`git pull` of a branch. Only worklog refs that do NOT
+    // contain the data file are genuinely dangerous orphan refs.
     const refs = allRefs.filter((ref) => {
       if (ref.startsWith('refs/worklog/remotes/')) return false;
-      if (ref === 'refs/worklog/data') {
-        try {
-          execSync('git cat-file -e refs/worklog/data:.worklog/worklog-data.jsonl', {
-            encoding: 'utf-8',
-            stdio: ['pipe', 'pipe', 'pipe'],
-          });
-          return false; // contains worklog data → legitimate sync branch
-        } catch {
-          // fall through: flagged as a dangerous orphan
-        }
+      try {
+        execSync(
+          `git cat-file -e ${ref}:.worklog/worklog-data.jsonl`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        return false; // contains worklog data → legitimate sync bookkeeping
+      } catch {
+        // fall through: flagged as a dangerous orphan
       }
       return true;
     });
