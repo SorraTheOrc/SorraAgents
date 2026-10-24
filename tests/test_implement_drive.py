@@ -678,6 +678,160 @@ class TestTimeoutOutcomeEvidence:
 
 
 # ---------------------------------------------------------------------------
+# SA-0MVLJWQ820060RFF — stranded in-progress child detection (tests)
+#
+# The production case (WL-0MVGUA9EY003XFAD): a child session is killed between
+# pushing its work to `dev` and running the final StatusLifecycle terminal
+# update, leaving the item stranded `in-progress` and blocking `wl next`.
+# Detection must name the stranded child together with its pushed-commit
+# evidence, without mutating anything (finalisation is a separate, explicit
+# opt-in — SA-0MVLJWTGP005XJPP).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingMutations:
+    """Record lifecycle mutations so a test can assert read-only behaviour."""
+
+    def __init__(self):
+        self.status_updates: list[tuple] = []
+
+    def update_status(self, *args, **kwargs):
+        self.status_updates.append((args, kwargs))
+        return {"success": True}
+
+
+def _patch_mutations(m):
+    """Patch ``StatusLifecycle.update_status`` with a recorder."""
+    recorder = _RecordingMutations()
+    return (
+        mock.patch.object(m.StatusLifecycle, "update_status", recorder.update_status),
+        recorder,
+    )
+
+
+class TestStrandedChildren:
+    """Detect a child whose work is on dev but whose item is still in-progress."""
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "stranded-child detection lands in SA-0MVLJWRVO000QQNP"
+        ),
+    )
+    def test_stranded_child_is_reported_with_commit_evidence(
+        self, implement_mod,
+    ):
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True},
+        ])
+        spawner = RecordingSpawner([_timeout_result("SA-C1", 3600)])
+        states = {"SA-C1": {
+            "id": "SA-C1", "status": "in-progress", "stage": "in_progress",
+        }}
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            child_states=states,
+            commit_evidence=lambda child_id: "abc1234",
+        )
+
+        # The chain still stops — the child is not terminal.
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        # …but the report names the stranded child and its pushed commit.
+        stranded = report["stranded_children"]
+        assert len(stranded) == 1
+        assert stranded[0]["id"] == "SA-C1"
+        assert stranded[0]["status"] == "in-progress"
+        assert stranded[0]["commit"] == "abc1234"
+        assert "SA-C1" in report["message"]
+        assert "stranded" in report["message"].lower()
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "stranded-child detection lands in SA-0MVLJWRVO000QQNP"
+        ),
+    )
+    def test_in_progress_child_without_pushed_commit_is_not_stranded(
+        self, implement_mod,
+    ):
+        """No false positives: no commit on dev → plain hard failure."""
+        m = implement_mod
+        runner = ScriptedParent([_child_report("SA-C1")])
+        spawner = RecordingSpawner([_timeout_result("SA-C1", 3600)])
+        states = {"SA-C1": {
+            "id": "SA-C1", "status": "in-progress", "stage": "in_progress",
+        }}
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            child_states=states,
+            commit_evidence=lambda child_id: None,
+        )
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report.get("stranded_children") in (None, [])
+        assert "stranded" not in report["message"].lower()
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "stranded-child detection lands in SA-0MVLJWRVO000QQNP"
+        ),
+    )
+    def test_terminal_child_is_never_reported_stranded(self, implement_mod):
+        """A completed-late child is terminal, so never "stranded"."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True},
+        ])
+        spawner = RecordingSpawner([_timeout_result("SA-C1", 3600)])
+        states = {"SA-C1": {
+            "id": "SA-C1", "status": "completed", "stage": "in_review",
+        }}
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            child_states=states,
+            commit_evidence=lambda child_id: "abc1234",
+        )
+
+        assert report["success"] is True
+        assert report.get("stranded_children") in (None, [])
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "stranded-child detection lands in SA-0MVLJWRVO000QQNP"
+        ),
+    )
+    def test_detection_does_not_mutate_child_state(self, implement_mod):
+        """Read-only by default: no finalisation unless explicitly requested."""
+        m = implement_mod
+        runner = ScriptedParent([_child_report("SA-C1")])
+        spawner = RecordingSpawner([_timeout_result("SA-C1", 3600)])
+        states = {"SA-C1": {
+            "id": "SA-C1", "status": "in-progress", "stage": "in_progress",
+        }}
+        patch, recorder = _patch_mutations(m)
+
+        with patch:
+            report = _run(
+                m, runner, spawner, [{"id": "SA-C1"}],
+                child_states=states,
+                commit_evidence=lambda child_id: "abc1234",
+            )
+
+        assert report["success"] is False
+        assert recorder.status_updates == []
+
+
+# ---------------------------------------------------------------------------
 # AC-6 / AC-7: recursion guard + missing spawner
 # ---------------------------------------------------------------------------
 
