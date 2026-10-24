@@ -5592,6 +5592,85 @@ def _default_session_spawner(
     return result
 
 
+def _reconcile_spawn_failure(
+    child_id: str,
+    spawn_result: dict[str, Any],
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    """Classify a failed child session against the child's current state.
+
+    A per-child session timeout (or non-zero exit) is a *bound*, not a
+    verdict: the child may already have committed, pushed and reached a
+    terminal work-item state before the session was killed. In the
+    ``WL-0MVGEB3IP002V8IB`` epic every child did exactly that, yet ``drive``
+    reported a hard failure and stopped the epic chain
+    (SA-0MVHXWLPG007OQVN).
+
+    This helper re-fetches the child (read-only ``wl show``) and classifies it
+    with :func:`_is_terminal_child`. It is called **only** on the spawn-failure
+    path (risk R1): a successful spawn never pays the extra fetch.
+
+    Terminal means status ``completed``/``done``/``in_review`` (or a
+    soft-deleted item) — see :data:`TERMINAL_STATUSES` — or a work item whose
+    stage is already ``in_review`` (the workflow sets both atomically, but a
+    stage-only terminal state is still terminal for reconciliation purposes).
+    A child that is still ``open``/``blocked``/``in_progress`` is **not**
+    terminal: the pre-existing hard-failure behaviour applies (risk R2).
+
+    Args:
+        child_id: The child work item ID whose session failed.
+        spawn_result: The spawner's result dict (``success``/``reason``).
+        timeout: The per-child session timeout in seconds (for the evidence).
+
+    Returns:
+        A dict with ``terminal`` (bool), ``status``, ``stage``, ``timed_out``
+        (bool), ``timeout_seconds`` (int | None), ``evidence`` (str) and
+        ``reason`` (str). ``status``/``stage`` are empty when the child could
+        not be fetched — callers must treat that as non-terminal (fail closed).
+    """
+    raw_reason = str(spawn_result.get("reason", "") or "")
+    timed_out = "timed out" in raw_reason.lower()
+    result: dict[str, Any] = {
+        "terminal": False,
+        "status": "",
+        "stage": "",
+        "timed_out": timed_out,
+        "timeout_seconds": timeout if timed_out else None,
+        "evidence": "",
+        "reason": raw_reason,
+    }
+
+    child = wl_show(child_id)
+    if not child:
+        # Fail closed: an unreadable child state is never a silent success.
+        LOG.warning(
+            "Could not re-fetch %s after a failed child session; keeping the "
+            "hard failure.",
+            child_id,
+        )
+        return result
+
+    status = str(child.get("status", "") or "")
+    stage = str(child.get("stage", "") or "")
+    result["status"] = status
+    result["stage"] = stage
+    result["terminal"] = _is_terminal_child(child) or stage == "in_review"
+    if not result["terminal"]:
+        return result
+
+    result["evidence"] = f"status={status}, stage={stage}"
+    result["reason"] = (
+        f"{raw_reason} Child reached a terminal state anyway "
+        f"({result['evidence']})."
+    )
+    LOG.info(
+        "Reconciled %s after a failed child session: terminal (%s).",
+        child_id,
+        result["evidence"],
+    )
+    return result
+
+
 def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     """Emit a drive report as JSON or a concise human summary."""
     if json_output:
@@ -5647,6 +5726,13 @@ def phase_drive(
        and wait for it.
     4. Repeat. A child is retried at most ``max_child_sessions`` times so a
        session that never reaches a terminal state cannot loop forever.
+
+    A per-child session timeout (or non-zero exit) is treated as a *bound*,
+    not a verdict: after a failed spawn the child is re-fetched and classified
+    with :func:`_reconcile_spawn_failure`. A child that already reached a
+    terminal state (``completed``/``done``/``in_review``) is recorded as
+    ``completed-late`` and the chain continues; a genuinely incomplete child
+    keeps the pre-existing hard failure (SA-0MVHXWLPG007OQVN).
 
     Args:
         work_item_id: The parent work item ID.
@@ -5815,6 +5901,27 @@ def phase_drive(
         driven.append(entry)
 
         if not spawn_result.get("success"):
+            # A failed spawn is a bound, not a verdict: reconcile against the
+            # child's actual work-item state (SA-0MVHXWLPG007OQVN). A child
+            # that committed, pushed and reached a terminal state before its
+            # session was killed is *completed late*, not failed.
+            reconciliation = _reconcile_spawn_failure(
+                child_id, spawn_result, timeout,
+            )
+            entry["timed_out"] = reconciliation["timed_out"]
+            entry["timeout_seconds"] = reconciliation["timeout_seconds"]
+            entry["terminal"] = reconciliation["terminal"]
+            entry["terminal_status"] = reconciliation["status"]
+            entry["terminal_stage"] = reconciliation["stage"]
+            entry["reason"] = reconciliation["reason"]
+            if reconciliation["terminal"]:
+                entry["result"] = "completed-late"
+                entry["reconciled"] = True
+                LOG.info(
+                    "Child %s completed late (%s); continuing the drive loop.",
+                    child_id, reconciliation["evidence"],
+                )
+                continue
             report["message"] = (
                 f"Child session for {child_id} failed: "
                 f"{spawn_result.get('reason', 'unknown error')}"
