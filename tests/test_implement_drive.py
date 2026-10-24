@@ -11,12 +11,23 @@ Contract (SA-0MUWNHKQH0034DW9):
 - AC-6: a driven session cannot recursively re-enter drive.
 - AC-7: a missing session spawner stops with actionable instructions.
 
+Timeout reconciliation (SA-0MVLJWL60001H6QK, parent SA-0MVHXWLPG007OQVN):
+a per-child session timeout is a bound, not a verdict.
+``TestTimeoutReconciliation`` pins the post-timeout classification — a child
+that already reached a terminal state is recorded as completed-late and the
+chain continues; a non-terminal child still fails hard; the report carries the
+evidence that distinguishes the two outcomes. The terminal-path cases are
+``xfail(strict=True)`` tracer bullets until the reconciliation siblings
+(SA-0MVLJWMQ8007EDW0 reconcile, SA-0MVLJWOJ8004ABBA evidence) land and remove
+the markers.
+
 The parent state machine and the session spawner are both injected so the
 orchestration loop is exercised deterministically (no worklog, no subprocess).
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import subprocess
@@ -112,12 +123,48 @@ def _patch_parent(m, children):
     )
 
 
-def _run(m, runner, spawner, children, **kwargs):
-    p1, p2, p3 = _patch_parent(m, children)
-    with p1, p2, p3:
+def _patch_child_state(m, states: dict[str, dict]):
+    """Route ``wl_show`` per child id while still serving the parent fetch.
+
+    ``phase_drive`` fetches the parent once and — after a failed spawn —
+    re-fetches the affected child to classify it. ``states`` maps child id to
+    the work-item dict ``wl_show`` should return for it. The parent fetch
+    (``PARENT``) and any unmapped id get a minimal placeholder, so a fetch for
+    the wrong id shows up as a non-terminal child instead of passing silently.
+    """
+
+    def _show(work_item_id):
+        if work_item_id == PARENT:
+            return {"id": PARENT}
+        return states.get(work_item_id, {})
+
+    return mock.patch.object(m, "wl_show", side_effect=_show)
+
+
+def _run(m, runner, spawner, children, child_states=None, **kwargs):
+    patches = list(_patch_parent(m, children))
+    if child_states is not None:
+        patches.append(_patch_child_state(m, child_states))
+    with contextlib.ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
         return m.phase_drive(
             PARENT, parent_runner=runner, spawn_session=spawner, **kwargs
         )
+
+
+def _timeout_result(cid: str, seconds: int = 3600) -> dict:
+    """Scripted spawner result for a timed-out child session.
+
+    Mirrors what ``_default_session_spawner`` returns on
+    ``subprocess.TimeoutExpired`` so the drive loop is exercised with the
+    exact failure shape produced in production.
+    """
+    return {
+        "success": False,
+        "returncode": None,
+        "reason": f"Child session for {cid} timed out after {seconds}s.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +290,156 @@ class TestDriveFailure:
         assert report["sessions_spawned"] == 2
         assert report["failed_child"] == "SA-C1"
         assert "after 2 session" in report["message"]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MVLJWL60001H6QK — timeout reconciliation (parent SA-0MVHXWLPG007OQVN)
+#
+# A driven child's session can be killed at the per-child timeout after the
+# child has already committed, pushed and reached a terminal work-item state.
+# Treating every timeout as a hard child failure produced a false-negative
+# drive report and stopped the epic chain. The cases below pin the required
+# behaviour: reconcile the child's actual state after a failed spawn.
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutReconciliation:
+    """A timeout is a bound, not a verdict (SA-0MVHXWLPG007OQVN)."""
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "phase_drive still treats every spawn failure as a hard child "
+            "failure; terminal-state reconciliation lands in "
+            "SA-0MVLJWMQ8007EDW0"
+        ),
+    )
+    def test_terminal_child_timed_out_continues_and_advances_parent(
+        self, implement_mod,
+    ):
+        """A child already completed/in_review is completed-late, not failed."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            _child_report("SA-C2"),
+            {"success": True, "parent_advanced": True},
+        ])
+        spawner = RecordingSpawner([_timeout_result("SA-C1", 3600)])
+        states = {
+            "SA-C1": {
+                "id": "SA-C1", "status": "completed",
+                "stage": "in_review",
+            },
+        }
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-C1"}, {"id": "SA-C2"}],
+            child_states=states, child_timeout=3600,
+        )
+
+        # The chain did not stop and the parent was advanced.
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert report.get("failed_child") is None
+        # The terminal child was not re-spawned; the loop moved on to C2.
+        assert [c["id"] for c in spawner.calls] == ["SA-C1", "SA-C2"]
+        assert report["sessions_spawned"] == 2
+        first, second = report["children_driven"]
+        assert first["result"] != "failed"
+        assert first["result"] in {"ok", "completed-late"}
+        assert second["result"] == "ok"
+        assert len(runner.calls) == 3
+
+    def test_non_terminal_child_timed_out_still_fails_hard(
+        self, implement_mod,
+    ):
+        """Regression guard: a non-terminal child keeps the hard failure."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            _child_report("SA-C2"),
+            {"success": True, "parent_advanced": True},
+        ])
+        spawner = RecordingSpawner([_timeout_result("SA-C1", 3600)])
+        states = {
+            "SA-C1": {
+                "id": "SA-C1", "status": "in_progress",
+                "stage": "in_progress",
+            },
+        }
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-C1"}, {"id": "SA-C2"}],
+            child_states=states, child_timeout=3600,
+        )
+
+        assert report["success"] is False
+        assert report["parent_advanced"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["children_driven"][0]["result"] == "failed"
+        assert "timed out" in report["children_driven"][0]["reason"]
+        # The chain stopped: C2 was never spawned and the parent never re-ran.
+        assert [c["id"] for c in spawner.calls] == ["SA-C1"]
+        assert len(runner.calls) == 1
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "drive report carries no timeout/terminal evidence yet; the "
+            "evidence fields land in SA-0MVLJWOJ8004ABBA"
+        ),
+    )
+    def test_report_evidence_distinguishes_terminal_from_incomplete(
+        self, implement_mod,
+    ):
+        """Each timeout outcome is truthfully distinguishable in the report."""
+        m = implement_mod
+        children = [{"id": "SA-C1"}, {"id": "SA-C2"}]
+
+        terminal_runner = ScriptedParent([
+            _child_report("SA-C1"),
+            _child_report("SA-C2"),
+            {"success": True, "parent_advanced": True},
+        ])
+        completed_late = _run(
+            m, terminal_runner,
+            RecordingSpawner([_timeout_result("SA-C1", 3600)]),
+            children,
+            child_states={"SA-C1": {
+                "id": "SA-C1", "status": "completed",
+                "stage": "in_review",
+            }},
+            child_timeout=3600,
+        )["children_driven"][0]
+
+        assert completed_late["result"] == "completed-late"
+        assert completed_late["timed_out"] is True
+        assert completed_late["timeout_seconds"] == 3600
+        assert completed_late["terminal"] is True
+        assert completed_late["terminal_status"] == "completed"
+        assert completed_late["terminal_stage"] == "in_review"
+        assert "timed out" in completed_late["reason"]
+        assert "completed" in completed_late["reason"]
+
+        incomplete_runner = ScriptedParent([_child_report("SA-C1")])
+        incomplete = _run(
+            m, incomplete_runner,
+            RecordingSpawner([_timeout_result("SA-C1", 3600)]),
+            children,
+            child_states={"SA-C1": {
+                "id": "SA-C1", "status": "in_progress",
+                "stage": "in_progress",
+            }},
+            child_timeout=3600,
+        )["children_driven"][0]
+
+        assert incomplete["result"] == "failed"
+        assert incomplete["timed_out"] is True
+        assert incomplete["timeout_seconds"] == 3600
+        assert incomplete["terminal"] is False
+        assert "timed out" in incomplete["reason"]
 
 
 # ---------------------------------------------------------------------------
