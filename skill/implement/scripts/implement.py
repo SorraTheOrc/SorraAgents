@@ -5684,16 +5684,59 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         print(f"  ⚠  Drive stopped: {report.get('work_item_id')}")
     print("=" * 60)
     for entry in report.get("children_driven", []):
-        icon = "✅" if entry.get("result") == "ok" else "❌"
+        result = entry.get("result")
+        if result == "ok":
+            icon = "✅"
+        elif result == "completed-late":
+            # The session was killed at the per-child timeout but the child
+            # had already reached a terminal state: a distinct, non-failure
+            # verdict so a producer is never misled (SA-0MVLJWOJ8004ABBA).
+            icon = "🕓"
+        else:
+            icon = "❌"
         print(
             f"  {icon} {entry.get('id')} "
-            f"(attempt {entry.get('attempt')}): {entry.get('result')}"
+            f"(attempt {entry.get('attempt')}): {result}"
         )
+        evidence = _format_timeout_evidence(entry)
+        if evidence:
+            print(f"     {evidence}")
         if entry.get("reason"):
             print(f"     {entry['reason']}")
     print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
+    if report.get("completed_late"):
+        print(f"  Completed late: {report['completed_late']}")
     print(f"  {report.get('message', '')}")
     print()
+
+
+def _format_timeout_evidence(entry: dict[str, Any]) -> str:
+    """Render the timeout/terminal evidence line for a drive report entry.
+
+    Only entries that carry the evidence fields (spawn-failure paths) produce
+    a line; successful entries render nothing extra.
+
+    Args:
+        entry: A ``children_driven`` entry.
+
+    Returns:
+        A human-readable evidence string, or an empty string.
+    """
+    if "timed_out" not in entry and "terminal" not in entry:
+        return ""
+    parts: list[str] = []
+    if entry.get("timed_out"):
+        seconds = entry.get("timeout_seconds")
+        parts.append(
+            f"timed out after {seconds}s" if seconds else "timed out"
+        )
+    if entry.get("terminal"):
+        status = entry.get("terminal_status") or "?"
+        stage = entry.get("terminal_stage") or "?"
+        parts.append(f"terminal (status={status}, stage={stage})")
+    else:
+        parts.append("child incomplete")
+    return "; ".join(parts)
 
 
 def phase_drive(
@@ -5749,8 +5792,13 @@ def phase_drive(
             :func:`_invoke_implement`.
 
     Returns:
-        Report dict with per-child results, sessions spawned, and whether the
-        parent was advanced.
+        Report dict with per-child results, sessions spawned, whether the
+        parent was advanced, and ``completed_late`` — the number of children
+        whose session timed out after they had already reached a terminal
+        state. Spawn-failure entries additionally carry ``timed_out``,
+        ``timeout_seconds``, ``terminal``, ``terminal_status`` and
+        ``terminal_stage`` so the two timeout outcomes are distinguishable
+        (SA-0MVLJWOJ8004ABBA).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -5759,6 +5807,7 @@ def phase_drive(
         "parent_advanced": False,
         "sessions_spawned": 0,
         "children_driven": [],
+        "completed_late": 0,
         "message": "",
     }
 
@@ -5841,6 +5890,13 @@ def phase_drive(
                 "message",
                 f"All children of {work_item_id} are terminal; parent advanced.",
             )
+            if report["completed_late"]:
+                report["message"] = (
+                    f"{report['message']} "
+                    f"{report['completed_late']} child(ren) completed late "
+                    f"(session timed out but the child had already reached a "
+                    f"terminal state)."
+                )
             break
 
         if parent_report.get("success") is False:
@@ -5917,6 +5973,7 @@ def phase_drive(
             if reconciliation["terminal"]:
                 entry["result"] = "completed-late"
                 entry["reconciled"] = True
+                report["completed_late"] += 1
                 LOG.info(
                     "Child %s completed late (%s); continuing the drive loop.",
                     child_id, reconciliation["evidence"],

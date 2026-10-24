@@ -553,6 +553,131 @@ class TestSpawnFailureReconciliation:
 
 
 # ---------------------------------------------------------------------------
+# SA-0MVLJWOJ8004ABBA — truthful timeout outcome evidence in the drive report
+#
+# A producer or auditor reading `drive --json` (or the human log) must be able
+# to tell "timed out but the child completed" apart from "timed out, child
+# incomplete", including the terminal evidence, so a false-negative failure
+# can never be mistaken for real work remaining.
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutOutcomeEvidence:
+    """Distinct verdicts, truthful reasons, human rendering, summary."""
+
+    def test_report_counts_completed_late_children(self, implement_mod):
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            _child_report("SA-C2"),
+            {"success": True, "parent_advanced": True},
+        ])
+        spawner = RecordingSpawner([
+            _timeout_result("SA-C1", 3600),
+            _timeout_result("SA-C2", 1800),
+        ])
+        states = {
+            "SA-C1": {"id": "SA-C1", "status": "completed",
+                      "stage": "in_review"},
+            "SA-C2": {"id": "SA-C2", "status": "in_review",
+                      "stage": "in_review"},
+        }
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}, {"id": "SA-C2"}],
+            child_states=states,
+        )
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert report["completed_late"] == 2
+        assert "2" in report["message"]
+        assert "completed late" in report["message"].lower()
+
+    def test_successful_drive_reports_zero_completed_late(
+        self, implement_mod,
+    ):
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True},
+        ])
+
+        report = _run(
+            m, runner, RecordingSpawner(), [{"id": "SA-C1"}],
+        )
+
+        assert report["completed_late"] == 0
+        assert "completed late" not in report["message"].lower()
+
+    def test_backward_compatible_report_keys(self, implement_mod):
+        """Existing keys keep their meaning and types (additive only)."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True},
+        ])
+
+        report = _run(
+            m, runner, RecordingSpawner([_timeout_result("SA-C1", 60)]),
+            [{"id": "SA-C1"}],
+            child_states={"SA-C1": {
+                "id": "SA-C1", "status": "completed", "stage": "in_review",
+            }},
+        )
+
+        assert isinstance(report["success"], bool)
+        assert isinstance(report["parent_advanced"], bool)
+        assert isinstance(report["sessions_spawned"], int)
+        assert isinstance(report["children_driven"], list)
+        assert isinstance(report["message"], str)
+        assert set(report) >= {
+            "success", "parent_advanced", "sessions_spawned",
+            "children_driven", "message",
+        }
+
+    def test_human_report_renders_completed_late_distinctly(
+        self, implement_mod, capsys,
+    ):
+        """The log must not show a completed-late child as a plain success."""
+        m = implement_mod
+        report = {
+            "phase": "drive",
+            "work_item_id": PARENT,
+            "success": True,
+            "parent_advanced": True,
+            "sessions_spawned": 1,
+            "completed_late": 1,
+            "children_driven": [{
+                "id": "SA-C1",
+                "attempt": 1,
+                "result": "completed-late",
+                "timed_out": True,
+                "timeout_seconds": 3600,
+                "terminal": True,
+                "terminal_status": "completed",
+                "terminal_stage": "in_review",
+                "reason": (
+                    "Child session for SA-C1 timed out after 3600s. Child "
+                    "reached a terminal state anyway (status=completed, "
+                    "stage=in_review)."
+                ),
+            }],
+            "message": "All children terminal; 1 completed late.",
+        }
+
+        m._emit_phase_report(report, json_output=False)
+        out = capsys.readouterr().out
+
+        assert "completed-late" in out
+        assert "status=completed" in out
+        assert "stage=in_review" in out
+        # A completed-late child gets its own icon, never the plain success one.
+        assert "🕓 SA-C1" in out
+        assert "✅ SA-C1" not in out
+
+
+# ---------------------------------------------------------------------------
 # AC-6 / AC-7: recursion guard + missing spawner
 # ---------------------------------------------------------------------------
 
