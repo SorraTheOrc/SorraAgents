@@ -16,10 +16,12 @@ a per-child session timeout is a bound, not a verdict.
 ``TestTimeoutReconciliation`` pins the post-timeout classification — a child
 that already reached a terminal state is recorded as completed-late and the
 chain continues; a non-terminal child still fails hard; the report carries the
-evidence that distinguishes the two outcomes. The terminal-path cases are
-``xfail(strict=True)`` tracer bullets until the reconciliation siblings
-(SA-0MVLJWMQ8007EDW0 reconcile, SA-0MVLJWOJ8004ABBA evidence) land and remove
-the markers.
+evidence that distinguishes the two outcomes.
+
+Stranded children (SA-0MVLJWQ820060RFF / SA-0MVLJWRVO000QQNP): a child whose
+session dies after pushing to ``dev`` but before its terminal update is
+reported as stranded, with its pushed-commit evidence, without mutating its
+lifecycle state (finalisation is a separate, explicit opt-in).
 
 The parent state machine and the session spawner are both injected so the
 orchestration loop is exercised deterministically (no worklog, no subprocess).
@@ -149,9 +151,17 @@ def _patch_child_state(m, states: dict[str, dict]):
 def _run(m, runner, spawner, children, child_states=None, **kwargs):
     patches = list(_patch_parent(m, children))
     calls: list[str] = []
+    comments: list[tuple[str, str]] = []
     if child_states is not None:
         state_patch, calls = _patch_child_state(m, child_states)
         patches.append(state_patch)
+    # ``phase_drive`` may comment on the parent (stranded-child diagnostic).
+    # Every drive test patches it so the orchestration loop stays hermetic and
+    # never touches the real worklog.
+    patches.append(mock.patch.object(
+        m, "wl_add_comment",
+        side_effect=lambda wid, text: comments.append((wid, text)) or True,
+    ))
     with contextlib.ExitStack() as stack:
         for patch in patches:
             stack.enter_context(patch)
@@ -159,6 +169,7 @@ def _run(m, runner, spawner, children, child_states=None, **kwargs):
             PARENT, parent_runner=runner, spawn_session=spawner, **kwargs
         )
     report["_wl_show_calls"] = calls
+    report["_comments"] = comments
     return report
 
 
@@ -712,12 +723,6 @@ def _patch_mutations(m):
 class TestStrandedChildren:
     """Detect a child whose work is on dev but whose item is still in-progress."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "stranded-child detection lands in SA-0MVLJWRVO000QQNP"
-        ),
-    )
     def test_stranded_child_is_reported_with_commit_evidence(
         self, implement_mod,
     ):
@@ -749,12 +754,6 @@ class TestStrandedChildren:
         assert "SA-C1" in report["message"]
         assert "stranded" in report["message"].lower()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "stranded-child detection lands in SA-0MVLJWRVO000QQNP"
-        ),
-    )
     def test_in_progress_child_without_pushed_commit_is_not_stranded(
         self, implement_mod,
     ):
@@ -777,12 +776,6 @@ class TestStrandedChildren:
         assert report.get("stranded_children") in (None, [])
         assert "stranded" not in report["message"].lower()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "stranded-child detection lands in SA-0MVLJWRVO000QQNP"
-        ),
-    )
     def test_terminal_child_is_never_reported_stranded(self, implement_mod):
         """A completed-late child is terminal, so never "stranded"."""
         m = implement_mod
@@ -804,12 +797,6 @@ class TestStrandedChildren:
         assert report["success"] is True
         assert report.get("stranded_children") in (None, [])
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "stranded-child detection lands in SA-0MVLJWRVO000QQNP"
-        ),
-    )
     def test_detection_does_not_mutate_child_state(self, implement_mod):
         """Read-only by default: no finalisation unless explicitly requested."""
         m = implement_mod

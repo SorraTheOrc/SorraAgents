@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MVN0IJ7H008OORA
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 #!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MUQ2OU12009Q8V5
@@ -5739,6 +5745,152 @@ def _format_timeout_evidence(entry: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+def _git_commit_evidence(
+    child_id: str,
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> str | None:
+    """Return the child's pushed commit hash on the parent branch, if any.
+
+    Read-only git evidence: the implement workflow commits carry the work-item
+    id, so a commit on ``origin/<parent_branch>`` whose message references the
+    child means its work was pushed. The remote-tracking ref is used as-is (no
+    network fetch) — a stale ref is acceptable evidence on the failure path,
+    and fetching would add network latency to an already-failing path.
+
+    Degrades gracefully: a missing/unreadable worktree, a git error, or a
+    repository without the remote-tracking ref returns ``None`` ("unknown")
+    without raising, so detection never crashes the drive loop and never
+    produces a false positive.
+
+    Args:
+        child_id: The child work-item id to look for.
+        worktree_path: The child's worktree (git is run with ``-C``).
+        parent_branch: Branch the work would have been pushed to (``dev``).
+
+    Returns:
+        The commit hash as a string, or ``None`` when no evidence is found.
+    """
+    if not worktree_path or not Path(worktree_path).exists():
+        return None
+    for ref in (f"origin/{parent_branch}", parent_branch):
+        try:
+            result = run_cmd(
+                [
+                    "git", "-C", str(worktree_path), "log", ref,
+                    "--grep", child_id, "-n", "1", "--format=%H",
+                ],
+                check=False,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            LOG.debug(
+                "Commit-evidence lookup for %s failed against %s: %s",
+                child_id, ref, exc,
+            )
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[0]
+    return None
+
+
+def _detect_stranded_child(
+    child_id: str,
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    commit_evidence: Callable[[str], str | None] | None = None,
+) -> dict[str, Any]:
+    """Detect a child whose work was pushed before its session was killed.
+
+    A stranded child is the ``WL-0MVGUA9EY003XFAD`` production shape: the
+    session pushed to ``dev`` but was killed before the final
+    ``StatusLifecycle`` terminal update, leaving the item ``in-progress`` and
+    blocking ``wl next``. Detection is **read-only** (no ``wl`` mutation, no
+    worktree mutation): it only looks for the child's commit on the parent
+    branch.
+
+    Args:
+        child_id: The child work-item id.
+        worktree_path: The child's worktree (for the git evidence).
+        parent_branch: Branch the work would have been pushed to.
+        commit_evidence: Injectable evidence provider (tests); defaults to
+            :func:`_git_commit_evidence`.
+
+    Returns:
+        A dict with ``stranded`` (bool), ``commit`` (str), ``evidence`` (str)
+        and ``reason`` (str). A provider failure degrades to ``stranded: False``
+        (unknown) — never a false positive, never a crash.
+    """
+    provider = commit_evidence or (
+        lambda cid: _git_commit_evidence(cid, worktree_path, parent_branch)
+    )
+    try:
+        commit = provider(child_id)
+    except Exception:
+        LOG.warning(
+            "Commit-evidence provider failed for %s; treating as unknown.",
+            child_id, exc_info=True,
+        )
+        commit = None
+
+    if not commit:
+        return {
+            "stranded": False,
+            "commit": "",
+            "evidence": "",
+            "reason": (
+                f"no commit referencing {child_id} found on {parent_branch}"
+            ),
+        }
+    commit = str(commit)
+    return {
+        "stranded": True,
+        "commit": commit,
+        "evidence": f"commit {commit} on {parent_branch}",
+        "reason": (
+            f"work item {child_id} is not terminal but commit {commit} is "
+            f"already on {parent_branch}"
+        ),
+    }
+
+
+def _stranded_children_comment(
+    stranded: list[dict[str, Any]], parent_branch: str,
+) -> str:
+    """Build the one-per-drive worklog comment naming stranded children.
+
+    Args:
+        stranded: The ``stranded_children`` report entries.
+        parent_branch: Branch the work was pushed to.
+
+    Returns:
+        Comment text naming each stranded child and how to finalise it.
+    """
+    lines = [
+        f"Drive detected {len(stranded)} stranded child(ren): a session "
+        f"failed after the work was pushed to `{parent_branch}`, so the item "
+        "is still non-terminal and blocks `wl next`.",
+        "",
+    ]
+    for item in stranded:
+        lines.append(
+            f"- `{item.get('id')}` — status={item.get('status') or '?'}, "
+            f"stage={item.get('stage') or '?'}, {item.get('evidence', '')}"
+        )
+    lines += [
+        "",
+        "Finalise the item(s) once the pushed work is verified (or re-run "
+        "drive with `--finalise-stranded` to let it finalise evidence-gated "
+        "children automatically):",
+        "",
+    ]
+    for item in stranded:
+        lines.append(
+            f"  wl update {item.get('id')} --status completed --stage in_review"
+        )
+    return "\n".join(lines)
+
+
 def phase_drive(
     work_item_id: str,
     json_output: bool = False,
@@ -5749,6 +5901,7 @@ def phase_drive(
     child_timeout: int | None = None,
     spawn_session: Callable[..., dict[str, Any]] | None = None,
     parent_runner: Callable[..., dict[str, Any] | None] | None = None,
+    commit_evidence: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Phase: drive every child of a parent to a terminal state in one call.
 
@@ -5790,6 +5943,9 @@ def phase_drive(
             :func:`_default_session_spawner`.
         parent_runner: Injectable ``parent`` runner (tests); defaults to
             :func:`_invoke_implement`.
+        commit_evidence: Injectable pushed-commit evidence provider (tests)
+            used by stranded-child detection; defaults to
+            :func:`_git_commit_evidence`.
 
     Returns:
         Report dict with per-child results, sessions spawned, whether the
@@ -5798,7 +5954,9 @@ def phase_drive(
         state. Spawn-failure entries additionally carry ``timed_out``,
         ``timeout_seconds``, ``terminal``, ``terminal_status`` and
         ``terminal_stage`` so the two timeout outcomes are distinguishable
-        (SA-0MVLJWOJ8004ABBA).
+        (SA-0MVLJWOJ8004ABBA). A non-terminal child whose work is already on
+        the parent branch additionally appears in ``stranded_children`` with
+        its pushed-commit evidence (SA-0MVLJWRVO000QQNP).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -5868,6 +6026,7 @@ def phase_drive(
 
     attempts: dict[str, int] = {}
     driven: list[dict[str, Any]] = []
+    stranded_comment_posted = False
     # Hard bound on the loop: each child may consume at most
     # max_child_sessions spawns plus one terminal classification, and the
     # final iteration advances the parent.
@@ -5979,6 +6138,48 @@ def phase_drive(
                     child_id, reconciliation["evidence"],
                 )
                 continue
+
+            # Not terminal: the hard failure stands. Before stopping the
+            # chain, check whether the child is *stranded* — its work is
+            # already on the parent branch but the item never reached a
+            # terminal state (SA-0MVLJWRVO000QQNP). Read-only: report + one
+            # parent comment, no status mutation.
+            stranded = _detect_stranded_child(
+                child_id, worktree_path, parent_branch,
+                commit_evidence=commit_evidence,
+            )
+            if stranded["stranded"]:
+                entry["stranded"] = True
+                entry["commit_evidence"] = stranded["commit"]
+                report.setdefault("stranded_children", []).append({
+                    "id": child_id,
+                    "status": reconciliation["status"],
+                    "stage": reconciliation["stage"],
+                    "commit": stranded["commit"],
+                    "evidence": stranded["evidence"],
+                    "reason": stranded["reason"],
+                })
+                if not stranded_comment_posted:
+                    wl_add_comment(
+                        work_item_id,
+                        _stranded_children_comment(
+                            report["stranded_children"], parent_branch,
+                        ),
+                    )
+                    stranded_comment_posted = True
+                LOG.warning(
+                    "Child %s is stranded: %s",
+                    child_id, stranded["reason"],
+                )
+                report["message"] = (
+                    f"Child session for {child_id} failed and the child is "
+                    f"stranded (not terminal, but {stranded['evidence']}); "
+                    f"finalise it or re-run drive with --finalise-stranded. "
+                    f"Reason: {spawn_result.get('reason', 'unknown error')}"
+                )
+                report["failed_child"] = child_id
+                break
+
             report["message"] = (
                 f"Child session for {child_id} failed: "
                 f"{spawn_result.get('reason', 'unknown error')}"
