@@ -504,9 +504,41 @@ Verifying the full suite before promotion uses the test skill's cached runner
 | `refresh-audits.js` | Pre-flight-only audit refresh (`planAuditRefresh`, `refreshAudits`, `runRefreshAuditsAction`) for `--refresh-audits` |
 | `check-final-validation.js` | Final validation sweep (parent-coverage / out-of-scope aware, exit 12) |
 | `check-critical-items.js` | Critical item gating |
-| `check-worklog-refs.js` | Validate worklog references |
+| `check-worklog-refs.js` | Validate worklog references (JS gate used by `run-release.js`) |
+| `release/worklog-ref-gate.sh` | Shell worklog-ref gate used by `release/merge-dev-to-main.sh`; applies the identical content rule (see below) |
 | `discord-notify.js` | Post-release Discord notification |
 | `remediate-spurious-closes.js` | Idempotent close-comment remediation |
 | `timing.js` | Timer / timing utilities |
 
 All scripts are internal — the only user-facing action is `release`.
+
+### Worklog-ref gate (two entry points, one rule)
+
+The worklog-ref gate exists twice because it is applied at two different
+layers, but the **rule is identical** and must never diverge
+(SA-0MVO7XZAB0095R6F):
+
+| Layer | Implementation | Caller |
+|---|---|---|
+| Wrapper gate (exit 8) | `check-worklog-refs.js` | `run-release.js` Step 3.5 |
+| Merge-script gate (exit 1) | `release/worklog-ref-gate.sh` | `release/merge-dev-to-main.sh` |
+
+Both exclude (a) remote-tracking mirrors `refs/worklog/remotes/**` and (b) any
+`refs/worklog/*` ref whose commit contains the worklog data file
+`.worklog/worklog-data.jsonl` — `wl sync` bookkeeping such as
+`refs/worklog/data`, `refs/worklog/fetched-check` and
+`refs/worklog/tmp-reauthor`. Every remaining ref is a dangerous orphan and
+blocks the release; a ref whose data-file presence cannot be determined is
+treated as dangerous (fail closed).
+
+`worklog-ref-gate.sh [<repo-path>]` can be run standalone for diagnosis:
+exit 0 = clean, exit 1 = dangerous ref(s) printed to stderr, exit 2 = usage
+error / not a git repository. `tests/unit/test-worklog-ref-gate.mjs` asserts
+the behaviour of both entry points **and** their parity on the same throwaway
+repository.
+
+> **Historical bug (fixed):** the merge script previously inlined a
+> *name-based* check that only special-cased `refs/worklog/data`, so once
+> `wl sync` created `refs/worklog/fetched-check` / `tmp-reauthor` every release
+> aborted in the merge script immediately after the wrapper's worklog-ref gate
+> had passed. Do not re-inline a name-based check in the merge script.

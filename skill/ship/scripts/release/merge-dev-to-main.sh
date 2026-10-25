@@ -108,37 +108,25 @@ if [[ "$DRY_RUN" != "true" ]]; then
 fi
 
 # ── Worklog-ref gating ─────────────────────────────────────────────────--------
-# Detect worklog refs and abort if present to prevent accidental merge of
-# worklog data into main. The worklog ref (refs/worklog/data) is an orphan ref
-# with no common ancestor with main or dev; merging it would corrupt the
-# worklog database for all users.
+# Detect *dangerous* worklog refs and abort, so worklog data is never merged
+# into main. Genuine orphans (no common ancestor with main/dev) would corrupt
+# the worklog database for all users.
 #
-# Remote-tracking mirror refs (refs/worklog/remotes/**) are harmless
-# bookkeeping maintained by `wl sync` and are never merged by git merge/pull,
-# so they are excluded from the gate (mirrors match the JS gate in
-# check-worklog-refs.js).
-if git for-each-ref refs/worklog/ --format="%(refname)" 2>/dev/null | grep -v '^refs/worklog/remotes/' | grep -q .; then
-  # Collect flagged refs, excluding refs/worklog/data when it holds the
-  # worklog data file (it is the worklog's own git-branch sync mechanism,
-  # never a code branch to merge into main/dev).
-  DANGEROUS_REFS=0
-  while IFS= read -r ref; do
-    case "$ref" in
-      refs/worklog/remotes/*) continue ;;
-      refs/worklog/data)
-        if git cat-file -e refs/worklog/data:.worklog/worklog-data.jsonl 2>/dev/null; then
-          continue  # legitimate worklog data sync branch
-        fi
-        ;;
-    esac
-    DANGEROUS_REFS=1
-    echo "  - $ref" >&2
-  done < <(git for-each-ref refs/worklog/ --format='%(refname)' 2>/dev/null)
-  if [ "$DANGEROUS_REFS" -eq 1 ]; then
-    echo "Error: Dangerous worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
-    echo "The worklog ref (refs/worklog/data) is separate from regular branches and must not be merged into main." >&2
-    exit 1
-  fi
+# The rule lives in exactly one place — release/worklog-ref-gate.sh — and is
+# identical to the JS gate (check-worklog-refs.js) applied by the run-release.js
+# wrapper moments earlier (SA-0MVO7XZAB0095R6F). Both exclude:
+#   * remote-tracking mirror refs (refs/worklog/remotes/**), and
+#   * any refs/worklog/* ref carrying the worklog data file
+#     (.worklog/worklog-data.jsonl) — `wl sync` bookkeeping such as
+#     refs/worklog/data, refs/worklog/fetched-check and
+#     refs/worklog/tmp-reauthor,
+# while still flagging orphan refs. Do NOT re-inline a name-based check here:
+# the previous inline version only special-cased refs/worklog/data by name and
+# aborted every release once `wl sync` created the other bookkeeping refs.
+if ! bash "$SCRIPT_DIR/worklog-ref-gate.sh" "$REPO_ROOT"; then
+  echo "Error: Dangerous worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
+  echo "The worklog refs listed above are separate from regular branches and must not be merged into main." >&2
+  exit 1
 fi
 
 # Fetch latest
