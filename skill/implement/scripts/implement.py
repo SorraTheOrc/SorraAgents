@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MVN0IJ7H008OORA
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 #!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MUQ2OU12009Q8V5
@@ -34,6 +40,7 @@ Optional flags:
   --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
   --max-child-sessions N    Max fresh sessions per child when driving (default: 1)
   --child-timeout N         Per-child session timeout in seconds (default: 3600)
+  --finalise-stranded       Finalise evidence-gated stranded children when driving
   -v, --verbose             Verbose logging
 
 Environment:
@@ -59,6 +66,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from collections.abc import Callable, Iterator
@@ -116,6 +124,24 @@ except ModuleNotFoundError:
 
     class _TestConcurrencyTimeout(RuntimeError):  # type: ignore[no-redef]
         """Fallback when the test skill is unavailable (never raised)."""
+
+try:
+    # Stable gate-failure notice contract (WL-0MVGUT787000LNDG). Imported
+    # separately so an older test skill without the constants degrades to
+    # the literal fallbacks instead of breaking the whole delegation import.
+    from test.scripts.run_tests import (
+        NOTICE_SLOT_BUSY as _NOTICE_SLOT_BUSY,
+    )
+    from test.scripts.run_tests import (
+        SLOT_BUSY_NOTICE_PREFIX as _SLOT_BUSY_NOTICE_PREFIX,
+    )
+except ImportError:
+    # Older test skill without the notice-code contract — degrade to the
+    # literal fallbacks (never break the delegation import chain).
+    _NOTICE_SLOT_BUSY = "slot_busy"  # type: ignore[assignment]
+    _SLOT_BUSY_NOTICE_PREFIX = (  # type: ignore[assignment]
+        "test concurrency slot busy:"
+    )
 
 from test_cache import run_cached
 from test_runner import canonicalize_quiet_test_command
@@ -326,6 +352,7 @@ def run_cmd(
     check: bool = False,
     timeout: int = 300,
     env: dict[str, str] | None = None,
+    start_new_session: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run a shell command and return the result.
 
@@ -336,6 +363,10 @@ def run_cmd(
         check: If True, raise CalledProcessError on non-zero exit.
         timeout: Timeout in seconds.
         env: Optional environment variable overrides.
+        start_new_session: If True, spawn the child in its own session /
+            process group so process-group kills performed inside it can
+            never reach the caller or its siblings
+            (SA-0MVJC5KNT0044L2B).
 
     Returns:
         ``subprocess.CompletedProcess``
@@ -353,6 +384,7 @@ def run_cmd(
         check=check,
         timeout=timeout,
         env={**os.environ, **(env or {})},
+        start_new_session=start_new_session,
     )
 
 
@@ -517,6 +549,56 @@ def wl_add_comment(work_item_id: str, comment: str) -> bool:
         LOG.warning("Failed to add comment to %s: %s", work_item_id, result.stderr.strip())
         return False
     return True
+
+
+def _assert_terminal_status(work_item_id: str) -> dict[str, Any]:
+    """Verify the store holds the terminal transition after a successful finish.
+
+    The terminal ``status=completed``/``stage=in_review`` write is issued by
+    ``StatusLifecycle.__exit__`` on **both** the push-with-diff path and the
+    no-op-push (no-diff) path — a branch with no diff from ``origin/dev``
+    still reaches the context manager and the write persists. This
+    read-back turns a silently lost or overwritten lifecycle write into a
+    loud finish failure instead of a green report: the recorded symptom on
+    OSL-0MVMB44C9008IXZX was exactly that — ``finish`` reported success
+    while the item was still ``open`` (OSL-0MVME1PI5005WU58).
+
+    The assertion runs only after Step 6's confirmed successful push (and
+    after ``StatusLifecycle.__exit__`` issued the write), so a genuine push
+    failure can never surface as ``in_review``. The regression pin is
+    ``skill/implement/tests/test_finish_no_diff_status.py``.
+
+    Args:
+        work_item_id: The work item ID.
+
+    Returns:
+        Dict with ``success`` (True), ``status`` and ``stage`` as read back
+        from the main-checkout store.
+
+    Raises:
+        RuntimeError: when the store does not hold terminal state — the
+            finish phase must then fail (and the item be released) instead
+            of reporting success.
+    """
+    try:
+        data = StatusLifecycle.show(work_item_id)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Status read-back failed after a successful finish: {exc}"
+        ) from exc
+    wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+    status = wi.get("status", "")
+    stage = wi.get("stage", "")
+    if status == "completed" and stage == "in_review":
+        return {"success": True, "status": status, "stage": stage}
+    raise RuntimeError(
+        f"Finish reported success but the main-checkout store does not hold "
+        f"the terminal transition for {work_item_id}: status={status!r}, "
+        f"stage={stage!r} (expected completed / in_review). The lifecycle "
+        f"write was lost or overwritten — investigate before re-running "
+        f"finish, or complete the transition by hand if the store was "
+        f"restored from a stale snapshot."
+    )
 
 
 def _safety_reset_if_in_progress(work_item_id: str) -> None:
@@ -2109,11 +2191,116 @@ def _sync_parent_branch(
 # ---------------------------------------------------------------------------
 
 
+def _main_checkout_for(worktree_path: str) -> str:
+    """Resolve a cwd guaranteed to be OUTSIDE the given worktree.
+
+    ``wl cleanup-worktree`` must not be spawned from inside the worktree it
+    targets: ContextHub's ``wl`` CLI auto-registers its own PID under a
+    worktree whenever its cwd is inside ``.worklog/worktrees/`` and then
+    reaps it — including the registering process itself
+    (SA-0MVJC5KNT0044L2B). Prefer the git-derived main checkout root, then
+    the canonical ``<main>/.worklog/worktrees/<slug>`` layout, and finally
+    the system temp dir (neutral — can never be inside a managed worktree).
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+
+    Returns:
+        An absolute directory path outside *worktree_path*.
+    """
+    try:
+        git_main = _get_repo_root(worktree_path)
+    except OSError:
+        # The worktree path no longer exists (e.g. cleanup during abort
+        # after removal): fall through to the neutral fallbacks.
+        git_main = None
+    if git_main:
+        return git_main
+    parts = Path(worktree_path).resolve().parts
+    if len(parts) >= 3 and parts[-3] == ".worklog" and parts[-2] == "worktrees":
+        return str(Path(*parts[:-3]))
+    return tempfile.gettempdir()
+
+
+def _ppid_of(pid: int) -> int | None:
+    """Return the parent PID of *pid* (Linux ``/proc``), else None."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            data = fh.read()
+        rparen = data.rfind(")")
+        if rparen == -1:
+            return None
+        fields = data[rparen + 2:].split()
+        return int(fields[1])  # field 4 overall == ppid
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _pid_is_invoker_related(pid: int) -> bool:
+    """True when *pid* must never be signalled by the worktree cleanup.
+
+    The cleanup runs *inside* the worktree being reaped (``implement.py
+    finish`` uses the worktree as cwd), so excluding only ``os.getpid()``
+    is insufficient: the invoking process shares its process group and
+    ancestry with the wrapper shell it was launched from and with any
+    subprocesses it spawned. Signalling any of those lands on the finish
+    process itself, stranding the dev push (SA-0MVJC5KNT0044L2B).
+
+    A PID is considered invoker-related when it is the invoking process
+    itself, belongs to the invoking process's process group, or is an
+    ancestor or descendant of it.
+    """
+    if pid == os.getpid():
+        return True
+    try:
+        if os.getpgid(pid) == os.getpgrp():
+            return True
+    except OSError:
+        pass  # Concurrently-exited process; the individual kill will ESRCH.
+    # Ancestry walk (bounded against pid-reuse loops): ancestors (a wrapper
+    # shell even if reparented into another group) and descendants we
+    # spawned (even if they moved to their own session, e.g. the push) both
+    # resolve to us.
+    seen: set[int] = set()
+    current = pid
+    while current not in seen and len(seen) < 64:
+        seen.add(current)
+        parent = _ppid_of(current)
+        if parent is None or parent <= 1 or parent == current:
+            break
+        if parent == os.getpid():
+            return True
+        current = parent
+    return False
+
+
 def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
     """Terminate processes associated with the given worktree path.
 
     Attempts ``wl cleanup-worktree <path>`` first. Falls back to finding
     and killing processes with the worktree path in their cwd.
+
+    **Self-exclusion contract (SA-0MVJC5KNT0044L2B).** This function may be
+    invoked *from inside* the worktree it targets (``implement.py finish``
+    runs with the worktree as cwd). The cleanup must therefore never signal
+    the invoking process, its wrapper shell, or anything in its process
+    group — a SIGTERM landing on the finish process mid-workflow previously
+    reset the item to ``open`` and stranded the dev push. Three independent
+    guards enforce this:
+
+    1. ``wl cleanup-worktree`` is spawned with ``cwd`` outside the worktree
+       (``_main_checkout_for``) so ContextHub's ``wl`` CLI does not
+       auto-register the invoking tree's own PID (``cli.js`` /
+       ``process-lifecycle.js`` register any process whose cwd is inside
+       ``.worklog/worktrees/`` and then reap it — including the registering
+       process itself); the kill set then only contains genuinely stray
+       PIDs registered by other sessions.
+    2. The ``wl`` subprocess runs in its own session (``start_new_session``)
+       so even a register-then-kill inside it can only reach its own
+       session/group, never the caller's.
+    3. The pgrep fallback excludes the invoking process's whole process
+       group and its ancestor/descendant chain — not merely
+       ``os.getpid()`` — via ``_pid_is_invoker_related``.
 
     Args:
         worktree_path: Absolute path to the worktree directory.
@@ -2129,9 +2316,14 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
 
     abs_path = str(Path(worktree_path).resolve())
 
-    # Try wl cleanup-worktree first
+    # Try wl cleanup-worktree first — from a cwd OUTSIDE the worktree and in
+    # its own session (guards 1 & 2 above). ``--json`` is required: without
+    # it the CLI prints human text and the kill count below would always
+    # fall through to the assume-success branch.
     wl_result = run_cmd(
-        ["wl", "cleanup-worktree", abs_path],
+        ["wl", "cleanup-worktree", abs_path, "--json"],
+        cwd=_main_checkout_for(worktree_path),
+        start_new_session=True,
         check=False,
         timeout=30,
     )
@@ -2139,7 +2331,13 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
         result["method"] = "wl_cleanup_worktree"
         try:
             data = json.loads(wl_result.stdout.strip())
-            result["terminated"] = data.get("terminated", 0)
+            # cleanup-worktree.js reports the kill count as
+            # ``processesKilled`` (single path) / ``worktreesCleaned``
+            # (``--all``); tolerate the legacy ``terminated`` key.
+            result["terminated"] = data.get(
+                "processesKilled",
+                data.get("terminated", data.get("worktreesCleaned", 0)),
+            )
             result["warning"] = data.get("warning", "")
         except (json.JSONDecodeError, ValueError):
             result["terminated"] = 1  # Assume success if exit code is 0
@@ -2167,11 +2365,14 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
                 int(pid) for pid in pgrep_result.stdout.strip().split()
                 if pid.isdigit()
             ]
-            # Exclude the current process
-            current_pid = os.getpid()
-            for pid in pids:
-                if pid == current_pid:
-                    continue
+            # Guard 3: exclude the invoking process, its whole process group
+            # and its ancestor/descendant chain — not merely ``os.getpid()``
+            # (the wrapper shell the finish was launched from is frequently
+            # exec'd into the finish process itself).
+            targets = [
+                pid for pid in pids if not _pid_is_invoker_related(pid)
+            ]
+            for pid in targets:
                 try:
                     os.kill(pid, signal.SIGTERM)
                     result["terminated"] += 1
@@ -2183,9 +2384,7 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
                 time.sleep(2)
 
             # Force kill any remaining
-            for pid in pids:
-                if pid == current_pid:
-                    continue
+            for pid in targets:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except (OSError, PermissionError):
@@ -2641,6 +2840,46 @@ def _guarded_exit_code(guarded: dict[str, Any]) -> int:
     return 0 if guarded.get("success") else 1
 
 
+#: Bound for the output tail carried into implement.py's gate diagnostics
+#: (WL-0MVGUT787000LNDG): a failed suite can print megabytes; the operator
+#: message only ever sees this tail.
+GATE_OUTPUT_TAIL_CHARS = 1200
+
+
+def _tail_text(text: str | None, max_chars: int = GATE_OUTPUT_TAIL_CHARS) -> str:
+    """Return a bounded tail of *text* (last ``max_chars`` characters).
+
+    Empty/None input yields an empty string; short text is returned whole.
+    """
+    if not text:
+        return ""
+    text = text.rstrip()
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:].lstrip()
+
+
+def _guarded_output(guarded: dict[str, Any], key: str) -> str:
+    """Aggregate the *key* output of a guarded run.
+
+    Prefers the aggregate field (newer test skill); falls back to
+    concatenating the per-suite fields so a legacy ``run_all`` shape still
+    yields a diagnostic output tail (WL-0MVGUT787000LNDG).
+    """
+    direct = guarded.get(key)
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    parts: list[str] = []
+    suites = guarded.get("suites")
+    if isinstance(suites, dict):
+        for suite in suites.values():
+            if isinstance(suite, dict):
+                value = suite.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value)
+    return "\n".join(parts)
+
+
 def _adapt_guarded_result(
     guarded: dict[str, Any], tooling: str | None, scope: str
 ) -> dict[str, Any]:
@@ -2651,6 +2890,12 @@ def _adapt_guarded_result(
     of strings, an ``exit_code``, ``skipped`` and ``tooling``. The
     ``live_repo_mutation`` key (set by the canonical outer guard) is carried
     through so a mutated checkout always fails the gate.
+
+    The guarded run's diagnostics are carried through additive-only (never
+    dropped): ``notices``/``notice_codes`` (slot contention, command-not-found,
+    suite timeout) and bounded ``stdout``/``stderr`` tails, so ``phase_finish``
+    can explain WHY the gate failed instead of emitting an empty ``Failures:``
+    message (WL-0MVGUT787000LNDG).
     """
     failures: list[str] = []
     for failure in guarded.get("failures", []):
@@ -2658,13 +2903,25 @@ def _adapt_guarded_result(
             failures.append(str(failure.get("test_name") or failure))
         else:
             failures.append(str(failure))
+    notices = [
+        str(n).strip()
+        for n in guarded.get("notices", [])
+        if str(n).strip()
+    ]
+    notice_codes = [
+        str(c).strip()
+        for c in guarded.get("notice_codes", [])
+        if str(c).strip()
+    ]
     exit_code = _guarded_exit_code(guarded)
     result: dict[str, Any] = {
         "success": bool(guarded.get("success")) and exit_code == 0,
-        "stdout": "",
-        "stderr": "",
+        "stdout": _tail_text(_guarded_output(guarded, "stdout")),
+        "stderr": _tail_text(_guarded_output(guarded, "stderr")),
         "exit_code": exit_code,
         "failures": failures,
+        "notices": notices,
+        "notice_codes": notice_codes,
         "skipped": False,
         "tooling": tooling,
         "scope": guarded.get("scope", scope),
@@ -2674,6 +2931,114 @@ def _adapt_guarded_result(
         result["live_repo_mutation"] = mutation
         result["success"] = False
     return result
+
+
+#: Classification of a test-gate failure (WL-0MVGUT787000LNDG). ``phase_finish``
+#: must distinguish a retryable infrastructure condition (no free test slot)
+#: from a genuine code failure so the operator does not burn a blind retry.
+GATE_FAILURE_SLOT_CONTENTION = "slot_contention"
+GATE_FAILURE_INFRASTRUCTURE = "infrastructure"
+GATE_FAILURE_TESTS = "test_failure"
+GATE_FAILURE_UNKNOWN = "unknown"
+
+
+def _gate_failure_kind(test_result: dict[str, Any]) -> str:
+    """Classify why the test gate failed.
+
+    Genuine structured failures always win: a real test failure must never be
+    reported as (or fixed by retrying instead of fixing) an infrastructure
+    condition. Slot contention is identified by the stable ``notice_code``
+    first, with a narrow legacy fallback on the slot-busy notice prefix (only
+    used when there are no structured failures), matching the constraint in
+    WL-0MVGUT787000LNDG — never a generic substring match.
+    """
+    if test_result.get("failures"):
+        return GATE_FAILURE_TESTS
+    notice_codes = [str(c) for c in (test_result.get("notice_codes") or [])]
+    if _NOTICE_SLOT_BUSY in notice_codes:
+        return GATE_FAILURE_SLOT_CONTENTION
+    for notice in test_result.get("notices") or []:
+        if str(notice).startswith(_SLOT_BUSY_NOTICE_PREFIX):
+            return GATE_FAILURE_SLOT_CONTENTION
+    if test_result.get("live_repo_mutation"):
+        return GATE_FAILURE_INFRASTRUCTURE
+    if notice_codes or test_result.get("notices"):
+        return GATE_FAILURE_INFRASTRUCTURE
+    return GATE_FAILURE_UNKNOWN
+
+
+def _gate_failure_detail(test_result: dict[str, Any]) -> str:
+    """Render the root-cause detail for a failed test gate.
+
+    Never returns an empty string (WL-0MVGUT787000LNDG): structured failures
+    first, then runner notices (slot contention / command-not-found / suite
+    timeout), then the command output tail (unparsed vitest/node failures),
+    and finally an explicit "no diagnostics" message so the operator is never
+    shown a blank ``Failures:`` block.
+    """
+    failures = [str(f) for f in (test_result.get("failures") or [])]
+    if failures:
+        return "Failures:\n" + "\n".join(failures[:20])
+
+    sections: list[str] = []
+    notices = [
+        str(n).strip()
+        for n in (test_result.get("notices") or [])
+        if str(n).strip()
+    ]
+    if notices:
+        sections.append("Runner notices:\n" + "\n".join(notices))
+    mutation = test_result.get("live_repo_mutation")
+    if mutation:
+        sections.append(
+            "Live-repo mutation detected:\n" + _tail_text(str(mutation))
+        )
+    output_tail = _tail_text(test_result.get("stderr")) or _tail_text(
+        test_result.get("stdout")
+    )
+    if output_tail:
+        sections.append("Command output (tail):\n" + output_tail)
+    if not sections:
+        sections.append(
+            "The test gate failed but the runner reported no failures, "
+            "notices or command output. Check the test-runner logs."
+        )
+    return "No structured test failures were parsed.\n\n" + "\n\n".join(sections)
+
+
+def _gate_failure_message(
+    test_result: dict[str, Any],
+    attempt: int,
+    max_retry: int,
+    work_item_id: str,
+) -> str:
+    """Build the operator-facing message for a failed changed-scope run.
+
+    Distinguishes "no free test slot" (a retryable infrastructure condition,
+    with the longer-``TEST_LOCK_TIMEOUT`` remedy) from genuine test failures
+    (WL-0MVGUT787000LNDG) and always includes the root-cause detail.
+    """
+    kind = _gate_failure_kind(test_result)
+    detail = _gate_failure_detail(test_result)
+    if kind == GATE_FAILURE_SLOT_CONTENTION:
+        headline = (
+            f"Test run {attempt}/{max_retry} could not start: no free test "
+            "slot (infrastructure condition, not a code failure). Wait for a "
+            "slot to free up, then retry — or raise TEST_LOCK_TIMEOUT "
+            "(e.g. TEST_LOCK_TIMEOUT=1800) to wait longer."
+        )
+    elif kind == GATE_FAILURE_INFRASTRUCTURE:
+        headline = (
+            f"Test run {attempt}/{max_retry} failed for an infrastructure "
+            "reason (not a code failure)."
+        )
+    else:
+        headline = f"Test run {attempt}/{max_retry} failed."
+    return (
+        f"{headline}\n\n{detail}\n\n"
+        f"Please fix the failures and re-run:\n"
+        f"  python3 scripts/implement.py finish {work_item_id}"
+    )
 
 
 def _run_guarded_suite(
@@ -4016,11 +4381,14 @@ def phase_finish(
     4. Test (with fix-and-re-run loop)
     5. Commit
     6. Fast-forward dev in the main checkout (AC1 — context-budget fix)
-    7. Clean up worktree processes
-    8. Push to dev (rebase + retry on concurrent advance)
+    7. Push to dev (rebase + retry on concurrent advance)
+    8. Clean up worktree processes (post-push, before removal —
+       self-exclusion-safe, SA-0MVJC5KNT0044L2B)
     9. Remove worktree
     10. Sync local parent branch (post-push, AC1/AC2)
     11. Mark in_review
+    12. Read back the terminal status from the main-checkout store and
+        fail loudly if it did not stick (OSL-0MVME1PI5005WU58)
 
     All implementation work MUST be done inside the worktree created by
     ``phase_start``. If the current directory is outside the worktree and the
@@ -4159,15 +4527,19 @@ def phase_finish(
     while not test_result["success"] and test_attempts < max_retry:
         test_attempts += 1
         failures = test_result.get("failures", [])
-        failure_summary = "\n".join(failures[:20]) if failures else test_result["stderr"][:1000]
-
-        msg = (
-            f"Test run {test_attempts}/{max_retry} failed.\n"
-            f"Failures:\n{failure_summary}\n\n"
-            f"Please fix the failures and re-run:\n"
-            f"  python3 scripts/implement.py finish {work_item_id}"
+        failure_reason = _gate_failure_kind(test_result)
+        # The message always explains WHY the gate failed — slot contention
+        # and unparsed output included, never an empty `Failures:` block
+        # (WL-0MVGUT787000LNDG).
+        msg = _gate_failure_message(
+            test_result, test_attempts, max_retry, work_item_id
         )
-        LOG.warning("Test run %d/%d failed", test_attempts, max_retry)
+        LOG.warning(
+            "Test run %d/%d failed (%s)",
+            test_attempts,
+            max_retry,
+            failure_reason,
+        )
 
         if json_output:
             # Report current state and let the agent loop externally
@@ -4177,6 +4549,8 @@ def phase_finish(
                 "attempt": test_attempts,
                 "max_retry": max_retry,
                 "failures": failures,
+                "notices": list(test_result.get("notices") or []),
+                "reason": failure_reason,
             }
             print(format_json_output(report))
             return report
@@ -4186,9 +4560,8 @@ def phase_finish(
         print("=" * 60)
         print(f"  ⚠  Test run {test_attempts}/{max_retry} failed")
         print("=" * 60)
-        print("  Failures:")
-        for f in failures[:10]:
-            print(f"    • {f}")
+        for line in _gate_failure_detail(test_result).splitlines():
+            print(f"  {line}")
         print()
         print("  Fix the failures and press Enter to re-run tests.")
         print("  Type 'abort' to abort the finish phase, or 'skip' to skip tests.")
@@ -4232,7 +4605,11 @@ def phase_finish(
         })
 
     if not test_result["success"]:
-        msg = f"Tests failed after {max_retry} retries. Aborting finish phase."
+        msg = (
+            f"Tests failed after {max_retry} retries.\n\n"
+            f"{_gate_failure_detail(test_result)}\n\n"
+            "Aborting finish phase."
+        )
         report["success"] = False
         report["message"] = msg
         wl_add_comment(work_item_id, msg)
@@ -4339,13 +4716,6 @@ def phase_finish(
                     exc,
                 )
 
-            # ── Step 5b: Clean up worktree processes ───────────────────────
-            LOG.info("Cleaning up worktree processes...")
-            cleanup_result = cleanup_worktree_processes(worktree_path)
-            report["steps"]["cleanup"] = cleanup_result
-            if cleanup_result.get("warning"):
-                LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
-
             # ── Step 6: Push to dev ────────────────────────────────────────
             # The push runs *before* the worktree is removed: a
             # non-fast-forward recovery must rebase the feature branch where
@@ -4391,6 +4761,20 @@ def phase_finish(
             report["steps"]["push"] = {"success": True, "hash": commit_hash}
             LOG.info("Push to dev succeeded")
 
+            # ── Step 6b: Clean up worktree processes ───────────────────────
+            # Runs *after* the push (historically it ran before, at Step 5b):
+            # a cleanup that misbehaves can no longer pre-empt the push,
+            # which is the failure mode that stranded commits local-only
+            # (SA-0MVJC5KNT0044L2B). The cleanup still precedes the worktree
+            # removal so stray sessions holding cwd in the tree do not block
+            # ``git worktree remove``. cleanup_worktree_processes itself is
+            # additionally self-exclusion-safe (see its docstring).
+            LOG.info("Cleaning up worktree processes...")
+            cleanup_result = cleanup_worktree_processes(worktree_path)
+            report["steps"]["cleanup"] = cleanup_result
+            if cleanup_result.get("warning"):
+                LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
+
             # ── Step 7: Remove worktree ───────────────────────────────────
             # Only after a successful push — a failed push keeps the
             # worktree so the recovery rebase and manual recovery remain
@@ -4419,6 +4803,17 @@ def phase_finish(
                 LOG.info("Parent-branch sync: %s", sync_result["warning"])
 
             # StatusLifecycle.__exit__ sets status=completed, stage=in_review
+
+        # ── Step 8b: Terminal-status read-back assertion ──────────────
+        # (OSL-0MVME1PI5005WU58) The terminal write above must have stuck
+        # in the main-checkout store on BOTH the push-with-diff and the
+        # no-op-push path; a finish that reports success while the store is
+        # still non-terminal is a silent lifecycle lie (recorded on
+        # OSL-0MVMB44C9008IXZX). Runs only after the confirmed successful
+        # push (Step 6) — a genuine push failure can never reach here.
+        report["steps"]["status_readback"] = _assert_terminal_status(
+            work_item_id
+        )
 
     except RuntimeError as e:
         msg = str(e)
@@ -5176,6 +5571,13 @@ def _default_session_spawner(
     dispatch — see the inline comment below and
     ``docs/dev/implement-skill-reference.md``.
 
+    A ``timeout`` (or non-zero exit) result is **not** a verdict: the caller
+    (``phase_drive``) reconciles it against the child's actual work-item state
+    via :func:`_reconcile_spawn_failure`, because the child may have committed,
+    pushed and reached a terminal state before the session was killed
+    (SA-0MVHXWLPG007OQVN). This function deliberately reports only what
+    happened to the process.
+
     Args:
         child_id: The child work item ID.
         worktree_path: The child's pre-created worktree (process cwd).
@@ -5267,6 +5669,85 @@ def _default_session_spawner(
     return result
 
 
+def _reconcile_spawn_failure(
+    child_id: str,
+    spawn_result: dict[str, Any],
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    """Classify a failed child session against the child's current state.
+
+    A per-child session timeout (or non-zero exit) is a *bound*, not a
+    verdict: the child may already have committed, pushed and reached a
+    terminal work-item state before the session was killed. In the
+    ``WL-0MVGEB3IP002V8IB`` epic every child did exactly that, yet ``drive``
+    reported a hard failure and stopped the epic chain
+    (SA-0MVHXWLPG007OQVN).
+
+    This helper re-fetches the child (read-only ``wl show``) and classifies it
+    with :func:`_is_terminal_child`. It is called **only** on the spawn-failure
+    path (risk R1): a successful spawn never pays the extra fetch.
+
+    Terminal means status ``completed``/``done``/``in_review`` (or a
+    soft-deleted item) — see :data:`TERMINAL_STATUSES` — or a work item whose
+    stage is already ``in_review`` (the workflow sets both atomically, but a
+    stage-only terminal state is still terminal for reconciliation purposes).
+    A child that is still ``open``/``blocked``/``in_progress`` is **not**
+    terminal: the pre-existing hard-failure behaviour applies (risk R2).
+
+    Args:
+        child_id: The child work item ID whose session failed.
+        spawn_result: The spawner's result dict (``success``/``reason``).
+        timeout: The per-child session timeout in seconds (for the evidence).
+
+    Returns:
+        A dict with ``terminal`` (bool), ``status``, ``stage``, ``timed_out``
+        (bool), ``timeout_seconds`` (int | None), ``evidence`` (str) and
+        ``reason`` (str). ``status``/``stage`` are empty when the child could
+        not be fetched — callers must treat that as non-terminal (fail closed).
+    """
+    raw_reason = str(spawn_result.get("reason", "") or "")
+    timed_out = "timed out" in raw_reason.lower()
+    result: dict[str, Any] = {
+        "terminal": False,
+        "status": "",
+        "stage": "",
+        "timed_out": timed_out,
+        "timeout_seconds": timeout if timed_out else None,
+        "evidence": "",
+        "reason": raw_reason,
+    }
+
+    child = wl_show(child_id)
+    if not child:
+        # Fail closed: an unreadable child state is never a silent success.
+        LOG.warning(
+            "Could not re-fetch %s after a failed child session; keeping the "
+            "hard failure.",
+            child_id,
+        )
+        return result
+
+    status = str(child.get("status", "") or "")
+    stage = str(child.get("stage", "") or "")
+    result["status"] = status
+    result["stage"] = stage
+    result["terminal"] = _is_terminal_child(child) or stage == "in_review"
+    if not result["terminal"]:
+        return result
+
+    result["evidence"] = f"status={status}, stage={stage}"
+    result["reason"] = (
+        f"{raw_reason} Child reached a terminal state anyway "
+        f"({result['evidence']})."
+    )
+    LOG.info(
+        "Reconciled %s after a failed child session: terminal (%s).",
+        child_id,
+        result["evidence"],
+    )
+    return result
+
+
 def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     """Emit a drive report as JSON or a concise human summary."""
     if json_output:
@@ -5280,16 +5761,350 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         print(f"  ⚠  Drive stopped: {report.get('work_item_id')}")
     print("=" * 60)
     for entry in report.get("children_driven", []):
-        icon = "✅" if entry.get("result") == "ok" else "❌"
+        result = entry.get("result")
+        if result == "ok":
+            icon = "✅"
+        elif result == "completed-late":
+            # The session was killed at the per-child timeout but the child
+            # had already reached a terminal state: a distinct, non-failure
+            # verdict so a producer is never misled (SA-0MVLJWOJ8004ABBA).
+            icon = "🕓"
+        elif result == "finalised":
+            # A stranded child was finalised through the evidence-gated
+            # --finalise-stranded path (SA-0MVLJWTGP005XJPP).
+            icon = "🛠"
+        else:
+            icon = "❌"
         print(
             f"  {icon} {entry.get('id')} "
-            f"(attempt {entry.get('attempt')}): {entry.get('result')}"
+            f"(attempt {entry.get('attempt')}): {result}"
         )
+        evidence = _format_timeout_evidence(entry)
+        if evidence:
+            print(f"     {evidence}")
         if entry.get("reason"):
             print(f"     {entry['reason']}")
     print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
+    if report.get("completed_late"):
+        print(f"  Completed late: {report['completed_late']}")
+    if report.get("finalised_children"):
+        print(f"  Finalised stranded: {len(report['finalised_children'])}")
+    if report.get("stranded_children"):
+        print(f"  Stranded (needs finalising): {len(report['stranded_children'])}")
     print(f"  {report.get('message', '')}")
     print()
+
+
+def _format_timeout_evidence(entry: dict[str, Any]) -> str:
+    """Render the timeout/terminal evidence line for a drive report entry.
+
+    Only entries that carry the evidence fields (spawn-failure paths) produce
+    a line; successful entries render nothing extra.
+
+    Args:
+        entry: A ``children_driven`` entry.
+
+    Returns:
+        A human-readable evidence string, or an empty string.
+    """
+    if "timed_out" not in entry and "terminal" not in entry:
+        return ""
+    parts: list[str] = []
+    if entry.get("timed_out"):
+        seconds = entry.get("timeout_seconds")
+        parts.append(
+            f"timed out after {seconds}s" if seconds else "timed out"
+        )
+    if entry.get("terminal"):
+        status = entry.get("terminal_status") or "?"
+        stage = entry.get("terminal_stage") or "?"
+        parts.append(f"terminal (status={status}, stage={stage})")
+    else:
+        parts.append("child incomplete")
+    return "; ".join(parts)
+
+
+def _git_commit_evidence(
+    child_id: str,
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> str | None:
+    """Return the child's pushed commit hash on the parent branch, if any.
+
+    Read-only git evidence: the implement workflow commits carry the work-item
+    id, so a commit on ``origin/<parent_branch>`` whose message references the
+    child means its work was pushed. The remote-tracking ref is used as-is (no
+    network fetch) — a stale ref is acceptable evidence on the failure path,
+    and fetching would add network latency to an already-failing path.
+
+    Degrades gracefully: a missing/unreadable worktree, a git error, or a
+    repository without the remote-tracking ref returns ``None`` ("unknown")
+    without raising, so detection never crashes the drive loop and never
+    produces a false positive.
+
+    Args:
+        child_id: The child work-item id to look for.
+        worktree_path: The child's worktree (git is run with ``-C``).
+        parent_branch: Branch the work would have been pushed to (``dev``).
+
+    Returns:
+        The commit hash as a string, or ``None`` when no evidence is found.
+    """
+    if not worktree_path or not Path(worktree_path).exists():
+        return None
+    for ref in (f"origin/{parent_branch}", parent_branch):
+        try:
+            result = run_cmd(
+                [
+                    "git", "-C", str(worktree_path), "log", ref,
+                    "--grep", child_id, "-n", "1", "--format=%H",
+                ],
+                check=False,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            LOG.debug(
+                "Commit-evidence lookup for %s failed against %s: %s",
+                child_id, ref, exc,
+            )
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[0]
+    return None
+
+
+def _detect_stranded_child(
+    child_id: str,
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    commit_evidence: Callable[[str], str | None] | None = None,
+) -> dict[str, Any]:
+    """Detect a child whose work was pushed before its session was killed.
+
+    A stranded child is the ``WL-0MVGUA9EY003XFAD`` production shape: the
+    session pushed to ``dev`` but was killed before the final
+    ``StatusLifecycle`` terminal update, leaving the item ``in-progress`` and
+    blocking ``wl next``. Detection is **read-only** (no ``wl`` mutation, no
+    worktree mutation): it only looks for the child's commit on the parent
+    branch.
+
+    Args:
+        child_id: The child work-item id.
+        worktree_path: The child's worktree (for the git evidence).
+        parent_branch: Branch the work would have been pushed to.
+        commit_evidence: Injectable evidence provider (tests); defaults to
+            :func:`_git_commit_evidence`.
+
+    Returns:
+        A dict with ``stranded`` (bool), ``commit`` (str), ``evidence`` (str)
+        and ``reason`` (str). A provider failure degrades to ``stranded: False``
+        (unknown) — never a false positive, never a crash.
+    """
+    provider = commit_evidence or (
+        lambda cid: _git_commit_evidence(cid, worktree_path, parent_branch)
+    )
+    try:
+        commit = provider(child_id)
+    except Exception:
+        LOG.warning(
+            "Commit-evidence provider failed for %s; treating as unknown.",
+            child_id, exc_info=True,
+        )
+        commit = None
+
+    if not commit:
+        return {
+            "stranded": False,
+            "commit": "",
+            "evidence": "",
+            "reason": (
+                f"no commit referencing {child_id} found on {parent_branch}"
+            ),
+        }
+    commit = str(commit)
+    return {
+        "stranded": True,
+        "commit": commit,
+        "evidence": f"commit {commit} on {parent_branch}",
+        "reason": (
+            f"work item {child_id} is not terminal but commit {commit} is "
+            f"already on {parent_branch}"
+        ),
+    }
+
+
+def _worktree_has_uncommitted_changes(worktree_path: str) -> bool:
+    """Whether *worktree_path* holds uncommitted work (read-only check).
+
+    Used as a finalisation safety gate: a stranded child may only be
+    finalised automatically when its worktree holds no uncommitted work, so
+    automatic finalisation can never strand (or silently discard) work.
+
+    Fail-safe: an unreadable or missing worktree is treated as "has
+    changes" (unsafe) so the caller falls back to the read-only diagnostic.
+
+    Args:
+        worktree_path: Absolute path to the child's worktree.
+
+    Returns:
+        True when the worktree has uncommitted changes or cannot be read.
+    """
+    if not worktree_path:
+        return True
+    try:
+        result = run_cmd(
+            ["git", "-C", str(worktree_path), "status", "--porcelain"],
+            check=False,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        LOG.debug("Worktree status check failed for %s: %s", worktree_path, exc)
+        return True
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
+
+
+def _finalise_stranded_child(
+    child_id: str,
+    evidence: dict[str, Any],
+    assignee: str = "",
+) -> dict[str, Any]:
+    """Finalise a stranded child via the existing ``StatusLifecycle`` path.
+
+    Safety gates (all must hold — never finalise otherwise):
+
+    1. verified pushed-commit evidence (``evidence['stranded']``),
+    2. the child is currently ``in-progress`` (never touch another state),
+    3. the child is not claimed by another live agent (non-empty assignee
+       other than *assignee*).
+
+    The caller additionally checks the worktree holds no uncommitted work
+    (:func:`_worktree_has_uncommitted_changes`) before calling this.
+
+    The mutation goes through ``StatusLifecycle.update_status`` (the only
+    supported finalise path) and is recorded as a comment on the child, so
+    the automatic finalisation is auditable.
+
+    Args:
+        child_id: The stranded child work item id.
+        evidence: The :func:`_detect_stranded_child` result.
+        assignee: The driving agent's identity; an assignee mismatch means
+            another agent holds the item and finalisation is refused.
+
+    Returns:
+        A dict with ``finalised`` (bool), ``commit`` (str) and ``reason``
+        (str). A refused or failed finalisation returns ``finalised: False``
+        so the caller falls back to the read-only diagnostic.
+    """
+    if not evidence.get("stranded"):
+        return {
+            "finalised": False,
+            "commit": "",
+            "reason": "no verified pushed-commit evidence",
+        }
+    child = wl_show(child_id)
+    if not child:
+        return {
+            "finalised": False,
+            "commit": "",
+            "reason": "could not re-fetch the child work item",
+        }
+    status = str(child.get("status", "") or "")
+    if status not in ("in-progress", "in_progress"):
+        return {
+            "finalised": False,
+            "commit": "",
+            "reason": f"child is not in-progress (status={status!r})",
+        }
+    claimed_by = str(child.get("assignee", "") or "").strip()
+    if claimed_by and claimed_by != assignee:
+        return {
+            "finalised": False,
+            "commit": "",
+            "reason": f"child is claimed by {claimed_by!r}",
+        }
+
+    commit = str(evidence.get("commit", ""))
+    try:
+        StatusLifecycle.update_status(child_id, "completed", stage="in_review")
+    except RuntimeError as exc:
+        return {
+            "finalised": False,
+            "commit": commit,
+            "reason": f"status update failed: {exc}",
+        }
+
+    reason = (
+        f"Automatically finalised by `implement.py drive --finalise-stranded`: "
+        f"the child session failed after its work was pushed "
+        f"({evidence.get('evidence', commit)}), the item was still "
+        f"in-progress, and its worktree held no uncommitted work. "
+        f"Status set to completed / stage in_review."
+    )
+    wl_add_comment(child_id, reason)
+    LOG.info("Finalised stranded child %s (%s)", child_id, evidence.get(
+        "evidence", commit,
+    ))
+    return {"finalised": True, "commit": commit, "reason": reason}
+
+
+def _stranded_children_comment(
+    stranded: list[dict[str, Any]],
+    parent_branch: str,
+    finalised: list[dict[str, Any]] | None = None,
+) -> str:
+    """Build the one-per-drive worklog comment naming stranded children.
+
+    Args:
+        stranded: The ``stranded_children`` report entries.
+        parent_branch: Branch the work was pushed to.
+        finalised: Children automatically finalised in this drive invocation
+            (``--finalise-stranded``); recorded in the same audit comment.
+
+    Returns:
+        Comment text naming each stranded child and how to finalise it.
+    """
+    finalised = finalised or []
+    lines: list[str] = []
+    if stranded:
+        lines += [
+            f"Drive detected {len(stranded)} stranded child(ren): a session "
+            f"failed after the work was pushed to `{parent_branch}`, so the "
+            "item is still non-terminal and blocks `wl next`.",
+            "",
+        ]
+        for item in stranded:
+            lines.append(
+                f"- `{item.get('id')}` — status={item.get('status') or '?'}, "
+                f"stage={item.get('stage') or '?'}, {item.get('evidence', '')}"
+            )
+        lines += [
+            "",
+            "Finalise the item(s) once the pushed work is verified (or re-run "
+            "drive with `--finalise-stranded` to let it finalise evidence-gated "
+            "children automatically):",
+            "",
+        ]
+        for item in stranded:
+            lines.append(
+                f"  wl update {item.get('id')} --status completed --stage in_review"
+            )
+    if finalised:
+        if lines:
+            lines.append("")
+        lines.append(
+            f"Automatically finalised {len(finalised)} stranded child(ren) "
+            "(`--finalise-stranded`, evidence-gated: pushed commit verified, "
+            "item still in-progress, worktree clean):"
+        )
+        lines.append("")
+        for item in finalised:
+            lines.append(
+                f"- `{item.get('id')}` — completed/in_review, "
+                f"commit {item.get('commit') or '?'}"
+            )
+    return "\n".join(lines)
 
 
 def phase_drive(
@@ -5302,6 +6117,9 @@ def phase_drive(
     child_timeout: int | None = None,
     spawn_session: Callable[..., dict[str, Any]] | None = None,
     parent_runner: Callable[..., dict[str, Any] | None] | None = None,
+    commit_evidence: Callable[[str], str | None] | None = None,
+    finalise_stranded: bool = False,
+    finalise_child: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Phase: drive every child of a parent to a terminal state in one call.
 
@@ -5323,6 +6141,13 @@ def phase_drive(
     4. Repeat. A child is retried at most ``max_child_sessions`` times so a
        session that never reaches a terminal state cannot loop forever.
 
+    A per-child session timeout (or non-zero exit) is treated as a *bound*,
+    not a verdict: after a failed spawn the child is re-fetched and classified
+    with :func:`_reconcile_spawn_failure`. A child that already reached a
+    terminal state (``completed``/``done``/``in_review``) is recorded as
+    ``completed-late`` and the chain continues; a genuinely incomplete child
+    keeps the pre-existing hard failure (SA-0MVHXWLPG007OQVN).
+
     Args:
         work_item_id: The parent work item ID.
         json_output: If True, emit JSON.
@@ -5336,10 +6161,27 @@ def phase_drive(
             :func:`_default_session_spawner`.
         parent_runner: Injectable ``parent`` runner (tests); defaults to
             :func:`_invoke_implement`.
+        commit_evidence: Injectable pushed-commit evidence provider (tests)
+            used by stranded-child detection; defaults to
+            :func:`_git_commit_evidence`.
+        finalise_stranded: When True, a stranded child that passes every
+            safety gate (verified pushed commit, still in-progress, not
+            claimed by another agent, worktree clean) is finalised to
+            ``completed``/``in_review`` and the chain continues. Default
+            False — detection is read-only (SA-0MVLJWTGP005XJPP).
+        finalise_child: Injectable finalisation path (tests); defaults to
+            :func:`_finalise_stranded_child`.
 
     Returns:
-        Report dict with per-child results, sessions spawned, and whether the
-        parent was advanced.
+        Report dict with per-child results, sessions spawned, whether the
+        parent was advanced, and ``completed_late`` — the number of children
+        whose session timed out after they had already reached a terminal
+        state. Spawn-failure entries additionally carry ``timed_out``,
+        ``timeout_seconds``, ``terminal``, ``terminal_status`` and
+        ``terminal_stage`` so the two timeout outcomes are distinguishable
+        (SA-0MVLJWOJ8004ABBA). A non-terminal child whose work is already on
+        the parent branch additionally appears in ``stranded_children`` with
+        its pushed-commit evidence (SA-0MVLJWRVO000QQNP).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -5348,6 +6190,7 @@ def phase_drive(
         "parent_advanced": False,
         "sessions_spawned": 0,
         "children_driven": [],
+        "completed_late": 0,
         "message": "",
     }
 
@@ -5408,6 +6251,8 @@ def phase_drive(
 
     attempts: dict[str, int] = {}
     driven: list[dict[str, Any]] = []
+    stranded_comment_posted = False
+    finaliser = finalise_child or _finalise_stranded_child
     # Hard bound on the loop: each child may consume at most
     # max_child_sessions spawns plus one terminal classification, and the
     # final iteration advances the parent.
@@ -5430,6 +6275,13 @@ def phase_drive(
                 "message",
                 f"All children of {work_item_id} are terminal; parent advanced.",
             )
+            if report["completed_late"]:
+                report["message"] = (
+                    f"{report['message']} "
+                    f"{report['completed_late']} child(ren) completed late "
+                    f"(session timed out but the child had already reached a "
+                    f"terminal state)."
+                )
             break
 
         if parent_report.get("success") is False:
@@ -5490,6 +6342,115 @@ def phase_drive(
         driven.append(entry)
 
         if not spawn_result.get("success"):
+            # A failed spawn is a bound, not a verdict: reconcile against the
+            # child's actual work-item state (SA-0MVHXWLPG007OQVN). A child
+            # that committed, pushed and reached a terminal state before its
+            # session was killed is *completed late*, not failed.
+            reconciliation = _reconcile_spawn_failure(
+                child_id, spawn_result, timeout,
+            )
+            entry["timed_out"] = reconciliation["timed_out"]
+            entry["timeout_seconds"] = reconciliation["timeout_seconds"]
+            entry["terminal"] = reconciliation["terminal"]
+            entry["terminal_status"] = reconciliation["status"]
+            entry["terminal_stage"] = reconciliation["stage"]
+            entry["reason"] = reconciliation["reason"]
+            if reconciliation["terminal"]:
+                entry["result"] = "completed-late"
+                entry["reconciled"] = True
+                report["completed_late"] += 1
+                LOG.info(
+                    "Child %s completed late (%s); continuing the drive loop.",
+                    child_id, reconciliation["evidence"],
+                )
+                continue
+
+            # Not terminal: the hard failure stands. Before stopping the
+            # chain, check whether the child is *stranded* — its work is
+            # already on the parent branch but the item never reached a
+            # terminal state (SA-0MVLJWRVO000QQNP). Read-only: report + one
+            # parent comment, no status mutation.
+            stranded = _detect_stranded_child(
+                child_id, worktree_path, parent_branch,
+                commit_evidence=commit_evidence,
+            )
+            if stranded["stranded"]:
+                entry["stranded"] = True
+                entry["commit_evidence"] = stranded["commit"]
+                stranded_entry = {
+                    "id": child_id,
+                    "status": reconciliation["status"],
+                    "stage": reconciliation["stage"],
+                    "commit": stranded["commit"],
+                    "evidence": stranded["evidence"],
+                    "reason": stranded["reason"],
+                }
+
+                # Opt-in, evidence-gated finalisation. Read-only by default:
+                # without --finalise-stranded the item is only diagnosed.
+                if (
+                    finalise_stranded
+                    and not _worktree_has_uncommitted_changes(worktree_path)
+                ):
+                    outcome = finaliser(child_id, stranded)
+                    if outcome.get("finalised"):
+                        entry["result"] = "finalised"
+                        entry["finalised"] = True
+                        report.setdefault("finalised_children", []).append({
+                            "id": child_id,
+                            "status": "completed",
+                            "stage": "in_review",
+                            "commit": outcome.get("commit", stranded["commit"]),
+                            "reason": outcome.get("reason", ""),
+                        })
+                        if not stranded_comment_posted:
+                            wl_add_comment(
+                                work_item_id,
+                                _stranded_children_comment(
+                                    report.get("stranded_children", []),
+                                    parent_branch,
+                                    finalised=report["finalised_children"],
+                                ),
+                            )
+                            stranded_comment_posted = True
+                        LOG.info(
+                            "Finalised stranded child %s; continuing the "
+                            "drive loop.",
+                            child_id,
+                        )
+                        continue
+                    LOG.warning(
+                        "Refused to finalise stranded child %s: %s",
+                        child_id, outcome.get("reason", "unknown reason"),
+                    )
+                    stranded_entry["finalise_refused"] = outcome.get(
+                        "reason", "unknown reason",
+                    )
+
+                report.setdefault("stranded_children", []).append(
+                    stranded_entry,
+                )
+                if not stranded_comment_posted:
+                    wl_add_comment(
+                        work_item_id,
+                        _stranded_children_comment(
+                            report["stranded_children"], parent_branch,
+                        ),
+                    )
+                    stranded_comment_posted = True
+                LOG.warning(
+                    "Child %s is stranded: %s",
+                    child_id, stranded["reason"],
+                )
+                report["message"] = (
+                    f"Child session for {child_id} failed and the child is "
+                    f"stranded (not terminal, but {stranded['evidence']}); "
+                    f"finalise it or re-run drive with --finalise-stranded. "
+                    f"Reason: {spawn_result.get('reason', 'unknown error')}"
+                )
+                report["failed_child"] = child_id
+                break
+
             report["message"] = (
                 f"Child session for {child_id} failed: "
                 f"{spawn_result.get('reason', 'unknown error')}"
@@ -5828,6 +6789,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"(default: {DEFAULT_CHILD_SESSION_TIMEOUT})"
         ),
     )
+    parser.add_argument(
+        "--finalise-stranded",
+        action="store_true",
+        default=False,
+        help=(
+            "When driving an epic, finalise stranded children (work pushed "
+            "but item still in-progress) to completed/in_review once the "
+            "pushed commit is verified and the worktree is clean. Read-only "
+            "diagnosis remains the default."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -5924,6 +6896,7 @@ def _main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 max_child_sessions=args.max_child_sessions,
                 child_timeout=args.child_timeout,
+                finalise_stranded=args.finalise_stranded,
             )
             _emit_timing(_root_timer)
     else:

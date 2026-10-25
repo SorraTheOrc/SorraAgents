@@ -345,6 +345,144 @@ Some text but no bullets.
         acs = extract_acceptance_criteria(desc)
         assert acs == ["Bullet one", "Bullet two", "Bullet three"]
 
+    def test_numbered_acs_extracted(self):
+        """Ordered-list AC entries (``1. ``) are collected in order."""
+        desc = """## Acceptance Criteria
+
+1. The parser accepts numbered items
+2. The parser strips the number marker
+3. Order of appearance is preserved
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "The parser accepts numbered items",
+            "The parser strips the number marker",
+            "Order of appearance is preserved",
+        ]
+
+    def test_paren_numbered_acs_extracted(self):
+        """The ``1) `` ordered-list marker variant is accepted."""
+        desc = """## Acceptance Criteria
+1) First criterion
+2) Second criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["First criterion", "Second criterion"]
+
+    def test_bold_led_numbered_acs_keep_text_verbatim(self):
+        """Bold-led numbered items keep the text after the marker verbatim."""
+        desc = """## Acceptance Criteria
+
+1. **Parser.** Recognises numbered AC entries.
+2. **Order.** Preserves document order.
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "**Parser.** Recognises numbered AC entries.",
+            "**Order.** Preserves document order.",
+        ]
+
+    def test_mixed_bullets_and_numbers_preserve_document_order(self):
+        """Bullet and numbered entries interleave in document order, once each."""
+        desc = """## Acceptance Criteria
+- Bullet first
+1. Numbered second
++ Bullet third
+2) Numbered fourth
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Bullet first",
+            "Numbered second",
+            "Bullet third",
+            "Numbered fourth",
+        ]
+
+    def test_multi_digit_numbering(self):
+        """Multi-digit ordered-list numbers are handled."""
+        desc = """## Acceptance Criteria
+9. Ninth criterion
+10. Tenth criterion
+11. Eleventh criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Ninth criterion",
+            "Tenth criterion",
+            "Eleventh criterion",
+        ]
+
+    def test_numbered_items_outside_ac_section_are_ignored(self):
+        """Numbered items outside the AC section are not collected."""
+        desc = """# Feature
+
+1. Numbered step in the description
+
+## Acceptance Criteria
+1. Only this criterion
+
+## Constraints
+1. Not a criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["Only this criterion"]
+
+    def test_bullet_list_behaviour_unchanged(self):
+        """Regression: bullet-only sections extract exactly as before."""
+        desc = """## Acceptance Criteria
+- AC 1: The system shall do X
++ AC 2: The system shall do Y
+- AC 3: The system shall do Z
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "AC 1: The system shall do X",
+            "AC 2: The system shall do Y",
+            "AC 3: The system shall do Z",
+        ]
+
+    def test_nested_bullet_under_numbered_item_is_not_an_ac(self):
+        """A bullet indented under an ordered-list item is nested detail, not
+        a top-level AC."""
+        desc = """## Acceptance Criteria
+1. First criterion
+   - Nested detail for first
+2. Second criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["First criterion", "Second criterion"]
+
+    def test_nested_bullet_under_bullet_is_not_an_ac(self):
+        """A bullet indented under another bullet is a sub-list, not a
+        top-level AC."""
+        desc = """## Acceptance Criteria
+- First bullet
+  - Nested detail
+- Second bullet
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["First bullet", "Second bullet"]
+
+    def test_nested_numbered_item_under_numbered_is_not_an_ac(self):
+        """A numbered item indented under another AC is nested detail."""
+        desc = """## Acceptance Criteria
+1. First
+   1. Nested step
+2. Second
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["First", "Second"]
+
+    def test_indented_ac_section_still_extracts_top_level(self):
+        """ACs indented uniformly (e.g. wrapped in a list) still extract;
+        only deeper-indented markers are treated as nested."""
+        desc = """## Acceptance Criteria
+  - Indented bullet one
+  - Indented bullet two
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["Indented bullet one", "Indented bullet two"]
+
 
 # =========================================================================
 # 4. Coverage computation
@@ -686,6 +824,176 @@ class TestRunCoverageReview:
                 assert child["ac_count"] == 2
             elif child["id"] == "SA-03":
                 assert child["ac_count"] == 1
+
+    def test_numbered_and_bulleted_acs_produce_same_recommendation(self):
+        """Decision parity: the same ACs written as an ordered list or as
+        bullets yield an identical coverage recommendation."""
+
+        def _make_runner(parent_block: str, child_block: str):
+            def _runner(cmd):
+                if "--parent" in cmd:
+                    return _FakeResult(
+                        json.dumps(
+                            {
+                                "success": True,
+                                "children": [{"id": "SA-02", "title": "Child"}],
+                            }
+                        )
+                    )
+                if "dep" in cmd and "list" in cmd:
+                    return _FakeResult(
+                        json.dumps({"success": True, "dependencies": []})
+                    )
+                if "SA-01" in cmd:
+                    return _FakeResult(
+                        json.dumps(
+                            {
+                                "success": True,
+                                "workItem": {
+                                    "description": "## Acceptance Criteria\n"
+                                    + parent_block,
+                                },
+                            }
+                        )
+                    )
+                if "SA-02" in cmd:
+                    return _FakeResult(
+                        json.dumps(
+                            {
+                                "success": True,
+                                "workItem": {
+                                    "description": "## Acceptance Criteria\n"
+                                    + child_block,
+                                },
+                            }
+                        )
+                    )
+                return _FakeResult("{}")
+
+            return _runner
+
+        numbered = run_coverage_review(
+            "SA-01",
+            runner=_make_runner(
+                "1. System must encrypt all data\n",
+                "1. User can view profile\n",
+            ),
+        )
+        bulleted = run_coverage_review(
+            "SA-01",
+            runner=_make_runner(
+                "- System must encrypt all data\n",
+                "- User can view profile\n",
+            ),
+        )
+
+        assert numbered["parent_acs"] == bulleted["parent_acs"] == [
+            "System must encrypt all data"
+        ]
+        assert numbered["recommendation"] == bulleted["recommendation"]
+        assert numbered["recommendation"] == "stop"
+
+    def test_unparseable_ac_section_fails_closed(self):
+        """An AC section whose entries cannot be parsed must not produce a
+        vacuous 100% pass: the review stops with an explicit warning."""
+
+        def _custom_runner(cmd):
+            if "--parent" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "children": [{"id": "SA-02", "title": "Child"}],
+                        }
+                    )
+                )
+            if "dep" in cmd and "list" in cmd:
+                return _FakeResult(
+                    json.dumps({"success": True, "dependencies": []})
+                )
+            if "SA-01" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {
+                                "description": (
+                                    "## Acceptance Criteria\n"
+                                    "* star bullet one\n"
+                                    "* star bullet two\n"
+                                ),
+                            },
+                        }
+                    )
+                )
+            if "SA-02" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {
+                                "description": (
+                                    "## Acceptance Criteria\n"
+                                    "- Something else\n"
+                                ),
+                            },
+                        }
+                    )
+                )
+            return _FakeResult("{}")
+
+        result = run_coverage_review("SA-01", runner=_custom_runner)
+        assert result["parent_acs"] == []
+        assert result["recommendation"] == "stop"
+        assert result["coverage"]["fully_covered"] is False
+        assert result["warnings"]
+
+    def test_absent_ac_section_is_not_a_failure(self):
+        """No AC section at all keeps the existing proceed behaviour (only an
+        AC section that exists but cannot be parsed fails closed)."""
+
+        def _custom_runner(cmd):
+            if "--parent" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "children": [{"id": "SA-02", "title": "Child"}],
+                        }
+                    )
+                )
+            if "dep" in cmd and "list" in cmd:
+                return _FakeResult(
+                    json.dumps({"success": True, "dependencies": []})
+                )
+            if "SA-01" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {"description": "No ACs here."},
+                        }
+                    )
+                )
+            if "SA-02" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {
+                                "description": (
+                                    "## Acceptance Criteria\n"
+                                    "- Something\n"
+                                ),
+                            },
+                        }
+                    )
+                )
+            return _FakeResult("{}")
+
+        result = run_coverage_review("SA-01", runner=_custom_runner)
+        assert result["recommendation"] == "proceed"
+        assert result["warnings"] == []
 
 
 class TestExtractAcsFromItem:

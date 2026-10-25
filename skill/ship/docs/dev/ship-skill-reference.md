@@ -193,9 +193,13 @@ audit whose content is unchanged is treated as trustworthy (no re-audit): a
 passing verdict is fresh; a failing verdict is a current genuine failure and
 blocks immediately. Legacy (fingerprint-less) audits, content changes, and
 probe errors fall back to the time gate / re-audit path. The probe is only
-attempted when the stored report actually carries an
-`Audit content fingerprint:` line (`hasContentFingerprint()`), so fingerprint-less
-items never spawn the runner.
+attempted when the stored report actually carries the **versioned**
+`Audit content fingerprint (v2):` line — mirroring the runner's
+`AUDIT_CONTENT_FINGERPRINT_PREFIX` constant — (`hasContentFingerprint()`), so
+fingerprint-less items never spawn the runner. Legacy unversioned reports
+(`Audit content fingerprint: <hex>`) are deliberately **not** matched: their
+fingerprints were computed with superseded formulas and cannot be recomputed,
+so they fall back to the time gate exactly like fingerprint-less audits.
 
 ### Step 3.7: Final validation sweep (exit 12)
 
@@ -437,8 +441,23 @@ notification.
 Close-work-items tests must **never mutate the live worklog** (SA-0MSJ2XMQL006CVQS):
 
 - `closeWorkItemsAfterRelease` accepts injectable `getCandidateItemsFn` /
-  `runCloseCommand` / `getDescendantsFn` boundaries.
+  `runCloseCommand` / `getDescendantsFn` / `getCommentsFn` boundaries.
 - Tests inject fakes (or mock `wl`) and never call with the default boundary.
+
+**Idempotency (SA-0MUECDK14002J37J):** the close sweep is safe to re-run. An
+item whose comments already carry this version's `Shipped in v<version>` marker
+is skipped — never re-closed, never re-annotated — and reported in
+`alreadyShippedCount` / `alreadyShippedItems`. The marker match is
+version-exact (`v0.1.1` never matches a `v0.1.18` marker). Marker discovery goes
+through the injectable `getCommentsFn` boundary (default: a read-only
+`wl comment list <id> --json`); a throwing/unreadable boundary is fail-safe — it
+warns and leaves the existing close behaviour intact so a release is never
+blocked by the check. Additionally, `wl close --force` already annotates every
+descendant, so only the topmost closable item of a subtree issues a close
+command; its swept descendants are verified via `getCloseStateFn` but never
+re-closed. A single sweep therefore produces exactly one close comment per
+item (the 2026-10-09 incident produced 99 close comments for 74 items through
+both double annotation paths).
 
 **Candidate-set scoping (SA-0MU2OY1N9000XL2H AC9/AC10):** because `wl close
 --force` recursively closes ALL descendants, a candidate whose subtree
@@ -485,9 +504,41 @@ Verifying the full suite before promotion uses the test skill's cached runner
 | `refresh-audits.js` | Pre-flight-only audit refresh (`planAuditRefresh`, `refreshAudits`, `runRefreshAuditsAction`) for `--refresh-audits` |
 | `check-final-validation.js` | Final validation sweep (parent-coverage / out-of-scope aware, exit 12) |
 | `check-critical-items.js` | Critical item gating |
-| `check-worklog-refs.js` | Validate worklog references |
+| `check-worklog-refs.js` | Validate worklog references (JS gate used by `run-release.js`) |
+| `release/worklog-ref-gate.sh` | Shell worklog-ref gate used by `release/merge-dev-to-main.sh`; applies the identical content rule (see below) |
 | `discord-notify.js` | Post-release Discord notification |
 | `remediate-spurious-closes.js` | Idempotent close-comment remediation |
 | `timing.js` | Timer / timing utilities |
 
 All scripts are internal — the only user-facing action is `release`.
+
+### Worklog-ref gate (two entry points, one rule)
+
+The worklog-ref gate exists twice because it is applied at two different
+layers, but the **rule is identical** and must never diverge
+(SA-0MVO7XZAB0095R6F):
+
+| Layer | Implementation | Caller |
+|---|---|---|
+| Wrapper gate (exit 8) | `check-worklog-refs.js` | `run-release.js` Step 3.5 |
+| Merge-script gate (exit 1) | `release/worklog-ref-gate.sh` | `release/merge-dev-to-main.sh` |
+
+Both exclude (a) remote-tracking mirrors `refs/worklog/remotes/**` and (b) any
+`refs/worklog/*` ref whose commit contains the worklog data file
+`.worklog/worklog-data.jsonl` — `wl sync` bookkeeping such as
+`refs/worklog/data`, `refs/worklog/fetched-check` and
+`refs/worklog/tmp-reauthor`. Every remaining ref is a dangerous orphan and
+blocks the release; a ref whose data-file presence cannot be determined is
+treated as dangerous (fail closed).
+
+`worklog-ref-gate.sh [<repo-path>]` can be run standalone for diagnosis:
+exit 0 = clean, exit 1 = dangerous ref(s) printed to stderr, exit 2 = usage
+error / not a git repository. `tests/unit/test-worklog-ref-gate.mjs` asserts
+the behaviour of both entry points **and** their parity on the same throwaway
+repository.
+
+> **Historical bug (fixed):** the merge script previously inlined a
+> *name-based* check that only special-cased `refs/worklog/data`, so once
+> `wl sync` created `refs/worklog/fetched-check` / `tmp-reauthor` every release
+> aborted in the merge script immediately after the wrapper's worklog-ref gate
+> had passed. Do not re-inline a name-based check in the merge script.

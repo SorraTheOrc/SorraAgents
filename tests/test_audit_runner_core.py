@@ -954,8 +954,19 @@ class TestPiPromptSafetyInstructions:
         assert count >= 2, f"Expected at least 2 [READ-ONLY AUDIT] occurrences, found {count}"
 
     def test_child_ac_prompt_has_structured_array_instruction(self):
-        """Child AC review prompt must instruct to return structured JSON array."""
-        assert "Return ONLY a structured JSON array" in self.SOURCE
+        """Child AC review prompt must instruct to return a strict JSON array.
+
+        SA-0MVI6VNDF001VE1S replaced the weaker "Return ONLY a structured
+        JSON array" line with the strict JSON contract (no prose, no Markdown
+        fences, no trailing commas), carried on the first call as well as the
+        re-ask. The assertion pins the contract and its schema instead of the
+        old phrasing.
+        """
+        assert "_JSON_CONTRACT_INSTRUCTION" in self.SOURCE
+        assert "Return ONLY a single valid JSON array" in self.SOURCE
+        assert "no Markdown code fences" in self.SOURCE
+        assert "trailing comma" in self.SOURCE
+        assert "one of met, unmet, partial, adjusted" in self.SOURCE
 
     def test_prompt_has_adjusted_verdict_option(self):
         """Both parent and child prompts must include 'adjusted' as a valid verdict."""

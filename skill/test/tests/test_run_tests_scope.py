@@ -38,6 +38,7 @@ from run_tests import (
     map_changed_to_tests,
     run_all,
     run_suite,
+    run_summary,
 )
 from shared.git_sandbox import commit_all, init_repo, run_git
 
@@ -424,6 +425,217 @@ class TestPerSuiteChangedScope:
             result = run_suite("pytest", cwd=repo, use_cache=True, force=True, scope="changed", base_ref="dev")
         assert cached["scope"] == "changed"
         assert result["scope"] == "changed"
+
+
+# Pinned pytest command used by the explicit-suite fallback regression tests.
+_PINNED_PYTEST_COMMANDS: list[str] = [
+    "python3 -m pytest -q -r a --disable-warnings",
+]
+# The pinned flags, without the interpreter prefix: ``_run_cmd`` receives argv
+# after ``executable_test_command()`` resolves the pytest executable prefix to
+# an absolute interpreter path (SA-0MVK154IE007OS3D), so tests compare the flag
+# suffix — the part that distinguishes the pin (``-m pytest``) from the legacy
+# bare ``pytest`` token.
+_PINNED_PYTEST_FLAGS = "-m pytest -q -r a --disable-warnings"
+
+
+def _assert_pinned_pytest_only(captured: list[str]) -> None:
+    """Assert exactly one executed command, and that it is the pinned form."""
+    assert len(captured) == 1, captured
+    assert captured[0].endswith(_PINNED_PYTEST_FLAGS), captured
+    # Never the legacy bare ``pytest`` token (the bug being fixed).
+    assert not captured[0].startswith("pytest "), captured
+
+
+class TestExplicitSuiteFallbackHonoursPins:
+    """Changed-scope fallback for an explicit suite honours pinned suiteCommands.
+
+    Regression tests for the cross-repo interpreter-pin bug
+    (OSL-0MVNWYRQB0095WXQ / SA-0MVO0EB1U007L7DS): when changed-scope
+    selection falls back to full scope for an explicit suite name, the
+    fallback must resolve through ``full_suite_commands(cwd)`` filtered by
+    suite name — never the legacy bare ``pytest`` token — so a repo's pinned
+    ``suiteCommands`` (custom interpreter) are honoured for every suite name.
+    """
+
+    @staticmethod
+    def _pin_repo_with_change(tmp_path: Path, suite_commands: list[str]) -> Path:
+        """A hermetic repo on ``dev`` with a ``.pi/test-config.json`` pin and a
+        subsequent change (so changed scope has something to fall back from)."""
+        repo = tmp_path / "pinned_repo"
+        repo.mkdir()
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": suite_commands}), encoding="utf-8"
+        )
+        (repo / "tests").mkdir()
+        (repo / "src").mkdir()
+        (repo / "pytest.ini").write_text("[pytest]\n")
+        (repo / "tests" / "test_foo.py").write_text("def test_foo(): pass\n")
+        _init_repo_with_dev(repo, message="init")
+        (repo / "src" / "foo.py").write_text("CHANGED\n")
+        return repo
+
+    def test_changed_scope_fallback_pytest_uses_pinned_command(self, tmp_path: Path) -> None:
+        """AC1/AC2: --suite pytest --scope changed runs the pinned command, never
+        the bare ``pytest`` token; the result still reports scope "full"."""
+        from types import SimpleNamespace
+
+        repo = self._pin_repo_with_change(tmp_path, _PINNED_PYTEST_COMMANDS)
+
+        captured: list[str] = []
+
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "pytest", cwd=repo, scope="changed", base_ref="dev",
+            )
+
+        # Fallback reports full scope, as before.
+        assert result["scope"] == "full"
+        # The pinned form runs — never the legacy bare ``pytest`` token.
+        _assert_pinned_pytest_only(captured)
+
+    def test_changed_scope_fallback_multi_command_pin_maps_suites(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC5: a multi-command pin maps each command to its own suite name."""
+        from types import SimpleNamespace
+
+        pin = [
+            "python3 -m pytest -q -r a --disable-warnings",
+            'node --test "tests/node/**/*.mjs"',
+        ]
+        repo = tmp_path / "multi_repo"
+        repo.mkdir()
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": pin}), encoding="utf-8"
+        )
+        (repo / "tests").mkdir()
+        (repo / "src").mkdir()
+        (repo / "pytest.ini").write_text("[pytest]\n")
+        (repo / "tests" / "test_foo.py").write_text("def test_foo(): pass\n")
+        (repo / "tests" / "node").mkdir()
+        (repo / "tests" / "node" / "utils.test.mjs").write_text("import test from \"node:test\";\n")
+        _init_repo_with_dev(repo, message="init")
+        (repo / "src" / "foo.py").write_text("CHANGED\n")
+
+        captured: list[str] = []
+
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            pytest_result = run_suite(
+                "pytest", cwd=repo, scope="changed", base_ref="dev",
+            )
+            pytest_captured = list(captured)
+            captured.clear()
+            node_result = run_suite(
+                "node", cwd=repo, scope="changed", base_ref="dev",
+            )
+
+        assert pytest_result["scope"] == "full"
+        assert node_result["scope"] == "full"
+        # Each suite name is mapped to its own pinned command. The node pin is
+        # compared on its parts (shlex re-joins argv, dropping the quotes).
+        _assert_pinned_pytest_only(pytest_captured)
+        assert len(captured) == 1, captured
+        assert captured[0].startswith("node --test "), captured
+        assert "tests/node/**/*.mjs" in captured[0], captured
+        # The pytest run filtered out the node pin (and vice versa).
+        assert not any("node --test" in c for c in pytest_captured)
+        assert not any("pytest" in c for c in captured)
+
+    def test_changed_scope_fallback_all_uses_pinned_commands(
+        self, tmp_path: Path,
+    ) -> None:
+        """--suite all --scope changed keeps resolving the full pinned set."""
+        from types import SimpleNamespace
+
+        repo = self._pin_repo_with_change(tmp_path, _PINNED_PYTEST_COMMANDS)
+
+        captured: list[str] = []
+
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "all", cwd=repo, scope="changed", base_ref="dev",
+            )
+
+        assert result["scope"] == "full"
+        _assert_pinned_pytest_only(captured)
+
+    def test_changed_scope_fallback_empty_filtered_pin_raises(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC7/AC6: a pin with no matching command raises the known-suite-style
+        error instead of silently running nothing."""
+        repo = self._pin_repo_with_change(
+            tmp_path, ['node --test "tests/node/**/*.mjs"'],
+        )
+
+        with pytest.raises(ValueError) as excinfo, \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            run_suite("pytest", cwd=repo, scope="changed", base_ref="dev")
+        assert "unknown suite: pytest" in str(excinfo.value)
+
+    def test_run_summary_looks_up_pinned_command(self, tmp_path: Path) -> None:
+        """AC3: read-only run_summary resolves the pinned command, so a cache
+        summary of --suite pytest finds the pinned entry."""
+        repo = self._pin_repo_with_change(tmp_path, _PINNED_PYTEST_COMMANDS)
+
+        looked_up: list[str] = []
+
+        def fake_query(cmd, **kwargs):
+            looked_up.append(cmd)
+            return {
+                "stdout": "passed",
+                "stderr": "",
+                "scope": "full",
+                "test_type": "full",
+                "interpreter": "python3 -m pytest",
+            }
+
+        with mock.patch.object(run_tests, "query_cached", side_effect=fake_query):
+            summary = run_summary(("pytest",), cwd=repo)
+
+        # The pinned command is what gets looked up (never the bare token).
+        assert looked_up == ["python3 -m pytest -q -r a --disable-warnings"]
+        assert summary["success"] is True
+        assert "pytest" not in summary["missing"]
+
+    def test_run_summary_reports_miss_when_pin_has_no_matching_command(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC3/AC6: a non-matching pin is a reported miss, never an empty
+        success (nothing looked up, nothing claimed green)."""
+        repo = self._pin_repo_with_change(
+            tmp_path, ['node --test "tests/node/**/*.mjs"'],
+        )
+
+        looked_up: list[str] = []
+
+        def fake_query(cmd, **kwargs):
+            looked_up.append(cmd)
+
+        with mock.patch.object(run_tests, "query_cached", side_effect=fake_query):
+            summary = run_summary(("pytest",), cwd=repo)
+
+        assert looked_up == []
+        assert summary["success"] is False
+        assert summary["missing"] == ["pytest"]
 
 
 class TestScopePropagated:

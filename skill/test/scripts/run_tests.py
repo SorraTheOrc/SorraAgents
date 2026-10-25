@@ -74,7 +74,7 @@ Exit codes:
   0 - all suites passed
   1 - at least one test failed (or --summary cache miss)
   2 - runner error (missing suite binary etc.)
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 
@@ -121,8 +121,10 @@ from test_cache import (
 from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
+    is_pytest_command,
     log_repository_override_scrub,
     repository_override_vars_present,
+    resolve_pytest_executable,
     subprocess_env_with_scrubbed_overrides,
 )
 
@@ -133,8 +135,10 @@ CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
 
 # Canonical pytest command (stable form for cache keying and cross-consumer
 # reuse). The executable is resolved at run time via executable_test_command
-# so a shell without ~/.local/bin on PATH still runs the suite
-# (SA-0MSQ012QG005N22S).
+# to the first probed candidate that can run pytest — the runner's own
+# interpreter (``sys.executable -m pytest``) when it can, so a PATH ``pytest``
+# bound to a foreign interpreter cannot shadow it (SA-0MVK154IE007OS3D); the
+# resolved interpreter is recorded in the run output and cache metadata.
 PYTEST_CMD = canonicalize_quiet_test_command("pytest")
 NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
 
@@ -154,6 +158,42 @@ TEST_LOCK_TIMEOUT_DEFAULT = 600.0
 #: the pool in lockstep (the thundering-herd wave). 0.0 disables the stagger.
 TEST_LOCK_JITTER_ENV = "TEST_LOCK_JITTER"
 TEST_LOCK_JITTER_DEFAULT = 0.1
+
+#: Stable, machine-readable notice codes carried on a suite result that fails
+#: WITHOUT structured test failures (WL-0MVGUT787000LNDG): no free test slot,
+#: command-not-found, suite timeout. Consumers (e.g. ``implement.py``'s finish
+#: gate) classify on the code — never on the human-readable notice text — so
+#: rewording a notice can never silently reclassify a genuine test failure as
+#: an infrastructure condition.
+NOTICE_SLOT_BUSY = "slot_busy"
+NOTICE_COMMAND_NOT_FOUND = "command_not_found"
+NOTICE_SUITE_TIMEOUT = "suite_timeout"
+
+#: Prefix of the no-free-slot notice produced by :func:`_test_concurrency_slot`.
+#: Exposed as a stable constant so a consumer handling a legacy result that
+#: predates ``notice_code`` can classify slot contention without duplicating
+#: the wording (WL-0MVGUT787000LNDG).
+SLOT_BUSY_NOTICE_PREFIX = "test concurrency slot busy:"
+
+#: Bound for the stdout/stderr tail carried on a suite result
+#: (WL-0MVGUT787000LNDG): large enough to include a stack trace, small enough
+#: that JSON reports stay readable. ``implement.py`` re-tails the aggregate to
+#: its own smaller bound for the operator message.
+NOTICE_OUTPUT_TAIL_CHARS = 4000
+
+
+def _output_tail(text: str | None, limit: int = NOTICE_OUTPUT_TAIL_CHARS) -> str:
+    """Return a bounded tail of *text* — the last ``limit`` characters.
+
+    Empty/None input yields an empty string; short text is returned whole.
+    """
+    if not text:
+        return ""
+    text = text.rstrip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
 
 #: Per-suite vitest/tinypool worker-pool bound (SA-0MVE98T1M006A17T): the
 #: complement to the host-wide suite ceiling. A single vitest suite normally
@@ -1464,7 +1504,7 @@ def _test_concurrency_slot() -> Iterator[None]:
             yield
     except TimeoutError as exc:
         raise TestConcurrencyTimeout(
-            f"test concurrency slot busy: no free slot within "
+            f"{SLOT_BUSY_NOTICE_PREFIX} no free slot within "
             f"{lock_timeout:.0f}s (TEST_MAX_CONCURRENCY={max_workers}) "
             f"— wait a staggered delay before retrying (do not re-run "
             f"immediately; concurrent waiters re-enter the pool in lockstep "
@@ -1524,9 +1564,10 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
     quotes — otherwise node matches zero files and the suite trivially
     "passes" with 0 tests (pre-existing bug fixed with SA-0MSGN5OJ4002OZKY).
 
-    The pytest executable is resolved before spawning so a shell without
-    ``~/.local/bin`` on PATH still runs the suite (SA-0MSQ012QG005N22S);
-    the canonical command (cache key) is unchanged.
+    The pytest executable is resolved before spawning so the suite runs under
+    the runner's interpreter (or the first probed candidate that can run
+    pytest) instead of a PATH ``pytest`` bound to a foreign interpreter
+    (SA-0MVK154IE007OS3D); the canonical command (cache key) is unchanged.
     """
     executable = executable_test_command(command)
     with _test_concurrency_slot():
@@ -1615,7 +1656,12 @@ def run_suite(
     cannot produce a subset for this suite (custom suite commands, no
     selection, no applicable commands), it falls back to the full suite and
     reports ``scope: "full"`` in the result so consumers never mistake a
-    partial run for a full one. The result always carries ``scope``
+    partial run for a full one. The fallback resolves through
+    ``full_suite_commands(cwd)`` filtered by suite name, so a repo's pinned
+    ``suiteCommands`` (custom interpreter) are honoured for every suite name
+    (OSL-0MVNWYRQB0095WXQ); when the pinned set defines no command for the
+    suite, it raises the unknown-suite-style error. The result always carries
+    ``scope``
     ("full"|"changed") and, for changed scope, ``changed_files`` (the file
     set that drove selection). The scope is recorded in the per-repo test
     cache metadata (``run_cached(scope=...)``) so read-only consumers can
@@ -1634,7 +1680,9 @@ def run_suite(
     (SA-0MUJKF2HP001BR51).
 
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
-    ``cached``, ``scope``, ``type`` and (on missing binary) ``notice``.
+    ``cached``, ``scope``, ``type``; on a failure WITHOUT structured failures a
+    ``notice`` (human-readable) plus a stable ``notice_code`` and bounded
+    ``stdout``/``stderr`` tails (WL-0MVGUT787000LNDG).
     """
     cwd = cwd or REPO_ROOT
     resolvable_scope = "full"
@@ -1671,15 +1719,37 @@ def run_suite(
             # Full scope (including changed-scope fallback — report "full" so
             # consumers never treat a partial selection as complete).
             if test_type == DEFAULT_TEST_TYPE:
-                # Legacy name-based resolution (AC5, unchanged for full runs).
-                if name == "pytest":
-                    commands = [pytest_command()]
-                elif name == "node":
-                    commands = node_suite_commands(cwd)
-                elif name == "all":
-                    commands = full_suite_commands(cwd)
-                else:
-                    raise ValueError(f"unknown suite: {name}")
+                if scope == "changed":
+                    # Changed-scope fallback: resolve through
+                    # ``full_suite_commands()`` — the single source of truth
+                    # (F2 AC4) — so a repo's pinned suiteCommands (custom
+                    # interpreter) are honoured for every suite name (the
+                    # fallback never silently swaps to the legacy bare
+                    # ``pytest`` token and a different interpreter,
+                    # OSL-0MVNWYRQB0095WXQ). A pinned/conventional suite
+                    # that defines no matching command raises the
+                    # unknown-suite-style error instead of silently running
+                    # nothing. Tool-less repos (empty full set) keep the
+                    # legacy resolution so full-scope behaviour is unchanged.
+                    full = full_suite_commands(cwd)
+                    if full:
+                        commands = filter_commands_for_suite(name, full)
+                        if not commands:
+                            raise ValueError(
+                                f"unknown suite: {name} — the repo's suite "
+                                "commands define no matching command"
+                            )
+                if commands is None:
+                    # Legacy name-based resolution (AC5; unchanged for direct
+                    # full-scope runs).
+                    if name == "pytest":
+                        commands = [pytest_command()]
+                    elif name == "node":
+                        commands = node_suite_commands(cwd)
+                    elif name == "all":
+                        commands = full_suite_commands(cwd)
+                    else:
+                        raise ValueError(f"unknown suite: {name}")
             else:
                 type_cmds = resolve_type_commands(cwd, test_type)
                 commands = filter_commands_for_suite(name, type_cmds)
@@ -1701,6 +1771,9 @@ def run_suite(
     all_failures: list[dict[str, str]] = []
     overall_returncode = 0
     cached_flags: list[bool] = []
+    interpreters: set[str] = set()
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
     for cmd in commands:
         try:
             if use_cache:
@@ -1719,6 +1792,8 @@ def run_suite(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
                 )
                 cached_flags.append(run["cached"])
+                if run.get("interpreter"):
+                    interpreters.add(run["interpreter"])
             else:
                 with _test_concurrency_slot():
                     proc = _run_cmd(
@@ -1727,6 +1802,8 @@ def run_suite(
                         timeout=timeout,
                     )
                 cached_flags.append(False)
+                if is_pytest_command(cmd):
+                    interpreters.add(resolve_pytest_executable())
         except FileNotFoundError as exc:
             return {
                 "success": False,
@@ -1734,8 +1811,14 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"command not found: {exc.filename}",
+                "notice_code": NOTICE_COMMAND_NOT_FOUND,
+                "stdout": _output_tail("\n".join(stdout_parts)),
+                "stderr": _output_tail("\n".join(stderr_parts)),
                 "scope": resolvable_scope,
                 "type": test_type,
+                "interpreter": (
+                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
+                ),
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
         except subprocess.TimeoutExpired:
@@ -1745,8 +1828,14 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": f"suite timed out after {timeout}s: {name}",
+                "notice_code": NOTICE_SUITE_TIMEOUT,
+                "stdout": _output_tail("\n".join(stdout_parts)),
+                "stderr": _output_tail("\n".join(stderr_parts)),
                 "scope": resolvable_scope,
                 "type": test_type,
+                "interpreter": (
+                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
+                ),
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
         except TestConcurrencyTimeout as exc:
@@ -1759,12 +1848,20 @@ def run_suite(
                 "command": command,
                 "failures": [],
                 "notice": str(exc),
+                "notice_code": NOTICE_SLOT_BUSY,
+                "stdout": _output_tail("\n".join(stdout_parts)),
+                "stderr": _output_tail("\n".join(stderr_parts)),
                 "scope": resolvable_scope,
                 "type": test_type,
+                "interpreter": (
+                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
+                ),
                 "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
             }
 
         output = f"{proc.stdout}\n{proc.stderr}"
+        stdout_parts.append(proc.stdout or "")
+        stderr_parts.append(proc.stderr or "")
         if "pytest" in cmd:
             failures = parse_pytest_failures(output)
         else:
@@ -1781,8 +1878,12 @@ def run_suite(
         "cached": use_cache and all(cached_flags) if cached_flags else False,
         "scope": resolvable_scope,
         "type": test_type,
+        "interpreter": "mixed" if len(interpreters) > 1 else next(iter(interpreters), ""),
         "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
         "notice": "",
+        "notice_code": "",
+        "stdout": _output_tail("\n".join(stdout_parts)),
+        "stderr": _output_tail("\n".join(stderr_parts)),
     }
 
 
@@ -1821,6 +1922,9 @@ def run_all(
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
     notices: list[str] = []
+    notice_codes: list[str] = []
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
     resolved_scopes: list[str] = []
     with Timer("run_all") as _all_timer:
         for name in suites:
@@ -1844,11 +1948,20 @@ def run_all(
                 all_failures.append({**failure, "suite": name})
             if result.get("notice"):
                 notices.append(result["notice"])
+            if result.get("notice_code"):
+                notice_codes.append(result["notice_code"])
+            if result.get("stdout"):
+                stdout_parts.append(result["stdout"])
+            if result.get("stderr"):
+                stderr_parts.append(result["stderr"])
     return {
         "success": all(r["success"] for r in results.values()),
         "suites": results,
         "failures": all_failures,
         "notices": notices,
+        "notice_codes": notice_codes,
+        "stdout": "\n".join(stdout_parts),
+        "stderr": "\n".join(stderr_parts),
         "scope": scope,
         "type": test_type,
         "resolved_scopes": resolved_scopes,
@@ -2027,19 +2140,25 @@ def run_summary(
     ``lines`` per suite, ``scopes`` (the recorded scope of the cached entry
     per suite — ``"full"``, ``"changed"``, or ``"mixed"`` when the suite's
     commands resolve to entries with different scopes), ``types`` (the
-    recorded test type per suite, same ``"mixed"``/``"missing"`` rules) and
-    ``missing`` (list of suite names). A ``changed``-scope summary is NOT
+    recorded test type per suite, same ``"mixed"``/``"missing"`` rules),
+    ``interpreters`` (the recorded pytest interpreter/executable per suite,
+    empty when unknown) and ``missing`` (list of suite names). A ``changed``-scope summary is NOT
     full-suite verification — consumers must treat it as partial evidence
-    (the audit skill rejects changed-scope entries for full-suite ACs). The
-    ``"all"`` suite resolves commands via ``full_suite_commands(cwd)`` — the
-    single source of truth (F2 AC4) — unless an explicit typed *commands*
-    profile is supplied.
+    (the audit skill rejects changed-scope entries for full-suite ACs).
+    Every suite resolves commands via ``full_suite_commands(cwd)`` filtered by
+    suite name — the single source of truth (F2 AC4) — unless an explicit
+    typed *commands* profile is supplied, so a repo's pinned suiteCommands
+    (custom interpreter) are honoured for read-only summaries of every suite
+    name (OSL-0MVNWYRQB0095WXQ). A suite with no matching command in a
+    non-empty suite-command set is reported as a miss; a tool-less repo (empty
+    full set) keeps the legacy name-based resolution.
     """
     cwd = cwd or REPO_ROOT
     result: dict[str, Any] = {
         "lines": {},
         "scopes": {},
         "types": {},
+        "interpreters": {},
         "missing": [],
         "success": True,
     }
@@ -2048,15 +2167,33 @@ def run_summary(
             suite_commands = group_commands(group, cwd) or full_suite_commands(cwd)
         elif commands is not None:
             suite_commands = filter_commands_for_suite(name, commands)
-        elif name == "pytest":
-            suite_commands = [pytest_command()]
-        elif name == "node":
-            suite_commands = node_suite_commands(cwd)
         else:
-            suite_commands = full_suite_commands(cwd)
+            # Resolve through ``full_suite_commands()`` — the single source of
+            # truth (F2 AC4) — so a repo's pinned suiteCommands are honoured
+            # for read-only cache summaries of every suite name
+            # (OSL-0MVNWYRQB0095WXQ): ``--suite pytest`` in a pinned repo must
+            # look up the pinned command, never the legacy bare ``pytest``
+            # token. When the repo declares suite commands but none match
+            # this suite, report a clear miss instead of silently succeeding
+            # with nothing to look up. A tool-less repo (empty full set) keeps
+            # the legacy name-based resolution unchanged.
+            full = full_suite_commands(cwd)
+            if full:
+                suite_commands = filter_commands_for_suite(name, full)
+                if not suite_commands:
+                    result["missing"].append(name)
+                    result["success"] = False
+                    continue
+            elif name == "pytest":
+                suite_commands = [pytest_command()]
+            elif name == "node":
+                suite_commands = node_suite_commands(cwd)
+            else:
+                suite_commands = full
         lines: list[str] = []
         scopes: set[str] = set()
         types: set[str] = set()
+        interpreters: set[str] = set()
         for cmd in suite_commands:
             entry = query_cached(
                 cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS, test_type=test_type
@@ -2068,9 +2205,14 @@ def run_summary(
             lines.extend(summary_lines(entry["stdout"], entry["stderr"], pattern=pattern))
             scopes.add(entry.get("scope", "full"))
             types.add(entry.get("test_type", "full"))
+            if entry.get("interpreter"):
+                interpreters.add(entry["interpreter"])
         result["lines"][name] = lines
         result["scopes"][name] = "mixed" if len(scopes) > 1 else (next(iter(scopes)) if scopes else "missing")
         result["types"][name] = "mixed" if len(types) > 1 else (next(iter(types)) if types else "missing")
+        result["interpreters"][name] = (
+            "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
+        )
     return result
 
 
@@ -2335,7 +2477,14 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         scope = summary["scopes"].get(name, "full")
                         recorded_type = summary["types"].get(name, test_type)
-                        print(f"{name} summary ({scope} scope, type={recorded_type}):")
+                        interpreter = summary["interpreters"].get(name, "")
+                        interpreter_info = (
+                            f", pytest interpreter: {interpreter}" if interpreter else ""
+                        )
+                        print(
+                            f"{name} summary ({scope} scope, "
+                            f"type={recorded_type}{interpreter_info}):"
+                        )
                         for line in lines:
                             print(f"  {line}")
                 print(_root_timer.render(), file=sys.stderr)
@@ -2375,7 +2524,12 @@ def main(argv: list[str] | None = None) -> int:
                 cached = " [cached]" if suite_result.get("cached") else ""
                 scope = f" [{suite_result.get('scope', 'full')} scope]"
                 type_info = f" [type {suite_result.get('type', test_type)}]"
-                print(f"{name}: {status}{cached}{scope}{type_info} ({suite_result['command']})")
+                interpreter = suite_result.get("interpreter") or ""
+                interpreter_info = f" [pytest interpreter: {interpreter}]" if interpreter else ""
+                print(
+                    f"{name}: {status}{cached}{scope}{type_info}{interpreter_info} "
+                    f"({suite_result['command']})"
+                )
                 if suite_result.get("notice"):
                     print(f"  notice: {suite_result['notice']}")
                 for failure in suite_result["failures"]:

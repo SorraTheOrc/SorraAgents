@@ -1,3 +1,16 @@
+> **SUPERSEDED (2026-10-21, SA-0MVI6VZBK0016GX5 / epic SA-0MVF1NKZQ009P3ZG).**
+> This report documents the Phase 2 performance round (P1–P6 plus the
+> parent-first model) and is retained for history. The current, reproducible
+> measured baseline now lives in
+> [`audit-performance-baseline.md`](audit-performance-baseline.md): commit-pinned
+> corpus figures from the committed harness
+> (`scripts/measure_audit_performance.py`), the ≤ 10 minute single-item
+> regression gate, the JSON-contract re-ask measurement, and the post-change
+> measurement (which records that the epic's ≥ 50 % wall-clock gate is **not**
+> yet met — the residual cost is the parent Phase-1 screen, tracked by
+> SA-0MVJ3Q662006RDJR). Read the baseline document for anything current; treat
+> this file as the Phase 2 round's record.
+
 # Audit skill — Measured Performance Report (post Phase 2 improvements + parent-first model)
 
 **Date:** 2026-08-04 (original baseline); 2026-08-08 (parent-first model regression targets, see §9)

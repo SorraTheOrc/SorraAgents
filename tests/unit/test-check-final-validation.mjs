@@ -783,7 +783,8 @@ describe('checkFinalValidation - content-fingerprint fast path', () => {
   test('treats a stale-passing fingerprint audit as fresh (no re-audit)', async () => {
     const mod = await import(MODULE_PATH);
     let remediationCalls = 0;
-    const raw = 'Ready to close: Yes\nAudit content fingerprint: deadbeef';
+    let freshnessCalls = 0;
+    const raw = 'Ready to close: Yes\nAudit content fingerprint (v2): deadbeef';
     const report = await mod.checkFinalValidation({
       getItemsFn: () => [
         { id: 'SA-CF', title: 'CF', needsProducerReview: false, parentId: null, updatedAt: '2026-09-05T10:00:00Z' },
@@ -793,9 +794,35 @@ describe('checkFinalValidation - content-fingerprint fast path', () => {
       }),
       runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
       resolveAuditRunnerFn: () => '/tmp/fake.py',
-      queryContentFreshnessFn: () => ({ fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: null }),
+      queryContentFreshnessFn: () => {
+        freshnessCalls += 1;
+        return { fresh: true, reason: 'content fingerprint unchanged', hasFingerprint: true, auditedAt: null };
+      },
     });
+    assert.equal(freshnessCalls, 1, 'a stale v2 audit must reach the content-freshness probe');
     assert.equal(remediationCalls, 0, 'content-fresh audit must not be re-audited');
+    assert.equal(report.hasBlockingItems, false);
+  });
+
+  test('a legacy v1 fingerprint falls back to the time gate without spawning the probe', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const raw = 'Ready to close: Yes\nAudit content fingerprint: deadbeef';
+    const report = await mod.checkFinalValidation({
+      getItemsFn: () => [
+        { id: 'SA-CF', title: 'CF', needsProducerReview: false, parentId: null, updatedAt: '2026-09-05T10:00:00Z' },
+      ],
+      runAuditShow: sequence([
+        { audit: { readyToClose: true, auditedAt: '2026-09-04T08:00:00Z', rawOutput: raw } },
+        { audit: { readyToClose: true, auditedAt: '2026-09-05T11:00:00Z', summary: 'ok' } },
+      ]),
+      runAuditCommand: () => { remediationCalls += 1; return 'ok'; },
+      resolveAuditRunnerFn: () => '/tmp/fake.py',
+      queryContentFreshnessFn: () => {
+        throw new Error('probe must not be spawned for a legacy v1 fingerprint');
+      },
+    });
+    assert.equal(remediationCalls, 1, 'legacy audit falls back to the time gate and is re-audited');
     assert.equal(report.hasBlockingItems, false);
   });
 });

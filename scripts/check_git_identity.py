@@ -247,9 +247,15 @@ def format_report(report: IdentityReport, command: str = "wl sync") -> str:
     lines.append("  # verify:")
     lines.append("  git config user.name && git config user.email")
     lines.append("  # if this checkout legitimately needs a different identity, align the")
-    lines.append("  # local override with the canonical value instead.")
+    lines.append("  # local override with the canonical value instead, or allow-list that")
+    lines.append("  # identity in .worklog/config.yaml `syncAllowedAuthors` (exact email")
+    lines.append("  # only, no wildcards; incident sentinels such as t@t.com never).")
+    lines.append("  # One-off incident remedy only: wl sync --allow-foreign-author")
     lines.append("")
     lines.append(f"See {WORK_ITEM_ID} and docs/dev/test-isolation.md §9.4 step 4.")
+    lines.append(
+        "Author-identity gate reference: docs/dev/worklog-sync.md#author-identity-gate."
+    )
     return "\n".join(lines)
 
 

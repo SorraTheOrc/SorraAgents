@@ -252,7 +252,7 @@ class TestBudgetExceededIntegration:
         mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
-    def _run(self, tmp_path, elapsed=800.0, checkpoint=False):
+    def _run(self, tmp_path, elapsed=1400.0, checkpoint=False):
         """Run cmd_issue with a fake clock reporting `elapsed` seconds since
         the guard start marker; pi and code quality are mocked."""
         clock = {"n": 0, "t0": 1000.0}
@@ -299,7 +299,7 @@ class TestBudgetExceededIntegration:
         """AC1/AC2: when the guard trips, the child is `partial (budget
         exceeded)`, the checkpoint is written with the marker, and the
         checkpoint is KEPT (not cleared) so a resume can re-audit the child."""
-        rc = self._run(tmp_path, elapsed=800.0, checkpoint=True)
+        rc = self._run(tmp_path, elapsed=1400.0, checkpoint=True)
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert rc == 0
@@ -308,7 +308,7 @@ class TestBudgetExceededIntegration:
         ac = child["ac_results"][0]
         assert ac["verdict"] == "partial"
         assert ac["text"] == "partial (budget exceeded)"
-        assert "710s" in ac["evidence"]
+        assert "1310s" in ac["evidence"]
         assert "--parent-timeout" in ac["evidence"]
         assert child.get("budget_exceeded") is True
 
@@ -318,13 +318,13 @@ class TestBudgetExceededIntegration:
         raw = json.loads(cp_path.read_text(encoding="utf-8"))
         exceeded = raw["phases"][PHASE_CHILDREN]["budget_exceeded"]
         assert "CHILD-1" in exceeded
-        assert exceeded["CHILD-1"]["budget_s"] == 710.0
+        assert exceeded["CHILD-1"]["budget_s"] == 1310.0
 
         assert "budget-exceeded children remain; checkpoint kept" in captured.err
 
     def test_no_bare_skip_message_in_skip_path(self, tmp_path, capsys):
         """AC3: the skip path emits no bare 'Skipped due to audit timeout'."""
-        self._run(tmp_path, elapsed=800.0, checkpoint=False)
+        self._run(tmp_path, elapsed=1400.0, checkpoint=False)
         captured = capsys.readouterr()
         assert "Skipped due to audit timeout" not in captured.err
         assert "Skipped due to audit timeout" not in captured.out

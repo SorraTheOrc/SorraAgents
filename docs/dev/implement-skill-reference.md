@@ -158,6 +158,108 @@ path. This is accepted because driven children are headless, the same exclusion
 is already accepted for audit calls, and the implement skill manages its own
 loop.
 
+## Why drive reconciles terminal children after a session timeout (SA-0MVHXWLPG007OQVN)
+
+A driven child session is bounded by `--child-timeout` (default 3600 s). That
+bound is **not a verdict**: a child can commit, push to `dev` and reach a
+terminal work-item state moments before the session is killed. Until
+SA-0MVHXWLPG007OQVN `phase_drive` treated every `subprocess.TimeoutExpired`
+from `_default_session_spawner` as a hard child failure, so `drive` reported
+`success: false` / `failed_child` for children that were already done.
+
+### Recorded production evidence
+
+In the ContextHub epic `WL-0MVGEB3IP002V8IB` (three children) each child
+session was killed at its per-child timeout (3600 s / 7200 s / 10800 s)
+**after** the child had committed and pushed to `dev`, yet `drive` reported:
+
+```
+"result": "failed",
+"reason": "Child session for WL-0MVGU4S58003IRXV timed out after 3600s."
+```
+
+Two children had verifiably reached a terminal state; the third had pushed
+its work but was killed between the push and the final `StatusLifecycle`
+update (left stranded `in-progress`, finalised manually afterwards).
+
+### Classification rules
+
+After a **failed** spawn (timeout **or** non-zero exit) `phase_drive` calls
+`_reconcile_spawn_failure`, which re-fetches the child (read-only `wl show`)
+and classifies it:
+
+| Condition | Outcome |
+|---|---|
+| status `completed` / `done` / `in_review`, stage `in_review`, or soft-deleted | **terminal** — entry `result: "completed-late"`, the chain continues |
+| status `open` / `blocked` / `in_progress`, or the fetch fails | **not terminal** — the pre-existing hard failure (`result: "failed"`, `failed_child`, chain stops) |
+
+Reconciliation runs **only on the failure path** — a successful spawn never
+pays the extra `wl show` (risk R1 in the intake). An unreadable child state
+fails closed: no crash, no silent success.
+
+### Report fields
+
+Spawn-failure entries carry, alongside the existing `id` / `attempt` /
+`result` / `reason`:
+
+- `timed_out` (bool) and `timeout_seconds` (int | null)
+- `terminal` (bool), `terminal_status`, `terminal_stage`
+- `stranded` (bool) and `commit_evidence` when the child's work is already on
+  the parent branch
+
+`report["completed_late"]` counts completed-late children; the summary
+`message` states how many completed late whenever the parent advanced after a
+timeout. The human rendering uses a distinct `🕓` icon for `completed-late`
+(never the `✅` success icon), `🛠` for `finalised`, and prints a
+`timed out after Ns; terminal (status=…, stage=…)` evidence line. All
+additions are additive: the existing keys (`success`, `parent_advanced`,
+`sessions_spawned`, `children_driven`, `message`) keep their meaning and types.
+
+### Stranded children (detection and opt-in finalisation)
+
+A **stranded** child is the `WL-0MVGUA9EY003XFAD` shape: the session pushed to
+`dev` but was killed before the final terminal update, leaving the item
+`in-progress` and blocking `wl next`.
+
+- **Detection (default, read-only).** `_detect_stranded_child` looks for a
+  commit referencing the child id on `origin/dev` (then local `dev`) via a
+  bounded `git log --grep` (30 s, no network fetch). Matches are reported in
+  `report["stranded_children"]` (`id`, `status`, `stage`, `commit`,
+  `evidence`, `reason`), the entry is marked `stranded`, and exactly **one**
+  worklog comment per drive invocation names the items and how to finalise
+  them. No lifecycle mutation and no worktree mutation happens.
+- **Graceful degradation.** A missing/unreadable worktree, a git error, or a
+  repository without the remote-tracking ref degrades to “unknown”
+  (`stranded: false`) without crashing and without false positives.
+- **Opt-in finalisation (`--finalise-stranded`).** When the pushed commit is
+  verified, the item is still `in-progress`, no other agent holds it
+  (non-empty `assignee`), and the child worktree holds **no uncommitted
+  work**, `_finalise_stranded_child` sets `completed`/`in_review` through
+  `StatusLifecycle.update_status` and comments the evidence on the child. The
+  entry becomes `result: "finalised"`, the child is listed in
+  `report["finalised_children"]`, and the chain continues. Any gate failing
+  falls back to the read-only diagnostic.
+
+### Tests
+
+```bash
+pytest -q tests/test_implement_drive.py
+```
+
+`TestTimeoutReconciliation`, `TestSpawnFailureReconciliation`,
+`TestTimeoutOutcomeEvidence`, `TestStrandedChildren` and
+`TestFinaliseStrandedChildren` cover the reconciliation, evidence, stranded
+and finalisation paths hermetically (injected spawner, per-child `wl_show`
+fake, injected commit-evidence provider, recording mutation fake).
+
+### Scope limits
+
+- The per-child timeout mechanism itself is unchanged (the defect was the
+  consequence handling, not the bound).
+- Session-per-child isolation and per-child worktree semantics are unchanged.
+- No fetch/network in the evidence path; a stale `origin/dev` ref is accepted
+  evidence on the failure path.
+
 ## Build step for repos without a build script
 
 The `implement.py finish` build step (`run_build()`) is tolerant of repos
@@ -229,8 +331,32 @@ configured runner):
   (SA-0MUY6U05F008RG86 — see
   [test-skill-reference.md](test-skill-reference.md#06-nested-run-isolation-sa-0muy6u05f008rg86)).
 
+**Gate-failure diagnostics (WL-0MVGUT787000LNDG):** a failed changed-scope
+run is never reported as an empty `Failures:` block. `_adapt_guarded_result`
+carries the guarded run's `notices`/`notice_codes` (slot contention,
+command-not-found, suite timeout) and bounded `stdout`/`stderr` tails into
+`phase_finish`'s message builder, which renders:
+
+- **No free test slot** — classified on the stable `notice_code`
+  (`slot_busy`), with a narrow legacy fallback on the slot-busy notice
+  prefix only when there are no structured failures. The message says the
+  gate *could not start* (an infrastructure condition, not a code failure)
+  and suggests raising `TEST_LOCK_TIMEOUT` to wait longer.
+- **Unparsed failures** (e.g. vitest output that no parser matches) — the
+  command's output tail is included so the operator sees the actual error.
+- **Structured failures** — unchanged: the first 20 failures are listed.
+
+Genuine structured failures always win the classification, so a real test
+failure is never misreported as (or retried as) an infrastructure
+condition. The classification uses the stable notice codes exported by
+`run_tests.py` (`NOTICE_SLOT_BUSY`, `NOTICE_COMMAND_NOT_FOUND`,
+`NOTICE_SUITE_TIMEOUT`), never string matching on the human-readable notice
+text.
+
 The returned dict includes `skipped` (bool) and `tooling` (str | None) in
-addition to `success`/`stdout`/`stderr`/`exit_code`/`failures`.
+addition to `success`/`stdout`/`stderr`/`exit_code`/`failures` — and, for a
+guarded (test-skill) run, `notices`/`notice_codes` so callers can explain a
+failure without any structured failures.
 
 ## Push timeout (SA-0MUH9R74O002MQDU)
 
@@ -277,3 +403,49 @@ A push timeout never silently loses work:
 3. `wl_add_comment` posts a full manual-push instruction including both.
 4. Status is reset to `open` (not abandoned).
 5. The agent or operator can push manually with the posted instruction.
+
+## Terminal-status read-back (no-op-push guarantee) (OSL-0MVME1PI5005WU58)
+
+`implement.py finish` must never report success while the main-checkout store
+holds a non-terminal state for the item. `phase_finish` writes the terminal
+transition from `StatusLifecycle.__exit__`, which runs on **both** finish
+paths — the push-with-diff path and the no-op-push path (a worktree branch
+with no diff from `origin/dev`, e.g. a verification-only item whose evidence
+is a worklog comment). The reproduction on OSL-0MVME1PI5005WU58 confirmed
+that no step discards or overwrites that write, so the guarantee is enforced
+rather than assumed.
+
+After the `with` block (Step 8b), `phase_finish` calls
+`_assert_terminal_status(work_item_id)`, which:
+
+- reads the item back through `StatusLifecycle.show()` (the same
+  prefix-to-sibling resolution as the write, so a cross-repo store — e.g. an
+  `OSL-*` item from a SorraAgents worktree — is read from its own project
+  store), and
+- returns `{"success": True, "status": ..., "stage": ...}`, recorded as
+  `report["steps"]["status_readback"]`, **or**
+- raises `RuntimeError` when the store does not hold `status=completed` /
+  `stage=in_review`.
+
+The raised error flows through `phase_finish`'s normal `RuntimeError`
+handler: the item is released to `open` and the run reports `success: false`
+with the read-back message. That is the intended behaviour — a silently lost
+or overwritten lifecycle write (the symptom recorded on OSL-0MVMB44C9008IXZX,
+where finish reported success while the item stayed `open`) becomes a loud
+failure instead of a green report.
+
+Ordering guarantees:
+
+- The read-back runs **only after** Step 6's confirmed successful push (it
+  sits after the `with` block that contains the push), so a failed push, push
+  timeout, or non-fast-forward failure still leaves the item `open` and never
+  produces an `in_review` report.
+- The read-back **reports**, it does not repair: it does not re-write the
+  terminal status. Re-run `finish` (or complete the transition by hand) after
+  investigating the store.
+- Push-with-diff behaviour is unchanged — the assertion is additive and
+  applies to both paths identically.
+
+Regression pin: `skill/implement/tests/test_finish_no_diff_status.py` covers
+the no-diff path (empty staged diff, no-op push success), the push-with-diff
+companion, and the fail-loud path when the store is non-terminal.

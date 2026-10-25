@@ -27,6 +27,19 @@ The helper routes the ``wl`` invocation through
 ``--worklog-dir`` (explicit > prefix-to-sibling > cwd chain) and surfaces
 detailed errors.
 
+Claim safety (SA-0MVE34D9B005TUYJ): a background sync must never undo a claim.
+``wl sync`` now refuses to downgrade a held claim — an item that is
+``in-progress`` (or carries a non-empty ``assignee``) and was active within
+``syncClaimHoldTtlHours`` (default 24 h) keeps its claimed ``status``/``stage``
+pair and its ``updatedAt``/``activityAt``; newer, more active transitions and
+attributed deletes still propagate, and a claim older than the TTL is released.
+Every refusal is recorded in the sync log and in ``wl --json sync`` output
+(``sync.claimHolds``). Because ``.worklog/config.yaml`` is tracked, worktree
+checkouts contain a ``.worklog/`` directory without a store: always pass
+``--worklog-dir <main-checkout>/.worklog`` from a worktree (this helper does)
+so a sync never operates on a second store for the same project prefix.
+See ``docs/dev/worklog-sync.md``.
+
 Usage::
 
     from shared.worklog_sync import sync_worklog

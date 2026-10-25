@@ -166,6 +166,12 @@ class TestGuardFiresOnMismatch:
         assert "agent@example.com" in combined
         assert "git config --local --unset" in combined
         assert "SA-0MUJ2VMF7000UHCX" in combined
+        # The remedy must name the fix, not only the offending value: the
+        # allow-list and the one-off escape hatch are the remaining options
+        # when the identity legitimately differs from the canonical one.
+        assert "syncAllowedAuthors" in combined
+        assert "--allow-foreign-author" in combined
+        assert "docs/dev/worklog-sync.md" in combined
 
     def test_expected_email_mismatch_is_rejected(self, tmp_path: Path):
         """When an expected email is supplied, a different configured email

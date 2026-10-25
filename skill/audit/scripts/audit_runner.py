@@ -612,7 +612,14 @@ CLI flag or the ``AUDIT_PARENT_TIMEOUT`` environment variable (see
 ``_resolve_parent_timeout``) for harnesses that allow longer parent runs.
 """
 
-PARENT_TIMEOUT_PER_CHILD = 600
+PARENT_TIMEOUT_PER_CHILD = 1200
+"""Per-child term (seconds) added to the parent cumulative guard.
+
+Must be >= ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s): raising the child
+budget would otherwise make the parent guard the new starvation point and
+skip children that could still have completed
+(SA-0MVI3608M0080QLW). Kept at 1200 s for ~10 % slack over one full screen.
+"""
 """Per-child budget (seconds) added to ``PARENT_TIMEOUT_DEFAULT`` when the
 default elapsed-time guard is scaled by the number of active children (see
 ``_default_parent_timeout``). ~10 min per child accommodates typical child
@@ -631,20 +638,93 @@ Pi model calls (e.g. ``AUDIT_PI_TIMEOUT=3600``) without changing defaults.
 AUDIT_CHILD_SCREEN_TIMEOUT_ENV = "AUDIT_CHILD_SCREEN_TIMEOUT"
 """Environment variable name for the child Phase-1 AC-review screen budget.
 
-Child Phase-1 AC-review screens are lightweight (30-190 s healthy) so they
-use a short per-call budget (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 600 s)
-instead of the full 1800 s Phase-2 budget. A screen that exceeds this
-budget returns a clean timeout verdict (existing ``_timeout`` marker +
-timeout evidence) — never a full 1800 s burn. Overridable via the
-``--child-screen-timeout`` CLI flag (flag wins) or this env var.
+Child Phase-1 AC-review screens use a right-sized per-call budget
+(``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, derived as
+``ceil(measured p95 x 2)`` — see that constant's docstring) instead of the
+full 1800 s Phase-2 budget. A screen that exceeds its budget is quarantined
+— the conservative ``partial`` verdict with evidence naming the budget and
+phase, plus a ``child_screen_timeouts`` count in the reliability summary —
+never a full 1800 s burn and never an unqualified judgement. Overridable via
+the ``--child-screen-timeout`` CLI flag (flag wins) or this env var.
 """
 
-_CHILD_SCREEN_TIMEOUT_DEFAULT = 600
+_CHILD_SCREEN_TIMEOUT_DEFAULT = 1080
 """Default per-call budget (seconds) for child Phase-1 AC-review screens.
 
-Set conservatively above healthy child Phase-1 durations (30-190 s) but far
-below the 1800 s Phase-2 budget, so a stalled lightweight child screen fails
-fast instead of burning a full 30-min budget (LP-0MSQ32S2M001EA74 AC1).
+**Derivation (SA-0MVI3608M0080QLW, measured — not guessed).** On the 2026-10-21
+reference run (ContextHub, 16-core host, load ~3) eleven child screens split
+into six completions and five that landed exactly on the old 600 s cap:
+
+    completions: 258, 336, 337, 394, 463, 506 s
+    p95 of completions: ~506 s   (median 389 s, max 506 s)
+
+So the old 600 s cap left only ~15 % headroom over the unconstrained p95 — any
+host-load increase converted completions into timeouts, and 5 of 11 screens
+(45 %) capped out. The budget is therefore derived as
+``ceil(p95 x safety_factor)`` with a documented **safety factor of 2**:
+``ceil(506 x 2) = 1012`` s, rounded up to **1080 s** (18 min) for a round value
+with a little extra slack. That keeps ~2.1x headroom over measured p95 while
+staying far below the 1800 s Phase-2 budget, so a genuinely stalled screen
+still fails fast.
+
+Re-derivation on a new corpus::
+
+    python3 scripts/measure_audit_performance.py --root ~/.audit_debug
+    # child row, p95 column -> ceil(p95 x 2)
+
+A capped screen is quarantinable, not silent: it degrades to ``partial`` with
+evidence naming the budget and phase, and increments the run's
+``child_screen_timeouts`` reliability counter
+(``AUDIT_RELIABILITY_SUMMARY``), so downstream consumers can exclude it
+instead of treating a timeout as a model judgement.
+
+``PARENT_TIMEOUT_PER_CHILD`` is kept >= this budget so the parent's cumulative
+guard never becomes the new starvation point.
+"""
+
+AUDIT_PARENT_SCREEN_TIMEOUT_ENV = "AUDIT_PARENT_SCREEN_TIMEOUT"
+"""Environment variable name for the parent Phase-1 AC screen budget.
+
+The parent Phase-1 AC screen is the same structural screening call as a
+child screen (read the FILE SCOPE manifest, map each AC to a
+met/unmet/partial/adjusted verdict), so it shares the measured right-sized
+screening budget (``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s) instead of the
+full 1800 s Phase-2 budget — a parent screen that exceeds its budget is
+quarantined exactly like a capped child screen (SA-0MVJ3Q662006RDJR).
+Overridable via the ``--parent-screen-timeout`` CLI flag (flag wins) or this
+env var.
+"""
+
+_PARENT_SCREEN_TIMEOUT_DEFAULT = 1080
+"""Default per-call budget (seconds) for the parent Phase-1 AC screen.
+
+**Derivation (SA-0MVJ3Q662006RDJR, measured — not guessed).** Right-sizing
+follows the same derivation discipline as the child-screen budget
+(``ceil(p95 x safety factor)`` for Phase-1 *screening* — SA-0MVI3608M0080QLW):
+the parent screen is the same structural screening call as a child screen
+(FILE SCOPE manifest -> per-AC verdicts), so the measured screening-class p95
+(~506 s, 2026-10-21 reference run) x safety factor 2 -> 1012, rounded up to
+**1080 s**.
+
+Parent-specific corroboration on the current corpus
+(``scripts/measure_audit_performance.py --root ~/.audit_debug``,
+2026-10-23): 482 parent-screen calls; completions p50 224.8 s / p90 906.3 s /
+p95 1232.9 s (contention-inclusive — the p95 is inflated by queue wait behind
+the saturated 2-slot proxy), with **16 calls currently landing squarely on the
+old 1800 s cap**. The 1080 s budget therefore covers >= 90 % of parent
+completions while converting the cap-bound 16 into fast, quarantinable fails
+instead of 30-minute burns.
+
+Re-derivation on a new corpus::
+
+    python3 scripts/measure_audit_performance.py --root ~/.audit_debug
+    # parent row, completions only, p95 column -> ceil(p95 x 2)
+
+A capped parent screen never triggers the JSON re-ask and never burns a second
+call: it degrades to ``partial`` with evidence naming the budget and phase and
+increments ``parent_screen_timeouts`` in ``AUDIT_RELIABILITY_SUMMARY``. It
+stays far below the 1800 s Phase-2 budget, so a genuinely stalled parent
+screen still fails fast.
 """
 
 AUDIT_STALL_TIMEOUT_ENV = "AUDIT_STALL_TIMEOUT"
@@ -880,6 +960,12 @@ _UNPARSEABLE_RAW_MAX_CHARS = 4000
 
 #: Stable key order for the per-run reliability summary. Operators and
 #: dashboards grep this line, so the key set and order are a contract.
+#: ``verdict_reasks`` counts the bounded JSON-contract re-asks
+#: (SA-0MVI6VNDF001VE1S) so the re-ask rate is measurable from the log
+#: instead of inferred from debug-log forensics. ``child_screen_timeouts``
+#: and ``parent_screen_timeouts`` count capped Phase-1 screens that were
+#: quarantined as ``partial`` (SA-0MVI3608M0080QLW, SA-0MVJ3Q662006RDJR); new
+#: keys are appended so existing dashboards keep their column positions.
 RELIABILITY_SUMMARY_KEYS = (
     "calls",
     "parse_ok",
@@ -888,6 +974,9 @@ RELIABILITY_SUMMARY_KEYS = (
     "child_skips",
     "provider_errors",
     "concurrency_waits",
+    "verdict_reasks",
+    "child_screen_timeouts",
+    "parent_screen_timeouts",
 )
 #: Machine-greppable prefix; the full line is ``<prefix> <key=value> ...``.
 RELIABILITY_SUMMARY_PREFIX = "AUDIT_RELIABILITY_SUMMARY"
@@ -928,7 +1017,8 @@ def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
 
     The line is ``AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n>
     parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n>
-    concurrency_waits=<n> elapsed_seconds=<x>`` with stable keys in
+    concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n>
+    parent_screen_timeouts=<n> elapsed_seconds=<x>`` with stable keys in
     :data:`RELIABILITY_SUMMARY_KEYS`. When *elapsed_seconds* is omitted the
     value is derived from the run start clock set by :func:`_rel_reset`.
     """
@@ -1109,16 +1199,28 @@ with a fingerprint are gated on content match instead (see
 ``_check_audit_freshness``).
 """
 
-AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint: "
-"""Prefix of the content-fingerprint metadata line embedded in audit reports.
+AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint (v2): "
+"""Prefix of the versioned content-fingerprint metadata line in audit reports.
 
-The content fingerprint (per-work-item touched-file state + work-item
-description hash + Key Files list, captured at audit time) is embedded in the
-persisted report so a re-audit of an unchanged item can skip the pipeline in
-seconds instead of re-running it (SA-0MSKB6US1009CNHT,
-SA-0MSPZDALB000S18P). The line is parsed back out by
-``_extract_content_fingerprint``.
+The content fingerprint is computed from the work item's OWN data only — a
+sha256 over the canonical ``{"schema": 2, "title_hash", "description_hash"}``
+payload, with **zero git invocations** (SA-0MVIDI8E00063OOP, superseding the
+per-touched-path formula of SA-0MSPZDALB000S18P). The description already
+contains the acceptance criteria and the Key Files section, so those are
+covered by ``description_hash``; comments and repository state never
+contribute. The line is embedded in the persisted report so a re-audit of an
+unchanged item can skip the pipeline in seconds instead of re-running it
+(SA-0MSKB6US1009CNHT).
+
+The ``v2`` version marker lets ``_extract_content_fingerprint`` distinguish
+this formula from the unversioned legacy lines written by earlier formulas,
+whose fingerprints cannot be recomputed. Legacy lines are ignored (→ ``None``)
+so those reports fall through to the existing time-gate floor instead of
+triggering a silent mass re-audit wave.
 """
+
+_AUDIT_CONTENT_FINGERPRINT_SCHEMA = 2
+"""Schema version embedded in the fingerprint payload (item-data-only)."""
 
 #: Marker prefix used to separate commit headers from file names in
 #: ``git log --name-only`` output (SA-0MSPZDALB000S18P).
@@ -1949,27 +2051,28 @@ def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
 
 def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None,
-                           work_item: dict | None = None,
-                           comments: Sequence[dict] | None = None) -> str | None:
+                           work_item: dict | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
 
     1. **Content-based gate (primary, SA-0MSKB6US1009CNHT):** when the
-       stored audit report carries a content fingerprint (the work item's
-       per-touched-file state + description hash + Key Files list captured
-       at audit time, SA-0MSPZDALB000S18P), the audit is fresh iff the
-       fingerprint is unchanged. This makes re-audits of unchanged items
-       return the existing report in seconds instead of re-running the
-       pipeline, even when ``updatedAt`` moved for non-content reasons
-       (e.g. a comment was added), or when an UNRELATED file was committed
-       or left dirty. A change to any file the item itself touched (or to
-       its description / Key Files) invalidates freshness and re-runs.
-    2. **Time gate (floor):** when the stored report carries no fingerprint
-       (e.g. legacy audits persisted before the fingerprint feature), the
-       existing 60s time gate is retained as the freshness floor: compare
-       the audit's ``auditedAt`` against the work item's ``updatedAt`` plus
-       ``AUDIT_FRESHNESS_BUFFER_SECONDS``.
+       stored audit report carries a **v2** content fingerprint (a sha256
+       over the item's own ``{schema: 2, title_hash, description_hash}``
+       payload, computed with zero git calls, SA-0MVIDI8E00063OOP), the
+       audit is fresh iff the fingerprint is unchanged. This makes re-audits
+       of unchanged items return the existing report in seconds instead of
+       re-running the pipeline, even when ``updatedAt`` moved for
+       non-content reasons (e.g. a comment was added). Only a change to this
+       item's own title or description (which contains the ACs and Key Files)
+       invalidates freshness; repository state, touched-file edits, comments
+       and lifecycle fields never do.
+    2. **Time gate (floor):** when the stored report carries no v2
+       fingerprint (legacy audits persisted by earlier formulas, whose
+       unversioned ``Audit content fingerprint:`` line is deliberately
+       ignored, or manual reports), the 60s time gate is retained as the
+       freshness floor: compare the audit's ``auditedAt`` against the work
+       item's ``updatedAt`` plus ``AUDIT_FRESHNESS_BUFFER_SECONDS``.
 
     Returns the ``rawOutput`` of the existing audit if still fresh, ``None``
     otherwise (no prior audit, stale audit, or command failure).
@@ -1982,13 +2085,6 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     caller already fetched the work item (SA-0MSL1Z7E9005TLBA): it is used
     for the fingerprint computation and the time-gate ``updatedAt``. When
     omitted, the work item is fetched via ``wl show``.
-
-    *comments* is the item's comment list (fetched via ``wl show``). It is
-    optional: when supplied it is forwarded to the fingerprint computation;
-    when omitted, ``_compute_content_fingerprint`` fetches it itself
-    (deterministic comment source, SA-0MVAWFYKT002CQ3L), so the
-    audit-time and check-time computations agree even when the caller does
-    not hold the list (parent child-reuse gate, read-only freshness probe).
     """
 
     try:
@@ -2010,19 +2106,18 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return None
 
     # ── Content-based freshness gate (SA-0MSKB6US1009CNHT) ─────────────
-    # When the stored audit carries a content fingerprint, freshness is
-    # decided by content match: re-auditing an item whose touched-file
-    # state, description hash, and Key Files are unchanged returns the
-    # existing report in seconds instead of re-running the pipeline
-    # (SA-0MSPZDALB000S18P: unrelated repo changes no longer invalidate it).
+    # When the stored audit carries a v2 content fingerprint, freshness is
+    # decided by item-data match: re-auditing an item whose title and
+    # description are unchanged returns the existing report in seconds
+    # instead of re-running the pipeline (SA-0MVIDI8E00063OOP: only the
+    # item's own data participates — no git calls, no comments).
     stored_fingerprint = _extract_content_fingerprint(raw_output)
     if stored_fingerprint is not None:
         current_fingerprint = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
-            comments=comments,
         )
         if current_fingerprint is None:
-            # Fingerprint cannot be computed now (e.g. git unavailable) —
+            # Fingerprint cannot be computed now (e.g. wl show failed) —
             # fail open and let the pipeline re-run.
             return None
         if current_fingerprint == stored_fingerprint:
@@ -2071,12 +2166,15 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
 
 
 def _extract_content_fingerprint(report_text: str) -> str | None:
-    """Extract the content fingerprint from a persisted audit report.
+    """Extract the v2 content fingerprint from a persisted audit report.
 
-    The fingerprint is stored as a metadata line in the report:
-    ``Audit content fingerprint: <sha256-hex>``. Returns the fingerprint
-    value, or ``None`` when the report carries no fingerprint (e.g. legacy
-    audits persisted before SA-0MSKB6US1009CNHT, or manual reports).
+    The fingerprint is stored as a versioned metadata line in the report:
+    ``Audit content fingerprint (v2): <sha256-hex>`` (the item-data-only
+    formula, SA-0MVIDI8E00063OOP). Returns the fingerprint value only for
+    ``v2`` lines. Unversioned legacy lines (``Audit content fingerprint:
+    <hex>``) written by earlier formulas are **not** returned: their
+    fingerprints cannot be recomputed, so ``None`` lets the caller fall
+    through to the time-gate floor instead of triggering a mass re-audit.
     """
     if not report_text:
         return None
@@ -2160,36 +2258,6 @@ def _normalise_repo_path(path: str) -> str:
     return p.strip()
 
 
-def _fetch_item_comments(runner: Runner, issue_id: str,
-                         worklog_dir: str | None = None) -> list[dict]:
-    """Best-effort fetch of a work item's comments for the fingerprint.
-
-    ``wl show --json`` returns the item's comments at the TOP level of the
-    payload (beside ``workItem`` — SA-0MSPZDALB000S18P), which is what
-    ``_bind_fetched_item`` binds into ``ctx.comments``. Used to make the
-    comment-recorded commit-hash source deterministic: callers that do not
-    already hold the comments list (the parent child-reuse gate and the
-    read-only freshness probe) fetch it here so the fingerprint they
-    compute matches the one the audit recorded at persist time
-    (SA-0MVAWFYKT002CQ3L).
-
-    Returns an empty list when the item has no comments or the fetch fails
-    (fail-open: the fingerprint then falls back to the item-id-grep and Key
-    Files sources).
-    """
-    if not issue_id:
-        return []
-    try:
-        data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
-                       worklog_dir=worklog_dir)
-    except Exception:  # noqa: BLE001 -- best-effort; never fail the fingerprint
-        return []
-    if not isinstance(data, dict):
-        return []
-    comments = data.get("comments")
-    return list(comments) if isinstance(comments, list) else []
-
-
 def _extract_comment_commit_hashes(comments: Sequence[dict] | None) -> list[str]:
     """Extract candidate commit shas recorded in a work item's comments.
 
@@ -2230,19 +2298,18 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
     Paths are normalised, de-duplicated, and sorted. Returns ``None`` (the
     fail-open signal for callers) when the set cannot be determined: git is
     unavailable / the ``git log`` call fails, or no paths are recorded. An
-    empty set is never returned, because it would make the fingerprint blind
-    to any file change (a correctness hazard — fail stale, never fail fresh).
+    empty set is never returned: ``None`` tells callers the scope could not be
+    determined so they skip the scan rather than fall back to a whole-repo
+    scan (fail stale, never fail fresh).
 
-    **Determinism.** The fingerprint is recomputed on every freshness check,
-    so the touched-file set must be identical at audit time and check time.
-    The fingerprint layer (``_compute_content_fingerprint``) guarantees this
-    by supplying the item's comments at every call site: callers that hold
-    the fetched list pass it through, and callers that do not (child-reuse
-    paths, the read-only freshness probe) have it fetched there
-    (deterministic comment source, SA-0MVAWFYKT002CQ3L). This function
-    itself stays a pure resolver — the comment source contributes only when
-    *comments* is supplied; direct callers building the Phase-2 file-scope
-    manifest rely on the grep + Key Files sources, which is stable for their
+    **Retained for the file-scope manifest.** The content fingerprint is
+    item-data-only and no longer consults this resolver; it remains the
+    source of an item's committed touched files for the Phase-2 file-scope
+    manifest and the code-quality scope resolution (SA-0MUI5ZYO6002W3KD).
+    This function stays a pure resolver — the comment source contributes only
+    when *comments* is supplied; callers that pass them
+    (``_resolve_file_scope``) get the extra safety net, while the Phase-2
+    manifest relies on the grep + Key Files sources, which is stable for its
     use.
 
     *work_item* may be passed in to reuse an already-fetched item; when
@@ -2313,178 +2380,80 @@ def _resolve_touched_files(runner: Runner, issue_id: str,
     return sorted(paths)
 
 
-def _parse_porcelain_path(line: str) -> str:
-    """Extract the path from a ``git status --porcelain`` entry.
-
-    Handles the rename/copy form (``R  old -> new`` → ``new``) and the plain
-    form (``XY path`` → ``path``). The leading status column is significant
-    (a leading space is part of the two-char status), so only trailing
-    whitespace is stripped. Returns ``""`` for malformed lines.
-    """
-    entry = line.rstrip()
-    if not entry:
-        return ""
-    if " -> " in entry:
-        entry = entry.split(" -> ", 1)[1]
-    elif len(entry) > 3:
-        entry = entry[3:]
-    else:
-        return ""
-    return _normalise_repo_path(entry)
-
-
-def _compute_path_fingerprints(runner: Runner,
-                               paths: Sequence[str]) -> dict | None:
-    """Capture the current state of each touched path for the fingerprint.
-
-    For every path this records:
-
-    * ``head`` — the path's committed state: its blob hash at HEAD
-      (``git rev-parse HEAD:<path>``) when present at HEAD, else the hash of
-      the latest commit touching it (``git log -1 --format=%H -- <path>``),
-      else ``""`` for a path never committed (e.g. an untracked new file).
-    * ``worktree`` — the path's narrowed working-tree state from
-      ``git status --porcelain -- <paths>`` and
-      ``git diff --name-only HEAD -- <paths>`` (empty when clean).
-
-    Returns a ``{path: {"head": ..., "worktree": ...}}`` dict, or ``None``
-    when a git call needed for the payload fails — callers fail open and
-    re-run the pipeline (SA-0MSPZDALB000S18P). The working-tree queries are
-    batched (two calls for all paths) and the per-path budget is one
-    ``rev-parse`` (plus one fallback ``log -1`` only when the path is not at
-    HEAD), honouring the bounded-cost constraint.
-    """
-    path_list = list(paths)
-    if not path_list:
-        return None
-
-    worktree: dict[str, list[str]] = {p: [] for p in path_list}
-    for cmd in (
-        ["git", "status", "--porcelain", "--", *path_list],
-        ["git", "diff", "--name-only", "HEAD", "--", *path_list],
-    ):
-        try:
-            proc = runner(cmd)
-        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
-            return None
-        if proc.returncode != 0:
-            return None  # cannot determine worktree state ⇒ fail open
-        diff_only = cmd[1] == "diff"
-        for line in proc.stdout.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if diff_only:
-                path = _normalise_repo_path(stripped)
-            else:
-                # Pass the RAW line: the leading status column is significant
-                # (a leading space is part of git's two-char status code).
-                path = _parse_porcelain_path(line)
-            if path and path in worktree:
-                worktree[path].append(stripped)
-
-    states: dict[str, dict] = {}
-    for path in path_list:
-        head_state = ""
-        try:
-            proc = runner(["git", "rev-parse", f"HEAD:{path}"])
-        except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
-            return None
-        if proc.returncode == 0 and proc.stdout.strip():
-            head_state = proc.stdout.strip()
-        else:
-            # Not present at HEAD (deleted / untracked): fall back to the
-            # latest commit that touched the path (empty when never committed).
-            try:
-                proc = runner(["git", "log", "-1", "--format=%H", "--", path])
-            except Exception:  # noqa: BLE001 -- git unavailable ⇒ fail open
-                return None
-            if proc.returncode != 0:
-                return None
-            head_state = proc.stdout.strip()
-        states[path] = {
-            "head": head_state,
-            "worktree": "\n".join(sorted(set(worktree.get(path, [])))),
-        }
-    return states
-
-
 def _compute_content_fingerprint(runner: Runner, issue_id: str,
                                  worklog_dir: str | None = None,
                                  work_item: dict | None = None,
-                                 comments: Sequence[dict] | None = None,
                                  ) -> str | None:
-    """Compute the content fingerprint for a work item at the current state.
+    """Compute the content fingerprint from the work item's OWN data only.
 
-    The fingerprint is taken over the work item's OWN scope — the files it
-    touched — instead of the whole repository, so an unrelated commit or an
-    unrelated working-tree change no longer invalidates a still-valid stored
-    audit (SA-0MSPZDALB000S18P). It combines (a change in ANY invalidates):
+    The fingerprint is a sha256 hex digest of the canonical JSON payload::
 
-    1. **per-touched-path state** — each touched path's committed state (blob
-       hash at HEAD, else latest touching commit) plus its narrowed
-       working-tree state (``_compute_path_fingerprints``), so a committed OR
-       uncommitted change to a touched file invalidates freshness;
-    2. **work-item description hash** — the audited acceptance-criteria text;
-    3. **Key Files list** — the file-scope manifest of the audited item.
+        {"schema": 2, "title_hash": <sha256(title)>,
+         "description_hash": <sha256(description)>}
 
-    The touched-file set is resolved by ``_resolve_touched_files`` (commits
-    referencing the item id + comment-recorded commit hashes + Key Files).
+    serialised with ``sort_keys=True`` (**exactly** these three keys). The
+    description contains the acceptance criteria AND the Key Files section, so
+    both are already covered by ``description_hash``; no comment-derived
+    input and no repository state are hashed. The computation performs
+    **zero git invocations** — it never calls the touched-file resolvers or
+    any ``git`` subprocess — so only a change to this work item's own
+    title/description invalidates a stored
+    audit (SA-0MVIDI8E00063OOP). Unrelated commits, working-tree changes,
+    touched-file edits, comments and lifecycle-field changes never do.
 
-    Tool-generated artefacts (e.g. Unity ``ProjectSettings/**`` or ``*.meta``
-    churn from batch runs) are **always invalidating** when they fall inside
-    the touched-file set: no ignore-list is applied, so a rewrite of a touched
-    artefact is treated as a genuine change (the safe direction — stale ⇒
-    re-run). See ``docs/dev/audit-skill-reference.md``.
+    *work_item* may be passed in to avoid a redundant ``wl show`` when the
+    caller already fetched the item (SA-0MSL1Z7E9005TLBA); when omitted it is
+    fetched via ``wl show <id> --json``. A missing/garbage title or
+    description still yields a deterministic hash (empty string for missing,
+    canonical JSON for non-string values).
 
-    *work_item* / *comments* may be passed in to avoid redundant ``wl show``
-    calls when the caller already fetched the item (SA-0MSL1Z7E9005TLBA). Both
-    are determined automatically when omitted: the fingerprint always resolves
-    the item's comments itself (deterministic comment source,
-    SA-0MVAWFYKT002CQ3L), so the comment-recorded commit-hash component of
-    the touched-file set contributes identically at audit/persist time,
-    parent child-reuse check time, and the read-only freshness probe.
-
-    Returns a sha256 hex digest of the canonical JSON payload, or ``None``
-    when the fingerprint cannot be determined (touched set unresolved, git
-    unavailable, wl show failure, or missing data) so callers fail open and
-    re-run the pipeline.
+    Returns the sha256 hex digest, or ``None`` (fail open → the caller re-runs
+    the full audit pipeline) ONLY when the work item cannot be fetched
+    (``wl show`` failure) or the payload cannot be built.
     """
     if work_item is None:
+        if not issue_id:
+            return None
         try:
             data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                            worklog_dir=worklog_dir)
         except Exception:  # noqa: BLE001 -- fail open on any wl/runner failure
             return None
-        work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
-        if comments is None and isinstance(data, dict):
-            # Reuse the comments from the same payload — no second fetch.
-            fetched = data.get("comments")
-            if isinstance(fetched, list):
-                comments = fetched
-    if comments is None and issue_id:
-        # Check-time callers (child-reuse gate, freshness probe) do not hold
-        # the comments list, so fetch it here. This keeps the touched-file
-        # set — and therefore the fingerprint — identical to the one the
-        # audit recorded at persist time (SA-0MVAWFYKT002CQ3L).
-        comments = _fetch_item_comments(runner, issue_id, worklog_dir=worklog_dir)
-    description = work_item.get("description", "") or ""
-    key_files = _extract_key_files(description)
-    touched = _resolve_touched_files(
-        runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
-        comments=comments,
-    )
-    if touched is None:
+        if not isinstance(data, dict) or data.get("success") is False:
+            return None
+        work_item = data.get("workItem")
+        if not isinstance(work_item, dict):
+            return None
+    try:
+        title = _fingerprint_text(work_item.get("title"))
+        description = _fingerprint_text(work_item.get("description"))
+        payload = json.dumps({
+            "schema": _AUDIT_CONTENT_FINGERPRINT_SCHEMA,
+            "title_hash": hashlib.sha256(title.encode("utf-8")).hexdigest(),
+            "description_hash": hashlib.sha256(
+                description.encode("utf-8")).hexdigest(),
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    except Exception:  # noqa: BLE001 -- payload build failure → fail open
         return None
-    path_states = _compute_path_fingerprints(runner, touched)
-    if path_states is None:
-        return None
-    payload = json.dumps({
-        "path_states": path_states,
-        "description_hash": hashlib.sha256(description.encode("utf-8")).hexdigest(),
-        "key_files": key_files,
-    }, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_text(value: object) -> str:
+    """Coerce a work-item field to a deterministic string for hashing.
+
+    Strings pass through; ``None`` becomes the empty string; other values are
+    canonicalised via JSON (``sort_keys=True``) so a garbage title/description
+    still yields a deterministic hash, falling back to the type name for
+    non-JSON-able objects.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        return type(value).__name__
 
 
 def _default_parent_timeout(n_children: int) -> int:
@@ -2768,8 +2737,8 @@ def _resolve_child_screen_timeout(cli_timeout: int | None) -> int | None:
     Precedence:
       1. ``--child-screen-timeout`` CLI flag (explicit override)
       2. ``AUDIT_CHILD_SCREEN_TIMEOUT`` environment variable (seconds)
-      3. ``None`` — falls back to ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600 s)
-         inside ``_call_pi`` for child screens
+      3. ``None`` — falls back to ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s,
+         derived from measured p95 x 2) inside ``_call_pi`` for child screens
 
     An invalid value (non-integer) is ignored with a warning so a
     misconfigured environment cannot break the audit run.
@@ -2784,6 +2753,35 @@ def _resolve_child_screen_timeout(cli_timeout: int | None) -> int | None:
             print(
                 f"Warning: invalid {AUDIT_CHILD_SCREEN_TIMEOUT_ENV} value {env_value!r}; "
                 "using default child-screen timeout",
+                file=sys.stderr,
+            )
+    return None
+
+
+def _resolve_parent_screen_timeout(cli_timeout: int | None) -> int | None:
+    """Resolve the per-call budget for the parent Phase-1 AC screen.
+
+    Precedence:
+      1. ``--parent-screen-timeout`` CLI flag (explicit override)
+      2. ``AUDIT_PARENT_SCREEN_TIMEOUT`` environment variable (seconds)
+      3. ``None`` — falls back to ``_PARENT_SCREEN_TIMEOUT_DEFAULT`` (1080 s,
+         the shared measured right-sized screening budget, derived as
+         ``ceil(p95 x 2)`` — SA-0MVJ3Q662006RDJR) inside ``_call_pi`` for
+         parent screens
+
+    An invalid value (non-integer) is ignored with a warning so a
+    misconfigured environment cannot break the audit run.
+    """
+    if cli_timeout is not None:
+        return cli_timeout
+    env_value = os.environ.get(AUDIT_PARENT_SCREEN_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_PARENT_SCREEN_TIMEOUT_ENV} value {env_value!r}; "
+                "using default parent-screen timeout",
                 file=sys.stderr,
             )
     return None
@@ -3301,35 +3299,124 @@ def _run_tests_via_test_skill(
     }
 
 
+AUDIT_CEILING_SOURCE_CLI = "cli"
+"""Ceiling source: explicit ``--max-concurrency`` CLI flag."""
+
+AUDIT_CEILING_SOURCE_ENV = "env"
+"""Ceiling source: explicit ``AUDIT_MAX_CONCURRENCY`` environment variable."""
+
+AUDIT_CEILING_SOURCE_SLOTS = "slots"
+"""Ceiling source: derived from the live proxy slot status."""
+
+AUDIT_CEILING_SOURCE_STATIC = "static"
+"""Ceiling source: configured static fallback (slot query failed)."""
+
+#: Guards the once-per-run derivation log (see
+#: :func:`_reset_audit_ceiling_log`).
+_AUDIT_CEILING_LOG_EMITTED = False
+
+
+def _reset_audit_ceiling_log() -> None:
+    """Re-arm the once-per-run audit-ceiling derivation log.
+
+    Exists so tests can observe the log deterministically; production code
+    never calls it (the guard is per process, and a process is one run).
+    """
+    global _AUDIT_CEILING_LOG_EMITTED
+    _AUDIT_CEILING_LOG_EMITTED = False
+
+
+def _log_audit_ceiling(
+    ceiling: int,
+    source: str,
+    available: int | None = None,
+    total: int | None = None,
+) -> None:
+    """Log the derived audit ceiling once per run (slot state + source).
+
+    A single line per run makes the decision observable in the audit log
+    without flooding it: the helper is called from every pi-call launch, so
+    an unguarded print would emit once per call.
+    """
+    global _AUDIT_CEILING_LOG_EMITTED
+    if _AUDIT_CEILING_LOG_EMITTED:
+        return
+    _AUDIT_CEILING_LOG_EMITTED = True
+    print(
+        "Audit ceiling: "
+        f"ceiling={ceiling} source={source} "
+        f"available_slots={available} total_slots={total}",
+        file=sys.stderr,
+    )
+
+
+def _audit_ceiling_from_slots() -> tuple[int, str, int | None, int | None]:
+    """Derive the audit ceiling from the live proxy slot capacity.
+
+    Queries the slot-status endpoint (see :func:`_query_slot_status`) and
+    returns ``(ceiling, source, available_slots, total_slots)`` where the
+    ceiling is ``max(1, min(available_slots, total_slots))`` — never above
+    the proxy's reported capacity, and never below 1 so a saturated pool
+    degrades to sequential execution instead of stalling.
+
+    The historical static ceiling (``DEFAULT_MAX_WORKERS``) is used when the
+    query fails: slot discovery is an optimisation, so an unreachable
+    endpoint must never block or fail an audit (fail-open).
+    """
+    try:
+        available, total = _query_slot_status()
+    except Exception:  # noqa: BLE001 — fail-open, mirrors _query_slot_status
+        available, total = None, None
+    if available is None or total is None:
+        return DEFAULT_MAX_WORKERS, AUDIT_CEILING_SOURCE_STATIC, None, None
+    capacity = max(0, min(int(available), int(total)))
+    return max(1, capacity), AUDIT_CEILING_SOURCE_SLOTS, available, total
+
+
 def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
-    """Resolve the audit concurrency ceiling.
+    """Resolve the audit concurrency ceiling (pi-call semaphore size).
 
     Precedence:
-      1. ``--max-concurrency`` CLI flag (explicit override)
-      2. ``AUDIT_MAX_CONCURRENCY`` environment variable
-      3. ``DEFAULT_MAX_WORKERS`` (6)
+      1. ``--max-concurrency`` CLI flag (explicit override, authoritative)
+      2. ``AUDIT_MAX_CONCURRENCY`` environment variable (authoritative)
+      3. live proxy slot status: ``max(1, min(available_slots, total_slots))``
+      4. ``DEFAULT_MAX_WORKERS`` (6) static fallback when the query fails
 
-    Right-sized via the F7 harness to the host's measured audit-slot capacity
-    (SA-0MUSZJRB9006ZCHE): 6 = 2x the 3-slot local LLM proxy pool; the
-    harness drained a burst of 8 audits with a batch-attributable load delta
-    <= 1.63 on the 16-core host and no swap growth.
+    Sizing the ceiling from the live slot capacity removes the queue-induced
+    timeout inflation that a hardcoded 6 against a 2-slot proxy produced
+    (SA-0MVF1NKZQ009P3ZG AC3): six concurrent pi sessions queued behind two
+    slots and the queue wait was charged against each call's own timeout
+    budget. Explicit operator intent is never overridden — the CLI and env
+    layers keep precedence, so a deliberate ceiling always wins.
+
+    The derivation is logged once per run (slot status, ceiling, source).
 
     An invalid (non-integer) env value is ignored with a warning so a
-    misconfigured environment cannot break the audit run.
+    misconfigured environment cannot break the audit run; it degrades to the
+    static ceiling rather than consulting the slot endpoint, because the
+    operator clearly intended an explicit ceiling.
     """
     if cli_value is not None:
-        return max(1, int(cli_value))
+        ceiling = max(1, int(cli_value))
+        _log_audit_ceiling(ceiling, AUDIT_CEILING_SOURCE_CLI)
+        return ceiling
     env_value = os.environ.get(ENV_MAX_WORKERS)
     if env_value:
         try:
-            return max(1, int(env_value))
+            ceiling = max(1, int(env_value))
         except ValueError:
             print(
                 f"Warning: invalid {ENV_MAX_WORKERS} value {env_value!r}; "
                 "using default ceiling",
                 file=sys.stderr,
             )
-    return DEFAULT_MAX_WORKERS
+            _log_audit_ceiling(DEFAULT_MAX_WORKERS, AUDIT_CEILING_SOURCE_STATIC)
+            return DEFAULT_MAX_WORKERS
+        _log_audit_ceiling(ceiling, AUDIT_CEILING_SOURCE_ENV)
+        return ceiling
+    ceiling, source, available, total = _audit_ceiling_from_slots()
+    _log_audit_ceiling(ceiling, source, available, total)
+    return ceiling
 
 
 def _audit_lock_timeout() -> float:
@@ -4121,6 +4208,62 @@ def _phase2_batch_enabled(cli_value: bool | None = None) -> bool:
     return env_value.strip().lower() in ("1", "true", "yes", "on")
 
 
+AUDIT_PHASE1_BATCH_ENV = "AUDIT_PHASE1_BATCH"
+"""Environment variable enabling Phase 1 batch screening (SA-0MVI6VRJT005M650).
+
+When set to a truthy value (and ``--batch-phase1`` is not passed), the
+pending child Phase-1 AC screens are folded into ONE indexed ``pi`` call
+(``phase1_batch``) instead of one full-prompt session per child. Phase 1 is
+the dominant cost centre (44 % of measured call time on the committed
+baseline; 62 % on the epic brief's accounting), and its per-child calls are
+the N of the N+1 structure.
+
+Off by default so no existing invocation changes behaviour until the
+batching-on/off parity evidence is reviewed (frozen-verdict-semantics
+constraint, SA-0MVF1NKZQ009P3ZG §Constraints).
+"""
+
+AUDIT_PHASE1_MODEL_ENV = "AUDIT_PHASE1_MODEL"
+"""Environment variable selecting the Phase 1 screening model.
+
+Phase 1 screening is structurally shallow (read the manifest, map each AC to
+a verdict) and is 44-62 % of audit call time, so routing it to a faster model
+is the cheapest per-call win available. Unset by default: Phase 1 keeps the
+resolved audit model so no invocation silently changes model
+(SA-0MVI6VRJT005M650 AC5).
+"""
+
+
+def _phase1_batch_enabled(cli_value: bool | None = None) -> bool:
+    """Resolve whether Phase 1 batch screening is enabled.
+
+    Precedence:
+      1. ``--batch-phase1`` CLI flag (explicit override)
+      2. ``AUDIT_PHASE1_BATCH`` environment variable (truthy)
+      3. ``False`` (default — preserves the existing N+1 per-child pattern)
+    """
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(AUDIT_PHASE1_BATCH_ENV, "")
+    return env_value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_phase1_model(cli_value: str | None = None) -> str | None:
+    """Resolve the Phase 1 screening model override, if any.
+
+    Precedence:
+      1. ``--phase1-model`` CLI flag (explicit override)
+      2. ``AUDIT_PHASE1_MODEL`` environment variable
+      3. ``None`` — callers fall back to the resolved audit model, so an
+         existing invocation never silently changes model
+         (SA-0MVI6VRJT005M650 AC5).
+    """
+    if cli_value:
+        return cli_value
+    env_value = os.environ.get(AUDIT_PHASE1_MODEL_ENV)
+    return env_value or None
+
+
 AUDIT_CHILD_IN_MAIN_SLOT_ENV = "AUDIT_CHILD_IN_MAIN_SLOT"
 """Environment variable for the child-audit execution mode gate.
 
@@ -4205,22 +4348,51 @@ def _normalize_model_source(source: str | None) -> str:
 # Pi integration
 # ---------------------------------------------------------------------------
 
-def _resolve_call_timeout(timeout: int | None, child_screen: bool = False) -> int:
+def _resolve_call_timeout(timeout: int | None, child_screen: bool = False,
+                          parent_screen: bool = False) -> int:
     """Resolve the effective per-call Pi timeout for a single call.
 
     Precedence:
       1. explicit ``timeout`` arg (from ``--timeout`` / ``AUDIT_PI_TIMEOUT``)
-      2. child Phase-1 AC-review screens: ``AUDIT_CHILD_SCREEN_TIMEOUT``
-         env or ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600 s) — a lightweight
-         child screen that exceeds its short budget fails fast instead of
-         burning the full 1800 s (LP-0MSQ32S2M001EA74 AC1)
-      3. all other calls: ``CALL_PI_TIMEOUT`` (1800 s)
+      2. parent Phase-1 AC screen: ``AUDIT_PARENT_SCREEN_TIMEOUT`` env or
+         ``_PARENT_SCREEN_TIMEOUT_DEFAULT`` (1080 s — the same measured
+         screening budget as child screens, `ceil(p95 x 2)`), so a parent
+         screen that exceeds its budget is quarantined instead of burning
+         the full 1800 s (SA-0MVJ3Q662006RDJR)
+      3. child Phase-1 AC-review screens: ``AUDIT_CHILD_SCREEN_TIMEOUT``
+         env or ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s, derived from
+         measured p95 x 2) — a child screen that exceeds its budget is
+         quarantined instead of burning the full 1800 s
+         (LP-0MSQ32S2M001EA74 AC1, SA-0MVI3608M0080QLW)
+      4. all other calls: ``CALL_PI_TIMEOUT`` (1800 s)
     """
     if timeout is not None:
         return timeout
+    if parent_screen:
+        return (
+            _resolve_parent_screen_timeout(None)
+            or _PARENT_SCREEN_TIMEOUT_DEFAULT
+        )
     if child_screen:
         return _resolve_child_screen_timeout(None) or _CHILD_SCREEN_TIMEOUT_DEFAULT
     return CALL_PI_TIMEOUT
+
+
+def _screen_call_capped(result: dict | None) -> bool:
+    """Whether a Phase-1 screen call was capped (timeout / concurrency wait).
+
+    A capped screen is quarantined: it degrades to the conservative
+    ``partial`` verdict with evidence naming the budget and phase, and the
+    run counts it in the reliability summary. A cap must never trigger the
+    bounded JSON re-ask or a full-model retry — those would spend a second
+    full-length call in service of the call that already exhausted its
+    budget (the 1800 s parent cap + 1147 s re-ask of SA-0MVI6VVC00029XO4's
+    measurement; SA-0MVJ3Q662006RDJR AC2).
+    """
+    return bool(
+        isinstance(result, dict)
+        and (result.get("_timeout") or result.get("_concurrency_timeout"))
+    )
 
 
 def _communicate_with_stall(process, cmd: list[str],
@@ -4330,6 +4502,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              max_retries: int | None = None,
              ac_fallback_used: threading.Event | None = None,
              child_screen: bool = False,
+             parent_screen: bool = False,
              issue_id: str = "",
              context: str = "",
              priority: int = Priority.MEDIUM) -> dict:
@@ -4359,9 +4532,18 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
 
         child_screen: If True, this is a lightweight child Phase-1 AC-review
             screen; it uses the short per-call budget
-            (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 600 s, configurable via
+            (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, derived from measured
+            p95 x 2, configurable via
             ``AUDIT_CHILD_SCREEN_TIMEOUT`` / ``--child-screen-timeout``)
             instead of the 1800 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
+
+        parent_screen: If True, this is the parent Phase-1 AC screen; it uses
+            the same measured right-sized screening budget
+            (``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, configurable via
+            ``AUDIT_PARENT_SCREEN_TIMEOUT`` / ``--parent-screen-timeout``)
+            instead of the 1800 s Phase-2 budget, so a capped parent screen is
+            quarantined rather than burning 30 minutes
+            (SA-0MVJ3Q662006RDJR AC1/AC3).
 
         issue_id: Work-item ID used in the ``--session-id`` flag.
         context: Phase/context string used in the ``--session-id`` flag
@@ -4412,7 +4594,9 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     if issue_id:
         cmd.extend(["--session-id", _build_session_id(issue_id, context)])
 
-    effective_timeout = _resolve_call_timeout(timeout, child_screen=child_screen)
+    effective_timeout = _resolve_call_timeout(
+        timeout, child_screen=child_screen, parent_screen=parent_screen,
+    )
     stall_timeout = _resolve_stall_timeout()
     effective_max_retries = _PI_MAX_RETRIES if max_retries is None else max_retries
     attempt = 0
@@ -4719,11 +4903,92 @@ def _extract_provider_error(raw: str) -> str | None:
 # Acceptance-criteria extractor
 # ---------------------------------------------------------------------------
 
+def _strip_trailing_commas(text: str) -> str:
+    """Remove JSON trailing commas that are outside string literals.
+
+    Models routinely emit ``{"a": 1,}`` or ``[1, 2,]`` — valid in JavaScript,
+    invalid in JSON. Without this repair such a response fails to parse and
+    costs a full re-ask (p50 461 s measured), so it is repaired in place.
+
+    Only commas that are followed (after whitespace) by ``]`` or ``}`` are
+    removed, and only when they appear outside a string literal, so a comma
+    that is part of a value (``"list: [a,]"``) is preserved as data.
+    """
+    out: list[str] = []
+    in_string = False
+    escape_next = False
+    i = 0
+    length = len(text)
+    while i < length:
+        char = text[i]
+        if escape_next:
+            escape_next = False
+            out.append(char)
+            i += 1
+            continue
+        if char == "\\" and in_string:
+            escape_next = True
+            out.append(char)
+            i += 1
+            continue
+        if char == '"':
+            in_string = not in_string
+            out.append(char)
+            i += 1
+            continue
+        if char == "," and not in_string:
+            # Look ahead past whitespace for a closing bracket.
+            j = i + 1
+            while j < length and text[j] in " \t\r\n":
+                j += 1
+            if j < length and text[j] in "]}":
+                i += 1  # drop the trailing comma, keep the whitespace
+                continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+def _tolerant_json_array_loads(candidate: str) -> list | None:
+    """Parse *candidate* as a JSON array, repairing common model slips.
+
+    Attempts, in order:
+      1. a strict ``json.loads`` of the candidate;
+      2. the same after removing trailing commas outside string literals,
+         plus Markdown code-fence lines (``` / ```json) that survived
+         extraction.
+
+    Returns the list on success, ``None`` when the text is genuinely not a
+    JSON array. Repair never reinterprets values — it only removes syntax
+    that JSON forbids — so verdict semantics are untouched
+    (SA-0MVI6VNDF001VE1S AC4).
+    """
+    try:
+        result = json.loads(candidate)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+    repaired = _strip_trailing_commas(candidate)
+    if repaired != candidate:
+        try:
+            result = json.loads(repaired)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def _extract_json_array(text: str) -> list | None:
     """Extract the last JSON array from text that may contain analysis before the array.
 
     Pi often returns analysis text followed by a JSON array at the end.
     This function finds the last `[` that is NOT inside a string and tries to parse.
+
+    Tolerance (AC4, SA-0MVI6VNDF001VE1S): prose around the array, Markdown
+    code fences, and trailing commas outside string literals are all accepted
+    so an unusual-but-well-formed response never costs a re-ask.
 
     Returns the parsed list if found, otherwise None.
     """
@@ -4759,23 +5024,17 @@ def _extract_json_array(text: str) -> list | None:
     for start in reversed(possible_starts):
         candidate = text[start:].strip()
 
-        # Try the full candidate first
-        try:
-            result = json.loads(candidate)
-            if isinstance(result, list):
-                return result
-        except json.JSONDecodeError:
-            pass
+        # Try the full candidate first (tolerating trailing commas)
+        result = _tolerant_json_array_loads(candidate)
+        if result is not None:
+            return result
 
         # If that failed, try to find where the JSON array ends
         for end_search in range(len(candidate) - 1, 0, -1):
             if candidate[end_search] == ']':
-                try:
-                    result = json.loads(candidate[:end_search + 1])
-                    if isinstance(result, list):
-                        return result
-                except json.JSONDecodeError:
-                    continue
+                result = _tolerant_json_array_loads(candidate[:end_search + 1])
+                if result is not None:
+                    return result
 
     return None
 
@@ -4792,7 +5051,21 @@ _JSON_REASK_PREFIX = (
 _JSON_REASK_SCHEMA = (
     "Each element MUST be an object with keys 'index' (integer), 'verdict' "
     "(one of met, unmet, partial, adjusted) and 'evidence' (a one-line note "
-    "with a file:line reference)."
+    "with a file:line reference). No Markdown code fences, no prose before or "
+    "after the array, and no trailing comma before a closing ']' or '}'."
+)
+
+#: Strict JSON contract carried on the FIRST call of every JSON-expecting
+#: phase (SA-0MVI6VNDF001VE1S AC4). Historically only the re-ask carried the
+#: strict schema, so the first response often used a code fence or a trailing
+#: comma and paid for a second full-length call (p50 461 s). Stating the
+#: contract up front removes most re-asks at zero extra cost.
+_JSON_CONTRACT_INSTRUCTION = (
+    "JSON CONTRACT — Return ONLY a single valid JSON array and nothing else: "
+    "no prose before or after it, no Markdown code fences, and no trailing "
+    "comma before a closing ']' or '}'. "
+    + _JSON_REASK_SCHEMA
+    + " "
 )
 
 
@@ -4805,6 +5078,7 @@ def _reask_json_array_once(
     instruction: str,
     priority: int | None = None,
     child_screen: bool = False,
+    parent_screen: bool = False,
 ) -> list | None:
     """Issue exactly one bounded 'return only the JSON array' re-ask.
 
@@ -4813,17 +5087,20 @@ def _reask_json_array_once(
     under the ``verdict_reask`` context and bounded by the per-call budget
     (child Phase-1 screens keep their short budget when *child_screen* is
     True, so the retry is as bounded as the call it retries —
-    WL-0MU0FHSEP003PCDY AC4). Returns the recovered batch, or ``None`` when
-    the single re-ask also fails (timeout, provider error, or unparseable
-    output) — the caller then falls back to the conservative ``partial``
-    verdict, never ``met`` (SA-0MU32TCFM003B78I AC3/AC5).
+    WL-0MU0FHSEP003PCDY AC4; the parent Phase-1 screen keeps the right-sized
+    parent budget when *parent_screen* is True). Returns the recovered batch,
+    or ``None`` when the single re-ask also fails (timeout, provider error, or
+    unparseable output) — the caller then falls back to the conservative
+    ``partial`` verdict, never ``met`` (SA-0MU32TCFM003B78I AC3/AC5).
     """
     prompt = _JSON_REASK_PREFIX + _JSON_REASK_SCHEMA + "\n\n" + instruction
+    _rel_incr("verdict_reasks")
     try:
         result = _call_pi_and_maybe_log(
             issue_id, "verdict_reask", prompt,
             model=model, pi_bin=pi_bin, debug_log=debug_log,
             timeout=timeout, json_expected=True, child_screen=child_screen,
+            parent_screen=parent_screen,
             priority=priority if priority is not None else Priority.MEDIUM,
         )
     except RuntimeError:
@@ -5070,6 +5347,42 @@ def _extract_key_files(description: str) -> list[str]:
     return files
 
 
+def _filter_existing_paths(paths: Sequence[str],
+                           project_root: Path | None = None) -> list[str]:
+    """Keep only *paths* that exist on disk (bounded, de-duplicated order).
+
+    Deleted and transient paths are dropped so that lint-scoped runs never
+    target ghost paths — without this filter, ``ruff check`` fails with
+    ``E902`` (IO error) and the remediation loop then writes junk
+    per-file-ignores for machine-absolute paths (SA-0MSXVXVUL0011JKX).
+
+    *project_root* is the base for repo-relative paths; it defaults to the
+    cwd-derived ``TARGET_PROJECT_ROOT`` (the launch-root fallback).
+    """
+    root = (
+        Path(project_root).resolve() if project_root is not None
+        else Path(TARGET_PROJECT_ROOT).resolve()
+    )
+    existing: list[str] = []
+    for path in paths:
+        # The ghost-path stat is best-effort: a pathological entry (e.g. a
+        # path component longer than NAME_MAX, an unreadable link, or a
+        # non-path payload returned by a mocked runner) raises OSError from
+        # ``Path.exists()``. Skip such entries rather than letting the
+        # manifest build abort (SA-0MUERWHED002FNQ4 regression: 13 audit
+        # tests failed with "File name too long").
+        try:
+            p = Path(path)
+            if p.is_absolute():
+                if p.exists():
+                    existing.append(path)
+            elif (root / p).exists() or Path(path).exists():
+                existing.append(path)
+        except OSError:
+            continue
+    return existing[:_FILE_SCOPE_MAX_FILES]
+
+
 def _git_changed_files(runner: Runner) -> list[str]:
     """Return the list of changed/untracked files from git (bounded).
 
@@ -5107,29 +5420,62 @@ def _git_changed_files(runner: Runner) -> list[str]:
 
     # ------------------------------------------------------------------
     # Drop ghost paths (deleted / transient files) that git reports but
-    # that no longer exist on disk.  Without this filter, ``ruff check``
-    # fails with E902 (IO error) and the remediation loop writes junk
-    # per-file-ignores for machine-absolute ghost paths (SA-0MSXVXVUL0011JKX).
+    # that no longer exist on disk (SA-0MSXVXVUL0011JKX).
     # ------------------------------------------------------------------
-    root = Path(TARGET_PROJECT_ROOT).resolve()
-    existing: list[str] = []
-    for path in changed:
-        # The ghost-path stat is best-effort: a pathological entry (e.g. a
-        # path component longer than NAME_MAX, an unreadable link, or a
-        # non-path payload returned by a mocked runner) raises OSError from
-        # ``Path.exists()``. Skip such entries rather than letting the
-        # manifest build abort (SA-0MUERWHED002FNQ4 regression: 13 audit
-        # tests failed with "File name too long").
-        try:
-            p = Path(path)
-            if p.is_absolute():
-                if p.exists():
-                    existing.append(path)
-            elif (root / p).exists() or Path(path).exists():
-                existing.append(path)
-        except OSError:
-            continue
-    return existing[:_FILE_SCOPE_MAX_FILES]
+    return _filter_existing_paths(changed)
+
+
+_CODE_QUALITY_SCOPE_EMPTY_REASON = (
+    "no in-scope files could be resolved (the git changed-file list is empty "
+    "and no committed touched files or Key Files resolved to existing paths) "
+    "— the whole-repository scan is deliberately not run "
+    "(SA-0MUI5ZYO6002W3KD)"
+)
+"""Documented skip reason for an empty code-quality scope.
+
+The audit must never silently widen an empty scope to a whole-repository
+lint: on the normal post-merge state (the item's work is already committed
+and the checkout is clean) that would report unrelated pre-existing findings
+against this item (SA-0MUI5ZYO6002W3KD).
+"""
+
+
+def _resolve_code_quality_scope(
+    runner: Runner,
+    issue_id: str,
+    work_item: dict | None = None,
+    comments: Sequence[dict] | None = None,
+    project_root: Path | None = None,
+) -> list[str]:
+    """Resolve the file scope for the audit's code-quality scans.
+
+    Both code-quality call sites (the Phase 1 scan and the remediation
+    re-scan) MUST resolve scope through this helper so neither can fall back
+    to the whole repository (SA-0MUI5ZYO6002W3KD AC5).
+
+    Resolution order:
+
+    1. the git changed-file list (``git diff --name-only HEAD`` +
+       ``git status --porcelain``) — the working-tree changes; then
+    2. the item's committed *touched* files (``_resolve_touched_files``:
+       files in commits referencing the item id, commit shas recorded in
+       its comments, and its Key Files). This is the source that keeps an
+       already-merged item in scope: its work is committed and the checkout
+       is clean, so (1) is empty.
+
+    Returns ``[]`` when no scope can be resolved. An empty result means
+    "lint nothing": callers MUST skip the scan with a documented reason
+    (``_CODE_QUALITY_SCOPE_EMPTY_REASON``), because ``_run_ruff_check``
+    treats a falsy ``files`` argument as a WHOLE-PROJECT scan — passing
+    ``None`` or ``[]`` would scan the entire repository.
+    """
+    changed = _git_changed_files(runner)
+    if changed:
+        return changed
+    touched = _resolve_touched_files(
+        runner, issue_id, work_item=work_item, comments=comments,
+    ) or []
+    return _filter_existing_paths(touched, project_root)
 
 
 def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
@@ -5563,12 +5909,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       line is emitted near the header so the report records the evidence
       source distinctly from the cache-consumption path.
 
-    *content_fingerprint* is the content fingerprint (per-touched-file state
-      + description hash + Key Files, see ``_compute_content_fingerprint``)
-      captured at audit time. When provided, an
-      ``Audit content fingerprint: <hex>`` line is emitted near the header so
-      the persisted report carries the freshness gate data
-      (SA-0MSKB6US1009CNHT). The line is parsed back by
+    *content_fingerprint* is the content fingerprint (a sha256 over the work
+      item's own title + description payload, zero git calls, see
+      ``_compute_content_fingerprint``) captured at audit time. When provided,
+      a versioned ``Audit content fingerprint (v2): <hex>`` line is emitted
+      near the header so the persisted report carries the freshness gate data
+      (SA-0MSKB6US1009CNHT, SA-0MVIDI8E00063OOP). The line is parsed back by
       ``_extract_content_fingerprint``.
 
     Ready-to-close logic:
@@ -5607,15 +5953,32 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if reason:
             child_reasons[cid] = reason
 
-    child_acs = [
-        a
-        for c in child_results
-        if (
-            str(c.get("id", "") or "") not in unserviced_ids
-            or not _child_has_stored_verdict(c)
-        )
-        for a in c.get("ac_results", [])
-    ]
+    # F3a (SA-0MVI35BIU002MTZQ, corrected RCA §5): child AC verdicts
+    # contribute to the parent's closure ONLY when the child is not an
+    # ASSESSED exempt child. An assessed exempt child (in_review/done/deleted
+    # or snapshot-exempt AND carrying a stored verdict) must not block the
+    # parent through a tainted/incorrect AC verdict produced by a
+    # parent-triggered re-screen — otherwise the exemption-aware checks that
+    # follow (`all_children_reviewed`, `any_child_audit_not_ready`) are
+    # defeated by this aggregation. A child with NO stored verdict (e.g. an
+    # unserviced in-main-slot screen) is NOT assessed and still counts, so it
+    # can never be reported ready.
+    child_acs: list[dict] = []
+    blocking_child_acs: list[tuple[str, dict]] = []
+    for c in child_results:
+        cid = str(c.get("id", "") or "")
+        # Un-serviced children whose stored verdict the parent INHERITS
+        # contribute no ACs (the stored verdict governs); un-serviced
+        # children without one are NOT-ASSESSED and still count.
+        if cid in unserviced_ids and _child_has_stored_verdict(c):
+            continue
+        # Assessed exempt children do not block through their AC verdicts.
+        if _child_is_exempt(c, snapshot_exempt) and _child_has_stored_verdict(c):
+            continue
+        for a in c.get("ac_results", []):
+            child_acs.append(a)
+            if a.get("verdict") not in _ACCEPTABLE_VERDICTS:
+                blocking_child_acs.append((cid, a))
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
         for r in ac_results + child_acs
@@ -5756,12 +6119,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if "Pi provider error" in _evidence_text(r.get("evidence"))
     )
 
+    # NOTE (SA-0MVI35BIU002MTZQ, corrected RCA §5): every ``not_reviewed``
+    # reference below is inside the Ready=No branch, so it cannot DRIVE the
+    # verdict — an earlier draft's claim that it contradicts the verdict was
+    # disproven. The verified misattribution (F3b) is handled explicitly by
+    # the ``blocking_child_acs`` branch in the narrative below.
     not_reviewed = [
         c for c in child_results
         if c.get("stage") not in ("in_review", "done", "")
     ]
 
-    if ready_before_cq == "Yes":
+    # A pending in-main-slot child screen forces Ready=No and must be
+    # presented as the child-audit execution gate (not as a normal result),
+    # even when the parent's own ACs pass — the gate text lives in the
+    # Ready=No branch below.
+    if ready_before_cq == "Yes" and not pending_child_screens:
         if has_blocking_cq:
             lines.append(
                 "All acceptance criteria are met and children are reviewed, "
@@ -5823,6 +6195,33 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"{partial_count} of {len(ac_results)} acceptance criteria are "
                 f"only partially met."
+            )
+        elif blocking_child_acs:
+            # F3b (SA-0MVI35BIU002MTZQ, corrected RCA §5): when the parent's
+            # own ACs are all acceptable, the blocker comes from child AC
+            # aggregation — name it explicitly (ids + fallback provenance)
+            # instead of blaming the children's stages, which misdirects the
+            # operator to a stage problem the exemption already neutralised.
+            blocking_ids: list[str] = []
+            for cid, _ac in blocking_child_acs:
+                if cid and cid not in blocking_ids:
+                    blocking_ids.append(cid)
+            tainted = [
+                ac for _cid, ac in blocking_child_acs
+                if any(marker in _evidence_text(ac.get("evidence"))
+                       for marker in _INFRA_FALLBACK_MARKERS)
+            ]
+            provenance = ""
+            if tainted:
+                provenance = (
+                    f" {len(tainted)} of these came from an infrastructure "
+                    "fallback (timeout/parse/provider error), not a model "
+                    "assessment, so they do not reflect an explicit 'No'."
+                )
+            lines.append(
+                f"{len(blocking_child_acs)} child acceptance criteria not "
+                f"acceptable ({', '.join(blocking_ids)}); the children's own "
+                f"stages are not the blocker.{provenance}"
             )
         elif not_reviewed:
             lines.append(
@@ -6125,12 +6524,12 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict],
       no model line is emitted. When ``None`` or empty, the fallback
       ``Model: manual (no provider)`` is used.
     *model_source* is the source of the model (``"local"`` or ``"remote"``).
-    *content_fingerprint* is the content fingerprint (per-touched-file state
-      + description hash + Key Files, see ``_compute_content_fingerprint``)
-      captured at audit time. When provided, an
-      ``Audit content fingerprint: <hex>`` line is emitted near the header so
-      the persisted child report stays content-gate-able on future parent
-      runs (LP-0MSQ32MF200675AR).
+    *content_fingerprint* is the content fingerprint (a sha256 over the child's
+      own title + description payload, zero git calls, see
+      ``_compute_content_fingerprint``) captured at audit time. When provided,
+      a versioned ``Audit content fingerprint (v2): <hex>`` line is emitted
+      near the header so the persisted child report stays content-gate-able on
+      future parent runs (LP-0MSQ32MF200675AR, SA-0MVIDI8E00063OOP).
 
     Ready-to-close logic:
       - All acceptance criteria must be ``met`` or ``adjusted``.
@@ -6214,6 +6613,7 @@ def _persist_child_audit(
     model_source: str | None = None,
     worklog_dir: str | None = None,
     content_fingerprint: str | None = None,
+    runner: Runner | None = None,
 ) -> tuple[bool, str]:
     """Assemble and persist an audit report for a single child work item.
 
@@ -6224,6 +6624,19 @@ def _persist_child_audit(
     *content_fingerprint* (when provided) is embedded in the child report so
     parent-persisted child audits stay content-gate-able on future runs
     (LP-0MSQ32MF200675AR).
+
+    **Lifecycle neutrality (SA-0MVI35BIU002MTZQ AC1/AC2).** A child audit
+    persisted by a parent run is a read-only side effect of the parent: it
+    must never change the child's lifecycle. ``wl audit-set
+    --ready-to-close no`` unconditionally reverts a ``completed``/
+    ``in_review`` item to ``open``/``plan_complete`` (a deliberate primitive
+    for independently re-audited items, WL-0MSKHYI5U0069FVV), so after
+    persisting we restore the captured pre-persist (status, stage) when the
+    readback shows the primitive changed it. *runner* (the parent's
+    injectable runner) is used for the readback/restore; when omitted (unit
+    tests / callers without one) no restore is attempted. The restore also
+    un-blocks any dependent the transient reversion cascaded to ``blocked``
+    (the worklog dependency engine reconciles on the child's update).
 
     Returns (rc, report_text).
     rc == 0 on success; rc == PERSIST_CONTENT_INVALID (4) when only the
@@ -6245,7 +6658,89 @@ def _persist_child_audit(
     )
 
     rc = persist_audit(child_id, report, worklog_dir=worklog_dir)
+    if runner is not None:
+        # Undo the `audit-set` reversion side effect immediately so the
+        # demotion window is as short as possible (dependents blocked by the
+        # transient revert are un-blocked by the restore via the worklog's
+        # dependency reconcile). Tainted verdicts take the same restore path
+        # — an infra-fallback 'No' must never demote a child
+        # (SA-0MVI35BIU002MTZQ AC2).
+        _restore_child_pre_audit_lifecycle(
+            child_id, child_status, child_stage,
+            runner=runner, worklog_dir=worklog_dir,
+        )
     return rc, report
+
+
+def _restore_child_pre_audit_lifecycle(
+    child_id: str,
+    pre_status: str,
+    pre_stage: str,
+    runner: Runner,
+    worklog_dir: str | None = None,
+) -> bool:
+    """Restore a child's pre-audit lifecycle after a parent-persisted audit.
+
+    ``wl audit-set --ready-to-close no`` reverts ``completed``/``in_review``
+    to ``open``/``plan_complete`` with no knowledge of audit exemptions or
+    fallback provenance (SA-0MVI35BIU002MTZQ). A parent-persisted child
+    audit is a read-only side effect of the parent run, so the captured
+    pre-audit (status, stage) is restored when the readback shows it changed
+    (which can only be a demotion — ``audit-set`` never promotes).
+
+    The restore is best-effort but verified: a ``wl update`` is only issued
+    when the live state actually diverged, and the result is read back.
+    Failures are logged, never fatal — the audit itself already persisted.
+
+    Returns True when the child's live state equals the captured pre-audit
+    state after the restore (or was never changed), False when the state
+    could not be verified/restored.
+    """
+    if not pre_status or not pre_stage:
+        return True
+    safe_status, safe_stage = _coerce_valid_status_stage(pre_status, pre_stage)
+    actual = _read_item_lifecycle_state(runner, child_id, worklog_dir)
+    if actual is None:
+        # Unverifiable readback: never blind-write a restore that could
+        # clobber a concurrent change.
+        print(
+            f"Warning: could not verify child {child_id} lifecycle after "
+            "parent-persisted audit (wl show failed); skipping restore.",
+            file=sys.stderr,
+        )
+        return False
+    if actual == (safe_status, safe_stage):
+        return True
+    try:
+        _run_wl(
+            runner,
+            ["wl", "update", child_id,
+             "--status", safe_status, "--stage", safe_stage, "--json"],
+            worklog_dir=worklog_dir,
+        )
+    except RuntimeError as exc:
+        print(
+            f"Warning: failed to restore child {child_id} to its pre-audit "
+            f"lifecycle ({safe_status}/{safe_stage}): {exc}",
+            file=sys.stderr,
+        )
+        return False
+    after = _read_item_lifecycle_state(runner, child_id, worklog_dir)
+    if after != (safe_status, safe_stage):
+        print(
+            f"Warning: child {child_id} lifecycle restore to "
+            f"({safe_status}/{safe_stage}) not confirmed (readback "
+            f"{after}); manual check recommended.",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        f"Parent-persisted child audit left {child_id} lifecycle-neutral: "
+        f"restored {actual[0]}/{actual[1]} -> "
+        f"{safe_status}/{safe_stage}.",
+        file=sys.stderr,
+    )
+    return True
 
 
 def _assemble_project_report(summary: str, recommendation: str) -> str:
@@ -6350,6 +6845,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            max_retries: int | None = None,
                            ac_fallback_used: threading.Event | None = None,
                            child_screen: bool = False,
+                           parent_screen: bool = False,
                            ac_count: int | None = None,
                            json_expected: bool = False,
                            priority: int | None = None,
@@ -6372,6 +6868,9 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         child_screen: If True, forwards to _call_pi() so child Phase-1
             AC-review screens use the short per-call budget
             (LP-0MSQ32S2M001EA74 AC1).
+        parent_screen: If True, forwards to _call_pi() so the parent Phase-1
+            AC screen uses the right-sized screening budget instead of the
+            1800 s Phase-2 budget (SA-0MVJ3Q662006RDJR AC1).
         ac_count: Number of acceptance criteria covered by this call. When
             supplied, the per-call timing line appends ``ac_count=N`` and
             ``avg_ac_elapsed_seconds`` (elapsed / N) so Phase-2 per-AC
@@ -6404,6 +6903,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools,
         timeout=timeout, max_retries=max_retries,
         ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+        parent_screen=parent_screen,
         issue_id=issue_id, context=context,
         priority=priority if priority is not None else Priority.MEDIUM,
     )
@@ -6548,12 +7048,12 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
 
     Freshness (LP-0MSQ32MF200675AR) uses the CONTENT-fingerprint gate
     FIRST — same logic as the item-level gate (_check_audit_freshness,
-    SA-0MSKB6US1009CNHT): when the stored report carries a content
-    fingerprint (the child's touched-file state + description hash + Key
-    Files captured at audit time, SA-0MSPZDALB000S18P), the audit is fresh
-    iff the fingerprint is unchanged, so a child whose updatedAt moved for
-    non-content reasons (comments, status bumps), or whose unrelated repo
-    files changed, is reused instead of re-audited. The legacy TIME gate
+    SA-0MSKB6US1009CNHT): when the stored report carries a **v2** content
+    fingerprint (a sha256 over the child's own title + description payload,
+    zero git calls — SA-0MVIDI8E00063OOP), the audit is fresh iff the
+    fingerprint is unchanged, so a child whose updatedAt moved for
+    non-content reasons (comments, status bumps), or whose repo files
+    changed, is reused instead of re-audited. The legacy TIME gate
     (auditedAt vs updatedAt + AUDIT_FRESHNESS_BUFFER_SECONDS) is kept as
     the floor for fingerprint-less legacy reports. When *force* is set,
     BOTH gates are bypassed and every child is re-audited.
@@ -6768,6 +7268,192 @@ def _child_acs_from_own_audit(child: dict, runner: Runner,
     return fallback if fallback is not None else fallback_met
 
 
+def _phase1_review_children_batched(
+    pending_children: list[tuple[int, dict]],
+    phase1_model: str,
+    full_model: str,
+    pi_bin: str,
+    debug_log: str | None,
+    timeout: int | None,
+    runner: Runner,
+    script_failure_callback: Callable[[str, Exception], None],
+    ac_fallback_used: threading.Event | None = None,
+) -> dict[int, list[dict]]:
+    """Screen ALL pending children's ACs in ONE indexed Phase 1 call.
+
+    Collapses the N child screens of the N+1 Phase 1 structure into a single
+    ``pi`` call (context ``phase1_batch``). Each child contributes a
+    ``child`` index and its ACs keep their per-child ``index``, so the reply
+    is a flat array of ``{child, index, verdict, evidence}`` objects that map
+    deterministically back onto the per-child AC lists.
+
+    Verdict semantics are unchanged (SA-0MVF1NKZQ009P3ZG §Constraints): a
+    child whose entries are missing from the reply — or a reply that is not
+    parseable at all — degrades that child's ACs to the conservative
+    ``partial`` verdict, exactly as a failed single-child screen does. A
+    batch can therefore never turn an unexamined AC into ``met``.
+
+    Returns ``{child_index: [ac_result, ...]}`` for every pending child.
+    Never raises: a Pi ``RuntimeError`` records a script failure and degrades
+    every child to ``partial``.
+    """
+    prepared: list[tuple[int, dict, list[str]]] = []
+    for ci, child in pending_children:
+        acs = _extract_acs(child.get("description", ""))
+        if acs and acs[0] != "No acceptance criteria defined.":
+            prepared.append((ci, child, acs))
+
+    # A child with no ACs needs no model call; start from its own result.
+    results: dict[int, list[dict]] = {
+        ci: [
+            {"text": ac, "verdict": VERDICT_PARTIAL,
+             "evidence": "No acceptance criteria to screen."}
+            for ac in _extract_acs(child.get("description", ""))
+        ]
+        for ci, child in pending_children
+        if not (_extract_acs(child.get("description", ""))
+                and _extract_acs(child.get("description", ""))[0]
+                != "No acceptance criteria defined.")
+    }
+    if not prepared:
+        return results
+
+    entries = [
+        {"child": ci, "index": j, "text": ac}
+        for ci, _child, acs in prepared
+        for j, ac in enumerate(acs)
+    ]
+    children_block = "\n\n".join(
+        f"### child={ci} — {child.get('id', '')}: {child.get('title', '')}\n"
+        f"{_build_file_scope_manifest(child, [], runner=runner)}"
+        for ci, child, _acs in prepared
+    )
+    prompt = (
+        f"[READ-ONLY AUDIT] You are performing a read-only audit. "
+        f"Do NOT close, modify, create, or delete any work items. "
+        f"Do NOT execute any wl, git, or other state-modifying commands. "
+        f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
+        f"Review the acceptance criteria of EVERY child work item below "
+        f"against the codebase in ONE pass. Return a SINGLE flat JSON array of "
+        f"objects, each with keys 'child' (integer, the child index shown "
+        f"below), 'index' (integer, the criterion's index within that child), "
+        f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
+        f"(a one-line note with a file:line reference). Return exactly one "
+        f"object per criterion listed.\n\n"
+        f"FILE SCOPE — Read ONLY the files listed in the per-child manifests "
+        f"below. Do not explore the whole repository. If a criterion requires "
+        f"a file not listed, state that in the evidence instead of searching "
+        f"for it.\n\n"
+        f"{children_block}\n\n"
+        f"{_SCANNING_BLOCK}"
+        f"If a criterion has acceptable variance (implementation differs from "
+        f"original spec but still satisfies user story intent), use verdict "
+        f"'adjusted' instead of 'unmet'. Include justification in the "
+        f"evidence field.\n\n"
+        f"Criteria: {json.dumps(entries)}"
+    )
+
+    try:
+        result = _call_pi_and_maybe_log(
+            "", "phase1_batch", prompt,
+            model=phase1_model, pi_bin=pi_bin, debug_log=debug_log,
+            timeout=timeout, ac_fallback_used=ac_fallback_used,
+            json_expected=True,
+        )
+    except RuntimeError as exc:
+        script_failure_callback("pi (phase1 batch review)", exc)
+        print(
+            f"Warning: Pi call failed for batched Phase 1 child review: {exc}",
+            file=sys.stderr,
+        )
+        result = {}
+    raw_text = (
+        result.get("extracted_text", "") or result.get("evidence", "")
+        or result.get("text", "")
+    )
+    batch = _extract_json_array(raw_text)
+    if batch is None:
+        try:
+            parsed = json.loads(raw_text)
+            batch = parsed if isinstance(parsed, list) else None
+        except (json.JSONDecodeError, TypeError):
+            batch = None
+    if not batch:
+        # AC4 safe fallback: a retry with the full model only when a distinct
+        # fast model was used. A capped batch (budget / concurrency wait) is
+        # never retried — it is quarantined as 'partial' so the run does not
+        # spend a second full-length call after the budget is already gone
+        # (SA-0MVJ3Q662006RDJR AC2/AC3).
+        if phase1_model != full_model and not _screen_call_capped(result):
+            print(
+                "Warning: fast Phase 1 model produced unparseable output — "
+                "retrying batched child review with the full audit model",
+                file=sys.stderr,
+            )
+            try:
+                result = _call_pi_and_maybe_log(
+                    "", "phase1_batch", prompt,
+                    model=full_model, pi_bin=pi_bin, debug_log=debug_log,
+                    timeout=timeout, ac_fallback_used=ac_fallback_used,
+                    json_expected=True,
+                )
+                raw_text = (
+                    result.get("extracted_text", "")
+                    or result.get("evidence", "")
+                    or result.get("text", "")
+                )
+                batch = _extract_json_array(raw_text)
+            except RuntimeError:
+                batch = None
+    # A capped child screen is quarantined, not silently treated as a model
+    # judgement (SA-0MVI3608M0080QLW): the result keeps the conservative
+    # `partial` verdict but its evidence names the budget and phase, and the
+    # run counts it in `child_screen_timeouts` so downstream consumers can
+    # exclude it.
+    capped = _screen_call_capped(result)
+    if capped:
+        _rel_incr("child_screen_timeouts")
+    answers: dict[tuple[int, int], dict] = {}
+    for item in batch or []:
+        if not isinstance(item, dict):
+            continue
+        child_idx = item.get("child")
+        ac_idx = item.get("index")
+        if isinstance(child_idx, int) and isinstance(ac_idx, int):
+            answers[(child_idx, ac_idx)] = item
+    for ci, child, acs in prepared:
+        ac_results: list[dict] = []
+        for j, ac in enumerate(acs):
+            item = answers.get((ci, j), {})
+            if item:
+                ac_results.append({
+                    "text": ac,
+                    "verdict": _normalize_verdict(item.get("verdict", "unmet")),
+                    "evidence": _evidence_text(item.get("evidence")),
+                })
+            else:
+                if capped:
+                    evidence = (
+                        "Child screen reached its Phase 1 budget "
+                        f"({_CHILD_SCREEN_TIMEOUT_DEFAULT} s, "
+                        "AUDIT_CHILD_SCREEN_TIMEOUT) before returning a "
+                        "verdict — QUARANTINED as partial (never met); raise "
+                        "the budget and re-run to verify this criterion."
+                    )
+                else:
+                    evidence = (
+                        "Batched Phase-1 screen returned no verdict for this "
+                        "criterion — treated as partial (never met)."
+                    )
+                ac_results.append({
+                    "text": ac,
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": evidence,
+                })
+        results[ci] = ac_results
+    return results
+
+
 def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                              full_model: str, pi_bin: str,
                              debug_log: str | None,
@@ -6813,7 +7499,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
             f"[READ-ONLY AUDIT] You are performing a read-only audit. "
             f"Do NOT close, modify, create, or delete any work items. "
             f"Do NOT execute any wl, git, or other state-modifying commands. "
-            f"Return ONLY a structured JSON array.\n\n"
+            f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
             f"Review the following acceptance criteria for child work item '{child.get('title', '')}' "
             f"against the codebase. "
             f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
@@ -6972,6 +7658,19 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                     evidence = _parse_failure_evidence(
                         result, "Phase 1 child screening",
                     )
+            # A screen that hit its Phase 1 budget is QUARANTINED, not a
+            # model judgement (SA-0MVI3608M0080QLW): the evidence names the
+            # budget and phase, and the run counts it in the reliability
+            # summary so downstream consumers can exclude it.
+            if result.get("_timeout") or result.get("_concurrency_timeout"):
+                _rel_incr("child_screen_timeouts")
+                evidence = (
+                    f"Child screen reached its Phase 1 budget "
+                    f"({_CHILD_SCREEN_TIMEOUT_DEFAULT} s, "
+                    f"AUDIT_CHILD_SCREEN_TIMEOUT) before returning a verdict — "
+                    f"QUARANTINED as partial (never met); raise the budget and "
+                    f"re-run to verify this criterion. {evidence}"
+                )
             for ac in child_acs:
                 child_ac_results.append({
                     "text": ac,
@@ -7257,6 +7956,14 @@ def _build_issue_json(
             str(c.get("id", "") or "") not in unserviced_ids
             or not _child_has_stored_verdict(c)
         )
+        # An ASSESSED exempt child does not contribute blocking AC verdicts
+        # — its lifecycle is already on the review queue (or closed) and a
+        # parent-triggered re-screen must not block the parent through a
+        # tainted/incorrect child verdict (SA-0MVI35BIU002MTZQ AC5, mirrored
+        # in the markdown report path). A child with NO stored verdict is NOT
+        # assessed and still counts.
+        and not (_child_is_exempt(c, snapshot_exempt)
+                 and _child_has_stored_verdict(c))
         for a in c.get("ac_results", [])
     ]
     all_ac_acceptable = all(
@@ -7421,7 +8128,7 @@ def _deep_analyze_child(
     child_prompt = (
         "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHILD] "
         "Do NOT close, modify, create, or delete any work items. "
-        "Return ONLY a structured JSON array.\n\n"
+        f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
         f"Deep code analysis for child: {child.get('title', '')} ({child.get('id', '')})\n\n"
         "FILE SCOPE — Read ONLY the files listed in the manifest below. "
         "Do not explore the whole repository. If a criterion requires a "
@@ -7708,7 +8415,7 @@ def _run_batch_phase2(
     batch_prompt = (
         "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — BATCH] "
         "Do NOT close, modify, create, or delete any work items. "
-        "Return ONLY a structured JSON array.\n\n"
+        f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
         "Deep code analysis for the parent work item and its active children. "
         "The criteria below form ONE indexed list: the parent's acceptance "
         "criteria first, then each child's criteria in order. Return one "
@@ -7981,7 +8688,7 @@ def _run_phase2_deep_analysis(
             "You are performing a deep code analysis. "
             "Do NOT close, modify, create, or delete any work items. "
             "Do NOT execute any wl, git, or other state-modifying commands. "
-            "Return ONLY a structured JSON array.\n\n"
+            f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
             "Phase 1 automated screening has PASSED. You must now perform deep code analysis.\n\n"
             "FILE SCOPE — Read ONLY the files listed in the manifest below. "
             "Do not explore the whole repository (no unbounded `find`, `grep -r`, "
@@ -9329,8 +10036,10 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # Tiered Phase 1 model (SA-0MSKB697P000T3HG): when a distinct phase-1
     # model is supplied it screens Phase 1 (parent + child AC screening)
     # while Phase 2 deep analysis keeps the full model; otherwise both phases
-    # share the resolved model.
-    phase1_model = ctx.phase1_model or resolved_model
+    # share the resolved model. The override comes from --phase1-model /
+    # AUDIT_PHASE1_MODEL (SA-0MVI6VRJT005M650 AC5) and defaults to the
+    # resolved audit model so no invocation silently changes model.
+    phase1_model = ctx.phase1_model or _resolve_phase1_model() or resolved_model
 
     if runner is None:
         runner = _default_runner
@@ -9439,7 +10148,6 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     original_status: str = "open"  # safe default
     original_stage: str = ""       # safe default (unknown)
     wi: dict | None = None
-    wi_comments: list = []
     try:
         item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
                             worklog_dir=worklog_dir)
@@ -9449,10 +10157,6 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             wi = item_data.get("workItem")
             if not isinstance(wi, dict):
                 wi = item_data
-            # Comments live beside ``workItem`` at the top level; they carry
-            # the commit hashes the implement skill recorded, which feed the
-            # touched-file fingerprint (SA-0MSPZDALB000S18P).
-            wi_comments = item_data.get("comments", []) or []
             original_status = wi.get("status", "open")
             original_stage = wi.get("stage", "")
     except RuntimeError:
@@ -9465,8 +10169,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     if not force:
         fresh_report = _check_audit_freshness(runner, issue_id,
                                               worklog_dir=worklog_dir,
-                                              work_item=wi,
-                                              comments=wi_comments)
+                                              work_item=wi)
         if fresh_report is not None:
             # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
             # the fresh audit so a redundant re-audit is stopped before the
@@ -9779,7 +10482,7 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
         "a chore work item to track a false-positive finding (config-fix "
         "remediation). "
         "Do NOT execute any wl, git, or other state-modifying commands. "
-        "Return ONLY a structured JSON array.\n\n"
+        f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
         "Classify each ruff lint finding below as either 'genuine' (a real "
         "defect that should stay), 'confident-false-positive' (the rule "
         "misfires for this file and the finding is not a real defect), or "
@@ -10074,7 +10777,6 @@ def _run_remediation_loop(
     worklog_dir: str | None,
     work_item: dict,
     content_fingerprint: str | None,
-    comments: Sequence[dict] | None = None,
 ) -> dict:
     """Confident-false-positive config remediation loop (F2 scope).
 
@@ -10170,7 +10872,6 @@ def _run_remediation_loop(
             })
         new_fp = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
-            comments=comments,
         )
         results["commits"].append({
             "sha": sha,
@@ -10179,21 +10880,35 @@ def _run_remediation_loop(
             "fingerprint_after": new_fp,
         })
         # Re-run the code-quality scan ONLY (no phase re-entry): same
-        # scoped changed-file list, fix=False (T2 AC4).
-        cq_scope_files = _git_changed_files(runner)
-        try:
-            cq_result = run_code_quality(
-                project_root=project_root, runner=runner, fix=False,
-                files=cq_scope_files or None,
-            )
-            if cq_result.get("success", False):
-                results["cq_findings"] = cq_result.get("findings", [])
-        except Exception as exc:  # noqa: BLE001 -- scan failure keeps prior findings
+        # scope resolution as the Phase 1 scan, fix=False (T2 AC4,
+        # SA-0MUI5ZYO6002W3KD AC5). An empty scope skips the re-scan
+        # (keeping the prior findings) rather than widening to the whole
+        # repository.
+        cq_scope_files = _resolve_code_quality_scope(
+            runner, issue_id, work_item=work_item,
+            project_root=project_root,
+        )
+        if not cq_scope_files:
             print(
-                f"Warning: remediation re-scan failed: {exc} — "
-                "keeping prior findings.",
+                f"Warning: remediation re-scan skipped: "
+                f"{_CODE_QUALITY_SCOPE_EMPTY_REASON} — keeping prior "
+                "findings.",
                 file=sys.stderr,
             )
+        else:
+            try:
+                cq_result = run_code_quality(
+                    project_root=project_root, runner=runner, fix=False,
+                    files=cq_scope_files,
+                )
+                if cq_result.get("success", False):
+                    results["cq_findings"] = cq_result.get("findings", [])
+            except Exception as exc:  # noqa: BLE001 -- scan failure keeps prior findings
+                print(
+                    f"Warning: remediation re-scan failed: {exc} — "
+                    "keeping prior findings.",
+                    file=sys.stderr,
+                )
         # Re-classify remaining ruff findings via the screen.
         results["fp_screen_results"] = _screen_ruff_findings(
             issue_id, results["cq_findings"], pi_bin, resolved_model,
@@ -10346,17 +11061,16 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         return None
 
     # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT,
-    # SA-0MSPZDALB000S18P): per-touched-file state + work-item description
-    # hash + Key Files list. The fingerprint is embedded in the persisted
-    # report so a re-audit of an unchanged item skips the pipeline
-    # (content-based freshness gate), while unrelated commits / working-tree
-    # changes elsewhere no longer invalidate it.
-    # Fail-open: if the fingerprint cannot be computed (touched set
-    # unresolved, git unavailable, wl failure), the audit proceeds and
-    # simply stores no fingerprint.
+    # SA-0MVIDI8E00063OOP): a sha256 over the item's own title + description
+    # payload (zero git calls — unrelated commits / working-tree changes /
+    # touched-file edits never invalidate). The fingerprint is embedded in
+    # the persisted report as a versioned ``Audit content fingerprint (v2):``
+    # line so a re-audit of an unchanged item skips the pipeline
+    # (content-based freshness gate).
+    # Fail-open: if the fingerprint cannot be computed (wl show failure),
+    # the audit proceeds and simply stores no fingerprint.
     content_fingerprint = _compute_content_fingerprint(
         runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
-        comments=ctx.comments,
     )
 
     # ------------------------------------------------------------------
@@ -10368,21 +11082,34 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     try:
         from code_review.scripts.code_quality import run_code_quality
         # Scoped, read-only code-quality scan (SA-0MSKB6VWU000RT58): the
-        # audit lints only the git changed-file list (already computed for
-        # the Phase 1/2 file-scope manifest) instead of the whole repo, and
-        # never mutates files (fix=False — audits are read-only). The
-        # changed-file list doubles as the scoping manifest, so no extra
-        # git scan is issued here.
-        cq_scope_files = _git_changed_files(runner)
-        cq_result = run_code_quality(
-            project_root=per_audit_root, runner=runner, fix=False,
-            files=cq_scope_files or None,
+        # audit lints only the resolved file scope instead of the whole
+        # repo, and never mutates files (fix=False — audits are read-only).
+        # The scope is the git changed-file list, falling back to the item's
+        # committed touched files (Key Files + its delivered commits): on the
+        # normal post-merge checkout the working tree is clean, so the
+        # changed-file list is empty and the committed files are the only
+        # accurate scope (SA-0MUI5ZYO6002W3KD).
+        cq_scope_files = _resolve_code_quality_scope(
+            runner, issue_id, work_item=work_item, comments=ctx.comments,
+            project_root=per_audit_root,
         )
-        if cq_result.get("success", False):
-            cq_findings = cq_result.get("findings", [])
-            cq_fixes_applied = cq_result.get("fixes_applied", 0)
+        if not cq_scope_files:
+            # An empty scope lints NOTHING — never the whole repository.
+            # ``files`` is not passed as [] / None because the linter runner
+            # treats a falsy list as a whole-project scan.
+            cq_skipped_reason = _CODE_QUALITY_SCOPE_EMPTY_REASON
         else:
-            cq_skipped_reason = cq_result.get("error", "Code quality check failed")
+            cq_result = run_code_quality(
+                project_root=per_audit_root, runner=runner, fix=False,
+                files=cq_scope_files,
+            )
+            if cq_result.get("success", False):
+                cq_findings = cq_result.get("findings", [])
+                cq_fixes_applied = cq_result.get("fixes_applied", 0)
+            else:
+                cq_skipped_reason = cq_result.get(
+                    "error", "Code quality check failed"
+                )
     except ImportError:
         # code_quality module not available — skip gracefully
         cq_skipped_reason = "code_quality module not available"
@@ -10449,7 +11176,6 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         worklog_dir=worklog_dir,
         work_item=work_item,
         content_fingerprint=content_fingerprint,
-        comments=ctx.comments,
     )
     cq_findings = remediation_results.get("cq_findings", cq_findings)
     fp_screen_results = remediation_results.get(
@@ -10479,6 +11205,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
                         on_runtime_error: Callable[[str, Exception], None],
                         failure_label: str,
                         child_screen: bool = False,
+                        parent_screen: bool = False,
                         enable_tools: bool = True,
                         priority: int | None = None) -> tuple[dict, list, str]:
     """Call Pi for one Phase 1 batched AC screen and parse the verdict JSON.
@@ -10494,17 +11221,29 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
     When *context* is ``"parent"``, the priority is forced to
     ``Priority.CRITICAL`` (SA-0MU32T8SH001R8MZ) so that Phase 1 parent
     screening is never starved by lower-priority concurrent audit calls.
+
+    A **capped** screen (per-call budget or concurrency wait) is never
+    re-asked: the caller quarantines it as ``partial`` with evidence naming
+    the budget and phase, so a capped call is one Phase 1 call to completion
+    instead of a second full-length retry (SA-0MVJ3Q662006RDJR AC2).
     """
     # Force CRITICAL priority for parent-screening calls so they are never
     # starved by lower-priority concurrent audits (SA-0MU32T8SH001R8MZ AC1).
     effective_priority = priority
     if context == "parent":
         effective_priority = Priority.CRITICAL
+    # The strict JSON contract is enforced HERE so every Phase 1 screen carries
+    # it regardless of which caller built the prompt: the first call is the one
+    # that most often drifts into a code fence or a trailing comma, and each
+    # such drift used to cost a full re-ask (SA-0MVI6VNDF001VE1S AC4).
+    if _JSON_CONTRACT_INSTRUCTION not in prompt:
+        prompt = _JSON_CONTRACT_INSTRUCTION + prompt
     try:
         result = _call_pi_and_maybe_log(
             issue_id, context, prompt, model=model, pi_bin=pi_bin,
             debug_log=debug_log, enable_tools=enable_tools, timeout=timeout,
             ac_fallback_used=ac_fallback_used, child_screen=child_screen,
+            parent_screen=parent_screen,
             json_expected=True,
             priority=effective_priority,
         )
@@ -10524,6 +11263,12 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
         isinstance(item, dict) and "index" in item for item in batch
     ):
         return result, batch, raw_text
+    # A capped screen is quarantined, never re-asked (SA-0MVJ3Q662006RDJR
+    # AC2): the call already spent its whole budget, so a re-ask would buy a
+    # second full-length call for the likeliest-to-fail case. The caller
+    # degrades to the conservative 'partial' verdict with quarantine evidence.
+    if _screen_call_capped(result):
+        return result, [], raw_text
     # Bounded JSON re-ask (SA-0MU32TCFM003B78I AC3): exactly one
     # "return only the JSON array" retry before the caller falls back to the
     # conservative 'partial' verdict.
@@ -10531,6 +11276,7 @@ def _call_phase1_screen(issue_id: str, context: str, prompt: str, model: str,
         issue_id, model, pi_bin, debug_log, timeout, prompt,
         priority=effective_priority,
         child_screen=child_screen,
+        parent_screen=parent_screen,
     )
     if reasked:
         return result, reasked, raw_text
@@ -10797,6 +11543,7 @@ def _reaudit_budget_exceeded_children(
                 model_source=ctx.model_source,
                 worklog_dir=ctx.worklog_dir,
                 content_fingerprint=fingerprint,
+                runner=ctx.runner,
             )
             child_persist_results.append({
                 "id": child_id,
@@ -10910,7 +11657,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"[READ-ONLY AUDIT] You are performing a read-only audit. "
             f"Do NOT close, modify, create, or delete any work items. "
             f"Do NOT execute any wl, git, or other state-modifying commands. "
-            f"Return ONLY a structured JSON array.\n\n"
+            f"{_JSON_CONTRACT_INSTRUCTION}\n\n"
             f"Review the following acceptance criteria against the codebase. "
             f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
             f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
@@ -10932,7 +11679,8 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
         result, batch, raw_text = _call_phase1_screen(
             issue_id, "parent", prompt, phase1_model, pi_bin, debug_log,
             timeout, ac_fallback_used, ctx.record_script_failure,
-            failure_label="parent AC review", enable_tools=True,
+            failure_label="parent AC review", parent_screen=True,
+            enable_tools=True,
             priority=_resolve_audit_priority(ctx.work_item),
         )
         # AC4 safe fallback (SA-0MSKB697P000T3HG): when a distinct Phase 1
@@ -10941,8 +11689,11 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
         # retry the SAME Phase 1 screen with the full audit model before
         # falling back to 'partial' diagnostics. When no distinct phase-1
         # model is supplied, phase1_model == resolved_model and this retry
-        # is a no-op — zero behavior change.
-        if not batch and phase1_model != ctx.resolved_model:
+        # is a no-op — zero behavior change. A capped screen is never
+        # retried: it is quarantined (SA-0MVJ3Q662006RDJR AC2), not given a
+        # second full-length call.
+        if (not batch and phase1_model != ctx.resolved_model
+                and not _screen_call_capped(result)):
             print(
                 "Warning: fast Phase 1 model produced unparseable output — "
                 "retrying parent AC review with the full audit model",
@@ -10952,6 +11703,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                 issue_id, "parent", prompt, ctx.resolved_model, pi_bin,
                 debug_log, timeout, ac_fallback_used,
                 ctx.record_script_failure, failure_label="parent AC review",
+                parent_screen=True,
                 enable_tools=True,
                 priority=_resolve_audit_priority(ctx.work_item),
             )
@@ -11025,6 +11777,22 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                     )
                 else:
                     evidence = "Pi model output could not be parsed — raw output logged"
+            # A parent screen that hit its right-sized Phase-1 budget is
+            # QUARANTINED exactly like a capped child screen
+            # (SA-0MVJ3Q662006RDJR AC3): the evidence names the budget and
+            # phase, and the run counts it in the reliability summary so
+            # downstream consumers can exclude it rather than read a timeout
+            # as a model judgement.
+            if _screen_call_capped(result):
+                _rel_incr("parent_screen_timeouts")
+                parent_budget = _resolve_call_timeout(timeout, parent_screen=True)
+                evidence = (
+                    "Parent screen reached its Phase 1 budget "
+                    f"({parent_budget} s, "
+                    f"AUDIT_PARENT_SCREEN_TIMEOUT) before returning a verdict — "
+                    f"QUARANTINED as partial (never met); raise the budget and "
+                    f"re-run to verify this criterion. {evidence}"
+                )
             for ac in acs:
                 ac_results.append({
                     "text": ac,
@@ -11315,7 +12083,26 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     # forced to 1; the separate-process path keeps the slot-aware
                     # parallel ceiling.
                     parallelism = 1 if ctx.child_in_main_slot else _resolve_child_concurrency()
-                    if parallelism > 1 and len(pending_children) > 1:
+                    # Phase 1 batch screening (SA-0MVI6VRJT005M650 AC5): fold
+                    # every pending child screen into ONE call instead of the
+                    # N child calls of the N+1 structure. Opt-in (default off)
+                    # and never used in-main-slot mode, which is inherently
+                    # sequential by design.
+                    if (
+                        len(pending_children) > 1
+                        and not ctx.child_in_main_slot
+                        and _phase1_batch_enabled()
+                    ):
+                        _batched = _phase1_review_children_batched(
+                            pending_children,
+                            ctx.resolved_phase1_model, ctx.resolved_model,
+                            pi_bin, debug_log, timeout,
+                            runner, ctx.record_script_failure,
+                            ac_fallback_used=ac_fallback_used,
+                        )
+                        for _ci, _acs in _batched.items():
+                            child_results[_ci]["ac_results"] = _acs
+                    elif parallelism > 1 and len(pending_children) > 1:
                         with ThreadPoolExecutor(max_workers=parallelism) as executor:
                             futures = [
                                 executor.submit(
@@ -11527,6 +12314,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                             model_source=model_source,
                             worklog_dir=worklog_dir,
                             content_fingerprint=child_fingerprint,
+                            runner=runner,
                         )
                         child_persist_results.append({
                             "id": child["id"],
@@ -11839,7 +12627,26 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     # forced to 1; the separate-process path keeps the slot-aware
                     # parallel ceiling.
                     parallelism = 1 if ctx.child_in_main_slot else _resolve_child_concurrency()
-                    if parallelism > 1 and len(pending_children) > 1:
+                    # Phase 1 batch screening (SA-0MVI6VRJT005M650 AC5): fold
+                    # every pending child screen into ONE call instead of the
+                    # N child calls of the N+1 structure. Opt-in (default off)
+                    # and never used in-main-slot mode, which is inherently
+                    # sequential by design.
+                    if (
+                        len(pending_children) > 1
+                        and not ctx.child_in_main_slot
+                        and _phase1_batch_enabled()
+                    ):
+                        _batched = _phase1_review_children_batched(
+                            pending_children,
+                            ctx.resolved_phase1_model, ctx.resolved_model,
+                            pi_bin, debug_log, timeout,
+                            runner, ctx.record_script_failure,
+                            ac_fallback_used=ac_fallback_used,
+                        )
+                        for _ci, _acs in _batched.items():
+                            child_results[_ci]["ac_results"] = _acs
+                    elif parallelism > 1 and len(pending_children) > 1:
                         with ThreadPoolExecutor(max_workers=parallelism) as executor:
                             futures = [
                                 executor.submit(
@@ -11929,6 +12736,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         model_source=model_source,
                         worklog_dir=worklog_dir,
                         content_fingerprint=child_fingerprint,
+                        runner=runner,
                     )
                     child_persist_results.append({
                         "id": child["id"],
@@ -13679,9 +14487,18 @@ def build_parser() -> argparse.ArgumentParser:
                          help=(
                              "Override the per-call Pi timeout for child Phase-1 "
                              "AC-review screens in seconds (default: "
-                             "AUDIT_CHILD_SCREEN_TIMEOUT env or 600; lightweight "
+                             "AUDIT_CHILD_SCREEN_TIMEOUT env or 1080; lightweight "
                              "child screens fail fast instead of burning the full "
                              "1800s budget)"
+                         ))
+    p_issue.add_argument("--parent-screen-timeout", type=int, default=None,
+                         help=(
+                             "Override the per-call Pi timeout for the parent "
+                             "Phase-1 AC screen in seconds (default: "
+                             "AUDIT_PARENT_SCREEN_TIMEOUT env or 1080; the parent "
+                             "screen uses the same right-sized screening budget "
+                             "as child screens and is quarantined, not retried, "
+                             "when it reaches it)"
                          ))
     p_issue.add_argument("--parent-timeout", type=int, default=None,
                          help=(
@@ -13696,6 +14513,21 @@ def build_parser() -> argparse.ArgumentParser:
                              "Enable Phase 2 batch deep analysis: fold the parent ACs and "
                              "pending child ACs into ONE indexed pi call (env: "
                              "AUDIT_PHASE2_BATCH; default off)"
+                         ))
+    p_issue.add_argument("--batch-phase1", action="store_true", default=None,
+                         help=(
+                             "Enable Phase 1 batch screening: fold every pending "
+                             "child's AC screen into ONE indexed pi call instead "
+                             "of one session per child (env: AUDIT_PHASE1_BATCH; "
+                             "default off — preserves the N+1 behaviour) "
+                             "(SA-0MVI6VRJT005M650)"
+                         ))
+    p_issue.add_argument("--phase1-model", default=None,
+                         help=(
+                             "Model used for Phase 1 parent/child AC screening "
+                             "(env: AUDIT_PHASE1_MODEL). Default: the resolved "
+                             "audit model, so no invocation silently changes "
+                             "model (SA-0MVI6VRJT005M650)"
                          ))
     p_issue.add_argument("--child-in-main-slot", action="store_true",
                          default=None,
@@ -13758,7 +14590,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_issue.add_argument("--max-concurrency", type=int, default=None,
-                         help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 6)")
+                         help=("Max concurrent pi/audit subprocesses. Precedence: this "
+                               "flag > AUDIT_MAX_CONCURRENCY env > live proxy slot "
+                               "capacity (max(1, min(available_slots, total_slots))) > "
+                               "static 6 fallback"))
     p_issue.add_argument("--green-run", default=None, metavar="SHA|HEAD",
                          help=(
                              "Operator-attested green test run: the full project test "
@@ -13904,7 +14739,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_project.add_argument("--worklog-dir", default=None,
                            help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_project.add_argument("--max-concurrency", type=int, default=None,
-                           help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 6)")
+                           help=("Max concurrent pi/audit subprocesses. Precedence: this "
+                               "flag > AUDIT_MAX_CONCURRENCY env > live proxy slot "
+                               "capacity (max(1, min(available_slots, total_slots))) > "
+                               "static 6 fallback"))
     p_project.add_argument("--max-citations-per-ac", type=int, default=None,
                            help=(
                                "Accepted for CLI parity with the issue subcommand; "
@@ -13963,6 +14801,12 @@ def main(argv: list[str] | None = None) -> int:
     child_screen_timeout = getattr(args, "child_screen_timeout", None)
     if child_screen_timeout is not None:
         os.environ[AUDIT_CHILD_SCREEN_TIMEOUT_ENV] = str(child_screen_timeout)
+
+    # CLI --parent-screen-timeout overrides AUDIT_PARENT_SCREEN_TIMEOUT for this
+    # process (SA-0MVJ3Q662006RDJR; mirrors the --child-screen-timeout pattern).
+    parent_screen_timeout = getattr(args, "parent_screen_timeout", None)
+    if parent_screen_timeout is not None:
+        os.environ[AUDIT_PARENT_SCREEN_TIMEOUT_ENV] = str(parent_screen_timeout)
 
     # CLI --session-dir overrides PI_CODING_AGENT_SESSION_DIR for this process
     # (and, because the env var is inherited, for every spawned pi process).
@@ -14079,6 +14923,17 @@ def _run_session_cleanup(args) -> None:
 
 def _run_issue_command(args) -> int:
     """Run the ``issue`` subcommand body (extracted for the F5 host gate)."""
+    # CLI flags for the Phase 1 levers are exported to their env vars for this
+    # process (mirrors the --max-concurrency pattern): _phase1_batch_enabled()
+    # and _resolve_phase1_model() read them at the dispatch sites, and the
+    # values are inherited by every spawned pi subprocess
+    # (SA-0MVI6VRJT005M650 AC5).
+    batch_phase1_flag = getattr(args, "batch_phase1", None)
+    if batch_phase1_flag is not None:
+        os.environ[AUDIT_PHASE1_BATCH_ENV] = "1" if batch_phase1_flag else "0"
+    phase1_model_flag = getattr(args, "phase1_model", None)
+    if phase1_model_flag:
+        os.environ[AUDIT_PHASE1_MODEL_ENV] = phase1_model_flag
     with SharedTimer("audit_runner_issue") as _root_timer:
         try:
             _rc = cmd_issue(args.issue_id, persist=not args.do_not_persist,

@@ -312,6 +312,12 @@ class TestScreenSkipped:
         with (
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
+            # Resolve a non-empty code-quality scope: with an empty scope the
+            # scan is skipped by design (SA-0MUI5ZYO6002W3KD), so the
+            # eslint-only findings would never reach the screen and this
+            # test would pass vacuously.
+            mock.patch.object(audit_runner, "_git_changed_files",
+                              return_value=["src/bad.js"]),
             mock.patch(
                 "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True,
@@ -499,6 +505,11 @@ class TestScreenBatchedCall:
         with (
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                               side_effect=_fake_pi),
+            # The pipeline must resolve a non-empty code-quality scope before
+            # screening: an empty scope skips the scan (SA-0MUI5ZYO6002W3KD),
+            # so the finding below would never reach the screen.
+            mock.patch.object(audit_runner, "_git_changed_files",
+                              return_value=["src/bad.py"]),
             mock.patch(
                 "code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True,

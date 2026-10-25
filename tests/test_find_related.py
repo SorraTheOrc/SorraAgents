@@ -1,8 +1,13 @@
 """Tests for the find-related automation script."""
 
+import contextlib
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "skill" / "find-related" / "scripts" / "find_related.py"
@@ -1047,3 +1052,303 @@ def test_skill_md_documents_status_lifecycle():
     # Must reference StatusLifecycle as the status management mechanism
     assert "StatusLifecycle" in content, "SKILL.md must reference StatusLifecycle for status management"
     assert "status" in content.lower(), "SKILL.md must mention status"
+
+
+# ---------------------------------------------------------------------------
+# Parallel search path (v5, SA-0MUG4654N000DFLQ)
+# ---------------------------------------------------------------------------
+
+
+def _parallel_barrier_search(keywords, barrier_n, extra=None):
+    """Build a fake run_wl_search that blocks until the whole batch started.
+
+    Every call registers itself, then blocks on a ``threading.Barrier(barrier_n)``
+    before returning. ``max_in_flight`` therefore proves deterministically (no
+    sleep-based guessing) that the fan-out overlaps rather than serialises.
+
+    ``extra`` is called as ``extra(keyword, in_flight)`` under the lock right
+    after a call registers itself (used to return per-keyword results).
+    """
+    barrier = threading.Barrier(barrier_n)
+    state = {"in_flight": [], "max_in_flight": 0}
+    lock = threading.Lock()
+
+    def fake_search(keyword, use_semantic=False, worklog_flags=None):
+        with lock:
+            state["in_flight"].append(keyword)
+            state["max_in_flight"] = max(state["max_in_flight"],
+                                          len(state["in_flight"]))
+            result = extra(keyword, state["in_flight"]) if extra else []
+        barrier.wait(timeout=15)
+        with lock:
+            state["in_flight"].remove(keyword)
+        return result
+
+    return fake_search, state
+
+
+def test_per_keyword_searches_run_concurrently(monkeypatch):
+    """AC4: the bounded per-keyword fan-out runs concurrently (v5)."""
+    mod = _import_find_related()
+    keywords = [f"kw{i}" for i in range(8)]
+    fake_search, state = _parallel_barrier_search(keywords, len(keywords))
+
+    monkeypatch.setattr(mod, "run_wl_search", fake_search)
+    results = mod.search_and_dedup(keywords, worklog_flags=["--x"])
+
+    assert results == []
+    assert state["max_in_flight"] == len(keywords), (
+        f"searches must overlap; max in flight was "
+        f"{state['max_in_flight']}"
+    )
+
+
+def test_one_query_per_keyword_strategy_preserved(monkeypatch):
+    """Constraint: each keyword still maps to exactly one wl search call."""
+    mod = _import_find_related()
+    keywords = ["alpha", "bravo", "charlie"]
+    calls = []
+
+    def fake_search(keyword, use_semantic=False, worklog_flags=None):
+        calls.append((keyword, use_semantic, worklog_flags))
+        return []
+
+    monkeypatch.setattr(mod, "run_wl_search", fake_search)
+    mod.search_and_dedup(keywords, use_semantic=True,
+                         worklog_flags=["--worklog-dir", "/tmp/store"])
+
+    # Thread completion order is not submission order; the *set* of queries
+    # must be exactly one per keyword (no batching, no duplicates).
+    assert len(calls) == len(keywords)
+    assert sorted(c[0] for c in calls) == sorted(keywords)
+    # The store-pinning flags and --semantic verdict reach every subprocess.
+    assert all(c[1] is True for c in calls)
+    assert all(c[2] == ["--worklog-dir", "/tmp/store"] for c in calls)
+
+
+def test_ranking_is_completion_order_independent(monkeypatch):
+    """AC2: identical recall/ranking regardless of which search finishes first."""
+    mod = _import_find_related()
+    keywords = ["alpha", "bravo", "charlie", "delta"]
+    results = {
+        "alpha": [{"id": "A", "title": "a", "score": -5.0},
+                  {"id": "B", "title": "b", "score": -1.0}],
+        "bravo": [{"id": "B", "title": "b", "score": -3.0},
+                   {"id": "C", "title": "c", "score": -2.0}],
+        "charlie": [{"id": "C", "title": "c", "score": -9.0},
+                     {"id": "D", "title": "d", "score": 0.0}],
+        # An empty search for one keyword must not perturb its siblings.
+        "delta": [],
+    }
+    # Throttle the winning keyword in the first run, sprint it in the second,
+    # so the two runs complete in different orders.
+    for throttled in ("bravo", "alpha"):
+        def fake_search(keyword, use_semantic=False, worklog_flags=None,
+                        _throttled=throttled):
+            time.sleep(0.15 if keyword == _throttled else 0.0)
+            return results[keyword]
+
+        monkeypatch.setattr(mod, "run_wl_search", fake_search)
+        ranked = mod.search_and_dedup(keywords, exclude_id="SELF")
+        assert [item["id"] for item in ranked] == ["C", "B", "A"]
+
+
+def test_max_search_keywords_bounds_concurrency(monkeypatch):
+    """MAX_SEARCH_KEYWORDS still bounds the fan-out and its parallelism."""
+    mod = _import_find_related()
+    keywords = [f"kw{i}" for i in range(20)]
+    fake_search, state = _parallel_barrier_search(keywords[:4], 4)
+
+    monkeypatch.setattr(mod, "MAX_SEARCH_KEYWORDS", 4)
+    monkeypatch.setattr(mod, "run_wl_search", fake_search)
+    mod.search_and_dedup(keywords)
+
+    assert state["max_in_flight"] == 4
+
+
+def test_failing_search_does_not_drop_sibling_results(monkeypatch):
+    """A raising search must not lose the other keywords' hits (v5)."""
+    mod = _import_find_related()
+
+    def fake_search(keyword, use_semantic=False, worklog_flags=None):
+        if keyword == "bravo":
+            raise RuntimeError("wl search blew up")
+        return [{"id": keyword.upper(), "title": "ok", "score": -1.0}]
+
+    monkeypatch.setattr(mod, "run_wl_search", fake_search)
+    ranked = mod.search_and_dedup(["alpha", "bravo", "charlie"])
+
+    assert sorted(item["id"] for item in ranked) == ["ALPHA", "CHARLIE"]
+
+
+def test_exclude_id_still_applies_in_parallel_path(monkeypatch):
+    """The analysed item never occupies a capped result slot."""
+    mod = _import_find_related()
+
+    def fake_search(keyword, use_semantic=False, worklog_flags=None):
+        return [{"id": "SELF", "title": "me", "score": -9.0},
+                {"id": "OTHER", "title": "other", "score": -1.0}]
+
+    monkeypatch.setattr(mod, "run_wl_search", fake_search)
+    ranked = mod.search_and_dedup(["alpha", "bravo"], exclude_id="SELF")
+
+    assert [item["id"] for item in ranked] == ["OTHER"]
+
+
+def test_repo_scan_overlaps_worklog_search_phase(monkeypatch):
+    """AC1: the repo scan runs during the search fan-out, not after it."""
+    mod = _import_find_related()
+    search_started = threading.Event()
+    repo_started = threading.Event()
+
+    def fake_search_and_dedup(keywords, **kwargs):
+        search_started.set()
+        assert repo_started.wait(10), "repo scan did not start in parallel"
+        return []
+
+    def fake_search_repo(path, keywords):
+        repo_started.set()
+        assert search_started.wait(10), "search phase did not overlap repo scan"
+        return []
+
+    monkeypatch.setattr(mod, "is_semantic_available", lambda **kw: True)
+    monkeypatch.setattr(mod, "search_and_dedup", fake_search_and_dedup)
+    monkeypatch.setattr(mod, "search_repo", fake_search_repo)
+
+    related, repo_matches = mod.collect_results(
+        ["alpha"], worklog_flags=["--x"], exclude_id="SELF",
+        repo_path="/tmp/repo",
+    )
+
+    assert related == []
+    assert repo_matches == []
+    assert search_started.is_set() and repo_started.is_set()
+
+
+def test_collect_results_forwards_semantic_probe(monkeypatch):
+    """The probe runs once and its verdict reaches search_and_dedup."""
+    mod = _import_find_related()
+    probe_calls = []
+    search_calls = []
+
+    def fake_probe(worklog_flags=None):
+        probe_calls.append(worklog_flags)
+        return True
+
+    def fake_search_and_dedup(keywords, **kwargs):
+        search_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(mod, "is_semantic_available", fake_probe)
+    monkeypatch.setattr(mod, "search_and_dedup", fake_search_and_dedup)
+    monkeypatch.setattr(mod, "search_repo", lambda path, keywords: [])
+
+    mod.collect_results(["alpha"], worklog_flags=["--x"], exclude_id="SELF",
+                        repo_path="/tmp/repo")
+
+    assert probe_calls == [["--x"]]
+    assert search_calls == [{
+        "use_semantic": True,
+        "worklog_flags": ["--x"],
+        "exclude_id": "SELF",
+    }]
+
+
+def test_main_delegates_to_parallel_collector(monkeypatch):
+    """_main wires search + repo scan through the parallel collector."""
+    mod = _import_find_related()
+    collect_calls = []
+
+    def fake_collect(keywords, worklog_flags=None, exclude_id=None,
+                     repo_path=None, verbose=False, probe_future=None):
+        collect_calls.append((keywords, exclude_id, repo_path, probe_future))
+        return [], []
+
+    monkeypatch.setattr(mod, "StatusLifecycle",
+                        lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(
+        mod, "run_wl_show",
+        lambda *a, **k: {"id": "SA-0TESTPARALLEL01",
+                         "title": "parallel search runtime",
+                         "description": "body"},
+    )
+    monkeypatch.setattr(mod, "collect_results", fake_collect)
+    monkeypatch.setattr(mod, "write_full_report", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "run_wl_update", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "is_semantic_available", lambda **kw: False)
+    monkeypatch.setattr(mod.sys, "argv", [
+        "find_related.py", "--work-item-id", "SA-0TESTPARALLEL01", "--json",
+    ])
+
+    with pytest.raises(SystemExit):
+        mod._main()
+
+    assert len(collect_calls) == 1
+    keywords, exclude_id, repo_path, probe_future = collect_calls[0]
+    assert exclude_id == "SA-0TESTPARALLEL01"
+    # Keywords derived from the title (weight-ordered, generic terms dropped).
+    assert keywords == ["parallel", "runtime", "search", "body"]
+    assert isinstance(repo_path, str) and repo_path
+    # The probe started before the fetch is handed to the collector.
+    assert probe_future is not None and probe_future.result() is False
+
+
+def test_probe_runs_while_the_work_item_is_fetched(monkeypatch):
+    """AC1: the semantic probe overlaps `wl show` instead of following it."""
+    mod = _import_find_related()
+    probe_started = threading.Event()
+    show_started = threading.Event()
+
+    def fake_probe(worklog_flags=None):
+        probe_started.set()
+        assert show_started.wait(10), "wl show did not start in parallel"
+        return True
+
+    def fake_show(work_item_id, worklog_flags=None):
+        show_started.set()
+        assert probe_started.wait(10), "semantic probe did not start first"
+        return {"id": work_item_id, "title": "t", "description": ""}
+
+    monkeypatch.setattr(mod, "is_semantic_available", fake_probe)
+    monkeypatch.setattr(mod, "run_wl_show", fake_show)
+
+    work_item, probe_future = mod.fetch_with_probe("SA-0TESTPARALLEL01",
+                                                   worklog_flags=["--x"])
+
+    assert work_item is not None
+    assert probe_future.result() is True
+
+
+def test_collect_results_reuses_supplied_probe_future(monkeypatch):
+    """A caller-supplied probe verdict is not re-probed by the collector."""
+    mod = _import_find_related()
+    probe_calls = []
+    search_calls = []
+
+    def fake_probe(worklog_flags=None):
+        probe_calls.append(worklog_flags)
+        return True
+
+    def fake_search_and_dedup(keywords, **kwargs):
+        search_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(mod, "is_semantic_available", fake_probe)
+    monkeypatch.setattr(mod, "search_and_dedup", fake_search_and_dedup)
+    monkeypatch.setattr(mod, "search_repo", lambda path, keywords: [])
+    monkeypatch.setattr(mod, "run_wl_show",
+                        lambda wid, **kw: {"id": wid, "title": "t",
+                                           "description": ""})
+
+    _, probe_future = mod.fetch_with_probe("SA-0TESTPARALLEL01",
+                                           worklog_flags=["--x"])
+    mod.collect_results(["alpha"], worklog_flags=["--x"], exclude_id="SELF",
+                        repo_path="/tmp/repo", probe_future=probe_future)
+
+    assert probe_calls == [["--x"]]
+    assert search_calls == [{
+        "use_semantic": True,
+        "worklog_flags": ["--x"],
+        "exclude_id": "SELF",
+    }]
+

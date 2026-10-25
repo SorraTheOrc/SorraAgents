@@ -259,6 +259,51 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$pif_bin"; then
   echo "Add this to your shell profile:" >&2
   echo "  export PATH=\"$pif_bin:\$PATH\"" >&2
 fi
+# ── Central Worklog post-pull hook installation ──────────────────────────
+# The committed project hooks (.githooks/post-checkout, post-merge,
+# post-rewrite, all worklog:post-pull-hook:v1) delegate to ONE per-machine
+# script:
+#
+#   exec "$HOME/.config/pi/.githooks/worklog-post-pull" "$@"
+#
+# Nothing else creates that directory, so a fresh environment fails every
+# checkout/merge with `exec: .../worklog-post-pull: not found` and the
+# post-pull `wl sync` never runs (SA-0MU8CRX1X008IORP). Install the central
+# script here as an executable symlink to this repo's committed source, so
+# hook fixes propagate without a reinstall. The project's own committed hooks
+# are left untouched.
+#
+# Set PI_SKIP_HOOK_INSTALL=1 to skip (the same opt-out as the pre-push wiring).
+# The install is machine-wide, so it does not require being inside a git repo.
+if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
+  POST_PULL_SRC="$SRC_DIR/.githooks/worklog-post-pull"
+  POST_PULL_DST="$HOME/.config/pi/.githooks/worklog-post-pull"
+
+  if [ -f "$POST_PULL_SRC" ]; then
+    chmod +x "$POST_PULL_SRC" 2>/dev/null || true
+    # create_symlink is idempotent: it creates the parent directory, reports an
+    # already-correct symlink, and backs up (never deletes) a foreign file.
+    create_symlink "$POST_PULL_DST" "$POST_PULL_SRC"
+    chmod +x "$POST_PULL_DST" 2>/dev/null || true
+    echo "OK: central post-pull hook installed: $POST_PULL_DST"
+  else
+    echo "WARNING: source post-pull hook not found at $POST_PULL_SRC; skipping central hook install" >&2
+  fi
+
+  # Fail-open portability check (SA-0MVK1Q30O0067NXX): the committed wrappers
+  # hard-code the delegating path. If this machine's central path differs, the
+  # install above cannot fix checkout/merge, so surface it rather than leaving
+  # a silent `not found` on the next checkout.
+  POST_PULL_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$POST_PULL_REPO_ROOT" ] && [ -f "$POST_PULL_REPO_ROOT/.githooks/post-checkout" ]; then
+    if ! grep -qF "$POST_PULL_DST" "$POST_PULL_REPO_ROOT/.githooks/post-checkout"; then
+      echo "WARNING: $POST_PULL_REPO_ROOT/.githooks/post-checkout does not delegate to $POST_PULL_DST" >&2
+      echo "  git checkout/merge will error with 'not found' until the committed wrapper" >&2
+      echo "  references this machine's central post-pull hook path." >&2
+    fi
+  fi
+fi
+
 # ── Context-budget pre-push hook wiring ───────────────────────────────────
 # Install a pre-push hook (worklog sync + context-budget gate + branch policy)
 # into the *current project* and configure git to use .githooks/. The gate's
@@ -336,6 +381,15 @@ if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
     #    (SA-0MUJ2VMF7000UHCX). A stale/foreign user.email makes `wl sync`'s
     #    author-identity gate refuse to merge Worklog data; surface it at
     #    install time so it is actionable. Non-fatal (fail-open).
+    #
+    #    The gate accepts commits authored by this checkout's `user.email` or
+    #    by an entry in `.worklog/config.yaml` `syncAllowedAuthors`, and always
+    #    refuses empty author emails. Set the canonical identity with
+    #    `git config --local user.email <email>`; a deliberately different
+    #    framework identity such as `pi@local` belongs in `syncAllowedAuthors`
+    #    (exact email only). One-off incident remedy: `wl sync
+    #    --allow-foreign-author`. Reference: docs/dev/worklog-sync.md
+    #    ("Author-identity gate").
     IDENTITY_GUARD="$CURRENT_REPO_ROOT/scripts/check_git_identity.py"
     if [ -f "$IDENTITY_GUARD" ]; then
       if identity_output="$(python3 "$IDENTITY_GUARD" --repo-root "$CURRENT_REPO_ROOT" 2>&1)"; then

@@ -60,6 +60,23 @@ def _met_ac(text: str = "AC") -> dict:
     }
 
 
+def _unmet_ac(text: str = "AC") -> dict:
+    return {
+        "text": text,
+        "verdict": audit_runner.VERDICT_UNMET,
+        "evidence": "not implemented",
+    }
+
+
+def _partial_tainted_ac(text: str = "AC") -> dict:
+    """A child AC degraded to partial by an infrastructure fallback."""
+    return {
+        "text": text,
+        "verdict": "partial",
+        "evidence": "partial (infra fallback: timed out — manual review required)",
+    }
+
+
 def _child(child_id: str, *, stage: str, status: str = "in_progress",
            child_audit_ready: bool | None = None,
            ac_results: list[dict] | None = None) -> dict:
@@ -112,6 +129,49 @@ class TestChildExemptionSnapshot:
             snapshot_exempt=set(),
         )
         assert "Ready to close: No" in report
+
+    def test_snapshot_exempts_tainted_child_acs(self):
+        """F3a (SA-0MVI35BIU002MTZQ, corrected RCA §5): a demoted snapshot
+        child's infra-fallback-tainted `partial` ACs do not force the parent
+        to `No` — the AC-aggregation path honours the exemption."""
+        ac_results = [_met_ac("Parent AC")]
+        tainted = _child(
+            "CHILD-1", stage="plan_complete", child_audit_ready=False,
+            ac_results=[_partial_tainted_ac()],
+        )
+        report = audit_runner._assemble_issue_report(
+            {"id": "PARENT-1"}, ac_results, [tainted],
+            model="test-model", model_source="remote",
+            snapshot_exempt={"CHILD-1"},
+        )
+        payload = audit_runner._build_issue_json(
+            {"id": "PARENT-1"}, ac_results, [tainted],
+            snapshot_exempt={"CHILD-1"},
+        )
+        assert "Ready to close: Yes" in report
+        assert payload["ready_to_close"] is True
+
+    def test_non_exempt_tainted_child_acs_are_named_as_blocker(self):
+        """F3b (SA-0MVI35BIU002MTZQ, corrected RCA §5): when the parent's own
+        ACs are acceptable and a non-exempt child's tainted ACs block
+        closure, the report names the child ACs and their fallback
+        provenance instead of blaming the children's stages."""
+        ac_results = [_met_ac("Parent AC")]
+        child = _child(
+            "CHILD-9", stage="plan_complete", child_audit_ready=False,
+            ac_results=[_partial_tainted_ac()],
+        )
+        report = audit_runner._assemble_issue_report(
+            {"id": "PARENT-1"}, ac_results, [child],
+            model="test-model", model_source="remote",
+            snapshot_exempt=set(),
+        )
+        assert "Ready to close: No" in report
+        assert "child acceptance criteria not acceptable" in report
+        assert "CHILD-9" in report
+        assert "infrastructure fallback" in report
+        # The misattribution (blaming only the child's stage) is gone.
+        assert "children not yet in in_review/done stage" not in report
 
     def test_snapshot_child_with_not_ready_audit_does_not_block(self):
         """AC1/AC4: a snapshot-exempt child whose persisted audit says

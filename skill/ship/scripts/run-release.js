@@ -550,6 +550,72 @@ function readCloseState(getCloseStateFn, itemId) {
   }
 }
 
+// ── shipped-in close markers ────────────────────────────────────────────────
+
+/**
+ * Build the regex matching a `Shipped in v<version>` close marker.
+ *
+ * Idempotency helper for the post-release close sweep
+ * (SA-0MUECDK14002J37J): the marker recorded by `wl close --reason` is
+ * `Closed with reason: Shipped in v<version>`, so the match is performed
+ * anywhere in the comment text. The version is regex-escaped and followed by
+ * a semver boundary, so `0.1.1` never matches a `v0.1.18` marker (and vice
+ * versa) — a prefix match would wrongly suppress a genuine later release.
+ *
+ * @param {string|null|undefined} version - Release semver (with or without a
+ *   leading `v`).
+ * @returns {RegExp|null} The marker pattern, or null when no version is given.
+ */
+export function shippedMarkerPattern(version) {
+  if (version === null || version === undefined) return null;
+  const bare = String(version).trim().replace(/^v/, '');
+  if (!bare) return null;
+  const escaped = bare.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`Shipped in v${escaped}(?![0-9A-Za-z.+-])`);
+}
+
+/**
+ * Whether any of a work item's comments already carries the close marker for
+ * `version`.
+ *
+ * A `true` result means the item was already closed (and annotated) for this
+ * release, so the sweep must neither close it again nor add another comment
+ * (SA-0MUECDK14002J37J AC1/AC2).
+ *
+ * @param {Array<{comment?: string, message?: string}|string>|null} comments -
+ *   Comment records from `wl comment list` (or plain strings).
+ * @param {string|null} version - Release semver.
+ * @returns {boolean}
+ */
+export function carriesShippedMarker(comments, version) {
+  const pattern = shippedMarkerPattern(version);
+  if (!pattern || !Array.isArray(comments)) return false;
+  return comments.some((entry) => {
+    if (typeof entry === 'string') return pattern.test(entry);
+    const text = (entry && (entry.comment || entry.message)) || '';
+    return pattern.test(text);
+  });
+}
+
+/**
+ * Default comment boundary: list a work item's comments via `wl comment list`.
+ *
+ * Read-only. Returns an empty list when the worklog reports no comments so the
+ * idempotency check is a no-op for unannotated items.
+ *
+ * @param {string} itemId - Work item id.
+ * @returns {Array<{author?: string, comment?: string}>}
+ */
+export function getItemComments(itemId) {
+  const output = execSync(`wl comment list ${shellQuote(itemId)} --json`, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const parsed = JSON.parse(output);
+  if (!parsed || parsed.success === false) return [];
+  return Array.isArray(parsed.comments) ? parsed.comments : [];
+}
+
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
@@ -617,10 +683,16 @@ function readCloseState(getCloseStateFn, itemId) {
  *   exits 0 but did not persist is retried once and then reported in
  *   `unclosedItems` (SA-0MUXA5ZNZ0019QY5). Defaults to {@link getItemLifecycle}.
  *   A throwing/`null` read is fail-safe: the item is treated as unclosed.
+ * @param {(itemId: string) => Array<{author?: string, comment?: string}>} [options.getCommentsFn] -
+ *   Comment boundary used by the idempotency check. A candidate that already
+ *   carries this version's `Shipped in v<version>` marker is skipped without a
+ *   close or a new annotation (SA-0MUECDK14002J37J AC1). A throwing boundary is
+ *   fail-safe: the item is treated as not-yet-shipped. Defaults to
+ *   {@link getItemComments} (a read-only `wl comment list`).
  * @param {boolean} [options.dryRun=false] - When true, intended child
  *   overrides and cascades are reported but no `wl` mutation is performed
  *   (AC4).
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, unclosedCount: number, unclosedItems: Array<{id: string, title: string, reason: string}>, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, unclosedCount: number, unclosedItems: Array<{id: string, title: string, reason: string}>, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}>, alreadyShippedCount: number, alreadyShippedItems: Array<{id: string, title: string, reason: string}>, overriddenCount: number, overriddenItems: Array<{id: string, title: string, ancestorId: string}>, cascadedCount: number, cascadedItems: Array<{id: string, ancestorId: string, auditTimestamp: string|null}>, refusedCount: number, refusedItems: Array<{id: string, title: string, reason: string, collateral: string[], needsProducerReview: string[]}> }}
  */
 export function closeWorkItemsAfterRelease(version, options = {}) {
   const {
@@ -644,6 +716,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       );
     },
     getParentAuditFn = getParentAudit,
+    getCommentsFn = getItemComments,
     runCascadeCommand = (childId, parentId, auditTimestamp) => {
       execSync(
         `wl update ${childId} --status completed --stage done --json`,
@@ -671,6 +744,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       unclosedItems: [],
       skippedCount: 0,
       skippedItems: [],
+      alreadyShippedCount: 0,
+      alreadyShippedItems: [],
       overriddenCount: 0,
       overriddenItems: [],
       cascadedCount: 0,
@@ -697,6 +772,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       unclosedItems: [],
       skippedCount: 0,
       skippedItems: [],
+      alreadyShippedCount: 0,
+      alreadyShippedItems: [],
       overriddenCount: 0,
       overriddenItems: [],
       cascadedCount: 0,
@@ -709,6 +786,44 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
 
   console.log(`Found ${items.length} work item(s).`);
 
+  // Idempotency (SA-0MUECDK14002J37J): never close — or re-annotate — an item
+  // that already carries this version's `Shipped in v<version>` marker. A
+  // repeated post-release sweep (or a run resumed after the close step) must
+  // be a no-op for already-shipped items instead of duplicating close
+  // comments and churning their lifecycle.
+  const alreadyShippedItems = [];
+  const candidates = [];
+  for (const item of items) {
+    let comments = null;
+    try {
+      comments = getCommentsFn(item.id);
+    } catch (err) {
+      // Fail-safe (AC3): an unreadable comment source must never block a
+      // release. Treat the item as not-yet-shipped and keep the existing
+      // close behaviour; the warning keeps the degraded check visible.
+      console.warn(`  ⚠ Could not read comments for ${item.id}: ${err.message}`);
+      comments = null;
+    }
+    if (carriesShippedMarker(comments, version)) {
+      alreadyShippedItems.push({
+        id: item.id,
+        title: item.title,
+        reason: `Already carries the "Shipped in v${version}" close marker`,
+      });
+      continue;
+    }
+    candidates.push(item);
+  }
+  if (alreadyShippedItems.length > 0) {
+    console.log(
+      `\nSkipping ${alreadyShippedItems.length} work item(s) already shipped in v${version}:`,
+    );
+    for (const shipped of alreadyShippedItems) {
+      console.log(`  ○ ${shipped.title || shipped.id} (${shipped.id}) — ${shipped.reason}`);
+    }
+    console.log('');
+  }
+
   // Filter: close items where needsProducerReview === false. A child with
   // needsProducerReview === true whose nearest in_review ancestor is an
   // audit-ready release candidate (readyToClose === true) is OVERRIDDEN:
@@ -719,7 +834,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   const toClose = [];
   const overriddenItems = [];
   const skippedItems = [];
-  for (const item of items) {
+  for (const item of candidates) {
     if (item.needsProducerReview === false) {
       toClose.push(item);
       continue;
@@ -805,7 +920,7 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   // non-terminal descendant that is held back solely because
   // `needsProducerReview === true` separately from generic out-of-scope
   // collateral (SA-0MUJKPDAA002VVDP AC2).
-  const candidateItemsById = new Map(items.map((item) => [item.id, item]));
+  const candidateItemsById = new Map(candidates.map((item) => [item.id, item]));
   const refusedItems = [];
   const closable = [];
   const cascadedItems = [];
@@ -929,9 +1044,42 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     }
   }
 
+  // Recursive-close annotation dedupe (SA-0MUECDK14002J37J): `wl close --force`
+  // on a parent already annotates every descendant with the same
+  // `Shipped in v<version>` reason. Closing a descendant separately in the
+  // same sweep would duplicate its close comment (the 25 double-closed items /
+  // 99 close comments of the 2026-10-09 incident), so only the topmost
+  // closable item of each subtree issues a close command; its covered
+  // descendants are verified (never re-closed) afterwards.
+  const closableIds = new Set(closable.map((item) => item.id));
+  const coveredByAncestor = new Map();
+  for (const item of closable) {
+    let descendants = [];
+    try {
+      descendants = getDescendantsFn(item.id) || [];
+    } catch (err) {
+      console.warn(`  ⚠ Could not resolve descendants for ${item.id}: ${err.message}`);
+      descendants = [];
+    }
+    for (const descendantId of descendants) {
+      if (closableIds.has(descendantId) && !coveredByAncestor.has(descendantId)) {
+        coveredByAncestor.set(descendantId, item.id);
+      }
+    }
+  }
+  const closingItems = dryRun
+    ? closable
+    : closable.filter((item) => !coveredByAncestor.has(item.id));
+  const coveredItems = dryRun
+    ? []
+    : closable.filter((item) => coveredByAncestor.has(item.id));
+
   if (closable.length === 0) {
     const message = `No work items to close (${skippedItems.length} skipped, needs producer review; `
-      + `${refusedItems.length} refused, descendants outside the candidate set or needing producer review).`;
+      + `${refusedItems.length} refused, descendants outside the candidate set or needing producer review).`
+      + (alreadyShippedItems.length > 0
+        ? ` ${alreadyShippedItems.length} already shipped in v${version}.`
+        : '');
     console.log(message);
     return {
       success: true,
@@ -942,6 +1090,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       unclosedItems: [],
       skippedCount: skippedItems.length,
       skippedItems,
+      alreadyShippedCount: alreadyShippedItems.length,
+      alreadyShippedItems,
       overriddenCount: overriddenItems.length,
       overriddenItems,
       cascadedCount: cascadedItems.length,
@@ -952,14 +1102,15 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     };
   }
 
-  console.log(`Closing ${closable.length} work item(s)...`);
+  console.log(`Closing ${closingItems.length} work item(s)...`);
 
   let closedCount = 0;
   let errorCount = 0;
   const errors = [];
   const unclosedItems = [];
+  const reason = `Shipped in v${version}`;
 
-  for (const item of closable) {
+  for (const item of closingItems) {
     if (dryRun) {
       // `--dry-run` must not mutate the worklog (AC4) — report the intended
       // close without invoking `wl close`.
@@ -968,7 +1119,6 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
       );
       continue;
     }
-    const reason = `Shipped in v${version}`;
     try {
       // --force: the audit gate (Step 2) already verified audit readiness for
       // every candidate, so the close step may bypass the per-item stage/audit
@@ -1028,6 +1178,32 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     }
   }
 
+  // Verify descendants swept by their ancestor's recursive close. They are
+  // never re-closed (that would duplicate the annotation), but they count as
+  // closed only when their persisted lifecycle proves the sweep landed.
+  for (const item of coveredItems) {
+    const ancestorId = coveredByAncestor.get(item.id);
+    const lifecycle = readCloseState(getCloseStateFn, item.id);
+    if (isTerminalCloseState(lifecycle)) {
+      console.log(
+        `  ✓ ${item.title || item.id} — closed via recursive close of ${ancestorId} `
+        + `with reason: "${reason}"`,
+      );
+      closedCount++;
+    } else {
+      const detail = lifecycle
+        ? `status=${lifecycle.status}, stage=${lifecycle.stage}`
+        : 'state unreadable';
+      const unclosedReason = `Swept by recursive close of ${ancestorId} did not persist (${detail})`;
+      console.warn(`  ⚠ ${item.title || item.id} (${item.id}) — ${unclosedReason}`);
+      unclosedItems.push({
+        id: item.id,
+        title: item.title,
+        reason: unclosedReason,
+      });
+    }
+  }
+
   const unclosedCount = unclosedItems.length;
   let summary;
   if (dryRun) {
@@ -1061,6 +1237,9 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
   if (refusedItems.length > 0) {
     summary += ` ${refusedItems.length} item(s) refused (collateral descendants outside candidate set).`;
   }
+  if (alreadyShippedItems.length > 0) {
+    summary += ` ${alreadyShippedItems.length} item(s) skipped (already shipped in v${version}).`;
+  }
 
   console.log(`\n${summary}`);
 
@@ -1075,6 +1254,8 @@ export function closeWorkItemsAfterRelease(version, options = {}) {
     unclosedItems,
     skippedCount: skippedItems.length,
     skippedItems,
+    alreadyShippedCount: alreadyShippedItems.length,
+    alreadyShippedItems,
     overriddenCount: overriddenItems.length,
     overriddenItems,
     cascadedCount: cascadedItems.length,
