@@ -819,6 +819,165 @@ class TestStrandedChildren:
 
 
 # ---------------------------------------------------------------------------
+# SA-0MVLJWTGP005XJPP — safe, evidence-gated finalisation of stranded children
+#
+# Finalisation is opt-in (``--finalise-stranded``) and only runs when the
+# pushed commit is verified, the item is still in-progress, no other agent
+# holds it, and its worktree holds no uncommitted work. Otherwise the
+# read-only diagnostic stands.
+# ---------------------------------------------------------------------------
+
+
+class TestFinaliseStrandedChildren:
+    """Finalise only when safe; fall back to the diagnostic otherwise."""
+
+    def _stranded_setup(self, implement_mod):
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True},
+        ])
+        spawner = RecordingSpawner([_timeout_result("SA-C1", 3600)])
+        states = {"SA-C1": {
+            "id": "SA-C1", "status": "in-progress", "stage": "in_progress",
+            "assignee": "",
+        }}
+        return m, runner, spawner, states
+
+    def test_finalises_stranded_child_when_safe(self, implement_mod):
+        m, runner, spawner, states = self._stranded_setup(implement_mod)
+        finalised_calls: list = []
+
+        def fake_finalise(child_id, evidence):
+            finalised_calls.append((child_id, evidence["commit"]))
+            return {
+                "finalised": True,
+                "commit": evidence["commit"],
+                "reason": "finalised for test",
+            }
+
+        with mock.patch.object(
+            m, "_worktree_has_uncommitted_changes", return_value=False,
+        ):
+            report = _run(
+                m, runner, spawner, [{"id": "SA-C1"}],
+                child_states=states,
+                commit_evidence=lambda child_id: "abc1234",
+                finalise_stranded=True,
+                finalise_child=fake_finalise,
+            )
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert finalised_calls == [("SA-C1", "abc1234")]
+        assert report["finalised_children"][0]["id"] == "SA-C1"
+        assert report["finalised_children"][0]["commit"] == "abc1234"
+        assert report["children_driven"][0]["result"] == "finalised"
+        assert report.get("failed_child") is None
+        # The parent worklog comment records the automatic finalisation.
+        assert any(
+            "finalised" in text.lower() for _wid, text in report["_comments"]
+        )
+
+    def test_default_is_read_only(self, implement_mod):
+        """Without --finalise-stranded nothing is mutated."""
+        m, runner, spawner, states = self._stranded_setup(implement_mod)
+        patch, recorder = _patch_mutations(m)
+
+        with patch, mock.patch.object(
+            m, "_worktree_has_uncommitted_changes",
+        ) as dirty_check:
+            report = _run(
+                m, runner, spawner, [{"id": "SA-C1"}],
+                child_states=states,
+                commit_evidence=lambda child_id: "abc1234",
+            )
+
+        assert report["success"] is False
+        assert recorder.status_updates == []
+        # The safety check is part of the finalisation path only.
+        assert dirty_check.called is False
+        assert report["stranded_children"][0]["id"] == "SA-C1"
+
+    def test_dirty_worktree_blocks_finalisation(self, implement_mod):
+        m, runner, spawner, states = self._stranded_setup(implement_mod)
+        patch, recorder = _patch_mutations(m)
+
+        with patch, mock.patch.object(
+            m, "_worktree_has_uncommitted_changes", return_value=True,
+        ):
+            report = _run(
+                m, runner, spawner, [{"id": "SA-C1"}],
+                child_states=states,
+                commit_evidence=lambda child_id: "abc1234",
+                finalise_stranded=True,
+            )
+
+        assert report["success"] is False
+        assert recorder.status_updates == []
+        assert report["stranded_children"][0]["id"] == "SA-C1"
+        assert "stranded" in report["message"].lower()
+
+    def test_claimed_by_another_agent_blocks_finalisation(
+        self, implement_mod,
+    ):
+        """A child held by another live agent is never finalised."""
+        m, runner, spawner, states = self._stranded_setup(implement_mod)
+        states["SA-C1"]["assignee"] = "another-agent"
+
+        with mock.patch.object(
+            m, "_worktree_has_uncommitted_changes", return_value=False,
+        ):
+            report = _run(
+                m, runner, spawner, [{"id": "SA-C1"}],
+                child_states=states,
+                commit_evidence=lambda child_id: "abc1234",
+                finalise_stranded=True,
+            )
+
+        assert report["success"] is False
+        assert report.get("finalised_children") in (None, [])
+        assert "stranded" in report["message"].lower()
+
+    def test_missing_evidence_never_finalises(self, implement_mod):
+        m, runner, spawner, states = self._stranded_setup(implement_mod)
+
+        with mock.patch.object(
+            m, "_worktree_has_uncommitted_changes", return_value=False,
+        ):
+            report = _run(
+                m, runner, spawner, [{"id": "SA-C1"}],
+                child_states=states,
+                commit_evidence=lambda child_id: None,
+                finalise_stranded=True,
+            )
+
+        assert report["success"] is False
+        assert report.get("finalised_children") in (None, [])
+        assert report.get("stranded_children") in (None, [])
+
+    def test_finalise_helper_refuses_non_in_progress_child(
+        self, implement_mod,
+    ):
+        """The helper itself never touches a terminal or claimed child."""
+        m = implement_mod
+        evidence = {
+            "stranded": True, "commit": "abc1234",
+            "evidence": "commit abc1234 on dev",
+        }
+        with mock.patch.object(
+            m, "wl_show", return_value={
+                "id": "SA-C1", "status": "open", "assignee": "",
+            },
+        ), mock.patch.object(m.StatusLifecycle, "update_status") as upd:
+            out = m._finalise_stranded_child("SA-C1", evidence)
+
+        assert out["finalised"] is False
+        assert "not in-progress" in out["reason"]
+        assert upd.called is False
+
+
+# ---------------------------------------------------------------------------
 # AC-6 / AC-7: recursion guard + missing spawner
 # ---------------------------------------------------------------------------
 

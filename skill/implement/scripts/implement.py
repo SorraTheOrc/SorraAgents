@@ -40,6 +40,7 @@ Optional flags:
   --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
   --max-child-sessions N    Max fresh sessions per child when driving (default: 1)
   --child-timeout N         Per-child session timeout in seconds (default: 3600)
+  --finalise-stranded       Finalise evidence-gated stranded children when driving
   -v, --verbose             Verbose logging
 
 Environment:
@@ -5698,6 +5699,10 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             # had already reached a terminal state: a distinct, non-failure
             # verdict so a producer is never misled (SA-0MVLJWOJ8004ABBA).
             icon = "🕓"
+        elif result == "finalised":
+            # A stranded child was finalised through the evidence-gated
+            # --finalise-stranded path (SA-0MVLJWTGP005XJPP).
+            icon = "🛠"
         else:
             icon = "❌"
         print(
@@ -5712,6 +5717,10 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
     if report.get("completed_late"):
         print(f"  Completed late: {report['completed_late']}")
+    if report.get("finalised_children"):
+        print(f"  Finalised stranded: {len(report['finalised_children'])}")
+    if report.get("stranded_children"):
+        print(f"  Stranded (needs finalising): {len(report['stranded_children'])}")
     print(f"  {report.get('message', '')}")
     print()
 
@@ -5854,40 +5863,177 @@ def _detect_stranded_child(
     }
 
 
+def _worktree_has_uncommitted_changes(worktree_path: str) -> bool:
+    """Whether *worktree_path* holds uncommitted work (read-only check).
+
+    Used as a finalisation safety gate: a stranded child may only be
+    finalised automatically when its worktree holds no uncommitted work, so
+    automatic finalisation can never strand (or silently discard) work.
+
+    Fail-safe: an unreadable or missing worktree is treated as "has
+    changes" (unsafe) so the caller falls back to the read-only diagnostic.
+
+    Args:
+        worktree_path: Absolute path to the child's worktree.
+
+    Returns:
+        True when the worktree has uncommitted changes or cannot be read.
+    """
+    if not worktree_path:
+        return True
+    try:
+        result = run_cmd(
+            ["git", "-C", str(worktree_path), "status", "--porcelain"],
+            check=False,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        LOG.debug("Worktree status check failed for %s: %s", worktree_path, exc)
+        return True
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
+
+
+def _finalise_stranded_child(
+    child_id: str,
+    evidence: dict[str, Any],
+    assignee: str = "",
+) -> dict[str, Any]:
+    """Finalise a stranded child via the existing ``StatusLifecycle`` path.
+
+    Safety gates (all must hold — never finalise otherwise):
+
+    1. verified pushed-commit evidence (``evidence['stranded']``),
+    2. the child is currently ``in-progress`` (never touch another state),
+    3. the child is not claimed by another live agent (non-empty assignee
+       other than *assignee*).
+
+    The caller additionally checks the worktree holds no uncommitted work
+    (:func:`_worktree_has_uncommitted_changes`) before calling this.
+
+    The mutation goes through ``StatusLifecycle.update_status`` (the only
+    supported finalise path) and is recorded as a comment on the child, so
+    the automatic finalisation is auditable.
+
+    Args:
+        child_id: The stranded child work item id.
+        evidence: The :func:`_detect_stranded_child` result.
+        assignee: The driving agent's identity; an assignee mismatch means
+            another agent holds the item and finalisation is refused.
+
+    Returns:
+        A dict with ``finalised`` (bool), ``commit`` (str) and ``reason``
+        (str). A refused or failed finalisation returns ``finalised: False``
+        so the caller falls back to the read-only diagnostic.
+    """
+    if not evidence.get("stranded"):
+        return {
+            "finalised": False,
+            "commit": "",
+            "reason": "no verified pushed-commit evidence",
+        }
+    child = wl_show(child_id)
+    if not child:
+        return {
+            "finalised": False,
+            "commit": "",
+            "reason": "could not re-fetch the child work item",
+        }
+    status = str(child.get("status", "") or "")
+    if status not in ("in-progress", "in_progress"):
+        return {
+            "finalised": False,
+            "commit": "",
+            "reason": f"child is not in-progress (status={status!r})",
+        }
+    claimed_by = str(child.get("assignee", "") or "").strip()
+    if claimed_by and claimed_by != assignee:
+        return {
+            "finalised": False,
+            "commit": "",
+            "reason": f"child is claimed by {claimed_by!r}",
+        }
+
+    commit = str(evidence.get("commit", ""))
+    try:
+        StatusLifecycle.update_status(child_id, "completed", stage="in_review")
+    except RuntimeError as exc:
+        return {
+            "finalised": False,
+            "commit": commit,
+            "reason": f"status update failed: {exc}",
+        }
+
+    reason = (
+        f"Automatically finalised by `implement.py drive --finalise-stranded`: "
+        f"the child session failed after its work was pushed "
+        f"({evidence.get('evidence', commit)}), the item was still "
+        f"in-progress, and its worktree held no uncommitted work. "
+        f"Status set to completed / stage in_review."
+    )
+    wl_add_comment(child_id, reason)
+    LOG.info("Finalised stranded child %s (%s)", child_id, evidence.get(
+        "evidence", commit,
+    ))
+    return {"finalised": True, "commit": commit, "reason": reason}
+
+
 def _stranded_children_comment(
-    stranded: list[dict[str, Any]], parent_branch: str,
+    stranded: list[dict[str, Any]],
+    parent_branch: str,
+    finalised: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build the one-per-drive worklog comment naming stranded children.
 
     Args:
         stranded: The ``stranded_children`` report entries.
         parent_branch: Branch the work was pushed to.
+        finalised: Children automatically finalised in this drive invocation
+            (``--finalise-stranded``); recorded in the same audit comment.
 
     Returns:
         Comment text naming each stranded child and how to finalise it.
     """
-    lines = [
-        f"Drive detected {len(stranded)} stranded child(ren): a session "
-        f"failed after the work was pushed to `{parent_branch}`, so the item "
-        "is still non-terminal and blocks `wl next`.",
-        "",
-    ]
-    for item in stranded:
+    finalised = finalised or []
+    lines: list[str] = []
+    if stranded:
+        lines += [
+            f"Drive detected {len(stranded)} stranded child(ren): a session "
+            f"failed after the work was pushed to `{parent_branch}`, so the "
+            "item is still non-terminal and blocks `wl next`.",
+            "",
+        ]
+        for item in stranded:
+            lines.append(
+                f"- `{item.get('id')}` — status={item.get('status') or '?'}, "
+                f"stage={item.get('stage') or '?'}, {item.get('evidence', '')}"
+            )
+        lines += [
+            "",
+            "Finalise the item(s) once the pushed work is verified (or re-run "
+            "drive with `--finalise-stranded` to let it finalise evidence-gated "
+            "children automatically):",
+            "",
+        ]
+        for item in stranded:
+            lines.append(
+                f"  wl update {item.get('id')} --status completed --stage in_review"
+            )
+    if finalised:
+        if lines:
+            lines.append("")
         lines.append(
-            f"- `{item.get('id')}` — status={item.get('status') or '?'}, "
-            f"stage={item.get('stage') or '?'}, {item.get('evidence', '')}"
+            f"Automatically finalised {len(finalised)} stranded child(ren) "
+            "(`--finalise-stranded`, evidence-gated: pushed commit verified, "
+            "item still in-progress, worktree clean):"
         )
-    lines += [
-        "",
-        "Finalise the item(s) once the pushed work is verified (or re-run "
-        "drive with `--finalise-stranded` to let it finalise evidence-gated "
-        "children automatically):",
-        "",
-    ]
-    for item in stranded:
-        lines.append(
-            f"  wl update {item.get('id')} --status completed --stage in_review"
-        )
+        lines.append("")
+        for item in finalised:
+            lines.append(
+                f"- `{item.get('id')}` — completed/in_review, "
+                f"commit {item.get('commit') or '?'}"
+            )
     return "\n".join(lines)
 
 
@@ -5902,6 +6048,8 @@ def phase_drive(
     spawn_session: Callable[..., dict[str, Any]] | None = None,
     parent_runner: Callable[..., dict[str, Any] | None] | None = None,
     commit_evidence: Callable[[str], str | None] | None = None,
+    finalise_stranded: bool = False,
+    finalise_child: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Phase: drive every child of a parent to a terminal state in one call.
 
@@ -5946,6 +6094,13 @@ def phase_drive(
         commit_evidence: Injectable pushed-commit evidence provider (tests)
             used by stranded-child detection; defaults to
             :func:`_git_commit_evidence`.
+        finalise_stranded: When True, a stranded child that passes every
+            safety gate (verified pushed commit, still in-progress, not
+            claimed by another agent, worktree clean) is finalised to
+            ``completed``/``in_review`` and the chain continues. Default
+            False — detection is read-only (SA-0MVLJWTGP005XJPP).
+        finalise_child: Injectable finalisation path (tests); defaults to
+            :func:`_finalise_stranded_child`.
 
     Returns:
         Report dict with per-child results, sessions spawned, whether the
@@ -6027,6 +6182,7 @@ def phase_drive(
     attempts: dict[str, int] = {}
     driven: list[dict[str, Any]] = []
     stranded_comment_posted = False
+    finaliser = finalise_child or _finalise_stranded_child
     # Hard bound on the loop: each child may consume at most
     # max_child_sessions spawns plus one terminal classification, and the
     # final iteration advances the parent.
@@ -6151,14 +6307,59 @@ def phase_drive(
             if stranded["stranded"]:
                 entry["stranded"] = True
                 entry["commit_evidence"] = stranded["commit"]
-                report.setdefault("stranded_children", []).append({
+                stranded_entry = {
                     "id": child_id,
                     "status": reconciliation["status"],
                     "stage": reconciliation["stage"],
                     "commit": stranded["commit"],
                     "evidence": stranded["evidence"],
                     "reason": stranded["reason"],
-                })
+                }
+
+                # Opt-in, evidence-gated finalisation. Read-only by default:
+                # without --finalise-stranded the item is only diagnosed.
+                if (
+                    finalise_stranded
+                    and not _worktree_has_uncommitted_changes(worktree_path)
+                ):
+                    outcome = finaliser(child_id, stranded)
+                    if outcome.get("finalised"):
+                        entry["result"] = "finalised"
+                        entry["finalised"] = True
+                        report.setdefault("finalised_children", []).append({
+                            "id": child_id,
+                            "status": "completed",
+                            "stage": "in_review",
+                            "commit": outcome.get("commit", stranded["commit"]),
+                            "reason": outcome.get("reason", ""),
+                        })
+                        if not stranded_comment_posted:
+                            wl_add_comment(
+                                work_item_id,
+                                _stranded_children_comment(
+                                    report.get("stranded_children", []),
+                                    parent_branch,
+                                    finalised=report["finalised_children"],
+                                ),
+                            )
+                            stranded_comment_posted = True
+                        LOG.info(
+                            "Finalised stranded child %s; continuing the "
+                            "drive loop.",
+                            child_id,
+                        )
+                        continue
+                    LOG.warning(
+                        "Refused to finalise stranded child %s: %s",
+                        child_id, outcome.get("reason", "unknown reason"),
+                    )
+                    stranded_entry["finalise_refused"] = outcome.get(
+                        "reason", "unknown reason",
+                    )
+
+                report.setdefault("stranded_children", []).append(
+                    stranded_entry,
+                )
                 if not stranded_comment_posted:
                     wl_add_comment(
                         work_item_id,
@@ -6518,6 +6719,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"(default: {DEFAULT_CHILD_SESSION_TIMEOUT})"
         ),
     )
+    parser.add_argument(
+        "--finalise-stranded",
+        action="store_true",
+        default=False,
+        help=(
+            "When driving an epic, finalise stranded children (work pushed "
+            "but item still in-progress) to completed/in_review once the "
+            "pushed commit is verified and the worktree is clean. Read-only "
+            "diagnosis remains the default."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -6614,6 +6826,7 @@ def _main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 max_child_sessions=args.max_child_sessions,
                 child_timeout=args.child_timeout,
+                finalise_stranded=args.finalise_stranded,
             )
             _emit_timing(_root_timer)
     else:
