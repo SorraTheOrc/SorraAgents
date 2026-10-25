@@ -27,6 +27,7 @@ from test_cache import (
     store,
     summary_lines,
 )
+from test_runner import subprocess_env_with_scrubbed_overrides
 
 SUCCESS_OUTPUT = (
     "Test Files  1 passed (1)\n"
@@ -590,6 +591,36 @@ def test_default_runner_prepends_local_bin_to_path(git_repo: Path) -> None:
         os.environ["PATH"] = original_path
 
 
+def test_scrubbed_env_dedupes_local_bin_to_front() -> None:
+    """subprocess_env_with_scrubbed_overrides normalises ~/.local/bin.
+
+    The spawned env must contain ~/.local/bin exactly once, at the front of
+    PATH, even when the ambient PATH already repeats it (launcher/profile
+    duplication). Without the dedupe, ``test_default_runner_skips_dup_*``
+    fails on hosts whose ambient PATH already contains ~/.local/bin.
+    """
+    local_bin = os.path.expanduser("~/.local/bin")
+    base_env = {
+        **os.environ,
+        "PATH": os.pathsep.join([local_bin, local_bin, "/usr/bin", local_bin]),
+    }
+    env = subprocess_env_with_scrubbed_overrides(base=base_env)
+    parts = env["PATH"].split(os.pathsep)
+    assert parts.count(local_bin) == 1, f"~/.local/bin appears {parts.count(local_bin)} times"
+    assert parts[0] == local_bin
+
+
+def test_scrubbed_env_preserves_env_when_no_local_bin() -> None:
+    """A PATH without ~/.local/bin is front-loaded with it exactly once."""
+    local_bin = os.path.expanduser("~/.local/bin")
+    base_env = {**os.environ, "PATH": "/usr/bin:/bin"}
+    env = subprocess_env_with_scrubbed_overrides(base=base_env)
+    parts = env["PATH"].split(os.pathsep)
+    assert parts.count(local_bin) == 1
+    assert parts[0] == local_bin
+    assert parts[1:] == ["/usr/bin", "/bin"]
+
+
 def test_default_runner_skips_dup_when_local_bin_already_on_path(git_repo: Path) -> None:
     """When ~/.local/bin is already on PATH, _default_runner must not duplicate it.
 
@@ -614,7 +645,7 @@ def test_default_runner_skips_dup_when_local_bin_already_on_path(git_repo: Path)
         sp.run = fake_run  # type: ignore[assignment]
         try:
             _default_runner("pytest -q", str(git_repo), 60)
-            # Count occurrences — should be exactly one.
+            # Count occurrences - should be exactly one.
             parts = captured_env["PATH"].split(os.pathsep)
             count = parts.count(local_bin)
             assert count == 1, f"~/.local/bin appears {count} times in PATH: {captured_env['PATH']}"

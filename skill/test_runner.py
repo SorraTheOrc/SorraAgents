@@ -384,12 +384,21 @@ def subprocess_env_with_scrubbed_overrides(
     PATH injection the runners rely on (user-installed ``pytest`` is not on
     PATH in restricted agent/cron shells). Unrelated variables are preserved
     and the input mapping is never mutated.
+
+    ``~/.local/bin`` is normalised to appear exactly once, at the front of
+    PATH: if absent it is prepended, and if present (possibly repeated by a
+    launcher/profile that appends it several times) it is deduplicated to a
+    single leading entry. This keeps the spawned PATH canonical regardless of
+    ambient duplication.
     """
     env = scrub_repository_overrides(os.environ if base is None else base)
     local_bin = os.path.expanduser("~/.local/bin")
-    path_value = env.get("PATH", "")
-    if local_bin not in path_value.split(os.pathsep):
-        env["PATH"] = local_bin + os.pathsep + path_value
+    path_parts = env.get("PATH", "").split(os.pathsep)
+    if local_bin in path_parts:
+        path_parts = [local_bin] + [p for p in path_parts if p != local_bin]
+    else:
+        path_parts = [local_bin] + path_parts
+    env["PATH"] = os.pathsep.join(path_parts)
     return env
 
 
