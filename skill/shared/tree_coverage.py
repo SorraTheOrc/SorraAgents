@@ -53,6 +53,15 @@ AUTO_CLOSE_SIMILARITY_THRESHOLD = 0.2
 #: Stable marker embedded in coverage-review comments so re-runs are idempotent.
 COVERAGE_COMMENT_MARKER = "[tree-coverage-review]"
 
+#: Diagnostic used when an ``## Acceptance Criteria`` section exists but no
+#: entries could be parsed (fail-closed guard).
+AC_SECTION_UNPARSEABLE_MESSAGE = (
+    "An 'Acceptance Criteria' section is present but no AC entries "
+    "could be parsed (check list formatting: use '- ', '+ ' or "
+    "'1. ' markers). Failing closed instead of reporting vacuous "
+    "100% coverage."
+)
+
 # ---------------------------------------------------------------------------
 # Subprocess execution helper (supports custom runners for test injection)
 # ---------------------------------------------------------------------------
@@ -376,6 +385,10 @@ def extract_acceptance_criteria(description: str) -> list[str]:
     ordered-list marker is kept verbatim, so bold-led items such as
     ``1. **Title.** text`` yield ``**Title.** text``.
 
+    Only *top-level* list items are collected: a marker indented deeper than
+    the first AC marker is nested detail inside an AC item (a sub-list or
+    explanatory bullet), not an AC itself.
+
     Arguments:
         description: The work item description text.
 
@@ -385,6 +398,9 @@ def extract_acceptance_criteria(description: str) -> list[str]:
     lines = description.split("\n")
     acs: list[str] = []
     in_ac_section = False
+    # Leading-whitespace depth of the first AC marker; any marker indented
+    # deeper is nested detail under an AC item, not a top-level AC.
+    base_indent: int | None = None
 
     for line in lines:
         stripped = line.strip()
@@ -399,10 +415,28 @@ def extract_acceptance_criteria(description: str) -> list[str]:
             continue
         # Collect AC entries: markdown bullets and ordered-list items
         ac_text = _strip_ac_list_marker(stripped)
-        if ac_text:
-            acs.append(ac_text)
+        if not ac_text:
+            continue
+        indent = len(line) - len(line.lstrip())
+        if base_indent is None:
+            base_indent = indent
+        if indent > base_indent:
+            # Deeper-indented marker: nested detail under an AC item.
+            continue
+        acs.append(ac_text)
 
     return acs
+
+
+def has_acceptance_criteria_section(description: str) -> bool:
+    """Return True when *description* contains an AC section header."""
+    return bool(
+        re.search(
+            r"^#+\s+Acceptance\s+Criteria",
+            description,
+            re.MULTILINE | re.IGNORECASE,
+        )
+    )
 
 
 def _strip_ac_list_marker(stripped: str) -> str:
@@ -421,11 +455,15 @@ def _strip_ac_list_marker(stripped: str) -> str:
 
 
 
-def extract_acs_from_item(
+def _fetch_item_description(
     work_item_id: str,
     runner: Any | None = None,
-) -> list[str]:
-    """Extract ACs from a work item by fetching it via ``wl show``."""
+) -> str | None:
+    """Fetch a work item's description via ``wl show``.
+
+    Returns the description string, or ``None`` when the fetch fails, the
+    payload is not valid JSON, or the item reports an error.
+    """
     cmd = ["wl", "show", work_item_id, "--json"]
     cmd[1:1] = resolve_worklog_flags(cmd)
     proc = _execute_subprocess(cmd, runner=runner)
@@ -433,21 +471,32 @@ def extract_acs_from_item(
         logger.warning(
             "wl show failed for AC extraction target=%s", work_item_id
         )
-        return []
+        return None
     try:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError:
         logger.warning(
             "wl show invalid JSON for AC extraction target=%s", work_item_id
         )
-        return []
+        return None
     if isinstance(data, dict) and data.get("success") is False:
         logger.warning(
             "wl show returned error for AC extraction target=%s", work_item_id
         )
-        return []
+        return None
     description = data.get("workItem", {}).get("description", "")
     if not isinstance(description, str):
+        return None
+    return description
+
+
+def extract_acs_from_item(
+    work_item_id: str,
+    runner: Any | None = None,
+) -> list[str]:
+    """Extract ACs from a work item by fetching it via ``wl show``."""
+    description = _fetch_item_description(work_item_id, runner=runner)
+    if description is None:
         return []
     return extract_acceptance_criteria(description)
 
@@ -627,14 +676,42 @@ def run_coverage_review(
           - ``coverage``: result from ``compute_coverage``
           - ``resolved_gaps``: list of gap resolutions (from ``resolve_coverage_gaps``)
           - ``unresolvable_conflicts``: list of conflict descriptions
+          - ``warnings``: non-fatal diagnostics (e.g. an unparseable AC section)
           - ``recommendation``: one of ``"proceed"``, ``"auto_close"``, or ``"stop"``
+
+    Fails closed: when the parent has an ``## Acceptance Criteria`` section but
+    no AC entries could be parsed, the recommendation is ``"stop"`` (with a
+    warning) instead of a vacuous ``fully_covered: true``. An absent or empty
+    AC section is not a failure and keeps the historical behaviour.
     """
+    # Fetch the parent description once so AC extraction and the AC-section
+    # presence check share a single ``wl show`` call.
+    parent_description = _fetch_item_description(work_item_id, runner=runner)
+    if parent_description is None:
+        parent_acs: list[str] = []
+        ac_section_present = False
+    else:
+        parent_acs = extract_acceptance_criteria(parent_description)
+        ac_section_present = has_acceptance_criteria_section(parent_description)
+
+    # Fail closed: an AC section that exists but yields nothing parseable is
+    # an extraction failure, not proof of coverage.
+    warnings: list[str] = []
+    ac_section_unparseable = ac_section_present and not parent_acs
+
     # Fetch children
     children_data = _wl_show_children(work_item_id, runner=runner)
     if not children_data:
+        if ac_section_unparseable:
+            return _fail_closed_review(
+                work_item_id,
+                [],
+                warnings,
+                AC_SECTION_UNPARSEABLE_MESSAGE,
+            )
         return {
             "work_item_id": work_item_id,
-            "parent_acs": extract_acs_from_item(work_item_id, runner=runner),
+            "parent_acs": parent_acs,
             "child_summary": [],
             "coverage": {
                 "coverage_map": {},
@@ -644,14 +721,12 @@ def run_coverage_review(
             },
             "resolved_gaps": [],
             "unresolvable_conflicts": [],
+            "warnings": warnings,
             "recommendation": "proceed",
         }
 
     # Order children by dependencies
     ordered_children = order_by_dependencies(children_data, work_item_id, runner=runner)
-
-    # Extract parent ACs
-    parent_acs = extract_acs_from_item(work_item_id, runner=runner)
 
     # Extract child ACs
     child_acs_flat: list[str] = []
@@ -668,6 +743,15 @@ def run_coverage_review(
             "title": child.get("title", ""),
             "ac_count": len(c_acs),
         })
+
+    if ac_section_unparseable:
+        result = _fail_closed_review(
+            work_item_id,
+            child_summary,
+            warnings,
+            AC_SECTION_UNPARSEABLE_MESSAGE,
+        )
+        return result
 
     # Compute coverage
     coverage = compute_coverage(parent_acs, child_acs_list)
@@ -714,7 +798,38 @@ def run_coverage_review(
         "coverage": coverage,
         "resolved_gaps": resolved_gaps,
         "unresolvable_conflicts": unresolvable_conflicts,
+        "warnings": warnings,
         "recommendation": recommendation,
+    }
+
+
+def _fail_closed_review(
+    work_item_id: str,
+    child_summary: list[dict],
+    warnings: list[str],
+    message: str,
+) -> dict[str, Any]:
+    """Build a fail-closed coverage-review result.
+
+    Reports ``stop`` with ``fully_covered: False`` and the diagnostic *message*
+    (also appended to *warnings* and ``unresolvable_conflicts``), so
+    ``apply_coverage_review`` records it and does not advance the stage.
+    """
+    warnings.append(message)
+    return {
+        "work_item_id": work_item_id,
+        "parent_acs": [],
+        "child_summary": child_summary,
+        "coverage": {
+            "coverage_map": {},
+            "uncovered": [],
+            "fully_covered": False,
+            "coverage_pct": 0.0,
+        },
+        "resolved_gaps": [],
+        "unresolvable_conflicts": [message],
+        "warnings": warnings,
+        "recommendation": "stop",
     }
 
 

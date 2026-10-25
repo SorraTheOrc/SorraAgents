@@ -441,6 +441,48 @@ Some text but no bullets.
             "AC 3: The system shall do Z",
         ]
 
+    def test_nested_bullet_under_numbered_item_is_not_an_ac(self):
+        """A bullet indented under an ordered-list item is nested detail, not
+        a top-level AC."""
+        desc = """## Acceptance Criteria
+1. First criterion
+   - Nested detail for first
+2. Second criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["First criterion", "Second criterion"]
+
+    def test_nested_bullet_under_bullet_is_not_an_ac(self):
+        """A bullet indented under another bullet is a sub-list, not a
+        top-level AC."""
+        desc = """## Acceptance Criteria
+- First bullet
+  - Nested detail
+- Second bullet
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["First bullet", "Second bullet"]
+
+    def test_nested_numbered_item_under_numbered_is_not_an_ac(self):
+        """A numbered item indented under another AC is nested detail."""
+        desc = """## Acceptance Criteria
+1. First
+   1. Nested step
+2. Second
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["First", "Second"]
+
+    def test_indented_ac_section_still_extracts_top_level(self):
+        """ACs indented uniformly (e.g. wrapped in a list) still extract;
+        only deeper-indented markers are treated as nested."""
+        desc = """## Acceptance Criteria
+  - Indented bullet one
+  - Indented bullet two
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["Indented bullet one", "Indented bullet two"]
+
 
 # =========================================================================
 # 4. Coverage computation
@@ -782,6 +824,176 @@ class TestRunCoverageReview:
                 assert child["ac_count"] == 2
             elif child["id"] == "SA-03":
                 assert child["ac_count"] == 1
+
+    def test_numbered_and_bulleted_acs_produce_same_recommendation(self):
+        """Decision parity: the same ACs written as an ordered list or as
+        bullets yield an identical coverage recommendation."""
+
+        def _make_runner(parent_block: str, child_block: str):
+            def _runner(cmd):
+                if "--parent" in cmd:
+                    return _FakeResult(
+                        json.dumps(
+                            {
+                                "success": True,
+                                "children": [{"id": "SA-02", "title": "Child"}],
+                            }
+                        )
+                    )
+                if "dep" in cmd and "list" in cmd:
+                    return _FakeResult(
+                        json.dumps({"success": True, "dependencies": []})
+                    )
+                if "SA-01" in cmd:
+                    return _FakeResult(
+                        json.dumps(
+                            {
+                                "success": True,
+                                "workItem": {
+                                    "description": "## Acceptance Criteria\n"
+                                    + parent_block,
+                                },
+                            }
+                        )
+                    )
+                if "SA-02" in cmd:
+                    return _FakeResult(
+                        json.dumps(
+                            {
+                                "success": True,
+                                "workItem": {
+                                    "description": "## Acceptance Criteria\n"
+                                    + child_block,
+                                },
+                            }
+                        )
+                    )
+                return _FakeResult("{}")
+
+            return _runner
+
+        numbered = run_coverage_review(
+            "SA-01",
+            runner=_make_runner(
+                "1. System must encrypt all data\n",
+                "1. User can view profile\n",
+            ),
+        )
+        bulleted = run_coverage_review(
+            "SA-01",
+            runner=_make_runner(
+                "- System must encrypt all data\n",
+                "- User can view profile\n",
+            ),
+        )
+
+        assert numbered["parent_acs"] == bulleted["parent_acs"] == [
+            "System must encrypt all data"
+        ]
+        assert numbered["recommendation"] == bulleted["recommendation"]
+        assert numbered["recommendation"] == "stop"
+
+    def test_unparseable_ac_section_fails_closed(self):
+        """An AC section whose entries cannot be parsed must not produce a
+        vacuous 100% pass: the review stops with an explicit warning."""
+
+        def _custom_runner(cmd):
+            if "--parent" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "children": [{"id": "SA-02", "title": "Child"}],
+                        }
+                    )
+                )
+            if "dep" in cmd and "list" in cmd:
+                return _FakeResult(
+                    json.dumps({"success": True, "dependencies": []})
+                )
+            if "SA-01" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {
+                                "description": (
+                                    "## Acceptance Criteria\n"
+                                    "* star bullet one\n"
+                                    "* star bullet two\n"
+                                ),
+                            },
+                        }
+                    )
+                )
+            if "SA-02" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {
+                                "description": (
+                                    "## Acceptance Criteria\n"
+                                    "- Something else\n"
+                                ),
+                            },
+                        }
+                    )
+                )
+            return _FakeResult("{}")
+
+        result = run_coverage_review("SA-01", runner=_custom_runner)
+        assert result["parent_acs"] == []
+        assert result["recommendation"] == "stop"
+        assert result["coverage"]["fully_covered"] is False
+        assert result["warnings"]
+
+    def test_absent_ac_section_is_not_a_failure(self):
+        """No AC section at all keeps the existing proceed behaviour (only an
+        AC section that exists but cannot be parsed fails closed)."""
+
+        def _custom_runner(cmd):
+            if "--parent" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "children": [{"id": "SA-02", "title": "Child"}],
+                        }
+                    )
+                )
+            if "dep" in cmd and "list" in cmd:
+                return _FakeResult(
+                    json.dumps({"success": True, "dependencies": []})
+                )
+            if "SA-01" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {"description": "No ACs here."},
+                        }
+                    )
+                )
+            if "SA-02" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {
+                                "description": (
+                                    "## Acceptance Criteria\n"
+                                    "- Something\n"
+                                ),
+                            },
+                        }
+                    )
+                )
+            return _FakeResult("{}")
+
+        result = run_coverage_review("SA-01", runner=_custom_runner)
+        assert result["recommendation"] == "proceed"
+        assert result["warnings"] == []
 
 
 class TestExtractAcsFromItem:
