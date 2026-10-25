@@ -103,6 +103,20 @@
           "compat": { "thinkingFormat": "qwen" }
         }
       }
+    },
+    "MunitoAI": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.munito.ai/inference/v1",
+      "apiKey": "$MUNITOAI_API_KEY",
+      "models": [
+        {
+          "id": "deepseek-ai/deepseek-v4-flash",
+          "name": "MunitoAI DeepSeek V4 Flash (paid)",
+          "contextWindow": 400000,
+          "maxTokens": 16384,
+          "input": ["text"]
+        }
+      ]
     }
   }
 }
