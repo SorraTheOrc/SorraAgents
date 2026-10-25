@@ -403,3 +403,49 @@ A push timeout never silently loses work:
 3. `wl_add_comment` posts a full manual-push instruction including both.
 4. Status is reset to `open` (not abandoned).
 5. The agent or operator can push manually with the posted instruction.
+
+## Terminal-status read-back (no-op-push guarantee) (OSL-0MVME1PI5005WU58)
+
+`implement.py finish` must never report success while the main-checkout store
+holds a non-terminal state for the item. `phase_finish` writes the terminal
+transition from `StatusLifecycle.__exit__`, which runs on **both** finish
+paths — the push-with-diff path and the no-op-push path (a worktree branch
+with no diff from `origin/dev`, e.g. a verification-only item whose evidence
+is a worklog comment). The reproduction on OSL-0MVME1PI5005WU58 confirmed
+that no step discards or overwrites that write, so the guarantee is enforced
+rather than assumed.
+
+After the `with` block (Step 8b), `phase_finish` calls
+`_assert_terminal_status(work_item_id)`, which:
+
+- reads the item back through `StatusLifecycle.show()` (the same
+  prefix-to-sibling resolution as the write, so a cross-repo store — e.g. an
+  `OSL-*` item from a SorraAgents worktree — is read from its own project
+  store), and
+- returns `{"success": True, "status": ..., "stage": ...}`, recorded as
+  `report["steps"]["status_readback"]`, **or**
+- raises `RuntimeError` when the store does not hold `status=completed` /
+  `stage=in_review`.
+
+The raised error flows through `phase_finish`'s normal `RuntimeError`
+handler: the item is released to `open` and the run reports `success: false`
+with the read-back message. That is the intended behaviour — a silently lost
+or overwritten lifecycle write (the symptom recorded on OSL-0MVMB44C9008IXZX,
+where finish reported success while the item stayed `open`) becomes a loud
+failure instead of a green report.
+
+Ordering guarantees:
+
+- The read-back runs **only after** Step 6's confirmed successful push (it
+  sits after the `with` block that contains the push), so a failed push, push
+  timeout, or non-fast-forward failure still leaves the item `open` and never
+  produces an `in_review` report.
+- The read-back **reports**, it does not repair: it does not re-write the
+  terminal status. Re-run `finish` (or complete the transition by hand) after
+  investigating the store.
+- Push-with-diff behaviour is unchanged — the assertion is additive and
+  applies to both paths identically.
+
+Regression pin: `skill/implement/tests/test_finish_no_diff_status.py` covers
+the no-diff path (empty staged diff, no-op push success), the push-with-diff
+companion, and the fail-loud path when the store is non-terminal.

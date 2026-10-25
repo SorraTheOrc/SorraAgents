@@ -66,6 +66,21 @@ with `StatusLifecycle.require_claimed(<id>)` before any mutation; on any
 in-session resume, re-claim first via `StatusLifecycle.ensure_claimed(<id>)`
 (idempotent).
 
+**Terminal status on both finish paths (OSL-0MVME1PI5005WU58).** `finish`
+persists `completed`/`in_review` on the push-with-diff path **and** on the
+no-op-push path (a branch with no diff from `origin/dev` — e.g. a
+verification-only item): both paths reach the same
+`with StatusLifecycle(..., target_stage="in_review")` exit, so the terminal
+write is issued either way. After that write, `finish` reads the item back
+from the main-checkout store (`_assert_terminal_status`) and **fails loudly**
+— item released to `open`, non-zero result — when the store does not hold
+`completed`/`in_review`, so a silently lost lifecycle write can never be
+reported as success. The read-back runs only after a confirmed successful
+push; a failed push, build, or gate still leaves the item `open`. Regression
+pin: `tests/test_finish_no_diff_status.py`. Deliberate gap: the read-back
+*reports* a lost write, it does not repair it — re-run `finish` after
+investigating the store.
+
 ## Project-local extensions
 
 The implement skill consumes the project-local extension convention
