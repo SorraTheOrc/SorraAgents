@@ -358,15 +358,23 @@ def _get_child_dependency_ids(
 # AC extraction
 # ---------------------------------------------------------------------------
 
+# Ordered-list AC marker: ``1. text`` or ``1) text`` (any number of digits).
+_ORDERED_AC_RE = re.compile(r"^\d+[.)]\s+(.+)$")
+
 
 def extract_acceptance_criteria(description: str) -> list[str]:
-    """Extract acceptance criteria bullets from a work item description.
+    """Extract acceptance criteria entries from a work item description.
 
     Looks for a section header matching ``## Acceptance Criteria`` (case-insensitive)
-    and collects lines starting with ``- `` (markdown bullets) until the next
-    section header (``##``) or end of content.
+    and collects list entries until the next section header (``##``) or end of
+    content. Both markdown bullets (``- `` / ``+ ``) and ordered-list items
+    (``1. `` / ``1) ``) are recognised; bullets and numbers interleave in
+    document order of appearance.
 
-    Strips leading ``- `` and surrounding whitespace from each bullet.
+    Strips the leading list marker (``- `` / ``+ `` or the trailing ``digits.)``
+    plus whitespace) and surrounding whitespace from each entry. Text after an
+    ordered-list marker is kept verbatim, so bold-led items such as
+    ``1. **Title.** text`` yield ``**Title.** text``.
 
     Arguments:
         description: The work item description text.
@@ -387,18 +395,30 @@ def extract_acceptance_criteria(description: str) -> list[str]:
         # Exit the section if we hit another heading
         if in_ac_section and re.match(r"^##\s+", stripped):
             break
-        # Collect AC bullets
-        if in_ac_section and stripped.startswith("- "):
-            ac_text = stripped[2:].strip()
-            if ac_text:
-                acs.append(ac_text)
-        # Also handle + bullets
-        if in_ac_section and stripped.startswith("+ "):
-            ac_text = stripped[2:].strip()
-            if ac_text:
-                acs.append(ac_text)
+        if not in_ac_section:
+            continue
+        # Collect AC entries: markdown bullets and ordered-list items
+        ac_text = _strip_ac_list_marker(stripped)
+        if ac_text:
+            acs.append(ac_text)
 
     return acs
+
+
+def _strip_ac_list_marker(stripped: str) -> str:
+    """Strip a markdown bullet or ordered-list marker from an AC line.
+
+    Returns the entry text with surrounding whitespace trimmed, or an empty
+    string when the line is not a bullet / ordered-list entry.
+    """
+    for marker in ("- ", "+ "):
+        if stripped.startswith(marker):
+            return stripped[len(marker):].strip()
+    match = _ORDERED_AC_RE.match(stripped)
+    if match:
+        return match.group(1).strip()
+    return ""
+
 
 
 def extract_acs_from_item(

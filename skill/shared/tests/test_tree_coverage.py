@@ -345,6 +345,102 @@ Some text but no bullets.
         acs = extract_acceptance_criteria(desc)
         assert acs == ["Bullet one", "Bullet two", "Bullet three"]
 
+    def test_numbered_acs_extracted(self):
+        """Ordered-list AC entries (``1. ``) are collected in order."""
+        desc = """## Acceptance Criteria
+
+1. The parser accepts numbered items
+2. The parser strips the number marker
+3. Order of appearance is preserved
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "The parser accepts numbered items",
+            "The parser strips the number marker",
+            "Order of appearance is preserved",
+        ]
+
+    def test_paren_numbered_acs_extracted(self):
+        """The ``1) `` ordered-list marker variant is accepted."""
+        desc = """## Acceptance Criteria
+1) First criterion
+2) Second criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["First criterion", "Second criterion"]
+
+    def test_bold_led_numbered_acs_keep_text_verbatim(self):
+        """Bold-led numbered items keep the text after the marker verbatim."""
+        desc = """## Acceptance Criteria
+
+1. **Parser.** Recognises numbered AC entries.
+2. **Order.** Preserves document order.
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "**Parser.** Recognises numbered AC entries.",
+            "**Order.** Preserves document order.",
+        ]
+
+    def test_mixed_bullets_and_numbers_preserve_document_order(self):
+        """Bullet and numbered entries interleave in document order, once each."""
+        desc = """## Acceptance Criteria
+- Bullet first
+1. Numbered second
++ Bullet third
+2) Numbered fourth
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Bullet first",
+            "Numbered second",
+            "Bullet third",
+            "Numbered fourth",
+        ]
+
+    def test_multi_digit_numbering(self):
+        """Multi-digit ordered-list numbers are handled."""
+        desc = """## Acceptance Criteria
+9. Ninth criterion
+10. Tenth criterion
+11. Eleventh criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Ninth criterion",
+            "Tenth criterion",
+            "Eleventh criterion",
+        ]
+
+    def test_numbered_items_outside_ac_section_are_ignored(self):
+        """Numbered items outside the AC section are not collected."""
+        desc = """# Feature
+
+1. Numbered step in the description
+
+## Acceptance Criteria
+1. Only this criterion
+
+## Constraints
+1. Not a criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["Only this criterion"]
+
+    def test_bullet_list_behaviour_unchanged(self):
+        """Regression: bullet-only sections extract exactly as before."""
+        desc = """## Acceptance Criteria
+- AC 1: The system shall do X
++ AC 2: The system shall do Y
+- AC 3: The system shall do Z
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "AC 1: The system shall do X",
+            "AC 2: The system shall do Y",
+            "AC 3: The system shall do Z",
+        ]
+
 
 # =========================================================================
 # 4. Coverage computation
