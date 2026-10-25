@@ -492,6 +492,42 @@ the repo declares custom `suiteCommands` in `.pi/test-config.json` (not
 introspectable), or the repo has no subsettable tooling. A scoped run never
 silently skips testing.
 
+**The fallback honours pinned suite commands
+(OSL-0MVNWYRQB0095WXQ).** When the fallback fires, the full-scope command set
+is resolved through `full_suite_commands(project_root)` — the single source
+of truth (section 1) — filtered by the requested suite name via
+`filter_commands_for_suite()` (`pytest` → commands containing `pytest`,
+`node` → commands containing `node`, `all` → every command).
+
+- A repo that pins `suiteCommands` (`{"suiteCommands": ["python3 -m pytest -q"]}`)
+therefore runs the **pinned** command — and the pinned interpreter — for
+`--suite pytest --scope changed`, exactly as `--suite all` does. The legacy
+bare `pytest` token is never substituted on the fallback path, so a scoped run
+can no longer silently re-resolve `pytest` to a different interpreter and
+report false collection errors.
+- A **multi-command pin** (mixed pytest + node entries) maps each command to
+its own suite name; `--suite pytest` runs the pytest entries only.
+- When the filtered set is **empty** (e.g. a node-only pin queried as
+`--suite pytest`), `run_suite` raises the unknown-suite-style
+`ValueError` (`unknown suite: pytest — the repo's suite commands define no
+matching command`) instead of silently running nothing and reporting success.
+- The reporting contract is unchanged: a fallback still records
+`scope: "full"`.
+
+Direct full-scope runs (`--scope full`) keep the legacy name-based resolution
+for `pytest`/`node` (section 1), and tool-less repos keep their legacy
+fallback, so existing behaviour is untouched.
+
+**Read-only summaries resolve the same way
+(OSL-0MVNWYRQB0095WXQ).** `--summary` (`run_summary`) also resolves each suite
+through `full_suite_commands(project_root)` filtered by suite name, so a
+summary of `--suite pytest` in a pinned repo looks up the **pinned** cache
+entry rather than missing it against a bare-token key. When the repo declares
+suite commands but none match the requested suite (e.g. a node-only pin
+queried as `--suite pytest`), the suite is reported as a miss (`missing`),
+never as an empty success. A tool-less repo (empty full-suite command set)
+keeps the legacy name-based lookup, unchanged.
+
 **Result JSON** carries `scope` (`full`/`changed`) at the run level
 (`run_all` outputs `scope` + per-suite `resolved_scopes`); `run_suite`
 results carry `scope` on every path (normal, `FileNotFoundError`,

@@ -74,7 +74,7 @@ Exit codes:
   0 - all suites passed
   1 - at least one test failed (or --summary cache miss)
   2 - runner error (missing suite binary etc.)
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 
@@ -1656,7 +1656,12 @@ def run_suite(
     cannot produce a subset for this suite (custom suite commands, no
     selection, no applicable commands), it falls back to the full suite and
     reports ``scope: "full"`` in the result so consumers never mistake a
-    partial run for a full one. The result always carries ``scope``
+    partial run for a full one. The fallback resolves through
+    ``full_suite_commands(cwd)`` filtered by suite name, so a repo's pinned
+    ``suiteCommands`` (custom interpreter) are honoured for every suite name
+    (OSL-0MVNWYRQB0095WXQ); when the pinned set defines no command for the
+    suite, it raises the unknown-suite-style error. The result always carries
+    ``scope``
     ("full"|"changed") and, for changed scope, ``changed_files`` (the file
     set that drove selection). The scope is recorded in the per-repo test
     cache metadata (``run_cached(scope=...)``) so read-only consumers can
@@ -1714,15 +1719,37 @@ def run_suite(
             # Full scope (including changed-scope fallback — report "full" so
             # consumers never treat a partial selection as complete).
             if test_type == DEFAULT_TEST_TYPE:
-                # Legacy name-based resolution (AC5, unchanged for full runs).
-                if name == "pytest":
-                    commands = [pytest_command()]
-                elif name == "node":
-                    commands = node_suite_commands(cwd)
-                elif name == "all":
-                    commands = full_suite_commands(cwd)
-                else:
-                    raise ValueError(f"unknown suite: {name}")
+                if scope == "changed":
+                    # Changed-scope fallback: resolve through
+                    # ``full_suite_commands()`` — the single source of truth
+                    # (F2 AC4) — so a repo's pinned suiteCommands (custom
+                    # interpreter) are honoured for every suite name (the
+                    # fallback never silently swaps to the legacy bare
+                    # ``pytest`` token and a different interpreter,
+                    # OSL-0MVNWYRQB0095WXQ). A pinned/conventional suite
+                    # that defines no matching command raises the
+                    # unknown-suite-style error instead of silently running
+                    # nothing. Tool-less repos (empty full set) keep the
+                    # legacy resolution so full-scope behaviour is unchanged.
+                    full = full_suite_commands(cwd)
+                    if full:
+                        commands = filter_commands_for_suite(name, full)
+                        if not commands:
+                            raise ValueError(
+                                f"unknown suite: {name} — the repo's suite "
+                                "commands define no matching command"
+                            )
+                if commands is None:
+                    # Legacy name-based resolution (AC5; unchanged for direct
+                    # full-scope runs).
+                    if name == "pytest":
+                        commands = [pytest_command()]
+                    elif name == "node":
+                        commands = node_suite_commands(cwd)
+                    elif name == "all":
+                        commands = full_suite_commands(cwd)
+                    else:
+                        raise ValueError(f"unknown suite: {name}")
             else:
                 type_cmds = resolve_type_commands(cwd, test_type)
                 commands = filter_commands_for_suite(name, type_cmds)
@@ -2117,10 +2144,14 @@ def run_summary(
     ``interpreters`` (the recorded pytest interpreter/executable per suite,
     empty when unknown) and ``missing`` (list of suite names). A ``changed``-scope summary is NOT
     full-suite verification — consumers must treat it as partial evidence
-    (the audit skill rejects changed-scope entries for full-suite ACs). The
-    ``"all"`` suite resolves commands via ``full_suite_commands(cwd)`` — the
-    single source of truth (F2 AC4) — unless an explicit typed *commands*
-    profile is supplied.
+    (the audit skill rejects changed-scope entries for full-suite ACs).
+    Every suite resolves commands via ``full_suite_commands(cwd)`` filtered by
+    suite name — the single source of truth (F2 AC4) — unless an explicit
+    typed *commands* profile is supplied, so a repo's pinned suiteCommands
+    (custom interpreter) are honoured for read-only summaries of every suite
+    name (OSL-0MVNWYRQB0095WXQ). A suite with no matching command in a
+    non-empty suite-command set is reported as a miss; a tool-less repo (empty
+    full set) keeps the legacy name-based resolution.
     """
     cwd = cwd or REPO_ROOT
     result: dict[str, Any] = {
@@ -2136,12 +2167,29 @@ def run_summary(
             suite_commands = group_commands(group, cwd) or full_suite_commands(cwd)
         elif commands is not None:
             suite_commands = filter_commands_for_suite(name, commands)
-        elif name == "pytest":
-            suite_commands = [pytest_command()]
-        elif name == "node":
-            suite_commands = node_suite_commands(cwd)
         else:
-            suite_commands = full_suite_commands(cwd)
+            # Resolve through ``full_suite_commands()`` — the single source of
+            # truth (F2 AC4) — so a repo's pinned suiteCommands are honoured
+            # for read-only cache summaries of every suite name
+            # (OSL-0MVNWYRQB0095WXQ): ``--suite pytest`` in a pinned repo must
+            # look up the pinned command, never the legacy bare ``pytest``
+            # token. When the repo declares suite commands but none match
+            # this suite, report a clear miss instead of silently succeeding
+            # with nothing to look up. A tool-less repo (empty full set) keeps
+            # the legacy name-based resolution unchanged.
+            full = full_suite_commands(cwd)
+            if full:
+                suite_commands = filter_commands_for_suite(name, full)
+                if not suite_commands:
+                    result["missing"].append(name)
+                    result["success"] = False
+                    continue
+            elif name == "pytest":
+                suite_commands = [pytest_command()]
+            elif name == "node":
+                suite_commands = node_suite_commands(cwd)
+            else:
+                suite_commands = full
         lines: list[str] = []
         scopes: set[str] = set()
         types: set[str] = set()
