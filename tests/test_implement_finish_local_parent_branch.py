@@ -417,6 +417,13 @@ def test_phase_finish_syncs_parent_branch_after_push(implement_mod, tmp_path):
         def update_status(*a, **k):
             return None
 
+        @staticmethod
+        def show(*a, **k):
+            # The post-finish store read-back (OSL-0MVME1PI5005WU58) reads
+            # the item back after the terminal write; the real
+            # StatusLifecycle always exposes this staticmethod.
+            return {"workItem": {"status": "completed", "stage": "in_review"}}
+
     def _record_push(*a, **k):
         calls.append("push")
         return True

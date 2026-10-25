@@ -551,6 +551,56 @@ def wl_add_comment(work_item_id: str, comment: str) -> bool:
     return True
 
 
+def _assert_terminal_status(work_item_id: str) -> dict[str, Any]:
+    """Verify the store holds the terminal transition after a successful finish.
+
+    The terminal ``status=completed``/``stage=in_review`` write is issued by
+    ``StatusLifecycle.__exit__`` on **both** the push-with-diff path and the
+    no-op-push (no-diff) path — a branch with no diff from ``origin/dev``
+    still reaches the context manager and the write persists. This
+    read-back turns a silently lost or overwritten lifecycle write into a
+    loud finish failure instead of a green report: the recorded symptom on
+    OSL-0MVMB44C9008IXZX was exactly that — ``finish`` reported success
+    while the item was still ``open`` (OSL-0MVME1PI5005WU58).
+
+    The assertion runs only after Step 6's confirmed successful push (and
+    after ``StatusLifecycle.__exit__`` issued the write), so a genuine push
+    failure can never surface as ``in_review``. The regression pin is
+    ``skill/implement/tests/test_finish_no_diff_status.py``.
+
+    Args:
+        work_item_id: The work item ID.
+
+    Returns:
+        Dict with ``success`` (True), ``status`` and ``stage`` as read back
+        from the main-checkout store.
+
+    Raises:
+        RuntimeError: when the store does not hold terminal state — the
+            finish phase must then fail (and the item be released) instead
+            of reporting success.
+    """
+    try:
+        data = StatusLifecycle.show(work_item_id)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Status read-back failed after a successful finish: {exc}"
+        ) from exc
+    wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+    status = wi.get("status", "")
+    stage = wi.get("stage", "")
+    if status == "completed" and stage == "in_review":
+        return {"success": True, "status": status, "stage": stage}
+    raise RuntimeError(
+        f"Finish reported success but the main-checkout store does not hold "
+        f"the terminal transition for {work_item_id}: status={status!r}, "
+        f"stage={stage!r} (expected completed / in_review). The lifecycle "
+        f"write was lost or overwritten — investigate before re-running "
+        f"finish, or complete the transition by hand if the store was "
+        f"restored from a stale snapshot."
+    )
+
+
 def _safety_reset_if_in_progress(work_item_id: str) -> None:
     """Reset a work item to ``open`` ONLY if it is currently in-progress.
 
@@ -4337,6 +4387,8 @@ def phase_finish(
     9. Remove worktree
     10. Sync local parent branch (post-push, AC1/AC2)
     11. Mark in_review
+    12. Read back the terminal status from the main-checkout store and
+        fail loudly if it did not stick (OSL-0MVME1PI5005WU58)
 
     All implementation work MUST be done inside the worktree created by
     ``phase_start``. If the current directory is outside the worktree and the
@@ -4751,6 +4803,17 @@ def phase_finish(
                 LOG.info("Parent-branch sync: %s", sync_result["warning"])
 
             # StatusLifecycle.__exit__ sets status=completed, stage=in_review
+
+        # ── Step 8b: Terminal-status read-back assertion ──────────────
+        # (OSL-0MVME1PI5005WU58) The terminal write above must have stuck
+        # in the main-checkout store on BOTH the push-with-diff and the
+        # no-op-push path; a finish that reports success while the store is
+        # still non-terminal is a silent lifecycle lie (recorded on
+        # OSL-0MVMB44C9008IXZX). Runs only after the confirmed successful
+        # push (Step 6) — a genuine push failure can never reach here.
+        report["steps"]["status_readback"] = _assert_terminal_status(
+            work_item_id
+        )
 
     except RuntimeError as e:
         msg = str(e)
