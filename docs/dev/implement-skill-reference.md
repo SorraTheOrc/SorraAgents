@@ -158,6 +158,108 @@ path. This is accepted because driven children are headless, the same exclusion
 is already accepted for audit calls, and the implement skill manages its own
 loop.
 
+## Why drive reconciles terminal children after a session timeout (SA-0MVHXWLPG007OQVN)
+
+A driven child session is bounded by `--child-timeout` (default 3600 s). That
+bound is **not a verdict**: a child can commit, push to `dev` and reach a
+terminal work-item state moments before the session is killed. Until
+SA-0MVHXWLPG007OQVN `phase_drive` treated every `subprocess.TimeoutExpired`
+from `_default_session_spawner` as a hard child failure, so `drive` reported
+`success: false` / `failed_child` for children that were already done.
+
+### Recorded production evidence
+
+In the ContextHub epic `WL-0MVGEB3IP002V8IB` (three children) each child
+session was killed at its per-child timeout (3600 s / 7200 s / 10800 s)
+**after** the child had committed and pushed to `dev`, yet `drive` reported:
+
+```
+"result": "failed",
+"reason": "Child session for WL-0MVGU4S58003IRXV timed out after 3600s."
+```
+
+Two children had verifiably reached a terminal state; the third had pushed
+its work but was killed between the push and the final `StatusLifecycle`
+update (left stranded `in-progress`, finalised manually afterwards).
+
+### Classification rules
+
+After a **failed** spawn (timeout **or** non-zero exit) `phase_drive` calls
+`_reconcile_spawn_failure`, which re-fetches the child (read-only `wl show`)
+and classifies it:
+
+| Condition | Outcome |
+|---|---|
+| status `completed` / `done` / `in_review`, stage `in_review`, or soft-deleted | **terminal** — entry `result: "completed-late"`, the chain continues |
+| status `open` / `blocked` / `in_progress`, or the fetch fails | **not terminal** — the pre-existing hard failure (`result: "failed"`, `failed_child`, chain stops) |
+
+Reconciliation runs **only on the failure path** — a successful spawn never
+pays the extra `wl show` (risk R1 in the intake). An unreadable child state
+fails closed: no crash, no silent success.
+
+### Report fields
+
+Spawn-failure entries carry, alongside the existing `id` / `attempt` /
+`result` / `reason`:
+
+- `timed_out` (bool) and `timeout_seconds` (int | null)
+- `terminal` (bool), `terminal_status`, `terminal_stage`
+- `stranded` (bool) and `commit_evidence` when the child's work is already on
+  the parent branch
+
+`report["completed_late"]` counts completed-late children; the summary
+`message` states how many completed late whenever the parent advanced after a
+timeout. The human rendering uses a distinct `🕓` icon for `completed-late`
+(never the `✅` success icon), `🛠` for `finalised`, and prints a
+`timed out after Ns; terminal (status=…, stage=…)` evidence line. All
+additions are additive: the existing keys (`success`, `parent_advanced`,
+`sessions_spawned`, `children_driven`, `message`) keep their meaning and types.
+
+### Stranded children (detection and opt-in finalisation)
+
+A **stranded** child is the `WL-0MVGUA9EY003XFAD` shape: the session pushed to
+`dev` but was killed before the final terminal update, leaving the item
+`in-progress` and blocking `wl next`.
+
+- **Detection (default, read-only).** `_detect_stranded_child` looks for a
+  commit referencing the child id on `origin/dev` (then local `dev`) via a
+  bounded `git log --grep` (30 s, no network fetch). Matches are reported in
+  `report["stranded_children"]` (`id`, `status`, `stage`, `commit`,
+  `evidence`, `reason`), the entry is marked `stranded`, and exactly **one**
+  worklog comment per drive invocation names the items and how to finalise
+  them. No lifecycle mutation and no worktree mutation happens.
+- **Graceful degradation.** A missing/unreadable worktree, a git error, or a
+  repository without the remote-tracking ref degrades to “unknown”
+  (`stranded: false`) without crashing and without false positives.
+- **Opt-in finalisation (`--finalise-stranded`).** When the pushed commit is
+  verified, the item is still `in-progress`, no other agent holds it
+  (non-empty `assignee`), and the child worktree holds **no uncommitted
+  work**, `_finalise_stranded_child` sets `completed`/`in_review` through
+  `StatusLifecycle.update_status` and comments the evidence on the child. The
+  entry becomes `result: "finalised"`, the child is listed in
+  `report["finalised_children"]`, and the chain continues. Any gate failing
+  falls back to the read-only diagnostic.
+
+### Tests
+
+```bash
+pytest -q tests/test_implement_drive.py
+```
+
+`TestTimeoutReconciliation`, `TestSpawnFailureReconciliation`,
+`TestTimeoutOutcomeEvidence`, `TestStrandedChildren` and
+`TestFinaliseStrandedChildren` cover the reconciliation, evidence, stranded
+and finalisation paths hermetically (injected spawner, per-child `wl_show`
+fake, injected commit-evidence provider, recording mutation fake).
+
+### Scope limits
+
+- The per-child timeout mechanism itself is unchanged (the defect was the
+  consequence handling, not the bound).
+- Session-per-child isolation and per-child worktree semantics are unchanged.
+- No fetch/network in the evidence path; a stale `origin/dev` ref is accepted
+  evidence on the failure path.
+
 ## Build step for repos without a build script
 
 The `implement.py finish` build step (`run_build()`) is tolerant of repos

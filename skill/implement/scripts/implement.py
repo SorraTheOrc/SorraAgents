@@ -5508,6 +5508,13 @@ def _default_session_spawner(
     dispatch — see the inline comment below and
     ``docs/dev/implement-skill-reference.md``.
 
+    A ``timeout`` (or non-zero exit) result is **not** a verdict: the caller
+    (``phase_drive``) reconciles it against the child's actual work-item state
+    via :func:`_reconcile_spawn_failure`, because the child may have committed,
+    pushed and reached a terminal state before the session was killed
+    (SA-0MVHXWLPG007OQVN). This function deliberately reports only what
+    happened to the process.
+
     Args:
         child_id: The child work item ID.
         worktree_path: The child's pre-created worktree (process cwd).

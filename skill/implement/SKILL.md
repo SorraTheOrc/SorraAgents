@@ -581,11 +581,36 @@ that child's own worktree, waits for it to exit, then continues. A single
 `drive` call therefore completes every child and advances the parent, while
 each child keeps its own clean context window and its own worktree. Options:
 `--json` (machine-readable per-child report), `--max-child-sessions N`
-(default 1) to bound retries, `--child-timeout S` (default 3600). When no Pi
-executable is available it stops with actionable manual instructions rather
-than silently skipping a child (`IMPLEMENT_DRIVE_PI_BIN` overrides the
-binary). A driven session is marked `IMPLEMENT_DRIVE_ACTIVE=1` and refuses to
-re-enter `drive`.
+(default 1) to bound retries, `--child-timeout S` (default 3600),
+`--finalise-stranded` (opt-in, evidence-gated finalisation of stranded
+children — see below). When no Pi executable is available it stops with
+actionable manual instructions rather than silently skipping a child
+(`IMPLEMENT_DRIVE_PI_BIN` overrides the binary). A driven session is marked
+`IMPLEMENT_DRIVE_ACTIVE=1` and refuses to re-enter `drive`.
+
+**A timeout is a bound, not a verdict (SA-0MVHXWLPG007OQVN).** After a failed
+child spawn (timeout or non-zero exit) `drive` re-fetches the child and
+classifies it: a child that already reached a terminal state is recorded as
+`completed-late` and the chain continues; a genuinely incomplete child keeps
+the hard failure. Report vocabulary, per-child entry fields and the stranded
+child handling:
+
+| `result` | Meaning |
+|---|---|
+| `ok` | The child session exited successfully. |
+| `completed-late` | The session timed out/failed **but** the child is terminal (status `completed`/`done`/`in_review`, stage `in_review`, or soft-deleted). The chain continues. |
+| `finalised` | A stranded child was finalised via `--finalise-stranded` (verified pushed commit, still in-progress, no other agent, clean worktree). The chain continues. |
+| `failed` | The child is not terminal — the chain stops and `failed_child` is set. |
+
+Spawn-failure entries additionally carry `timed_out`, `timeout_seconds`,
+`terminal`, `terminal_status` and `terminal_stage`; `report["completed_late"]`
+counts the completed-late children and the summary message states how many
+completed late. A non-terminal child whose work is already on the parent
+branch appears in `report["stranded_children"]` with its pushed-commit
+evidence (read-only: report plus one parent comment, no status mutation).
+`--finalise-stranded` additionally finalises such children through
+`StatusLifecycle` (`completed`/`in_review`) when every safety gate holds, and
+lists them in `report["finalised_children"]`.
 
 > **Child sessions run extensions-disabled.** The spawner builds
 > `pi -p "/skill:implement <child>" --approve --no-extensions` so a globally
