@@ -123,8 +123,16 @@ fi
 # while still flagging orphan refs. Do NOT re-inline a name-based check here:
 # the previous inline version only special-cased refs/worklog/data by name and
 # aborted every release once `wl sync` created the other bookkeeping refs.
-if ! bash "$SCRIPT_DIR/worklog-ref-gate.sh" "$REPO_ROOT"; then
-  echo "Error: Dangerous worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
+WORKLOG_REF_GATE="$SCRIPT_DIR/worklog-ref-gate.sh"
+if [[ ! -f "$WORKLOG_REF_GATE" ]]; then
+  # Fail closed: without the gate the release cannot verify that worklog data
+  # refs are safe to ignore. The ship skill ships both scripts side by side, so
+  # a missing sibling means a partial install/copy.
+  echo "Error: worklog-ref gate not found at '$WORKLOG_REF_GATE'." >&2
+  echo "release/worklog-ref-gate.sh ships alongside this script; install (or copy) both." >&2
+  exit 1
+fi
+if ! bash "$WORKLOG_REF_GATE" "$REPO_ROOT"; then  echo "Error: Dangerous worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
   echo "The worklog refs listed above are separate from regular branches and must not be merged into main." >&2
   exit 1
 fi

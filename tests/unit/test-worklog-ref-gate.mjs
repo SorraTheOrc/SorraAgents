@@ -23,7 +23,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, execSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -295,16 +295,36 @@ describe('bash and JS gates agree (AC4 — divergence guard)', () => {
 describe('merge-dev-to-main.sh — gate integration (AC1/AC2)', () => {
   const hasGh = spawnSync('gh', ['--version'], { encoding: 'utf-8' }).status === 0;
 
-  function runMergeScript(repoDir) {
+  function runMergeScript(repoDir, scriptPath = MERGE_SCRIPT) {
     // No remote is configured, so a script that gets PAST the worklog-ref gate
     // fails later at `git fetch`; a script that is BLOCKED exits at the gate.
-    return spawnSync('bash', [MERGE_SCRIPT, '--work-item-id', 'SA-TEST'], {
+    return spawnSync('bash', [scriptPath, '--work-item-id', 'SA-TEST'], {
       cwd: repoDir,
       encoding: 'utf-8',
       env: { ...GIT_ENV, WORKLOG_SKIP_PRE_PUSH: '1' },
       timeout: 60_000,
     });
   }
+
+  test('fails closed with an actionable message when the gate script is missing', () => {
+    if (!hasGh) return; // gh is a documented script prerequisite
+    const repo = makeScratchRepo();
+    // A partial install/copy: the release script without its sibling gate,
+    // kept OUTSIDE the repo so the fixture tree stays clean.
+    const loneDir = mkdtempSync(join(tmpdir(), 'wl-lone-script-'));
+    const lone = join(loneDir, 'merge-dev-to-main.sh');
+    copyFileSync(MERGE_SCRIPT, lone);
+    try {
+      const result = runMergeScript(repo.dir, lone);
+
+      assert.notEqual(result.status, 0, 'a missing gate must never let the release proceed');
+      assert.match(result.stderr, /worklog-ref gate not found/);
+      assert.match(result.stderr, /worklog-ref-gate\.sh/, 'the message must name the missing script');
+    } finally {
+      rmSync(repo.dir, { recursive: true, force: true });
+      rmSync(loneDir, { recursive: true, force: true });
+    }
+  });
 
   test('aborts at the gate when a dangerous worklog ref exists', () => {
     if (!hasGh) return; // gh is a documented script prerequisite
