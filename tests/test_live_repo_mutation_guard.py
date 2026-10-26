@@ -1041,3 +1041,73 @@ class TestConcurrencyExcludedOuterGuard:
         assert result["success"] is False
         assert "live_repo_mutation" in result
         assert "feature-x" in result["live_repo_mutation"]
+
+
+# ---------------------------------------------------------------------------
+# WL-0MVPE2BY9001CR9O — the inner guard also covers the MAIN CHECKOUT when a
+# direct pytest run is started from a linked worktree
+# ---------------------------------------------------------------------------
+
+
+class TestConftestGuardCoversMainCheckout:
+    """A worktree-scoped pytest run that mutates the main checkout must fail.
+
+    The 2026-10-26 incident class: a run started in
+    ``<main>/.worklog/worktrees/<wl-…>`` unlinked tracked files in ``<main>``
+    and no guard could see it, because both guards snapshotted only their own
+    root. The inner plugin now snapshots every reachable checkout.
+    """
+
+    def test_worktree_run_deleting_a_main_checkout_file_is_failed_and_named(
+        self, tmp_path
+    ):
+        main = _init_guard_repo(tmp_path, "main")
+        worktree = gs.add_worktree(
+            main, main / ".worklog" / "worktrees" / "wl-agent", "wl-agent"
+        )
+        _write_guard_conftest(worktree)
+        victim = main / "README.md"
+        mutator = tmp_path / "delete_main_file.py"
+        mutator.write_text(
+            "from pathlib import Path\n" + f"Path({str(victim)!r}).unlink()\n",
+            encoding="utf-8",
+        )
+        (worktree / "test_main_checkout_mutator.py").write_text(
+            "import subprocess\n"
+            "import sys\n\n"
+            "def test_deletes_a_main_checkout_file():\n"
+            "    subprocess.run(\n"
+            f"        [sys.executable, {str(mutator)!r}],\n"
+            "        check=True,\n"
+            "    )\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(worktree)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, combined
+        assert "live-repo mutation" in combined, combined
+        # The message names the mutated checkout AND the mutated path.
+        assert "README.md" in combined, combined
+        assert str(main.resolve()) in combined, combined
+        assert "main checkout" in combined, combined
+        # The guard is real: the deletion really happened.
+        assert not victim.exists()
+
+    def test_worktree_run_leaving_the_main_checkout_alone_stays_green(self, tmp_path):
+        """No new false positives: a clean worktree-scoped run stays green."""
+        main = _init_guard_repo(tmp_path, "main-clean")
+        worktree = gs.add_worktree(
+            main, main / ".worklog" / "worktrees" / "wl-agent", "wl-agent"
+        )
+        _write_guard_conftest(worktree)
+        (worktree / "test_noop.py").write_text(
+            "def test_ok():\n    assert True\n", encoding="utf-8"
+        )
+
+        proc = _run_nested_pytest(worktree)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined, combined

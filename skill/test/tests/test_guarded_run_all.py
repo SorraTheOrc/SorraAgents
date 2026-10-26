@@ -94,7 +94,7 @@ class TestGuardOwnership:
             observed["detect_called"] = (root, snapshot_before)
 
         monkeypatch.delenv(MARKER_ENV, raising=False)
-        monkeypatch.setattr(run_tests, "snapshot_repo_state", fake_snapshot)
+        monkeypatch.setattr(run_tests, "snapshot_guarded_roots", fake_snapshot)
         monkeypatch.setattr(run_tests, "run_all", fake_run_all)
         monkeypatch.setattr(run_tests, "_detect_live_repo_mutation", fake_detect)
 
@@ -114,7 +114,9 @@ class TestGuardOwnership:
     def test_clears_marker_even_when_run_all_raises(self, monkeypatch):
         """The marker is cleared in a ``finally`` even on an exception."""
         monkeypatch.delenv(MARKER_ENV, raising=False)
-        monkeypatch.setattr(run_tests, "snapshot_repo_state", lambda root: {"git": True})
+        monkeypatch.setattr(
+            run_tests, "snapshot_guarded_roots", lambda root: {"git": True}
+        )
 
         def boom(**kwargs):
             raise RuntimeError("suite exploded")
@@ -145,7 +147,7 @@ class TestGuardOwnership:
             observed["detect_called"] = True
             return "should not happen"
 
-        monkeypatch.setattr(run_tests, "snapshot_repo_state", fake_snapshot)
+        monkeypatch.setattr(run_tests, "snapshot_guarded_roots", fake_snapshot)
         monkeypatch.setattr(run_tests, "run_all", fake_run_all)
         monkeypatch.setattr(run_tests, "_detect_live_repo_mutation", fake_detect)
 
@@ -162,7 +164,9 @@ class TestGuardOwnership:
     def test_mutation_is_merged_and_fails_the_run(self, monkeypatch):
         """A detected mutation marks the result failed with the diff attached."""
         monkeypatch.delenv(MARKER_ENV, raising=False)
-        monkeypatch.setattr(run_tests, "snapshot_repo_state", lambda root: {"git": True})
+        monkeypatch.setattr(
+            run_tests, "snapshot_guarded_roots", lambda root: {"git": True}
+        )
         monkeypatch.setattr(run_tests, "run_all", lambda **kwargs: _fake_result())
         monkeypatch.setattr(
             run_tests,
@@ -181,7 +185,9 @@ class TestGuardOwnership:
     def test_forwards_all_run_all_kwargs(self, monkeypatch):
         """Every kwarg is forwarded to run_all unchanged."""
         monkeypatch.delenv(MARKER_ENV, raising=False)
-        monkeypatch.setattr(run_tests, "snapshot_repo_state", lambda root: {"git": True})
+        monkeypatch.setattr(
+            run_tests, "snapshot_guarded_roots", lambda root: {"git": True}
+        )
         monkeypatch.setattr(run_tests, "_detect_live_repo_mutation", lambda r, s: None)
         captured: dict[str, object] = {}
 
@@ -281,7 +287,7 @@ def test_outer_guard_detection_ignores_only_dev_and_origin_ref_moves(tmp_path):
         check=True,
     )
 
-    before = gs.snapshot_repo_state(repo)
+    before = gs.snapshot_guarded_roots(repo)
     _advance_refs(
         repo,
         "refs/heads/dev",
@@ -302,13 +308,15 @@ def test_outer_guard_detection_still_fires_on_new_non_excluded_branch(tmp_path):
     repo = gs.init_repo(tmp_path / "adv", default_branch="dev")
     (repo / "README.md").write_text("fixture\n", encoding="utf-8")
     gs.commit_all(repo, "init")
-    before = gs.snapshot_repo_state(repo)
+    before = gs.snapshot_guarded_roots(repo)
     gs.run_git(repo, ["branch", "feature-x"], check=True)
 
     detected = _detect_live_repo_mutation(repo, before)
 
     assert detected is not None
     assert "feature-x" in detected
+
+
 # ---------------------------------------------------------------------------
 # WL-0MVPE2B8E005O0OS — a guarded run started in a linked worktree must also
 # watch the MAIN CHECKOUT
@@ -339,14 +347,6 @@ def _mutating_scope_command(tmp_path: Path, victim: Path) -> str:
     return f"{sys.executable} {script}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "WL-0MVPADZ1Z000FOSG: guarded_run_all snapshots only the guarded root, so "
-        "a worktree-scoped run that deletes a tracked file in the main checkout "
-        "still reports a clean run. The guard fix flips this by removing the marker."
-    ),
-)
 def test_guarded_run_from_worktree_fails_on_main_checkout_deletion(
     tmp_path, monkeypatch
 ):

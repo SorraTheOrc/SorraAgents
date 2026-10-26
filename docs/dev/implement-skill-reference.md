@@ -449,3 +449,78 @@ Ordering guarantees:
 Regression pin: `skill/implement/tests/test_finish_no_diff_status.py` covers
 the no-diff path (empty staged diff, no-op push success), the push-with-diff
 companion, and the fail-loud path when the store is non-terminal.
+
+## Live-repo guard ownership and main-checkout coverage (WL-0MVPE2BY9001CR9O)
+
+Two guards stand between a test run and a corrupted checkout, and they have
+**one owner each** — no third implementation, and no divergence in what they
+inspect:
+
+| Guard | Owner | Entry point |
+|---|---|---|
+| **Outer** (release/implement path) | `guarded_run_all()` in `skill/test/scripts/run_tests.py` | the `run_tests.py` CLI and `implement.py`'s finish-gate test step both delegate to it |
+| **Inner** (direct `pytest`) | `LiveRepoMutationGuard` registered by `skill/shared/live_repo_guard.py:register` | the repo-root `conftest.py` (and any fixture that arms it for a `tmp_path` repo) |
+
+`guarded_run_all` also owns the `LIVE_REPO_GUARD_ACTIVE` recursion marker: when
+it is set by an outer guard the call stands down, and while it holds the marker
+the inner plugin stands down. Exactly one guard owns a run — never both, never
+neither. Both implementations take their snapshot/diff surface from the shared
+`git_sandbox` helpers (`snapshot_guarded_roots`, `diff_guarded_roots`,
+`describe_guarded_diff`), which is what keeps the two nets identical.
+
+### What each guard watches
+
+The surface is refs + local config + working tree of **every checkout the run
+can reach**:
+
+- the guarded root (the checkout the run was started in), and
+- **its main checkout**, whenever the guarded root is a linked worktree
+  (`<main>/.worklog/worktrees/<wl-…>`), resolved from git plumbing
+  (`git rev-parse --git-common-dir`) — never from a directory-name pattern.
+
+Both checkouts are needed because a worktree-scoped run shares one object store
+*and* a symlinked `node_modules` chain
+(`<worktree>/node_modules -> <main>/node_modules`, with
+`node_modules/@worklog/shared -> ../../packages/shared`) with the main checkout.
+A root-only snapshot pair therefore reported the 2026-10-26 `packages/shared`
+wipe — a worktree-scoped `finish` that unlinked 25 tracked files in the main
+checkout — as a fully clean run (see
+[rca-main-checkout-wipe.md](rca-main-checkout-wipe.md)).
+
+The exclusions that keep the guard free of false positives are applied **per
+checkout**, so the main checkout's own churn is never a failure:
+
+- refs checked out in a registered worktree other than *that* checkout's root,
+  plus the `branch.<name>.*` config those worktrees own (ownership-based,
+  SA-0MV8311B3005DNG8) — so `implement.py finish`'s own Step-5 fast-forward in
+  the main checkout, and worktrees registered/removed mid-run, are churn;
+- `refs/heads/dev` and the whole `refs/remotes/origin/*` namespace
+  (WL-0MV5MYBKJ0033P8U);
+- `refs/worklog/*` (worklog tooling refs).
+
+A **failure names the mutated checkout and every mutated path in it**, e.g.:
+
+```
+live-repo mutation detected: the test suite changed a guarded checkout for
+…/.worklog/worktrees/wl-… . The run is failed so a corrupted checkout cannot be pushed as green.
+  in main checkout /home/…/ContextHub:
+  added path     [ D] packages/shared/src/database.ts
+```
+
+### Cost
+
+The extra surface is **git plumbing only**: one extra read-only snapshot per
+run (`git for-each-ref`, `git config --local --list`,
+`git worktree list --porcelain`, and one `git status`) plus the same again at
+the end. Nothing is added per test: the per-test guard still compares the cheap
+refs+config fingerprint first and only pays for the full working-tree snapshot
+when that fingerprint actually moved (F5 AC4). The fingerprint is a *trigger*,
+never a verdict — the authoritative diff decides, so excluded-set churn can
+never fail a clean run (SA-0MUINEW6X0034C65).
+
+Regression pins: `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`),
+`skill/test/tests/test_guarded_run_all.py`
+(`test_guarded_run_from_worktree_fails_on_main_checkout_deletion`,
+`test_guarded_run_fast_forward_of_main_checkout_dev_is_expected_churn`) and
+`tests/test_live_repo_mutation_guard.py`
+(`TestConftestGuardCoversMainCheckout`).
