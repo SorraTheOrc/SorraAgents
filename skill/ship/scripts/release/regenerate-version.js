@@ -19,6 +19,10 @@
  *   - Build success → `git add -u` (tracked modifications only, so build
  *     droppings such as `dist/` are never staged) and a commit
  *     `Regenerate derived version files for v<version>` when anything changed.
+ *   - Submodule pointers excluded → after staging, every staged gitlink
+ *     (index mode `160000`) is restored to its recorded entry, so a build
+ *     that advances a submodule checkout can never smuggle a pointer bump
+ *     into the derived-files commit (generic — no per-repo configuration).
  *   - Build failure → a `Warning: … (continuing with release)` line is logged
  *     and the process exits 0: regeneration is **non-fatal**, mirroring the
  *     post-bump CHANGELOG step.
@@ -71,6 +75,50 @@ function runNpmBuild(repoRoot) {
   });
 }
 
+/**
+ * Unstage every staged submodule pointer (gitlink) in *repoRoot*.
+ *
+ * `git add -u` stages a submodule's gitlink whenever the submodule checkout
+ * HEAD differs from the recorded index entry. Consumer-repo builds may advance
+ * a submodule checkout (e.g. main-street's `engine:sync`), so a derived-files
+ * commit would otherwise silently bump the submodule pointer — breaking pin
+ * contracts that expect the pointer to match a committed pin.
+ *
+ * Restore all staged gitlinks (index mode `160000`) to their recorded HEAD
+ * entries. This is generic (any submodule, any repo) and scoped strictly to
+ * gitlink entries: unrelated staged changes are untouched. A gitlink that was
+ * not staged is a harmless no-op.
+ *
+ * @param {string} repoRoot - Repository root.
+ * @returns {string[]} Submodule paths whose gitlink staging was reversed.
+ */
+function unstageSubmodulePointers(repoRoot) {
+  // `--stage -z`: NUL-separated ``<mode> <object> <stage>\t<path>`` records.
+  const index = execFileSync('git', ['ls-files', '--stage', '-z'], {
+    cwd: repoRoot,
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const gitlinks = index
+    .split('\0')
+    .filter(Boolean)
+    .map((record) => {
+      const tab = record.indexOf('\t');
+      if (tab === -1) return null;
+      const mode = record.slice(0, tab).split(' ')[0];
+      return mode === '160000' ? record.slice(tab + 1) : null;
+    })
+    .filter(Boolean);
+
+  if (gitlinks.length === 0) return [];
+
+  execFileSync('git', ['restore', '--staged', '--', ...gitlinks], {
+    cwd: repoRoot,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  return gitlinks;
+}
+
 // ── Core step ───────────────────────────────────────────────────────────────
 
 /**
@@ -113,6 +161,14 @@ export function regenerateDerivedFiles({
   // Stage tracked modifications only (`git add -u`): untracked build
   // droppings such as `dist/` are deliberately not staged.
   execFileSync('git', ['add', '-u'], { cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'] });
+
+  // The build may also have advanced a submodule checkout (e.g. main-street's
+  // `engine:sync`), which `git add -u` stages as a gitlink change. Restore
+  // staged submodule pointers to their recorded entries: the derived-files
+  // commit contains regenerated tracked files only and can never bump a
+  // submodule pointer. Generic — applies to every submodule, no per-repo
+  // configuration.
+  unstageSubmodulePointers(repoRoot);
 
   const staged = execFileSync('git', ['diff', '--cached', '--name-only'], {
     cwd: repoRoot,

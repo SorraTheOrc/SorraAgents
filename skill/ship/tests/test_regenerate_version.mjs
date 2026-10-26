@@ -31,6 +31,17 @@ function git(dir, args) {
   return res.stdout.trim();
 }
 
+/** Run a git command with the file transport protocol allow-listed. */
+function gitFile(dir, args) {
+  const res = spawnSync('git', ['-c', 'protocol.file.allow=always', ...args], {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: { ...process.env, GIT_ALLOW_PROTOCOL: 'file', GIT_TERMINAL_PROMPT: '0' },
+  });
+  if (res.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${res.stderr}`);
+  return res.stdout.trim();
+}
+
 function mkFixtureRepo({ version, buildScript = null, derivedVersion = '0.0.0' }) {
   const dir = mkdtempSync(join(tmpdir(), 'regen-skill-'));
   git(dir, ['init', '-q']);
@@ -51,6 +62,55 @@ function mkFixtureRepo({ version, buildScript = null, derivedVersion = '0.0.0' }
 function writeDerivedVersion(dir) {
   const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8'));
   writeFileSync(join(dir, 'src', 'version.ts'), `export const WORKLOG_VERSION = '${pkg.version}';\n`);
+}
+
+/**
+ * Throwaway fixture repo with a local-path `core` submodule (mirrors
+ * main-street's engine layout) plus the standard derived-version files.
+ */
+function mkSubmoduleFixtureRepo({ version, buildScript = 'node build.js', derivedVersion = '0.0.0' } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'regen-gitlink-'));
+  const engine = join(root, 'engine');
+  const game = join(root, 'game');
+  mkdirSync(engine, { recursive: true });
+  mkdirSync(game, { recursive: true });
+
+  gitFile(engine, ['init', '-q', '-b', 'dev']);
+  gitFile(engine, ['config', 'user.email', 'fixture@test']);
+  gitFile(engine, ['config', 'user.name', 'Fixture']);
+  writeFileSync(join(engine, 'version.txt'), 'v1\n');
+  gitFile(engine, ['add', 'version.txt']);
+  gitFile(engine, ['commit', '-q', '-m', 'engine v1']);
+
+  gitFile(game, ['init', '-q', '-b', 'main']);
+  gitFile(game, ['config', 'user.email', 'fixture@test']);
+  gitFile(game, ['config', 'user.name', 'Fixture']);
+  gitFile(game, ['submodule', 'add', engine, 'core']);
+  gitFile(game, ['config', '-f', '.gitmodules', 'submodule.core.branch', 'dev']);
+
+  const pkg = { name: 'fixture', version, type: 'module' };
+  if (buildScript) pkg.scripts = { build: buildScript };
+  writeFileSync(join(game, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
+  mkdirSync(join(game, 'src'), { recursive: true });
+  writeFileSync(join(game, 'src', 'version.ts'), `export const WORKLOG_VERSION = '${derivedVersion}';\n`);
+
+  gitFile(game, ['add', '-A']);
+  gitFile(game, ['commit', '-q', '-m', 'init']);
+
+  const gitlink = () => gitFile(game, ['ls-files', '-s', 'core']).split(/\s+/)[1] ?? '';
+  const advanceEngine = () => {
+    writeFileSync(join(engine, 'version.txt'), `v${Date.now()}\n`);
+    gitFile(engine, ['add', 'version.txt']);
+    gitFile(engine, ['commit', '-q', '-m', 'advance']);
+    gitFile(join(game, 'core'), ['fetch', 'origin']);
+    gitFile(join(game, 'core'), ['checkout', '-q', 'FETCH_HEAD']);
+  };
+  const dirtyCore = () => {
+    const p = join(game, 'core', 'version.txt');
+    writeFileSync(p, readFileSync(p, 'utf-8') + 'wip\n');
+  };
+
+  return { root, game, engine, gitlink, advanceEngine, dirtyCore };
 }
 
 const fixtures = [];
@@ -92,5 +152,46 @@ describe('regenerate-version (skill-local)', () => {
     assert.equal(git(dir, ['rev-parse', 'HEAD']), before);
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /Warning: derived version file regeneration failed/);
+  });
+
+  // ── Submodule pointer (gitlink) exclusion ─────────────────────────────────
+  // A consumer build may advance a submodule checkout (main-street's
+  // `engine:sync`), so `git add -u` would otherwise stage the gitlink. The
+  // derived-files commit must never contain a submodule pointer bump.
+
+  test('advanced submodule checkout → commits only the regenerated tracked file', () => {
+    const f = mkSubmoduleFixtureRepo({ version: '5.0.0', derivedVersion: '1.0.0' });
+    fixtures.push(f.root);
+    const gitlinkBefore = f.gitlink();
+    f.advanceEngine();
+    const result = regenerateDerivedFiles({ repoRoot: f.game, version: '5.0.0', runBuild: () => writeDerivedVersion(f.game), logger: console });
+    assert.equal(result.committed, true);
+    assert.deepEqual(result.files, ['src/version.ts']);
+    const committed = git(f.game, ['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean);
+    assert.deepEqual(committed, ['src/version.ts'], 'the derived-files commit must not contain a gitlink bump');
+    assert.equal(f.gitlink(), gitlinkBefore, 'the recorded submodule pointer is unchanged');
+  });
+
+  test('advanced submodule checkout with no other changes → no commit', () => {
+    const f = mkSubmoduleFixtureRepo({ version: '6.0.0', derivedVersion: '6.0.0' });
+    fixtures.push(f.root);
+    f.advanceEngine();
+    const before = git(f.game, ['rev-parse', 'HEAD']);
+    const result = regenerateDerivedFiles({ repoRoot: f.game, version: '6.0.0', runBuild: () => {}, logger: console });
+    assert.deepEqual(result, { ran: true, success: true, committed: false, reason: 'no changes' });
+    assert.equal(git(f.game, ['rev-parse', 'HEAD']), before, 'no commit when only the gitlink moved');
+  });
+
+  test('dirty submodule working tree → still no gitlink staging', () => {
+    const f = mkSubmoduleFixtureRepo({ version: '7.0.0', derivedVersion: '1.0.0' });
+    fixtures.push(f.root);
+    const gitlinkBefore = f.gitlink();
+    f.advanceEngine();
+    f.dirtyCore();
+    const result = regenerateDerivedFiles({ repoRoot: f.game, version: '7.0.0', runBuild: () => writeDerivedVersion(f.game), logger: console });
+    assert.equal(result.committed, true);
+    const committed = git(f.game, ['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean);
+    assert.deepEqual(committed, ['src/version.ts']);
+    assert.equal(f.gitlink(), gitlinkBefore, 'the recorded submodule pointer is unchanged');
   });
 });
