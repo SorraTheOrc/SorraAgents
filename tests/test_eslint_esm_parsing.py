@@ -115,6 +115,9 @@ class TestEslintParsing:
         # ES2025 trailing comma inside a dynamic `import()` is not allowed at
         # the configured `ecmaVersion: 2022` (SA-0MVO589VU005960Y).
         "tests/unit/test-check-audit-gate.mjs",
+        # Same ES2025 trailing-comma-in-`import()` class of parsing error
+        # (SA-0MVO58B4J004Y40C).
+        "tests/unit/test-check-final-validation.mjs",
     ]
 
     @pytest.mark.parametrize("rel_path", AFFECTED_FILES)
