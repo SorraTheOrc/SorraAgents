@@ -112,11 +112,20 @@ class TestEslintParsing:
         "skill/ship/scripts/run-release.js",
         "skill/ship/scripts/ship.js",
         "tests/helpers/git-sim.js",
+        # ES2025 trailing comma inside a dynamic `import()` is not allowed at
+        # the configured `ecmaVersion: 2022` (SA-0MVO589VU005960Y).
+        "tests/unit/test-check-audit-gate.mjs",
     ]
 
     @pytest.mark.parametrize("rel_path", AFFECTED_FILES)
     def test_file_parses_without_error(self, rel_path):
-        """Run eslint on each previously-failing file and expect 0 errors."""
+        """Run eslint on each previously-failing file and expect 0 errors.
+
+        Pins that the repository lint config (``ecmaVersion: 2022``) can parse
+        every listed file: a fatal *Parsing error* here means new syntax the
+        configured grammar does not accept slipped in (for example an ES2025
+        trailing comma inside ``import()``), not a style nit.
+        """
         import subprocess
 
         if shutil.which("eslint") is None:

@@ -1254,7 +1254,7 @@ describe('checkAuditReadyToClose - bounded remediation budget', () => {
   test('stops at the attempt cap and blocks remaining items with offline guidance', async () => {
     const mod = await import(MODULE_PATH);
     const budgetMod = await import(
-      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js'),
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js')
     );
     const items = [
       { id: 'SA-A', title: 'Item A', needsProducerReview: false, parentId: null, updatedAt: '2026-09-04T10:00:00Z' },
