@@ -544,11 +544,15 @@ of truth (section 1) — filtered by the requested suite name via
 `node` → commands containing `node`, `all` → every command).
 
 - A repo that pins `suiteCommands` (`{"suiteCommands": ["python3 -m pytest -q"]}`)
-therefore runs the **pinned** command — and the pinned interpreter — for
-`--suite pytest --scope changed`, exactly as `--suite all` does. The legacy
-bare `pytest` token is never substituted on the fallback path, so a scoped run
-can no longer silently re-resolve `pytest` to a different interpreter and
-report false collection errors.
+therefore runs the **pinned** command for `--suite pytest --scope changed`,
+exactly as `--suite all` does. The legacy bare `pytest` token is never
+substituted on the fallback path, so a scoped run can no longer silently
+re-resolve `pytest` to a different interpreter and report false collection
+errors. Selection honours the pin *verbatim* (that is what
+`run_suite`'s `command` result field reports); execution-time
+`executable_test_command()` resolution (SA-0MVK154IE007OS3D) still normalises
+only the pytest interpreter prefix, so `--scope changed` and `--scope full`
+spawn byte-identical commands for the same suite.
 - A **multi-command pin** (mixed pytest + node entries) maps each command to
 its own suite name; `--suite pytest` runs the pytest entries only.
 - When the filtered set is **empty** (e.g. a node-only pin queried as
@@ -557,6 +561,11 @@ its own suite name; `--suite pytest` runs the pytest entries only.
 matching command`) instead of silently running nothing and reporting success.
 - The reporting contract is unchanged: a fallback still records
 `scope: "full"`.
+- Regression coverage: `skill/test/tests/test_run_tests_scope.py` →
+`TestExplicitSuiteFallbackHonoursPins`. Because the execution-time
+interpreter rewrite makes the legacy token and a `python3 -m pytest` pin look
+alike in the spawned argv, the tests assert the selected command source
+(`result["command"]`), which is the pin verbatim on the fixed path.
 
 Direct full-scope runs (`--scope full`) keep the legacy name-based resolution
 for `pytest`/`node` (section 1), and tool-less repos keep their legacy

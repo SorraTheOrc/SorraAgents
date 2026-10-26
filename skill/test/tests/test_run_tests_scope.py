@@ -433,9 +433,10 @@ _PINNED_PYTEST_COMMANDS: list[str] = [
 ]
 # The pinned flags, without the interpreter prefix: ``_run_cmd`` receives argv
 # after ``executable_test_command()`` resolves the pytest executable prefix to
-# an absolute interpreter path (SA-0MVK154IE007OS3D), so tests compare the flag
-# suffix — the part that distinguishes the pin (``-m pytest``) from the legacy
-# bare ``pytest`` token.
+# an absolute interpreter path (SA-0MVK154IE007OS3D), so execution-level
+# assertions compare the flag suffix. The *command source* discrimination
+# (pin vs legacy token) is asserted separately via ``result["command"]`` —
+# see ``_assert_command_source``.
 _PINNED_PYTEST_FLAGS = "-m pytest -q -r a --disable-warnings"
 
 
@@ -445,6 +446,26 @@ def _assert_pinned_pytest_only(captured: list[str]) -> None:
     assert captured[0].endswith(_PINNED_PYTEST_FLAGS), captured
     # Never the legacy bare ``pytest`` token (the bug being fixed).
     assert not captured[0].startswith("pytest "), captured
+
+
+def _assert_command_source(result: dict, expected: str) -> None:
+    """Assert the *selected* command, before execution-time resolution.
+
+    ``run_suite`` returns ``command`` as the raw selected command (the pin
+    verbatim), while ``_run_cmd`` receives argv after
+    ``executable_test_command()`` rewrites the pytest prefix to the probed
+    interpreter (SA-0MVK154IE007OS3D). Because that rewrite makes the legacy
+    bare ``pytest`` token and a ``python3 -m pytest`` pin look identical at
+    execution time, the executed argv alone cannot prove *which* command
+    source won. ``command`` is therefore the discriminating assertion: it is
+    the pinned string when the fallback resolves through
+    ``full_suite_commands()``, and the legacy ``pytest`` token when it does
+    not.
+    """
+    assert result["command"] == expected, (
+        f"expected the pinned command source {expected!r}, "
+        f"got {result['command']!r}"
+    )
 
 
 class TestExplicitSuiteFallbackHonoursPins:
@@ -497,6 +518,9 @@ class TestExplicitSuiteFallbackHonoursPins:
 
         # Fallback reports full scope, as before.
         assert result["scope"] == "full"
+        # The pinned command is the selected source (AC1/AC2) — the legacy
+        # bare ``pytest`` token is never substituted.
+        _assert_command_source(result, _PINNED_PYTEST_COMMANDS[0])
         # The pinned form runs — never the legacy bare ``pytest`` token.
         _assert_pinned_pytest_only(captured)
 
@@ -544,6 +568,10 @@ class TestExplicitSuiteFallbackHonoursPins:
 
         assert pytest_result["scope"] == "full"
         assert node_result["scope"] == "full"
+        # Each suite name is mapped to its own pinned command (AC5): the
+        # selected command source is the pin entry, verbatim.
+        _assert_command_source(pytest_result, pin[0])
+        _assert_command_source(node_result, pin[1])
         # Each suite name is mapped to its own pinned command. The node pin is
         # compared on its parts (shlex re-joins argv, dropping the quotes).
         _assert_pinned_pytest_only(pytest_captured)
@@ -575,6 +603,8 @@ class TestExplicitSuiteFallbackHonoursPins:
             )
 
         assert result["scope"] == "full"
+        # ``--suite all`` keeps resolving the full pinned set (AC4/AC5).
+        _assert_command_source(result, _PINNED_PYTEST_COMMANDS[0])
         _assert_pinned_pytest_only(captured)
 
     def test_changed_scope_fallback_empty_filtered_pin_raises(
