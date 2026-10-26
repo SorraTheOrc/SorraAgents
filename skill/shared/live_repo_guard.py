@@ -33,7 +33,14 @@ Safety / no-false-positive rules (F5 AC2/AC5/AC6/AC7):
 - the cheap fingerprint is only a **trigger**: a movement is confirmed against
   the authoritative diff before a test is failed, so excluded-set churn
   (worktree registered/removed mid-run) cannot fail a clean run with
-  ``(no differences)`` (SA-0MUINEW6X0034C65).
+  ``(no differences)`` (SA-0MUINEW6X0034C65);
+- the guard covers **every checkout the guarded run can reach**
+  (WL-0MVPE2BY9001CR9O): the guarded root plus, when it is a linked worktree,
+  its main checkout. A direct ``pytest`` run started inside
+  ``<main>/.worklog/worktrees/<wl-…>`` therefore also fails when it unlinks a
+  tracked file in ``<main>``, and the message names the mutated checkout and
+  path — the 2026-10-26 `packages/shared` wipe was invisible to both guards for
+  exactly this reason.
 
 Guard-ownership contract (SA-0MUH1MJL6003767Q)
 ----------------------------------------------
@@ -47,6 +54,13 @@ outer guard owns the checkout (snapshot → run → mutation check) and sets
 inner plugin stand down. When an outer guard has already set the marker (a
 nested/cascaded run), ``guarded_run_all`` stands down in turn and the
 outermost guard remains the single owner — never both, never neither.
+
+Both implementations take their snapshot/diff surface from the same shared
+helpers (``snapshot_guarded_roots`` / ``diff_guarded_roots`` /
+``describe_guarded_diff`` in ``git_sandbox``), so the main-checkout coverage
+cannot drift between them: this plugin is the inner net for direct ``pytest``
+invocations, the outer guard for the release/implement path, and neither
+reimplements the other's surface.
 """
 
 from __future__ import annotations
@@ -75,16 +89,24 @@ def _load_git_sandbox() -> Any:
 
 
 class LiveRepoMutationGuard:
-    """A registered pytest plugin that fails a session which mutates its root."""
+    """A registered pytest plugin that fails a session which mutates a root.
+
+    The guarded surface is every checkout the session can reach — the guarded
+    root plus, when it is a linked worktree, its main checkout
+    (WL-0MVPE2BY9001CR9O). Cheap per-test fingerprints only *trigger* a
+    confirmation against the authoritative multi-root diff.
+    """
 
     def __init__(self, root: Path) -> None:
         self._gs = _load_git_sandbox()
         self.root = Path(root).resolve()
-        self.before = self._gs.snapshot_repo_state(self.root)
-        self._baseline = self._gs.fingerprint(
-            self._gs.snapshot_repo_state(self.root, include_status=False)
+        self.before = self._gs.snapshot_guarded_roots(self.root)
+        self._baseline = self._gs.fingerprint_guarded_roots(
+            self._gs.snapshot_guarded_roots(self.root, include_status=False)
         )
-        self.active = bool(self.before.get("git"))
+        self.active = any(
+            entry["snapshot"].get("git") for entry in self.before.get("roots", ())
+        )
         self.last_test: str | None = None
         self.offender: str | None = None
 
@@ -102,8 +124,10 @@ class LiveRepoMutationGuard:
     def pytest_runtest_teardown(self, item: Any, nextitem: Any) -> None:
         if not self.active:
             return
-        current = self._gs.snapshot_repo_state(self.root, include_status=False)
-        if self._gs.fingerprint(current) == self._baseline:
+        current = self._gs.snapshot_guarded_roots(
+            self.root, include_status=False
+        )
+        if self._gs.fingerprint_guarded_roots(current) == self._baseline:
             return
         # The cheap fingerprint moved, but it is only a *trigger*: confirm the
         # movement against the authoritative full diff before failing. An
@@ -111,34 +135,35 @@ class LiveRepoMutationGuard:
         # (its branch enters/leaves the excluded set) yet yields no reportable
         # diff; failing on that produced the bogus
         # ``(no differences)`` failure (SA-0MUINEW6X0034C65).
-        after = self._gs.snapshot_repo_state(self.root)
-        diff = self._gs.diff_snapshots(self.before, after)
+        after = self._gs.snapshot_guarded_roots(self.root)
+        diff = self._gs.diff_guarded_roots(self.before, after)
         # Reset the baseline so a single mutation is reported once.
         self.before = after
-        self._baseline = self._gs.fingerprint(
-            self._gs.snapshot_repo_state(self.root, include_status=False)
+        self._baseline = self._gs.fingerprint_guarded_roots(
+            self._gs.snapshot_guarded_roots(self.root, include_status=False)
         )
         if not diff["changed"]:
             return
         self.offender = item.nodeid
         pytest.fail(
             f"live-repo mutation detected during {item.nodeid}:\n"
-            + self._gs.describe_diff(diff),
+            + self._gs.describe_guarded_diff(diff),
             pytrace=False,
         )
 
     def pytest_sessionfinish(self, session: Any, exitstatus: int) -> None:
         if not self.active:
             return
-        after = self._gs.snapshot_repo_state(self.root)
-        diff = self._gs.diff_snapshots(self.before, after)
+        after = self._gs.snapshot_guarded_roots(self.root)
+        diff = self._gs.diff_guarded_roots(self.before, after)
         if not diff["changed"]:
             return
         named = self.offender or self.last_test or "<unknown test>"
         session.exitstatus = 1
         print(
             "ERROR: live-repo mutation detected at session end"
-            f" (last recorded test: {named}):\n" + self._gs.describe_diff(diff),
+            f" (last recorded test: {named}):\n"
+            + self._gs.describe_guarded_diff(diff),
             file=sys.stderr,
         )
 

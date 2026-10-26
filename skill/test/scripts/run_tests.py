@@ -61,7 +61,11 @@ refs + local config + working tree, with an **ownership-based exclusion**: a
 ref checked out in a registered worktree other than the guard's own root (plus
 its ``branch.<name>.*`` config, retained worktree-track config, and
 remote-tracking refs) is concurrent-infrastructure churn; the guard root's
-own branch stays monitored (SA-0MV8311B3005DNG8). See also the repo-root
+own branch stays monitored (SA-0MV8311B3005DNG8). The guard also covers the
+**main checkout** whenever the guarded root is a linked worktree — the two
+exclusions are applied per checkout, so a worktree-scoped run that unlinks a
+tracked file in the main checkout can no longer be reported green
+(WL-0MVPE2BY9001CR9O). See also the repo-root
 ``conftest.py`` / ``skill/shared/live_repo_guard.py`` inner guard, which this
 outer guard stands down (SA-0MUG30J5F001L57H, SA-0MUH1MJL6003767Q).
 
@@ -99,9 +103,9 @@ if _SKILLS_ROOT_STR in sys.path:
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
 from shared.git_sandbox import (
-    describe_diff,
-    diff_snapshots,
-    snapshot_repo_state,
+    describe_guarded_diff,
+    diff_guarded_roots,
+    snapshot_guarded_roots,
 )
 from shared.process_semaphore import Semaphore, nested_semaphore_dir  # noqa: F401
 from shared.skill_extensions import (
@@ -2220,25 +2224,31 @@ def _detect_live_repo_mutation(
     project_root: Path,
     snapshot_before: dict[str, Any] | None,
 ) -> str | None:
-    """Return a rendered diff when the suite mutated *project_root*, else None.
+    """Return a rendered diff when the guarded run mutated a checkout, else None.
 
     Detect-only: it never prevents a mutation, it stops a corrupted checkout
     from being reported as a green suite (and therefore from being pushed).
     ``None`` for a non-git root (no-op) and when the guard was stood down by an
     outer guard (``snapshot_before is None``).
+
+    The surface is **every checkout the guarded run can reach**
+    (WL-0MVPE2BY9001CR9O): the guarded root plus, when the run started in a
+    linked worktree, its main checkout. A worktree-scoped run shares one object
+    store and a symlinked ``node_modules`` with the main checkout, so a
+    root-only check reported a gutted main checkout as clean (the 2026-10-26
+    `packages/shared` wipe). The message names the mutated checkout and every
+    mutated path in it.
     """
     if snapshot_before is None:
         return None
-    snapshot_after = snapshot_repo_state(project_root)
-    if not snapshot_before.get("git", True) or not snapshot_after.get("git", True):
-        return None
-    diff = diff_snapshots(snapshot_before, snapshot_after)
+    snapshot_after = snapshot_guarded_roots(project_root)
+    diff = diff_guarded_roots(snapshot_before, snapshot_after)
     if not diff["changed"]:
         return None
     return (
-        "live-repo mutation detected: the test suite changed the checkout at "
-        f"{project_root}. The run is failed so a corrupted checkout cannot be "
-        "pushed as green.\n" + describe_diff(diff)
+        "live-repo mutation detected: the test suite changed a guarded "
+        f"checkout for {project_root}. The run is failed so a corrupted "
+        "checkout cannot be pushed as green.\n" + describe_guarded_diff(diff)
     )
 
 
@@ -2300,7 +2310,9 @@ def guarded_run_all(
 
     # Stand down when an outer guard already owns the checkout (nested run).
     guard_active = not os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV)
-    snapshot_before = snapshot_repo_state(project_root) if guard_active else None
+    snapshot_before = (
+        snapshot_guarded_roots(project_root) if guard_active else None
+    )
 
     if guard_active:
         os.environ[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
