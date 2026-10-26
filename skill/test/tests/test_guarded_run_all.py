@@ -309,3 +309,127 @@ def test_outer_guard_detection_still_fires_on_new_non_excluded_branch(tmp_path):
 
     assert detected is not None
     assert "feature-x" in detected
+# ---------------------------------------------------------------------------
+# WL-0MVPE2B8E005O0OS — a guarded run started in a linked worktree must also
+# watch the MAIN CHECKOUT
+# ---------------------------------------------------------------------------
+
+
+def _main_with_linked_worktree(tmp_path: Path):
+    """A ``dev`` checkout with a tracked file plus a linked ``wl-*`` worktree."""
+    from shared import git_sandbox as gs
+
+    main = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (main / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    (main / "keep.txt").write_text("keep\n", encoding="utf-8")
+    gs.commit_all(main, "init")
+    worktree = gs.add_worktree(
+        main, main / ".worklog" / "worktrees" / "wl-agent", "wl-agent"
+    )
+    return gs, main, worktree
+
+
+def _mutating_scope_command(tmp_path: Path, victim: Path) -> str:
+    """A shell-safe 'test command' that unlinks *victim* — the offending child."""
+    script = tmp_path / "delete_tracked.py"
+    script.write_text(
+        "from pathlib import Path\n" f"Path({str(victim)!r}).unlink()\n",
+        encoding="utf-8",
+    )
+    return f"{sys.executable} {script}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "WL-0MVPADZ1Z000FOSG: guarded_run_all snapshots only the guarded root, so "
+        "a worktree-scoped run that deletes a tracked file in the main checkout "
+        "still reports a clean run. The guard fix flips this by removing the marker."
+    ),
+)
+def test_guarded_run_from_worktree_fails_on_main_checkout_deletion(
+    tmp_path, monkeypatch
+):
+    """E2E: a guarded scope run inside a linked worktree deletes a main-checkout
+    tracked file → the run FAILS and the message names the mutated path.
+
+    The fixture reproduces the incident layout: the guarded root is a real
+    linked worktree under ``.worklog/worktrees/wl-agent`` and the offending
+    deletion happens in the *main* checkout, exactly the "main checkout mutated
+    by a worktree-scoped run" defect class (docs/dev/worktree-isolation.md).
+    """
+    from shared.process_semaphore import nested_semaphore_dir
+
+    gs, main, worktree = _main_with_linked_worktree(tmp_path)
+    victim = main / "keep.txt"
+
+    # A nested run must not contend for the host-wide "test" slot this suite
+    # holds, and no outer guard may own the checkout (that would stand down
+    # the authority under test).
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+
+    result = guarded_run_all(
+        worktree,
+        timeout=120,
+        suites=("all",),
+        commands=[_mutating_scope_command(tmp_path, victim)],
+        scope="full",
+        use_cache=False,
+        no_cache=True,
+    )
+
+    assert not victim.exists(), "fixture invariant: the child really deleted the file"
+    assert result["success"] is False, result
+    mutation = result.get("live_repo_mutation")
+    assert mutation, "the worktree-scoped run must not report a clean checkout"
+    assert "keep.txt" in mutation, mutation
+    assert str(main.resolve()) in mutation, mutation
+
+
+def test_guarded_run_fast_forward_of_main_checkout_dev_is_expected_churn(
+    tmp_path, monkeypatch
+):
+    """Characterisation: finish's own Step-5 fast-forward in the main checkout is
+    NEVER a guard failure.
+
+    A concurrent `implement.py finish` fast-forwards the main checkout's ``dev``
+    to the commit it just pushed (and its ``fetch`` moves ``origin/dev``) while
+    another worktree-scoped run is in flight. That is expected infrastructure
+    churn, so the newly covered main checkout must not turn it into a failure.
+    """
+    from shared.process_semaphore import nested_semaphore_dir
+
+    gs, main, worktree = _main_with_linked_worktree(tmp_path)
+    origin = gs.init_bare_remote(tmp_path / "origin.git")
+    gs.add_remote(main, "origin", str(origin))
+    gs.run_git(main, ["push", "-u", "origin", "dev"], check=True)
+
+    script = tmp_path / "fast_forward_dev.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        f"from pathlib import Path\n"
+        f"main = Path({str(main)!r})\n"
+        "(main / 'shared.txt').write_text('new\\n', encoding='utf-8')\n"
+        "subprocess.run(['git', '-C', str(main), 'add', '-A'], check=True)\n"
+        "subprocess.run(['git', '-C', str(main), 'commit', '-qm', 'advance dev'], check=True)\n"
+        "subprocess.run(['git', '-C', str(main), 'update-ref',\n"
+        "                'refs/remotes/origin/dev', 'HEAD'], check=True)\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+
+    result = guarded_run_all(
+        worktree,
+        timeout=120,
+        suites=("all",),
+        commands=[f"{sys.executable} {script}"],
+        scope="full",
+        use_cache=False,
+        no_cache=True,
+    )
+
+    assert result["success"] is True, result.get("live_repo_mutation")
+    assert "live_repo_mutation" not in result

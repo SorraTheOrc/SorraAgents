@@ -19,6 +19,14 @@ SA-0MUG30IIR00978CW):
    reports additions, removals and moves. The regression guards (F4/F5) use
    these to fail a run that mutated its own checkout.
 
+   ``snapshot_guarded_roots`` / ``diff_guarded_roots`` extend that pair to
+   **every checkout a guarded run can reach**: the guarded root itself plus,
+   when the guarded root is a linked worktree, its **main checkout**
+   (WL-0MVPE2BY9001CR9O). A worktree-scoped run shares one object store and a
+   symlinked ``node_modules`` with the main checkout, so a run started in
+   ``<main>/.worklog/worktrees/<wl-…>`` can unlink tracked files in ``<main>``
+   while a root-only snapshot pair reports a clean run.
+
 Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
 
 - **stdlib-only** — no ``shared.*`` or ``test.*`` imports, so the repo-root
@@ -559,6 +567,150 @@ def main_checkout_root(
             if candidate.is_dir():
                 return candidate
     return None
+
+
+#: Role label for the checkout a guarded run was started in.
+GUARDED_ROOT_ROLE = "guarded"
+
+#: Role label for the main checkout of a guarded root that is a linked worktree.
+MAIN_CHECKOUT_ROLE = "main_checkout"
+
+
+def guarded_roots(root: str | os.PathLike[str]) -> tuple[Path, ...]:
+    """The checkouts a guarded run started at *root* must watch.
+
+    The result is ``(<guarded toplevel>,)`` for an ordinary checkout, and
+    ``(<guarded toplevel>, <main checkout>)`` when *root* is a **linked
+    worktree** (WL-0MVPE2BY9001CR9O). The main checkout is resolved from git
+    plumbing via :func:`main_checkout_root` — never from a ``wl-*`` directory
+    name — so any registered worktree, wherever it lives, gets the same
+    coverage.
+
+    A non-git path (or a path git cannot resolve) yields just the resolved
+    *root*, so the helper is a no-op for non-repository callers.
+    """
+    resolved = Path(root).resolve()
+    top = git_toplevel(resolved)
+    if top is None:
+        return (resolved,)
+    top_path = Path(top).resolve()
+    main = main_checkout_root(resolved, top=top)
+    if main is None:
+        return (top_path,)
+    main_path = Path(main).resolve()
+    if main_path == top_path:
+        return (top_path,)
+    return (top_path, main_path)
+
+
+def snapshot_guarded_roots(
+    root: str | os.PathLike[str],
+    *,
+    include_status: bool = True,
+) -> dict[str, Any]:
+    """Snapshot every checkout a guarded run started at *root* can reach.
+
+    Each entry carries the root's ``role`` (:data:`GUARDED_ROOT_ROLE` or
+    :data:`MAIN_CHECKOUT_ROLE`), its ``path`` and the per-root
+    :func:`snapshot_repo_state` result. The per-root exclusions (ownership-based
+    worktree refs, retained ``branch.<name>.*`` config, ``refs/heads/dev`` and
+    ``refs/remotes/origin/*``) therefore apply to **each** root independently,
+    so concurrent `dev`/`origin/*` movement or a worktree registered/removed
+    mid-run stays invisible on both sides.
+
+    Cost is git plumbing only (one plumbing snapshot per checkout, no per-test
+    work); ``include_status=False`` keeps the cheap refs+config fingerprint
+    shape for the per-test guard.
+
+    Returns ``{"root": <guarded root>, "roots": [entry, ...]}``.
+    """
+    entries: list[dict[str, Any]] = []
+    paths = guarded_roots(root)
+    main_path = paths[1] if len(paths) > 1 else None
+    for path in paths:
+        role = GUARDED_ROOT_ROLE
+        if main_path is not None and path == main_path:
+            role = MAIN_CHECKOUT_ROLE
+        entries.append(
+            {
+                "role": role,
+                "path": str(path),
+                "snapshot": snapshot_repo_state(path, include_status=include_status),
+            }
+        )
+    return {"root": str(Path(root).resolve()), "roots": entries}
+
+
+def fingerprint_guarded_roots(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    """A cheap, hashable fingerprint of every root in a guarded snapshot.
+
+    Used by the per-test guard as a short-circuit trigger only: because each
+    entry's :func:`fingerprint` already ignores the ownership-based exclusions,
+    registering or removing an agent worktree mid-run cannot move it. Inclusion
+    of ``role``/``path`` keeps the two roots distinct even when their refs and
+    config are identical.
+    """
+    return tuple(
+        (entry.get("role", ""), entry.get("path", ""), fingerprint(entry["snapshot"]))
+        for entry in snapshot.get("roots", ())
+    )
+
+
+def diff_guarded_roots(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Diff two :func:`snapshot_guarded_roots` results, root by root.
+
+    Returns ``{"changed": bool, "roots": [{"role", "path", "diff"}, ...]}``
+    where each ``diff`` is the :func:`diff_snapshots` result for that root, so a
+    caller can report **which** checkout was mutated. ``changed`` is the
+    disjunction over all roots; a root present in only one snapshot (no change
+    of roots within a run is expected, but a worktree registered mid-run must
+    never fail the run) is treated as unchanged.
+    """
+    roots: list[dict[str, Any]] = []
+    before_roots = before.get("roots", ())
+    after_roots = after.get("roots", ())
+    changed = False
+    for before_entry, after_entry in zip(before_roots, after_roots):
+        diff = diff_snapshots(before_entry["snapshot"], after_entry["snapshot"])
+        changed = changed or diff["changed"]
+        roots.append(
+            {
+                "role": before_entry.get("role", ""),
+                "path": before_entry.get("path", ""),
+                "diff": diff,
+            }
+        )
+    return {"changed": changed, "roots": roots}
+
+
+def describe_guarded_diff(diff: dict[str, Any]) -> str:
+    """Render every mutated path of a :func:`diff_guarded_roots` result.
+
+    With a single root this is exactly :func:`describe_diff` (no extra noise for
+    the common, worktree-free case). With a guarded root plus its main checkout
+    each changed checkout is announced by path, so the failure message names
+    *every* mutated main-checkout path instead of hiding it behind one generic
+    heading.
+    """
+    roots = diff.get("roots", ())
+    changed_roots = [entry for entry in roots if entry["diff"]["changed"]]
+    if not changed_roots:
+        return "  (no differences)"
+    if len(roots) == 1:
+        return describe_diff(changed_roots[0]["diff"])
+    lines: list[str] = []
+    for entry in changed_roots:
+        label = (
+            "main checkout"
+            if entry.get("role") == MAIN_CHECKOUT_ROLE
+            else "guarded checkout"
+        )
+        lines.append(f"  in {label} {entry.get('path', '')}:")
+        lines.extend(describe_diff(entry["diff"]).splitlines())
+    return "\n".join(lines)
 
 
 def snapshot_repo_state(
