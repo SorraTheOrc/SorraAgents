@@ -11,6 +11,7 @@ in the cache entry.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -473,3 +474,92 @@ def test_run_tests_spawns_local_bin_pytest_when_earlier_candidates_fail(
     assert code == 0
     assert captured[0].startswith(str(fake_pytest))
     assert "-q -r a --disable-warnings" in captured[0]
+
+
+def test_foreign_pytest_on_path_is_skipped_end_to_end(tmp_path: Path) -> None:
+    """AC2/AC4: an end-to-end ``run_tests.py`` run whose PATH holds a pytest
+    bound to an interpreter that cannot run pytest.
+
+    Reproduces the host failure mode that motivated this change
+    (SA-0MVK154IE007OS3D) without needing that machine: the foreign PATH
+    ``pytest`` is probed and skipped, the suite executes under the runner's
+    interpreter (``sys.executable -m pytest``), the JSON result names that
+    interpreter, the canonical command form is unchanged, and the foreign
+    shim never executes the suite (its probe ``--version`` call fails and it
+    is never selected for the real run).
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "rt-test@example.com")
+    git(repo, "config", "user.name", "RT Test")
+    (repo / ".gitignore").write_text(".pytest_cache/\n__pycache__/\n")
+    (repo / "pytest.ini").write_text("[pytest]\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_green.py").write_text(
+        "def test_green():\n    assert True\n"
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "init")
+
+    # A PATH ``pytest`` whose shebang points at an interpreter that cannot
+    # run pytest (the RossGameDev `~/.local/bin/pytest` failure mode). The
+    # resolution probe (``--version``) fails; any other invocation records a
+    # marker so the test can prove the shim was never used to run the suite.
+    marker = repo / "foreign-pytest-executed"
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    shim = fakebin / "pytest"
+    shim.write_text(
+        "#!/bin/sh\n"
+        '# the availability probe must fail: this "pytest" cannot run pytest\n'
+        'case " $* " in *" --version "*) exit 4 ;; esac\n'
+        f"touch {marker}\n"
+        "exit 4\n"
+    )
+    shim.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = str(fakebin) + os.pathsep + env.get("PATH", "")
+    # The nested runner must not queue behind this suite's host-wide slot.
+    env["PI_SEMAPHORE_DIR"] = str(rt.nested_semaphore_dir(tmp_path))
+    # Keep the throwaway repo byte-identical across the run so the live-repo
+    # guard sees no mutation (no .pytest_cache, no __pycache__ bytecode).
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(Path(rt.__file__).resolve()),
+            "--project-root",
+            str(repo),
+            "--suite",
+            "pytest",
+            "--type",
+            "full",
+            "--json",
+            "--no-cache",
+        ],
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    result = payload["suites"]["pytest"]
+    assert result["success"] is True, payload
+    # The interpreter actually used is the runner's, and it is named in the
+    # run output (auditability, AC2) — never the foreign PATH ``pytest``.
+    assert result["interpreter"] == sys.executable, result
+    # The canonical command form (the cache key) is unchanged; only the
+    # executable prefix was rewritten at run time.
+    assert result["command"] == "pytest -q -r a --disable-warnings"
+    assert not marker.exists(), "the foreign PATH pytest executed the suite"
+    # The canonical command form is reported as-is, so the cache key and
+    # cross-consumer contract stay stable (only the prefix was rewritten).
+    assert result["scope"] == "full"

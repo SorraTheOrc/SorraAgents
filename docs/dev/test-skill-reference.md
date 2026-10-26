@@ -360,7 +360,10 @@ foreign-interpreter candidate is never selected while a working one exists:
    probe.
 5. **`~/.local/bin/pytest`** — retained user-install fallback
    (SA-0MSQ012QG005N22S; user-site bin dirs are absent from non-login
-   shells).
+   shells). It sits between the PATH `pytest` and the final `python3`
+   candidate: a concrete, probed, user-site install that carries the user's
+   dependency set is preferred over the possibly-foreign PATH `python3`
+   interpreter, while still never winning over the runner's interpreter.
 6. **`python3 -m pytest`** — last resort when the runner's interpreter cannot
    run pytest but PATH `python3` can.
 
@@ -381,6 +384,47 @@ remains visible and auditable. Direct `run_cached()` consumers — the audit
 F3 auto-run and the implement finish gate — get the same behaviour through
 `test_cache._default_runner`, which rewrites the executable prefix via
 `executable_test_command()` exactly like `_cached_runner` does.
+
+#### Field verification (AC4, SA-0MVK154IE007OS3D)
+
+**Observed failure (host `RossGameDev`, repo ContentCreator, 2026-10-22, from
+the origin report):** with the old bare-`pytest`-first resolution, a PATH
+`~/.local/bin/pytest` carrying a system-Python shebang (`#!/usr/bin/python3`;
+PEP 668 externally managed, no project dependencies) shadowed the runner's
+interpreter. `python3 <skill>/test/scripts/run_tests.py --type full` then
+exited 2 with 13 collection errors — the first
+`ModuleNotFoundError: No module named 'numpy'` came from
+`.pi/skills/wiki-tts-generate/scripts/tts_generate.py`, plus
+`tests/test_podcast_parts_layout.py` and `tests/test_rss_process_notes.py` —
+while the same tree was green under the repository's canonical runner
+`./scripts/run_tests.sh` (2588 passed, 16 skipped). The red result was cached
+by git state + scope, so one such run poisoned the audit-accepted full-suite
+entry for that commit until a `--force` run replaced it.
+
+**Post-fix behaviour:** the same command now resolves `sys.executable -m
+pytest` (the interpreter carrying the project's dependencies, which precedes
+a PATH `pytest` that fails its probe), executes the same tests the canonical
+runner would, prints `[pytest interpreter: <path>]`, and records the choice
+in the cache entry's `metadata.json` — so the green result matches
+`./scripts/run_tests.sh` and is auditable. The resolution is executed by the
+interpreter the agent started the runner with, which is the repository's
+canonical interpreter (`python3 …/run_tests.py`).
+
+**Repeatable verification (any host — no `RossGameDev` checkout required):**
+
+```bash
+# The green full-suite run names the interpreter actually used:
+python3 <skill>/test/scripts/run_tests.py --type full --force --json \
+  | jq -r '.suites.pytest.interpreter'
+```
+
+The configuration-independent regression
+`tests/test_pytest_path_resolution.py::test_foreign_pytest_on_path_is_skipped_end_to_end`
+reproduces the shadowing end to end (a temp repo whose PATH holds a
+`pytest` bound to an interpreter that cannot run pytest), asserting that the
+suite executes green under `sys.executable -m pytest`, that the JSON result
+and output name that interpreter, and that the foreign shim never executes
+the suite.
 
 ### 1a. Test types (`--type`) and the local extension contract (SA-0MTJQB2MA008HMO6)
 
