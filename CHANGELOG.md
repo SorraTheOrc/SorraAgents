@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.24 (2026-10-25)
+> **Release focus:** This release focuses on making audits faster, more accurate, and less disruptive by scoping them to an item's own files, keeping results valid unless details change, and preventing them from resetting or blocking work. It also fixes worklog sync and git checkout/merge reliability, and ensures releases and task completion run cleanly without duplicate actions or false failures.
+### Features
+- Top-level items marked ready by audits now require producer review before release. (SA-0MSSVKYEW008PJ9H)
+- Audits now stay valid unless the item's own details change, so unrelated repo activity no longer triggers re-audits. (SA-0MSRVI17W004U9G0)
+- Audits now finish much faster, so release checks no longer stall for hours. (SA-0MVF1NKZQ009P3ZG)
+- Related-item searches now finish in under 5 seconds instead of 5-6. (SA-0MUG4654N000DFLQ)
+- Git checkouts and merges no longer error, and worklogs now sync automatically after pulls. (SA-0MU8CRX1X008IORP)
+### Bug Fixes
+- Worklog sync now works again, so your progress saves and shares correctly. (SA-0MV9JVLBQ0090RNC)
+- Skill scripts now run reliably from any project folder without command errors. (SA-0MT7U3NCB000T1SR)
+- Fewer false bug reports from config files, so real issues get fixed faster. (SA-0MT2Q10PX0078DEM)
+- Audits no longer reset finished work back to open or block dependent tasks. (SA-0MVI35BIU002MTZQ)
+- Finishing a task now reliably pushes your work to dev instead of stopping short. (SA-0MVJC5KNT0044L2B)
+- Repeated release runs no longer close or re-annotate the same work items twice. (SA-0MUECDK14002J37J)
+- Audits now only check your item's own files, so unrelated code issues no longer block your work. (SA-0MUI5ZYO6002W3KD)
+- Worklog sync is fixed, so your progress and completed tasks now save to the server correctly. (SA-0MVB57M02008QPJS)
+- Worklog sync no longer blocks on pi@local commits, with clearer fix guidance and docs. (SA-0MVFOUW2B007WAZ0)
+- Sync no longer overwrites your newest audit with an older copy, so audit results stay accurate. (SA-0MUJNFF3K009BF03)
+- Background syncs no longer undo your in-progress work, so your claims stay put while you work. (SA-0MVE34D9B005TUYJ)
+- Epic runs no longer report finished work as failed when a session times out. (SA-0MVHXWLPG007OQVN)
+- Releases can now complete without being blocked by internal worklog bookkeeping refs. (SA-0MVO7XZAB0095R6F)
+- Audits no longer flag non-code files as errors, so you won't see bogus quality issues. (SA-0MSTMAPL40019JX5)
+
 ## v0.1.23 (2026-10-21)
 > **Release focus:** This release focuses on strengthening release safety and audit reliability, ensuring unreviewed items are blocked, audits run faster and more consistently, and test results always reflect the latest code. It also improves agent task handling, background job visibility, and overall stability through internal code cleanup.
 ### Features

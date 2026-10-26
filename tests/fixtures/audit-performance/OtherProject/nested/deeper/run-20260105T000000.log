@@ -1,0 +1,2 @@
+Per-call timing: issue_id=SA-6 context=parent elapsed_seconds=600.0 model=mock
+Per-call timing: issue_id=SA-6 context=verdict_reask elapsed_seconds=1800.0 model=mock

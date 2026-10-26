@@ -358,6 +358,21 @@ class TestCmdIssueCodeQualityIntegration:
         except (OSError, TypeError):
             pytest.skip("Cannot inspect cmd_issue source")
 
+    @pytest.fixture(autouse=True)
+    def _scoped_code_quality(self, monkeypatch):
+        """Give the code-quality scan a non-empty file scope.
+
+        The audit never widens an empty scope to a whole-repository scan
+        (SA-0MUI5ZYO6002W3KD): the ``wl``-only fake runner reports no git
+        changes and the item description has no Key Files, so the scope
+        would resolve empty and the scan would be skipped, making these
+        finding-driven assertions unreachable.
+        """
+        monkeypatch.setattr(
+            "audit.scripts.audit_runner._git_changed_files",
+            lambda runner: ["src/main.py"],
+        )
+
     def _make_wl_runner(self):
         """Create a mock runner for wl calls only."""
         def fake_runner(cmd, **kwargs):

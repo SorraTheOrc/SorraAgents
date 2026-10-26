@@ -81,7 +81,8 @@ def _fake_screen_factory(calls, fast_batch, full_batch):
 
     def _fake(issue_id, context, prompt, model, pi_bin, debug_log, timeout,
               ac_fallback_used, on_runtime_error, failure_label,
-              child_screen=False, enable_tools=True, priority=None):
+              child_screen=False, parent_screen=False, enable_tools=True,
+              priority=None):
         calls.append({"context": context, "model": model})
         if model != "full-model":
             return fast_batch
@@ -250,7 +251,8 @@ class TestPerPhaseModelThreading:
 
         def _fake(issue_id, context, prompt, model, pi_bin, debug_log, timeout,
                   ac_fallback_used, on_runtime_error, failure_label,
-                  child_screen=False, enable_tools=True, priority=None):
+                  child_screen=False, parent_screen=False,
+                  enable_tools=True, priority=None):
             calls.append(model)
             prompts.append(prompt)
             return ({"verdict": "met", "evidence": "", "extracted_text": json.dumps(batch)}, batch, "raw")

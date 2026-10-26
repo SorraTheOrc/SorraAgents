@@ -60,6 +60,8 @@ test('close-work-items: closeWorkItemsAfterRelease returns expected structure', 
   const mod = await import(RUN_RELEASE_PATH);
 
   const result = mod.closeWorkItemsAfterRelease('1.0.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [],
     runCloseCommand: () => {},
   });
@@ -80,6 +82,8 @@ test('close-work-items: closeWorkItemsAfterRelease accepts a version string', as
   // With empty candidate set (no items to close), it should succeed gracefully.
   // Candidate query is injected so the live worklog is never touched.
   const result = mod.closeWorkItemsAfterRelease('1.2.3', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [],
     runCloseCommand: () => {},
   });
@@ -108,6 +112,8 @@ test('close-work-items: closes only needsProducerReview=false candidates', async
   const closed = [];
   const skipped = [];
   const result = mod.closeWorkItemsAfterRelease('0.2.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-CLOSE1', title: 'Close Me', needsProducerReview: false },
       { id: 'SA-CLOSE2', title: 'Close Me Too', needsProducerReview: false },
@@ -146,6 +152,8 @@ test('close-work-items: reports close failures without aborting the sweep', asyn
   const mod = await import(RUN_RELEASE_PATH);
 
   const result = mod.closeWorkItemsAfterRelease('0.2.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-OK', title: 'OK', needsProducerReview: false },
       { id: 'SA-FAIL', title: 'Fails', needsProducerReview: false },
@@ -172,6 +180,8 @@ test('close-work-items: closeWorkItemsAfterRelease handles missing version', asy
   const mod = await import(RUN_RELEASE_PATH);
 
   const result = mod.closeWorkItemsAfterRelease(null, {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [{ id: 'SA-X', title: 'X', needsProducerReview: false }],
     runCloseCommand: () => { throw new Error('should not be called'); },
   });
@@ -230,6 +240,8 @@ test('close-work-items: refuses to force-close a candidate with collateral desce
   const mod = await import(RUN_RELEASE_PATH);
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.3.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
       { id: 'SA-CHILD', title: 'Child', needsProducerReview: false },
@@ -253,18 +265,30 @@ test('close-work-items: refuses to force-close a candidate with collateral desce
 test('close-work-items: force-closes a candidate whose descendants are all candidates', async () => {
   const mod = await import(RUN_RELEASE_PATH);
   const closed = [];
+  const verified = [];
   const result = mod.closeWorkItemsAfterRelease('0.3.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
       { id: 'SA-CHILD', title: 'Child', needsProducerReview: false },
     ],
     getDescendantsFn: (id) => (id === 'SA-PARENT' ? ['SA-CHILD'] : []),
     runCloseCommand: (itemId) => { closed.push(itemId); },
-    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
+    getCloseStateFn: (id) => {
+      verified.push(id);
+      return { status: 'completed', stage: 'done' };
+    },
   });
 
-  assert.ok(closed.includes('SA-PARENT'), 'a fully in-set subtree is closed');
-  assert.ok(closed.includes('SA-CHILD'));
+  // A fully in-set subtree is closed by ONE command on the parent: `wl close
+  // --force` already annotates every descendant, so closing the child again
+  // would duplicate its close comment (SA-0MUECDK14002J37J).
+  assert.deepEqual(closed, ['SA-PARENT'],
+    'only the topmost candidate issues a close command');
+  assert.ok(verified.includes('SA-CHILD'),
+    'the swept descendant is verified, never re-closed');
+  assert.equal(result.closedCount, 2, 'parent and swept child both count as closed');
   assert.equal(result.refusedCount, 0);
 });
 
@@ -276,6 +300,8 @@ test('close-work-items: closes a parent whose descendants are all terminal', asy
   const mod = await import(RUN_RELEASE_PATH);
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
     ],
@@ -301,6 +327,8 @@ test('close-work-items: still refuses a parent with a non-terminal descendant', 
   const mod = await import(RUN_RELEASE_PATH);
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
     ],
@@ -321,6 +349,8 @@ test('close-work-items: mixed terminal/non-terminal refusal names only non-termi
   const mod = await import(RUN_RELEASE_PATH);
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
     ],
@@ -349,6 +379,8 @@ test('close-work-items: npr descendant refusal reports a distinct producer-revie
   const mod = await import(RUN_RELEASE_PATH);
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
       {
@@ -389,6 +421,8 @@ test('close-work-items: mixed generic/npr collateral reports both causes distinc
   const mod = await import(RUN_RELEASE_PATH);
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.4.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
       {
@@ -443,6 +477,8 @@ test('close-work-items: cascades non-terminal descendants of an audit-ready pare
   const closed = [];
   const cascaded = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
     ],
@@ -482,6 +518,8 @@ test('close-work-items: does not cascade when the parent audit is not passing', 
   const closed = [];
   const cascaded = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
     ],
@@ -505,6 +543,8 @@ test('close-work-items: dry-run reports the cascade without mutating descendants
   const closed = [];
   const cascaded = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
     ],
@@ -529,6 +569,8 @@ test('close-work-items: a cascade failure leaves that child as collateral and re
   const mod = await import(RUN_RELEASE_PATH);
   const closed = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
     ],
@@ -555,6 +597,8 @@ test('close-work-items: already-terminal descendants are never cascaded', async 
   const closed = [];
   const cascaded = [];
   const result = mod.closeWorkItemsAfterRelease('0.5.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-PARENT', title: 'Parent', needsProducerReview: false },
     ],
@@ -741,6 +785,8 @@ test('close-verify: all closes persist -> success with no unclosed items', async
   const mod = await import(RUN_RELEASE_PATH);
   const closes = [];
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-A', title: 'A', needsProducerReview: false },
       { id: 'SA-B', title: 'B', needsProducerReview: false },
@@ -762,6 +808,8 @@ test('close-verify: a no-op close (exit 0, state unchanged) is retried then repo
   const mod = await import(RUN_RELEASE_PATH);
   const closes = [];
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-OK', title: 'OK', needsProducerReview: false },
       { id: 'SA-LOST', title: 'Lost', needsProducerReview: false },
@@ -799,6 +847,8 @@ test('close-verify: a retry that re-persists reports the item closed', async () 
   const closes = [];
   let reads = 0;
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-FLAKY', title: 'Flaky', needsProducerReview: false },
     ],
@@ -822,6 +872,8 @@ test('close-verify: a retry that re-persists reports the item closed', async () 
 test('close-verify: an unreadable/null verification state is unclosed (fail-safe)', async () => {
   const mod = await import(RUN_RELEASE_PATH);
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-UNREADABLE', title: 'Unreadable', needsProducerReview: false },
     ],
@@ -839,6 +891,8 @@ test('close-verify: an unreadable/null verification state is unclosed (fail-safe
 test('close-verify: a throwing verification boundary is unclosed (fail-safe)', async () => {
   const mod = await import(RUN_RELEASE_PATH);
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-THROW', title: 'Throw', needsProducerReview: false },
     ],
@@ -857,6 +911,8 @@ test('close-verify: dry-run neither closes nor verifies', async () => {
   const closes = [];
   let verified = 0;
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     dryRun: true,
     getCandidateItemsFn: () => [
       { id: 'SA-DRY', title: 'Dry', needsProducerReview: false },
@@ -875,6 +931,8 @@ test('close-verify: dry-run neither closes nor verifies', async () => {
 test('close-verify: unclosed items never contribute to closedCount', async () => {
   const mod = await import(RUN_RELEASE_PATH);
   const result = mod.closeWorkItemsAfterRelease('0.6.0', {
+    // Idempotency boundary injected so the suite never reads the live worklog.
+    getCommentsFn: () => [],
     getCandidateItemsFn: () => [
       { id: 'SA-P1', title: 'Persists', needsProducerReview: false },
       { id: 'SA-L1', title: 'Lost One', needsProducerReview: false },
@@ -892,4 +950,137 @@ test('close-verify: unclosed items never contribute to closedCount', async () =>
     ['SA-L1', 'SA-L2'],
     'every unclosed item is listed by id',
   );
+});
+
+// ---------------------------------------------------------------------------
+// SA-0MUECDK14002J37J: idempotent post-release close sweep
+// ---------------------------------------------------------------------------
+const MARKED_COMMENT = (v) => [{ comment: `Closed with reason: Shipped in v${v}` }];
+
+test('idempotency: run-release.js exports shippedMarkerPattern and carriesShippedMarker', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  assert.equal(typeof mod.shippedMarkerPattern, 'function');
+  assert.equal(typeof mod.carriesShippedMarker, 'function');
+});
+
+test('idempotency: a candidate already carrying the marker is skipped without a close or annotation', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closes = [];
+  const overrides = [];
+  const result = mod.closeWorkItemsAfterRelease('0.7.0', {
+    getCommentsFn: (id) => (id.startsWith('SA-DONE') ? MARKED_COMMENT('0.7.0') : []),
+    getCandidateItemsFn: () => [
+      { id: 'SA-FRESH', title: 'Fresh', needsProducerReview: false },
+      { id: 'SA-DONE', title: 'Already Shipped', needsProducerReview: false },
+      { id: 'SA-DONE-NPR', title: 'Already Shipped + NPR', needsProducerReview: true, parentId: 'SA-P' },
+    ],
+    getDescendantsFn: () => [],
+    getAncestorAuditFn: () => ({ outcome: 'covered', ancestorId: 'SA-P' }),
+    runOverrideCommand: (childId) => { overrides.push(childId); },
+    runCloseCommand: (itemId) => { closes.push(itemId); },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
+  });
+
+  assert.deepEqual(closes, ['SA-FRESH'],
+    'only items not yet shipped for this version are closed');
+  assert.deepEqual(overrides, [],
+    'an already-shipped flagged child is never overridden/annotated');
+  assert.equal(result.closedCount, 1);
+  assert.equal(result.alreadyShippedCount, 2);
+  assert.deepEqual(
+    result.alreadyShippedItems.map((i) => i.id).sort(),
+    ['SA-DONE', 'SA-DONE-NPR'],
+  );
+  assert.match(result.message, /2 item\(s\) skipped \(already shipped in v0\.7\.0\)/);
+});
+
+test('idempotency: re-running the sweep after a close is a no-op (no duplicate comments)', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const commentsByItem = new Map(); // Simulated persistent comment store.
+  const closes = [];
+  const run = () => mod.closeWorkItemsAfterRelease('0.8.0', {
+    getCommentsFn: (id) => commentsByItem.get(id) || [],
+    getCandidateItemsFn: () => [
+      { id: 'SA-R1', title: 'Released One', needsProducerReview: false },
+      { id: 'SA-R2', title: 'Released Two', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: (itemId) => {
+      closes.push(itemId);
+      commentsByItem.set(
+        itemId,
+        (commentsByItem.get(itemId) || []).concat(MARKED_COMMENT('0.8.0')),
+      );
+    },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
+  });
+
+  const first = run();
+  const second = run();
+  assert.equal(first.closedCount, 2);
+  assert.equal(first.alreadyShippedCount, 0);
+  assert.equal(second.closedCount, 0, 'the second sweep closes nothing');
+  assert.equal(second.alreadyShippedCount, 2, 'already-shipped items are reported, not re-closed');
+  assert.deepEqual(closes, ['SA-R1', 'SA-R2'], 'each item is closed exactly once');
+  assert.match(second.message, /already shipped in v0\.8\.0/);
+});
+
+test('idempotency: marker match is version-exact (v0.1.1 does not suppress v0.1.18)', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closes = [];
+  const result = mod.closeWorkItemsAfterRelease('0.1.18', {
+    getCommentsFn: () => MARKED_COMMENT('0.1.1'),
+    getCandidateItemsFn: () => [
+      { id: 'SA-V', title: 'V18', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: (itemId) => { closes.push(itemId); },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
+  });
+
+  assert.deepEqual(closes, ['SA-V'],
+    'a marker for another version never suppresses the close');
+  assert.equal(result.alreadyShippedCount, 0);
+});
+
+test('idempotency: an unreadable comment source is fail-safe and does not block the close', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closes = [];
+  const result = mod.closeWorkItemsAfterRelease('0.9.0', {
+    getCommentsFn: () => { throw new Error('wl down'); },
+    getCandidateItemsFn: () => [
+      { id: 'SA-X', title: 'X', needsProducerReview: false },
+    ],
+    getDescendantsFn: () => [],
+    runCloseCommand: (itemId) => { closes.push(itemId); },
+    getCloseStateFn: () => ({ status: 'completed', stage: 'done' }),
+  });
+
+  assert.deepEqual(closes, ['SA-X'],
+    'a failing marker read must never block an otherwise valid close');
+  assert.equal(result.closedCount, 1);
+  assert.equal(result.alreadyShippedCount, 0);
+});
+
+test('idempotency: a swept descendant that did not persist is reported unclosed', async () => {
+  const mod = await import(RUN_RELEASE_PATH);
+  const closed = [];
+  const result = mod.closeWorkItemsAfterRelease('0.10.0', {
+    getCommentsFn: () => [],
+    getCandidateItemsFn: () => [
+      { id: 'SA-P', title: 'Parent', needsProducerReview: false },
+      { id: 'SA-C', title: 'Child', needsProducerReview: false },
+    ],
+    getDescendantsFn: (id) => (id === 'SA-P' ? ['SA-C'] : []),
+    runCloseCommand: (itemId) => { closed.push(itemId); },
+    getCloseStateFn: (id) =>
+      (id === 'SA-P' ? CLOSED_STATE() : UNCLOSED_STATE()),
+  });
+
+  assert.deepEqual(closed, ['SA-P'],
+    'only the parent issues a close command');
+  assert.equal(result.closedCount, 1);
+  assert.equal(result.unclosedCount, 1);
+  assert.deepEqual(result.unclosedItems.map((i) => i.id), ['SA-C']);
+  assert.match(result.unclosedItems[0].reason, /Swept by recursive close of SA-P/);
 });

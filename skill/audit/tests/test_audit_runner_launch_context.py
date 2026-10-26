@@ -997,6 +997,11 @@ class TestPerAuditRootConsumers:
         with (
             patcher,
             mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", launch_root),
+            # A non-empty code-quality scope is required for the scan to run
+            # at all: an empty scope is skipped by design
+            # (SA-0MUI5ZYO6002W3KD).
+            mock.patch.object(audit_runner, "_git_changed_files",
+                              return_value=["src/x.py"]),
             mock.patch(
                 "code_review.scripts.code_quality.run_code_quality", mock_cq
             ),

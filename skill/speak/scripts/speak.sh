@@ -10,10 +10,11 @@
 #   ./skill/speak/scripts/speak.sh "Text to speak"
 #   ./skill/speak/scripts/speak.sh --stream "Text to speak"
 #   ./skill/speak/scripts/speak.sh --voice nova "Text to speak"
+#   ./skill/speak/scripts/speak.sh --endpoint http://127.0.0.1:8000/v1/audio/speech "Text"
 #   ./skill/speak/scripts/speak.sh --help
 #
 # Environment:
-#   TTS_API_URL  Override the TTS API endpoint.
+#   TTS_API_URL  Override the TTS API endpoint (--endpoint takes precedence).
 #   TTS_VOICE    Default voice name when --voice is not given (default: ryan).
 #   SPEAK_DIR    Override the output directory.
 #
@@ -43,7 +44,11 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
-TTS_API_URL="${TTS_API_URL:-http://100.79.231.101:8000/v1/audio/speech}"
+DEFAULT_ENDPOINT="http://100.79.231.101:8000/v1/audio/speech"
+# Endpoint precedence: --endpoint wins over TTS_API_URL, which wins over the
+# built-in default. Both code paths (save-to-file and --stream) read this one
+# variable.
+TTS_API_URL="${TTS_API_URL:-$DEFAULT_ENDPOINT}"
 CURL_TIMEOUT=60
 
 # Default voice: explicit --voice wins over TTS_VOICE, which wins over "ryan".
@@ -74,11 +79,14 @@ Options:
   --voice <name> Server-side voice name to synthesise with
                  (default: \$TTS_VOICE or "ryan"). Use any voice the TTS
                  endpoint exposes, e.g. nova, ginny_di, default.
+  --endpoint <url> TTS API endpoint to POST to (default: \$TTS_API_URL or
+                 $DEFAULT_ENDPOINT). Takes precedence over TTS_API_URL.
   --help         Show this help message and exit
 
 Environment variables:
   SPEAK_DIR    Override the output directory (default: <repo-root>/.pi/speak/)
-  TTS_API_URL  Override the TTS API endpoint (default: $TTS_API_URL)
+  TTS_API_URL  Default TTS API endpoint when --endpoint is not given
+               (default: $DEFAULT_ENDPOINT)
   TTS_VOICE    Default voice name when --voice is not given (default: ryan)
 
 Examples:
@@ -86,6 +94,7 @@ Examples:
   $(basename "$0") 'The TTS system is now working.'
   $(basename "$0") --voice nova "Hi, I'm Nova."
   TTS_VOICE=ginny_di $(basename "$0") "Hello from ginny_di."
+  $(basename "$0") --endpoint http://127.0.0.1:8000/v1/audio/speech "Hello from the local server."
   $(basename "$0") --stream "Hello" | aplay
   ssh user@host "cd /project && ./skill/speak/scripts/speak.sh --stream 'hi'" | aplay
   TTS_API_URL="http://localhost:8000/v1/audio/speech" $(basename "$0") "Test"
@@ -101,7 +110,8 @@ VOICE="$DEFAULT_VOICE"
 TEXT=""
 
 # Parse options in any order before the text argument. The first non-option
-# argument is the text to speak; parsing stops there.
+# argument is the text to speak; parsing stops there. --endpoint overrides the
+# TTS_API_URL environment variable, which in turn overrides the default URL.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stream)
@@ -119,6 +129,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --voice=*)
             echo "Error: use --voice <name> (space-separated), not $1." >&2
+            usage >&2
+            exit 1
+            ;;
+        --endpoint)
+            if [[ $# -lt 2 || -z "${2:-}" || "$2" == --* ]]; then
+                echo "Error: --endpoint requires a URL (e.g. --endpoint http://127.0.0.1:8000/v1/audio/speech)." >&2
+                usage >&2
+                exit 1
+            fi
+            # Assigning the shared endpoint variable makes the flag win over
+            # TTS_API_URL for both the save-to-file and --stream code paths.
+            TTS_API_URL="$2"
+            shift 2
+            ;;
+        --endpoint=*)
+            echo "Error: use --endpoint <url> (space-separated), not $1." >&2
             usage >&2
             exit 1
             ;;

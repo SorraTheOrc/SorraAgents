@@ -209,10 +209,16 @@ def test_concurrency_ceiling_respected_with_serialization(monkeypatch):
 
 
 def test_default_ceiling_documented(monkeypatch):
-    """Without env override, the audit semaphore uses the documented default."""
+    """Without env override and with a failed slot query, the static default stands."""
     from shared.process_semaphore import DEFAULT_MAX_WORKERS
 
     monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    # Slot discovery unavailable → the static default is the documented
+    # fallback (SA-0MVI6VJCP006XNA2 AC3). With a reachable proxy the ceiling
+    # derives from live slots instead, so this test pins the fallback path.
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (None, None)
+    )
     with _mock_popen():
         audit_runner._call_pi("prompt", model="m", pi_bin="pi")
     # The audit ceiling helper must report the default.
@@ -234,19 +240,24 @@ def test_invalid_env_ceiling_falls_back(monkeypatch, capsys):
     assert "invalid" in capsys.readouterr().err.lower()
 
 
-def test_default_ceiling_right_sized_to_proxy_pool():
-    """The default audit concurrency ceiling is right-sized (SA-0MUSZJRB9006ZCHE).
+def test_default_ceiling_right_sized_to_proxy_pool(monkeypatch):
+    """The static fallback ceiling is right-sized (SA-0MUSZJRB9006ZCHE).
 
     The F7 harness measured the host's real audit-slot capacity and the
     3-slot local LLM proxy pool bounds useful inference concurrency. The
-    default must be at least 3 (so N >= 3 concurrent audits are admitted
-    without queueing) and bounded (so it does not exceed the host's CPU
-    headroom; 6 = 2x the proxy pool).
+    static fallback must be at least 3 (so N >= 3 concurrent audits are
+    admitted without queueing) and bounded (so it does not exceed the host's
+    CPU headroom; 6 = 2x the proxy pool). Pin the fallback by mocking the
+    slot query to fail (SA-0MVI6VJCP006XNA2 AC3); against a live proxy the
+    ceiling derives from the reported slot capacity instead.
     """
     from shared.process_semaphore import DEFAULT_MAX_WORKERS
 
     assert DEFAULT_MAX_WORKERS >= 3, "must admit at least 3 concurrent audits"
     assert DEFAULT_MAX_WORKERS <= 8, "must stay within measured host headroom"
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (None, None)
+    )
     assert audit_runner._audit_semaphore_max_workers() == DEFAULT_MAX_WORKERS
 
 
@@ -270,7 +281,18 @@ def test_default_ceiling_admits_n_ge_3_without_saturation(monkeypatch):
     and complete with real `met` verdicts — zero `unmet`
     (bounded-queue/host-wide saturation) verdicts. Mirrors
     SA-0MTG5RYH8005RQNM AC1 and this item's AC3.
+
+    The static default is pinned by mocking the slot query to fail: since
+    SA-0MVI6VJCP006XNA2 the ceiling derives from live slot capacity when the
+    query succeeds, so without this the assertion would instead measure the
+    host's momentary free-slot count (flaky under concurrent audits).
     """
+    from shared.process_semaphore import DEFAULT_MAX_WORKERS
+
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (None, None)
+    )
+    assert DEFAULT_MAX_WORKERS >= 3
     lock = threading.Lock()
     active = 0
     peak = 0
@@ -1054,3 +1076,134 @@ def test_find_orphaned_audit_processes_missing_proc_root(tmp_path):
     assert audit_runner._find_orphaned_audit_processes(
         str(tmp_path / "does-not-exist")
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# AC3 (SA-0MVF1NKZQ009P3ZG / SA-0MVI6VJCP006XNA2): the audit pi-call ceiling is
+# derived from the LIVE proxy slot status instead of a hardcoded static value,
+# never exceeding reported capacity, with a safe floor of 1 and a static
+# fallback when the query fails. An explicit request stays authoritative.
+# ---------------------------------------------------------------------------
+
+
+def _reset_ceiling_log():
+    """Reset the once-per-run ceiling log guard so each test observes it."""
+    audit_runner._reset_audit_ceiling_log()
+
+
+def test_ceiling_derived_from_two_slot_proxy(monkeypatch):
+    """A 2-slot proxy caps the audit ceiling at 2 (never the static 6)."""
+    _reset_ceiling_log()
+    monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (2, 2)
+    )
+    ceiling = audit_runner._audit_semaphore_max_workers()
+    assert ceiling <= 2, f"2-slot proxy must cap the ceiling at 2, got {ceiling}"
+    assert ceiling == 2
+
+
+def test_ceiling_floor_is_one_when_all_slots_busy(monkeypatch):
+    """A saturated proxy (0 free of 2) degrades to sequential, never to 0."""
+    _reset_ceiling_log()
+    monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (0, 2)
+    )
+    assert audit_runner._audit_semaphore_max_workers() == 1
+
+
+def test_ceiling_never_exceeds_reported_total_slots(monkeypatch):
+    """A nonsensical available>total report is clamped to total capacity."""
+    _reset_ceiling_log()
+    monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (5, 2)
+    )
+    assert audit_runner._audit_semaphore_max_workers() == 2
+
+
+def test_ceiling_falls_back_to_static_when_slot_query_fails(monkeypatch):
+    """An unreachable slot endpoint degrades to the configured static ceiling."""
+    from shared.process_semaphore import DEFAULT_MAX_WORKERS
+
+    _reset_ceiling_log()
+    monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (None, None)
+    )
+    assert audit_runner._audit_semaphore_max_workers() == DEFAULT_MAX_WORKERS
+
+
+def test_explicit_env_ceiling_is_authoritative_over_slots(monkeypatch):
+    """AUDIT_MAX_CONCURRENCY is never silently overridden by slot discovery."""
+    _reset_ceiling_log()
+    monkeypatch.setenv(ENV_MAX_WORKERS, "4")
+
+    def _boom(*a, **k):  # pragma: no cover - must not be consulted
+        raise AssertionError("slot status must not be queried for an explicit ceiling")
+
+    monkeypatch.setattr(audit_runner, "_query_slot_status", _boom)
+    assert audit_runner._audit_semaphore_max_workers() == 4
+
+
+def test_explicit_cli_ceiling_is_authoritative_over_slots(monkeypatch):
+    """--max-concurrency is authoritative and also skips the slot query."""
+    _reset_ceiling_log()
+    monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+
+    def _boom(*a, **k):  # pragma: no cover - must not be consulted
+        raise AssertionError("slot status must not be queried for an explicit ceiling")
+
+    monkeypatch.setattr(audit_runner, "_query_slot_status", _boom)
+    assert audit_runner._audit_semaphore_max_workers(3) == 3
+
+
+def test_ceiling_derivation_logged_once_per_run(monkeypatch, capsys):
+    """The derivation (slots, ceiling, source) is logged exactly once per run."""
+    _reset_ceiling_log()
+    monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (2, 2)
+    )
+    for _ in range(3):
+        audit_runner._audit_semaphore_max_workers()
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if "audit ceiling" in ln.lower()]
+    assert len(lines) == 1, f"expected exactly one ceiling log line, got {lines}"
+    logged = lines[0].lower()
+    assert "slots" in logged
+    assert "2" in logged
+
+
+def test_ceiling_log_reports_static_source_on_fallback(monkeypatch, capsys):
+    """The once-per-run log names the fallback source when the query fails."""
+    _reset_ceiling_log()
+    monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (None, None)
+    )
+    audit_runner._audit_semaphore_max_workers()
+    err = capsys.readouterr().err.lower()
+    line = next(ln for ln in err.splitlines() if "audit ceiling" in ln)
+    assert "static" in line
+
+
+def test_call_pi_uses_slot_derived_ceiling_not_static(monkeypatch):
+    """_call_pi's semaphore honours the slot-derived ceiling (end-to-end path)."""
+    _reset_ceiling_log()
+    monkeypatch.delenv(ENV_MAX_WORKERS, raising=False)
+    monkeypatch.setattr(
+        audit_runner, "_query_slot_status", lambda *a, **k: (2, 2)
+    )
+    seen = {}
+    real_semaphore = audit_runner.Semaphore
+
+    def _spy(name, max_workers=None, **kwargs):
+        seen["max_workers"] = max_workers
+        return real_semaphore(name, max_workers=max_workers, **kwargs)
+
+    monkeypatch.setattr(audit_runner, "Semaphore", _spy)
+    with _mock_popen():
+        audit_runner._call_pi("prompt", model="m", pi_bin="pi")
+    assert seen["max_workers"] == 2

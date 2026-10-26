@@ -36,6 +36,11 @@ def _audit_show_payload(raw_output: str | None) -> str:
     return json.dumps({"success": True, "workItemId": "SA-1", "audit": audit})
 
 
+def _fingerprint_line(value: str) -> str:
+    """Versioned fingerprint metadata line as emitted by the audit runner."""
+    return f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{value}"
+
+
 def test_check_freshness_subcommand_registered():
     args = audit_runner.build_parser().parse_args(["check-freshness", "SA-1"])
     assert args.command == "check-freshness"
@@ -43,7 +48,7 @@ def test_check_freshness_subcommand_registered():
 
 
 def test_check_freshness_reports_content_fresh(capsys):
-    raw = "Ready to close: Yes\nAudit content fingerprint: abc123\n"
+    raw = f"Ready to close: Yes\n{_fingerprint_line('abc123')}\n"
     runner = lambda cmd: _completed(_audit_show_payload(raw))
     with mock.patch.object(audit_runner, "_default_runner", runner), \
          mock.patch.object(audit_runner, "_check_audit_freshness", return_value=raw):
@@ -58,7 +63,7 @@ def test_check_freshness_reports_content_fresh(capsys):
 
 
 def test_check_freshness_reports_content_changed(capsys):
-    raw = "Ready to close: Yes\nAudit content fingerprint: abc123\n"
+    raw = f"Ready to close: Yes\n{_fingerprint_line('abc123')}\n"
     runner = lambda cmd: _completed(_audit_show_payload(raw))
     with mock.patch.object(audit_runner, "_default_runner", runner), \
          mock.patch.object(audit_runner, "_check_audit_freshness", return_value=None):
@@ -68,6 +73,21 @@ def test_check_freshness_reports_content_changed(capsys):
     assert out["fresh"] is False
     assert out["hasFingerprint"] is True
     assert out["reason"] == "content changed"
+
+
+def test_check_freshness_legacy_line_reports_no_fingerprint(capsys):
+    """An unversioned legacy line is not a v2 fingerprint: ``hasFingerprint``
+    is false and the probe reports the legacy time-gate fallback."""
+    raw = "Ready to close: Yes\nAudit content fingerprint: abc123\n"
+    runner = lambda cmd: _completed(_audit_show_payload(raw))
+    with mock.patch.object(audit_runner, "_default_runner", runner), \
+         mock.patch.object(audit_runner, "_check_audit_freshness", return_value=None):
+        audit_runner.cmd_check_freshness("SA-1", worklog_dir=_WORKLOG_DIR)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["fresh"] is False
+    assert out["hasFingerprint"] is False
+    assert out["reason"] == "stale (legacy audit, time gate)"
 
 
 def test_check_freshness_reports_no_stored_audit(capsys):

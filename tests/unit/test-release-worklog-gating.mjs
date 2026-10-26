@@ -1,8 +1,14 @@
 /**
- * Unit tests for worklog-ref gating in the release pipeline.
+ * Worklog-ref gating in the release pipeline — structural contracts.
  *
- * Tests that merge-dev-to-main.sh and run-release.js properly detect
- * and reject worklog refs before proceeding with a release.
+ * The *behaviour* of the worklog-ref gate (which refs are dangerous, which are
+ * legitimate `wl sync` bookkeeping, and parity between the shell and JS
+ * implementations) is covered by real behavioural tests in
+ * `test-worklog-ref-gate.mjs`. This file only asserts the wiring that those
+ * tests cannot observe from outside the release script: that
+ * `merge-dev-to-main.sh` delegates to the shared gate rather than carrying its
+ * own copy of the rule (the divergence that broke every release —
+ * SA-0MVO7XZAB0095R6F), and that the gate runs before the merge.
  */
 
 import { test, describe } from 'node:test';
@@ -19,66 +25,44 @@ const RUN_RELEASE_PATH = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'run-releas
 
 // ── merge-dev-to-main.sh worklog-ref gating ─────────────────────────────────
 
-describe('merge-dev-to-main.sh: worklog-ref gating', () => {
+describe('merge-dev-to-main.sh: worklog-ref gating delegates to the shared gate', () => {
   const content = readFileSync(MERGE_SCRIPT_PATH, 'utf-8');
 
-  test('references git for-each-ref refs/worklog/ to detect worklog refs', () => {
-    assert.ok(
-      content.includes('for-each-ref refs/worklog/'),
-      'Script should use git for-each-ref refs/worklog/ to detect worklog refs',
+  test('invokes the extracted worklog-ref gate', () => {
+    assert.match(
+      content,
+      /worklog-ref-gate\.sh/,
+      'merge-dev-to-main.sh must call release/worklog-ref-gate.sh instead of inlining the rule',
     );
   });
 
-  test('prints a clear error message when worklog refs are detected', () => {
-    assert.ok(
-      content.includes('worklog') && (content.includes('ref') || content.includes('refs')),
-      'Script should mention worklog refs in its error message',
+  test('does not re-inline its own ref-name special case', () => {
+    // The previous bug: an inline gate that only special-cased the literal name
+    // `refs/worklog/data`, so `wl sync` bookkeeping refs
+    // (refs/worklog/fetched-check, refs/worklog/tmp-reauthor) aborted every
+    // release while the JS gate passed. The rule must live in one place.
+    assert.doesNotMatch(
+      content,
+      /for-each-ref\s+refs\/worklog\//,
+      'the ref enumeration belongs in worklog-ref-gate.sh, not in the merge script',
     );
   });
 
-  test('aborts with non-zero exit code when worklog refs are present', () => {
-    assert.ok(
-      content.match(/exit\s+(\d+|[^\s]+)/) || content.includes('exit'),
-      'Script should exit with non-zero when worklog refs are detected',
-    );
+  test('aborts with exit 1 and a stderr explanation when the gate fails', () => {
+    assert.match(content, /Dangerous worklog refs detected/, 'must keep the operator-facing abort message');
+    // Slice from the actual invocation (not the explanatory comment above it).
+    const callPos = content.indexOf('$SCRIPT_DIR/worklog-ref-gate.sh');
+    assert.ok(callPos >= 0, 'the gate must be invoked via $SCRIPT_DIR/worklog-ref-gate.sh');
+    const gateBlock = content.slice(callPos, callPos + 600);
+    assert.match(gateBlock, /exit 1/, 'a failing gate must abort the release');
+    assert.match(gateBlock, />&2/, 'the abort explanation must go to stderr');
   });
 
-  test('gating check is before the merge operation', () => {
-    // Find the position of the worklog check and the git merge command
-    const worklogPos = content.indexOf('worklog');
+  test('gating check runs before the merge operation', () => {
+    const gatePos = content.indexOf('$SCRIPT_DIR/worklog-ref-gate.sh');
     const mergePos = content.indexOf('git merge');
-    assert.ok(
-      worklogPos >= 0 && mergePos >= 0,
-      'Both worklog check and merge operation should exist',
-    );
-    assert.ok(
-      worklogPos < mergePos,
-      'Worklog gating check should appear before the merge operation',
-    );
-  });
-
-  test('uses --format=%(refname) so mirror refs can be filtered', () => {
-    assert.ok(
-      content.includes('--format="%(refname)"'),
-      'Script should use --format=%(refname) so remote-tracking mirrors can be excluded',
-    );
-  });
-
-  test('ignores remote-tracking mirror refs (refs/worklog/remotes/**)', () => {
-    assert.ok(
-      content.includes("grep -v '^refs/worklog/remotes/'") ||
-        content.includes('refs/worklog/remotes/'),
-      'Script should exclude refs/worklog/remotes/ mirror refs from the gate',
-    );
-  });
-
-  test('still blocks when a local orphan ref (refs/worklog/data) exists', () => {
-    // The filter must only exclude refs/worklog/remotes/**, not local refs.
-    const filterLine = content.split('\n').find((line) => line.includes('remotes/'));
-    assert.ok(
-      filterLine && !filterLine.includes('refs/worklog/data'),
-      'Filter should exclude only refs/worklog/remotes/**, never refs/worklog/data',
-    );
+    assert.ok(gatePos >= 0 && mergePos >= 0, 'both the gate call and the merge operation must exist');
+    assert.ok(gatePos < mergePos, 'the worklog-ref gate must run before the merge');
   });
 });
 
@@ -87,21 +71,11 @@ describe('merge-dev-to-main.sh: worklog-ref gating', () => {
 describe('run-release.js: worklog-ref gating', () => {
   const content = readFileSync(RUN_RELEASE_PATH, 'utf-8');
 
-  test('references worklog in comments or logic', () => {
-    assert.ok(
-      content.includes('worklog') || content.includes('Worklog'),
-      'run-release.js should reference worklog somewhere for worklog-ref gating',
-    );
-  });
-
-  test('has a worklog-ref gating step (or references merge-dev-to-main.sh check)', () => {
-    // The worklog gating can either be in run-release.js itself or delegated
-    // to merge-dev-to-main.sh. If it delegates, it should reference the script.
-    assert.ok(
-      content.includes('worklog') ||
-      content.includes('merge-dev-to-main') ||
-      content.includes('release script'),
-      'run-release.js should either have its own worklog gating or delegate to the release script',
+  test('references the worklog-ref gate (wrapper-level check)', () => {
+    assert.match(
+      content,
+      /checkWorklogRefs/,
+      'run-release.js should apply the JS worklog-ref gate before the merge',
     );
   });
 });

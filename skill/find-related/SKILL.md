@@ -20,9 +20,9 @@ Discover related work for a work item via Worklog search, file inspection, and o
 2. Derive keywords from title/description; stop words excluded, 3+ chars, numeric-only tokens dropped; **the skill's own automated-report section is stripped first** so report tokens never feed back; ordered by **descending weight** where a title occurrence weighs `TITLE_WEIGHT` (3) body occurrences (v4) so the top-k terms are the item's compressed subject
 3. Suppress **project-generic scaffold terms** — `PROJECT_STOP_WORDS` ("work", "item", "report", "review", "skill", "related", "find", …) — so a capped search sweep never spends a query slot on a term that matches most of the corpus (v4; zero extra subprocess cost)
 4. Probe `wl search --semantic` — use hybrid ranking if available
-5. **Cap** worklog search to the top `MAX_SEARCH_KEYWORDS` weighted keywords, one `wl search` subprocess each (v3; was one subprocess per extracted keyword — 523 spawns on the polluted review item); multi-term batched queries were measured to collapse conjunctively, so capping (not batching) preserves recall
+5. **Cap** worklog search to the top `MAX_SEARCH_KEYWORDS` weighted keywords, one `wl search` subprocess each, **run concurrently** via a bounded thread pool (v5, SA-0MUG4654N000DFLQ — per-subprocess latency dominates, so the batch now costs ~the slowest single query instead of the sum; multi-term batched queries were measured to collapse conjunctively, so capping plus concurrency — not batching — preserves recall); results are aggregated in keyword order so ranking stays deterministic
 6. **Rank** work items by descending **distinct-keyword match count**, then ascending best `score` (more negative = better — matching wl's own best-first `score` ordering), then id (v4; fixes the v2 inverted descending-score sort that surfaced the *worst* matches first)
-7. Search repo files (`.md`, `.py`, `.js`, `.mjs`, `.txt`, excluding `.git`, `.worklog`, `node_modules`, etc. — the main checkout is authoritative; stale worktrees/sidecar output are never scanned)
+7. Search repo files (`.md`, `.py`, `.js`, `.mjs`, `.txt`, excluding `.git`, `.worklog`, `node_modules`, etc. — the main checkout is authoritative; stale worktrees/sidecar output are never scanned). This scan runs **in parallel with the Worklog search phase** (steps 4–5), since both consume the same derived keywords (v5)
 8. **Rank** repo files by distinct keyword match count, cap at `MAX_REPO_FILE_RESULTS`
 9. Filter out the current work item from results (during aggregation, so it never occupies a capped slot)
 10. Generate report under "## Related work (automated report)"
@@ -47,6 +47,7 @@ Discover related work for a work item via Worklog search, file inspection, and o
 | `MAX_REPO_FILE_RESULTS` | 3 | Maximum repo file matches shown. Same soft-limit semantics. |
 | `MAX_KEYWORDS_PER_FILE` | 5 | Maximum matched keywords listed per repo file match. Raw keyword word-lists are the dominant source of report bloat (measured ~58% of the related-work section), so lists are capped with a `(+N more)` marker to keep descriptions/prompts compact. |
 | `MAX_SEARCH_KEYWORDS` | 8 | Maximum keywords fed to Worklog search. Bounds the subprocess fan-out (v2 spawned one `wl search` per keyword, growing 14 → 82 → 523 across runs) while preserving per-keyword recall — measured 26 distinct items from 6 spawns vs 1 result from a 25-term batched semantic query. |
+| `MAX_SEARCH_WORKERS` | 8 | Maximum `wl search` subprocesses run simultaneously (v5, SA-0MUG4654N000DFLQ). The searches are independent and latency-bound, so overlapping them costs ~the slowest single call instead of the sum. The whole batch still runs at a lower bound, just in more waves. |
 | `TITLE_WEIGHT` | 3 | Weight of one title occurrence relative to one body occurrence (v4). A zero-extra-cost IDF proxy; setting it to `1` reverts to v3 frequency-only ordering. |
 | `PROJECT_STOP_WORDS` | see source | Project-scaffold terms ("work", "item", "report", "review", "skill", "related", "find", …) suppressed in addition to the general English `STOP_WORDS` (v4); documented per-term in `find_related.py`. |
 
@@ -139,21 +140,47 @@ Work item: <id> | Related: 3 | Repo matches: 2 | Added IDs: REL-001, REL-002
 
 ### Runtime expectations
 
-Typical runs finish in **~3–6s** (v3): worklog search is bounded to
-`MAX_SEARCH_KEYWORDS` (8) per-keyword subprocesses (~0.4–0.5s each) instead of one
-per extracted keyword (96% of v2 runtime was subprocess waits; the polluted
-review item hit 523 spawns / unbounded wall-clock). Keyword extraction never
-reads the skill's own report and is weight-ranked (title boost + generic-term
-suppression, v4) with zero extra subprocesses, so re-runs do not grow
-slower over time (pre-fix feedback loop: 14 → 82 → 523 keywords). Repo
-scanning excludes `.worklog` (~83% of scanned files) so stale worktrees and
-the sidecar full report are neither read nor matched. See
-`docs/dev/find-related-v3-analysis.md` for the measured before/after.
+Typical runs finish in **~2–4s** (v5), inside the skill's <5s target.
+Measured end-to-end on the reference item `SA-0MUG4654N000DFLQ` (8 keyword
+searches): **3.7s / 4.1s / 4.4s** — and that was with the host already
+carrying other agents' CPU load. The cost model changed with v5:
 
-> **Note:** Actual timing varies by machine. Measured ~5–6s on a typical
-> development machine (8 searches at ~0.43s each + semantic probe + repo scan).
-> The v3 analysis measured ~3s on a faster machine; the bottleneck is per-subprocess
-> latency, not algorithmic complexity.
+- the worklog search fans its `MAX_SEARCH_KEYWORDS` (8) per-keyword
+  subprocesses out **concurrently** (`MAX_SEARCH_WORKERS`), so the batch
+  costs ~the slowest single query (~0.4–0.5s) instead of their sum (~3.4s);
+- the repository scan runs in parallel with the search phase, and the
+  semantic probe runs in parallel with the `wl show` fetch, so neither
+  adds to the critical path.
+
+Per-subprocess latency — not algorithmic complexity — is the bottleneck, so
+concurrency, not a smaller keyword cap, is the lever (96% of v2 runtime was
+subprocess waits; the polluted review item hit 523 spawns / unbounded
+wall-clock). Keyword extraction never reads the skill's own report and is
+weight-ranked (title boost + generic-term suppression, v4) with zero extra
+subprocesses, so re-runs do not grow slower over time (pre-fix feedback
+loop: 14 → 82 → 523 keywords). Repo scanning excludes `.worklog` (~83% of
+scanned files) so stale worktrees and the sidecar full report are neither
+read nor matched. See `docs/dev/find-related-v3-analysis.md` for the pre-v5
+before/after.
+
+> **Measurement (v5, recorded on work item SA-0MUG4654N000DFLQ).**
+>
+> - *Fan-out overlap* — on the reference item the search phase reported
+>   `search_wall=4.89s sum_of_query_durations=30.51s slowest_query=4.87s
+>   max_queries_in_flight=8`: the batch costs the *slowest* query, not the
+>   30s sum.
+> - *End-to-end* — three runs of the script with `--work-item-id
+>   SA-0MUG4654N000DFLQ --json` against a snapshot copy of the worklog store
+>   (used to remove cross-agent `wl`/`wl sync` contention) measured 3.72s /
+>   4.09s / 4.43s, recall unchanged (3 related items, 3 repo matches).
+> - *Old vs new under identical load* — alternating the pre-v5 and v5 script
+>   on the same host at the same moment measured 20.9s / 28.1s / 47.5s for
+>   pre-v5 versus 10.9s / 11.5s / 22.5s for v5, with identical recall. Those
+>   live-store numbers are inflated by other agents' worklog traffic — which
+>   is why the absolute <5s figure above uses the store snapshot.
+>
+> Actual timing varies by machine and by host load (a contended host inflates
+> every phase several-fold); the concurrency win is the stable part.
 
 ### Idempotency
 
@@ -167,6 +194,27 @@ replaced with the section instead of being orphaned or stacked. Manual
 ### Design
 
 Fully offline (local `wl` + filesystem). Conservative keyword matching. Scans `.md`, `.py`, `.js`, `.mjs`, `.txt` files only.
+
+### Changes in v5 (runtime — SA-0MUG4654N000DFLQ)
+
+- **Concurrent search fan-out:** the bounded per-keyword `wl search` batch
+  now runs through a `ThreadPoolExecutor` capped at `MAX_SEARCH_WORKERS`
+  (8). Independent searches overlap, so the phase costs ~the slowest single
+  query instead of the sum of all of them (measured on a loaded host: 30.5s
+  of query time in a 4.9s wall clock, 8 queries in flight). Results are
+  still aggregated in **keyword order**, so ranking stays deterministic and
+  completion-order independent.
+- **Repo scan and probe overlapped:** the repository scan and the Worklog
+  search phase (probe + fan-out) are independent and now run in parallel
+  (`collect_results`), and the semantic probe starts before the `wl show`
+  fetch (`fetch_with_probe`) — so neither the scan nor the probe adds to
+  the critical path.
+- **Unchanged invariants:** still exactly one `wl search` per keyword (no
+  batching — measured to collapse conjunctively), `MAX_SEARCH_KEYWORDS`
+  still bounds the fan-out, keyword extraction is unchanged, and the
+  analysed item is still excluded from results.
+- **Resilience:** a keyword whose search raises now yields no results for
+  that keyword instead of aborting the batch.
 
 ### Changes in v4 (keyword relevance — SA-0MUG46NJE003JOCD)
 

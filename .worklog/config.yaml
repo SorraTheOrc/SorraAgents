@@ -8,7 +8,14 @@ githubRepo: SorraTheOrc/SorraAgents
 # user.email, so `wl sync` can merge worklog data pushed from the operator's
 # GitHub-identity checkout. `pi@local` is the host framework identity used by
 # agent checkouts, so their worklog-data commits merge too
-# (SA-0MVGSB63F00803HK). The list stays exact-email (no allow-all).
+# (SA-0MVGSB63F00803HK, SA-0MVB57M02008QPJS).
+#
+# This deliberately widens the project gate: a `pi@local`-authored sync commit
+# is merged instead of stranding every local worklog mutation. The widening is
+# bounded — the list stays exact-email (no allow-all, no wildcards), the
+# empty-author-email gate is never bypassed, and incident sentinel identities
+# such as `t@t.com` stay refused. Regression coverage:
+# tests/test_author_gate_allowlist.py. See SA-0MVB57M02008QPJS.
 syncAllowedAuthors:
   - 250240+SorraTheOrc@users.noreply.github.com
   - pi@local

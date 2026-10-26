@@ -316,6 +316,8 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const overrides = [];
     const closes = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
+      // Idempotency boundary injected so the suite never reads the live worklog.
+      getCommentsFn: () => [],
       getCandidateItemsFn: () => [
         { id: 'SA-P1', title: 'Parent One', needsProducerReview: false, parentId: null },
         { id: 'SA-C1', title: 'Child One', needsProducerReview: true, parentId: 'SA-P1' },
@@ -354,6 +356,8 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const overrides = [];
     const closes = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
+      // Idempotency boundary injected so the suite never reads the live worklog.
+      getCommentsFn: () => [],
       getCandidateItemsFn: () => [
         { id: 'SA-P1', title: 'Parent One', needsProducerReview: false, parentId: null },
         { id: 'SA-C1', title: 'Child One', needsProducerReview: true, parentId: 'SA-P1' },
@@ -376,6 +380,8 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const mod = await import(RUN_RELEASE_PATH);
     const overrides = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
+      // Idempotency boundary injected so the suite never reads the live worklog.
+      getCommentsFn: () => [],
       getCandidateItemsFn: () => [
         { id: 'SA-C1', title: 'Child One', needsProducerReview: true, parentId: 'SA-P1' },
       ],
@@ -395,6 +401,8 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const overrides = [];
     const closes = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
+      // Idempotency boundary injected so the suite never reads the live worklog.
+      getCommentsFn: () => [],
       dryRun: true,
       getCandidateItemsFn: () => [
         { id: 'SA-P1', title: 'Parent One', needsProducerReview: false, parentId: null },
@@ -417,6 +425,8 @@ describe('closeWorkItemsAfterRelease - child override', () => {
     const mod = await import(RUN_RELEASE_PATH);
     const overrides = [];
     const result = mod.closeWorkItemsAfterRelease('1.2.3', {
+      // Idempotency boundary injected so the suite never reads the live worklog.
+      getCommentsFn: () => [],
       getCandidateItemsFn: () => [
         { id: 'SA-C1', title: 'Child One', needsProducerReview: null, parentId: 'SA-P1' },
       ],

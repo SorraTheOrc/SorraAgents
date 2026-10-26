@@ -148,6 +148,14 @@ def _run_release(
     script_copy = release_dir / "merge-dev-to-main.sh"
     shutil.copy(RELEASE_SCRIPT, script_copy)
     script_copy.chmod(0o755)
+    # The worklog-ref gate is a sibling module of the release script
+    # (SA-0MVO7XZAB0095R6F) and the real install always ships both. Without it
+    # the release fails closed, which is asserted separately in
+    # tests/unit/test-release-worklog-gating.mjs.
+    gate_source = RELEASE_SCRIPT.parent / "worklog-ref-gate.sh"
+    gate_copy = release_dir / "worklog-ref-gate.sh"
+    shutil.copy(gate_source, gate_copy)
+    gate_copy.chmod(0o755)
 
     env = {
         **os.environ,

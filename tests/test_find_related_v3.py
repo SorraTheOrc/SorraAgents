@@ -174,7 +174,9 @@ class TestSearchAndDedupTopK:
         with mock.patch.object(mod, "run_wl_search", side_effect=fake_search):
             mod.search_and_dedup(kws, use_semantic=True)
         assert len(calls) == mod.MAX_SEARCH_KEYWORDS
-        assert calls == kws[: mod.MAX_SEARCH_KEYWORDS]
+        # v5 runs the batch concurrently, so the calls are no longer appended
+        # in submission order — the cap must select the top-k keyword *set*.
+        assert sorted(calls) == sorted(kws[: mod.MAX_SEARCH_KEYWORDS])
 
     def test_semantic_flag_passed_through(self):
         """Hybrid --semantic ranking is used for each queried keyword."""

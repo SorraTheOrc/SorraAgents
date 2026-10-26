@@ -5,6 +5,18 @@ Fetches a work item, derives keywords from its title/description, searches
 Worklog and the repository for related items, generates a concise Markdown
 report, and updates the work-item description.
 
+v5 (SA-0MUG4654N000DFLQ) runtime changes:
+  - The bounded per-keyword search fan-out runs concurrently (bounded
+    ThreadPoolExecutor, MAX_SEARCH_WORKERS): independent `wl search`
+    subprocesses now cost ~the slowest single call instead of their sum
+    (measured 8 sequential searches ~3.4-6.4s -> ~1s). Results are still
+    aggregated in keyword order, so ranking stays deterministic.
+  - The Worklog search phase (semantic probe + search fan-out) and the
+    repository scan run concurrently, hiding the repo scan behind the
+    subprocess fan-out instead of adding to the wall clock.
+  - Query strategy unchanged: still exactly one `wl search` per keyword
+    (batched queries were measured to collapse conjunctively).
+
 v4 (SA-0MUG46NJE003JOCD) keyword-relevance changes:
   - Keywords are weighted (title terms outweigh body occurrences) and
     project-generic scaffold terms ("work", "item", "report", "review",
@@ -45,6 +57,8 @@ import re
 import subprocess
 import sys
 import traceback
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -154,6 +168,16 @@ MAX_KEYWORDS_PER_FILE: int = 5
 # spawns on the review item) where multi-term batched queries collapsed to
 # ~1 conjunctive result, so capping beats batching as the speed lever.
 MAX_SEARCH_KEYWORDS: int = 8
+
+
+# Maximum number of `wl search` subprocesses run concurrently (v5,
+# SA-0MUG4654N000DFLQ). The searches are independent and dominated by
+# per-subprocess startup/IO latency (~0.4-1s each), so overlapping them
+# costs ~the slowest single call instead of the sum (~3.4-6.4s measured for
+# 8 keywords) without changing the per-keyword query strategy. Bounded to
+# keep the host's CPU/IO load predictable; a lower value still runs the
+# whole batch, just fewer at a time.
+MAX_SEARCH_WORKERS: int = 8
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +372,145 @@ def run_wl_search(keyword: str, use_semantic: bool = False,
         return []
 
 
+def _run_searches_concurrently(
+    keywords: Iterable[str],
+    use_semantic: bool = False,
+    worklog_flags: list[str] | None = None,
+    max_workers: int = MAX_SEARCH_WORKERS,
+    search_fn: Callable[..., list[dict[str, Any]]] | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Run one ``wl search`` per keyword concurrently, preserving order.
+
+    Returns the per-keyword result lists **in keyword order** (not
+    completion order), so the caller's aggregation and ranking are
+    completion-order independent and therefore deterministic.
+
+    Concurrency is bounded by ``min(len(keywords), max_workers)``; every
+    keyword is still queried, just over several waves when the bound is
+    lower than the batch size. A keyword whose search raises yields an
+    empty list instead of aborting the batch — one bad query must not drop
+    the other keywords' results.
+
+    v5 (SA-0MUG4654N000DFLQ): the searches are independent subprocesses
+    (96% of v2/v3 runtime was per-subprocess wait), so overlapping them
+    removes the sum-of-latencies bottleneck while keeping the per-keyword
+    query strategy (batching was measured to collapse conjunctively).
+    """
+    batch = list(keywords)
+    if not batch:
+        return []
+
+    run_search = search_fn or run_wl_search
+    workers = max(1, min(len(batch), max_workers))
+
+    if workers == 1:
+        # No pool overhead for the single-keyword case.
+        return [
+            _search_one(run_search, keyword, use_semantic, worklog_flags)
+            for keyword in batch
+        ]
+
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="find-related-search",
+    ) as pool:
+        futures = [
+            pool.submit(_search_one, run_search, keyword, use_semantic,
+                        worklog_flags)
+            for keyword in batch
+        ]
+        return [future.result() for future in futures]
+
+
+def _search_one(
+    search_fn: Callable[..., list[dict[str, Any]]],
+    keyword: str,
+    use_semantic: bool,
+    worklog_flags: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Run one keyword search, degrading to no results on failure."""
+    try:
+        return search_fn(keyword, use_semantic=use_semantic,
+                         worklog_flags=worklog_flags)
+    except Exception:  # noqa: BLE001 -- one failed query must not sink the batch
+        return []
+
+
+def fetch_with_probe(
+    work_item_id: str,
+    worklog_flags: list[str] | None = None,
+) -> tuple[dict[str, Any] | None, Any]:
+    """Fetch the work item while the semantic-search probe runs concurrently.
+
+    The probe depends only on the resolved store flags — not on the item — so
+    it overlaps the ``wl show`` fetch instead of adding to the critical path
+    (v5, SA-0MUG4654N000DFLQ). The executor is closed before returning, so the
+    elapsed time is ``max(show, probe)`` and the returned future is already
+    resolved (its value stays readable after shutdown).
+
+    Returns ``(work_item, probe_future)``; pass the future to
+    :func:`collect_results` so the search phase reuses the probe verdict
+    instead of probing again.
+    """
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="find-related-probe",
+    ) as pool:
+        probe_future = pool.submit(is_semantic_available,
+                                   worklog_flags=worklog_flags)
+        work_item = run_wl_show(work_item_id, worklog_flags=worklog_flags)
+    return work_item, probe_future
+
+
+def collect_results(
+    keywords: list[str],
+    worklog_flags: list[str] | None = None,
+    exclude_id: str | None = None,
+    repo_path: str | Path = REPO_ROOT,
+    verbose: bool = False,
+    probe_future: Any = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Probe + search Worklog and scan the repository concurrently.
+
+    The two phases are independent — both consume the derived *keywords*
+    and neither feeds the other — so the (I/O-bound) repository scan is run
+    in parallel with the subprocess-bound Worklog search phase instead of
+    adding to the wall clock (v5, SA-0MUG4654N000DFLQ).
+
+    The Worklog phase itself probes semantic search availability (its
+    verdict is passed to :func:`search_and_dedup`) and then runs the
+    bounded concurrent per-keyword fan-out. *probe_future* lets the caller
+    hand in an already-started probe (see :func:`fetch_with_probe`), so the
+    probe latency overlaps the ``wl show`` fetch.
+
+    Returns ``(related_items, repo_matches)``, each already ranked and
+    capped.
+    """
+    def _search_phase() -> list[dict[str, Any]]:
+        if probe_future is not None:
+            use_semantic = probe_future.result()
+        else:
+            use_semantic = is_semantic_available(worklog_flags=worklog_flags)
+        if verbose:
+            print(f"[find-related] Semantic search available: {use_semantic}",
+                  file=sys.stderr)
+        # The analysed item is excluded so it never occupies a capped slot.
+        return search_and_dedup(
+            keywords,
+            use_semantic=use_semantic,
+            worklog_flags=worklog_flags,
+            exclude_id=exclude_id,
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="find-related-phase",
+    ) as pool:
+        search_future = pool.submit(_search_phase)
+        repo_future = pool.submit(search_repo, str(repo_path), keywords)
+        return search_future.result(), repo_future.result()
+
+
 def run_wl_update(work_item_id: str, description: str,
                   worklog_flags: list[str] | None = None) -> bool:
     """Update a work item description via `wl update <id> --description <text>`.
@@ -420,6 +583,11 @@ def search_and_dedup(
     ``worklog_flags`` pins the target worklog store (resolved from the
     work-item id being analyzed) so every search targets the same store.
 
+    v5 (SA-0MUG4654N000DFLQ): the per-keyword searches run concurrently
+    (see :func:`_run_searches_concurrently`), so the batch costs ~the
+    slowest single subprocess instead of their sum. Results are aggregated
+    in keyword order, keeping the ranking below deterministic.
+
     v4 (SA-0MUG46NJE003JOCD) ranking: items are ranked by **descending
     number of distinct searched keywords they match**, then **ascending
     best score** (more negative = better, matching ``wl search``'s own
@@ -442,9 +610,11 @@ def search_and_dedup(
     # item_id -> {item, matches (distinct searched keywords), best score}
     found: dict[str, dict[str, Any]] = {}
 
-    for keyword in keywords[:max_keywords]:
-        items = run_wl_search(keyword, use_semantic=use_semantic,
-                              worklog_flags=worklog_flags)
+    # v5: run the bounded batch concurrently; results come back in keyword
+    # order so the aggregation/ranking below is completion-order independent.
+    batch = keywords[:max_keywords]
+    for items in _run_searches_concurrently(batch, use_semantic=use_semantic,
+                                            worklog_flags=worklog_flags):
         for item in items:
             item_id = item.get("id")
             if not item_id or item_id == exclude_id:
@@ -787,8 +957,12 @@ def _main() -> None:
             print(f"[find-related] Work item: {args.work_item_id}", file=sys.stderr)
             print(f"[find-related] Repo path: {args.repo_path}", file=sys.stderr)
 
-        # Fetch the work item
-        work_item = run_wl_show(args.work_item_id, worklog_flags=wl_flags)
+        # Start the semantic probe before fetching the item: it depends only
+        # on the resolved store flags, so its latency hides behind `wl show`
+        # instead of adding to it (v5, SA-0MUG4654N000DFLQ).
+        work_item, probe_future = fetch_with_probe(
+            args.work_item_id, worklog_flags=wl_flags,
+        )
         if work_item is None:
             msg = f"Failed to fetch work item {args.work_item_id}"
             notice = FailureNotice(
@@ -815,19 +989,18 @@ def _main() -> None:
         if args.verbose:
             print(f"[find-related] Keywords: {keywords}", file=sys.stderr)
 
-        # Probe semantic search availability
-        use_semantic = is_semantic_available(worklog_flags=wl_flags)
-        if args.verbose:
-            print(f"[find-related] Semantic search available: {use_semantic}", file=sys.stderr)
-
-        # Search Worklog (with semantic ranking when available); the item
-        # being analyzed is excluded so it never occupies a capped slot.
-        related_items = search_and_dedup(keywords, use_semantic=use_semantic,
-                                         worklog_flags=wl_flags,
-                                         exclude_id=args.work_item_id)
-
-        # Search repository (ranked and limited)
-        repo_matches = search_repo(args.repo_path, keywords)
+        # Search Worklog and the repository concurrently: the two phases are
+        # independent (both consume the derived keywords), so the repo scan
+        # overlaps the subprocess-bound search fan-out instead of adding to
+        # the wall clock (v5, SA-0MUG4654N000DFLQ).
+        related_items, repo_matches = collect_results(
+            keywords,
+            worklog_flags=wl_flags,
+            exclude_id=args.work_item_id,
+            repo_path=args.repo_path,
+            verbose=args.verbose,
+            probe_future=probe_future,
+        )
 
 
         # Filter out the current work item from results

@@ -78,7 +78,10 @@ hit the same entries because both resolve the same project root.
 - **Pipeline normalization**: output-filtering pipelines (e.g.
   `npm test 2>&1 | grep -E "Test Files|failed"`, `| tail -30`, `| head`,
   `| tee`) normalize to the underlying run and share one cache entry.
-- **Visibility**: non-JSON output marks cache hits with `[cached]`.
+- **Visibility**: non-JSON output marks cache hits with `[cached]` and names
+  the pytest interpreter used (`[pytest interpreter: <path>]`). The concrete
+  interpreter/executable is also stored in `metadata.json` (`interpreter`)
+  — see *pytest interpreter resolution* below (SA-0MVK154IE007OS3D).
 - **PATH augmentation for user-installed executables (SA-0MSUZAJPC003BS66)**: the
   default runner (`_default_runner` in `test_cache.py`) prepends
   `~/.local/bin` to the subprocess `PATH` when it is not already present, so
@@ -168,6 +171,19 @@ immediately or crashing. This means multiple agents running tests concurrently
 will serialize gracefully — each waits its turn and succeeds once a slot
 becomes free.
 
+**Failure-notice contract (WL-0MVGUT787000LNDG):** a suite that fails
+WITHOUT structured test failures reports a stable machine-readable
+`notice_code` alongside the human-readable `notice` — `slot_busy`
+(`NOTICE_SLOT_BUSY`), `command_not_found` (`NOTICE_COMMAND_NOT_FOUND`) or
+`suite_timeout` (`NOTICE_SUITE_TIMEOUT`). `run_suite` also carries bounded
+`stdout`/`stderr` tails (`_output_tail`, 4000 chars) and `run_all`
+aggregates them into top-level `notice_codes`/`stdout`/`stderr`. Consumers
+(e.g. `implement.py`'s finish gate) classify failures on the codes — never
+by string-matching the notice text — so rewording a notice can never
+silently reclassify a genuine test failure as infrastructure contention.
+The slot-busy notice text itself is anchored to the exported
+`SLOT_BUSY_NOTICE_PREFIX` constant.
+
 **Staggered-wait contract (SA-0MVEDOF7A004TSWD):** under a saturated pool,
 \*concurrent* waiters all enqueue with the same `TEST_LOCK_TIMEOUT` bound and,
 without measures, would poll the slot pool at a fixed cadence and expire at one
@@ -240,7 +256,7 @@ slot its own outer run holds; with two concurrent full suites and
 out the whole `TEST_LOCK_TIMEOUT` (observed 2700s hangs in `implement.py
 finish` and the pre-push gate). The observed offenders were
 `tests/test_live_repo_mutation_guard.py::TestRunTestsGuardFires::*` and
-`tests/test_pytest_path_resolution.py::test_run_tests_spawns_resolved_pytest_when_missing`.
+`tests/test_pytest_path_resolution.py::test_run_tests_spawns_runner_interpreter_when_pytest_missing`.
 
 **Contract:** a fixture that spawns (or calls) a nested runner sets
 `PI_SEMAPHORE_DIR` to a per-test isolated directory for that invocation. The
@@ -316,6 +332,55 @@ suite (~412s measured wall-clock) before it can finish, so the timeout was
 raised to 1500s (~3.6x margin) to allow both the test skill and the audit
 runner's auto-execute path to complete. No `suiteCommands` override is set
 — command detection continues to use the convention-based resolution above.
+
+### 1b. pytest interpreter resolution (SA-0MVK154IE007OS3D)
+
+The canonical pytest **command** (the cache key) is always
+`pytest -q -r a --disable-warnings`. The **executable prefix** actually run is
+resolved at execution time by `resolve_pytest_command()` in
+`skill/test_runner.py`, replacing the historical bare-`pytest` rule
+(SA-0MSQ012QG005N22S). Every candidate is **probed** (a cheap
+`<candidate> --version`, run once per process via the memoised
+`_PYTEST_COMMAND`) and skipped when it cannot run pytest — a failing or
+foreign-interpreter candidate is never selected while a working one exists:
+
+1. **`PYTEST_BIN`** — explicit pytest binary/command override, used verbatim
+   when it runs.
+2. **`TEST_PYTHON`** — explicit interpreter override (`<TEST_PYTHON> -m
+   pytest`).
+3. **`sys.executable -m pytest`** — the interpreter that started the runner,
+   i.e. the project's interpreter. This is the fix for hosts where a PATH
+   `pytest` script carries a system-Python shebang that cannot import the
+   project's dependencies (collection then fails with exit 2 — e.g.
+   `ModuleNotFoundError: No module named 'numpy'` — even though the repo's
+   canonical `python3 -m pytest` run is green). Because `sys.executable`
+   precedes the PATH `pytest`, the two orders can never disagree while the
+   runner's interpreter can run pytest.
+4. **`pytest` on PATH** (`shutil.which`) — only when earlier forms fail the
+   probe.
+5. **`~/.local/bin/pytest`** — retained user-install fallback
+   (SA-0MSQ012QG005N22S; user-site bin dirs are absent from non-login
+   shells).
+6. **`python3 -m pytest`** — last resort when the runner's interpreter cannot
+   run pytest but PATH `python3` can.
+
+When every candidate fails the probe the resolved command falls back to bare
+`pytest` and the spawn surfaces the error (never a silently narrowed suite).
+Overrides are read on the first resolution in a process (the result is
+memoised for the whole process), so export `PYTEST_BIN` / `TEST_PYTHON`
+before invoking `run_tests.py` rather than mid-run.
+
+**Auditability (AC2):** the concrete interpreter/executable selected is
+recorded in the cache entry (`metadata.json` → `interpreter` field) and in
+`run_tests.py` output (`[pytest interpreter: /usr/bin/python3]` on the
+non-JSON suite line; `interpreter` in the per-suite JSON result and in the
+`--summary` JSON `interpreters` map). The cache key stays git-state + command
++ type — the interpreter is informational metadata, so an entry is never
+silently invalidated for having run under a different interpreter; the choice
+remains visible and auditable. Direct `run_cached()` consumers — the audit
+F3 auto-run and the implement finish gate — get the same behaviour through
+`test_cache._default_runner`, which rewrites the executable prefix via
+`executable_test_command()` exactly like `_cached_runner` does.
 
 ### 1a. Test types (`--type`) and the local extension contract (SA-0MTJQB2MA008HMO6)
 
@@ -426,6 +491,42 @@ non-test/unmapped, the selection references only deleted/non-existent paths,
 the repo declares custom `suiteCommands` in `.pi/test-config.json` (not
 introspectable), or the repo has no subsettable tooling. A scoped run never
 silently skips testing.
+
+**The fallback honours pinned suite commands
+(OSL-0MVNWYRQB0095WXQ).** When the fallback fires, the full-scope command set
+is resolved through `full_suite_commands(project_root)` — the single source
+of truth (section 1) — filtered by the requested suite name via
+`filter_commands_for_suite()` (`pytest` → commands containing `pytest`,
+`node` → commands containing `node`, `all` → every command).
+
+- A repo that pins `suiteCommands` (`{"suiteCommands": ["python3 -m pytest -q"]}`)
+therefore runs the **pinned** command — and the pinned interpreter — for
+`--suite pytest --scope changed`, exactly as `--suite all` does. The legacy
+bare `pytest` token is never substituted on the fallback path, so a scoped run
+can no longer silently re-resolve `pytest` to a different interpreter and
+report false collection errors.
+- A **multi-command pin** (mixed pytest + node entries) maps each command to
+its own suite name; `--suite pytest` runs the pytest entries only.
+- When the filtered set is **empty** (e.g. a node-only pin queried as
+`--suite pytest`), `run_suite` raises the unknown-suite-style
+`ValueError` (`unknown suite: pytest — the repo's suite commands define no
+matching command`) instead of silently running nothing and reporting success.
+- The reporting contract is unchanged: a fallback still records
+`scope: "full"`.
+
+Direct full-scope runs (`--scope full`) keep the legacy name-based resolution
+for `pytest`/`node` (section 1), and tool-less repos keep their legacy
+fallback, so existing behaviour is untouched.
+
+**Read-only summaries resolve the same way
+(OSL-0MVNWYRQB0095WXQ).** `--summary` (`run_summary`) also resolves each suite
+through `full_suite_commands(project_root)` filtered by suite name, so a
+summary of `--suite pytest` in a pinned repo looks up the **pinned** cache
+entry rather than missing it against a bare-token key. When the repo declares
+suite commands but none match the requested suite (e.g. a node-only pin
+queried as `--suite pytest`), the suite is reported as a miss (`missing`),
+never as an empty success. A tool-less repo (empty full-suite command set)
+keeps the legacy name-based lookup, unchanged.
 
 **Result JSON** carries `scope` (`full`/`changed`) at the run level
 (`run_all` outputs `scope` + per-suite `resolved_scopes`); `run_suite`

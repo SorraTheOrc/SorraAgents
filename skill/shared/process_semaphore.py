@@ -18,9 +18,17 @@ Configuration
 - ``max_workers`` (explicit argument) — highest priority.
 - ``AUDIT_MAX_CONCURRENCY`` environment variable — override for audit-style
   workloads (default ceiling documented below).
-- Default: 6 concurrent workers when neither is provided.
+- Default: 6 concurrent workers when neither is provided **and the live
+  proxy slot status is unavailable**.
 
-The default is right-sized to the host's measured audit-slot capacity
+For audit pi-call workloads the effective ceiling is resolved by
+``audit_runner._audit_semaphore_max_workers()`` (SA-0MVF1NKZQ009P3ZG AC3):
+an explicit argument or ``AUDIT_MAX_CONCURRENCY`` is authoritative, and
+otherwise the **live proxy slot capacity** is consulted first
+(``/llama/local/status`` → ``max(1, min(available_slots, total_slots))``,
+fail-open) so a 2-slot proxy never queues six pi sessions behind two slots.
+The static 6 here is the fallback when the slot query fails; it is
+right-sized to the host's measured audit-slot capacity
 (SA-0MUSZJRB9006ZCHE): the F7 harness (``skill/shared/validate_fanout.py``)
 drained a burst of 8 audits in 18.7s at ceiling 3 vs 12.9s at ceiling 6,
 with a batch-attributable load delta <= 1.63 on the 16-core host and no swap

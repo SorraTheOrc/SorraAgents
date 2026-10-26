@@ -18,10 +18,14 @@ Invoke the underlying bash script directly:
 $(skill_path speak)/scripts/speak.sh "Text to convert to speech"
 ```
 
-Or set the `TTS_API_URL` environment variable to use a different endpoint:
+Or set the `TTS_API_URL` environment variable to use a different endpoint
+(`--endpoint` takes precedence when both are given):
 
 ```bash
 TTS_API_URL="http://localhost:8000/v1/audio/speech" $(skill_path speak)/scripts/speak.sh "Hello"
+
+# Or pass the endpoint as an explicit flag (takes precedence over TTS_API_URL):
+$(skill_path speak)/scripts/speak.sh --endpoint http://127.0.0.1:8000/v1/audio/speech "Hello"
 ```
 
 ### Timing wrapper (recommended)
@@ -44,6 +48,7 @@ clean for `--stream` mode.
 |----------|-------------|
 | `text`   | Text string to be spoken (enclose in quotes for multi-word phrases) |
 | `--voice <name>` | Server-side voice name to synthesise with (default: `$TTS_VOICE` or `ryan`). Use any voice the endpoint exposes, e.g. `nova`, `ginny_di`, `default`. |
+| `--endpoint <url>` | TTS API endpoint to POST to (default: `$TTS_API_URL` or the remote URL below). Takes precedence over `TTS_API_URL`. |
 | `--stream` | Write raw audio to stdout (pipe over SSH to a remote player) |
 | `--help` | Show usage instructions and exit |
 
@@ -51,7 +56,7 @@ clean for `--stream` mode.
 
 | Variable      | Default                                       | Description                              |
 |---------------|-----------------------------------------------|------------------------------------------|
-| `TTS_API_URL` | `http://100.79.231.101:8000/v1/audio/speech`  | Override the TTS API endpoint            |
+| `TTS_API_URL` | `http://100.79.231.101:8000/v1/audio/speech`  | Default TTS API endpoint when `--endpoint` is not given (an explicit `--endpoint` takes precedence) |
 | `TTS_VOICE`   | `ryan`                                        | Default voice name when `--voice` is not given (an explicit `--voice` takes precedence) |
 | `SPEAK_DIR`   | `<repo-root>/.pi/speak/`                      | Override the output directory            |
 
@@ -103,9 +108,11 @@ payload:
 
 The `voice` field defaults to `ryan` for backwards compatibility and can be
 selected per invocation with `--voice <name>` or globally with the
-`TTS_VOICE` environment variable (`--voice` wins). The local CosyVoice server
-exposes `ryan`, `default`, `nova`, and `ginny_di`; any other
-OpenAI-compatible endpoint may expose different names.
+`TTS_VOICE` environment variable (`--voice` wins). The endpoint is selected
+per invocation with `--endpoint <url>`, else `TTS_API_URL`, else the remote
+default (`--endpoint` wins). The local CosyVoice server exposes `ryan`,
+`default`, `nova`, and `ginny_di`; any other OpenAI-compatible endpoint may
+expose different names.
 
 A 60-second timeout is applied to the API call.
 
@@ -137,8 +144,11 @@ $(skill_path speak)/scripts/speak.py 'The TTS system is now working.'
 $(skill_path speak)/scripts/speak.py --stream "Hello" | aplay
 ssh user@host "$(skill_path speak)/scripts/speak.py --stream 'hi'" | aplay
 
-# Custom API endpoint
+# Custom API endpoint (environment variable)
 TTS_API_URL="http://localhost:8000/v1/audio/speech" $(skill_path speak)/scripts/speak.py "Test"
+
+# Custom API endpoint (explicit flag -- takes precedence over TTS_API_URL)
+$(skill_path speak)/scripts/speak.py --endpoint http://127.0.0.1:8000/v1/audio/speech "Hello from the local server."
 
 # Select a specific server-side voice
 $(skill_path speak)/scripts/speak.py --voice nova "Hi, I'm Nova."

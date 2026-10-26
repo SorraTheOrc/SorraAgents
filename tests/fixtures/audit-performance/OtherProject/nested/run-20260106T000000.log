@@ -1,0 +1,4 @@
+Per-call timing: issue_id=SA-7 context=verdict_reask elapsed_seconds=461.0 model=mock
+Per-call timing: issue_id=SA-7 context=phase2_child:0 elapsed_seconds=300.0 ac_count=2 avg_ac_elapsed_seconds=150.0 model=mock
+Per-call timing: issue_id=SA-7 context=phase2_child:1 elapsed_seconds=900.0 ac_count=3 avg_ac_elapsed_seconds=300.0 model=mock
+Per-call timing: issue_id=SA-8 context=false-positive-screen elapsed_seconds=598.0 model=mock
