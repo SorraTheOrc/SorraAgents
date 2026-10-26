@@ -91,7 +91,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2]
@@ -2028,11 +2028,13 @@ def _parse_iso_utc(value) -> datetime | None:
     timestamp-parse implementation both callers use.
     """
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        # ``fromisoformat`` accepts the ``Z`` suffix natively on the
+        # project's 3.11 target, so no ``+00:00`` rewrite is needed.
+        parsed = datetime.fromisoformat(str(value))
     except (ValueError, TypeError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -5429,7 +5431,7 @@ _CODE_QUALITY_SCOPE_EMPTY_REASON = (
     "no in-scope files could be resolved (the git changed-file list is empty "
     "and no committed touched files or Key Files resolved to existing paths) "
     "— the whole-repository scan is deliberately not run "
-    "(SA-0MUI5ZYO6002W3KD)"
+    "(SA-0MUI5ZYO6002W3KD, SA-0MVPDTSRV0049KW2)"
 )
 """Documented skip reason for an empty code-quality scope.
 
@@ -5438,6 +5440,93 @@ lint: on the normal post-merge state (the item's work is already committed
 and the checkout is clean) that would report unrelated pre-existing findings
 against this item (SA-0MUI5ZYO6002W3KD).
 """
+
+
+def _filter_code_quality_scope(
+    paths: Sequence[str],
+    project_root: Path | None = None,
+) -> list[str]:
+    """Drop code-quality scan paths that leave the audited project.
+
+    The code-quality lint must only ever touch files this project owns
+    (SA-0MVPDTSRV0049KW2): a work item's ``Key Files``, a commit that touches
+    a git submodule, or a comment-recorded hash can otherwise drag submodule
+    files or another repository's files into the scan. ``create_quality_epics``
+    then files *critical* work items against that foreign code, blocking the
+    owning project's next release at the ship skill's critical-items gate.
+
+    Two bounds are applied, each path is resolved first (``Path.resolve()``,
+    so symlinks and ``..`` segments cannot smuggle a path outside the root):
+
+    1. **Containment** — the resolved path must lie inside *project_root*;
+    2. **Nested repositories** — no ancestor between the file and the project
+       root may carry a ``.git`` entry (file or directory), which is how git
+       marks submodules and nested checkouts.
+
+    A path that fails resolution (unresolvable symlink, NUL byte, …) is
+    dropped rather than raising, so a pathological entry can never abort the
+    audit. In-scope paths are returned **unchanged and in order**, never
+    rewritten, re-ordered or widened. When nothing survives, the empty result
+    means "lint nothing" — callers must skip the scan with
+    ``_CODE_QUALITY_SCOPE_EMPTY_REASON`` (never a whole-repository fallback).
+
+    *project_root* defaults to the cwd-derived ``TARGET_PROJECT_ROOT``,
+    matching ``_filter_existing_paths`` so the filter cannot silently widen
+    to an unrelated root.
+    """
+    root = (
+        Path(project_root).resolve() if project_root is not None
+        else Path(TARGET_PROJECT_ROOT).resolve()
+    )
+    kept: list[str] = []
+    dropped = 0
+    for path in paths:
+        try:
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError, ValueError):
+            # Unresolvable entry (dangling link, NUL byte, loop): never
+            # abort the audit on a pathological path — drop it instead.
+            dropped += 1
+            continue
+        if resolved == root or root not in resolved.parents:
+            # Outside the audited project (a sibling repository, an absolute
+            # Key File, or a ``..`` escape that resolved out of bounds).
+            dropped += 1
+            continue
+        if _inside_nested_git_repo(resolved, root):
+            dropped += 1
+            continue
+        kept.append(path)
+    if dropped:
+        print(
+            f"Warning: dropped {dropped} path(s) from the code-quality scope "
+            f"(outside project root or inside a nested git repository) — "
+            f"linting {len(kept)} in-scope file(s) only (SA-0MVPDTSRV0049KW2).",
+            file=sys.stderr,
+        )
+    return kept[:_FILE_SCOPE_MAX_FILES]
+
+
+def _inside_nested_git_repo(resolved: Path, root: Path) -> bool:
+    """True when a ``.git`` marker sits between *resolved* and *root*.
+
+    Walks the ancestors of *resolved* up to (but excluding) *root* and
+    returns True as soon as an ancestor carries a ``.git`` entry — either a
+    directory (a nested checkout) or a file (a git submodule's gitlink). The
+    root itself is never examined, so a normal clone's top-level ``.git``
+    does not mark every file nested.
+    """
+    for parent in resolved.parents:
+        if parent == root:
+            return False
+        if root not in parent.parents:
+            return False
+        if (parent / ".git").exists():
+            return True
+    return False
 
 
 def _resolve_code_quality_scope(
@@ -5471,11 +5560,15 @@ def _resolve_code_quality_scope(
     """
     changed = _git_changed_files(runner)
     if changed:
-        return changed
+        # Both scope sources are bounded to the audited project: a changed
+        # path can itself be a submodule path or escape the root via ``..``
+        # (SA-0MVPDTSRV0049KW2 AC3).
+        return _filter_code_quality_scope(changed, project_root)
     touched = _resolve_touched_files(
         runner, issue_id, work_item=work_item, comments=comments,
     ) or []
-    return _filter_existing_paths(touched, project_root)
+    existing = _filter_existing_paths(touched, project_root)
+    return _filter_code_quality_scope(existing, project_root)
 
 
 def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
@@ -13637,7 +13730,7 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         try:
             _cascade_descendants_terminal(
                 ctx.issue_id,
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
                 runner=ctx.runner,
                 worklog_dir=ctx.worklog_dir,
                 persist=ctx.persist,
