@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MVPTU9HG00146UV
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `gs` is never used
+# -->
 """Unit tests for ``run_tests.guarded_run_all`` — guard-ownership contract.
 
 Covers SA-0MV0EERBB007QA4V (child of SA-0MUH1MJL6003767Q): the canonical
