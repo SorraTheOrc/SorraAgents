@@ -1,10 +1,10 @@
+#!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MVPTU74Y005WAY0
 # smell: formatting
 # severity: low
 # description: Shebang is present but file is not executable
 # -->
-#!/usr/bin/env python3
 """Run the full project test suite in quiet mode and report every failure.
 
 Suites are resolved per-repo through ``full_suite_commands`` (the single
