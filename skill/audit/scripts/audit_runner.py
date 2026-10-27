@@ -7471,33 +7471,32 @@ def _phase1_review_children_batched(
             batch = parsed if isinstance(parsed, list) else None
         except (json.JSONDecodeError, TypeError):
             batch = None
-    if not batch:
-        # AC4 safe fallback: a retry with the full model only when a distinct
-        # fast model was used. A capped batch (budget / concurrency wait) is
-        # never retried — it is quarantined as 'partial' so the run does not
-        # spend a second full-length call after the budget is already gone
-        # (SA-0MVJ3Q662006RDJR AC2/AC3).
-        if phase1_model != full_model and not _screen_call_capped(result):
-            print(
-                "Warning: fast Phase 1 model produced unparseable output — "
-                "retrying batched child review with the full audit model",
-                file=sys.stderr,
+    # AC4 safe fallback: a retry with the full model only when a distinct
+    # fast model was used. A capped batch (budget / concurrency wait) is
+    # never retried — it is quarantined as 'partial' so the run does not
+    # spend a second full-length call after the budget is already gone
+    # (SA-0MVJ3Q662006RDJR AC2/AC3).
+    if not batch and phase1_model != full_model and not _screen_call_capped(result):
+        print(
+            "Warning: fast Phase 1 model produced unparseable output — "
+            "retrying batched child review with the full audit model",
+            file=sys.stderr,
+        )
+        try:
+            result = _call_pi_and_maybe_log(
+                "", "phase1_batch", prompt,
+                model=full_model, pi_bin=pi_bin, debug_log=debug_log,
+                timeout=timeout, ac_fallback_used=ac_fallback_used,
+                json_expected=True,
             )
-            try:
-                result = _call_pi_and_maybe_log(
-                    "", "phase1_batch", prompt,
-                    model=full_model, pi_bin=pi_bin, debug_log=debug_log,
-                    timeout=timeout, ac_fallback_used=ac_fallback_used,
-                    json_expected=True,
-                )
-                raw_text = (
-                    result.get("extracted_text", "")
-                    or result.get("evidence", "")
-                    or result.get("text", "")
-                )
-                batch = _extract_json_array(raw_text)
-            except RuntimeError:
-                batch = None
+            raw_text = (
+                result.get("extracted_text", "")
+                or result.get("evidence", "")
+                or result.get("text", "")
+            )
+            batch = _extract_json_array(raw_text)
+        except RuntimeError:
+            batch = None
     # A capped child screen is quarantined, not silently treated as a model
     # judgement (SA-0MVI3608M0080QLW): the result keeps the conservative
     # `partial` verdict but its evidence names the budget and phase, and the
