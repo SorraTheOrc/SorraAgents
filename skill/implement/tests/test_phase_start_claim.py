@@ -41,7 +41,7 @@ def _clean_stash_result() -> dict:
 
 
 @contextlib.contextmanager
-def _mocked_phase_start(*, update_status, git_dirty: bool = False):
+def _mocked_phase_start(*, update_status, git_dirty: bool = False, worktree_add: bool = True):
     """Patch every external boundary of ``phase_start``.
 
     Args:
@@ -49,6 +49,8 @@ def _mocked_phase_start(*, update_status, git_dirty: bool = False):
             ``StatusLifecycle`` class so claim/update calls can be observed.
         git_dirty: When True, the safety gate sees a dirty tree and aborts
             before worktree creation.
+        worktree_add: When False, ``git_worktree_add`` fails so the phase
+            aborts with a clean-up reset.
     """
     status = "## dev\n M dirty.py\n" if git_dirty else "## dev\n"
     worktree_path = str(Path("/tmp/wt").resolve())
@@ -98,7 +100,7 @@ def _mocked_phase_start(*, update_status, git_dirty: bool = False):
             )
         )
         stack.enter_context(patch.object(implement, "_is_worktree", return_value=False))
-        stack.enter_context(patch.object(implement, "git_worktree_add", return_value=True))
+        stack.enter_context(patch.object(implement, "git_worktree_add", return_value=worktree_add))
         stack.enter_context(
             patch.object(implement, "_ensure_node_modules_symlink", return_value=True)
         )
@@ -165,7 +167,33 @@ def test_claim_happens_before_dirty_gate_without_stage(caplog):
     assert calls[0].args == ("SA-TEST", "in_progress")
     assert "stage" not in calls[0].kwargs
     assert calls[1].args == ("SA-TEST", "open")
+    # The dirty-gate reset releases the assignee hold too.
+    assert calls[1].kwargs.get("assignee") == ""
     assert "Failed to update stage" not in caplog.text
+
+
+def test_worktree_failure_reset_releases_assignee(caplog):
+    """A worktree-creation failure resets to open AND clears the assignee.
+
+    The claim (with its assignee hold) happens before the worktree is
+    created; when creation fails the phase must release the item to ``open``
+    and clear the assignee so it is never left on a scheduling hold.
+    """
+    lifecycle = MagicMock()
+    with (
+        caplog.at_level(logging.DEBUG, logger=LOG_NAME),
+        _mocked_phase_start(update_status=lifecycle, worktree_add=False),
+    ):
+        report = implement.phase_start("SA-TEST", json_output=True)
+
+    assert report["success"] is False
+    assert "Failed to create worktree" in report["message"]
+
+    calls = lifecycle.update_status.call_args_list
+    assert calls[0].args == ("SA-TEST", "in_progress")
+    # The failure reset releases the assignee hold.
+    assert calls[-1].args == ("SA-TEST", "open")
+    assert calls[-1].kwargs.get("assignee") == ""
 
 
 def test_claim_failure_is_reported_and_logged_at_error(caplog):

@@ -627,7 +627,7 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
     wi = data.get("workItem", {})
     current = wi.get("status", "")
     if current in ("in-progress", "in_progress"):
-        StatusLifecycle.update_status(work_item_id, "open")
+        StatusLifecycle.update_status(work_item_id, "open", assignee="")
         LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
     else:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
@@ -4359,7 +4359,7 @@ def phase_start(
         report["message"] = msg
         report["extension_error"] = True
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4412,7 +4412,7 @@ def phase_start(
         report["success"] = False
         report["message"] = msg
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4487,7 +4487,7 @@ def phase_start(
         report["dirty_worktree"] = True
         wl_add_comment(work_item_id, f"Start phase aborted: dirty working tree detected.\n```\n{status_output}\n```")
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4583,7 +4583,7 @@ def phase_start(
             report["success"] = False
             report["message"] = msg
             try:
-                StatusLifecycle.update_status(work_item_id, "open")
+                StatusLifecycle.update_status(work_item_id, "open", assignee="")
             except RuntimeError:
                 LOG.error("Failed to reset work item %s status to open", work_item_id)
             if json_output:
@@ -4862,7 +4862,7 @@ def phase_finish(
             f"worktree.\n```\n{msg}\n```",
         )
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4950,7 +4950,7 @@ def phase_finish(
             f"Build failed during finish phase.\n```\n{build_result['stderr'][:500]}\n```",
         )
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -5023,7 +5023,7 @@ def phase_finish(
             report["message"] = msg
             wl_add_comment(work_item_id, msg)
             try:
-                StatusLifecycle.update_status(work_item_id, "open")
+                StatusLifecycle.update_status(work_item_id, "open", assignee="")
             except RuntimeError:
                 LOG.error("Failed to reset work item %s status to open", work_item_id)
             if json_output:
@@ -5061,7 +5061,7 @@ def phase_finish(
         report["message"] = msg
         wl_add_comment(work_item_id, msg)
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -5122,7 +5122,9 @@ def phase_finish(
         return report
 
     try:
-        with StatusLifecycle(work_item_id, target_stage="in_review"):
+        with StatusLifecycle(
+            work_item_id, target_stage="in_review", clear_assignee_on_exit=True
+        ):
             # ── Step 4: Commit ─────────────────────────────────────────────
             commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"
             LOG.info("Committing changes...")
@@ -5335,7 +5337,7 @@ def phase_finish(
         report["message"] = msg
         # Status was restored to original by StatusLifecycle; override to open
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if "git push to dev failed" in msg or "git push to dev timed out" in msg:
@@ -5434,7 +5436,7 @@ def phase_abort(
     # ── Step 1: Reset status ───────────────────────────────────────
     LOG.info("Resetting work item %s status to open...", work_item_id)
     try:
-        StatusLifecycle.update_status(work_item_id, "open")
+        StatusLifecycle.update_status(work_item_id, "open", assignee="")
     except RuntimeError:
         LOG.error("Failed to reset work item %s status to open", work_item_id)
 
@@ -5950,7 +5952,7 @@ def phase_parent(
     if not already_terminal:
         try:
             StatusLifecycle.update_status(
-                work_item_id, "completed", stage="in_review"
+                work_item_id, "completed", stage="in_review", assignee=""
             )
         except RuntimeError:
             msg = f"Failed to advance parent {work_item_id}"
@@ -6546,7 +6548,9 @@ def _finalise_stranded_child(
 
     commit = str(evidence.get("commit", ""))
     try:
-        StatusLifecycle.update_status(child_id, "completed", stage="in_review")
+        StatusLifecycle.update_status(
+            child_id, "completed", stage="in_review", assignee=""
+        )
     except RuntimeError as exc:
         return {
             "finalised": False,

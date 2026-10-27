@@ -263,6 +263,49 @@ class TestStatusLifecycleUnit:
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
         assert "--assignee" in calls[2]
 
+    def test_clear_assignee_on_success_exit(self, mock_run):
+        """clear_assignee_on_exit releases the assignee on the success exit.
+
+        Implement/intake claim with an assignee (a scheduling hold) and must
+        clear it when the run completes successfully; the clear is folded into
+        the terminal ``completed`` update (assignee-hold convention).
+        """
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123", clear_assignee_on_exit=True):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
+        assert "--assignee" in calls[2]
+        assert calls[2][calls[2].index("--assignee") + 1] == ""
+
+    def test_clear_assignee_on_exit_keeps_entry_claim_held(self, mock_run):
+        """The hold is held during the run and only released on exit."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle(
+            "TEST-123", assignee="bot", clear_assignee_on_exit=True
+        ):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        # Entry still sets the assignee, so the claim is held while working...
+        assert "--assignee" in calls[1]
+        assert "bot" in calls[1]
+        # ...and the exit clears it together with the completed transition.
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
+        assert "--assignee" in calls[2]
+        assert calls[2][calls[2].index("--assignee") + 1] == ""
+
     def test_wl_show_failure_then_update_fails(self, mock_run):
         """wl show failure is caught, but in_progress update failure raises."""
         mock_run.side_effect = [
@@ -927,6 +970,23 @@ class TestStatusLifecycleIntegration:
             )
             inside = json.loads(show.stdout)
             assert inside["workItem"]["assignee"] == "integration-test"
+
+    def test_clear_assignee_on_success_exit_real(self, temp_work_item):
+        """Verify the real store clears the assignee with the completion."""
+        item_id = temp_work_item
+
+        with StatusLifecycle(
+            item_id, assignee="integration-test", clear_assignee_on_exit=True
+        ):
+            pass
+
+        show = subprocess.run(
+            ["wl", "show", item_id, "--json"],
+            capture_output=True, text=True, check=True,
+        )
+        after = json.loads(show.stdout)
+        assert after["workItem"]["status"] == "completed"
+        assert after["workItem"]["assignee"] == ""
 
     def test_work_item_not_found(self):
         """Verify RuntimeError for non-existent work item."""

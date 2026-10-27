@@ -533,6 +533,10 @@ class StatusLifecycle:
 
     - **Normal exit:** transitions to ``completed`` (optionally advancing stage)
     - **Exception exit:** restores original status (rollback)
+    - **clear_assignee_on_exit=True:** on the normal (successful) exit the
+      assignee is cleared together with the ``completed`` transition, releasing
+      the scheduling hold (non-empty assignee = hold; clear to release). Only
+      applied when explicitly requested — other callers are unaffected.
     - **restore_on_exit=True:** restores the original status on success too —
       for read-only analysis skills (find-related, refactor, effort-and-risk)
       that must NOT advance the workflow stage. This avoids setting
@@ -546,6 +550,9 @@ class StatusLifecycle:
         assignee: Optional assignee name. Set on entry; cleared on failure exit.
         target_stage: Optional stage value (e.g. ``in_review``) to set
             on successful exit.
+        clear_assignee_on_exit: If True, clear the assignee on the successful
+            exit (together with the ``completed`` transition) so the work item
+            is never left on a scheduling hold after the skill run completes.
         restore_on_exit: If True, restore the original status on successful
             exit instead of advancing to ``completed``.
         runner: Optional injectable command runner for testing.
@@ -579,12 +586,14 @@ class StatusLifecycle:
         assignee: str | None = None,
         target_stage: str | None = None,
         restore_on_exit: bool = False,
+        clear_assignee_on_exit: bool = False,
         runner: Runner | None = None,
     ) -> None:
         self._work_item_id = work_item_id
         self._assignee = assignee
         self._target_stage = target_stage
         self._restore_on_exit = restore_on_exit
+        self._clear_assignee_on_exit = clear_assignee_on_exit
         self._runner = runner or _default_runner
         self._original_status: str = "open"  # safe default
         self._did_set_in_progress: bool = False
@@ -842,6 +851,11 @@ class StatusLifecycle:
             kwargs: dict = {"status": "completed", "runner": self._runner}
             if self._target_stage is not None:
                 kwargs["stage"] = self._target_stage
+            if self._clear_assignee_on_exit:
+                # Release the assignee hold together with the completed
+                # transition (implement/intake clear-on-completion convention:
+                # non-empty assignee = scheduling hold; clear to release).
+                kwargs["assignee"] = ""
             self.update_status(self._work_item_id, **kwargs)
             LOG.info(
                 "Set status=completed for %s (stage=%s)",

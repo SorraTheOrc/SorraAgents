@@ -17,6 +17,11 @@ Exit codes:
     1 — error during execution
 
 All commands produce JSON output for agent consumption.
+
+Assignee release: ``start`` sets the assignee (a claim/hold marker); every
+terminal command (``finish``, ``auto-complete``, ``abort``) and every
+failure reset clears it, so a completed or released item is never left on
+a scheduling hold (non-empty assignee = hold; clear to release).
 """
 
 from __future__ import annotations
@@ -73,7 +78,10 @@ def cmd_start(item_id: str, assignee: str | None = None) -> dict:
 def cmd_finish(item_id: str, description_file: str | None = None) -> dict:
     """Complete the intake process: set status to open, stage to intake_complete.
 
-    Optionally applies a description file before the status update.
+    Optionally applies a description file before the status update. The
+    terminal transition also clears the assignee (assignee-hold convention:
+    non-empty assignee = scheduling hold; clear to release) so a finished
+    item is never left held.
 
     Args:
         item_id: The work item ID.
@@ -88,14 +96,17 @@ def cmd_finish(item_id: str, description_file: str | None = None) -> dict:
             _run_wl_update_description(item_id, description_file)
         except RuntimeError:
             # The item was claimed (in_progress) by `start`; reset to open so
-            # it is never left stuck in in_progress on failure.
+            # it is never left stuck in in_progress on failure, and release
+            # the assignee hold.
             try:
-                StatusLifecycle.update_status(item_id, "open")
+                StatusLifecycle.update_status(item_id, "open", assignee="")
             except RuntimeError:
                 LOG.error("Failed to reset work item %s status to open", item_id)
             raise
 
-    StatusLifecycle.update_status(item_id, "open", stage="intake_complete")
+    StatusLifecycle.update_status(
+        item_id, "open", stage="intake_complete", assignee=""
+    )
     LOG.info("Intake finished for %s", item_id)
     return {"success": True, "action": "finished", "item_id": item_id}
 
@@ -103,7 +114,9 @@ def cmd_finish(item_id: str, description_file: str | None = None) -> dict:
 def cmd_auto_complete(item_id: str) -> dict:
     """Auto-complete a well-defined work item without a full intake interview.
 
-    Transitions: in_progress → open with stage=intake_complete.
+    Transitions: in_progress → open with stage=intake_complete. The terminal
+    transition clears the assignee so the item is released for the next
+    lifecycle step (assignee-hold convention).
 
     Args:
         item_id: The work item ID.
@@ -113,11 +126,14 @@ def cmd_auto_complete(item_id: str) -> dict:
     """
     StatusLifecycle.update_status(item_id, "in_progress")
     try:
-        StatusLifecycle.update_status(item_id, "open", stage="intake_complete")
+        StatusLifecycle.update_status(
+            item_id, "open", stage="intake_complete", assignee=""
+        )
     except RuntimeError:
-        # Reset back to open so the item is never left stuck in in_progress.
+        # Reset back to open so the item is never left stuck in in_progress
+        # (and release the assignee hold).
         try:
-            StatusLifecycle.update_status(item_id, "open")
+            StatusLifecycle.update_status(item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", item_id)
         raise
@@ -128,13 +144,16 @@ def cmd_auto_complete(item_id: str) -> dict:
 def cmd_abort(item_id: str) -> dict:
     """Reset work item status to open on abort/interrupt.
 
+    Also clears the assignee so an aborted item is never left on a
+    scheduling hold.
+
     Args:
         item_id: The work item ID.
 
     Returns:
         A dict with action and item_id keys.
     """
-    StatusLifecycle.update_status(item_id, "open")
+    StatusLifecycle.update_status(item_id, "open", assignee="")
     _mark_pane_aborted()
     LOG.info("Intake aborted for %s", item_id)
     return {"success": True, "action": "aborted", "item_id": item_id}

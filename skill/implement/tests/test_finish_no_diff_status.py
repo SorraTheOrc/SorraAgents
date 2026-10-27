@@ -232,3 +232,33 @@ def test_finish_fails_loudly_when_terminal_status_missing_from_store(tmp_path):
     assert "does not hold the terminal transition" in report["message"]
     # The item is released to open (StatusLifecycle's reset), not left claimed.
     assert _reset_update(mocks["update_status"]) == ("OSL-TEST", "open")
+    # The reset also releases the assignee hold.
+    resets = [
+        c for c in mocks["update_status"].call_args_list
+        if len(c.args) >= 2 and c.args[1] == "open"
+    ]
+    assert resets and resets[-1].kwargs.get("assignee") == ""
+
+
+def test_finish_success_clears_assignee(tmp_path):
+    """finish releases the assignee hold with the terminal completion.
+
+    A non-empty assignee is a scheduling hold; a successful implement run
+    must clear it together with the ``completed``/``in_review`` transition so
+    the reviewed item is never left held (assignee-hold convention).
+    """
+    lifecycle = MagicMock()
+    with _mocked_phase_finish(
+        update_status=lifecycle, tmp_path=tmp_path
+    ) as mocks:
+        report = implement.phase_finish("OSL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+
+    terminal_calls = [
+        c for c in mocks["update_status"].call_args_list
+        if c.kwargs.get("status") == "completed"
+        and c.kwargs.get("stage") == "in_review"
+    ]
+    assert terminal_calls, "finish must issue the terminal transition"
+    assert terminal_calls[-1].kwargs.get("assignee") == ""

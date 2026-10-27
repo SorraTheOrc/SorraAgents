@@ -54,11 +54,25 @@ logs or comments.
 Status transitions are managed by the shared `StatusLifecycle` context manager
 from `../shared/status_lifecycle.py`. The orchestration script (`implement.py`)
 uses it automatically: `phase_start()` claims (`in_progress`); `phase_finish()`
-wraps build/test/commit/push in `with StatusLifecycle(..., target_stage="in_review"):`
+wraps build/test/commit/push in `with StatusLifecycle(..., target_stage="in_review")`
 (success → `completed`/`in_review`; error → original status restored);
 `phase_abort()` resets to `open` (also `implement.py abort <WIP-id>`). Manual
 use: `StatusLifecycle.update_status()` or the context-manager pattern in
 `../shared/status_lifecycle.py`.
+
+**Assignee release on every terminal outcome.** Each implement run releases
+the assignee when it ends, regardless of how it ends (assignee-hold
+convention: non-empty assignee = scheduling hold; clear to release):
+
+- successful `finish` clears the assignee together with the
+  `completed`/`in_review` transition (`clear_assignee_on_exit=True`)
+- every failure/abort reset to `open` (`phase_start`, `phase_finish`,
+  `phase_abort`, the signal/KeyboardInterrupt safety reset) also passes
+  `assignee=""`
+- epic/parent completion and the stranded-child `drive --finalise` path
+  clear the assignee on the `completed`/`in_review` advance
+
+A finished or released item is therefore never left on a scheduling hold.
 
 **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No
 `wl` mutation (description/comment/child creation) while `status: open`. Guard
@@ -865,11 +879,11 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 | Phase | Mechanism | Status | Stage |
 |-------|-----------|--------|-------|
 | Claim (Step 1) | `update_status(id, "in_progress", assignee="<AGENT>")` / `phase_start()` (status-only; stage unchanged) | in_progress | unchanged |
-| Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review")` | completed | in_review |
-| Final (Step 9) | `with StatusLifecycle(id, target_stage="in_review"):` / `phase_finish()` | completed | in_review |
-| Abort (dirty/gate/user/error/termination) | `update_status(id, "open")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
+| Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review", assignee="")` | completed | in_review |
+| Final (Step 9) | `with StatusLifecycle(id, target_stage="in_review", clear_assignee_on_exit=True):` / `phase_finish()` | completed | in_review |
+| Abort (dirty/gate/user/error/termination) | `update_status(id, "open", assignee="")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
 
-> **All abort/failure transitions reset to `open`.** Never leave a work item in `in_progress` unless actively implementing.
+> **All abort/failure transitions reset to `open` and clear the assignee.** Never leave a work item in `in_progress` unless actively implementing; never leave a completed or released item on an assignee hold.
 
 ## Scripts (canonical runner & modules)
 

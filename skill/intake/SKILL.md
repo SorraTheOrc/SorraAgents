@@ -65,6 +65,12 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 - **Finish**: `python3 $(skill_path intake)/scripts/intake.py finish <work-item-id> [--description-file <path>]`.
 - **Abort** (release on failure): `python3 $(skill_path intake)/scripts/intake.py abort <work-item-id>`.
 
+**Assignee release on completion.** Intake claims with the
+`--assignee "<AGENT>"` hold; every terminal outcome — `finish`,
+`auto-complete`, `abort`, or a failure reset — clears the assignee
+(`assignee=""`), so a finished or released item is never left on a
+scheduling hold (non-empty assignee = hold; clear to release).
+
 **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No `wl` mutation (description/comment/child creation) while `status: open`. Guard with `StatusLifecycle.require_claimed(<id>)` before any mutation; on in-session resume after producer approval, re-claim first via `StatusLifecycle.ensure_claimed(<id>)` (idempotent). Release to `open` only at true handoff (open-ended wait with no in-session resume), completion, or error/abort.
 
 ## Worklog resolution
@@ -247,7 +253,8 @@ If the intake process fails or is interrupted before completion:
 python3 $(skill_path intake)/scripts/intake.py abort <work-item-id>
 ```
 
-This resets `status=open`, releasing the item for other agents.
+This resets `status=open` **and clears the assignee**, releasing the item
+for other agents.
 
 ## Traceability & idempotence
 
