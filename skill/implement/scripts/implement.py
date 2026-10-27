@@ -57,6 +57,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import os
@@ -64,11 +65,17 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1696,6 +1703,124 @@ def _verify_main_checkout(
     guard["verifies"].append(entry)
     guard["verdict"] = entry["verdict"]
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Per-checkout finish lock (WL-0MVPADZ1Z000FOSG AC5)
+# ---------------------------------------------------------------------------
+
+#: Lock-file path relative to the main checkout root. One exclusive advisory
+#: ``flock`` holder per repository — two finishes on the same main checkout
+#: can never overlap (2026-10-26 incident: two concurrent finishes plus a
+#: full-scope test run on one shared checkout).
+MAIN_CHECKOUT_LOCK_RELPATH = os.path.join(".worklog", "locks", "main-checkout.lock")
+
+
+def _main_checkout_lock_path(repo_root: str) -> Path:
+    """Absolute path of the main-checkout finish lock file."""
+    return Path(repo_root) / MAIN_CHECKOUT_LOCK_RELPATH
+
+
+def _main_checkout_lock_holder(repo_root: str) -> dict[str, Any] | None:
+    """Read the holder metadata from the lock file (best-effort)."""
+    lock_path = _main_checkout_lock_path(repo_root)
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _describe_lock_holder(holder: dict[str, Any] | None) -> str:
+    """Human-readable holder description for refusal messages.
+
+    Carries every metadata field available in the lock file (work item id,
+    PID, ISO start time, repo root, host) so the refusal names the concurrent
+    actor; degrades to a generic "unknown" when no metadata was written.
+    """
+    if not holder:
+        return "unknown (lock file present but no holder metadata)"
+    parts: list[str] = []
+    wid = holder.get("work_item_id")
+    parts.append(f"work item {wid}" if wid else "unknown work item")
+    if holder.get("pid"):
+        parts.append(f"pid {holder['pid']}")
+    if holder.get("started_at"):
+        parts.append(f"started {holder['started_at']}")
+    if holder.get("repo_root"):
+        parts.append(f"repo {holder['repo_root']}")
+    if holder.get("host"):
+        parts.append(f"host {holder['host']}")
+    return ", ".join(parts)
+
+
+def _release_main_checkout_lock(fd: int | None) -> None:
+    """Release the held main-checkout lock. Idempotent (None/no-op)."""
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def acquire_main_checkout_lock(
+    repo_root: str,
+    work_item_id: str,
+) -> tuple[int | None, str | None]:
+    """Take the exclusive per-checkout finish lock (non-blocking).
+
+    The lock is an advisory ``flock`` on
+    ``<main-checkout>/.worklog/locks/main-checkout.lock``, so it is released
+    by the kernel when the holder dies (SIGKILL included) — no stale-lock
+    bookkeeping exists to trust (WL-0MVPADZ1Z000FOSG AC4/AC5). Holder metadata
+    (work item id, PID, ISO start time, repo root, host) is written into the
+    lock file after acquisition for the refusal message only; a metadata write
+    failure never fails the acquisition.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        work_item_id: The work item this finish run belongs to.
+
+    Returns:
+        ``(fd, None)`` on success (caller must release via
+        :func:`_release_main_checkout_lock`), or ``(None, description)`` with a
+        human-readable holder description when the lock is already held.
+    """
+    lock_path = _main_checkout_lock_path(repo_root)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"cannot create lock directory {lock_path.parent}: {exc}"
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        return None, f"cannot open lock file {lock_path}: {exc}"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, AttributeError) as exc:
+        os.close(fd)
+        if isinstance(exc, OSError) and exc.errno in (errno.EACCES, errno.EAGAIN):
+            return None, _describe_lock_holder(_main_checkout_lock_holder(repo_root))
+        return None, f"flock failed on {lock_path}: {exc}"
+    holder = {
+        "work_item_id": work_item_id,
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "repo_root": repo_root,
+        "host": socket.gethostname(),
+    }
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, json.dumps(holder, indent=2).encode("utf-8"))
+    except OSError:  # holder metadata is best-effort; the flock is the lock
+        pass
+    return fd, None
 
 
 def git_worktree_add(
@@ -4962,6 +5087,40 @@ def phase_finish(
     # gate.
     LOG.info("Changed-scope validation passed — full suite deferred to the dev-push gate")
 
+    # ── Step 3c: Single-owner main-checkout lock (WL-0MVPADZ1Z000FOSG AC5) ─
+    # Everything from the commit onwards operates on the main checkout, so
+    # exactly one finish per checkout may hold this critical section at a
+    # time. The lock is a non-blocking advisory flock — no measurable latency
+    # when free, kernel-released when the holder dies, and recorded in the
+    # report for observability.
+    lock_fd, lock_holder_description = acquire_main_checkout_lock(
+        repo_root, work_item_id
+    )
+    report["steps"]["main_checkout_lock"] = {
+        "lock_path": str(_main_checkout_lock_path(repo_root)),
+        "acquired": lock_fd is not None,
+        "acquired_at": (
+            datetime.now(timezone.utc).isoformat() if lock_fd is not None else None
+        ),
+        "holder": lock_holder_description,
+    }
+    if lock_fd is None:
+        msg = (
+            f"Another finish holds the main-checkout lock "
+            f"({report['steps']['main_checkout_lock']['lock_path']}). "
+            f"Holder: {lock_holder_description}. Aborting without modifying "
+            f"the checkout or the work item — two finishes on the same main "
+            f"checkout must never overlap. Re-run finish once the holder "
+            f"completes."
+        )
+        report["success"] = False
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            LOG.error(msg)
+        return report
+
     try:
         with StatusLifecycle(work_item_id, target_stage="in_review"):
             # ── Step 4: Commit ─────────────────────────────────────────────
@@ -5196,6 +5355,11 @@ def phase_finish(
         else:
             LOG.error(msg)
         return report
+    finally:
+        # Released on EVERY exit path from the critical section (success,
+        # RuntimeError, or an escaping exception): the kernel also releases
+        # the flock if this process dies.
+        _release_main_checkout_lock(lock_fd)
 
     # ── Step 9: Add completion comment ─────────────────────────────
     wl_add_comment(

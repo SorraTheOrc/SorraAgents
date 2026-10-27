@@ -271,6 +271,115 @@ check_orphaned_worktrees() {
     fi
 }
 
+# ── Check 4: Main-checkout finish lock (WL-0MVPADZ1Z000FOSG AC5) ────────
+
+check_main_checkout_lock() {
+    local lock_file="${REPO_ROOT}/.worklog/locks/main-checkout.lock"
+    if [[ ! -f "$lock_file" ]]; then
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"check":"main_checkout_lock","status":"ok"}'
+        else
+            echo "✓ No finish holds the main-checkout lock."
+        fi
+        return 0
+    fi
+
+    # Probe: a non-blocking flock on a fresh fd succeeds only when nobody
+    # holds the lock. The subshell's fd closes on exit, releasing the probe.
+    if ( exec 9<>"$lock_file" && flock -n 9 ) 2>/dev/null; then
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"check":"main_checkout_lock","status":"ok"}'
+        else
+            echo "✓ Main-checkout lock file exists but is free."
+        fi
+        return 0
+    fi
+
+    local holder="unknown (lock file present but no holder metadata)"
+    holder="$(python3 - "$lock_file" <<'PY' 2>/dev/null || echo "$holder"
+import json, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, encoding='utf-8'))
+except Exception:
+    print('unknown (lock file present but no holder metadata)')
+    raise SystemExit(0)
+parts = []
+wid = data.get('work_item_id')
+parts.append(f'work item {wid}' if wid else 'unknown work item')
+if data.get('pid'):
+    parts.append(f"pid {data['pid']}")
+if data.get('started_at'):
+    parts.append(f"started {data['started_at']}")
+if data.get('repo_root'):
+    parts.append(f"repo {data['repo_root']}")
+if data.get('host'):
+    parts.append(f"host {data['host']}")
+print(', '.join(parts))
+PY
+)"
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        echo "{\"check\":\"main_checkout_lock\",\"status\":\"warning\",\"lock_path\":\"$lock_file\",\"holder\":\"$(echo "$holder" | sed 's/["\\]/\\&/g')\"}"
+    else
+        echo "⚠ Main-checkout lock is HELD: $holder"
+        echo "  Lock file: $lock_file"
+        echo "  Only one implement.py finish may operate on a shared main checkout."
+    fi
+    return 1
+}
+
+# ── Check 5: Tracked-file deletions in the main checkout (AC6) ────────────
+
+check_tracked_deletions() {
+    local status_output
+    status_output="$(git status --porcelain=v1 2>/dev/null || echo "")"
+
+    local deletions=()
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == "##"* ]] && continue
+        local code="${line:0:2}"
+        local file_path="${line:3}"
+        file_path="$(echo "$file_path" | sed 's/^ *//') "
+        file_path="$(echo "$file_path" | sed 's/ -> .*//' | sed 's/ *$//')"
+        [[ -z "$file_path" || "$file_path" == .worklog/* ]] && continue
+        if [[ "$code" == *D* ]]; then
+            deletions+=("$file_path")
+        fi
+    done <<< "$status_output"
+
+    if [[ ${#deletions[@]} -gt 0 ]]; then
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            local deletions_json="["
+            local first=true
+            for f in "${deletions[@]}"; do
+                if [[ "$first" == "true" ]]; then
+                    first=false
+                else
+                    deletions_json+=","
+                fi
+                deletions_json+="\"$(echo "$f" | sed 's/"/\\"/g')\""
+            done
+            deletions_json+="]"
+            echo "{\"check\":\"tracked_deletions\",\"status\":\"warning\",\"deletions\":${deletions_json}}"
+        else
+            echo "⚠ Tracked-file deletions in the main checkout (${#deletions[@]}):"
+            for f in "${deletions[@]}"; do
+                echo "  - $f"
+            done
+            echo "  Recovery: git checkout -- <path> (or git restore <path>) in the main checkout."
+        fi
+        return 1
+    else
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"check":"tracked_deletions","status":"ok"}'
+        else
+            echo "✓ No tracked-file deletions in the main checkout."
+        fi
+        return 0
+    fi
+}
+
 # ── Main ──────────────────────────────────────────────────────────
 
 cd "$REPO_ROOT"
@@ -286,6 +395,8 @@ overall_exit=0
 check_orphaned_stashes || overall_exit=1
 check_dirty_checkout || overall_exit=1
 check_orphaned_worktrees || overall_exit=1
+check_main_checkout_lock || overall_exit=1
+check_tracked_deletions || overall_exit=1
 
 if [[ "$overall_exit" -ne 0 ]]; then
     if [[ "$JSON_OUTPUT" == "true" ]]; then

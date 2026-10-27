@@ -563,3 +563,38 @@ verdicts per stage, own-churn list, final verdict). Regression pins:
 `skill/implement/tests/test_finish_main_checkout_guard.py` and the existing
 `skill/implement/tests/test_finish_no_diff_status.py` (must stay green — a
 clean finish is unaffected).
+
+## Single-owner main-checkout lock (WL-0MVPADZ1Z000FOSG AC5)
+
+`implement.py finish` serialises its main-checkout critical section (commit →
+fast-forward → push → worktree removal) with a **per-checkout exclusive
+advisory lock**: `<main-checkout>/.worklog/locks/main-checkout.lock`
+(`acquire_main_checkout_lock`). Concurrency contract:
+
+- **One finish per main checkout.** Acquisition is a single non-blocking
+  `flock(LOCK_EX | LOCK_NB)` — no measurable latency when free, and no wait
+  when held: a second finish exits **non-zero** with a message naming the
+  holder (work item id, PID, ISO start time, repo root, host — recorded in the
+  lock file after acquisition) and **without modifying the checkout or the
+  work item** (no status write, no comment). Re-run once the holder
+  completes.
+- **No stale locks are possible.** The lock is the kernel's flock on the lock
+  file's open file description, so a killed holder (SIGKILL included) releases
+  it automatically — there is no PID bookkeeping to trust or clean up. The
+  lock is also released on every in-process exit path (success, `RuntimeError`
+  abort, escaping exception) via the `try/finally` around the critical
+  section.
+- **Per-checkout scope.** Finishes in different repositories on the same host
+  are unaffected (the lock file lives inside each checkout).
+- **Observability.** `report["steps"]["main_checkout_lock"]` records the lock
+  path, whether it was acquired, when, and the holder description when refused.
+- **Hygiene reporting.** `scripts/hygiene_check.sh` reports a held lock
+  (`check_main_checkout_lock`) and any **tracked-file deletions** in the main
+  checkout (`check_tracked_deletions`) in both human and `--json` output,
+  reusing its existing git-status dirty-checkout detection.
+
+The flock pattern mirrors `skill/shared/process_semaphore.py` (kernel-released
+locks, holder metadata for messages only). Regression pins:
+`skill/implement/tests/test_finish_main_checkout_lock.py` (contention, holder
+metadata, SIGKILL crash release, cross-checkout independence, `phase_finish`
+refusal/success, hygiene script JSON + human output).
