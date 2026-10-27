@@ -6602,9 +6602,11 @@ def _stranded_children_comment(
             )
         lines += [
             "",
-            "Finalise the item(s) once the pushed work is verified (or re-run "
-            "drive with `--finalise-stranded` to let it finalise evidence-gated "
-            "children automatically):",
+            (
+                "Finalise the item(s) once the pushed work is verified (or re-run "
+                "drive with `--finalise-stranded` to let it finalise evidence-gated "
+                "children automatically):"
+            ),
             "",
         ]
         for item in stranded:
