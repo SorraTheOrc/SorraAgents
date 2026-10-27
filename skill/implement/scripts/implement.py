@@ -6588,9 +6588,11 @@ def _stranded_children_comment(
     lines: list[str] = []
     if stranded:
         lines += [
-            f"Drive detected {len(stranded)} stranded child(ren): a session "
-            f"failed after the work was pushed to `{parent_branch}`, so the "
-            "item is still non-terminal and blocks `wl next`.",
+            (
+                f"Drive detected {len(stranded)} stranded child(ren): a session "
+                f"failed after the work was pushed to `{parent_branch}`, so the "
+                "item is still non-terminal and blocks `wl next`."
+            ),
             "",
         ]
         for item in stranded:
