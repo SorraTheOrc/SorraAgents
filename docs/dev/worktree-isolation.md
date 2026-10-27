@@ -8,9 +8,19 @@ worktree**), and how to prove you are really inside the worktree — because
 
 Related: [implement skill](../../skill/implement/SKILL.md),
 [implement skill reference](implement-skill-reference.md),
+[main-checkout wipe RCA](rca-main-checkout-wipe.md),
 [test isolation](test-isolation.md). Origin: incident in repo
 `tce-main-street` (epic `MS-0MUXW90YE009L4DQ`, child
-`MS-0MUXWGT7G009THBO`) and work item `SA-0MUY9PSRS003V5CM`.
+`MS-0MUXWGT7G009THBO`), the 2026-10-26 ContextHub wipe
+(`WL-0MVPADZ1Z000FOSG`, see
+[the RCA](rca-main-checkout-wipe.md)) and work item `SA-0MUY9PSRS003V5CM`.
+
+> **Normative invariant (WL-0MVPADZ1Z000FOSG).** A worktree-scoped agent run
+> (build, test, finish, refactor) MUST NOT mutate the **main checkout** beyond
+> the narrow allow-list in
+> [The main checkout is a guarded surface](#the-main-checkout-is-a-guarded-surface).
+> Every deviation is either refused before it happens or aborted loudly with
+> the offending paths named — never carried silently into a commit or push.
 
 ## Why worktrees
 
@@ -115,6 +125,100 @@ main-checkout paths and does **not** advance the parent.
 The guard is deliberately precise: a legitimate child whose work is already in
 its worktree, a clean main checkout, or `.worklog/`-only dirt never trigger
 it.
+
+## The main checkout is a guarded surface
+
+A linked worktree shares one object store — and, in agent workflows, one
+symlinked `node_modules` chain
+(`<worktree>/node_modules -> <main>/node_modules`, with
+`node_modules/@worklog/shared -> ../../packages/shared`) — with the **main
+checkout**. Implementation work therefore happens *inside* the worktree, but
+`implement.py finish` necessarily operates on the main checkout: it
+fast-forwards `dev`, pushes from it, and removes the worktree afterwards. On
+a shared host several agents can be finishing at the same time.
+
+The 2026-10-26 incident showed what that costs when nothing watches the main
+checkout: 25 tracked files under `packages/shared/` disappeared from the main
+working tree while an unrelated session ran in it, and `wl` itself stopped
+working ([RCA](rca-main-checkout-wipe.md)).
+
+### Legitimate mutations (allow-list)
+
+Only these main-checkout mutations are legitimate during a worktree-scoped run:
+
+| Mutation | Actor | Why it is legitimate |
+|---|---|---|
+| Fast-forward of the main checkout's `dev` to the finished commit | `implement.py finish` Step 5 | Keeps the push baseline current; its own working-tree churn is attributed to finish (`own_churn`) and never aborts |
+| Writes under `<main-checkout>/.worklog/` | `wl` (comments, status, cache), the finish lock file | Worklog bookkeeping is the store's own surface, never a source change |
+| Project-declared expected-dirty paths | the project (`.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`) | Read-only background state the project explicitly declares |
+| Nothing else | — | Any other tracked-file deletion or modification is foreign |
+
+### Refused or aborted mutations
+
+| Defect class | Enforcement point | Evidence |
+|---|---|---|
+| A test run mutates the guarded checkout, or the main checkout of a worktree-scoped run | outer `guarded_run_all` guard and the inner `live_repo_guard` plugin (both snapshot **every reachable checkout**) | `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`), `skill/test/tests/test_guarded_run_all.py`, `tests/test_live_repo_mutation_guard.py` |
+| A foreign mutation of the main checkout is observed by `finish` (deletion **or** modification) | finish main-checkout guard (`_snapshot_main_checkout` → `_verify_main_checkout` at `pre_push` and `pre_worktree_removal`): aborts loudly, names every offending path, the concurrent-actor evidence and `git checkout -- <path>`; the item stays `open` | `skill/implement/tests/test_finish_main_checkout_guard.py` |
+| Two finishes operate on the same main checkout concurrently | per-checkout exclusive `flock` on `<main-checkout>/.worklog/locks/main-checkout.lock`: the second finish exits non-zero naming the holder, without touching the checkout or the work item | `skill/implement/tests/test_finish_main_checkout_lock.py` |
+| A driven child writes to the main checkout instead of its worktree | placement guard in `phase_parent`/`phase_drive`: fails closed, names the offending paths, does not advance the parent | `skill/implement/tests/test_implement_parent_safety.py` |
+| A periodic/operator check of main-checkout hygiene | `scripts/hygiene_check.sh`: `main_checkout_lock` and `tracked_deletions` checks (human and `--json`) | `tests/test_implement_stash_hygiene.py` |
+| The shared workspace build output is missing, breaking `wl` | `wl` preflight (`src/cli.ts` in ContextHub): one actionable diagnostic and a non-zero exit instead of `ERR_MODULE_NOT_FOUND` | `tests/cli/missing-shared-dist.test.ts` (ContextHub), [dev note](https://github.com/SorraTheOrc/ContextHub/blob/dev/docs/dev/wl-shared-dist-diagnostic.md) |
+
+The finish-side details (report keys `report["steps"]["main_checkout_guard"]`
+and `report["steps"]["main_checkout_lock"]`, the `own_churn` allow-list and the
+per-checkout lock contract) are documented in the
+[implement skill reference](implement-skill-reference.md#finish-main-checkout-guard-wl-0mvpadz1z000fosg-ac3).
+
+### Residual risk
+
+The RCA proved the *silence* mechanism (a worktree-scoped run could mutate the
+main checkout without any guard noticing) and named the surviving mechanism
+class — a worktree-scoped `npm run build` whose postbuild re-anchors onto the
+main checkout (`scripts/install-herdr.sh`) combined with the nested
+`node_modules` symlinks — but **no single command could be reproduced** from
+the surviving evidence. The mitigation is therefore detection-first: the
+guards above refuse or abort the *effect* (a mutated main checkout) whatever
+the trigger was. Residual risk: a mutation performed while no finish/guard is
+running stays undetected until the next hygiene check
+(`scripts/hygiene_check.sh`) or finish run notices it.
+
+## Recovery: the main checkout was mutated
+
+This mirrors exactly what the incident session did, in order:
+
+1. **Inspect before touching anything** — confirm the change is pure:
+
+   ```bash
+   cd /abs/path/to/main-checkout
+   git status --porcelain=v1          # deletions show as " D <path>"
+   git diff --stat                    # verify no local edits you need
+   ```
+
+2. **Restore tracked deletions from HEAD** (never stash or reset — that can
+   strand another agent's work):
+
+   ```bash
+   git checkout -- packages/shared   # or an individual `git checkout -- <path>`
+   ```
+
+3. **Rebuild the gitignored shared build output** (`wl` resolves
+   `@worklog/shared/*` from it):
+
+   ```bash
+   npm run build:shared
+   wl show <any-id> --json           # proves wl resolves again
+   ```
+
+4. **Confirm the checkout is hygienic** (no held finish lock, no tracked
+   deletions, no orphaned stashes):
+
+   ```bash
+   scripts/hygiene_check.sh          # add --json for machine-readable output
+   ```
+
+5. **Re-run the interrupted step** — `implement.py finish <id>` from the
+   worktree, or the original `wl`/plan command. A `finish` that observed the
+   mutation has already aborted and left the work item `open`.
 
 ## Recovery when work landed in the main checkout
 

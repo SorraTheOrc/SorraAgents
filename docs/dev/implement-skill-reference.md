@@ -598,3 +598,22 @@ locks, holder metadata for messages only). Regression pins:
 `skill/implement/tests/test_finish_main_checkout_lock.py` (contention, holder
 metadata, SIGKILL crash release, cross-checkout independence, `phase_finish`
 refusal/success, hygiene script JSON + human output).
+
+### The main-checkout invariant these finish behaviours enforce
+
+The normative statement — which main-checkout mutations are legitimate, which
+are refused, and which code enforces each one — lives in
+[worktree-isolation.md](worktree-isolation.md#the-main-checkout-is-a-guarded-surface),
+together with the RCA and the recovery procedure. The three finish-side report
+keys added for it are:
+
+| Report key | Meaning |
+|---|---|
+| `report["steps"]["main_checkout_guard"]` | Snapshot time, per-stage verify times/verdicts (`pre_push`, `pre_worktree_removal`), the own-fast-forward churn allow-list and the final verdict |
+| `report["steps"]["main_checkout_lock"]` | Lock path, whether it was acquired, when, and the holder description when the finish was refused |
+| `report["steps"]["status_readback"]` | Confirms the terminal `completed`/`in_review` transition actually stuck in the store |
+
+Sibling behaviour outside this repository: the `wl` CLI (ContextHub) prints a
+single actionable diagnostic instead of an `ERR_MODULE_NOT_FOUND` stack trace
+when the shared build output (`packages/shared/dist`) is missing — see the
+[ContextHub dev note](https://github.com/SorraTheOrc/ContextHub/blob/dev/docs/dev/wl-shared-dist-diagnostic.md).

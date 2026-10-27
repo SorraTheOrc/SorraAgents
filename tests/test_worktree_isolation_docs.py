@@ -88,3 +88,77 @@ class TestCrossLinks:
 
     def test_agents_global_links_isolation_doc(self) -> None:
         assert "docs/dev/worktree-isolation.md" in _read(_AGENTS_GLOBAL)
+
+
+class TestMainCheckoutGuardedSurface:
+    """WL-0MVPADZ1Z000FOSG: the main checkout is documented as a guarded surface.
+
+    The normative section is the audit-facing contract for the 2026-10-26
+    main-checkout wipe, so it is pinned like the rest of this document: the
+    allow-list, one enforcement point per refused mutation class, the RCA
+    link, the residual-risk statement and the recovery procedure must all be
+    present and consistent with the implemented guards.
+    """
+
+    def _section(self) -> str:
+        content = _read(_ISOLATION_DOC)
+        start = content.find("## The main checkout is a guarded surface")
+        assert start != -1, (
+            "worktree-isolation.md must contain the normative "
+            "'The main checkout is a guarded surface' section"
+        )
+        end = content.find("## Recovery when work landed in the main checkout", start)
+        assert end != -1 and end > start, "the normative section must precede the recovery section"
+        return content[start:end]
+
+    def test_documents_the_normative_invariant(self) -> None:
+        content = " ".join(_read(_ISOLATION_DOC).split())
+        assert "Normative invariant" in content
+        assert "MUST NOT mutate the **main checkout**" in content
+
+    def test_documents_the_allow_list(self) -> None:
+        section = self._section()
+        assert "Legitimate mutations (allow-list)" in section
+        # The two legitimate finish/wl mutations are named explicitly.
+        assert "Fast-forward of the main checkout's `dev`" in section
+        assert "Writes under `<main-checkout>/.worklog/`" in section
+        assert "expected-dirty" in section
+
+    def test_documents_each_enforcement_point_with_its_test(self) -> None:
+        section = " ".join(self._section().split())
+        for enforcement in (
+            "guarded_run_all",
+            "live_repo_guard",
+            "main-checkout guard",
+            "main-checkout.lock",
+            "placement guard",
+            "hygiene_check.sh",
+            "shared workspace build output",
+        ):
+            assert enforcement in section, f"enforcement point missing: {enforcement}"
+        for test_pin in (
+            "test_finish_main_checkout_guard.py",
+            "test_finish_main_checkout_lock.py",
+            "test_guarded_run_all.py",
+            "test_implement_stash_hygiene.py",
+            "missing-shared-dist.test.ts",
+        ):
+            assert test_pin in section, f"test pin missing: {test_pin}"
+
+    def test_links_the_rca_and_states_residual_risk(self) -> None:
+        section = " ".join(self._section().split())
+        assert "rca-main-checkout-wipe.md" in section
+        assert "Residual risk" in section
+        assert "no single command could be reproduced" in section
+
+    def test_documents_the_recovery_procedure(self) -> None:
+        content = " ".join(_read(_ISOLATION_DOC).split())
+        assert "## Recovery: the main checkout was mutated" in content
+        assert "git checkout -- packages/shared" in content
+        assert "npm run build:shared" in content
+        assert "scripts/hygiene_check.sh" in content
+
+    def test_references_finish_report_keys(self) -> None:
+        doc = _read(_REPO_ROOT / "docs" / "dev" / "implement-skill-reference.md")
+        assert 'report["steps"]["main_checkout_guard"]' in doc
+        assert 'report["steps"]["main_checkout_lock"]' in doc
