@@ -119,10 +119,12 @@ class TestRunSuiteDiagnostics:
             def __exit__(self, *a):
                 return False
 
-        with mock.patch.object(run_tests, "Semaphore", _BusySemaphore):
-            with pytest.raises(run_tests.TestConcurrencyTimeout) as exc_info:
-                with run_tests._test_concurrency_slot():
-                    pass  # pragma: no cover
+        with (
+            mock.patch.object(run_tests, "Semaphore", _BusySemaphore),
+            pytest.raises(run_tests.TestConcurrencyTimeout) as exc_info,
+            run_tests._test_concurrency_slot(),
+        ):
+            pass  # pragma: no cover
 
         assert str(exc_info.value).startswith(SLOT_BUSY_NOTICE_PREFIX)
 
