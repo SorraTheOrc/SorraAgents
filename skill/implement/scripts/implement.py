@@ -71,6 +71,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1426,6 +1427,275 @@ def _main_checkout_offending_paths(
             continue
         paths.append(file_path)
     return sorted(set(paths))
+
+
+def _main_checkout_status_map(repo_root: str) -> dict[str, str]:
+    """Parse ``git status --porcelain=v1`` into a ``{path: code}`` map.
+
+    Only the working-tree/status surface is captured (no refs, config or
+    worktree registrations), so finish's own fast-forward, ref movement and
+    agent-worktree register/remove do not move the map. ``.worklog/``
+    bookkeeping is filtered out here — the finish run itself writes there
+    via ``wl`` (comments, status updates, cache).
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+
+    Returns:
+        A mapping of relative path → porcelain XY code, excluding
+        ``.worklog/`` paths.
+    """
+    status_output = git_status(cwd=repo_root)
+    entries: dict[str, str] = {}
+    for line in status_output.splitlines():
+        if line.startswith("##") or not line.strip():
+            continue
+        if len(line) < 4:
+            continue
+        code = line[:2]
+        file_path = line[3:].strip()
+        if " -> " in file_path:
+            file_path = file_path.split(" -> ", 1)[1].strip()
+        if not file_path or file_path.startswith(".worklog/"):
+            continue
+        entries[file_path] = code
+    return entries
+
+
+def _snapshot_main_checkout(repo_root: str) -> dict[str, Any]:
+    """Snapshot the main checkout's status surface at a point in time.
+
+    The finish main-checkout guard (WL-0MVPADZ1Z000FOSG AC3) compares two of
+    these snapshots to detect foreign tracked-file mutations of the main
+    checkout during a worktree-scoped finish run.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+
+    Returns:
+        ``{"taken_at": <ISO timestamp>, "status": {path: code}}``.
+    """
+    return {
+        "taken_at": datetime.now(timezone.utc).isoformat(),
+        "status": _main_checkout_status_map(repo_root),
+    }
+
+
+def _main_checkout_guard_violations(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    own_churn: set[str] | frozenset[str] | tuple[str, ...] = (),
+    expected_dirty: tuple[str, ...] = (),
+) -> list[str]:
+    """Return the offending main-checkout paths between two snapshots.
+
+    A path is offending when its status entry *changed* between snapshots
+    (added, deleted or modified) and it is none of:
+
+    - under ``.worklog/`` (the finish run's own bookkeeping surface),
+    - a project-declared expected-dirty path (*expected_dirty*), nor
+    - a path in *own_churn* whose status code is not a deletion.
+
+    *own_churn* is the file list of finish's own Step-5 fast-forward of the
+    main checkout's ``dev`` branch: those working-tree changes are attributed
+    to finish and never abort. A deletion (``D`` in the code) is **never**
+    allow-listed, even when the path appears in *own_churn* — a fast-forward
+    cannot delete a file relative to the tracked tree, so a ``D`` entry is
+    foreign by construction (WL-0MVPADZ1Z000FOSG AC3).
+
+    Args:
+        baseline: The :func:`_snapshot_main_checkout` taken at run start.
+        current: The :func:`_snapshot_main_checkout` taken at a verify point.
+        own_churn: Paths changed by finish's own fast-forward.
+        expected_dirty: Project-declared dirty path prefixes to exclude.
+
+    Returns:
+        Sorted, de-duplicated list of ``"<path> [<code>]"`` entries.
+    """
+    before = baseline.get("status", {})
+    after = current.get("status", {})
+    own = set(own_churn or ())
+    offending: list[str] = []
+    for path, code in sorted(after.items()):
+        if path.startswith(".worklog/") or _path_is_expected_dirty(
+            path, expected_dirty
+        ):
+            continue
+        if path in own and "D" not in code:
+            continue  # finish's own fast-forward churn
+        if path not in before or before[path] != code:
+            offending.append(f"{path} [{code}]")
+    return offending
+
+
+def _record_finish_own_churn(
+    repo_root: str, before_head: str, after_head: str
+) -> list[str]:
+    """File list of finish's own fast-forward of the main checkout.
+
+    The diff between the main checkout's HEAD before the Step-5 fast-forward
+    and after covers every working-tree change the fast-forward itself
+    caused (branch checkout + commit merge), so those paths are attributable
+    to finish and excluded from the main-checkout guard's offending set.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        before_head: ``git rev-parse HEAD`` before the fast-forward.
+        after_head: The fast-forwarded HEAD (commit hash just merged).
+
+    Returns:
+        Sorted file list, or ``[]`` when either side is unavailable.
+    """
+    if not before_head or not after_head:
+        return []
+    result = run_cmd(
+        ["git", "diff", "--name-only", before_head, after_head],
+        cwd=repo_root,
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        return []
+    return sorted(p for p in result.stdout.splitlines() if p.strip())
+
+
+def _main_checkout_actor_evidence(
+    repo_root: str, worktree_path: str
+) -> str:
+    """Best-effort concurrent-actor evidence for the guard's abort message.
+
+    Sources, in order:
+
+    1. other worktree state files (``.implement_state.json``) under the main
+       checkout — each names its owning work item and start time,
+    2. live processes whose ``/proc/<pid>/cwd`` resolves to the main
+       checkout root (Linux only; skipped elsewhere).
+
+    Returns ``"unknown"`` when no source yields evidence (the abort message
+    still fires — evidence is informative, never gating).
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        worktree_path: This finish run's own worktree (excluded from the
+            evidence scan).
+    """
+    own = str(Path(worktree_path).resolve())
+    evidence: list[str] = []
+    worktrees_dir = Path(repo_root) / ".worklog" / "worktrees"
+    try:
+        state_files = sorted(worktrees_dir.glob("wl-*/.implement_state.json"))
+    except OSError:
+        state_files = []
+    for state_file in state_files:
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(state_file.parent.resolve()) == own:
+            continue
+        evidence.append(
+            f"work item {data.get('work_item_id', '?')} "
+            f"(worktree {state_file.parent}, started "
+            f"{data.get('started_at', '?')})"
+        )
+        if len(evidence) >= 5:
+            break
+    try:
+        root = str(Path(repo_root).resolve())
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                cwd = os.readlink(f"/proc/{entry}/cwd")
+            except OSError:
+                continue
+            if str(Path(cwd).resolve()) == root:
+                evidence.append(f"pid {entry} with cwd in the main checkout")
+                if len(evidence) >= 8:
+                    break
+    except OSError:
+        pass
+    return "; ".join(evidence) if evidence else "unknown"
+
+
+def _main_checkout_guard_message(
+    repo_root: str,
+    violations: list[str],
+    actor_evidence: str,
+    stage: str,
+) -> str:
+    """Render the loud-abort message for a main-checkout guard failure.
+
+    Names every offending path, the concurrent-actor evidence available at
+    runtime and the recovery command, so an agent hitting the abort can
+    restore the main checkout and re-run finish without spelunking.
+    """
+    listing = "\n".join(f"  - {p}" for p in violations[:20])
+    if len(violations) > 20:
+        listing += f"\n  … and {len(violations) - 20} more"
+    return (
+        f"Main-checkout mutation detected ({stage} verify): tracked-file "
+        f"changes in the main checkout at {repo_root} were NOT made by this "
+        f"finish run. Aborting instead of silently committing, fast-forwarding "
+        f"or pushing them.\n"
+        f"Offending paths:\n{listing}\n"
+        f"Concurrent actor evidence: {actor_evidence}\n"
+        f"Recovery: in the main checkout run `git checkout -- <path>` (or "
+        f"`git restore <path>`) for each path above to restore the tracked "
+        f"files from HEAD, then re-run `implement.py finish`."
+    )
+
+
+def _verify_main_checkout(
+    guard: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    repo_root: str,
+    worktree_path: str,
+    own_churn: list[str],
+    expected_dirty: tuple[str, ...],
+    stage: str,
+) -> list[str]:
+    """Re-snapshot the main checkout and record a guard verify entry.
+
+    Appends ``{"stage", "at", "verdict", "offending"?}`` to
+    ``guard["verifies"]``, updates ``guard["verdict"]`` and returns the
+    offending paths (empty list = pass), so an operator can read the guard's
+    work straight from the finish report.
+
+    Args:
+        guard: The ``report["steps"]["main_checkout_guard"]`` dict.
+        baseline: Snapshot taken at run start.
+        repo_root: Absolute path to the main checkout.
+        worktree_path: This finish run's own worktree.
+        own_churn: Paths changed by finish's own fast-forward.
+        expected_dirty: Project-declared dirty path prefixes to exclude.
+        stage: Verify stage label (``pre_push`` / ``pre_worktree_removal``).
+
+    Returns:
+        The offending paths (empty list on pass).
+    """
+    current = _snapshot_main_checkout(repo_root)
+    violations = _main_checkout_guard_violations(
+        baseline,
+        current,
+        own_churn=own_churn,
+        expected_dirty=expected_dirty,
+    )
+    entry: dict[str, Any] = {
+        "stage": stage,
+        "at": current["taken_at"],
+        "verdict": "fail" if violations else "pass",
+    }
+    if violations:
+        entry["offending"] = violations
+        entry["actor_evidence"] = _main_checkout_actor_evidence(
+            repo_root, worktree_path
+        )
+    guard["verifies"].append(entry)
+    guard["verdict"] = entry["verdict"]
+    return violations
 
 
 def git_worktree_add(
@@ -4476,6 +4746,58 @@ def phase_finish(
             print(f"\n⛔ {msg}\n")
         return report
 
+    # ── Step 0.75: Main-checkout guard (WL-0MVPADZ1Z000FOSG AC3) ──
+    # A worktree-scoped finish must never silently build on, fast-forward
+    # over, or push foreign tracked-file mutations of the main checkout. All
+    # implementation work happens in the worktree, but finish itself operates
+    # on the main checkout (Step 5 fast-forward, Step 6 push, Step 7
+    # removal), so the main checkout is snapshotted now and re-verified
+    # before the push and before worktree removal. A mutation not
+    # attributable to finish's own fast-forward aborts loudly, names every
+    # offending path, and leaves the item open.
+    repo_root = (
+        state.repo_root
+        if state
+        else (_get_repo_root() or str(Path.cwd().resolve()))
+    )
+    main_checkout_baseline = _snapshot_main_checkout(repo_root)
+    main_checkout_guard: dict[str, Any] = {
+        "repo_root": repo_root,
+        "snapshot_at": main_checkout_baseline["taken_at"],
+        "baseline_paths": len(main_checkout_baseline["status"]),
+        "own_churn": [],
+        "verifies": [],
+        "verdict": "pass",
+    }
+    report["steps"]["main_checkout_guard"] = main_checkout_guard
+
+    def _abort_on_main_checkout_violation(stage: str, own_churn: list[str]) -> None:
+        """Verify the main checkout; raise a loud abort when it was mutated.
+
+        Records the verdict in ``report["steps"]["main_checkout_guard"]``
+        and, on failure, comments on the work item before raising so the
+        audit trail survives the status reset in the outer handler.
+        """
+        violations = _verify_main_checkout(
+            main_checkout_guard,
+            main_checkout_baseline,
+            repo_root=repo_root,
+            worktree_path=worktree_path,
+            own_churn=own_churn,
+            expected_dirty=expected_dirty_paths(repo_root),
+            stage=stage,
+        )
+        if not violations:
+            return
+        actor = main_checkout_guard["verifies"][-1].get(
+            "actor_evidence", "unknown"
+        )
+        msg = _main_checkout_guard_message(
+            repo_root, violations, actor, stage
+        )
+        wl_add_comment(work_item_id, msg)
+        raise RuntimeError(msg)
+
     # ── Step 1: Refactor step ──────────────────────────────────────
     if not no_refactor:
         LOG.info("Running refactor step...")
@@ -4673,6 +4995,16 @@ def phase_finish(
                     repo_root,
                     commit_hash,
                 )
+                # 0. Capture the pre-fast-forward HEAD so the guard can
+                #    attribute the fast-forward's own file churn.
+                before_head_result = run_cmd(
+                    ["git", "rev-parse", "HEAD"], cwd=repo_root,
+                )
+                before_head = (
+                    before_head_result.stdout.strip()
+                    if before_head_result.returncode == 0
+                    else ""
+                )
                 # 1. Fetch latest origin/dev so our local-tracking ref is current.
                 fetch_result = run_cmd(
                     ["git", "fetch", "origin", "dev"], cwd=repo_root,
@@ -4709,12 +5041,26 @@ def phase_finish(
                         f"{merge_commit_result.stderr.strip()}"
                     )
                 LOG.info("Fast-forward to %s succeeded", commit_hash)
+                # 5. The fast-forward's own file churn is expected — record it
+                #    so the main-checkout guard never aborts on it
+                #    (WL-0MVPADZ1Z000FOSG AC3/AC4).
+                main_checkout_guard["own_churn"] = _record_finish_own_churn(
+                    repo_root, before_head, commit_hash
+                )
             except Exception as exc:  # noqa: BLE001
                 LOG.warning(
                     "Fast-forward dev failed (%s); push will proceed from the "
                     "stale checkout — the context-budget gate may reject the push.",
                     exc,
                 )
+
+            # ── Step 5b: Main-checkout guard verify (pre-push) ───────────
+            # A foreign mutation of the main checkout must abort before the
+            # push, never be carried along by finish's own fast-forward and
+            # push.
+            _abort_on_main_checkout_violation(
+                "pre_push", main_checkout_guard["own_churn"]
+            )
 
             # ── Step 6: Push to dev ────────────────────────────────────────
             # The push runs *before* the worktree is removed: a
@@ -4774,6 +5120,15 @@ def phase_finish(
             report["steps"]["cleanup"] = cleanup_result
             if cleanup_result.get("warning"):
                 LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
+
+            # ── Step 6c: Main-checkout guard verify (pre-removal) ────────
+            # Re-verify once more before tearing the worktree down: a
+            # mutation that appeared during the push (e.g. the pre-push
+            # hook) must still abort loudly instead of being left silently
+            # in place.
+            _abort_on_main_checkout_violation(
+                "pre_worktree_removal", main_checkout_guard["own_churn"]
+            )
 
             # ── Step 7: Remove worktree ───────────────────────────────────
             # Only after a successful push — a failed push keeps the

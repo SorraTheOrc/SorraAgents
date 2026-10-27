@@ -524,3 +524,42 @@ Regression pins: `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`),
 `test_guarded_run_fast_forward_of_main_checkout_dev_is_expected_churn`) and
 `tests/test_live_repo_mutation_guard.py`
 (`TestConftestGuardCoversMainCheckout`).
+
+## Finish main-checkout guard (WL-0MVPADZ1Z000FOSG AC3)
+
+The test guards above protect a **test run**. But `implement.py finish`
+itself operates on the main checkout — Step-5 fast-forward, Step-6 push,
+Step-7 worktree removal — so a foreign actor mutating the main checkout
+mid-finish (the 2026-10-26 `packages/shared` wipe) could be silently
+carried into the push or committed by a subsequent `git commit -a`. The
+finish main-checkout guard closes that window:
+
+- **Snapshot at run start** (`_snapshot_main_checkout`): the main
+  checkout's working-tree status surface (`git status --porcelain=v1`,
+  `{path: code}`, `.worklog/` filtered out) is captured right after the
+  placement gate — before build/test/commit.
+- **Verify before the push** (Step 5b, `pre_push`): after the fast-forward,
+  `own_churn` (the fast-forward's own file list, `git diff --name-only` of
+  the pre-fast-forward HEAD → the merged commit) is attributed to finish and
+  excluded; everything else that changed aborts.
+- **Verify before worktree removal** (Step 6c, `pre_worktree_removal`): a
+  mutation that appeared during the push (e.g. the pre-push hook's full
+  suite) must still abort loudly.
+
+On failure `phase_finish` raises inside the `StatusLifecycle` context; the
+work item is left `open` (never `completed`/`in_review`), the abort message
+names **every** offending path, the concurrent-actor evidence available at
+runtime (other worktree `.implement_state.json` entries, live processes with
+cwd in the main checkout, or `unknown`) and the recovery command
+(`git checkout -- <path>`). Pre-existing dirty files present in the baseline
+snapshot and project-declared expected-dirty paths are never a failure;
+a deletion (`D`) is never allow-listed, even when the path appears in
+`own_churn` — a fast-forward cannot delete a file relative to the tree, so
+`D` entries are foreign by construction.
+
+The guard's work is observable in the finish report under
+`report["steps"]["main_checkout_guard"]` (snapshot time, verify times and
+verdicts per stage, own-churn list, final verdict). Regression pins:
+`skill/implement/tests/test_finish_main_checkout_guard.py` and the existing
+`skill/implement/tests/test_finish_no_diff_status.py` (must stay green — a
+clean finish is unaffected).
