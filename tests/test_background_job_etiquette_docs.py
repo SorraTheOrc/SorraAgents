@@ -124,9 +124,10 @@ class TestNoLegacySleepPolling:
             # *endorses* sleeping), not the deprecation warnings themselves.
             for line in text.splitlines():
                 stripped = line.strip()
-                if not stripped.startswith((">", "```", "#")):
-                    if "sleep 900" in stripped or "sleep 30" in stripped:
-                        offenders.append(f"{md.relative_to(REPO_ROOT)}: {stripped}")
+                if not stripped.startswith((">", "```", "#")) and (
+                    "sleep 900" in stripped or "sleep 30" in stripped
+                ):
+                    offenders.append(f"{md.relative_to(REPO_ROOT)}: {stripped}")
         assert not offenders, (
             "skill docs recommend bare fixed-length sleep polling:\n"
             + "\n".join(offenders)
