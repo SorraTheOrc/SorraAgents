@@ -1,10 +1,10 @@
+#!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MVN0IJ7H008OORA
 # smell: unknown
 # severity: low
 # description: Unparenthesized implicit string concatenation in collection
 # -->
-#!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MUQ2OU12009Q8V5
 # smell: formatting
