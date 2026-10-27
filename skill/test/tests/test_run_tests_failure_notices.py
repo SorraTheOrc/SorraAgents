@@ -42,7 +42,7 @@ def _repo(tmp_path: Path) -> Path:
     repo.mkdir()
     (repo / ".pi").mkdir()
     (repo / ".pi" / "test-config.json").write_text(
-        '{"suiteCommands": ["%s"]}' % _CMD, encoding="utf-8"
+        f'{{"suiteCommands": ["{_CMD}"]}}', encoding="utf-8"
     )
     return repo
 
