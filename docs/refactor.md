@@ -56,6 +56,58 @@ comparing the current branch against a parent branch (default: `dev`). It uses:
 Only files modified in the current session are analyzed — pre-existing files
 are not re-examined.
 
+Both scan modes (session-boundary and full-project) then apply the same
+[scan-scope filter](#scan-scope-external-code-is-ignored) so external code is
+never analysed.
+
+### Scan scope: external code is ignored
+
+The refactor step analyses **only code that belongs to the project**. Vendored
+code and npm-installed packages committed to a repository are not project
+code, so they are dropped before auto-fix and smell detection — the report,
+the work items, and the injected `REFACTOR` comments never mention them.
+
+Excluded by default, at any depth:
+
+| Group | Directory names / patterns |
+|---|---|
+| VCS, build output, environments, worklog state | `.git/`, `__pycache__/`, `build/`, `dist/`, `.venv/`, `venv/`, `.tox/`, `.eggs/`, `*.egg-info/`, `.worklog/` |
+| Vendored code and npm-installed packages | `node_modules/`, `vendor/`, `third_party/`, `third-party/`, `site-packages/`, `bower_components/`, `jspm_packages/`, `packages/` |
+
+In addition, **`.gitignore` rules are honoured for tracked files too**: a
+vendored file that was committed (`git add -f`) but matches a `.gitignore`
+pattern is excluded, including patterns from nested `.gitignore` files. This
+runs as one batched `git check-ignore --no-index --stdin -z` call — never one
+subprocess per file. When git is unavailable, the directory is not a git
+repository, or the command fails, a warning is logged and the remaining
+filters still apply (the scan never errors).
+
+Project-owned directories (`skill/`, `command/`, `scripts/`, `pi-client/`,
+`tests/`, `src/`, …) always stay in scope.
+
+`packages/` is treated as npm-installed/external by default. A monorepo that
+keeps its own source there can re-include it — see
+[Path filters](#path-filters-exclude--include).
+
+Filtering is implemented by `skill/refactor/path_filters.py`
+(`filter_scannable_paths()`), which is applied once in
+`detect_session_files()` before any auto-fix or detection step, so report
+counts (`files_analyzed`) and remediation counts are always computed from the
+filtered set.
+
+#### Filter precedence
+
+For each candidate file, decisions apply in this order:
+
+1. **`include`** (`.refactor.json`) — an explicit re-include wins over every
+   exclusion: the defaults, `exclude`, and `.gitignore`.
+2. Source-extension check (full-project scans only: `.py`, `.js`, `.jsx`,
+   `.ts`, `.tsx`, `.mjs`, `.cjs`). Session scans keep every touched file so
+   non-source changes are still reported.
+3. Default external/build directory exclusion (table above).
+4. **`exclude`** (`.refactor.json`) — additive to the defaults.
+5. **`.gitignore`** filtering via `git check-ignore`.
+
 ### 2. Hybrid Smell Detection
 
 Two detection methods are combined:
@@ -200,7 +252,9 @@ An example file is provided at `.refactor.json.example`.
     "long_method",
     "god_class",
     "feature_envy"
-  ]
+  ],
+  "exclude": ["src/generated", "*.min.js"],
+  "include": ["packages/my-app-package"]
 }
 ```
 
@@ -215,6 +269,37 @@ An example file is provided at `.refactor.json.example`.
 | `llm.max_tokens` | Maximum tokens per LLM request | `2000` |
 | `severity_mapping` | Map severity to priority/color | See above |
 | `smell_types` | List of supported smell types | 11 types |
+| `exclude` | Extra directories/globs excluded from scans (additive to defaults) | `[]` |
+| `include` | Directories/globs re-included in scans (overrides defaults, `exclude`, `.gitignore`) | `[]` |
+
+`.refactor.json` in the project root is discovered automatically; pass
+`--config <path>` to use a different file. Existing config files without the
+path keys keep working unchanged.
+
+### Path filters (`exclude` / `include`)
+
+Two optional keys narrow or widen the scan scope (see
+[Scan scope](#scan-scope-external-code-is-ignored) for the defaults):
+
+| Key | Effect |
+|-----|--------|
+| `exclude` | Extra directories/globs to exclude. **Additive** to the built-in defaults. |
+| `include` | Directories/globs to re-include. **Overrides** the defaults, `exclude`, and `.gitignore` for the matched paths. |
+
+Entries may be directory names (`vendor`), directory paths (`src/legacy`),
+whole-path globs (`src/generated/**`, `*.min.js`), or component globs
+(`packages`, `*.generated.ts`). Slash-free entries match at any depth.
+
+```json
+{
+  "exclude": ["src/legacy", "*.min.js"],
+  "include": ["packages/my-app-package"]
+}
+```
+
+A re-include is the escape hatch for a project that deliberately keeps its own
+source under a default-excluded directory (e.g. a monorepo whose packages live
+in `packages/`).
 
 ## Smell Types
 
@@ -320,6 +405,7 @@ python3 skill/refactor/scripts/refactor.py --config .my-refactor.json
 | Orchestrator | `skill/refactor/scripts/refactor.py` | Main entry point and workflow orchestration |
 | Config | `skill/refactor/scripts/config.py` | Configuration loading (`RefactorConfig`) |
 | Session Boundary | `skill/refactor/session_boundary.py` | Detect files changed in current session |
+| Path Filters | `skill/refactor/path_filters.py` | Scan-scope filtering: default external directory exclusions, `.gitignore` (batched `git check-ignore`), config `exclude`/`include` precedence |
 | Smell Detection | `skill/refactor/smell_detection.py` | Hybrid linter + LLM smell detection |
 | Work Item Creation | `skill/refactor/workitem_creation.py` | Create work items for pre-existing smells |
 | Comment Injection | `skill/refactor/comment_injection.py` | Inject REFACTOR comments into source files |

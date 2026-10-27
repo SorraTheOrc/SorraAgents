@@ -44,6 +44,7 @@ before the final commit) to identify and address code quality issues.
 refactor/
 ├── SKILL.md                   # This file
 ├── __init__.py                # Package init
+├── path_filters.py           # Scan-scope filtering (external paths, .gitignore, exclude/include)
 ├── session_boundary.py        # Git diff session boundary detection
 ├── smell_detection.py         # Hybrid linter + LLM smell detection
 ├── workitem_creation.py       # Worklog work item creation
@@ -52,6 +53,46 @@ refactor/
     ├── __init__.py            # Scripts package init
     └── refactor.py            # Main orchestration script
 ```
+
+## Scan scope — which files are analysed
+
+The refactor skill analyses **only code that belongs to the project**. Both
+scan modes (full-project and session-boundary) drop external paths before
+auto-fix and detection, so the report, the work items, and the injected
+`REFACTOR` comments never mention code the project does not own.
+
+Excluded by default, at **any depth**:
+
+| Group | Directory names / patterns |
+|---|---|
+| VCS, build output, environments, worklog state | `.git/`, `__pycache__/`, `build/`, `dist/`, `.venv/`, `venv/`, `.tox/`, `.eggs/`, `*.egg-info/`, `.worklog/` |
+| Vendored code and npm-installed packages | `node_modules/`, `vendor/`, `third_party/`, `third-party/`, `site-packages/`, `bower_components/`, `jspm_packages/`, `packages/` |
+
+In addition, **`.gitignore` rules are honoured even for tracked files** (a
+vendored file that was force-added but is gitignored is still excluded). This
+uses one batched `git check-ignore --no-index --stdin -z` call; when git is
+unavailable or the directory is not a git repository, a warning is logged and
+the remaining filters still apply.
+
+Project-owned directories (`skill/`, `command/`, `scripts/`, `pi-client/`,
+`tests/`, `src/`, …) always stay in scope.
+
+`packages/` is treated as npm-installed/external by default. A monorepo that
+keeps its own source there can re-include it (see
+[Path filters](#path-filters-exclude--include)).
+
+### Precedence
+
+Path decisions are applied in this order for each candidate file:
+
+1. **`include`** (from `.refactor.json`) — an explicit re-include wins over
+   every exclusion, including the defaults, `exclude`, and `.gitignore`.
+2. Source-extension check (full-project scans only: `.py`, `.js`, `.jsx`,
+   `.ts`, `.tsx`, `.mjs`, `.cjs`). Session scans keep every touched file so
+   non-source changes are still reported.
+3. Default external/build directory exclusion (table above).
+4. **`exclude`** (from `.refactor.json`) — additive to the defaults.
+5. **`.gitignore`** filtering via `git check-ignore`.
 
 ## Worklog sync
 
@@ -161,7 +202,7 @@ Report ===`` heading without making any changes.
 
 ### `.refactor.json` Configuration
 
-Example config (project root):
+Example config (project root; automatically discovered, or pass `--config`):
 
 ```json
 {
@@ -169,7 +210,32 @@ Example config (project root):
   "llm": { "enabled": true, "model": "default", "temperature": 0.1, "max_tokens": 2000 },
   "severity_mapping": { "critical": "high", "high": "high", "medium": "medium", "low": "low" },
   "smell_types": ["unused_import", "unused_variable", "complex_function", "magic_number",
-    "duplicate_code", "long_method", "god_class", "feature_envy", "shotgun_surgery"]
+    "duplicate_code", "long_method", "god_class", "feature_envy", "shotgun_surgery"],
+  "exclude": ["src/generated", "*.min.js"],
+  "include": ["packages/my-app-package"]
+}
+```
+
+### Path filters (`exclude` / `include`)
+
+Two optional keys control the scan scope (see
+[Scan scope](#scan-scope--which-files-are-analysed) for the defaults):
+
+| Key | Effect |
+|---|---|
+| `exclude` | Extra directories/globs to exclude. **Additive** to the built-in defaults. |
+| `include` | Directories/globs to re-include. **Overrides** the defaults, `exclude`, and `.gitignore` for the matched paths. |
+
+Entries may be directory names (`vendor`), directory paths (`src/legacy`),
+whole-path globs (`src/generated/**`, `*.min.js`), or component globs
+(`packages`, `*.generated.ts`). Slash-free entries match at any depth. Both
+keys are optional: a config file without them keeps the default behaviour, so
+existing config files need no change.
+
+```json
+{
+  "exclude": ["src/legacy", "*.min.js"],
+  "include": ["packages/my-app-package"]
 }
 ```
 

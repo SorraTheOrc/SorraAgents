@@ -79,6 +79,11 @@ class RefactorConfig:
         llm_config: Configuration for LLM-based detection.
         severity_mapping: Mapping from severity levels to priority/color.
         smell_types: List of supported smell types.
+        path_exclude: Extra path globs/directories excluded from scans
+            (``exclude`` key).  Additive to the built-in defaults.
+        path_include: Path globs/directories re-included in scans
+            (``include`` key).  Overrides both the defaults and
+            :attr:`path_exclude`.
         raw: The raw configuration dict (for debugging).
     """
 
@@ -89,6 +94,8 @@ class RefactorConfig:
         default_factory=lambda: dict(DEFAULT_SEVERITY_MAPPING)
     )
     smell_types: list[str] = field(default_factory=lambda: list(DEFAULT_SMELL_TYPES))
+    path_exclude: list[str] = field(default_factory=list)
+    path_include: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -166,6 +173,8 @@ class RefactorConfig:
             llm_config=llm_config,
             severity_mapping=severity_mapping,
             smell_types=smell_types,
+            path_exclude=_as_str_list(raw.get("exclude")),
+            path_include=_as_str_list(raw.get("include")),
             raw=raw,
         )
 
@@ -207,12 +216,27 @@ class RefactorConfig:
             "llm": dict(self.llm_config),
             "severity_mapping": dict(self.severity_mapping),
             "smell_types": list(self.smell_types),
+            "exclude": list(self.path_exclude),
+            "include": list(self.path_include),
         }
 
 
 # ---------------------------------------------------------------------------
 # Convenience function
 # ---------------------------------------------------------------------------
+
+
+def _as_str_list(value: Any) -> list[str]:
+    """Coerce a config value to a list of non-empty strings.
+
+    Malformed values (``None``, numbers, dicts) yield an empty list so that a
+    config without usable path keys keeps the default scan scope.
+    """
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    return [str(item) for item in value if isinstance(item, str) and item.strip()]
 
 
 def load_refactor_config(config_path: str | None = None) -> RefactorConfig:
