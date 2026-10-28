@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MVS2E33A006M43J
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 """Tests for the shared herdr pane-title status indicator (SA-0MTFLQEQQ0083EW1).
 
 The helper prepends a status prefix (``✅`` / ``⚠️`` / ``🚫`` or
@@ -146,10 +152,7 @@ class TestDeriveStatus:
 # shared classifier feeds the report renderer and the pane-status derivation so
 # a routine next step never produces the ⚠️ ``note`` state.
 #
-# The classifier/normaliser is implemented by F1 (SA-0MVQ1QL5G007MLGM); these
-# tests are written first (TDD) and are marked ``xfail(strict=False)`` while
-# the implementation is absent, so the tree stays green. Each ``xfail`` reason
-# records which child implements the behaviour it pins.
+# The classifier/normaliser is implemented by F1 (SA-0MVQ1QL5G007MLGM).
 # ---------------------------------------------------------------------------
 
 #: Texts that are *solely* routine workflow progression.
@@ -178,31 +181,23 @@ BLOCKING_PHRASINGS = (
     "Run /skill:plan after you approve the migration",
 )
 
-_F1 = "requires F1 (SA-0MVQ1QL5G007MLGM): shared routine-next-step classifier"
-
-
 class TestIsRoutineNextStep:
     """``is_routine_next_step`` recognises routine workflow progression only."""
 
     @pytest.mark.parametrize("text", ROUTINE_PHRASINGS)
-    @pytest.mark.xfail(reason=_F1, strict=False)
     def test_routine_phrasing_is_routine(self, text):
         assert herdr_pane.is_routine_next_step(text) is True
 
     @pytest.mark.parametrize("text", BLOCKING_PHRASINGS)
-    @pytest.mark.xfail(reason=_F1, strict=False)
     def test_blocking_or_ambiguous_phrasing_is_not_routine(self, text):
         assert herdr_pane.is_routine_next_step(text) is False
 
-    @pytest.mark.xfail(reason=_F1 + " (None needed is not a next step)", strict=False)
     def test_none_needed_is_not_a_next_step(self):
         assert herdr_pane.is_routine_next_step("None needed") is False
 
-    @pytest.mark.xfail(reason=_F1, strict=False)
     def test_empty_text_is_not_routine(self):
         assert herdr_pane.is_routine_next_step("") is False
 
-    @pytest.mark.xfail(reason=_F1, strict=False)
     def test_none_is_not_routine(self):
         """Fail-open: a missing value is never claimed to be routine."""
         assert herdr_pane.is_routine_next_step(None) is False
@@ -212,16 +207,13 @@ class TestNormaliseProducerActions:
     """``normalise_producer_actions`` collapses routine-only text."""
 
     @pytest.mark.parametrize("text", ROUTINE_PHRASINGS)
-    @pytest.mark.xfail(reason=_F1, strict=False)
     def test_routine_text_becomes_none_needed(self, text):
         assert herdr_pane.normalise_producer_actions(text) == "None needed"
 
     @pytest.mark.parametrize("text", BLOCKING_PHRASINGS)
-    @pytest.mark.xfail(reason=_F1, strict=False)
     def test_blocking_text_is_returned_verbatim(self, text):
         assert herdr_pane.normalise_producer_actions(text) == text
 
-    @pytest.mark.xfail(reason=_F1, strict=False)
     def test_none_needed_is_unchanged(self):
         """The default value is already correct — no rewrite, no diagnostic."""
         assert herdr_pane.normalise_producer_actions("None needed") == "None needed"
@@ -236,7 +228,6 @@ class TestRoutineNextStepStatus:
     """Routine next steps never raise the ⚠️ ``note`` pane state."""
 
     @pytest.mark.parametrize("text", ROUTINE_PHRASINGS)
-    @pytest.mark.xfail(reason=_F1, strict=False)
     def test_routine_producer_actions_derive_done(self, text):
         assert herdr_pane.derive_status(_MEET_AC, text, None) == "done"
 

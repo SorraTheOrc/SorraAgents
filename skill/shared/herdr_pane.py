@@ -81,6 +81,46 @@ ROUTINE_STEP_TARGETS: tuple[str, ...] = (
     "review", "in_review", "release", "done", "the next stage",
 )
 
+#: A workflow target: the next skill (``/skill:<name>``), a known stage
+#: name, or the phrase "the next stage". The trailing negative lookahead keeps
+#: short stage names from matching inside longer words (``plan`` in
+#: ``planner``, ``review`` in ``reviewer``).
+_ROUTINE_TARGET_RE = (
+    r"(?:/skill:[a-z][a-z0-9_-]*"
+    r"|the next stage"
+    r"|"
+    + "|".join(
+        re.escape(target)
+        for target in sorted(ROUTINE_STEP_TARGETS, key=len, reverse=True)
+    )
+    + r")(?![a-z0-9_-])"
+)
+
+#: A workflow-progression verb (longest first so ``proceed with`` wins over a
+#: bare ``proceed`` prefix — there is no bare ``proceed`` verb by design).
+_ROUTINE_VERB_RE = (
+    r"(?:review and proceed|review and continue|proceed with|proceed to"
+    r"|continue with|run|start|begin)"
+)
+
+#: Clause shapes that count as routine workflow progression. A clause must
+#: match one entirely: a verb + target, "next step[:] <target>", or a review of
+#: the current stage's brief.
+_ROUTINE_CLAUSE_RES = (
+    re.compile(rf"{_ROUTINE_VERB_RE}\s+{_ROUTINE_TARGET_RE}"),
+    re.compile(rf"next step\s*:?\s*{_ROUTINE_TARGET_RE}"),
+    re.compile(rf"review\s+the\s+(?:{_ROUTINE_TARGET_RE}\s+)?brief"),
+)
+
+#: Clause separators: conjunction lead-ins and punctuation that join two
+#: independently-classifiable clauses.
+_ROUTINE_CLAUSE_SPLIT_RE = re.compile(
+    r"\s*(?:,|;|\band then\b|\bthen\b|\band\b)\s*", re.IGNORECASE,
+)
+
+#: Optional lead-ins stripped from the start of a clause before matching.
+_ROUTINE_LEADIN_RE = re.compile(r"^(?:then|next step\s*:?)\s+", re.IGNORECASE)
+
 #: Conservative aliases accepted for the ``status`` argument.
 _STATUS_ALIASES: dict[str, str] = {
     "success": "done", "succeeded": "done", "ok": "done", "complete": "done",
@@ -113,6 +153,72 @@ def is_substantive(value) -> bool:
     return str(value).strip().lower() not in ROUTINE_TEXTS
 
 
+def _is_routine_clause(clause: str) -> bool:
+    """Return True when *clause* is entirely routine workflow progression.
+
+    The match is anchored at both ends so a routine-looking prefix followed by
+    a blocking condition ("Run /skill:plan after you approve the migration")
+    is NOT accepted: ambiguous text must fall through to the caller unchanged
+    (prefer false negatives over hiding a real producer action).
+    """
+    text = clause.strip().lower().rstrip(".!?:;").strip()
+    if not text:
+        return False
+    # Match the clause as written first (so "next step: implement" hits the
+    # lead-in clause shape), then retry without a leading "then"/"next step"
+    # so "Then run /skill:ship" reduces to the verb + target shape.
+    candidates = [text]
+    stripped = _ROUTINE_LEADIN_RE.sub("", text).strip()
+    if stripped and stripped != text:
+        candidates.append(stripped)
+    return any(
+        _clause_re.fullmatch(candidate)
+        for candidate in candidates
+        for _clause_re in _ROUTINE_CLAUSE_RES
+    )
+
+
+def is_routine_next_step(value) -> bool:
+    """Return True when *value* is *only* routine workflow progression.
+
+    Routine progression — "Proceed to /skill:plan", "Run /skill:audit",
+    "Next step: implement", "Review the intake brief and then run
+    /skill:plan" — duplicates the report Conclusion's ``Ready for
+    <next_action>`` line and must never be presented as a producer action
+    (SA-0MVNQ3RLW006XEFW).
+
+    Conservative by design: **every** clause must match the routine
+    vocabulary, otherwise the whole text is treated as non-routine so a real
+    producer action is never hidden. A missing/empty value is not a next step
+    (``False``), and the routine placeholders in :data:`ROUTINE_TEXTS` are not
+    next steps either — callers keep their existing handling for those.
+    """
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    clauses = [c for c in _ROUTINE_CLAUSE_SPLIT_RE.split(text) if c.strip()]
+    if not clauses:
+        return False
+    return all(_is_routine_clause(clause) for clause in clauses)
+
+
+def normalise_producer_actions(value, default: str = "None needed") -> str:
+    """Collapse routine-only producer actions to *default* (else verbatim).
+
+    Returns the **original text unchanged** unless :func:`is_routine_next_step`
+    accepts it, so genuine blocking actions ("Answer the OPEN QUESTION …") are
+    never rewritten. ``None``/blank values already render as *default*.
+    """
+    if value is None:
+        return default
+    text = str(value)
+    if is_routine_next_step(text):
+        return default
+    return text
+
+
 def _verdict(row) -> str:
     """Extract and normalise the verdict from an AC row."""
     if isinstance(row, (list, tuple)) and len(row) >= 4:
@@ -136,7 +242,8 @@ def derive_status(
     for row in acceptance_criteria or []:
         if _verdict(row) != "met":
             return "attention"
-    if is_substantive(producer_actions) or is_substantive(notes):
+    if is_substantive(normalise_producer_actions(producer_actions)) \
+            or is_substantive(notes):
         return "note"
     return "done"
 
