@@ -9,10 +9,13 @@
  *   - STOP acknowledges with STOPPED and exits cleanly
  *   - a CUDA initialisation failure falls back to CPU int8
  *   - a missing faster-whisper install produces an actionable error, not a crash
+ *   - a missing numpy install produces an actionable error at start, not a crash
  *
- * The real Python worker is exercised end-to-end. A stub `faster_whisper`
- * module is injected via PYTHONPATH, so no GPU, model download or
- * faster-whisper install is required.
+ * The real Python worker is exercised end-to-end. Stub `faster_whisper` and
+ * `numpy` modules are injected via PYTHONPATH, so no GPU, model download,
+ * faster-whisper install or site-packages numpy is required — the suite is
+ * green on an interpreter that cannot import either dependency
+ * (SA-0MVRNLSQT006T5GQ).
  *
  * Run: node --test tests/unit/test-voice-whisper-worker.mjs
  */
@@ -25,6 +28,10 @@ import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  NUMPY_STUB,
+  MISSING_NUMPY_STUB,
+} from "../helpers/voice-python-stubs.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(__dirname, "..", "..", "pi-client", "voice-input", "whisper_worker.py");
@@ -59,10 +66,16 @@ let stubDir;
 before(() => {
   stubDir = mkdtempSync(join(tmpdir(), "voice-whisper-stub-"));
   writeFileSync(join(stubDir, "faster_whisper.py"), STUB, "utf8");
+  writeFileSync(join(stubDir, "numpy.py"), NUMPY_STUB, "utf8");
   // An empty dir used to simulate faster-whisper being absent.
   const empty = join(stubDir, "empty");
   mkdirSync(empty, { recursive: true });
-  stubDir = { stub: stubDir, empty };
+  // faster-whisper present, numpy absent, to simulate a numpy-free interpreter.
+  const noNumpy = join(stubDir, "no-numpy");
+  mkdirSync(noNumpy, { recursive: true });
+  writeFileSync(join(noNumpy, "faster_whisper.py"), STUB, "utf8");
+  writeFileSync(join(noNumpy, "numpy.py"), MISSING_NUMPY_STUB, "utf8");
+  stubDir = { stub: stubDir, empty, noNumpy };
 });
 
 /** Workers still running, killed on process teardown so a failed assertion
@@ -346,6 +359,20 @@ describe("whisper worker error handling", () => {
 
     const error = await worker.waitFor("error");
     assert.match(error.message, /faster-whisper is not installed/);
+
+    const { code } = await worker.exit;
+    assert.equal(code, 1);
+  });
+
+  test("a missing numpy install emits an actionable error at start and exits non-zero", async () => {
+    const worker = new WorkerHarness(["--device", "cpu"], { pythonPath: stubDir.noNumpy });
+    worker.send({ type: "start", device: "cpu" });
+
+    const error = await worker.waitFor("error");
+    assert.match(error.message, /numpy is not installed/);
+    // The failure is reported at start, not mid-stream as a transcription error.
+    assert.doesNotMatch(error.message, /transcription failed/);
+    assert.equal(worker.messages.filter((m) => m.type === "ready").length, 0);
 
     const { code } = await worker.exit;
     assert.equal(code, 1);

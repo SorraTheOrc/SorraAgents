@@ -160,6 +160,10 @@ Notes:
   over the default `small`; `large-v3` (~3 GB) is too tight.
 - A missing `faster-whisper` install emits an actionable `error` and exits 1
   (the extension disables itself gracefully via the doctor instead of crashing).
+- A missing `numpy` install emits the same actionable `error` at `start` —
+  numpy is a runtime requirement of faster-whisper, so an interpreter without
+  it is reported up front rather than mid-stream as a `transcription failed:
+  No module named 'numpy'`.
 
 ## Preflight checks (`doctor.js`)
 
@@ -253,15 +257,20 @@ Pure unit tests (no microphone, GPU or model download):
 |---|---|
 | `tests/unit/test-voice-recorder.mjs` | RMS, PCM framing, silence/pause timing, capture errors, SIGINT shutdown |
 | `tests/unit/test-voice-whisper-client.mjs` | worker lifecycle, JSON protocol, partials, finalise, stop, crash handling |
-| `tests/unit/test-voice-whisper-worker.mjs` | real Python worker against a stub `faster_whisper`: start/ready/feed/partial/finalise/stop, CUDA fallback, missing dependency, buffer reset |
+| `tests/unit/test-voice-whisper-worker.mjs` | real Python worker against stub `faster_whisper` and `numpy` modules: start/ready/feed/partial/finalise/stop, CUDA fallback, missing dependency (faster-whisper and numpy), buffer reset |
 | `tests/unit/test-voice-config.mjs` | settings resolution/validation/precedence (incl. `feedbackSound`) |
 | `tests/unit/test-voice-doctor.mjs` | preflight checks and severity aggregation |
 | `tests/unit/test-voice-controller.mjs` | state machine, toggle, partial replacement, submission, shortcut dispatch, doctor gating, feedback transitions, sound on/off, stop-race, errors |
 | `tests/unit/test-voice-herdr-shortcuts.mjs` | phrase matching, target-pane resolution, chord dispatch, failure handling (injected herdr runner) |
 | `tests/unit/test-voice-input.mjs` | end-to-end wiring: controller → recorder → real worker → auto-submit |
 
-The worker tests inject a stub `faster_whisper` module via `PYTHONPATH`, so the
-real line-delimited JSON loop is exercised without the dependency installed.
+The worker tests inject stub `faster_whisper` and `numpy` modules via
+`PYTHONPATH`, so the real line-delimited JSON loop is exercised without either
+dependency installed. numpy is a runtime requirement of the worker
+(`pi-client/voice-input/whisper_worker.py` converts PCM via
+`numpy.frombuffer(...).astype("float32")`); the stubs live in
+`tests/helpers/voice-python-stubs.mjs` so the suite is hermetic on any
+interpreter, including one that cannot import numpy.
 
 ## Scope and non-goals
 
