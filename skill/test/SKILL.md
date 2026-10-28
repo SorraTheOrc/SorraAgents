@@ -185,6 +185,18 @@ non-ignored paths). Non-git project roots are a no-op.
   fails the run;
 - the `refs/worklog/` data namespace (churned by `wl` during a run).
 
+**Working-tree attribution** (SA-0MUIJAHXS003M7BG): a path that was **already
+dirty at run start** and is clean at run end was *resolved* during the run — a
+sibling session committing work it had itself dirtied in the shared checkout —
+so it is churn, not a mutation. It never fails the run; it is reported as an
+informational note instead (`excluded: concurrently resolved working-tree
+change in <checkout>: <path> [<code>]`), carried under `live_repo_excluded` in
+the JSON result and printed as `note:` lines in text output. Every other
+working-tree difference is still a mutation: a path that was clean at run start
+and is modified, deleted or newly created, and a path that stays dirty with a
+different status code. Rules and pinned blind spots:
+[docs/dev/test-isolation.md](../../docs/dev/test-isolation.md) §8.5.
+
 **Reading a failure:** the diff lists every added/deleted/moved ref, added/
 removed/changed config key and added/removed/changed path, e.g.
 
@@ -196,13 +208,15 @@ live-repo mutation detected: the test suite changed the checkout at <root>.
 ```
 
 JSON runs carry the same text under `live_repo_mutation` and set
-`success: false`.
+`success: false`; `live_repo_excluded` (when present) lists the excluded churn.
 
 **Direct `pytest` runs** are covered by a second, reusable guard:
 [`live_repo_guard.py`](../shared/live_repo_guard.py), armed by the
 repo-root [`conftest.py`](../../conftest.py). It compares a cheap refs+config
 fingerprint at each test's teardown and **names the offending test**
-(`pytest.fail`), then compares the full surface at session end. It is a no-op
+(`pytest.fail`), then compares the full surface at session end. Excluded
+working-tree churn from a concurrent session is printed there as a `note:`
+line, never as a failure. It is a no-op
 under `--collect-only`, under xdist workers and for non-git roots. A
 **recursion marker** (`LIVE_REPO_GUARD_ACTIVE`) is exported when a guard arms:
 subprocesses inherit it, so a nested `pytest`/`run_tests.py` invocation stands

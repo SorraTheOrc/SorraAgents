@@ -55,6 +55,26 @@ Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
   non-excluded key, working-tree contamination, and moves of non-excluded
   refs (SA-0MUIA3OE40001QJX); a ``refs/heads/dev``-only ref move is no longer
   a standalone incident signal (see ``docs/dev/test-isolation.md`` §8.4).
+
+**Working-tree attribution rule (SA-0MUIJAHXS003M7BG).** The working-tree
+surface is attributed by *start-of-run provenance*, derived only from git
+plumbing — the two ``git status --porcelain=v1 -uall`` snapshots: a status
+entry that **disappeared** was non-clean at snapshot start and is clean at
+snapshot end, i.e. the path was **resolved inside the guard window**. A
+hermetic suite never commits, checks out or reverts, so such a resolution is
+concurrent churn (a sibling session committing work it had already dirtied in
+the shared checkout) and is excluded from the verdict, reported instead as an
+informational note (``EXCLUDED_CHURN_NOTE_PREFIX``, AC1/AC3). Everything else
+stays a mutation (AC2): a path that was **clean at snapshot start** and is
+modified, deleted or created at snapshot end, and a path that is *still* dirty
+with a different status code. Derivations are status codes and snapshot
+provenance only — never a ``wl-*`` or path-name pattern (AC4).
+
+Pinned blind spots (AC4, ``TestWorkingTreeAttributionBoundaries``): a suite
+that reverts or deletes another session's *uncommitted* work is masked (the
+path was pre-dirty, so its resolution is attributed), the clean→dirty
+false-positive direction is deliberately retained, and a content-only change
+to an already-dirty path is invisible to a status-code surface.
 """
 
 from __future__ import annotations
@@ -104,6 +124,12 @@ CONCURRENCY_EXCLUDED_REF_EXACT = "refs/heads/dev"
 #: plumbing namespaces (never a ``wl-*`` name pattern) so the incident's own
 #: fixture branches remain detectable.
 CONCURRENCY_EXCLUDED_REF_NAMESPACES: tuple[str, ...] = ("refs/remotes/origin/",)
+
+#: Prefix of the informational note emitted when a working-tree difference is
+#: attributed to concurrent churn and therefore excluded from the verdict
+#: (SA-0MUIJAHXS003M7BG AC3). Emitted — never silent — so a reviewer can tell
+#: an excluded foreign change from a clean run.
+EXCLUDED_CHURN_NOTE_PREFIX = "excluded: concurrently resolved working-tree change"
 
 
 def _is_concurrency_excluded_ref(ref: str) -> bool:
@@ -667,7 +693,9 @@ def diff_guarded_roots(
     caller can report **which** checkout was mutated. ``changed`` is the
     disjunction over all roots; a root present in only one snapshot (no change
     of roots within a run is expected, but a worktree registered mid-run must
-    never fail the run) is treated as unchanged.
+    never fail the run) is treated as unchanged. Each root's ``diff`` carries
+    its own attribution, so pass the whole result to
+    :func:`excluded_churn_notes` to render the informational note (AC3).
     """
     roots: list[dict[str, Any]] = []
     before_roots = before.get("roots", ())
@@ -731,6 +759,11 @@ def snapshot_repo_state(
     Returns a dict with ``root``, ``git``, ``refs``, ``config``, ``status``,
     ``worktrees`` and ``excluded_refs``. A non-git root yields empty surfaces
     (the guard is a no-op there).
+
+    The ``status`` map itself is the **start-of-run provenance**
+    :func:`diff_snapshots` uses to attribute concurrent churn
+    (SA-0MUIJAHXS003M7BG): a path present here was already dirty, so its
+    disappearance later in the run is a resolution, not suite damage.
     """
     resolved = Path(root).resolve()
     top = git_toplevel(resolved)
@@ -864,12 +897,28 @@ def diff_snapshots(
     Refs checked out in registered agent worktrees (``excluded_refs``) and the
     ``branch.<name>.*`` config those worktrees own are ignored, using the
     union of both snapshots' excluded sets so a worktree appearing or
-    disappearing mid-run is invisible on either side. Returns
-    ``{"changed": bool, "refs": ..., "config": ..., "status": ...}`` where
-    each category lists added/removed/changed entries.
+    disappearing mid-run is invisible on either side.
+
+    Working-tree differences are additionally **attributed** by start-of-run
+    provenance (SA-0MUIJAHXS003M7BG): a status entry present in ``before`` and
+    absent from ``after`` was resolved during the run (concurrent churn) and is
+    reported under ``excluded.status.removed`` instead of failing the diff —
+    see :func:`excluded_churn_notes`. ``changed`` is the attributed verdict, so
+    it is ``False`` when the only difference is such a resolution.
+
+    Returns ``{"changed": bool, "refs": ..., "config": ..., "status": ...,
+    "excluded": ...}`` where ``status`` lists the verdict-bearing
+    (``added``/``changed``) working-tree entries and each other category lists
+    ``added``/``removed``/``changed`` entries.
     """
     if not before.get("git", True) or not after.get("git", True):
-        return {"changed": False, "refs": {}, "config": {}, "status": {}}
+        return {
+            "changed": False,
+            "refs": {},
+            "config": {},
+            "status": {},
+            "excluded": {"status": {"removed": {}}},
+        }
 
     excluded = set(before.get("excluded_refs", set())) | set(
         after.get("excluded_refs", set())
@@ -906,15 +955,34 @@ def diff_snapshots(
         if k in after_config and before_config[k] != after_config[k]
     }
 
-    status_added = {k: v for k, v in after["status"].items() if k not in before["status"]}
-    status_removed = {
-        k: v for k, v in before["status"].items() if k not in after["status"]
+    before_status = before["status"]
+    after_status = after["status"]
+    status_added = {k: v for k, v in after_status.items() if k not in before_status}
+    resolved_status = {
+        k: v for k, v in before_status.items() if k not in after_status
     }
     status_changed = {
-        k: (before["status"][k], after["status"][k])
-        for k in before["status"]
-        if k in after["status"] and before["status"][k] != after["status"][k]
+        k: (before_status[k], after_status[k])
+        for k in before_status
+        if k in after_status and before_status[k] != after_status[k]
     }
+
+    # Working-tree attribution (SA-0MUIJAHXS003M7BG, rule (a)). A status entry
+    # that disappeared was already non-clean at snapshot start and is clean at
+    # snapshot end: the path was resolved *inside* the guard window. A hermetic
+    # suite never commits/checks out/reverts, so only a concurrent session (a
+    # sibling committing work it had itself dirtied in the shared checkout) can
+    # have resolved it — that is churn, not damage, and it is excluded from the
+    # verdict but reported as a note (`excluded_churn_notes`).
+    #
+    # Deliberately retained as incidents (AC2):
+    #   * a path added to the status surface — clean at snapshot start, now
+    #     modified / deleted / newly created (the clean→dirty direction);
+    #   * a path that is still dirty with a different code — no resolution is
+    #     observable, so no attribution is provable.
+    # Provenance is the start snapshot's own status codes (git plumbing), never
+    # a path-name or `wl-*` pattern (AC4).
+    excluded_status = {"removed": resolved_status}
 
     changed = bool(
         refs_added
@@ -924,7 +992,6 @@ def diff_snapshots(
         or config_removed
         or config_changed
         or status_added
-        or status_removed
         or status_changed
     )
     return {
@@ -941,14 +1008,56 @@ def diff_snapshots(
         },
         "status": {
             "added": status_added,
-            "removed": status_removed,
             "changed": status_changed,
         },
+        "excluded": {"status": excluded_status},
     }
 
 
+def excluded_working_tree_churn(diff: dict[str, Any]) -> dict[str, str]:
+    """``path -> status code`` of working-tree differences excluded by attribution.
+
+    These entries were non-clean at snapshot start and clean at snapshot end,
+    so the path was resolved during the run — concurrent churn that must not
+    fail the run (SA-0MUIJAHXS003M7BG AC1). They never appear in
+    ``diff["status"]`` and therefore never set ``diff["changed"]``, but they
+    are never silent either: :func:`excluded_churn_notes` renders them (AC3).
+    """
+    return dict(diff.get("excluded", {}).get("status", {}).get("removed", {}))
+
+
+def excluded_churn_notes(diff: dict[str, Any]) -> list[str]:
+    """Informational notes for working-tree churn excluded from the verdict.
+
+    Accepts either a :func:`diff_guarded_roots` result (``{"roots": [...]}``)
+    or a bare :func:`diff_snapshots` result, so both guards — and the outer
+    ``guarded_run_all`` consumer — share one renderer. Each note names the
+    checkout and every excluded path with its status code, prefixed by
+    :data:`EXCLUDED_CHURN_NOTE_PREFIX` (AC3). Empty list = nothing excluded.
+    """
+    entries: list[tuple[str, dict[str, Any]]] = []
+    if "roots" in diff:
+        for entry in diff.get("roots", ()):
+            entries.append((str(entry.get("path", "")), entry.get("diff") or {}))
+    else:
+        entries.append(("", diff))
+
+    notes: list[str] = []
+    for checkout, root_diff in entries:
+        where = f" in {checkout}" if checkout else ""
+        for path, code in sorted(excluded_working_tree_churn(root_diff).items()):
+            notes.append(f"{EXCLUDED_CHURN_NOTE_PREFIX}{where}: {path} [{code}]")
+    return notes
+
+
 def describe_diff(diff: dict[str, Any]) -> str:
-    """Render a human-readable, actionable summary of a snapshot diff."""
+    """Render a human-readable, actionable summary of a snapshot diff.
+
+    Renders the **verdict-bearing** differences only: working-tree churn
+    excluded by attribution (SA-0MUIJAHXS003M7BG) is intentionally absent here
+    because this renderer produces failure messages — the excluded paths are
+    announced by :func:`excluded_churn_notes` instead.
+    """
     lines: list[str] = []
     refs = diff.get("refs", {})
     for ref, sha in sorted(refs.get("added", {}).items()):

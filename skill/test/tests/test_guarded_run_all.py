@@ -21,7 +21,9 @@ Contract under test:
   function stands down — it does not snapshot, does not touch the marker,
   and does not run the mutation detector.
 - The result is the ``run_all`` dict shape, plus ``live_repo_mutation`` when
-  the owning guard detected a mutation.
+  the owning guard detected a mutation, and ``live_repo_excluded`` when
+  working-tree churn was attributed to a concurrent session and therefore
+  excluded from the verdict (SA-0MUIJAHXS003M7BG AC3).
 """
 
 from __future__ import annotations
@@ -98,6 +100,7 @@ class TestGuardOwnership:
 
         def fake_detect(root, snapshot_before):
             observed["detect_called"] = (root, snapshot_before)
+            return {"mutation": None, "excluded": []}
 
         monkeypatch.delenv(MARKER_ENV, raising=False)
         monkeypatch.setattr(run_tests, "snapshot_guarded_roots", fake_snapshot)
@@ -129,7 +132,9 @@ class TestGuardOwnership:
 
         monkeypatch.setattr(run_tests, "run_all", boom)
         monkeypatch.setattr(
-            run_tests, "_detect_live_repo_mutation", lambda root, snapshot: None
+            run_tests,
+            "_detect_live_repo_mutation",
+            lambda root, snapshot: {"mutation": None, "excluded": []},
         )
 
         with pytest.raises(RuntimeError):
@@ -151,7 +156,7 @@ class TestGuardOwnership:
 
         def fake_detect(root, snapshot_before):  # pragma: no cover
             observed["detect_called"] = True
-            return "should not happen"
+            return {"mutation": "should not happen", "excluded": []}
 
         monkeypatch.setattr(run_tests, "snapshot_guarded_roots", fake_snapshot)
         monkeypatch.setattr(run_tests, "run_all", fake_run_all)
@@ -177,7 +182,10 @@ class TestGuardOwnership:
         monkeypatch.setattr(
             run_tests,
             "_detect_live_repo_mutation",
-            lambda root, snapshot_before: "live-repo mutation detected: refs moved",
+            lambda root, snapshot_before: {
+                "mutation": "live-repo mutation detected: refs moved",
+                "excluded": [],
+            },
         )
 
         result = guarded_run_all(REPO_ROOT)
@@ -194,7 +202,11 @@ class TestGuardOwnership:
         monkeypatch.setattr(
             run_tests, "snapshot_guarded_roots", lambda root: {"git": True}
         )
-        monkeypatch.setattr(run_tests, "_detect_live_repo_mutation", lambda r, s: None)
+        monkeypatch.setattr(
+            run_tests,
+            "_detect_live_repo_mutation",
+            lambda r, s: {"mutation": None, "excluded": []},
+        )
         captured: dict[str, object] = {}
 
         def fake_run_all(**kwargs):
@@ -301,9 +313,10 @@ def test_outer_guard_detection_ignores_only_dev_and_origin_ref_moves(tmp_path):
         "refs/remotes/origin/feature-x",
     )
 
-    detected = _detect_live_repo_mutation(repo, before)
+    verdict = _detect_live_repo_mutation(repo, before)
 
-    assert detected is None, detected
+    assert verdict["mutation"] is None, verdict["mutation"]
+    assert verdict["excluded"] == []
 
 
 def test_outer_guard_detection_still_fires_on_new_non_excluded_branch(tmp_path):
@@ -317,10 +330,10 @@ def test_outer_guard_detection_still_fires_on_new_non_excluded_branch(tmp_path):
     before = gs.snapshot_guarded_roots(repo)
     gs.run_git(repo, ["branch", "feature-x"], check=True)
 
-    detected = _detect_live_repo_mutation(repo, before)
+    verdict = _detect_live_repo_mutation(repo, before)
 
-    assert detected is not None
-    assert "feature-x" in detected
+    assert verdict["mutation"] is not None
+    assert "feature-x" in verdict["mutation"]
 
 
 # ---------------------------------------------------------------------------
@@ -439,3 +452,130 @@ def test_guarded_run_fast_forward_of_main_checkout_dev_is_expected_churn(
 
     assert result["success"] is True, result.get("live_repo_mutation")
     assert "live_repo_mutation" not in result
+
+
+# ---------------------------------------------------------------------------
+# SA-0MUIJAHXS003M7BG — working-tree churn attributed to a concurrent session
+# ---------------------------------------------------------------------------
+# The outer guard inherits the shared ``git_sandbox`` attribution rule (no
+# consumer-side drift): a working-tree path that was already dirty at snapshot
+# start and is clean at run end was resolved by a concurrent session, so it
+# must not fail the run — but it is reported under ``live_repo_excluded`` so
+# the exclusion is never silent. A path that becomes dirty from a clean start
+# is still a mutation.
+
+
+def _attribution_repo(tmp_path: Path) -> Path:
+    """A ``dev`` checkout with one tracked file and a pre-existing dirty edit."""
+    from shared import git_sandbox as gs
+
+    repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (repo / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    (repo / "README.md").write_text("sibling edit\n", encoding="utf-8")
+    return repo
+
+
+def _write_command(tmp_path: Path, name: str, body: str) -> str:
+    """Write a small Python 'suite command' script and return its invocation."""
+    script = tmp_path / name
+    script.write_text(body, encoding="utf-8")
+    return f"{sys.executable} {script}"
+
+
+def test_outer_guard_attributes_a_concurrently_resolved_path(tmp_path):
+    """The verdict dict carries the note instead of a mutation (AC1/AC3)."""
+    from run_tests import _detect_live_repo_mutation
+    from shared import git_sandbox as gs
+
+    repo = _attribution_repo(tmp_path)
+    before = gs.snapshot_guarded_roots(repo)
+
+    # The sibling session commits the work it had already dirtied; ``dev``
+    # moves with it, which the concurrency exclusion already covers.
+    gs.run_git(repo, ["commit", "-am", "sibling work"], check=True)
+
+    verdict = _detect_live_repo_mutation(repo, before)
+
+    assert verdict["mutation"] is None, verdict["mutation"]
+    notes = verdict["excluded"]
+    assert len(notes) == 1, notes
+    assert gs.EXCLUDED_CHURN_NOTE_PREFIX in notes[0]
+    assert "README.md" in notes[0]
+
+
+def test_guarded_run_reports_excluded_churn_without_failing(tmp_path, monkeypatch):
+    """E2E (AC1/AC3): a sibling commit of pre-existing dirt keeps the run green.
+
+    The suite command is the concurrent actor: it commits a file that was
+    already dirty before the run started. The run must succeed, must not report
+    a ``live_repo_mutation``, and must carry the exclusion note.
+    """
+    from shared import git_sandbox as gs
+    from shared.process_semaphore import nested_semaphore_dir
+
+    repo = _attribution_repo(tmp_path)
+    sibling_commit = (
+        "import subprocess\n"
+        "import sys\n"
+        f"repo = {str(repo)!r}\n"
+        "subprocess.run(['git', '-C', repo, '-c', 'user.name=Sibling',\n"
+        "                '-c', 'user.email=sibling@example.invalid',\n"
+        "                'commit', '-am', 'sibling work'], check=True)\n"
+        "sys.exit(0)\n"
+    )
+
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+
+    result = guarded_run_all(
+        repo,
+        timeout=120,
+        suites=("all",),
+        commands=[_write_command(tmp_path, "sibling_commit.py", sibling_commit)],
+        scope="full",
+        use_cache=False,
+        no_cache=True,
+    )
+
+    assert result["success"] is True, result.get("live_repo_mutation")
+    assert "live_repo_mutation" not in result
+    notes = result.get("live_repo_excluded")
+    assert notes, result
+    assert any("README.md" in note for note in notes), notes
+    assert any(gs.EXCLUDED_CHURN_NOTE_PREFIX in note for note in notes), notes
+
+
+def test_guarded_run_still_fails_on_a_newly_dirty_tracked_path(tmp_path, monkeypatch):
+    """E2E (AC2): deleting a path that was clean at run start still fails."""
+    from shared import git_sandbox as gs
+    from shared.process_semaphore import nested_semaphore_dir
+
+    repo = _attribution_repo(tmp_path)
+    gs.run_git(repo, ["checkout", "--", "README.md"], check=True)  # clean start
+    victim = repo / "README.md"
+    delete_command = (
+        "import sys\n"
+        f"from pathlib import Path\nPath({str(victim)!r}).unlink()\n"
+        "sys.exit(0)\n"
+    )
+
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+
+    result = guarded_run_all(
+        repo,
+        timeout=120,
+        suites=("all",),
+        commands=[_write_command(tmp_path, "delete_tracked.py", delete_command)],
+        scope="full",
+        use_cache=False,
+        no_cache=True,
+    )
+
+    assert not victim.exists(), "fixture invariant: the child really deleted the file"
+    assert result["success"] is False, result
+    mutation = result.get("live_repo_mutation")
+    assert mutation and "README.md" in mutation, mutation
+    assert "live_repo_excluded" not in result, result

@@ -10,7 +10,10 @@ Covers:
 - AC5 — no false positives: churn in an unrelated repository, a no-op run, and
   agent-worktree churn (branch advance, plus registration/removal mid-run
   including the ``--track`` branch config) do not trip the guard
-  (SA-0MUINEW6X0034C65).
+  (SA-0MUINEW6X0034C65);
+- working-tree attribution (SA-0MUIJAHXS003M7BG): a concurrent sibling commit
+  of already-dirty work keeps the session green and prints the exclusion note,
+  while damage starting from a clean checkout still fails and names the test.
 
 No live checkout is mutated to obtain any proof; every mutation happens in a
 ``tmp_path`` repository created through ``shared.git_sandbox``.
@@ -1111,3 +1114,88 @@ class TestConftestGuardCoversMainCheckout:
         combined = proc.stdout + proc.stderr
         assert proc.returncode == 0, combined
         assert "live-repo mutation" not in combined, combined
+
+
+# ---------------------------------------------------------------------------
+# SA-0MUIJAHXS003M7BG — working-tree churn attributed to a concurrent session
+# ---------------------------------------------------------------------------
+# The inner plugin inherits the shared ``git_sandbox`` attribution rule: a path
+# that was already dirty when the session started and is clean at session end
+# was resolved by a concurrent sibling session, so the session stays green and
+# the exclusion is printed as an informational note. Damage that starts from a
+# clean checkout still fails the session and names the offending test.
+
+
+def _init_dev_guard_repo(base: Path, name: str = "victim") -> Path:
+    """A guardable repo whose default branch is the shared integration ``dev``.
+
+    The concurrency exclusion for ``refs/heads/dev`` (WL-0MV5MYBKJ0033P8U) is
+    what makes a *commit* by a concurrent session attributable here: a sibling
+    session commits on the shared integration branch, exactly as the 2026-10-19
+    incident's commit ``7de44be9`` did.
+    """
+    repo = gs.init_repo(base / name, default_branch="dev")
+    (repo / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n.pytest_cache/\n.worklog/\n", encoding="utf-8"
+    )
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    return repo
+
+
+class TestWorkingTreeAttributionNested:
+    """Inner-guard parity for working-tree attribution (AC1/AC2/AC3)."""
+
+    def test_concurrent_commit_of_pre_existing_dirt_keeps_the_session_green(
+        self, tmp_path
+    ):
+        """AC1/AC3: a sibling commit of already-dirty work does not fail the run.
+
+        The path carries `` M`` status when ``pytest_configure`` snapshots and
+        is clean at session end. The session must exit 0, must not report a
+        mutation, and must print the exclusion note naming the path.
+        """
+        repo = _init_dev_guard_repo(tmp_path)
+        _write_guard_conftest(repo)
+        # Pre-existing dirt: the sibling session's uncommitted work.
+        (repo / "README.md").write_text("sibling edit\n", encoding="utf-8")
+        (repo / "test_sibling_commit.py").write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n\n"
+            "ROOT = Path(__file__).resolve().parent\n\n"
+            "def test_sibling_commits_its_own_dirt():\n"
+            "    subprocess.run(\n"
+            "        ['git', '-C', str(ROOT), '-c', 'user.name=Sibling',\n"
+            "         '-c', 'user.email=sibling@example.invalid',\n"
+            "         'commit', '-am', 'sibling work'],\n"
+            "        check=True,\n"
+            "    )\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(repo)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        assert "live-repo mutation" not in combined, combined
+        assert "excluded: concurrently resolved working-tree change" in combined, combined
+        assert "README.md" in combined, combined
+
+    def test_creating_a_new_path_still_fails_and_names_the_test(self, tmp_path):
+        """AC2: damage that starts from a clean checkout is never attributed."""
+        repo = _init_dev_guard_repo(tmp_path, "adversary")
+        _write_guard_conftest(repo)
+        (repo / "test_creator.py").write_text(
+            "from pathlib import Path\n\n"
+            "def test_creates_an_untracked_file():\n"
+            "    (Path(__file__).resolve().parent / 'artefact.txt').write_text('x')\n",
+            encoding="utf-8",
+        )
+
+        proc = _run_nested_pytest(repo)
+
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, combined
+        assert "live-repo mutation" in combined, combined
+        assert "test_creates_an_untracked_file" in combined, combined
+        assert "artefact.txt" in combined, combined

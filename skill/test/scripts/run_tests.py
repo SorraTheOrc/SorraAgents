@@ -111,6 +111,7 @@ sys.path.insert(0, _SKILLS_ROOT_STR)
 from shared.git_sandbox import (
     describe_guarded_diff,
     diff_guarded_roots,
+    excluded_churn_notes,
     snapshot_guarded_roots,
 )
 from shared.process_semaphore import Semaphore, nested_semaphore_dir  # noqa: F401
@@ -2229,13 +2230,21 @@ def run_summary(
 def _detect_live_repo_mutation(
     project_root: Path,
     snapshot_before: dict[str, Any] | None,
-) -> str | None:
-    """Return a rendered diff when the guarded run mutated a checkout, else None.
+) -> dict[str, Any]:
+    """Evaluate the guarded run's checkout delta.
 
+    Returns ``{"mutation": <rendered diff or None>, "excluded": [<note>, ...]}``.
     Detect-only: it never prevents a mutation, it stops a corrupted checkout
     from being reported as a green suite (and therefore from being pushed).
-    ``None`` for a non-git root (no-op) and when the guard was stood down by an
-    outer guard (``snapshot_before is None``).
+    ``mutation`` is ``None`` for a non-git root (no-op) and when the guard was
+    stood down by an outer guard (``snapshot_before is None``).
+
+    ``excluded`` carries the informational note for working-tree churn that was
+    attributed to a concurrent session and therefore cannot fail the run
+    (SA-0MUIJAHXS003M7BG AC1/AC3) — the paths, the checkout and the status
+    codes, so a reviewer can tell an excluded foreign change from a clean run.
+    The attribution rule itself lives in the shared ``git_sandbox`` helper, so
+    the inner ``live_repo_guard`` plugin cannot drift from it.
 
     The surface is **every checkout the guarded run can reach**
     (WL-0MVPE2BY9001CR9O): the guarded root plus, when the run started in a
@@ -2246,16 +2255,18 @@ def _detect_live_repo_mutation(
     mutated path in it.
     """
     if snapshot_before is None:
-        return None
+        return {"mutation": None, "excluded": []}
     snapshot_after = snapshot_guarded_roots(project_root)
     diff = diff_guarded_roots(snapshot_before, snapshot_after)
+    excluded = excluded_churn_notes(diff)
     if not diff["changed"]:
-        return None
-    return (
+        return {"mutation": None, "excluded": excluded}
+    mutation = (
         "live-repo mutation detected: the test suite changed a guarded "
         f"checkout for {project_root}. The run is failed so a corrupted "
         "checkout cannot be pushed as green.\n" + describe_guarded_diff(diff)
     )
+    return {"mutation": mutation, "excluded": excluded}
 
 
 def guarded_run_all(
@@ -2310,7 +2321,10 @@ def guarded_run_all(
 
     Returns:
         The :func:`run_all` result dict, with ``success=False`` and
-        ``live_repo_mutation`` set when the owned guard detected a mutation.
+        ``live_repo_mutation`` set when the owned guard detected a mutation,
+        and ``live_repo_excluded`` (informational notes) when working-tree
+        churn was attributed to a concurrent session and excluded from the
+        verdict (SA-0MUIJAHXS003M7BG AC3).
     """
     project_root = Path(cwd or REPO_ROOT).resolve()
 
@@ -2345,10 +2359,18 @@ def guarded_run_all(
     # Detect-only: fail the run when the checkout mutated, so a corrupted
     # checkout can never be reported (or pushed) as green. Armed on
     # cache-served runs too (nothing executes, but the delta is verified).
+    # Working-tree churn attributed to a concurrent session is excluded from
+    # the verdict but reported under ``live_repo_excluded`` (AC3) — never
+    # silently, so a reviewer can tell an excluded foreign change from a
+    # clean run.
     if guard_active:
-        mutation = _detect_live_repo_mutation(project_root, snapshot_before)
+        verdict = _detect_live_repo_mutation(project_root, snapshot_before)
+        mutation = verdict.get("mutation")
+        excluded = list(verdict.get("excluded") or [])
         if mutation is not None:
             result = {**result, "success": False, "live_repo_mutation": mutation}
+        if excluded:
+            result = {**result, "live_repo_excluded": excluded}
 
     return result
 
@@ -2554,6 +2576,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  FAILED: {failure['test_name']}")
             for notice in result["notices"]:
                 print(f"notice: {notice}")
+            for note in result.get("live_repo_excluded") or []:
+                print(f"note: {note}")
             if result.get("live_repo_mutation"):
                 print("ERROR: " + result["live_repo_mutation"], file=sys.stderr)
             print(_root_timer.render(), file=sys.stderr)

@@ -61,6 +61,25 @@ helpers (``snapshot_guarded_roots`` / ``diff_guarded_roots`` /
 cannot drift between them: this plugin is the inner net for direct ``pytest``
 invocations, the outer guard for the release/implement path, and neither
 reimplements the other's surface.
+
+Working-tree attribution (SA-0MUIJAHXS003M7BG)
+----------------------------------------------
+
+Both guards inherit the shared attribution rule from ``git_sandbox``'s
+``diff_snapshots``: a working-tree path that was **already non-clean at
+snapshot start** and is clean at session end was *resolved* during the run (a
+sibling session committing work it had itself dirtied in the shared
+checkout), so it is churn rather than a mutation. This plugin therefore runs
+that churn as an informational note (``excluded: concurrently resolved
+working-tree change …``, accumulated across tests and printed at session end)
+instead of failing a test. Blind spots, pinned by
+``TestWorkingTreeAttributionBoundaries`` in
+``skill/shared/tests/test_git_sandbox.py`` and documented in
+``docs/dev/test-isolation.md`` §8.5: masking a suite that reverts or deletes
+another session's *uncommitted* work, the deliberately retained clean→dirty
+false-positive direction, and invisible content-only changes to an
+already-dirty path. Derivation is git plumbing (``git status`` codes across
+the two snapshots), never a ``wl-*`` or path-name pattern.
 """
 
 from __future__ import annotations
@@ -109,6 +128,16 @@ class LiveRepoMutationGuard:
         )
         self.last_test: str | None = None
         self.offender: str | None = None
+        #: Informational notes for working-tree churn attributed to a
+        #: concurrent session (never a failure) — accumulated across tests so
+        #: re-baselining cannot drop them (SA-0MUIJAHXS003M7BG AC3).
+        self.excluded: list[str] = []
+
+    def _record_excluded(self, diff: dict[str, Any]) -> None:
+        """Accumulate the excluded-churn notes of *diff* (deduplicated)."""
+        for note in self._gs.excluded_churn_notes(diff):
+            if note not in self.excluded:
+                self.excluded.append(note)
 
     # -- hooks ---------------------------------------------------------------
 
@@ -137,6 +166,9 @@ class LiveRepoMutationGuard:
         # ``(no differences)`` failure (SA-0MUINEW6X0034C65).
         after = self._gs.snapshot_guarded_roots(self.root)
         diff = self._gs.diff_guarded_roots(self.before, after)
+        # Benign churn is never silent: record the note before re-baselining
+        # (the excluded entry leaves ``self.before`` at the reset below).
+        self._record_excluded(diff)
         # Reset the baseline so a single mutation is reported once.
         self.before = after
         self._baseline = self._gs.fingerprint_guarded_roots(
@@ -156,6 +188,11 @@ class LiveRepoMutationGuard:
             return
         after = self._gs.snapshot_guarded_roots(self.root)
         diff = self._gs.diff_guarded_roots(self.before, after)
+        self._record_excluded(diff)
+        # Informational, never a failure: an excluded foreign change must be
+        # distinguishable from a clean run (SA-0MUIJAHXS003M7BG AC3).
+        for note in self.excluded:
+            print(f"note: {note}", file=sys.stdout)
         if not diff["changed"]:
             return
         named = self.offender or self.last_test or "<unknown test>"

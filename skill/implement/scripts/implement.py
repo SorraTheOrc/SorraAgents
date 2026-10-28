@@ -3291,6 +3291,11 @@ def _adapt_guarded_result(
     suite timeout) and bounded ``stdout``/``stderr`` tails, so ``phase_finish``
     can explain WHY the gate failed instead of emitting an empty ``Failures:``
     message (WL-0MVGUT787000LNDG).
+
+    ``live_repo_excluded`` is carried too: working-tree churn attributed to a
+    concurrent session never fails the gate, but it is surfaced in the finish
+    output so an excluded foreign change is distinguishable from a clean run
+    (SA-0MUIJAHXS003M7BG AC3).
     """
     failures: list[str] = []
     for failure in guarded.get("failures", []):
@@ -3325,6 +3330,13 @@ def _adapt_guarded_result(
     if mutation:
         result["live_repo_mutation"] = mutation
         result["success"] = False
+    excluded = [
+        str(n).strip()
+        for n in guarded.get("live_repo_excluded", [])
+        if str(n).strip()
+    ]
+    if excluded:
+        result["live_repo_excluded"] = excluded
     return result
 
 
@@ -5069,6 +5081,16 @@ def phase_finish(
         else:
             LOG.error(msg)
         return report
+
+    # Working-tree churn attributed to a concurrent session is excluded from
+    # the guard's verdict but is never silent: surface the note in the finish
+    # output and the JSON report so the operator can tell an excluded foreign
+    # change from a clean run (SA-0MUIJAHXS003M7BG AC3).
+    excluded_churn = list(test_result.get("live_repo_excluded") or [])
+    if excluded_churn:
+        report["live_repo_excluded"] = excluded_churn
+        for note in excluded_churn:
+            LOG.info("Live-repo guard note: %s", note)
 
     # ── Step 3b: Full-suite coverage moved to the dev-push gate ─────
     # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) No

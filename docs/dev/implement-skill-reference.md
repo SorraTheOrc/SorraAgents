@@ -498,6 +498,19 @@ checkout**, so the main checkout's own churn is never a failure:
   (WL-0MV5MYBKJ0033P8U);
 - `refs/worklog/*` (worklog tooling refs).
 
+Working-tree churn is attributed rather than excluded wholesale
+(SA-0MUIJAHXS003M7BG): a path that was **already dirty at run start** and is
+clean at run end was resolved during the run (a sibling session committing work
+it had itself dirtied in the shared checkout), so it does not fail the run. It
+is never silent — the run result carries the note
+(`excluded: concurrently resolved working-tree change in <checkout>: <path>
+[<code>]`) and `implement.py finish`'s test gate logs it
+(`Live-repo guard note: …`) plus records it in the JSON report under
+`live_repo_excluded`. A path that becomes dirty from a clean start is still a
+mutation (delete/modify/create), and so is a path that stays dirty with a
+different status code. Full rule and pinned blind spots: §8.5 of
+[test-isolation.md](test-isolation.md).
+
 A **failure names the mutated checkout and every mutated path in it**, e.g.:
 
 ```
@@ -518,12 +531,16 @@ when that fingerprint actually moved (F5 AC4). The fingerprint is a *trigger*,
 never a verdict — the authoritative diff decides, so excluded-set churn can
 never fail a clean run (SA-0MUINEW6X0034C65).
 
-Regression pins: `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`),
+Regression pins: `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`,
+`TestWorkingTreeAttribution`, `TestWorkingTreeAttributionIncidents`,
+`TestWorkingTreeAttributionBoundaries`),
 `skill/test/tests/test_guarded_run_all.py`
 (`test_guarded_run_from_worktree_fails_on_main_checkout_deletion`,
-`test_guarded_run_fast_forward_of_main_checkout_dev_is_expected_churn`) and
+`test_guarded_run_fast_forward_of_main_checkout_dev_is_expected_churn`,
+`test_guarded_run_reports_excluded_churn_without_failing`,
+`test_guarded_run_still_fails_on_a_newly_dirty_tracked_path`) and
 `tests/test_live_repo_mutation_guard.py`
-(`TestConftestGuardCoversMainCheckout`).
+(`TestConftestGuardCoversMainCheckout`, `TestWorkingTreeAttributionNested`).
 
 ## Finish main-checkout guard (WL-0MVPADZ1Z000FOSG AC3)
 

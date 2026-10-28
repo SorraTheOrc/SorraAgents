@@ -362,7 +362,8 @@ drift.
 
 The mutation surface is **refs + local `.git/config` + working tree**. Three
 namespaces are deliberately excluded because their movement cannot be
-distinguished from suite-caused movement:
+distinguished from suite-caused movement (working-tree churn is attributed
+separately — see §8.5):
 
 - `refs/worklog/*` — managed by the `wl` tool;
 - concurrent-infrastructure churn — every branch ref checked out in a
@@ -431,7 +432,9 @@ Genuine mutations still fail the guard and name the offending test:
   branches);
 - a rewritten local-config key outside the excluded set (e.g. `user.name`,
   `core.bare`, `branch.dev.remote`);
-- a deleted tracked file or an added untracked file;
+- a deleted tracked file or an added untracked file **that was clean at
+  snapshot start** (a path that was already dirty and is resolved later is
+  attributed to concurrent churn — see §8.5);
 - a move of a monitored own-root branch (own-root branches other than the
   concurrency-excluded `refs/heads/dev` stay monitored).
 
@@ -467,6 +470,63 @@ Regression coverage:
   `tests/test_live_repo_mutation_guard.py`;
 - outer-guard detection inherits the helper (no drift) in
   `skill/test/tests/test_guarded_run_all.py`.
+
+### 8.5 Working-tree attribution (SA-0MUIJAHXS003M7BG)
+
+The ref/config exclusions above cannot help with **working-tree** churn: on a
+multi-agent host a guarded run shares its checkout with sibling sessions, and a
+sibling that commits work it had *already dirtied* makes those paths leave the
+status surface mid-run. Before this rule the guard reported exactly that as
+``deleted path   [ M]`` and failed a run that mutated nothing (2026-10-19: 4427
+passed, only two pre-dirty docs paths reported after a concurrent commit
+``7de44be9`` landed inside the run window).
+
+**The rule (option (a), pre-existing-dirty attribution).** Start-of-run
+provenance, taken from the two ``git status --porcelain=v1 -uall`` snapshots:
+
+| Snapshot difference | Verdict |
+|---|---|
+| path **present** at snapshot start, **absent** at session end | **excluded** — resolved during the run (a sibling commit/checkout of work it had itself dirtied); reported as an informational note |
+| path **absent** at snapshot start, **present** at session end (modified, deleted or newly created) | **mutation** — clean→dirty damage is suite-caused |
+| path present at both, with a **different status code** | **mutation** — no resolution is observable, so nothing is attributable |
+
+The derivation is git plumbing only (status codes plus the start snapshot's own
+``status`` map) — never a ``wl-*`` or path-name pattern (AC4). The excluded
+paths are emitted as notes (``EXCLUDED_CHURN_NOTE_PREFIX`` in
+``skill/shared/git_sandbox.py``), never silently dropped:
+
+```text
+note: excluded: concurrently resolved working-tree change in /home/…/repo: docs/dev/test-isolation.md [ M]
+```
+
+surfaced as ``live_repo_excluded`` (a list of notes) in the ``run_tests.py``
+result JSON, as ``note:`` lines in its text output, printed by the inner plugin
+at session end, and logged by ``implement.py finish``'s test gate.
+
+**Blind spots (accepted, pinned).**
+
+1. **Masked revert/delete of another session's *uncommitted* work.** A suite
+   that reverts a sibling's pre-existing edit, or deletes its pre-existing
+   untracked file, produces the same "resolved" signal as the sibling's own
+   commit, so it is attributed away. Mitigations: the note names every
+   excluded path, and the finish main-checkout guard (WL-0MVPADZ1Z000FOSG)
+   remains a second net.
+2. **Retained clean→dirty false positive.** The exclusion deliberately does
+   not touch the incident direction: a path that becomes dirty from a clean
+   start still fails the run, even if a sibling (not the suite) created it.
+3. **Invisible content-only change to an already-dirty path.** A status-code
+   surface never compared content, before or after this rule: an already-dirty
+   path edited again keeps its code and yields no difference.
+
+Regression pins: ``TestWorkingTreeAttribution``,
+``TestWorkingTreeAttributionIncidents`` and
+``TestWorkingTreeAttributionBoundaries`` in
+``skill/shared/tests/test_git_sandbox.py`` (helper rule, the benign concurrent
+commit from a second actor, the delete/modify/create incident cases and the
+pinned boundaries), ``TestWorkingTreeAttributionNested`` in
+``tests/test_live_repo_mutation_guard.py`` (inner-plugin parity) and the
+``live_repo_excluded`` tests in
+``skill/test/tests/test_guarded_run_all.py`` (outer-guard parity, AC3 note).
 
 
 ## 9. Production test-execution scrub (2026-09-26 recurrence, SA-0MUIA3OE40001QJX)
