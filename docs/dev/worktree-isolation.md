@@ -114,6 +114,39 @@ path) into each driven child session's environment, alongside the
 `IMPLEMENT_DRIVE_ACTIVE=1` recursion guard. It is the machine-checkable
 counterpart to the human instruction above.
 
+## The state file: `repo_root` is the main checkout
+
+`<worktree>/.implement_state.json` records the run's metadata. Its
+`repo_root` field has exactly one meaning: **the main checkout root** — never
+the worktree, never a path inside it.
+
+This matters because every consumer of that field acts on the main checkout:
+
+- `finish` fast-forwards `dev` in the main checkout and pushes from it;
+- `finish` posts the parent-branch sync against the main checkout;
+- `_remove_worktree(..., repo_root=<value>)` refuses to remove a path that
+  resolves to `repo_root`, so a worktree recorded as the root makes finish
+  raise `REFUSE to remove the repository root` *after* a successful push;
+- the signal handler restores (`git checkout` / `git pull`) in `repo_root`.
+
+**Resolution rule.** `phase_start` resolves it with `_get_repo_root()`, which
+returns the main checkout even when invoked from **inside** a linked worktree
+(`git rev-parse --git-common-dir`'s parent). Resuming `start` from inside an
+existing worktree — the normal driven-child pattern — therefore also records
+the main checkout. Never derive it from `Path.cwd()`: when `cwd` is the
+worktree that writes the worktree into the state file.
+
+**Stale state is repaired, not trusted.** A state file written by an older
+build may already carry the worktree (or a path inside it) as `repo_root`.
+`finish` and `abort` detect that (`_resolve_main_repo_root`), log the rejected
+and the derived value at WARNING, and use the main checkout root anyway — so a
+stranded worktree finishes cleanly without hand-edited JSON.
+`_remove_worktree`'s safety gates are unchanged: the corrected root is
+supplied to them, the gates are never relaxed.
+
+Regression coverage (real temp git repo plus linked worktree, no
+`_get_repo_root` mocking): `skill/implement/tests/test_repo_root_resolution.py`.
+
 ## The placement guard
 
 `phase_parent`/`phase_drive` fail closed when a **non-terminal** child's

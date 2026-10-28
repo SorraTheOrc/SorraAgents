@@ -2087,6 +2087,60 @@ def _get_repo_root(cwd: str | None = None) -> str | None:
     return toplevel.as_posix()
 
 
+def _resolve_main_repo_root(
+    worktree_path: str | None = None,
+    state: ImplementState | None = None,
+) -> str:
+    """Resolve the MAIN checkout root for a worktree-scoped phase.
+
+    The implement state file's ``repo_root`` is authoritative **except** when
+    it points at the worktree itself or somewhere inside it: that is stale
+    state written by ``phase_start`` when it resumed from inside a linked
+    worktree, and trusting it makes ``phase_finish`` refuse to remove "the
+    repository root" and ``phase_abort`` restore the wrong checkout
+    (MS-0MVM7NJF70037YU4).
+
+    A stale value is rejected with a WARNING naming both the rejected and the
+    derived value, then the main root is derived from *worktree_path* via
+    :func:`_get_repo_root` (which resolves ``--git-common-dir``'s parent),
+    falling back to discovery from the current directory.
+
+    Args:
+        worktree_path: Absolute path to the phase's worktree, if known.
+        state: The implement state read for this worktree, if available.
+
+    Returns:
+        Absolute main checkout root — never the worktree or a path inside it
+        (unless the worktree *is* the main checkout, which the callers'
+        removal safety gates then refuse on their own terms).
+    """
+    worktree = Path(worktree_path).resolve() if worktree_path else None
+
+    def _inside_worktree(candidate: str) -> bool:
+        if worktree is None:
+            return False
+        resolved = Path(candidate).resolve()
+        return resolved == worktree or worktree in resolved.parents
+
+    stated = (state.repo_root if state else "") or ""
+    if stated and not _inside_worktree(stated):
+        return str(Path(stated).resolve())
+
+    derived = (
+        (_get_repo_root(str(worktree)) if worktree else None)
+        or _get_repo_root()
+        or str(Path.cwd().resolve())
+    )
+    if stated:
+        LOG.warning(
+            "Ignoring stale state repo_root=%s (it is the worktree or inside "
+            "it); using the main checkout root %s instead.",
+            stated,
+            derived,
+        )
+    return derived
+
+
 def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> bool:
     """Auto-symlink the main checkout's node_modules into a worktree.
 
@@ -4632,7 +4686,11 @@ def phase_start(
     )
 
     # ── Step 8: Register signal handlers ───────────────────────────
-    repo_root = str(Path.cwd().resolve())
+    # ``repo_root`` is the main checkout root resolved at Step 6.5. Do NOT
+    # recompute it from ``Path.cwd()``: on a resume from inside the worktree
+    # ``cwd`` IS the worktree, so the state file and the signal globals
+    # recorded the worktree — which then made finish refuse to remove "the
+    # repository root" after a successful push (MS-0MVM7NJF70037YU4).
     _store_signal_globals(abs_wt_path, work_item_id, repo_root)
     _register_signal_handlers()
 
@@ -4892,11 +4950,11 @@ def phase_finish(
     # before the push and before worktree removal. A mutation not
     # attributable to finish's own fast-forward aborts loudly, names every
     # offending path, and leaves the item open.
-    repo_root = (
-        state.repo_root
-        if state
-        else (_get_repo_root() or str(Path.cwd().resolve()))
-    )
+    # ``state.repo_root`` is the main checkout root, but a state file written
+    # by an older build may carry the worktree itself (start resumed from
+    # inside it); such a stale value is rejected and the main root re-derived
+    # from the worktree (MS-0MVM7NJF70037YU4).
+    repo_root = _resolve_main_repo_root(worktree_path, state)
     main_checkout_baseline = _snapshot_main_checkout(repo_root)
     main_checkout_guard: dict[str, Any] = {
         "repo_root": repo_root,
@@ -5167,11 +5225,7 @@ def phase_finish(
             # checkout at push time), it sees the updated files — so
             # context-budget compliant commits that modify AGENTS.md etc. no
             # longer trigger the stale-checkout failure.
-            repo_root = (
-                state.repo_root
-                if state
-                else (_get_repo_root() or str(Path.cwd().resolve()))
-            )
+            # ``repo_root`` was resolved (stale state rejected) at Step 0.75.
             try:
                 LOG.info(
                     "Fast-forwarding dev in main checkout (%s) to %s ...",
@@ -5321,7 +5375,7 @@ def phase_finish(
             remove_state(worktree_path)
             if not _remove_worktree(
                 worktree_path,
-                repo_root=state.repo_root if state else None,
+                repo_root=repo_root,
             ):
                 msg = f"Failed to remove worktree at {worktree_path}"
                 LOG.warning(msg)
@@ -5467,6 +5521,13 @@ def phase_abort(
 
     # ── Step 2: Find and cleanup worktree ──────────────────────────
     worktree_path = _discover_worktree(work_item_id)
+    # Resolve the MAIN checkout root *before* the worktree is torn down: the
+    # stale-state rejection needs the worktree to exist, and aborting from
+    # inside the worktree must restore the main checkout, never the worktree
+    # (MS-0MVM7NJF70037YU4).
+    repo_root = _resolve_main_repo_root(
+        worktree_path, read_state(worktree_path) if worktree_path else None
+    )
     if worktree_path and Path(worktree_path).exists():
         LOG.info("Cleaning up worktree at %s...", worktree_path)
         cleanup_worktree_processes(worktree_path)
@@ -5475,7 +5536,6 @@ def phase_abort(
         report["worktree_path"] = worktree_path
 
     # ── Step 3: Restore repo state ─────────────────────────────────
-    repo_root = str(Path.cwd().resolve())
     _restore_repo_state(repo_root)
 
     # ── Step 4: Log comment ────────────────────────────────────────

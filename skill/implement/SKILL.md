@@ -885,6 +885,30 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 
 > **All abort/failure transitions reset to `open` and clear the assignee.** Never leave a work item in `in_progress` unless actively implementing; never leave a completed or released item on an assignee hold.
 
+## Implement state file: `repo_root` is always the main checkout
+
+`<worktree>/.implement_state.json` carries `repo_root`, and it always means the
+**main checkout root** — never the worktree, never a path inside it. Every
+consumer acts on the main checkout: the `dev` fast-forward and push in
+`finish`, the parent-branch sync, the signal handler's `_restore_repo_state`,
+and `_remove_worktree(..., repo_root=…)`, whose safety gate refuses a path that
+resolves to `repo_root`. A worktree recorded as `repo_root` therefore makes
+`finish` raise `REFUSE to remove the repository root` *after* a successful push
+and leaves the item `open` (MS-0MVM7NJF70037YU4).
+
+- `phase_start` resolves the value with `_get_repo_root()`, which returns the
+  main checkout even when `start` is invoked (or resumed) from **inside** a
+  linked worktree. Do not derive it from `Path.cwd()`.
+- `finish` and `abort` do not blindly trust an existing value: a `repo_root`
+  that is the worktree or inside it is stale. It is rejected (WARNING logs the
+  rejected and derived values) and `_resolve_main_repo_root` re-derives the
+  main checkout, so already-stranded worktrees finish without hand-edited JSON.
+- `_remove_worktree`'s gates stay untouched — the fix supplies the correct root
+  rather than relaxing the check.
+
+Full rationale and the resume-from-worktree case:
+[docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md#the-state-file-repo_root-is-the-main-checkout).
+
 ## Scripts (canonical runner & modules)
 
 This skill does not ship a single orchestrator script — implementation follows
