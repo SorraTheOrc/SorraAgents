@@ -89,14 +89,69 @@ This completes the <skill_name> process for <id> (<title>). Ready for <next_acti
 - **Meta-Data**: each field on its own bullet as `<icon> <text>`; `Children`
   is a plain count (no ContextHub icon exists for it). Deterministic from
   `wl show <id> --children --json` (see [Meta-Data](#meta-data) below).
-- **Producer Actions**: default `None needed`; only list real producer
-  actions when something is required.
+- **Producer Actions**: actions the producer must take to **complete the
+  current stage** — blocking only. Default `None needed`; omit the flag
+  entirely when nothing is required. Routine workflow progression is **not**
+  a producer action (see [Producer Actions](#producer-actions) below).
 - **Notes**: freeform — context, caveats, assumptions that don't fit the
   structured sections. **Must sit between `## Producer Actions` and
   `## Conclusion`**.
 - **Conclusion**: the literal sentence
   `This completes the <skill_name> process for <id> (<title>). Ready for <next_action>.`
 - **Terminator**: the rendered report's final line is `</end_session>` on its own line (only for terminal sessions; question-ended sessions omit the report and the marker).
+
+### Producer Actions
+
+The normative rule: `## Producer Actions` contains **only** actions the
+producer must take to complete the **current** stage. It answers one
+question — *is the producer blocking this work item right now?*
+
+**Belongs in Producer Actions** (blocking, current-stage, agent cannot do it):
+
+- answering an open question the stage is waiting on;
+- making a decision between named options;
+- granting an approval/review the stage is gated on;
+- supplying missing access, credentials, or a token;
+- performing a manual step the agent cannot (e.g. a UI-only configuration).
+
+**Does NOT belong** — routine workflow progression. The Conclusion already
+encodes the next phase in its `Ready for <next_action>` line, so repeating it
+here falsely signals that the producer is blocking:
+
+- "Proceed to /skill:plan", "Run /skill:audit next";
+- "Proceed to the next stage" / "Proceed with implementation";
+- "Review the intake brief, then run /skill:plan";
+- "Next step: implement".
+
+When the only "action" is to continue the normal workflow, the section must
+read exactly `None needed` (omit `--producer-actions` entirely). Reviewing a
+brief or report is part of the normal workflow — only request a *decision*
+("choose A or B"), an approval, or a missing *input*.
+
+Positive / negative examples of the rendered section:
+
+```markdown
+## Producer Actions
+
+None needed
+```
+
+```markdown
+## Producer Actions
+
+Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP before `/skill:plan` can start.
+```
+
+```markdown
+## Producer Actions
+
+Proceed to /skill:plan        <!-- WRONG: this is the Conclusion's job -->
+```
+
+The rule is enforced twice, by design: the prose here is the primary fix, and
+the renderer guard (below) keeps a report correct when an agent ignores it.
+Classification is conservative — ambiguous text is rendered unchanged,
+because hiding a real producer action is worse than repeating a routine one.
 
 ## Meta-Data
 
@@ -202,7 +257,7 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \
   --ac "<...>|<...>|unmet" \
-  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>] \
   [--use-case "<use-case string>"]
@@ -221,6 +276,9 @@ Rules for callers:
 2. **Meta-Data is rendered by the script** from live `wl show --json` —
    the caller supplies only prose (headline, Producer Actions, Notes,
    next action).
+   `--producer-actions` carries **blocking, current-stage** actions only;
+   omit it (or pass `None needed`) when the next step is just the next
+   phase of the workflow.
 3. Run it as the **final step**, after all status/stage transitions, so the
    Meta-Data reflects the end-of-session state.
 4. Output is stdout markdown; the calling skill **pastes it verbatim into
@@ -247,8 +305,11 @@ than stacking a second one.
 | `attention` | Any AC verdict other than `met` (`unmet`/`partial`/`adjusted`), or an abort/failure | 🚫 | `Attention` |
 
 - **Derivation** is from the supplied AC verdicts, Producer Actions and Notes
-  (`adjust`/`partial` count as not fully met → red). The standard workflow
-  next action is not itself treated as substantive producer content.
+  (`adjust`/`partial` count as not fully met → red). Producer actions are
+  routed through the shared routine-next-step classifier
+  (`shared/herdr_pane.py`), so a routine next step ("Proceed to
+  /skill:plan") yields `done`, never `note` — the same classifier the
+  renderer uses to normalise the section, so the two can never disagree.
 - **Text fallbacks** reuse the renderer's `--no-icons` / `WL_NO_ICONS=1`
   mechanism (no colour coding).
 - **Length**: the combined title is bounded to herdr's 60-character limit,
@@ -269,6 +330,12 @@ than stacking a second one.
   headline.
 - `render_metadata(work_item, children=None, audit_result=None)` → the `## Meta-Data` bullet block. `audit_result` is the **top-level** `auditResult` object from the `wl show --json` envelope; when omitted, the legacy `workItem.auditResult` / `workItem.audit` fallbacks apply (see the precedence list above).
 - `render_report_from_workitem(work_item, *, skill_name, headline, acceptance_criteria, ..., children=None, audit_result=None, use_cases=None)` → full report from an already-fetched work-item dict plus the envelope's structured `auditResult`.
+- `normalise_producer_actions(producer_actions)` → collapses routine-only
+  producer actions to `None needed` (returning genuine blocking text
+  verbatim) and writes **one** stderr diagnostic naming the discarded text.
+  It delegates to the single shared classifier
+  `shared/herdr_pane.py:normalise_producer_actions`, which the pane
+  status derivation consumes too, so both paths agree by construction.
 - `render_from_wl(skill_name, work_item_id, ..., use_cases=None)` → fetches the `wl show <id> --children --json` envelope and threads its top-level `auditResult` into the metadata.
 - CLI (`render_report.py <id> --skill-name ... --ac ... --use-case ...`): fetches the item
   via `wl show <id> --children --json` (worklog store resolved via the

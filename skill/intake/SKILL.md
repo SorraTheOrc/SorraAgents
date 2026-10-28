@@ -292,7 +292,7 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --ac "Acceptance criteria defined — testable and measurable | Brief reviewed | met" \
   --ac "Effort and risk assessed — size and risk estimate recorded | Effort/risk report present | met" \
   --ac "Related work gathered — find-related report collected | Related work comment present | met" \
-  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```
