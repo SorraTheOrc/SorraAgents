@@ -14,6 +14,10 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 from audit.scripts import audit_runner
+from audit.tests.test_audit_runner_phase1 import (
+    _make_phase1_runner,
+    _phase1_child,
+)
 from audit.tests.wl_helpers import stateful_wl_side_effect
 from test.scripts.run_tests import repo_has_pytest_suite
 
@@ -364,6 +368,205 @@ class TestGreenRunPromptInjection:
             assert rc == mock_cmd.return_value
             _args, kwargs = mock_cmd.call_args
             assert kwargs["green_run"] == "HEAD"
+
+class TestGreenRunChildScreenInjection:
+    """LP-0MVO35BF90021QY6 AC1/AC2/AC3: the resolved green-run evidence block
+    must reach BOTH child Phase-1 screens — the per-child screen
+    (``_phase1_review_child_acs``) and the opt-in batched screen
+    (``_phase1_review_children_batched``) — exactly as it already reaches the
+    parent Phase-1 screen and every Phase 2 prompt.
+
+    The block is spliced immediately after the SCANNING block, so an absent
+    block leaves the prompt byte-identical: no evidence at HEAD ⇒ no block ⇒
+    execution-dependent child ACs stay ``partial`` (never a fabricated met).
+    """
+
+    def _block(self):
+        block, _sha = audit_runner._resolve_green_run_attestation(
+            "HEAD", _green_run_git_runner(),
+        )
+        assert block and "GREEN-RUN ATTESTATION" in block
+        return block
+
+    @staticmethod
+    def _capture_child_prompt(child, *, block, verdict="met"):
+        """Run the single-child screen and return (prompt, ac_results)."""
+        prompts: list[str] = []
+
+        def _fake_call(issue_id, context, prompt, **kwargs):
+            prompts.append(prompt)
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": verdict, "evidence": "f.py:1"},
+            ])}
+
+        runner, _audit_shows = _make_phase1_runner([])
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ):
+            _ci, acs = audit_runner._phase1_review_child_acs(
+                0, child,
+                phase1_model="test-model",
+                full_model="test-model",
+                pi_bin="pi",
+                debug_log=None,
+                timeout=None,
+                runner=runner,
+                script_failure_callback=lambda *a: None,
+                green_run_block=block,
+            )
+        assert len(prompts) == 1, "one child screen call expected"
+        return prompts[0], acs
+
+    @staticmethod
+    def _capture_batch_prompt(children, *, block, verdict="met"):
+        """Run the batched child screen and return (prompts, results)."""
+        prompts: list[str] = []
+        pending = list(enumerate(children))
+
+        def _fake_call(issue_id, context, prompt, **kwargs):
+            prompts.append(prompt)
+            return {"extracted_text": json.dumps([
+                {"child": ci, "index": 0, "verdict": verdict,
+                 "evidence": "f.py:1"}
+                for ci, _child in pending
+            ])}
+
+        runner, _audit_shows = _make_phase1_runner([])
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ):
+            results = audit_runner._phase1_review_children_batched(
+                pending, "test-model", "test-model", "pi", None, None,
+                runner, lambda *a: None, green_run_block=block,
+            )
+        return prompts, results
+
+    def test_single_child_prompt_includes_block(self):
+        """AC1/AC2: the per-child screen prompt carries the block, and a
+        'met' verdict returned against that evidence is not degraded."""
+        block = self._block()
+        prompt, acs = self._capture_child_prompt(_phase1_child(1), block=block)
+        assert "GREEN-RUN ATTESTATION" in prompt
+        assert _GREEN_RUN_HEAD in prompt
+        # AC4: the child screen still never executes the suite itself.
+        assert "Do NOT execute tests yourself" in prompt
+        assert acs[0]["verdict"] == "met"
+
+    def test_single_child_prompt_without_block_is_unchanged(self):
+        """AC2/AC3: no evidence at HEAD ⇒ no block, prompt otherwise identical."""
+        block = self._block()
+        with_block, _ = self._capture_child_prompt(_phase1_child(1), block=block)
+        without_block, _ = self._capture_child_prompt(_phase1_child(1), block=None)
+        assert "GREEN-RUN ATTESTATION" not in without_block
+        assert with_block.replace(block, "", 1) == without_block
+
+    def test_in_main_slot_emitted_prompt_includes_block(self):
+        """AC1: the in-main-slot emission carries the block too — it is the
+        prompt the main session actually executes."""
+        block = self._block()
+        runner, _audit_shows = _make_phase1_runner([])
+        with mock.patch.object(
+            audit_runner, "_emit_in_main_slot_work"
+        ) as mock_emit:
+            _ci, acs = audit_runner._phase1_review_child_acs(
+                0, _phase1_child(1),
+                phase1_model="test-model",
+                full_model="test-model",
+                pi_bin="pi",
+                debug_log=None,
+                timeout=None,
+                runner=runner,
+                script_failure_callback=lambda *a: None,
+                child_in_main_slot=True,
+                green_run_block=block,
+            )
+        emitted = mock_emit.call_args[0]
+        assert emitted[0] == "phase1_child_screen"
+        assert "GREEN-RUN ATTESTATION" in emitted[2]["prompt"]
+        # AC4: in-main-slot verdicts stay pending (never a fabricated met).
+        assert all(a["verdict"] == "partial" for a in acs)
+
+    def test_batched_prompt_includes_block(self):
+        """AC1/AC2: the batched child screen prompt carries the block, and
+        'met' verdicts returned against that evidence are not degraded."""
+        block = self._block()
+        children = [_phase1_child(1), _phase1_child(2, "CHILD-2")]
+        prompts, results = self._capture_batch_prompt(children, block=block)
+        assert len(prompts) == 1, "batched screen must fold into ONE call"
+        assert "GREEN-RUN ATTESTATION" in prompts[0]
+        assert _GREEN_RUN_HEAD in prompts[0]
+        assert "Do NOT execute tests yourself" in prompts[0]
+        assert all(r[0]["verdict"] == "met" for r in results.values())
+
+    def test_batched_prompt_without_block_is_unchanged(self):
+        """AC2/AC3: no evidence at HEAD ⇒ no block, prompt otherwise identical."""
+        block = self._block()
+        children = [_phase1_child(1), _phase1_child(2, "CHILD-2")]
+        with_block, _ = self._capture_batch_prompt(children, block=block)
+        without_block, _ = self._capture_batch_prompt(children, block=None)
+        assert "GREEN-RUN ATTESTATION" not in without_block[0]
+        assert with_block[0].replace(block, "", 1) == without_block[0]
+
+class TestGreenRunChildScreenCallSites:
+    """LP-0MVO35BF90021QY6 AC1: the ``_phase_children`` dispatch branches
+    thread ``ctx.green_run_block`` into the child Phase-1 screens."""
+
+    def _run_cmd_issue(self, children, *, batch, prompts, monkeypatch):
+        if batch:
+            monkeypatch.setenv(audit_runner.AUDIT_PHASE1_BATCH_ENV, "1")
+        else:
+            monkeypatch.delenv(audit_runner.AUDIT_PHASE1_BATCH_ENV, raising=False)
+        mock_runner, _audit_shows = _make_phase1_runner(children)
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            prompts[context] = prompt
+            if context == "parent":
+                return {"extracted_text": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+                ])}
+            if context == "phase1_batch":
+                return {"extracted_text": json.dumps([
+                    {"child": ci, "index": 0, "verdict": "met",
+                     "evidence": "f.py:1"}
+                    for ci in range(len(children))
+                ])}
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        mock_cq = mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "code_review.scripts.code_quality.run_code_quality", mock_cq
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True, green_run="HEAD",
+            )
+        assert rc == 0
+
+    def test_sequential_child_screen_receives_block(self, monkeypatch):
+        """The sequential dispatch branch forwards the block."""
+        prompts: dict[str, str] = {}
+        self._run_cmd_issue(
+            [_phase1_child(1)], batch=False, prompts=prompts,
+            monkeypatch=monkeypatch,
+        )
+        assert "child:CHILD-1" in prompts
+        assert "GREEN-RUN ATTESTATION" in prompts["child:CHILD-1"]
+
+    def test_batched_child_screen_receives_block(self, monkeypatch):
+        """The opt-in batched dispatch branch forwards the block."""
+        prompts: dict[str, str] = {}
+        self._run_cmd_issue(
+            [_phase1_child(1), _phase1_child(2, "CHILD-2")], batch=True,
+            prompts=prompts, monkeypatch=monkeypatch,
+        )
+        assert "phase1_batch" in prompts
+        assert "GREEN-RUN ATTESTATION" in prompts["phase1_batch"]
 
 class TestGreenRunReportLine:
     """The persisted report records the accepted attestation (AC4)."""

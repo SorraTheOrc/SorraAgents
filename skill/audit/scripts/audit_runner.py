@@ -7371,6 +7371,7 @@ def _phase1_review_children_batched(
     runner: Runner,
     script_failure_callback: Callable[[str, Exception], None],
     ac_fallback_used: threading.Event | None = None,
+    green_run_block: str | None = None,
 ) -> dict[int, list[dict]]:
     """Screen ALL pending children's ACs in ONE indexed Phase 1 call.
 
@@ -7385,6 +7386,15 @@ def _phase1_review_children_batched(
     parseable at all — degrades that child's ACs to the conservative
     ``partial`` verdict, exactly as a failed single-child screen does. A
     batch can therefore never turn an unexamined AC into ``met``.
+
+    *green_run_block* is the resolved GREEN-RUN evidence block (operator
+    attestation, auto-verified cached full-suite run, or executed test-skill
+    run), or ``None`` when no evidence exists at the audited HEAD
+    (LP-0MVO35BF90021QY6). It is spliced immediately after the SCANNING block
+    — exactly as the parent Phase-1 and every Phase 2 prompt already do — so
+    an absent block leaves the prompt byte-identical and an execution-
+    dependent child AC can only be marked ``met`` against real evidence. The
+    block itself forbids executing the suite; the read-only mandate stands.
 
     Returns ``{child_index: [ac_result, ...]}`` for every pending child.
     Never raises: a Pi ``RuntimeError`` records a script failure and degrades
@@ -7439,6 +7449,7 @@ def _phase1_review_children_batched(
         f"for it.\n\n"
         f"{children_block}\n\n"
         f"{_SCANNING_BLOCK}"
+        f"{green_run_block or ''}"
         f"If a criterion has acceptable variance (implementation differs from "
         f"original spec but still satisfies user story intent), use verdict "
         f"'adjusted' instead of 'unmet'. Include justification in the "
@@ -7552,7 +7563,8 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                              timeout: int | None, runner: Runner,
                              script_failure_callback: Callable[[str, Exception], None],
                              ac_fallback_used: threading.Event | None = None,
-                             child_in_main_slot: bool = False
+                             child_in_main_slot: bool = False,
+                             green_run_block: str | None = None,
                              ) -> tuple[int, list[dict]]:
     """Phase 1 child AC review worker (P7, parallel-safe).
 
@@ -7574,6 +7586,15 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
     instruction; the child's ACs are marked pending main-session review.
     A later parent run reuses the child's persisted audit (freshness/child
     verdict reuse) with zero pi calls.
+
+    *green_run_block* (LP-0MVO35BF90021QY6) is the resolved GREEN-RUN evidence
+    block, or ``None`` when no evidence exists at the audited HEAD. It is
+    spliced immediately after the SCANNING block so the child screen judges
+    execution-dependent ACs on the same verified evidence the parent Phase-1
+    screen receives; an absent block leaves the prompt byte-identical and
+    such ACs stay ``partial`` (never a fabricated ``met``). The block reaches
+    the in-main-slot emitted prompt too, since that is the prompt the main
+    session executes.
 
     Never raises: a Pi ``RuntimeError`` records a script failure and falls
     back to diagnostic ``partial`` verdicts (identical to the historical
@@ -7603,6 +7624,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
             f"here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
             f"{_SCANNING_BLOCK}"
+            f"{green_run_block or ''}"
             f"If a criterion has acceptable variance (implementation differs from original "
             f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
             f"Include justification in the evidence field.\n\n"
@@ -11612,6 +11634,7 @@ def _reaudit_budget_exceeded_children(
             ctx.runner, ctx.record_script_failure,
             ac_fallback_used=ctx.ac_fallback_used,
             child_in_main_slot=ctx.child_in_main_slot,
+            green_run_block=ctx.green_run_block,
         )
         cr["ac_results"] = acs
         cr["child_audit_ready"] = False
@@ -12191,6 +12214,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                             pi_bin, debug_log, timeout,
                             runner, ctx.record_script_failure,
                             ac_fallback_used=ac_fallback_used,
+                            green_run_block=green_run_block,
                         )
                         for _ci, _acs in _batched.items():
                             child_results[_ci]["ac_results"] = _acs
@@ -12205,6 +12229,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     runner, ctx.record_script_failure,
                                     ac_fallback_used=ac_fallback_used,
                                     child_in_main_slot=ctx.child_in_main_slot,
+                                    green_run_block=green_run_block,
                                 )
                                 for ci, child in pending_children
                             ]
@@ -12220,6 +12245,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                                 child_in_main_slot=ctx.child_in_main_slot,
+                                green_run_block=green_run_block,
                             )
                             child_results[ci]["ac_results"] = acs
 
@@ -12735,6 +12761,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                             pi_bin, debug_log, timeout,
                             runner, ctx.record_script_failure,
                             ac_fallback_used=ac_fallback_used,
+                            green_run_block=green_run_block,
                         )
                         for _ci, _acs in _batched.items():
                             child_results[_ci]["ac_results"] = _acs
@@ -12749,6 +12776,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     runner, ctx.record_script_failure,
                                     ac_fallback_used=ac_fallback_used,
                                     child_in_main_slot=ctx.child_in_main_slot,
+                                    green_run_block=green_run_block,
                                 )
                                 for ci, child in pending_children
                             ]
@@ -12764,6 +12792,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                                 child_in_main_slot=ctx.child_in_main_slot,
+                                green_run_block=green_run_block,
                             )
                             child_results[ci]["ac_results"] = acs
 
