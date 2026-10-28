@@ -59,6 +59,28 @@ ROUTINE_TEXTS: frozenset[str] = frozenset({
     "no actions needed", "no producer action needed",
 })
 
+#: Optional lead-in phrasings that introduce a *routine workflow-progression*
+#: action ("next step: implement", "then run /skill:plan").
+#:
+#: Routine progression belongs in the report's ``Ready for <next_action>``
+#: conclusion line, never in ``## Producer Actions`` (SA-0MVNQ3RLW006XEFW).
+ROUTINE_STEP_LEADINS: tuple[str, ...] = ("next step", "then")
+
+#: Imperative verbs that signal routine workflow progression when followed by
+#: a workflow target.
+ROUTINE_STEP_VERBS: tuple[str, ...] = (
+    "run", "start", "begin", "proceed with", "continue with", "proceed to",
+    "review and proceed", "review and continue",
+)
+
+#: Workflow targets that make a verb phrase routine progression: the next
+#: skill (``/skill:<name>``, matched separately) or a known stage name.
+ROUTINE_STEP_TARGETS: tuple[str, ...] = (
+    "idea", "intake", "intake_complete", "plan", "planning",
+    "plan_complete", "implement", "implementation", "in_progress", "audit",
+    "review", "in_review", "release", "done", "the next stage",
+)
+
 #: Conservative aliases accepted for the ``status`` argument.
 _STATUS_ALIASES: dict[str, str] = {
     "success": "done", "succeeded": "done", "ok": "done", "complete": "done",
