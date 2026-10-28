@@ -81,6 +81,9 @@ try:
         icons_enabled,  # type: ignore[import-not-found]
         update_pane_title,  # type: ignore[import-not-found]
     )
+    from shared.herdr_pane import (
+        normalise_producer_actions as _shared_normalise_producer_actions,
+    )
 except ImportError:
     def derive_status(*_a, **_kw):  # type: ignore[no-redef]
         return "done"
@@ -90,6 +93,10 @@ except ImportError:
 
     def update_pane_title(*_a, **_kw):  # type: ignore[no-redef]
         return {"updated": False}
+
+    def _shared_normalise_producer_actions(value, default="None needed"):
+        # type: ignore[no-redef]
+        return default if not value or not str(value).strip() else str(value)
 
 # ─── Icon mappings (sourced from ContextHub) ───────────────────────────
 
@@ -360,6 +367,40 @@ def _derive_session_status(acceptance_criteria):
 
 # ─── Report rendering ──────────────────────────────────────────────────
 
+#: The rendered ``## Producer Actions`` placeholder when nothing is required.
+NONE_NEEDED = "None needed"
+
+
+def normalise_producer_actions(producer_actions):
+    """Collapse routine workflow progression to ``None needed``.
+
+    ``## Producer Actions`` carries only actions the producer must take to
+    complete the **current** stage (answer an open question, decide, approve,
+    supply access, perform a manual step). Routine progression — "run
+    /skill:<next>", "proceed to <next stage>", "review the brief, then …" —
+    belongs in the Conclusion's ``Ready for <next_action>`` line, so echoing it
+    here would falsely imply the producer is blocking (SA-0MVNQ3RLW006XEFW).
+
+    Classification is delegated to the single shared classifier
+    (:func:`shared.herdr_pane.normalise_producer_actions`) so the renderer and
+    the pane-status derivation can never disagree. Genuine blocking actions are
+    returned verbatim (prefer false negatives over hiding a real action).
+
+    When routine text is discarded, exactly one diagnostic naming that text is
+    written to stderr so the author sees the rewrite.
+    """
+    normalised = _shared_normalise_producer_actions(producer_actions)
+    original = "" if producer_actions is None else str(producer_actions)
+    if original.strip() and normalised != original:
+        print(
+            "render_report: discarded routine producer action "
+            f"(workflow progression belongs in 'Ready for <next_action>'): "
+            f"{original.strip()}",
+            file=sys.stderr,
+        )
+    return normalised
+
+
 def render_report(
     skill_name: str,
     work_item_id: str,
@@ -389,7 +430,9 @@ def render_report(
     metadata : dict
         Pre-computed metadata mapping (from ``render_metadata()``).
     producer_actions : str or None
-        Actions for the producer. Defaults to "None needed".
+        Actions for the producer, limited to what they must do to complete
+        the current stage. Defaults to "None needed"; routine workflow
+        progression is normalised away (see :func:`normalise_producer_actions`).
     notes : str or None
         Freeform agent commentary.
     next_action : str
@@ -410,6 +453,10 @@ def render_report(
 
     # Derive session status from AC verdicts
     status = _derive_session_status(acceptance_criteria)
+
+    # Routine workflow progression is not a producer action
+    # (SA-0MVNQ3RLW006XEFW): normalise before it reaches the report body.
+    producer_actions = normalise_producer_actions(producer_actions)
 
     # Header
     lines.append(f"# {status.title()} {skill_name}")
@@ -455,7 +502,7 @@ def render_report(
     lines.append("## Producer Actions")
     lines.append("")
     if not producer_actions or not producer_actions.strip():
-        lines.append("None needed")
+        lines.append(NONE_NEEDED)
     else:
         lines.append(producer_actions)
     lines.append("")
@@ -534,6 +581,10 @@ def apply_pane_status(
 
     Called at the end of the report render so the operator's pane grid shows
     a status prefix (``✅``/``⚠️``/``🚫`` or ``Done``/``Note``/``Attention``).
+    ``derive_status`` routes the producer actions through the shared
+    routine-next-step classifier (:func:`shared.herdr_pane.derive_status`), so
+    a routine next step yields ``done`` rather than ``note`` without this
+    function re-deriving (or re-diagnosing) the normalisation.
     Fail-open: never raises and never breaks a report.
     """
     try:
@@ -651,7 +702,11 @@ def main():
     parser.add_argument(
         "--producer-actions",
         default=None,
-        help="Actions for the producer (or omit for 'None needed').",
+        help=(
+            "Actions the producer must take to complete the CURRENT stage "
+            "(blocking only). Omit for 'None needed' — routine workflow "
+            "progression is discarded."
+        ),
     )
     parser.add_argument(
         "--notes",

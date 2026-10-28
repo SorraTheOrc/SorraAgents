@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MVSBD60M007L4WK
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 """
 Tests for the report renderer (skill/report/scripts/render_report.py).
 
@@ -1112,8 +1118,8 @@ class TestPaneStatusIntegration(unittest.TestCase):
 # ``Ready for <next_action>`` line, never in ``## Producer Actions``. The
 # classifier/normaliser is implemented by F1 (SA-0MVQ1QL5G007MLGM) and wired
 # into the renderer by F2 (SA-0MVQ1QLP6005MRCH); these tests are written first
-# (TDD) and marked ``xfail(strict=False)`` while the behaviour is absent, so
-# the tree stays green. Each reason names the child that implements it.
+# Normalisation is implemented by F2 (SA-0MVQ1QLP6005MRCH) on top of the
+# shared classifier from F1 (SA-0MVQ1QL5G007MLGM).
 
 ROUTINE_PRODUCER_ACTIONS = [
     "Proceed to /skill:plan",
@@ -1127,7 +1133,6 @@ BLOCKING_PRODUCER_ACTIONS = [
     "Approve the remediation list in comment #4",
 ]
 
-_F2 = "requires F2 (SA-0MVQ1QLP6005MRCH): renderer normalisation"
 _PRODUCER_ACTIONS_HEADING = "## Producer Actions"
 
 
@@ -1167,7 +1172,6 @@ class TestProducerActionsNormalisation:
     """Routine next steps collapse to ``None needed`` (parent AC2/AC3)."""
 
     @pytest.mark.parametrize("text", ROUTINE_PRODUCER_ACTIONS)
-    @pytest.mark.xfail(reason=_F2, strict=False)
     def test_routine_text_renders_exactly_none_needed(self, text):
         report, _ = _render(text)
         assert _section_body(report, _PRODUCER_ACTIONS_HEADING) == "None needed"
@@ -1175,7 +1179,6 @@ class TestProducerActionsNormalisation:
         assert text not in report
 
     @pytest.mark.parametrize("text", ROUTINE_PRODUCER_ACTIONS)
-    @pytest.mark.xfail(reason=_F2, strict=False)
     def test_routine_text_emits_single_stderr_diagnostic_naming_text(self, text):
         _, stderr = _render(text)
         diagnostics = [ln for ln in stderr.splitlines() if ln.strip()]
@@ -1209,7 +1212,6 @@ class TestProducerActionsNormalisation:
         report, _ = _render("Proceed to /skill:plan", notes="Assumption: X")
         assert _section_body(report, "## Notes") == "Assumption: X"
 
-    @pytest.mark.xfail(reason=_F2, strict=False)
     def test_json_path_normalises_routine_producer_actions(self):
         """The ``--json`` stdin path shares the same normalisation (F2 AC1)."""
         import render_report as rr
@@ -1252,7 +1254,6 @@ class TestPaneStatusNormalisation:
                 rr.main()
         return pane
 
-    @pytest.mark.xfail(reason=_F2, strict=False)
     def test_routine_producer_actions_update_pane_done(self):
         pane = self._run_cli(
             ["--producer-actions", "Proceed to /skill:plan"],
