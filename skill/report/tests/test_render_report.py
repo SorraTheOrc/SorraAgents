@@ -15,8 +15,10 @@ import os
 import sys
 import textwrap
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
+
+import pytest
 
 # Ensure the scripts directory is on the path so we can import the renderer.
 SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), '..', 'scripts')
@@ -1102,6 +1104,168 @@ class TestPaneStatusIntegration(unittest.TestCase):
         pane, _ = self._run_cli(
             ["--no-icons"], ac=["Ok|tests|met"])
         self.assertFalse(pane.call_args.kwargs.get("use_icons"))
+
+
+# ─── Producer Actions normalisation (parent AC2/AC3) ─────────────────────
+#
+# Routine workflow progression belongs in the Conclusion's
+# ``Ready for <next_action>`` line, never in ``## Producer Actions``. The
+# classifier/normaliser is implemented by F1 (SA-0MVQ1QL5G007MLGM) and wired
+# into the renderer by F2 (SA-0MVQ1QLP6005MRCH); these tests are written first
+# (TDD) and marked ``xfail(strict=False)`` while the behaviour is absent, so
+# the tree stays green. Each reason names the child that implements it.
+
+ROUTINE_PRODUCER_ACTIONS = [
+    "Proceed to /skill:plan",
+    "Review the intake brief and then run /skill:plan",
+    "Next step: implement",
+]
+
+BLOCKING_PRODUCER_ACTIONS = [
+    "Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP "
+    "before /skill:plan can start",
+    "Approve the remediation list in comment #4",
+]
+
+_F2 = "requires F2 (SA-0MVQ1QLP6005MRCH): renderer normalisation"
+_PRODUCER_ACTIONS_HEADING = "## Producer Actions"
+
+
+def _section_body(report, heading):
+    """Return the trimmed body of *heading* up to the next ``## `` heading."""
+    lines = report.split("\n")
+    assert heading in lines, f"missing section {heading!r} in report"
+    body = []
+    for line in lines[lines.index(heading) + 1:]:
+        if line.startswith("## "):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _render(producer_actions, notes=None, next_action="review"):
+    """Render directly and capture stderr diagnostics."""
+    import render_report as rr
+
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        report = rr.render_report(
+            skill_name="intake",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="Did the thing.",
+            acceptance_criteria=[("1", "AC one", "test", "met")],
+            metadata={},
+            producer_actions=producer_actions,
+            notes=notes,
+            next_action=next_action,
+        )
+    return report, stderr.getvalue()
+
+
+class TestProducerActionsNormalisation:
+    """Routine next steps collapse to ``None needed`` (parent AC2/AC3)."""
+
+    @pytest.mark.parametrize("text", ROUTINE_PRODUCER_ACTIONS)
+    @pytest.mark.xfail(reason=_F2, strict=False)
+    def test_routine_text_renders_exactly_none_needed(self, text):
+        report, _ = _render(text)
+        assert _section_body(report, _PRODUCER_ACTIONS_HEADING) == "None needed"
+        # The routine text is not echoed anywhere in the report.
+        assert text not in report
+
+    @pytest.mark.parametrize("text", ROUTINE_PRODUCER_ACTIONS)
+    @pytest.mark.xfail(reason=_F2, strict=False)
+    def test_routine_text_emits_single_stderr_diagnostic_naming_text(self, text):
+        _, stderr = _render(text)
+        diagnostics = [ln for ln in stderr.splitlines() if ln.strip()]
+        assert len(diagnostics) == 1, f"expected one diagnostic, got {stderr!r}"
+        assert stderr.count(text) == 1
+
+    @pytest.mark.parametrize("text", BLOCKING_PRODUCER_ACTIONS)
+    def test_blocking_actions_render_verbatim(self, text):
+        report, stderr = _render(text)
+        assert _section_body(report, _PRODUCER_ACTIONS_HEADING) == text
+        assert stderr.strip() == ""
+
+    def test_routine_clause_with_blocking_condition_renders_verbatim(self):
+        text = "Run /skill:plan after you approve the migration"
+        report, stderr = _render(text)
+        assert _section_body(report, _PRODUCER_ACTIONS_HEADING) == text
+        assert stderr.strip() == ""
+
+    def test_none_needed_is_rendered_without_diagnostic(self):
+        report, stderr = _render("None needed")
+        assert _section_body(report, _PRODUCER_ACTIONS_HEADING) == "None needed"
+        assert stderr.strip() == ""
+
+    @pytest.mark.parametrize("value", [None, "", "   "])
+    def test_absent_producer_actions_render_none_needed(self, value):
+        report, stderr = _render(value)
+        assert _section_body(report, _PRODUCER_ACTIONS_HEADING) == "None needed"
+        assert stderr.strip() == ""
+
+    def test_notes_are_never_normalised(self):
+        report, _ = _render("Proceed to /skill:plan", notes="Assumption: X")
+        assert _section_body(report, "## Notes") == "Assumption: X"
+
+    @pytest.mark.xfail(reason=_F2, strict=False)
+    def test_json_path_normalises_routine_producer_actions(self):
+        """The ``--json`` stdin path shares the same normalisation (F2 AC1)."""
+        import render_report as rr
+
+        argv = [
+            "render_report.py", "--json", "--skill-name", "intake",
+            "--producer-actions", "Proceed to /skill:plan",
+        ]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        pane = mock.patch.object(
+            rr, "update_pane_title", return_value={"updated": False})
+        with mock.patch.object(rr.sys, "argv", argv), \
+                mock.patch.object(
+                    rr.sys, "stdin", io.StringIO(PASSING_ENVELOPE_JSON)), \
+                pane, redirect_stdout(stdout), redirect_stderr(stderr):
+            rr.main()
+        body = _section_body(stdout.getvalue(), _PRODUCER_ACTIONS_HEADING)
+        assert body == "None needed"
+        diagnostics = [ln for ln in stderr.getvalue().splitlines() if ln.strip()]
+        assert len(diagnostics) == 1
+
+
+class TestPaneStatusNormalisation:
+    """Routine next steps must not produce the ⚠️ ``note`` pane state (T2)."""
+
+    def _run_cli(self, extra_argv, *, ac=None):
+        import render_report as rr
+
+        argv = ["render_report.py", "SA-0TEST0000000001",
+                "--skill-name", "intake", *(extra_argv or [])]
+        for row in ac or []:
+            argv += ["--ac", row]
+        pane_patcher = mock.patch.object(
+            rr, "update_pane_title", return_value={"updated": True})
+        with mock.patch.object(rr.sys, "argv", argv), \
+                mock.patch.object(rr, "render_from_wl", return_value="# report"), \
+                pane_patcher as pane:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+                rr.main()
+        return pane
+
+    @pytest.mark.xfail(reason=_F2, strict=False)
+    def test_routine_producer_actions_update_pane_done(self):
+        pane = self._run_cli(
+            ["--producer-actions", "Proceed to /skill:plan"],
+            ac=["All good|tests|met"],
+        )
+        assert pane.call_args.args[0] == "done"
+
+    def test_blocking_producer_actions_update_pane_note(self):
+        pane = self._run_cli(
+            ["--producer-actions", "Approve the remediation list in comment #4"],
+            ac=["All good|tests|met"],
+        )
+        assert pane.call_args.args[0] == "note"
 
 
 if __name__ == "__main__":

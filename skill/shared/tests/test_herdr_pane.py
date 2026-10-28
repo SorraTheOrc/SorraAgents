@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _SKILLS_ROOT = REPO_ROOT / "skill"
 if str(_SKILLS_ROOT) not in sys.path:
@@ -132,6 +134,130 @@ class TestDeriveStatus:
         status = herdr_pane.derive_status(
             [("1", "works", "test", "MET")], None, None)
         assert status == "done"
+
+
+# ---------------------------------------------------------------------------
+# Routine next-step classification (SA-0MVNQ3RLW006XEFW, test item
+# SA-0MVQ1QKLN007S1BW).
+#
+# Routine workflow progression ("run /skill:<next>", "proceed to <stage>",
+# "review the brief, then …") belongs in the Conclusion's
+# ``Ready for <next_action>`` line, never in ``## Producer Actions``. The same
+# shared classifier feeds the report renderer and the pane-status derivation so
+# a routine next step never produces the ⚠️ ``note`` state.
+#
+# The classifier/normaliser is implemented by F1 (SA-0MVQ1QL5G007MLGM); these
+# tests are written first (TDD) and are marked ``xfail(strict=False)`` while
+# the implementation is absent, so the tree stays green. Each ``xfail`` reason
+# records which child implements the behaviour it pins.
+# ---------------------------------------------------------------------------
+
+#: Texts that are *solely* routine workflow progression.
+ROUTINE_PHRASINGS = (
+    "Proceed to /skill:plan",
+    "Review the intake brief and then run /skill:plan",
+    "Next step: implement",
+    "Run /skill:audit",
+    "Then run /skill:ship",
+    "Proceed with implementation",
+    "Continue with planning",
+)
+
+#: Texts carrying a genuine blocking action (or an ambiguous clause). These
+#: must never be classified as routine (prefer false negatives over hiding a
+#: real producer action).
+BLOCKING_PHRASINGS = (
+    "Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP before "
+    "/skill:plan can start",
+    "Approve the remediation list in comment #4",
+    "Please review the PR",
+    "Choose option A or B",
+    "Supply the missing API token so /skill:audit can run",
+    # A routine clause followed by a blocking condition: all clauses must match
+    # for the text to count as routine.
+    "Run /skill:plan after you approve the migration",
+)
+
+_F1 = "requires F1 (SA-0MVQ1QL5G007MLGM): shared routine-next-step classifier"
+
+
+class TestIsRoutineNextStep:
+    """``is_routine_next_step`` recognises routine workflow progression only."""
+
+    @pytest.mark.parametrize("text", ROUTINE_PHRASINGS)
+    @pytest.mark.xfail(reason=_F1, strict=False)
+    def test_routine_phrasing_is_routine(self, text):
+        assert herdr_pane.is_routine_next_step(text) is True
+
+    @pytest.mark.parametrize("text", BLOCKING_PHRASINGS)
+    @pytest.mark.xfail(reason=_F1, strict=False)
+    def test_blocking_or_ambiguous_phrasing_is_not_routine(self, text):
+        assert herdr_pane.is_routine_next_step(text) is False
+
+    @pytest.mark.xfail(reason=_F1 + " (None needed is not a next step)", strict=False)
+    def test_none_needed_is_not_a_next_step(self):
+        assert herdr_pane.is_routine_next_step("None needed") is False
+
+    @pytest.mark.xfail(reason=_F1, strict=False)
+    def test_empty_text_is_not_routine(self):
+        assert herdr_pane.is_routine_next_step("") is False
+
+    @pytest.mark.xfail(reason=_F1, strict=False)
+    def test_none_is_not_routine(self):
+        """Fail-open: a missing value is never claimed to be routine."""
+        assert herdr_pane.is_routine_next_step(None) is False
+
+
+class TestNormaliseProducerActions:
+    """``normalise_producer_actions`` collapses routine-only text."""
+
+    @pytest.mark.parametrize("text", ROUTINE_PHRASINGS)
+    @pytest.mark.xfail(reason=_F1, strict=False)
+    def test_routine_text_becomes_none_needed(self, text):
+        assert herdr_pane.normalise_producer_actions(text) == "None needed"
+
+    @pytest.mark.parametrize("text", BLOCKING_PHRASINGS)
+    @pytest.mark.xfail(reason=_F1, strict=False)
+    def test_blocking_text_is_returned_verbatim(self, text):
+        assert herdr_pane.normalise_producer_actions(text) == text
+
+    @pytest.mark.xfail(reason=_F1, strict=False)
+    def test_none_needed_is_unchanged(self):
+        """The default value is already correct — no rewrite, no diagnostic."""
+        assert herdr_pane.normalise_producer_actions("None needed") == "None needed"
+
+
+#: Route producer actions through the shared classifier so routine-only text
+#: yields ``done`` rather than ⚠️ ``note`` (parent AC4, F1 AC3).
+_MEET_AC = [("1", "works", "test", "met")]
+
+
+class TestRoutineNextStepStatus:
+    """Routine next steps never raise the ⚠️ ``note`` pane state."""
+
+    @pytest.mark.parametrize("text", ROUTINE_PHRASINGS)
+    @pytest.mark.xfail(reason=_F1, strict=False)
+    def test_routine_producer_actions_derive_done(self, text):
+        assert herdr_pane.derive_status(_MEET_AC, text, None) == "done"
+
+    @pytest.mark.parametrize("text", BLOCKING_PHRASINGS)
+    def test_blocking_producer_actions_still_derive_note(self, text):
+        assert herdr_pane.derive_status(_MEET_AC, text, None) == "note"
+
+    def test_none_needed_still_derives_done(self):
+        assert herdr_pane.derive_status(_MEET_AC, "None needed", None) == "done"
+
+    def test_routine_actions_with_substantive_notes_still_note(self):
+        """Normalising producer actions must not suppress real notes."""
+        assert herdr_pane.derive_status(
+            _MEET_AC, "Proceed to /skill:plan", "Assumption: X") == "note"
+
+    def test_unmet_ac_still_attention(self):
+        assert herdr_pane.derive_status(
+            [("1", "works", "test", "unmet")],
+            "Proceed to /skill:plan",
+            None,
+        ) == "attention"
 
 
 # ---------------------------------------------------------------------------
