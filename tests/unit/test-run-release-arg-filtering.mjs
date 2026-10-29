@@ -15,9 +15,9 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
@@ -99,7 +99,7 @@ describe('run-release: releaseScriptForwardArgs', () => {
  * @returns {{ status: number|null, recordFile: string, recorded: string }}
  */
 function runRunReleaseWithRecordingScript(cliArgs) {
-  const tmpDir = mkdtempSync(join(tmpdir(), 'run-release-argfilter-'));
+  const tmpDir = makeTempDir('run-release-argfilter-');
   const recordFile = join(tmpDir, 'merge-args.txt');
 
   const skillScriptDir = join(tmpDir, 'skill', 'ship', 'scripts');

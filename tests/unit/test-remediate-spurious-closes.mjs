@@ -11,9 +11,9 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { tmpdir } from 'node:os';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -170,7 +170,7 @@ describe('remediateSpuriousCloses', () => {
 
 describe('remediateSpuriousCloses CLI (mocked wl on PATH)', () => {
   test('deletes spurious comments and restores items via the real CLI wiring', () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'remediate-spurious-test-'));
+    const tmpDir = makeTempDir('remediate-spurious-test-');
     const binDir = join(tmpDir, 'bin');
     mkdirSync(binDir, { recursive: true });
 

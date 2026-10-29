@@ -20,9 +20,9 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
@@ -62,7 +62,7 @@ function runRunRelease(opts = {}) {
     cwd,
   } = opts;
 
-  const tmpDir = mkdtempSync(join(tmpdir(), 'run-release-test-'));
+  const tmpDir = makeTempDir('run-release-test-');
 
   // Recreate the skill directory layout that run-release.js expects:
   // <tmp>/skill/ship/scripts/run-release.js

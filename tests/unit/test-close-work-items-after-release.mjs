@@ -703,11 +703,11 @@ test('close-work-items: release-process.md mentions producer-review filtering', 
 // release close completes in a single pass instead of leaving items dangling.
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 
 test('close-work-items: wl close is invoked with --force for candidates', () => {
-  const tmpDir = mkdtempSync(join(tmpdir(), 'close-work-items-force-test-'));
+  const tmpDir = makeTempDir('close-work-items-force-test-');
 
   // Mock `wl` on PATH: answers the candidate queries used by
   // getCandidateItems() and records every `wl close` invocation.

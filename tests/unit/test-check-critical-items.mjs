@@ -14,9 +14,9 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 import { fileURLToPath } from 'node:url';
 import { spawnSync, execSync } from 'node:child_process';
 
@@ -44,7 +44,7 @@ function runCheckCriticalItems(opts = {}) {
     wlCriticalItems, // array of work items, or null to simulate wl not found
   } = opts;
 
-  const tmpDir = mkdtempSync(join(tmpdir(), 'check-critical-items-test-'));
+  const tmpDir = makeTempDir('check-critical-items-test-');
 
   // Copy the check-critical-items.js module into the tmp dir
   const testModulePath = join(tmpDir, 'check-critical-items.js');

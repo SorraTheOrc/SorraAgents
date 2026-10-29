@@ -26,9 +26,8 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { parseReleaseArgs, WRAPPER_USAGE, isNewlyCreatedTag } from '../../skill/ship/scripts/run-release.js';
@@ -38,6 +37,9 @@ import {
   DISCORD_NOTIFY_LOG_ENV,
   writeStubDiscordNotify,
 } from '../helpers/release-notify-stub.mjs';
+// Temp dirs are created via the shared helper so every harness sandbox is
+// removed on process exit (no /tmp quota leak, SA-0MVTSV5SO008625I).
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
@@ -69,7 +71,7 @@ const DEP_FILES = [
  * @returns {{ tmpDir: string, runReleasePath: string, logs: object }}
  */
 function buildLayout(opts = {}) {
-  const tmpDir = mkdtempSync(join(tmpdir(), 'run-release-failfast-'));
+  const tmpDir = makeTempDir('run-release-failfast-');
   const skillScriptDir = join(tmpDir, 'skill', 'ship', 'scripts');
   mkdirSync(skillScriptDir, { recursive: true });
 

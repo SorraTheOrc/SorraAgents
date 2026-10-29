@@ -124,7 +124,32 @@ The regression guard fails the suite if a test mutates the live checkout:
 see the [test skill](../test/SKILL.md#live-repo-mutation-guard-detect-only)
 and [`tests/test_live_repo_mutation_guard.py`](../../tests/test_live_repo_mutation_guard.py).
 
-### 8. Unmocked Audit / Suite Subprocess Spawns
+### 9. Leaking Temp Artefacts
+
+**What it looks like:** A node test harness creates a sandbox tree via
+`mkdtempSync(join(tmpdir(), …))` (a fake skill layout, git fixture, webhook
+config tree) and never removes it — no `after` hook, no `rmSync`.
+
+**Why it's bad:** `/tmp` here is a tmpfs with a per-user quota. Every
+full-suite run leaves thousands of unremoved directories behind; the
+accumulation eventually exhausts the quota and a later run fails with an
+opaque `Unknown system error -122` (EDQUOT) on whichever test happens to write
+next (2026-10-29, `run-release: --help is side-effect free`, SA-0MVTSV5SO008625I).
+
+**Fix:** Route temp-dir creation through the shared helper
+[`tests/helpers/temp-dir.mjs`](../../tests/helpers/temp-dir.mjs) —
+`makeTempDir(prefix)` registers the directory for removal on process exit and
+wraps quota/space failures in an actionable diagnostic. Alternatively, remove
+the directory in an `after()` hook:
+
+```js
+import { after } from 'node:test';
+
+const dir = mkdtempSync(join(tmpdir(), 'my-harness-'));
+after(() => rmSync(dir, { recursive: true, force: true }));
+```
+
+### 10. Unmocked Audit / Suite Subprocess Spawns
 
 **What it looks like:** A test exercises the audit's child-audit cascade
 (`--audit-children`) or any other path that calls `subprocess.run` to spawn a
@@ -180,6 +205,11 @@ with mock.patch.object(audit_runner.subprocess, "run",
    the repo-root [`conftest.py`](../../conftest.py)) fails the session if a test
    mutates the checkout.
 8. **Tests that reach the audit child-cascade / suite subprocess must mock
-   `audit_runner.subprocess.run`** (see anti-pattern 8) so no real
+   `audit_runner.subprocess.run`** (see anti-pattern 10) so no real
    `audit_runner.py issue` child is spawned; assert the mocked invocation
    instead.
+9. **Harness sandboxes are removed when the test finishes.** Prefer
+   [`tests/helpers/temp-dir.mjs`](../../tests/helpers/temp-dir.mjs)
+   (`makeTempDir`) so exit-time cleanup is automatic; at minimum delete the
+   directory in an `after()` hook. Never leave `mkdtempSync` trees behind
+   (anti-pattern 9).

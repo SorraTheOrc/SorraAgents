@@ -24,14 +24,14 @@ import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   NUMPY_STUB,
   MISSING_NUMPY_STUB,
 } from "../helpers/voice-python-stubs.mjs";
+import { makeTempDir } from "../helpers/temp-dir.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(__dirname, "..", "..", "pi-client", "voice-input", "whisper_worker.py");
@@ -64,7 +64,7 @@ class WhisperModel:
 let stubDir;
 
 before(() => {
-  stubDir = mkdtempSync(join(tmpdir(), "voice-whisper-stub-"));
+  stubDir = makeTempDir("voice-whisper-stub-");
   writeFileSync(join(stubDir, "faster_whisper.py"), STUB, "utf8");
   writeFileSync(join(stubDir, "numpy.py"), NUMPY_STUB, "utf8");
   // An empty dir used to simulate faster-whisper being absent.
