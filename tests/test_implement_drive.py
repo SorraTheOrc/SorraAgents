@@ -213,7 +213,9 @@ class TestDriveCompletion:
         ]
         # Parent was re-run after each child and once more to advance.
         assert len(runner.calls) == 3
-        assert [e["result"] for e in report["children_driven"]] == ["ok", "ok"]
+        assert [e["result"] for e in report["children_driven"]] == [
+            "finished", "finished",
+        ]
 
     def test_each_spawn_carries_a_clean_guarded_environment(
         self, implement_mod,
@@ -359,8 +361,8 @@ class TestTimeoutReconciliation:
         assert report["sessions_spawned"] == 2
         first, second = report["children_driven"]
         assert first["result"] != "failed"
-        assert first["result"] in {"ok", "completed-late"}
-        assert second["result"] == "ok"
+        assert first["result"] in {"finished", "completed-late"}
+        assert second["result"] == "finished"
         assert len(runner.calls) == 3
 
     def test_non_terminal_child_timed_out_still_fails_hard(

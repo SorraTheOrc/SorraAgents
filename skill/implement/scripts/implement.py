@@ -6419,6 +6419,138 @@ def _reconcile_finish_failure(
     return result
 
 
+def _reset_child_worktree(
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any]:
+    """Reset a child's **own** worktree to the parent-branch HEAD.
+
+    Used by the drive recovery path after a child's ``finish`` exhausted its
+    attempts: the abandoned WIP leaves a dirty worktree that makes every
+    subsequent drive re-run the identical failing ``finish`` (the livelock
+    reproduced on AH-0MV9DB68T002IROX). Resetting the worktree to the
+    parent-branch HEAD restores a clean startable state so the next loop
+    iteration can start a fresh session (SA-0MVLJXVND0015LPW).
+
+    Isolation gates — the reset only ever touches the child's own worktree:
+
+    1. the path exists and is a **linked git worktree** (``.git`` is a file);
+       a main checkout (``.git`` directory) is refused outright;
+    2. ``git rev-parse --show-toplevel`` inside the path resolves to the path
+       itself, so a nested/shared path can never be reset;
+    3. only ``git reset --hard <parent_branch>`` and ``git clean -fd`` run —
+       the clean is never run on a shared/main path.
+
+    ``git clean -fd`` deliberately omits ``-x``: ignored files (notably the
+    ``node_modules`` symlink) survive the reset.
+
+    Args:
+        worktree_path: The child's worktree path (never the main checkout).
+        parent_branch: Ref to reset to (default: ``dev``).
+
+    Returns:
+        A dict with ``success`` (bool), ``reset`` (bool), ``ref`` (the ref
+        reset to) and ``reason`` (failure explanation, empty on success).
+    """
+    result: dict[str, Any] = {
+        "success": False,
+        "reset": False,
+        "ref": parent_branch,
+        "reason": "",
+    }
+    if not worktree_path:
+        result["reason"] = "no worktree path available for the child"
+        return result
+
+    wt = Path(worktree_path)
+    if not wt.exists():
+        result["reason"] = f"worktree path does not exist: {worktree_path}"
+        return result
+    if not _is_worktree(wt):
+        result["reason"] = (
+            f"refusing to reset {worktree_path}: it is not a linked git "
+            "worktree (main-checkout reset is forbidden)"
+        )
+        return result
+
+    top = run_cmd(
+        ["git", "-C", str(wt), "rev-parse", "--show-toplevel"], check=False,
+    )
+    top_path = Path(top.stdout.strip()) if top.stdout.strip() else None
+    if (
+        top.returncode != 0
+        or top_path is None
+        or top_path.resolve() != wt.resolve()
+    ):
+        result["reason"] = (
+            f"refusing to reset {worktree_path}: git reports a different "
+            "worktree root"
+        )
+        return result
+
+    reset = run_cmd(
+        ["git", "-C", str(wt), "reset", "--hard", parent_branch],
+        check=False,
+    )
+    if reset.returncode != 0:
+        result["reason"] = (
+            f"git reset --hard {parent_branch} failed: "
+            f"{(reset.stderr or '').strip()}"
+        )
+        return result
+
+    clean = run_cmd(["git", "-C", str(wt), "clean", "-fd"], check=False)
+    if clean.returncode != 0:
+        result["reason"] = (
+            f"git clean -fd failed: {(clean.stderr or '').strip()}"
+        )
+        return result
+
+    result["success"] = True
+    result["reset"] = True
+    result["cleaned"] = (clean.stdout or "").strip()
+    return result
+
+
+def _reset_for_retry_comment(
+    child_id: str,
+    finish_attempts: int,
+    failure_message: str,
+    reconciliation: dict[str, Any],
+    reset_result: dict[str, Any],
+) -> str:
+    """Build the audit comment recording a reset-for-retry recovery.
+
+    The comment is the durable record that a child owner's WIP was discarded
+    and why: the finish failure reason, the number of failed finish attempts,
+    the child's non-terminal state and the exact reset performed.
+    """
+    cleaned = reset_result.get("cleaned") or ""
+    lines = [
+        f"Drive reset this child for a clean retry (`{child_id}`).",
+        "",
+        f"- Failed `finish` attempts: {finish_attempts}",
+        (
+            f"- Child state before reset: "
+            f"{reconciliation.get('evidence') or 'unknown'}"
+        ),
+        f"- Failure reason: {failure_message or 'unspecified'}",
+        (
+            f"- Worktree reset to: `{reset_result.get('ref')}` "
+            "(`git reset --hard`, then `git clean -fd`)"
+        ),
+        "",
+        (
+            "Uncommitted WIP in the child's worktree was discarded so the "
+            "next drive iteration can start a fresh session. Restore it from "
+            "the abandoned session's log if it is still needed."
+        ),
+    ]
+    if cleaned:
+        lines.insert(6, f"- Removed by `git clean`: {cleaned.replace(chr(10), ', ')}")
+    return "\n".join(lines)
+
+
 def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     """Emit a drive report as JSON or a concise human summary."""
     if json_output:
@@ -6433,7 +6565,7 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     print("=" * 60)
     for entry in report.get("children_driven", []):
         result = entry.get("result")
-        if result == "ok":
+        if result == "finished":
             icon = "✅"
         elif result == "completed-late":
             # The session was killed at the per-child timeout but the child
@@ -6449,6 +6581,11 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             # terminal state: recorded as done, never reset
             # (SA-0MVLJXTYY005XQDV).
             icon = "🕓"
+        elif result == "reset-for-retry":
+            # A non-terminal child's abandoned worktree was reset to the
+            # parent-branch HEAD so a fresh session can retry it
+            # (SA-0MVLJXVND0015LPW).
+            icon = "♻"
         else:
             icon = "❌"
         print(
@@ -6467,6 +6604,8 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         print(
             f"  Terminal-reconciled: {report['terminal_reconciled']}"
         )
+    if report.get("reset_for_retry"):
+        print(f"  Reset for retry: {report['reset_for_retry']}")
     if report.get("finalised_children"):
         print(f"  Finalised stranded: {len(report['finalised_children'])}")
     if report.get("stranded_children"):
@@ -6853,6 +6992,17 @@ def phase_drive(
     loop continues; only a genuinely non-terminal child keeps the hard
     failure. Terminal children are never finished, reset or re-spawned.
 
+    A non-terminal child whose finish bound is exhausted is recovered instead
+    of livelocking (SA-0MVLJXVND0015LPW): its **own** worktree is reset to the
+    parent-branch HEAD (``git reset --hard <parent_branch>`` + ``git clean
+    -fd``, isolation-gated so the main checkout can never be touched) and its
+    status is set back to ``open`` through :class:`StatusLifecycle`, with an
+    audit comment recording the failure reason, the finish-attempt count and
+    the reset performed. The loop then continues, so the next iteration
+    starts a fresh session for that child. The reset runs at most once per
+    child per drive invocation: a second exhaustion after a successful reset
+    stops the chain (bounded, truthful) rather than resetting forever.
+
     Args:
         work_item_id: The parent work item ID.
         json_output: If True, emit JSON.
@@ -6894,7 +7044,9 @@ def phase_drive(
         finish executions observed, and ``finish_attempt_limit`` reports the
         bound applied (SA-0MVLJXS7R000XIFL). ``terminal_reconciled`` counts
         children recorded as done after their finish failed
-        (SA-0MVLJXTYY005XQDV).
+        (SA-0MVLJXTYY005XQDV); ``reset_for_retry`` counts non-terminal
+        children whose worktree was reset for a fresh session
+        (SA-0MVLJXVND0015LPW).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -6905,6 +7057,7 @@ def phase_drive(
         "children_driven": [],
         "completed_late": 0,
         "terminal_reconciled": 0,
+        "reset_for_retry": 0,
         "finish_attempts": {},
         "finish_attempt_limit": None,
         "message": "",
@@ -6972,6 +7125,7 @@ def phase_drive(
 
     attempts: dict[str, int] = {}
     finish_attempts: dict[str, int] = {}
+    reset_cids: set[str] = set()
     driven: list[dict[str, Any]] = []
     stranded_comment_posted = False
     finaliser = finalise_child or _finalise_stranded_child
@@ -7077,24 +7231,105 @@ def phase_drive(
                         reconciliation["evidence"],
                     )
                     continue
-                LOG.error(
-                    "Child %s finish failed %d time(s), exhausting the "
-                    "finish-attempt bound (%d); the child is still "
-                    "non-terminal (%s); stopping the drive chain.",
+                # Non-terminal: break the livelock by resetting the child to a
+                # clean startable state and letting the loop continue so the
+                # next iteration starts a fresh session
+                # (SA-0MVLJXVND0015LPW). The reset is bounded to once per
+                # child per drive invocation: a second exhaustion after the
+                # reset stops the chain instead of resetting forever.
+                if failed_cid in reset_cids:
+                    LOG.error(
+                        "Child %s finish failed again after its worktree "
+                        "was already reset in this drive invocation; "
+                        "stopping the drive chain.",
+                        failed_cid,
+                    )
+                    report["message"] = (
+                        f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                        f"(finish-attempt bound {finish_attempt_limit} "
+                        f"exhausted again after a reset; child is still "
+                        f"non-terminal: "
+                        f"{reconciliation['evidence'] or 'state unreadable'})."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
+                reset_worktree = (
+                    parent_report.get("worktree_path")
+                    or _discover_worktree(failed_cid)
+                    or ""
+                )
+                reset_result = _reset_child_worktree(
+                    reset_worktree, parent_branch,
+                )
+                if not reset_result["success"]:
+                    LOG.error(
+                        "Refusing to reset child %s: %s",
+                        failed_cid, reset_result["reason"],
+                    )
+                    report["message"] = (
+                        f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                        f"(finish-attempt bound {finish_attempt_limit} "
+                        f"exhausted; child is still non-terminal: "
+                        f"{reconciliation['evidence'] or 'state unreadable'}; "
+                        f"recovery reset refused: {reset_result['reason']})."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
+                reset_cids.add(failed_cid)
+                # Record the discard *before* changing the status, so the
+                # child owner's WIP is never discarded silently.
+                wl_add_comment(
                     failed_cid,
+                    _reset_for_retry_comment(
+                        failed_cid,
+                        finish_attempts[failed_cid],
+                        str(parent_report.get("message", "") or ""),
+                        reconciliation,
+                        reset_result,
+                    ),
+                )
+                try:
+                    StatusLifecycle.update_status(
+                        failed_cid, "open", assignee="",
+                    )
+                except RuntimeError as exc:
+                    LOG.error(
+                        "Failed to reset child %s to open after its "
+                        "worktree reset: %s", failed_cid, exc,
+                    )
+                    report["message"] = (
+                        f"Child {failed_cid} worktree was reset to "
+                        f"{reset_result['ref']} but its status could not be "
+                        f"set to open ({exc}); stopping the drive chain."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
+                driven.append({
+                    "id": failed_cid,
+                    "result": "reset-for-retry",
+                    "reset": True,
+                    "status": "open",
+                    "stage": reconciliation["stage"],
+                    "finish_attempts": finish_attempts[failed_cid],
+                    "evidence": reconciliation["evidence"],
+                    "reason": (
+                        f"finish failed {finish_attempts[failed_cid]} "
+                        f"time(s); worktree reset to {reset_result['ref']} "
+                        "and the child queued for a fresh session."
+                    ),
+                })
+                report["reset_for_retry"] = (
+                    report.get("reset_for_retry", 0) + 1
+                )
+                LOG.info(
+                    "Reset child %s worktree to %s after %d failed finish "
+                    "attempt(s); continuing the drive loop with a fresh "
+                    "session.",
+                    failed_cid,
+                    reset_result["ref"],
                     finish_attempts[failed_cid],
-                    finish_attempt_limit,
-                    reconciliation["evidence"] or "state unreadable",
                 )
-                report["message"] = (
-                    f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
-                    f"(finish-attempt bound {finish_attempt_limit} exhausted "
-                    f"after {finish_attempts[failed_cid]} attempt(s); child "
-                    f"is still non-terminal: "
-                    f"{reconciliation['evidence'] or 'state unreadable'})."
-                )
-                report["failed_child"] = failed_cid
-                break
+                continue
             report["message"] = parent_report.get(
                 "message",
                 f"Phase parent reported a failure for {work_item_id}.",
@@ -7146,7 +7381,7 @@ def phase_drive(
             "id": child_id,
             "worktree_path": worktree_path,
             "attempt": attempts[child_id],
-            "result": "ok" if spawn_result.get("success") else "failed",
+            "result": "finished" if spawn_result.get("success") else "failed",
             "reason": spawn_result.get("reason", ""),
         }
         driven.append(entry)

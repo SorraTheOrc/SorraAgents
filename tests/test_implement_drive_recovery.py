@@ -38,6 +38,7 @@ without touching production code from this item.
 from __future__ import annotations
 
 import contextlib
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -154,12 +155,14 @@ class DriveHarness:
         runner: ScriptedParent | None = None,
         spawn_results: list[dict] | None = None,
         child_states: dict[str, dict] | None = None,
+        worktree_path: str = "",
     ):
         self.mod = mod
         self.children = list(children)
         self.runner = runner or RecordingParent(list(reports or []))
         self.spawner = RecordingSpawner(spawn_results)
         self.child_states = dict(child_states or {})
+        self.worktree_path = worktree_path
         self.show_calls: list[str] = []
         self.comments: list[tuple[str, str]] = []
         self.status_updates: list[dict] = []
@@ -201,7 +204,12 @@ class DriveHarness:
 
         def _record(*args, **kwargs):
             calls.append((args, kwargs))
-            return {"success": True}
+            return {
+                "success": True,
+                "reset": True,
+                "ref": kwargs.get("parent_branch", "dev") if kwargs else "dev",
+                "reason": "",
+            }
 
         self.extra_patches.append(
             mock.patch.object(self.mod, name, side_effect=_record, create=True)
@@ -251,7 +259,7 @@ class DriveHarness:
             mock.patch.object(
                 self.mod, "wl_show_children", return_value=self.children,
             ),
-            mock.patch.object(self.mod, "_discover_worktree", return_value=""),
+            mock.patch.object(self.mod, "_discover_worktree", return_value=self.worktree_path),
             mock.patch.object(
                 self.mod, "wl_add_comment", side_effect=self._comment,
             ),
@@ -526,19 +534,18 @@ class TestFinishFailureTerminalReconciliation:
         assert harness.status_updates == []
         assert reset_calls == []
 
-    def test_non_terminal_child_keeps_hard_failure_after_bound(
+    def test_non_terminal_child_without_resettable_worktree_fails_closed(
         self, drive_harness, finishing_failed_parent_runner,
     ):
-        """A still non-terminal child after the bound keeps the hard finish
-        failure (the reset/retry recovery lands in the sibling feature); it
-        is never reconciled as done."""
+        """A still non-terminal child is never reconciled as done; when no
+        resettable worktree is available the hard finish failure stands (the
+        reset path fails closed rather than guessing)."""
         child = _child("SA-C1")
         harness = drive_harness(
             children=[child],
             runner=finishing_failed_parent_runner("SA-C1", times=10),
             child_states={"SA-C1": child},
         )
-        reset_calls = harness.record_reset_helper()
 
         report = harness.run(finish_attempt_limit=3)
 
@@ -547,9 +554,9 @@ class TestFinishFailureTerminalReconciliation:
         assert report["finish_attempts"] == {"SA-C1": 3}
         assert report.get("terminal_reconciled", 0) == 0
         assert "status=open" in report["message"]
+        assert "recovery reset refused" in report["message"]
         assert harness.spawner.calls == []
         assert harness.status_updates == []
-        assert reset_calls == []
         assert report["children_driven"] == []
 
     def test_unfetchable_child_fails_closed(self, drive_harness):
@@ -583,6 +590,191 @@ class TestFinishFailureTerminalReconciliation:
 
         assert report["success"] is True
         assert report["_show_calls"] == [PARENT]
+
+
+# ---------------------------------------------------------------------------
+# Parent AC3 (SA-0MVLJXVND0015LPW): non-terminal reset for a clean retry
+# ---------------------------------------------------------------------------
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    """Run a git command in *cwd* and raise on failure (test helper)."""
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True,
+        capture_output=True, text=True,
+    )
+
+
+@pytest.fixture
+def child_worktree(tmp_path):
+    """A real repo with a linked child worktree holding abandoned WIP.
+
+    Mirrors the production failure state: the child's own worktree has
+    uncommitted modifications and untracked files left behind by a killed
+    session, while the main checkout has its own unrelated dirty file that
+    must never be touched by a reset.
+    """
+    repo = tmp_path / "main_repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    _git("config", "user.email", "test@test.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("# Test\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "Initial commit", cwd=repo)
+    _git("branch", "dev", cwd=repo)
+
+    worktree = (tmp_path / "wt-child").resolve()
+    _git(
+        "worktree", "add", "--track", "-b", "wl-SA-C1-test",
+        str(worktree), "dev", cwd=repo,
+    )
+
+    # Abandoned session WIP: a tracked-file modification plus untracked files.
+    (worktree / "README.md").write_text("# Abandoned WIP\n")
+    (worktree / "wip.txt").write_text("half-finished work\n")
+    tests_dir = worktree / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_wip.py").write_text("def test_wip():\n    assert False\n")
+
+    # Unrelated dirty file in the MAIN checkout: must survive any reset.
+    (repo / "main_dirty.txt").write_text("operator work\n")
+
+    return {"repo": repo, "worktree": worktree}
+
+
+class TestNonTerminalResetForRetry:
+    """An exhausted non-terminal child is reset and retried in a fresh
+    session instead of livelocking the epic."""
+
+    def test_reset_helper_resets_only_the_child_worktree(
+        self, implement_mod, child_worktree,  # noqa: F811 — fixture param
+    ):
+        m = implement_mod
+        worktree = child_worktree["worktree"]
+        repo = child_worktree["repo"]
+
+        result = m._reset_child_worktree(str(worktree), "dev")
+
+        assert result["success"] is True
+        assert result["reset"] is True
+        assert result["ref"] == "dev"
+        # The child worktree is clean and back at the parent-branch HEAD.
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1"], cwd=str(worktree),
+            capture_output=True, text=True, check=True,
+        )
+        assert status.stdout.strip() == ""
+        assert not (worktree / "wip.txt").exists()
+        assert not (worktree / "tests" / "test_wip.py").exists()
+        assert (worktree / "README.md").read_text() == "# Test\n"
+        # The main checkout's own dirty file is untouched.
+        assert (repo / "main_dirty.txt").read_text() == "operator work\n"
+
+    def test_reset_helper_refuses_the_main_checkout(
+        self, implement_mod, child_worktree,  # noqa: F811 — fixture param
+    ):
+        m = implement_mod
+        repo = child_worktree["repo"]
+
+        result = m._reset_child_worktree(str(repo), "dev")
+
+        assert result["success"] is False
+        assert result["reset"] is False
+        assert "not a linked git worktree" in result["reason"]
+        # The main checkout's dirty file survived the refused reset.
+        assert (repo / "main_dirty.txt").read_text() == "operator work\n"
+
+    def test_reset_helper_fails_closed_for_missing_worktree(
+        self, implement_mod, tmp_path,  # noqa: F811 — fixture param
+    ):
+        result = implement_mod._reset_child_worktree(
+            str(tmp_path / "does-not-exist"), "dev",
+        )
+
+        assert result["success"] is False
+        assert result["reset"] is False
+        assert "does not exist" in result["reason"]
+
+    def test_non_terminal_child_reset_then_retried_in_fresh_session(
+        self, drive_harness, child_worktree,
+    ):
+        """AC3/AC6: after the finish bound the child is reset, its status is
+        set back to ``open``, an audit comment is recorded, and the loop
+        continues so the next iteration spawns a fresh session."""
+        worktree = child_worktree["worktree"]
+        repo = child_worktree["repo"]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report("SA-C1") for _ in range(3)),
+                {"success": True, "next_child": "SA-C1",
+                 "worktree_path": str(worktree)},
+                {"success": True, "parent_advanced": True},
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path=str(worktree),
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert report["reset_for_retry"] == 1
+        results = [e["result"] for e in report["children_driven"]]
+        assert results == ["reset-for-retry", "finished"]
+        reset_entry = report["children_driven"][0]
+        assert reset_entry["reset"] is True
+        assert reset_entry["finish_attempts"] == 3
+        assert reset_entry["status"] == "open"
+        assert "reset to dev" in reset_entry["reason"]
+        # Status reset through the shared lifecycle path, then a fresh session.
+        assert {"id": "SA-C1", "status": "open", "assignee": ""} in (
+            harness.status_updates
+        )
+        assert harness.spawn_calls == ["SA-C1"]
+        # Audit comment names the failure, the attempts and the reset.
+        child_comments = [
+            text for wid, text in harness.comments if wid == "SA-C1"
+        ]
+        assert len(child_comments) == 1
+        assert "Failed to finish child SA-C1" in child_comments[0]
+        assert "3" in child_comments[0]
+        assert "git reset --hard" in child_comments[0]
+        assert "- Worktree reset to: `dev`" in child_comments[0]
+        # The abandoned WIP was discarded from the child worktree only.
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1"], cwd=str(worktree),
+            capture_output=True, text=True, check=True,
+        )
+        assert status.stdout.strip() == ""
+        assert (repo / "main_dirty.txt").read_text() == "operator work\n"
+
+    def test_reset_runs_at_most_once_per_child(
+        self, drive_harness, child_worktree,
+    ):
+        """A child that keeps failing after its reset stops the chain
+        (bounded) instead of resetting forever."""
+        worktree = child_worktree["worktree"]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report("SA-C1") for _ in range(8)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path=str(worktree),
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["reset_for_retry"] == 1
+        assert len(harness.status_updates) == 1
+        # Four finish failures consumed: the bound (3) triggers one reset,
+        # then the next failure stops the chain without a second reset.
+        assert len(harness.runner.returned) == 4
+        assert report["children_driven"][0]["result"] == "reset-for-retry"
 
 
 # ---------------------------------------------------------------------------
