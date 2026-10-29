@@ -11,6 +11,7 @@ Related work item: SA-0MS69FE4Q008N8SZ
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -32,12 +33,16 @@ class TestImplementScriptStatusLifecycle:
     def test_imports_status_lifecycle(self):
         """implement.py imports StatusLifecycle from skill.shared."""
         assert self.SOURCE, f"implement.py not found at {self.IMPLEMENT_PY}"
-        has_import = any([
-            "from shared.status_lifecycle import StatusLifecycle" in self.SOURCE,
-            "from shared import StatusLifecycle" in self.SOURCE,
-            "from shared import status_lifecycle" in self.SOURCE,
-        ])
-        assert has_import, (
+        # Parse the module so a parenthesised multi-name import (formatted by
+        # ruff) counts just like the single-name one: the intent is that
+        # StatusLifecycle comes from shared.status_lifecycle.
+        imported: set[str] = set()
+        for node in ast.walk(ast.parse(self.SOURCE)):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.module in ("shared.status_lifecycle", "shared"):
+                imported.update(alias.name for alias in node.names)
+        assert "StatusLifecycle" in imported, (
             "implement.py should import StatusLifecycle from shared.status_lifecycle"
         )
 

@@ -100,8 +100,17 @@ try:
         SkillExtensionError,
         load_extension,
     )
-    from shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
+    from shared.status_lifecycle import (
+        StatusLifecycle,
+        resolve_worklog_dir,
+        resolve_worklog_flags,
+    )
     from shared.timing import Timer
+    from shared.work_item_lock import (
+        ENV_LOCK_TOKEN,
+        WorkItemLock,
+        lock_file_path,
+    )
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 try:
@@ -197,6 +206,10 @@ DRIVE_RECURSION_ENV = "IMPLEMENT_DRIVE_ACTIVE"
 #: so the child can verify its worktree root before its first edit — ``cwd``
 #: alone does not confine an agent (it can ``cd`` to the main checkout).
 WORKTREE_ENV = "IMPLEMENT_WORKTREE_PATH"
+#: Report action for a child whose per-work-item lock is held by a live
+#: holder (another driver/session). The refused party performs no work and
+#: reports the holder identity instead of racing it (SA-0MVQ5AXLF002PAQ3).
+ACTION_SKIPPED_HELD = "skipped-held"
 
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
@@ -286,28 +299,25 @@ class ImplementState:
 _worktree_path_global: str | None = None
 _work_item_id_global: str | None = None
 _repo_root_global: str | None = None
+#: The per-child lock held by this process for the lifetime of ``phase_start``.
+#: Kept module-level so the signal handler can release it deterministically
+#: before exiting, and so spawned processes inherit its ownership token.
+_child_lock_global: WorkItemLock | None = None
 _cleanup_done = False
 
 
-def _signal_handler(signum: int, frame: Any) -> None:
-    """Global signal handler for SIGTERM/SIGINT during any phase.
+def _handle_signal_cleanup(signum: int) -> None:
+    """Deterministic cleanup body for SIGTERM/SIGINT (does not exit).
 
-    Runs deterministic cleanup: resets the work-item status (never leaves it
-    in-progress), terminates child processes, removes the worktree, and exits.
+    Split out of :func:`_signal_handler` so the cleanup contract — release
+    the per-child lock, never leave a claimed item unexplained, remove the
+    worktree, restore repo state — is directly testable without terminating
+    the interpreting process.
 
-    Uses ``os._exit`` (not ``sys.exit``) so the status reset is authoritative:
-    a ``sys.exit``-raised ``SystemExit`` would unwind through any active
-    ``StatusLifecycle`` context manager, which would restore the original
-    (in-progress) status and undo the reset.
+    Args:
+        signum: The signal number that triggered the cleanup.
     """
-    global _cleanup_done
-    if _cleanup_done:
-        return
-    _cleanup_done = True
-
     signame = signal.Signals(signum).name
-    LOG.warning("Received signal %s, running deterministic cleanup...", signame)
-
     try:
         wt = _worktree_path_global
         wid = _work_item_id_global
@@ -322,6 +332,26 @@ def _signal_handler(signum: int, frame: Any) -> None:
             except RuntimeError:
                 LOG.error("Failed to reset work item %s status to open", wid)
 
+            # A claim interrupted before the worktree exists must never be
+            # silent: the operator needs to know the item was released and
+            # why (SA-0MVQ5AXLF002PAQ3 AC2). The child lock is the phase
+            # marker — only ``phase_start`` holds it, so a signal during
+            # ``finish``/``abort`` never gets a misleading "start" comment.
+            if _child_lock_global is not None and not (wt and Path(wt).exists()):
+                try:
+                    wl_add_comment(
+                        wid,
+                        f"Start phase interrupted by {signame} before the "
+                        "worktree was created. The per-child lock was "
+                        "released and the work item returned to open; "
+                        f"re-run `implement.py start {wid}` to continue.",
+                    )
+                except Exception as exc:  # noqa: BLE001 - never block cleanup
+                    LOG.error(
+                        "Failed to record the %s interruption on %s: %s",
+                        signame, wid, exc,
+                    )
+
         if wt and Path(wt).exists():
             cleanup_worktree_processes(wt)
             _remove_worktree(wt)
@@ -329,7 +359,33 @@ def _signal_handler(signum: int, frame: Any) -> None:
             _restore_repo_state(rr)
     except Exception as exc:  # noqa: BLE001
         LOG.error("Cleanup handler error: %s", exc)
+    finally:
+        # Explicit release (the kernel also releases the flock when
+        # ``os._exit`` closes the descriptor): no stale holder survives a
+        # signal, and the release is observable in tests.
+        _release_child_lock()
 
+
+def _signal_handler(signum: int, frame: Any) -> None:
+    """Global signal handler for SIGTERM/SIGINT during any phase.
+
+    Runs deterministic cleanup: resets the work-item status (never leaves it
+    in-progress), releases the per-child lock, terminates child processes,
+    removes the worktree, and exits.
+
+    Uses ``os._exit`` (not ``sys.exit``) so the status reset is authoritative:
+    a ``sys.exit``-raised ``SystemExit`` would unwind through any active
+    ``StatusLifecycle`` context manager, which would restore the original
+    (in-progress) status and undo the reset.
+    """
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+
+    signame = signal.Signals(signum).name
+    LOG.warning("Received signal %s, running deterministic cleanup...", signame)
+    _handle_signal_cleanup(signum)
     LOG.info("Cleanup complete. Exiting due to %s.", signame)
     os._exit(2)
 
@@ -635,6 +691,202 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
 
 
+# ---------------------------------------------------------------------------
+# Per-work-item child lock (SA-0MVQ5AXLF002PAQ3)
+#
+# The flock primitive lives in ``shared.work_item_lock``; this section is the
+# implement-side integration: the choke point that owns it, the read-only
+# probe used for reporting, and the ownership token propagated to spawned
+# processes.
+# ---------------------------------------------------------------------------
+
+
+def _child_lock_dir(work_item_id: str) -> Path | None:
+    """Resolve the worklog **store** directory that owns the child lock.
+
+    Single, patchable resolution point: the lock must live under
+    ``<worklog>/locks/`` (never inside a worktree, which can be removed
+    mid-flight), and tests isolate it to a throwaway store by patching this
+    helper.
+
+    Args:
+        work_item_id: The work item whose lock directory is resolved.
+
+    Returns:
+        The worklog store path, or ``None`` when it cannot be resolved.
+    """
+    try:
+        return resolve_worklog_dir(work_item_id)
+    except RuntimeError:
+        return None
+
+
+def _new_child_lock(work_item_id: str) -> WorkItemLock:
+    """Build the per-work-item lock handle for *work_item_id*.
+
+    The ownership token comes from ``IMPLEMENT_CHILD_LOCK_TOKEN`` when the
+    process is part of an existing holder chain (driver → ``parent``/``start``
+    subprocesses → driven child session); otherwise the lock generates one.
+
+    Args:
+        work_item_id: The work item whose critical section is serialised.
+
+    Returns:
+        A not-yet-acquired :class:`WorkItemLock`.
+    """
+    worklog_dir = _child_lock_dir(work_item_id)
+    kwargs: dict[str, Any] = {
+        "agent": os.environ.get("IMPLEMENT_AGENT_NAME") or "implement",
+        "session_id": os.environ.get("PI_SESSION_ID") or f"pid-{os.getpid()}",
+    }
+    if worklog_dir is not None:
+        kwargs["worklog_dir"] = worklog_dir
+    return WorkItemLock(work_item_id, **kwargs)
+
+
+def _set_child_lock(lock: WorkItemLock) -> None:
+    """Register *lock* as this process's held child lock (signal-safe)."""
+    global _child_lock_global
+    _child_lock_global = lock
+
+
+def _release_child_lock() -> None:
+    """Release and forget this process's held child lock (idempotent)."""
+    global _child_lock_global
+    lock = _child_lock_global
+    _child_lock_global = None
+    if lock is not None:
+        lock.release()
+
+
+def _child_lock_token(base: dict[str, str] | None = None) -> str | None:
+    """Return the explicit lock ownership token of the current holder chain.
+
+    Prefers the token of the lock this process actually holds; falls back to
+    the inherited :data:`ENV_LOCK_TOKEN` of an enclosing holder chain. Never
+    derives ownership from a pid — pid equality alone is deliberately not an
+    ownership signal (SA-0MOABYW contract, AC4).
+
+    Args:
+        base: Environment mapping to inspect when no lock is held locally
+            (defaults to ``os.environ``).
+
+    Returns:
+        The token string, or ``None`` when this process is not part of a
+        holder chain.
+    """
+    if _child_lock_global is not None:
+        return _child_lock_global.token
+    env = base if base is not None else os.environ
+    return env.get(ENV_LOCK_TOKEN) or None
+
+
+def _read_child_lock_metadata(path: Path) -> dict[str, Any] | None:
+    """Read lock-file owner metadata (best-effort; ``None`` when unreadable)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _probe_child_lock(work_item_id: str) -> dict[str, Any] | None:
+    """Return the live holder's metadata when *work_item_id*'s lock is held.
+
+    Read-only by construction: it opens an **existing** lock file, takes a
+    non-blocking ``flock`` probe and releases it immediately. It never
+    creates, rewrites or truncates the lock file, so classifying a child has
+    no side effects (a refused contender must leave a byte-identical store
+    behind).
+
+    A holder chain that propagated its ownership token is not a *blocking*
+    holder: the probe reports self-ownership as free, exactly like the lock
+    primitive's re-entrancy rule (never a pid-equality heuristic).
+
+    Ambiguous states (held but unreadable metadata) fail closed: they report
+    a holder with an ``unknown`` identity rather than racing a live writer.
+
+    Args:
+        work_item_id: The child work item to probe.
+
+    Returns:
+        Holder metadata when a live holder exists, else ``None``.
+    """
+    if not work_item_id or fcntl is None:
+        return None
+    store = _child_lock_dir(work_item_id)
+    if store is None:
+        return None
+    path = lock_file_path(work_item_id, store)
+    if not path.is_file():
+        return None
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                return None
+            metadata = _read_child_lock_metadata(path)
+            if metadata is not None and metadata.get("token") == _child_lock_token():
+                return None  # our own holder chain: re-entrant, not blocked
+            if metadata is None:
+                return {
+                    "agent": "unknown",
+                    "pid": None,
+                    "session_id": "unknown",
+                    "started_at": "unknown",
+                }
+            return metadata
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:  # pragma: no cover - defensive
+            pass
+
+
+def _describe_child_lock_holder(holder: dict[str, Any] | None) -> str:
+    """Human-readable holder identity for a ``skipped-held`` report."""
+    if not holder:
+        return "an unknown holder (lock file unreadable)"
+    return (
+        f"{holder.get('agent', '?')}@pid {holder.get('pid', '?')} "
+        f"(session {holder.get('session_id', '?')}, "
+        f"since {holder.get('started_at', '?')})"
+    )
+
+
+def _skipped_held_report(
+    report: dict[str, Any],
+    work_item_id: str,
+    holder: dict[str, Any] | None,
+    lock_path: Path | None,
+) -> dict[str, Any]:
+    """Populate *report* for a contender that could not acquire the lock.
+
+    A refused ``start`` performs **no** store write: no claim, no
+    status/assignee mutation, no comment, no worktree create/remove and no
+    lock-metadata rewrite. It reports the holder identity instead.
+    """
+    report["success"] = False
+    report["action"] = ACTION_SKIPPED_HELD
+    report["held_by"] = holder
+    report["lock_path"] = str(lock_path) if lock_path is not None else ""
+    report["message"] = (
+        f"Work item {work_item_id} is held by {_describe_child_lock_holder(holder)}. "
+        "Another implementation session owns its critical section; no "
+        "claim, worktree or file write was performed. Re-run once the holder "
+        "finishes (or reclaim a stale lock when its pid is dead)."
+    )
+    return report
+
+
 def _check_and_evaluate_risk_effort(
     work_item_id: str, work_item: dict[str, Any],
 ) -> dict[str, Any]:
@@ -876,8 +1128,15 @@ def _classify_child(child: dict[str, Any]) -> str:
 
     Returns one of:
       - ``"skip-terminal"`` — already in a terminal state; never re-implemented.
+      - ``"skipped-held"`` — a live holder owns the child's per-work-item
+        lock (another driver/session); reported, never raced.
       - ``"skip-in-progress"`` — claimed by another agent; reported, not clobbered.
       - ``"implement"`` — the standard workflow should run on this child.
+
+    Precedence is deliberate: a terminal child is never re-implemented (even
+    with a stale lock file lying around), and a live holder outranks the
+    status-based ``in-progress`` guess because it is a fact about a running
+    process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3).
 
     Args:
         child: A child work-item dict from ``wl show --children``.
@@ -888,6 +1147,8 @@ def _classify_child(child: dict[str, Any]) -> str:
     status = str(child.get("status", ""))
     if _is_terminal_child(child):
         return "skip-terminal"
+    if _probe_child_lock(str(child.get("id", ""))) is not None:
+        return ACTION_SKIPPED_HELD
     if status in ("in-progress", "in_progress"):
         return "skip-in-progress"
     return "implement"
@@ -997,6 +1258,8 @@ def _next_child_to_implement(
         action = _classify_child(child)
         if action == "skip-terminal":
             continue
+        if action == ACTION_SKIPPED_HELD:
+            continue  # a live holder owns it; never a second session
         if action == "skip-in-progress":
             continue  # never clobber another agent's claim
         cid = str(child.get("id", ""))
@@ -4334,6 +4597,9 @@ def phase_start(
     Steps:
     1. Validate the work item ID
     2. Code Freeze gate: refuse when a release is in progress
+    2.5. Acquire the per-work-item child lock (before the claim and before
+        any worktree creation/resume); a held child is reported as
+        ``skipped-held`` and performs no writes (AC1)
     3. Claim the work item (status → in_progress)
     4. Safety gate: check for dirty working tree
     5. Stash hygiene gate: warn on orphaned stashes (fail-open, --allow-orphaned-stashes to skip)
@@ -4342,6 +4608,11 @@ def phase_start(
     7. Create a worktree from the parent branch
     8. Register signal handlers
     9. Write persistent state
+
+    The lock is held for the whole of the phase and released on normal exit,
+    on exception/abort and on SIGINT/SIGTERM (AC2). Two concurrent
+    ``drive``/``parent``/``start`` invocations for one child can therefore
+    never both enter its critical section (SA-0MVOABYW00004978).
 
     Args:
         work_item_id: The work item ID.
@@ -4391,6 +4662,88 @@ def phase_start(
         else:
             print(f"\n⛔ {msg}\n")
         return report
+
+    # ── Step 2.5: Acquire the per-child lock (AC1) ────────────────
+    # The single choke point for ``drive``, ``parent`` and a manual ``start``.
+    # Acquired BEFORE the claim and before any worktree creation/resume so a
+    # contender can never mutate the item or its worktree. A failed acquire
+    # is fail-closed: report the holder and write nothing.
+    try:
+        lock = _new_child_lock(work_item_id)
+        lock_result = lock.acquire()
+    except (OSError, RuntimeError) as exc:
+        msg = (
+            f"Cannot acquire the per-child lock for {work_item_id}: {exc}. "
+            "Refusing to start (fail closed) because exclusive ownership "
+            "cannot be guaranteed."
+        )
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        return report
+
+    if not lock_result.acquired:
+        _skipped_held_report(
+            report, work_item_id, lock_result.held_by, lock_result.path,
+        )
+        lock.release()  # a losing handle never held the kernel lock: no-op
+        LOG.warning("%s", report["message"])
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {report['message']}\n")
+        return report
+
+    _set_child_lock(lock)
+    if lock_result.reentrant:
+        LOG.info(
+            "Re-entered the per-child lock for %s by ownership token "
+            "(holder chain); not blocked.",
+            work_item_id,
+        )
+    elif lock_result.reclaimed:
+        LOG.warning(
+            "Reclaimed a stale per-child lock for %s from %s (dead pid).",
+            work_item_id,
+            _describe_child_lock_holder(lock_result.reclaimed),
+        )
+
+    # Register the signal handler from the claim onwards: an interruption
+    # between the claim and the worktree creation must release the lock and
+    # leave an explanatory comment (AC2).
+    _register_signal_handlers()
+    try:
+        return _phase_start_locked(
+            report,
+            work_item_id,
+            json_output=json_output,
+            parent_branch=parent_branch,
+            worktree_path_override=worktree_path_override,
+            force=force,
+        )
+    finally:
+        # Normal exit, early return and exception all release the lock; the
+        # signal handler releases it explicitly before ``os._exit``.
+        _release_child_lock()
+
+
+def _phase_start_locked(
+    report: dict[str, Any],
+    work_item_id: str,
+    *,
+    json_output: bool,
+    parent_branch: str,
+    worktree_path_override: str | None,
+    force: bool,
+) -> dict[str, Any]:
+    """Steps 3-9 of :func:`phase_start`, executed under the child lock.
+
+    Split out purely so the lock's acquisition/release brackets the whole
+    mutating section without re-indenting it. ``report`` is populated by the
+    caller (validation and Code Freeze gates) and returned here.
+    """
 
     # ── Step 3: Claim the work item via shared helper ─────────────
     # Status-only claim: the workflow stage must NOT be advanced here.
@@ -5609,12 +5962,21 @@ def _invoke_implement(
     cmd = _build_implement_cmd(action, work_item_id, extra_flags=flags)
     LOG.debug("Subprocess: %s", " ".join(cmd))
     repo_root = _get_repo_root() or str(Path.cwd())
+    # Propagate the holder chain's ownership token explicitly (AC4) so a
+    # subprocess that runs ``phase_start`` for the held child re-enters the
+    # lock instead of being falsely refused: the driver's own ``parent`` →
+    # ``start`` chain must never block on its own lock.
+    env = dict(os.environ)
+    token = _child_lock_token(env)
+    if token:
+        env[ENV_LOCK_TOKEN] = token
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         check=False,
         timeout=_resolve_test_timeout(repo_root),
+        env=env,
     )
     if result.returncode != 0:
         LOG.error(
@@ -5670,9 +6032,10 @@ def phase_parent(
        ``wl dep list`` edges): in-chain blockers are implemented before
        the children they block; cycles fail fast; cross-project blockers
        are reported as coordination notes.
-    4. Classify children: terminal → skip; in_progress elsewhere → skip+report;
-       blocked by a non-terminal sibling → not startable (reported);
-       otherwise → implementable.
+    4. Classify children: terminal → skip; a live lock holder →
+       ``skipped-held`` (report the holder and stop cleanly); in_progress
+       elsewhere → skip+report; blocked by a non-terminal sibling → not
+       startable (reported); otherwise → implementable.
     5. All children terminal → advance the parent to ``completed``/``in_review``
        (existing Step 5.1 advancement retained) and comment a per-child summary.
     6. Otherwise → start the next startable child (claim + worktree via
@@ -5786,6 +6149,11 @@ def phase_parent(
             "action": _classify_child(child),
             "external_blockers": external,
         })
+        entry = classifications[-1]
+        if entry["action"] == ACTION_SKIPPED_HELD:
+            # Surface the live holder's identity so the operator can diagnose
+            # who owns the child (AC3).
+            entry["held_by"] = _probe_child_lock(cid)
     report["children"] = classifications
 
     # ── Step 5.5: Resolve dependency order (blockers first) ────────
@@ -5920,6 +6288,35 @@ def phase_parent(
                 "status": child.get("status", ""),
             })
             continue
+
+        if action == ACTION_SKIPPED_HELD:
+            # A live holder owns this child's critical section. Stop cleanly
+            # with the holder's identity instead of spawning a second session
+            # (AC3) — never a concurrent second writer.
+            holder = _probe_child_lock(cid)
+            child_results.append({
+                "id": cid, "title": title,
+                "action": ACTION_SKIPPED_HELD,
+                "status": child.get("status", ""),
+                "held_by": holder,
+            })
+            report["success"] = True
+            report["action"] = ACTION_SKIPPED_HELD
+            report["skipped_held"] = True
+            report["held_by"] = holder
+            report.setdefault("held_children", []).append(cid)
+            report["message"] = (
+                f"Child {cid} is held by "
+                f"{_describe_child_lock_holder(holder)}; no second session "
+                f"was started. Re-run `implement.py parent {work_item_id}` "
+                "once the holder finishes."
+            )
+            report["children_processed"] = child_results
+            if json_output:
+                print(format_json_output(report))
+            else:
+                print(f"\n\u23f3 {report['message']}\n")
+            return report
 
         worktree_path = _discover_worktree(cid)
         has_changes = bool(
@@ -6093,8 +6490,9 @@ def _child_session_env(
 
     Marks the session as driver-owned (recursion guard), removes the
     parent session's identity so the child starts its own clean session,
-    and (when *worktree_path* is given) injects ``IMPLEMENT_WORKTREE_PATH``
-    so the child can verify its worktree root before its first edit.
+    propagates the per-child lock ownership token, and (when *worktree_path*
+    is given) injects ``IMPLEMENT_WORKTREE_PATH`` so the child can verify its
+    worktree root before its first edit.
 
     Args:
         base: Base environment (defaults to ``os.environ``).
@@ -6108,6 +6506,13 @@ def _child_session_env(
     env[DRIVE_RECURSION_ENV] = "1"
     env.pop("PI_SESSION_ID", None)
     env.pop("PI_SESSION_FILE", None)
+    # Explicit ownership propagation (AC4): the driven session runs
+    # ``start``/``finish`` for the same child id, so it must re-enter the
+    # holder chain's lock by token rather than be refused by it. Never a pid
+    # heuristic — a tokenless session is a different owner.
+    token = _child_lock_token(env)
+    if token:
+        env[ENV_LOCK_TOKEN] = token
     if worktree_path:
         env[WORKTREE_ENV] = worktree_path
     return env
@@ -7046,7 +7451,10 @@ def phase_drive(
         children recorded as done after their finish failed
         (SA-0MVLJXTYY005XQDV); ``reset_for_retry`` counts non-terminal
         children whose worktree was reset for a fresh session
-        (SA-0MVLJXVND0015LPW).
+        (SA-0MVLJXVND0015LPW). A child whose per-work-item lock is held by
+        another live session is reported with ``action: "skipped-held"``,
+        ``skipped_held: True``, ``held_by`` and ``held_children`` — and no
+        session is spawned for it (SA-0MVQ5AXLF002PAQ3).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -7335,6 +7743,25 @@ def phase_drive(
                 f"Phase parent reported a failure for {work_item_id}.",
             )
             report["failed_child"] = parent_report.get("next_child")
+            break
+
+        if parent_report.get("skipped_held"):
+            # The parent stopped cleanly because a live holder owns the next
+            # child's critical section. Surface the held classification and
+            # its holder, and spawn nothing (AC3): a second session would race
+            # the holder's worktree writes (SA-0MVOABYW00004978).
+            report["action"] = ACTION_SKIPPED_HELD
+            report["skipped_held"] = True
+            report["held_by"] = parent_report.get("held_by")
+            report["held_children"] = parent_report.get("held_children", [])
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            report["message"] = parent_report.get(
+                "message",
+                f"A child of {work_item_id} is held by another "
+                "implementation session; no session was spawned.",
+            )
             break
 
         child_id = parent_report.get("next_child")

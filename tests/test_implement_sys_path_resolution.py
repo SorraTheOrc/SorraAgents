@@ -100,6 +100,12 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
     # ``Timer`` from it at module load for timing instrumentation.
     real_timing = (_REPO_ROOT / "skill" / "shared" / "timing.py").read_text()
     (skill_pkg / "shared" / "timing.py").write_text(real_timing)
+    # Provide the per-work-item lock module (SA-0MVQ5AXLF002PAQ3) —
+    # implement.py imports WorkItemLock from it at module load.
+    real_wil = (
+        _REPO_ROOT / "skill" / "shared" / "work_item_lock.py"
+    ).read_text()
+    (skill_pkg / "shared" / "work_item_lock.py").write_text(real_wil)
     # Provide the test cache + runner modules (SA-0MSGN5OJ4002OZKY) —
     # implement.py's run_tests() routes through the cache at import time.
     real_tc = (_REPO_ROOT / "skill" / "test_cache.py").read_text()
