@@ -212,9 +212,13 @@ defaults rather than by relaxing the idle gate (§5 recommendation stands
 unchanged).
 
 **Empirical measurement (F7 harness).** `skill/shared/validate_fanout.py`
-was run with the ingress cap lifted (`AUDIT_MAX_HOST_AUDITS=32`) so the
-`AUDIT_MAX_CONCURRENCY` ceiling was the binding constraint — 8 concurrent
-audit invocations with a mock pi per ceiling. Raw artifact:
+was run with the ingress cap lifted so the `AUDIT_MAX_CONCURRENCY` ceiling
+was the binding constraint — 8 concurrent audit invocations with a mock pi
+per ceiling. The harness now lifts `AUDIT_MAX_HOST_AUDITS` to the batch size
+itself (the capacity runs passed `AUDIT_MAX_HOST_AUDITS=32` by hand for the
+same reason) and cleans up its throwaway worklog afterwards, so the cap can
+no longer turn a measurement into a batch failure (SA-0MVTV8WQ00014DSK).
+Raw artifact:
 [`audit-ceiling-validation.json`](audit-ceiling-validation.json).
 
 | Ceiling | Drain (s) | Batch load delta (1m) | Swap delta | Peak batch pi |
