@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -101,6 +103,78 @@ def test_check_freshness_reports_no_stored_audit(capsys):
     assert out["hasFingerprint"] is False
     assert out["reason"] == "no stored audit"
     assert out["auditedAt"] is None
+
+
+# ── Probe-contract pin (SA-0MVTU1WHS002HN1C AC1) ─────────────────────────────
+#
+# The ship gates have always invoked the read-only probe as
+# ``check-freshness <id> --json`` (``queryContentFreshness()`` in
+# ``skill/ship/scripts/check-audit-gate.js``), but this subparser accepted only
+# ``issue_id``/``--worklog-dir``, so the flag was rejected by argparse and the
+# JS side's fail-open ``catch`` silently degraded to the conservative time
+# gate. These two tests pin the *accepted argv shape* and the *unchanged
+# payload*; the paired JS test pins the exact command string that
+# ``queryContentFreshness()`` builds, so the two sides cannot drift apart again.
+#
+# TRACER BULLET: both tests are red for the right reason (argparse exits 2 with
+# ``unrecognized arguments: --json``) and are marked ``xfail(strict=True)``
+# until SA-0MVTU2268007BBYO accepts the flag. That item removes the markers —
+# a strict unexpected pass is itself a failure, so the markers cannot be left
+# behind silently.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="tracer bullet: SA-0MVTU2268007BBYO accepts --json on the subparser",
+)
+def test_check_freshness_subcommand_accepts_json_flag():
+    """AC1: the probe argv built by the ship gates parses.
+
+    ``args.json`` is the argparse default destination for ``--json``; the
+    implementation sibling adds the flag to the ``check-freshness``
+    subparser, so the namespace carries it (accepted but unused — the
+    subcommand already prints JSON).
+    """
+    args = audit_runner.build_parser().parse_args(
+        ["check-freshness", "SA-1", "--json"]
+    )
+
+    assert args.command == "check-freshness"
+    assert args.issue_id == "SA-1"
+    assert args.json is True
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="tracer bullet: SA-0MVTU2268007BBYO accepts --json on the subparser",
+)
+def test_check_freshness_json_flag_leaves_the_payload_unchanged(capsys):
+    """AC1: accepting the flag is additive — the probe payload is identical.
+
+    The flag exists only so the documented invocation parses; it must not
+    change what the subcommand prints (or silently switch output formats).
+    """
+    raw = f"Ready to close: Yes\n{_fingerprint_line('abc123')}\n"
+    runner = lambda cmd: _completed(_audit_show_payload(raw))
+
+    plain_args = audit_runner.build_parser().parse_args(["check-freshness", "SA-1"])
+    with mock.patch.object(audit_runner, "_default_runner", runner), \
+         mock.patch.object(audit_runner, "_check_audit_freshness", return_value=raw):
+        audit_runner.cmd_check_freshness(plain_args.issue_id, worklog_dir=_WORKLOG_DIR)
+    plain = json.loads(capsys.readouterr().out)
+
+    flag_args = audit_runner.build_parser().parse_args(
+        ["check-freshness", "SA-1", "--json"]
+    )
+    with mock.patch.object(audit_runner, "_default_runner", runner), \
+         mock.patch.object(audit_runner, "_check_audit_freshness", return_value=raw):
+        rc = audit_runner.cmd_check_freshness(flag_args.issue_id, worklog_dir=_WORKLOG_DIR)
+    flagged = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert flagged == plain
+    assert flagged["fresh"] is True
+    assert flagged["hasFingerprint"] is True
 
 
 def test_check_freshness_fails_open_on_lookup_error(capsys):

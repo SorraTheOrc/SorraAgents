@@ -922,3 +922,272 @@ describe('ship skill documentation', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Probe contract, upgrade, regression and no-contradictory-block invariant
+// (SA-0MVTU1WHS002HN1C, Step 3.7 half of parent AC2/AC3/AC4)
+//
+// The Step-3.7 sweep shares `getAuditStatus()`, `queryContentFreshness()` and
+// `attemptAuditRemediation()` with the Step-2 audit gate, so these tests pin
+// the same contract for the *other* consumer of the shared probe. Tests that
+// pin behaviour not yet implemented carry an explicit `skip` naming the
+// implementing sibling (SA-0MVTU22MB0057T2L) — never a placeholder body — and
+// that sibling removes the marker.
+//
+// Hermetic: the only stubbed boundaries are the command executors; the real
+// `queryContentFreshness()` builds the argv and JSON-parses the reply.
+// ---------------------------------------------------------------------------
+
+const PROBE_ITEM = {
+  id: 'SA-FV-PROBE-1',
+  title: 'Final-Validation Probe Item',
+  needsProducerReview: false,
+  parentId: null,
+  // Newer than the audit below, so the stored audit is time-stale.
+  updatedAt: '2026-10-29T12:00:00Z',
+};
+
+const PROBE_FP_LINE = 'Audit content fingerprint (v2): 9f2c4a7e6d5b';
+const PROBE_AUDITED_AT = '2026-10-29T11:00:00Z';
+
+// `audit_runner.py issue <id>` short-circuits a content-fresh audit: exit 0,
+// no restamp, leaving a passing but time-stale audit.
+const SHORT_CIRCUIT_STDOUT =
+  'Skipping: audit still fresh — Ready to close: Yes\n';
+
+/** Build a `wl audit-show` payload for a given stored audit body. */
+function probeAudit({
+  readyToClose = true,
+  fingerprint = 'v2',
+  transient = false,
+  auditedAt = PROBE_AUDITED_AT,
+  summary = 'All acceptance criteria met.',
+} = {}) {
+  const verdict = readyToClose ? 'Yes' : 'No';
+  const fpLine =
+    fingerprint === 'v2'
+      ? PROBE_FP_LINE
+      : fingerprint === 'legacy'
+        ? 'Audit content fingerprint: 9f2c4a7e6d5b'
+        : null;
+  const rawOutput = [
+    `Ready to close: ${verdict}`,
+    transient ? 'Phase 2 deep analysis timed out.' : `\n## Summary\n\n${summary}`,
+    fpLine,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return {
+    success: true,
+    workItemId: PROBE_ITEM.id,
+    audit: { readyToClose, auditedAt, summary, rawOutput },
+  };
+}
+
+/**
+ * The real `queryContentFreshness()` with only its command boundary stubbed.
+ *
+ * The probe is owned by `check-audit-gate.js` (the shared implementation both
+ * gates import); `check-final-validation.js` consumes it without re-exporting,
+ * so it is imported from its source of truth here. The probe still builds its
+ * argv, runs it through `runCommand` and JSON-parses the reply.
+ */
+async function realProbe({ reply, commands }) {
+  const probeMod = await import(
+    join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-audit-gate.js')
+  );
+  return (workItemId) =>
+    probeMod.queryContentFreshness(workItemId, {
+      runCommand: (cmd) => {
+        if (commands) {
+          commands.push(cmd);
+        }
+        const value = typeof reply === 'function' ? reply(cmd, workItemId) : reply;
+        if (value instanceof Error) {
+          throw value;
+        }
+        return typeof value === 'string' ? value : JSON.stringify(value);
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+}
+
+const FRESH_REPLY = {
+  fresh: true,
+  reason: 'content fingerprint unchanged',
+  hasFingerprint: true,
+  auditedAt: PROBE_AUDITED_AT,
+};
+const CONTENT_CHANGED_REPLY = {
+  fresh: false,
+  reason: 'content changed',
+  hasFingerprint: true,
+  auditedAt: PROBE_AUDITED_AT,
+};
+const PROBE_FAILED_REPLY = {
+  fresh: false,
+  reason: 'check-freshness failed: argparse: unrecognized arguments: --json',
+  hasFingerprint: false,
+  auditedAt: null,
+};
+
+describe('checkFinalValidation - time-stale passing audit upgrade (parent AC2)', () => {
+  test('a content-fresh probe upgrades a time-stale passing audit without a re-audit', async () => {
+    const mod = await import(MODULE_PATH);
+    const commands = [];
+    let remediationCalls = 0;
+
+    const report = await mod.checkFinalValidation({
+      getItemsFn: () => [PROBE_ITEM],
+      runAuditShow: () => JSON.stringify(probeAudit()),
+      runAuditCommand: () => {
+        remediationCalls += 1;
+        return SHORT_CIRCUIT_STDOUT;
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      queryContentFreshnessFn: await realProbe({ commands, reply: FRESH_REPLY }),
+    });
+
+    assert.deepEqual(commands, [
+      'python3 "/tmp/fake-audit_runner.py" check-freshness SA-FV-PROBE-1 --json',
+    ]);
+    assert.equal(remediationCalls, 0, 'a content-fresh audit must not be re-audited');
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.blockingItems.length, 0);
+    assert.equal(report.remediatedItems.length, 0);
+    assert.equal(report.passingCount, 1);
+  });
+
+  test('a probe failure still falls back to the time gate and blocks conservatively', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+
+    const report = await mod.checkFinalValidation({
+      getItemsFn: () => [PROBE_ITEM],
+      runAuditShow: () => JSON.stringify(probeAudit({ readyToClose: false })),
+      runAuditCommand: () => {
+        remediationCalls += 1;
+        throw Object.assign(new Error('runner failed'), { stderr: Buffer.from('boom') });
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      queryContentFreshnessFn: () => ({ ...PROBE_FAILED_REPLY, reason: 'boom' }),
+    });
+
+    assert.equal(remediationCalls, 1, 'the time gate still triggers a re-audit');
+    assert.equal(report.hasBlockingItems, true);
+  });
+});
+
+describe('checkFinalValidation - no contradictory block invariant (parent AC3)', () => {
+  test('no fixture produces a blocking entry whose reason says it passed', {
+    skip:
+      'TRACER BULLET — fails until SA-0MVTU22MB0057T2L stops the ' +
+      'post-remediation passing+stale block; that item removes this marker.',
+  }, async () => {
+    const mod = await import(MODULE_PATH);
+
+    const audits = [
+      ['passing + v2 fingerprint', probeAudit()],
+      ['passing + legacy fingerprint', probeAudit({ fingerprint: 'legacy' })],
+      ['passing + no fingerprint', probeAudit({ fingerprint: 'none' })],
+      ['failing + v2 fingerprint', probeAudit({ readyToClose: false })],
+      ['transient + v2 fingerprint', probeAudit({ readyToClose: false, transient: true })],
+      ['missing audit', { success: true, workItemId: PROBE_ITEM.id, audit: null }],
+    ];
+    const probes = [
+      ['probe reports content-fresh', FRESH_REPLY],
+      ['probe reports content changed', CONTENT_CHANGED_REPLY],
+      ['probe fails open', PROBE_FAILED_REPLY],
+    ];
+
+    for (const [auditLabel, audit] of audits) {
+      for (const [probeLabel, reply] of probes) {
+        const label = `${auditLabel} / ${probeLabel}`;
+        const report = await mod.checkFinalValidation({
+          getItemsFn: () => [PROBE_ITEM],
+          // Stable payload: `issue <id>` short-circuits, so a re-check sees the
+          // same stored audit (still passing and still time-stale).
+          runAuditShow: () => JSON.stringify(audit),
+          runAuditCommand: () => SHORT_CIRCUIT_STDOUT,
+          resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+          queryContentFreshnessFn: await realProbe({ reply }),
+        });
+
+        for (const entry of report.blockingItems) {
+          assert.ok(
+            !String(entry.reason).includes('Ready to close'),
+            `${label}: a blocking entry must name the real condition, got: ${entry.reason}`,
+          );
+          assert.ok(
+            !String(entry.summary || '').includes('Ready to close: Yes'),
+            `${label}: a blocking entry must not report a passing verdict`,
+          );
+        }
+
+        // AC3(b): an unconfirmed passing time-stale audit blocks with the real
+        // condition named plus the `--force` remedy.
+        const passingStale = Boolean(audit.audit && audit.audit.readyToClose === true);
+        if (passingStale && reply !== FRESH_REPLY) {
+          assert.equal(
+            report.blockingItems.length,
+            1,
+            `${label}: an unconfirmed passing time-stale audit must block`,
+          );
+          const entry = report.blockingItems[0];
+          assert.match(
+            String(entry.reason),
+            /time-stale but content changed/,
+            `${label}: the reason must name the real condition`,
+          );
+          assert.match(
+            String(entry.reason),
+            /issue SA-FV-PROBE-1 --force/,
+            `${label}: the reason must carry the --force remedy`,
+          );
+        }
+      }
+    }
+  });
+});
+
+describe('checkFinalValidation - ContextHub regression (parent AC4)', () => {
+  test('a short-circuiting remediation never blocks the release', {
+    skip:
+      'TRACER BULLET — reproduces the ContextHub failure and fails until ' +
+      'SA-0MVTU22MB0057T2L resolves the post-remediation passing+stale state; ' +
+      'that item removes this marker.',
+  }, async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let shows = 0;
+    let probeCallIndex = 0;
+    const probeReplies = [PROBE_FAILED_REPLY, FRESH_REPLY];
+
+    const report = await mod.checkFinalValidation({
+      getItemsFn: () => [PROBE_ITEM],
+      runAuditShow: () => {
+        shows += 1;
+        // readyToClose: true, auditedAt < updatedAt, v2 fingerprint present;
+        // the re-check is unchanged because `issue` short-circuited.
+        return JSON.stringify(probeAudit());
+      },
+      runAuditCommand: () => {
+        remediationCalls += 1;
+        return SHORT_CIRCUIT_STDOUT;
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      queryContentFreshnessFn: await realProbe({
+        reply: () => probeReplies[Math.min(probeReplies.length - 1, probeCallIndex++)],
+      }),
+    });
+
+    assert.equal(remediationCalls, 1, 'the observed sequence did attempt a re-audit');
+    assert.ok(shows >= 2, 'the gate re-read the audit after remediation');
+    // run-release.js maps `hasBlockingItems` to exit 12 for Step 3.7, so a
+    // non-blocking report is exactly "the release is not aborted".
+    assert.equal(report.hasBlockingItems, false, 'Step 3.7 must not exit 12');
+    assert.equal(report.blockingItems.length, 0);
+    assert.equal(report.remediatedItems.length, 1);
+    assert.equal(report.remediatedItems[0].workItemId, PROBE_ITEM.id);
+  });
+});

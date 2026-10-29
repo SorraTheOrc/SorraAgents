@@ -1695,3 +1695,351 @@ describe('attemptAuditRemediation - abort-recovery cleanup after the runner', ()
     assert.deepEqual(cleanupCalls, ['SA-1']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 24. Probe contract, upgrade, regression and post-remediation invariants
+//     (SA-0MVTU1WHS002HN1C)
+//
+// Tracer-bullet slice for SA-0MVTPAV4N005WPWF. The *green* tests pin the
+// contract that must never drift again: the argv `queryContentFreshness()`
+// builds, and the fact that a content-fresh probe upgrades a time-stale
+// passing audit without a re-audit. The tests that pin behaviour not yet
+// implemented carry an explicit `skip` naming the implementing sibling
+// (SA-0MVTU22MB0057T2L) — never a placeholder body — and that sibling removes
+// the marker. (`node:test` has no strict-xfail equivalent of
+// `pytest.mark.xfail(strict=True)`; a `todo` marker would be parsed as a
+// `not ok` line by the test-skill runner, so `skip` is the convention here.)
+//
+// Hermetic: the only stubbed boundaries are the command executors
+// (`runAuditShow`, `runAuditCommand` and the probe's own `runCommand`). The
+// probe's `queryContentFreshness()` always runs for real, so its argv
+// building and JSON parse are exercised rather than assumed.
+// ---------------------------------------------------------------------------
+
+const PROBE_ITEM = {
+  id: 'SA-PROBE-1',
+  title: 'Probe Contract Item',
+  needsProducerReview: false,
+  parentId: null,
+  // Newer than the audit below, so the stored audit is time-stale.
+  updatedAt: '2026-10-29T12:00:00Z',
+};
+
+const PROBE_FP_LINE = 'Audit content fingerprint (v2): 9f2c4a7e6d5b';
+const PROBE_AUDITED_AT = '2026-10-29T11:00:00Z';
+
+// `audit_runner.py issue <id>` short-circuits a content-fresh audit: it exits
+// 0 without restamping `auditedAt`, leaving a passing but time-stale audit.
+const SHORT_CIRCUIT_STDOUT =
+  'Skipping: audit still fresh — Ready to close: Yes\n';
+
+/** Build a `wl audit-show` payload for a given stored audit body. */
+function probeAudit({
+  readyToClose = true,
+  fingerprint = 'v2',
+  transient = false,
+  auditedAt = PROBE_AUDITED_AT,
+  summary = 'All acceptance criteria met.',
+} = {}) {
+  const verdict = readyToClose ? 'Yes' : 'No';
+  const fpLine =
+    fingerprint === 'v2'
+      ? PROBE_FP_LINE
+      : fingerprint === 'legacy'
+        ? 'Audit content fingerprint: 9f2c4a7e6d5b'
+        : null;
+  const rawOutput = [
+    `Ready to close: ${verdict}`,
+    transient ? 'Phase 2 deep analysis timed out.' : `\n## Summary\n\n${summary}`,
+    fpLine,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return {
+    success: true,
+    workItemId: PROBE_ITEM.id,
+    audit: { readyToClose, auditedAt, summary, rawOutput },
+  };
+}
+
+/**
+ * The **real** `queryContentFreshness()` with only its command boundary
+ * stubbed: it still builds the argv, executes it through `runCommand` and
+ * JSON-parses the reply. Tests therefore pin the probe's parse path instead of
+ * assuming a hand-written stub of its return value.
+ */
+function realProbe(mod, { reply, commands }) {
+  return (workItemId) =>
+    mod.queryContentFreshness(workItemId, {
+      runCommand: (cmd) => {
+        if (commands) {
+          commands.push(cmd);
+        }
+        const value = typeof reply === 'function' ? reply(cmd, workItemId) : reply;
+        if (value instanceof Error) {
+          throw value;
+        }
+        return typeof value === 'string' ? value : JSON.stringify(value);
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+    });
+}
+
+const FRESH_REPLY = {
+  fresh: true,
+  reason: 'content fingerprint unchanged',
+  hasFingerprint: true,
+  auditedAt: PROBE_AUDITED_AT,
+};
+const CONTENT_CHANGED_REPLY = {
+  fresh: false,
+  reason: 'content changed',
+  hasFingerprint: true,
+  auditedAt: PROBE_AUDITED_AT,
+};
+const PROBE_FAILED_REPLY = {
+  fresh: false,
+  reason:
+    'check-freshness failed: argparse: unrecognized arguments: --json',
+  hasFingerprint: false,
+  auditedAt: null,
+};
+
+describe('queryContentFreshness - runner contract pin (parent AC1)', () => {
+  test('builds the exact argv the runner parser must accept', async () => {
+    const mod = await import(MODULE_PATH);
+    const commands = [];
+
+    const result = realProbe(mod, { commands, reply: FRESH_REPLY })('SA-PROBE-1');
+
+    // Paired with
+    // skill/audit/tests/test_audit_runner_check_freshness.py::
+    // test_check_freshness_subcommand_accepts_json_flag, which pins that this
+    // argv parses. Neither side may change without the other.
+    assert.deepEqual(commands, [
+      'python3 "/tmp/fake-audit_runner.py" check-freshness SA-PROBE-1 --json',
+    ]);
+    assert.equal(result.fresh, true);
+    assert.equal(result.hasFingerprint, true);
+    assert.equal(result.reason, 'content fingerprint unchanged');
+  });
+});
+
+describe('checkAuditReadyToClose - time-stale passing audit upgrade (parent AC2)', () => {
+  test('a content-fresh probe upgrades a time-stale passing audit without a re-audit', async () => {
+    const mod = await import(MODULE_PATH);
+    const commands = [];
+    let remediationCalls = 0;
+
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [PROBE_ITEM],
+      runAuditShow: () => JSON.stringify(probeAudit()),
+      runAuditCommand: () => {
+        remediationCalls += 1;
+        return SHORT_CIRCUIT_STDOUT;
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      // The real probe, stubbing only its command executor — the JSON parse is
+      // the code path under test (not a stubbed queryContentFreshnessFn).
+      queryContentFreshnessFn: realProbe(mod, { commands, reply: FRESH_REPLY }),
+    });
+
+    assert.equal(commands.length, 1, 'the real probe must run exactly once');
+    assert.deepEqual(commands, [
+      'python3 "/tmp/fake-audit_runner.py" check-freshness SA-PROBE-1 --json',
+    ]);
+    assert.equal(remediationCalls, 0, 'a content-fresh audit must not be re-audited');
+    assert.equal(report.hasBlockingItems, false);
+    assert.equal(report.blockingItems.length, 0);
+    assert.equal(report.remediatedItems.length, 0, 'no remediation was needed');
+  });
+
+  test('a probe failure still falls back to the time gate and blocks conservatively', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    const failedProbe = () => ({
+      ...PROBE_FAILED_REPLY,
+      reason: 'check-freshness failed: boom',
+    });
+
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [PROBE_ITEM],
+      runAuditShow: () => JSON.stringify(probeAudit({ readyToClose: false })),
+      runAuditCommand: () => {
+        remediationCalls += 1;
+        throw Object.assign(new Error('runner failed'), { stderr: Buffer.from('boom') });
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      queryContentFreshnessFn: failedProbe,
+    });
+
+    // Fail-open safety: an inconclusive probe never passes a stale audit.
+    assert.equal(remediationCalls, 1, 'the time gate still triggers a re-audit');
+    assert.equal(report.hasBlockingItems, true);
+  });
+});
+
+describe('attemptAuditRemediation - post-remediation content freshness (parent AC3)', () => {
+  const POST_REMEDIATION_SKIP =
+    'TRACER BULLET — fails until SA-0MVTU22MB0057T2L resolves passing+stale ' +
+    'post-remediation by content freshness; that item removes this marker.';
+
+  test('an unchanged fingerprint resolves to passing with a content-fresh basis', {
+    skip: POST_REMEDIATION_SKIP,
+  }, async () => {
+    const mod = await import(MODULE_PATH);
+
+    const result = await mod.attemptAuditRemediation(PROBE_ITEM, {
+      runAuditShow: () => JSON.stringify(probeAudit()),
+      runAuditCommand: () => SHORT_CIRCUIT_STDOUT,
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      checkStuckAuditFn: () => false,
+      queryContentFreshnessFn: realProbe(mod, { reply: FRESH_REPLY }),
+    });
+
+    assert.equal(result.status, 'passing');
+    assert.match(result.reason, /content/i, 'the reason must name the content-fresh basis');
+    assert.doesNotMatch(result.reason, /Ready to close/);
+  });
+
+  test('a changed fingerprint blocks naming the real condition and the --force remedy', {
+    skip: POST_REMEDIATION_SKIP,
+  }, async () => {
+    const mod = await import(MODULE_PATH);
+
+    const result = await mod.attemptAuditRemediation(PROBE_ITEM, {
+      runAuditShow: () => JSON.stringify(probeAudit()),
+      runAuditCommand: () => SHORT_CIRCUIT_STDOUT,
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      checkStuckAuditFn: () => false,
+      queryContentFreshnessFn: realProbe(mod, { reply: CONTENT_CHANGED_REPLY }),
+    });
+
+    assert.equal(result.status, 'blocking');
+    assert.match(result.reason, /time-stale but content changed/);
+    assert.match(result.reason, /issue SA-PROBE-1 --force/);
+  });
+});
+
+describe('checkAuditReadyToClose - no contradictory block invariant (parent AC3)', () => {
+  test('no fixture produces a blocking entry whose reason says it passed', {
+    skip:
+      'TRACER BULLET — fails until SA-0MVTU22MB0057T2L stops the ' +
+      'post-remediation passing+stale block; that item removes this marker.',
+  }, async () => {
+    const mod = await import(MODULE_PATH);
+
+    const audits = [
+      ['passing + v2 fingerprint', probeAudit()],
+      ['passing + legacy fingerprint', probeAudit({ fingerprint: 'legacy' })],
+      ['passing + no fingerprint', probeAudit({ fingerprint: 'none' })],
+      ['failing + v2 fingerprint', probeAudit({ readyToClose: false })],
+      ['transient + v2 fingerprint', probeAudit({ readyToClose: false, transient: true })],
+      ['missing audit', { success: true, workItemId: PROBE_ITEM.id, audit: null }],
+    ];
+    const probes = [
+      ['probe reports content-fresh', FRESH_REPLY],
+      ['probe reports content changed', CONTENT_CHANGED_REPLY],
+      ['probe fails open', PROBE_FAILED_REPLY],
+    ];
+
+    for (const [auditLabel, audit] of audits) {
+      for (const [probeLabel, reply] of probes) {
+        const label = `${auditLabel} / ${probeLabel}`;
+        const report = await mod.checkAuditReadyToClose({
+          getCandidateItemsFn: () => [PROBE_ITEM],
+          // Stable payload: `issue <id>` short-circuits, so a re-check sees the
+          // same stored audit (still passing and still time-stale).
+          runAuditShow: () => JSON.stringify(audit),
+          runAuditCommand: () => SHORT_CIRCUIT_STDOUT,
+          resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+          queryContentFreshnessFn: realProbe(mod, { reply }),
+        });
+
+        for (const entry of report.blockingItems) {
+          assert.ok(
+            !String(entry.reason).includes('Ready to close'),
+            `${label}: a blocking entry must name the real condition, got: ${entry.reason}`,
+          );
+          assert.ok(
+            !String(entry.summary || '').includes('Ready to close: Yes'),
+            `${label}: a blocking entry must not report a passing verdict`,
+          );
+        }
+
+        // AC3(b): a *passing* time-stale audit whose content cannot be confirmed
+        // (content changed / probe failed / probe reported not fresh) must name
+        // the real condition and carry the actionable `--force` remedy — never
+        // the contradictory `Ready to close`.
+        const passingStale = Boolean(audit.audit && audit.audit.readyToClose === true);
+        if (passingStale && reply !== FRESH_REPLY) {
+          assert.equal(
+            report.blockingItems.length,
+            1,
+            `${label}: an unconfirmed passing time-stale audit must block`,
+          );
+          const entry = report.blockingItems[0];
+          assert.match(
+            String(entry.reason),
+            /time-stale but content changed/,
+            `${label}: the reason must name the real condition`,
+          );
+          assert.match(
+            String(entry.reason),
+            /issue SA-PROBE-1 --force/,
+            `${label}: the reason must carry the --force remedy`,
+          );
+        }
+      }
+    }
+  });
+});
+
+describe('checkAuditReadyToClose - ContextHub regression (parent AC4)', () => {
+  test('a short-circuiting remediation never blocks the release', {
+    skip:
+      'TRACER BULLET — reproduces the ContextHub failure and fails until ' +
+      'SA-0MVTU22MB0057T2L resolves the post-remediation passing+stale state; ' +
+      'that item removes this marker.',
+  }, async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+    let shows = 0;
+    let probeCallIndex = 0;
+    const probeReplies = [
+      // Observed sequence: the runner rejected the probe's `--json` argv, so
+      // the fail-open catch reported "not fresh" and the gate fell through to
+      // in-gate remediation.
+      PROBE_FAILED_REPLY,
+      // Content is in fact unchanged — a working probe says so.
+      FRESH_REPLY,
+    ];
+
+    const report = await mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [PROBE_ITEM],
+      runAuditShow: () => {
+        shows += 1;
+        // readyToClose: true, auditedAt < updatedAt, v2 fingerprint present;
+        // the re-check is unchanged because `issue` short-circuited.
+        return JSON.stringify(probeAudit());
+      },
+      runAuditCommand: () => {
+        remediationCalls += 1;
+        return SHORT_CIRCUIT_STDOUT;
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      queryContentFreshnessFn: realProbe(mod, {
+        reply: () => probeReplies[Math.min(probeReplies.length - 1, probeCallIndex++)],
+      }),
+    });
+
+    assert.equal(remediationCalls, 1, 'the observed sequence did attempt a re-audit');
+    assert.ok(shows >= 2, 'the gate re-read the audit after remediation');
+    // run-release.js maps `hasBlockingItems` to exit 6 for Step 2, so a
+    // non-blocking report is exactly "the release is not aborted".
+    assert.equal(report.hasBlockingItems, false, 'Step 2 must not exit 6');
+    assert.equal(report.blockingItems.length, 0);
+    assert.equal(report.remediatedItems.length, 1);
+    assert.equal(report.remediatedItems[0].workItemId, PROBE_ITEM.id);
+  });
+});
