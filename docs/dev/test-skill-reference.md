@@ -410,12 +410,48 @@ in the cache entry's `metadata.json` — so the green result matches
 interpreter the agent started the runner with, which is the repository's
 canonical interpreter (`python3 …/run_tests.py`).
 
+**Measured parity (real ContentCreator checkout, 2026-10-29).** Verified on
+host `rgardler-AI-Laptop` against ContentCreator `main` (`bf46a75`, the
+`packages/ContextHub` submodule initialised, and the vendored
+`.pi/packages/pi-llm-wiki-manual` dependencies installed with `npm ci` —
+without them the repository's own runner fails three
+`tests/test_rebuild_wiki_meta.py` cases on a fresh clone):
+
+| Runner | Command | Result |
+|--------|---------|--------|
+| Canonical | `./scripts/run_tests.sh` | exit 0 — **3286 passed, 2 skipped** across the 7 suites |
+| Test skill | `run_tests.py --type full --force --json` | success — **3286 passed, 2 skipped**, interpreter `/usr/bin/python3` |
+
+Both runners therefore report the same green result, and the skill run names
+the interpreter it used. In this repository the executed pytest command comes
+from the repo-level pin (`.pi/test-config.json` → `suiteCommands` =
+`python3 -m pytest -q -r a --disable-warnings`, tracked separately in
+OSL-0MVJOKJXK009J8ZA), which agrees with the framework resolution. Per
+producer decision 2026-10-29 (AC4), host-independent parity of this kind
+satisfies the field verification; the literal `RossGameDev` host is not
+required.
+
+**Failure condition reproduced end to end (2026-10-29).** With a `pytest`
+first on `PATH` whose `--version` succeeds but whose interpreter cannot
+import the project's dependencies (the `RossGameDev` shape), the pre-fix
+selection — a bare `pytest -q -r a --disable-warnings` — reproduces the field
+failure exactly (`ModuleNotFoundError: No module named 'numpy'`, exit 2),
+while the fixed resolver, run in the same checkout with the same poisoned
+`PATH`, selects the runner's interpreter:
+
+```text
+which(pytest)               = <foreign-pytest-dir>/pytest
+resolve_pytest_command()    = /usr/bin/python3 -m pytest
+executable_test_command("pytest -q -r a --disable-warnings")
+                            = /usr/bin/python3 -m pytest -q -r a --disable-warnings
+```
+
 **Repeatable verification (any host — no `RossGameDev` checkout required):**
 
 ```bash
 # The green full-suite run names the interpreter actually used:
 python3 <skill>/test/scripts/run_tests.py --type full --force --json \
-  | jq -r '.suites.pytest.interpreter'
+  | jq -r '.suites | to_entries | map(.value.interpreter) | unique[]'
 ```
 
 The configuration-independent regression
