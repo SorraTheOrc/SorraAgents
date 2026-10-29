@@ -481,6 +481,111 @@ class TestBoundedFinishAttempts:
 
 
 # ---------------------------------------------------------------------------
+# Parent AC2 (SA-0MVLJXTYY005XQDV): terminal reconciliation on finish failure
+# ---------------------------------------------------------------------------
+
+
+class TestFinishFailureTerminalReconciliation:
+    """A child whose ``finish`` exhausted the bound is re-fetched and, when
+    terminal, recorded as done instead of stalling the epic."""
+
+    def test_terminal_child_reconciled_when_finish_bound_exhausted(
+        self, drive_harness, finishing_failed_parent_runner,
+    ):
+        """After the finish bound, a terminal child is recorded as done and
+        the drive continues; it is never reset, finished or re-spawned."""
+        child = _child("SA-C1", status="completed", stage="in_review")
+        harness = drive_harness(
+            children=[child],
+            runner=RecordingParent([
+                *(finishing_failed_report("SA-C1") for _ in range(3)),
+                {"success": True, "parent_advanced": True,
+                 "message": "all children terminal"},
+            ]),
+            child_states={"SA-C1": child},
+        )
+        reset_calls = harness.record_reset_helper()
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert report["finish_attempts"] == {"SA-C1": 3}
+        entry = report["children_driven"][0]
+        assert entry["id"] == "SA-C1"
+        assert entry["result"] == "terminal-reconciled"
+        assert entry["reconciled"] is True
+        assert entry["status"] == "completed"
+        assert entry["stage"] == "in_review"
+        assert entry["finish_attempts"] == 3
+        assert entry["evidence"] == "status=completed, stage=in_review"
+        assert "terminal state" in entry["reason"]
+        assert report["terminal_reconciled"] == 1
+        # Nothing was finished, reset, or re-spawned.
+        assert harness.spawner.calls == []
+        assert harness.status_updates == []
+        assert reset_calls == []
+
+    def test_non_terminal_child_keeps_hard_failure_after_bound(
+        self, drive_harness, finishing_failed_parent_runner,
+    ):
+        """A still non-terminal child after the bound keeps the hard finish
+        failure (the reset/retry recovery lands in the sibling feature); it
+        is never reconciled as done."""
+        child = _child("SA-C1")
+        harness = drive_harness(
+            children=[child],
+            runner=finishing_failed_parent_runner("SA-C1", times=10),
+            child_states={"SA-C1": child},
+        )
+        reset_calls = harness.record_reset_helper()
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["finish_attempts"] == {"SA-C1": 3}
+        assert report.get("terminal_reconciled", 0) == 0
+        assert "status=open" in report["message"]
+        assert harness.spawner.calls == []
+        assert harness.status_updates == []
+        assert reset_calls == []
+        assert report["children_driven"] == []
+
+    def test_unfetchable_child_fails_closed(self, drive_harness):
+        """When the child cannot be re-fetched, the hard failure stands
+        (never a silent success)."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            reports=[finishing_failed_report("SA-C1")],
+        )
+
+        report = harness.run(finish_attempt_limit=1)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["children_driven"] == []
+
+    def test_happy_path_never_re_fetches_children(self, drive_harness):
+        """Reconciliation fetches happen only on the slow finish-failure
+        path (AC6) — a clean drive re-fetches no child."""
+        child = _child("SA-C1")
+        harness = drive_harness(
+            children=[child],
+            reports=[
+                {"success": True, "next_child": "SA-C1",
+                 "worktree_path": "/wt/SA-C1"},
+                {"success": True, "parent_advanced": True},
+            ],
+        )
+
+        report = harness.run()
+
+        assert report["success"] is True
+        assert report["_show_calls"] == [PARENT]
+
+
+# ---------------------------------------------------------------------------
 # AC3 (parent AC5): terminal children are never touched
 # ---------------------------------------------------------------------------
 

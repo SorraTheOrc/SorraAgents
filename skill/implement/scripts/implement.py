@@ -6353,6 +6353,72 @@ def _reconcile_spawn_failure(
     return result
 
 
+def _reconcile_finish_failure(
+    child_id: str,
+    parent_report: dict[str, Any],
+    finish_attempts: int,
+) -> dict[str, Any]:
+    """Classify a child after its failing ``finish`` exhausted the bound.
+
+    ``implement.py finish`` can fail *after* the child reached a terminal
+    state (for example the push succeeded and a later gate step failed).
+    Treating every ``finishing_failed`` as chain-fatal stalls an epic whose
+    child is genuinely done. This helper re-fetches the child (read-only
+    ``wl show``) and classifies it with :func:`_is_terminal_child`
+    (SA-0MVLJXTYY005XQDV). It is called **only** when the finish-attempt
+    bound is exhausted, so the happy path pays no extra fetch.
+
+    Args:
+        child_id: The child whose ``finish`` failed.
+        parent_report: The ``phase_parent`` report carrying the failure.
+        finish_attempts: Number of failing finish executions observed.
+
+    Returns:
+        A dict with ``terminal`` (bool), ``status``, ``stage``,
+        ``finish_attempts``, ``evidence`` (str) and ``reason`` (str).
+        ``status``/``stage`` are empty when the child could not be fetched —
+        callers must treat that as non-terminal (fail closed).
+    """
+    result: dict[str, Any] = {
+        "terminal": False,
+        "status": "",
+        "stage": "",
+        "finish_attempts": finish_attempts,
+        "evidence": "",
+        "reason": str(parent_report.get("message", "") or ""),
+    }
+
+    child = wl_show(child_id)
+    if not child:
+        LOG.warning(
+            "Could not re-fetch %s after %d failed finish attempt(s); "
+            "keeping the hard failure.",
+            child_id,
+            finish_attempts,
+        )
+        return result
+
+    status = str(child.get("status", "") or "")
+    stage = str(child.get("stage", "") or "")
+    result["status"] = status
+    result["stage"] = stage
+    result["evidence"] = f"status={status or '?'}, stage={stage or '?'}"
+    result["terminal"] = _is_terminal_child(child) or stage == "in_review"
+    if not result["terminal"]:
+        return result
+
+    result["reason"] = (
+        f"finish failed {finish_attempts} time(s) but the child reached a "
+        f"terminal state anyway ({result['evidence']})."
+    )
+    LOG.info(
+        "Reconciled %s after a failed finish: terminal (%s).",
+        child_id,
+        result["evidence"],
+    )
+    return result
+
+
 def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     """Emit a drive report as JSON or a concise human summary."""
     if json_output:
@@ -6378,6 +6444,11 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             # A stranded child was finalised through the evidence-gated
             # --finalise-stranded path (SA-0MVLJWTGP005XJPP).
             icon = "🛠"
+        elif result == "terminal-reconciled":
+            # The child's finish failed but the child had already reached a
+            # terminal state: recorded as done, never reset
+            # (SA-0MVLJXTYY005XQDV).
+            icon = "🕓"
         else:
             icon = "❌"
         print(
@@ -6392,6 +6463,10 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
     if report.get("completed_late"):
         print(f"  Completed late: {report['completed_late']}")
+    if report.get("terminal_reconciled"):
+        print(
+            f"  Terminal-reconciled: {report['terminal_reconciled']}"
+        )
     if report.get("finalised_children"):
         print(f"  Finalised stranded: {len(report['finalised_children'])}")
     if report.get("stranded_children"):
@@ -6771,6 +6846,13 @@ def phase_drive(
     ``max_child_sessions``, so the default behaviour (one attempt) is
     unchanged from before this feature.
 
+    Before the chain stops, the exhausted child is reconciled
+    (SA-0MVLJXTYY005XQDV): it is re-fetched with ``wl show`` and classified
+    with :func:`_is_terminal_child`. A child that reached a terminal state
+    despite the failed finish is recorded as ``terminal-reconciled`` and the
+    loop continues; only a genuinely non-terminal child keeps the hard
+    failure. Terminal children are never finished, reset or re-spawned.
+
     Args:
         work_item_id: The parent work item ID.
         json_output: If True, emit JSON.
@@ -6810,7 +6892,9 @@ def phase_drive(
         its pushed-commit evidence (SA-0MVLJWRVO000QQNP). ``finish_attempts``
         maps each child whose ``finish`` failed to the number of failing
         finish executions observed, and ``finish_attempt_limit`` reports the
-        bound applied (SA-0MVLJXS7R000XIFL).
+        bound applied (SA-0MVLJXS7R000XIFL). ``terminal_reconciled`` counts
+        children recorded as done after their finish failed
+        (SA-0MVLJXTYY005XQDV).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -6820,6 +6904,7 @@ def phase_drive(
         "sessions_spawned": 0,
         "children_driven": [],
         "completed_late": 0,
+        "terminal_reconciled": 0,
         "finish_attempts": {},
         "finish_attempt_limit": None,
         "message": "",
@@ -6944,17 +7029,69 @@ def phase_drive(
                         finish_attempt_limit,
                     )
                     continue
-                LOG.error(
+                LOG.warning(
                     "Child %s finish failed %d time(s), exhausting the "
-                    "finish-attempt bound (%d); stopping the drive chain.",
+                    "finish-attempt bound (%d); reconciling the child's "
+                    "actual state.",
                     failed_cid,
                     finish_attempts[failed_cid],
                     finish_attempt_limit,
                 )
+                # Bound exhausted: re-fetch the child and reconcile. A
+                # child whose finish failed but which nevertheless reached a
+                # terminal state (e.g. the push succeeded and a later gate
+                # step failed) is done, not failed — recording it as
+                # terminal lets the epic advance
+                # (SA-0MVLJXTYY005XQDV). This fetch runs only on the slow
+                # finish-failure path.
+                reconciliation = _reconcile_finish_failure(
+                    failed_cid,
+                    parent_report,
+                    finish_attempts[failed_cid],
+                )
+                if reconciliation["terminal"]:
+                    driven.append({
+                        "id": failed_cid,
+                        "result": "terminal-reconciled",
+                        "reconciled": True,
+                        "status": reconciliation["status"],
+                        "stage": reconciliation["stage"],
+                        "finish_attempts": finish_attempts[failed_cid],
+                        "evidence": reconciliation["evidence"],
+                        "reason": reconciliation["reason"],
+                    })
+                    report["terminal_reconciled"] = (
+                        report.get("terminal_reconciled", 0) + 1
+                    )
+                    wl_add_comment(
+                        failed_cid,
+                        "Drive reconciled this child after its `finish` "
+                        f"failed {finish_attempts[failed_cid]} time(s): "
+                        f"{reconciliation['evidence']}. Recorded as done "
+                        "(`terminal-reconciled`); no reset was performed.",
+                    )
+                    LOG.info(
+                        "Reconciled %s after a failed finish: terminal "
+                        "(%s); continuing the drive loop.",
+                        failed_cid,
+                        reconciliation["evidence"],
+                    )
+                    continue
+                LOG.error(
+                    "Child %s finish failed %d time(s), exhausting the "
+                    "finish-attempt bound (%d); the child is still "
+                    "non-terminal (%s); stopping the drive chain.",
+                    failed_cid,
+                    finish_attempts[failed_cid],
+                    finish_attempt_limit,
+                    reconciliation["evidence"] or "state unreadable",
+                )
                 report["message"] = (
                     f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
                     f"(finish-attempt bound {finish_attempt_limit} exhausted "
-                    f"after {finish_attempts[failed_cid]} attempt(s))."
+                    f"after {finish_attempts[failed_cid]} attempt(s); child "
+                    f"is still non-terminal: "
+                    f"{reconciliation['evidence'] or 'state unreadable'})."
                 )
                 report["failed_child"] = failed_cid
                 break
