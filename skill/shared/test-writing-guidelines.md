@@ -134,7 +134,11 @@ config tree) and never removes it — no `after` hook, no `rmSync`.
 full-suite run leaves thousands of unremoved directories behind; the
 accumulation eventually exhausts the quota and a later run fails with an
 opaque `Unknown system error -122` (EDQUOT) on whichever test happens to write
-next (2026-10-29, `run-release: --help is side-effect free`, SA-0MVTSV5SO008625I).
+next (2026-10-29, SA-0MVTSV5SO008625I and SA-0MVTSV8GO005KZ5V). One exhaustion
+typically fails several unrelated node tests in the same run — e.g.
+`run-release: --help is side-effect free` and
+`run-release: post-release gated on a newly created tag` — because each
+failing harness is simply the next one to write.
 
 **Fix:** Route temp-dir creation through the shared helper
 [`tests/helpers/temp-dir.mjs`](../../tests/helpers/temp-dir.mjs) —

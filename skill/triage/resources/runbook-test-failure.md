@@ -28,7 +28,7 @@ Some failures are caused by the host, not the tested code. Recognise and treat t
 - **`Unknown system error -122` (errno EDQUOT) / `ENOSPC` on `writeFileSync` or `mkdtempSync`** — the OS temp dir is a tmpfs with a per-user quota (`/tmp` on this host). Leaked test harness sandboxes (see test-writing-guidelines anti-pattern 9) and other projects' artefacts accumulate until the quota is exhausted; a later suite run then fails with this opaque error on an arbitrary test that happens to write next.
   - Verify: `df -h /tmp` (check the `Use%`), and look for the failing stack pointing at a temp-dir `writeFileSync`/`mkdtempSync`
   - Remediation: free space under `/tmp` (remove stale test artefacts, e.g. `find /tmp -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +` run by an operator) and **fix the leaking harness** so it removes its temp dirs (route via the shared `tests/helpers/temp-dir.mjs` helper). Not a code regression — do not treat `-122` as a product defect.
-  - Reference incident: SA-0MVTSV5SO008625I (2026-10-29, `run-release: --help is side-effect free`).
+  - Reference incidents: SA-0MVTSV5SO008625I and SA-0MVTSV8GO005KZ5V (2026-10-29). A single quota exhaustion surfaced as **several** failing node tests in the same full-suite run, all in the `run-release` harness family (`run-release: --help is side-effect free`, `run-release: post-release gated on a newly created tag`), because whichever harness wrote next hit the quota. Treat a cluster of unrelated node failures in one run as one environmental incident, not several product regressions.
 
 PR unblock guidance
 -------------------
