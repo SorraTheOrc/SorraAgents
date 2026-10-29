@@ -5851,6 +5851,39 @@ def _child_has_stored_verdict(child: dict) -> bool:
     return bool(child.get("reused_from")) or child.get("child_audit_ready") is not None
 
 
+def _child_acs_assessed_in_run(child: dict) -> bool:
+    """True when *child* carries real (non-pending) acceptable verdicts.
+
+    The child-verdict reuse pre-pass runs BEFORE child screening, so a child
+    with no stored verdict is tagged ``child_audit_ready = False`` at that
+    point. The screening that follows (separate-process Phase-1, or the
+    budget-exceeded re-screen) then fills ``ac_results`` with real verdicts
+    without touching that flag — so the flag alone cannot distinguish
+    "never judged" from "judged by this run".
+
+    A child whose criteria were all judged acceptable by this run has been
+    assessed; reporting it as ``not_assessed`` misleads a reader (and an
+    orchestrator grepping reason codes) into treating a fully screened child
+    as an unjudged one (MS-0MVQO6N34007DHP8). A child whose screens are still
+    pending main-session review, whose screening was budget-exceeded, or
+    whose verdicts include anything but ``met``/``adjusted`` is NOT
+    considered assessed here, so the existing ``not_assessed`` semantics are
+    preserved for genuinely unjudged and blocking children.
+    """
+    acs = child.get("ac_results") or []
+    if not acs or child.get("budget_exceeded"):
+        return False
+    if any(
+        a.get("verdict") == VERDICT_PARTIAL
+        and MAIN_SLOT_PENDING_EVIDENCE in str(a.get("evidence", ""))
+        for a in acs
+    ):
+        return False
+    return all(
+        a.get("verdict") in (VERDICT_MET, VERDICT_ADJUSTED) for a in acs
+    )
+
+
 def _unserviced_main_slot_child_ids(
     child_results: list[dict],
     stale_pending_ids: set[str] | None,
@@ -5881,18 +5914,27 @@ def _classify_child_assessment_reason(
       carry the unserviced pending marker).  Whether the parent inherits a
       stored verdict or not is a separate concern; the reason always names the
       unserviced-in-main-slot origin.
-    * ``not_assessed`` — the child is genuinely not-ready and has no stored
-      verdict (a normal "not ready" verdict).
-    * ``None`` — the child is assessed (stored-verdict-inherited, in_review,
-      done, exempt, etc.) and does not need a diagnostic.
+    * ``not_assessed`` — the child is genuinely not-assessed: no stored
+      verdict AND no acceptable verdict from this run's screening (pending
+      screens, budget-exceeded screening, or blocking verdicts).
+    * ``None`` — the child is assessed (stored-verdict-inherited, screened to
+      an acceptable verdict by this run, in_review, done, exempt, etc.) and
+      does not need a diagnostic.
 
     The caller decides whether to surface the code in the report or JSON payload.
     """
     if _is_unserviced_main_slot_child(child, stale_pending_ids):
         return REASON_UNSERVICED_IN_MAIN_SLOT
-    # A child whose child_audit_ready is False and which is not unserviced
-    # is genuinely not-ready / not-assessed.
-    if child.get("child_audit_ready") is False:
+    # A child whose child_audit_ready is False and which is not unserviced is
+    # not-assessed ONLY when this run never judged its criteria. A child this
+    # run screened to an acceptable verdict (child_audit_ready is still False
+    # because it was set before screening) HAS been assessed — the flag means
+    # "no stored verdict at pre-pass time", not "never judged"
+    # (MS-0MVQO6N34007DHP8).
+    if (
+        child.get("child_audit_ready") is False
+        and not _child_acs_assessed_in_run(child)
+    ):
         return REASON_NOT_ASSESSED
     return None
 
