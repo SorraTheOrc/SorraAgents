@@ -737,6 +737,35 @@ layers on top of the subprocess-isolated orchestration above:
 - **Parent advanced last.** The parent is advanced to `completed`/`in_review`
   only after **all** child sessions have reached a terminal stage.
 
+**One child = one holder (per-child lock).** A child's critical section —
+work-item claim plus worktree creation/resume — is serialised by an exclusive
+`fcntl.flock` at `<worklog>/locks/child-<id>.lock`, acquired in `phase_start`
+before any mutation and held for the holder's lifetime. `drive`, `parent` and
+a manual `start` all share this choke point:
+
+- **A held child is never started twice.** If another live session owns the
+  lock, the child is classified `skipped-held`: the report carries
+  `action: "skipped-held"`, `skipped_held: true`, the holder identity in
+  `held_by` (`agent`, `pid`, `session_id`, `started_at`) and the child in
+  `held_children`, and **no session is spawned** for it. Nothing is written —
+  no claim, no status/assignee change, no comment, no worktree change.
+- **Ownership is a token, not a pid.** The holder exports
+  `IMPLEMENT_CHILD_LOCK_TOKEN` to its subprocesses and to the driven child
+  session, so the driver's own `parent` → `start` chain and the child session
+  re-enter the lock instead of blocking on themselves.
+- **Release is kernel-guaranteed.** Normal exit, exceptions and
+  `SIGINT`/`SIGTERM` release the lock explicitly; `SIGKILL`/crash release it
+  when the kernel closes the descriptor. A recorded holder whose pid is dead is
+  reclaimed automatically with a logged warning naming it.
+- **Not the same as `--assignee`.** A non-empty assignee is a human-visible
+  scheduling hold; the lock is proof of a live process. Never infer a live
+  holder from `assignee`, and never treat a live lock as an assignee.
+
+Operators diagnose a held child from the report's `held_by` (and `lock_path` in
+a `start` report) or by
+reading `<worklog>/locks/child-<id>.lock`, then check `ps -p <pid>`; see
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb).
+
 This mirrors the "Epic/parent items — one session per child" guidance in
 `AGENTS_GLOBAL.md`.
 
@@ -745,6 +774,10 @@ Guards (deterministic, in `phase_parent`):
 - **Dependency order** — a child `blocked` by another item is implemented
   only after its blockers; the chain is resolved dependency-order correct.
 - **Terminal children are never re-implemented** (skipped, reported).
+- **Held children are never raced** — a child whose per-work-item lock is held
+  by another live session is reported as `skipped-held` (with `held_by`) and no
+  second session is started; the phase stops cleanly and can be re-run once the
+  holder finishes.
 - **In-progress by another agent** (no worktree) → skipped and reported,
   never clobbered. An in-progress child *we* started (worktree exists) is
   finished when its worktree has changes, or returned to the agent for

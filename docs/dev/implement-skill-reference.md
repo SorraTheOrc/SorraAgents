@@ -763,3 +763,147 @@ Sibling behaviour outside this repository: the `wl` CLI (ContextHub) prints a
 single actionable diagnostic instead of an `ERR_MODULE_NOT_FOUND` stack trace
 when the shared build output (`packages/shared/dist`) is missing — see the
 [ContextHub dev note](https://github.com/SorraTheOrc/ContextHub/blob/dev/docs/dev/wl-shared-dist-diagnostic.md).
+
+## Per-child implementation lock (SA-0MVQ7VMRL00498YB)
+
+`implement.py start` serialises the critical section of one work item — the
+work-item claim plus worktree creation/resume — with a **per-work-item
+exclusive lock**. It exists because two concurrent `implement.py drive`
+invocations could previously spawn two child sessions for the same child in the
+same worktree: both wrote the same files, untracked work was replaced, and one
+session's `finish` removed the worktree under the other
+(SA-0MVOABYW00004978). The primitive lives in
+`skill/shared/work_item_lock.py`; `phase_start` is the single choke point, so
+`drive`, `parent` and a manual `start` all share it.
+
+### Lock path and owner metadata
+
+- **Path:** `<worklog>/locks/child-<work-item-id>.lock` — under the worklog
+  **store**, never inside a worktree (a worktree can be removed mid-flight,
+  while its lock must outlive it).
+- **Mechanism:** a non-blocking exclusive advisory `fcntl.flock`
+  (`LOCK_EX | LOCK_NB`) held for the holder's lifetime. There is no polling,
+  no wall-clock TTL that can expire under a long legitimate session, and no
+  waiting: a contender fails immediately.
+- **Owner metadata** (JSON, written through the locked descriptor) records
+  `agent`, `pid`, `session_id`, `started_at` (ISO-8601 UTC) and `token`.
+
+### Acquire, refuse and fail closed
+
+`phase_start` acquires the lock **before** claiming the item and before any
+worktree creation/resume. A contender that does not acquire it reports
+`action: "skipped-held"` and performs **no** store write: no claim, no
+status/assignee mutation, no comment, no worktree create/remove, and no lock
+metadata rewrite (the classification probe is read-only). The JSON report
+carries:
+
+| Field | Meaning |
+|---|---|
+| `action` | `"skipped-held"` |
+| `success` | `false` |
+| `held_by` | Holder metadata (`agent`, `pid`, `session_id`, `started_at`, `token`), or `null` when unreadable |
+| `lock_path` | The lock file that is held |
+| `message` | `Work item <id> is held by <agent>@pid <pid> (session <session>, since <started_at>). …` |
+
+Ambiguity fails closed: an unreadable or corrupt lock file, or a failure to
+record ownership, returns *held* (`acquired: false`) instead of overwriting a
+possible live holder. The warning names the file so an operator can inspect it
+and remove it only when no live holder exists.
+
+`parent` and `drive` surface the same refusal — `action: "skipped-held"`,
+`skipped_held: true`, `held_by`, `held_children`, and
+`children[].held_by`/`children_processed[].held_by` — and spawn **no second
+session** for the held child. `phase_parent` stops cleanly (no worktree
+create/remove, no status mutation, no comment) and the parent/drive command
+can be re-run once the holder finishes.
+
+### Release semantics
+
+The kernel owns the lock, not the bookkeeping:
+
+- **Normal exit, early return, exception** — `phase_start` releases it in a
+  `finally` around the whole mutating section.
+- **`SIGINT` / `SIGTERM`** — the signal handler resets the item status and
+  releases the lock deterministically before `os._exit`. If the signal lands
+  after the claim but before the worktree exists, it also posts an explanatory
+  comment on the work item (`Start phase interrupted by <SIGNAL> before the
+  worktree was created…`) so a released item is never silently unexplained.
+- **`SIGKILL` / crash** — guaranteed by the kernel when the descriptor is
+  closed; no stale flock can survive a killed holder.
+
+### Ownership token (`IMPLEMENT_CHILD_LOCK_TOKEN`)
+
+Ownership is propagated by one explicit token, never inferred from pid
+equality:
+
+- The holder's token is exported as `IMPLEMENT_CHILD_LOCK_TOKEN` to every
+  subprocess it spawns (`_invoke_implement`) and to the driven child session
+  (`_child_session_env`).
+- An acquire whose token matches the token in the lock file is a
+  **re-entrant no-op** (`acquired: true`, `reentrant: true`): the driver's own
+  `parent` → `start` chain and the driven child session (which runs
+  `start`/`finish` for the same child id) are therefore never falsely blocked.
+- A process with a different or absent token is a different owner, even if it
+  happens to share the pid.
+
+### Stale-holder reclamation
+
+A recorded owner whose pid is no longer alive does not block forever. When the
+kernel lock is free but the file still records a dead pid, `acquire()` reclaims
+it and logs:
+
+```
+reclaimed stale work item lock <path>: previous holder <agent> (pid <pid>) is no longer alive; kernel lock was free.
+```
+
+The `LockResult.reclaimed` field carries the previous holder's metadata and
+`phase_start` logs the reclamation, naming the previous holder. A `SIGKILL`ed
+holder needs no manual cleanup: killing the process releases the flock, and the
+next acquire reclaims the stale metadata.
+
+### Diagnosing a held child
+
+When `start`, `parent` or `drive` reports `skipped-held`:
+
+1. **Read the lock file.** `cat <worklog>/locks/child-<id>.lock` gives the
+   holder's `agent`, `pid`, `session_id`, `started_at` and `token`. The
+   report's `held_by` (plus `lock_path` in a `start` report) exposes the same
+   values without opening the store.
+2. **Confirm the holder is alive.** `ps -p <pid> -o pid,lstart,cmd` (or
+   `kill -0 <pid>`). A live pid means an in-flight session owns the child: let
+   it finish and re-run the parent/drive command; never start a second writer.
+3. **When reclamation happens automatically.** Only when the recorded pid is
+   provably dead (`ProcessLookupError`) *and* the kernel lock is free — the next
+   acquire reclaims and warns. A pid owned by another user (`PermissionError`)
+   or an ambiguous `OSError` is treated as alive (fail closed), so it is never
+   stolen.
+4. **Corrupt metadata** is never auto-reclaimed: the warning names the file.
+   Inspect it, confirm no live holder exists, and only then remove it.
+
+### Scheduling hold versus live process lock
+
+Keep the two holds distinct — they answer different questions and neither
+substitutes for the other:
+
+| Signal | Where it lives | Meaning |
+|---|---|---|
+| `child-<id>.lock` + `IMPLEMENT_CHILD_LOCK_TOKEN` | Worklog `locks/` directory, held by a live process | **Live process lock**: a session is executing the child's critical section right now; no second writer is admitted. |
+| `--assignee <agent>` on the work item | Worklog item metadata | **Human-visible scheduling hold**: a producer/agent has reserved the item; it is a coordination convention, not proof of a running process, and a stale assignee does not block `phase_start`. |
+
+A child can be held by a live process while its item shows no assignee (the
+claim is status-only), and an assigned item can have no live lock (the holder
+exited). Reports surface the lock's `held_by`; they never infer a live holder
+from `assignee`.
+
+### Scope limits and tests
+
+- One lock per **child work item**; serialising whole `drive` invocations (a
+  driver-level mutex) is explicitly out of scope.
+- The lock does not nest into the host-wide `process_semaphore` slot pools.
+- Regression pins: `skill/shared/tests/test_work_item_lock.py`
+  (acquire/release, token re-entrancy, SIGTERM release, dead-pid reclamation
+  with warning), `skill/implement/tests/test_phase_start_child_lock.py`
+  (`phase_start` ordering/refusal/signal/token propagation, `skipped-held`
+  reports) and `skill/implement/tests/test_drive_child_lock.py` (two concurrent
+  subprocesses: exactly one acquires, the loser writes nothing and the winner's
+  files are not diverged).
