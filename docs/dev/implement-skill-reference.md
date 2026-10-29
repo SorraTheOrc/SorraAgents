@@ -260,6 +260,135 @@ fake, injected commit-evidence provider, recording mutation fake).
 - No fetch/network in the evidence path; a stale `origin/dev` ref is accepted
   evidence on the failure path.
 
+## Drive failure recovery: bounded finish attempts, reconciliation and reset
+
+`implement.py drive` must terminate reliably and advance an epic even when a
+**child's `finish`** keeps failing — a different failure path from a failed
+child *session* (see the timeout section above), and the one that livelocked
+epic `AH-0MV9DB68T002IROX` (SA-0MVLIZ33M009C5QY).
+
+### The livelock this prevents
+
+When a driven child session dies mid-work (timeout, host load), its worktree
+is left dirty and its item non-terminal. `phase_parent` classifies the dirty
+worktree as "has changes" and runs `implement.py finish <child>`; `finish`
+fails on the abandoned WIP (build/tests red) and resets the item status to
+`open` **but leaves the worktree dirty**. The next drive invocation repeats
+the identical failing `finish`. Recorded evidence (2026-10-19): 29+ drive
+runs, each exiting 1 after 600–890 s with `Failed to finish child
+AH-0MVDV4PNZ004ZWOZ`, `sessions_spawned: 0`, `parent_advanced: false`.
+
+### The three recovery tiers
+
+Once a `finishing_failed` parent report is seen, `phase_drive` applies the
+following tiers in order. Every tier is bounded and records its outcome in
+`children_driven`:
+
+1. **Bounded retry — `--finish-attempt-limit N`** (default: the
+   `--max-child-sessions` value, so the default is one attempt and behaviour
+   is unchanged from before this feature). Failing finish executions are
+   counted **per child** in `finish_attempts` (a counter distinct from the
+   session-spawn attempts). While the count is below the bound the loop
+   re-runs `parent`, which retries the `finish`; the same child's failing
+   `finish` is never executed beyond the bound within one drive invocation.
+2. **Terminal reconciliation — `terminal-reconciled`.** When the bound is
+   exhausted the child is re-fetched with a read-only `wl show` and
+   classified with `_is_terminal_child` (status `completed`/`done`/
+   `in_review`/`deleted`, or stage `in_review`). A child that reached a
+   terminal state despite the failed finish (e.g. the push succeeded and a
+   later gate step failed) is recorded as done (`result:
+   "terminal-reconciled"`, never `failed`), an evidence comment is posted,
+   and the loop continues to the next actionable child. It is **never**
+   finished, reset or re-spawned. An unreadable child state fails closed
+   (hard failure, no crash, no silent success).
+3. **Reset for retry — `reset-for-retry`.** A genuinely non-terminal child is
+   reset to a clean startable state so the livelock cannot repeat:
+   - the child's **own** worktree is reset to the parent-branch HEAD with
+     `git reset --hard <parent_branch>` followed by `git clean -fd`
+     (`-fd` respects `.gitignore`, so the `node_modules` symlink survives);
+   - the item status is set back to `open` through the shared
+     `StatusLifecycle` path (`assignee=""`);
+   - an audit comment on the child records the failure reason, the failed
+     finish-attempt count, the child's non-terminal state and the reset
+     performed — abandoned WIP is never discarded silently;
+   - the loop then continues, so the next iteration starts a **fresh
+     session** for that child (session-attempt accounting is unchanged).
+
+   The reset runs **at most once per child per drive invocation**: a second
+   exhaustion after a successful reset stops the chain (bounded and
+   truthful) rather than resetting forever.
+
+### Isolation gates for the reset
+
+`_reset_child_worktree` only ever touches the child's own worktree:
+
+- the path must exist and be a **linked git worktree** (`.git` is a file) —
+  a main checkout (`.git` directory) is refused outright;
+- `git rev-parse --show-toplevel` inside the path must resolve to the path
+  itself (a nested/shared path is refused);
+- only `git reset --hard <parent_branch>` and `git clean -fd` run, and only
+  inside that path — `git clean` is never run on a shared or main path;
+- a refused/failed reset leaves the hard failure in place and names the
+  reason in `report["message"]`.
+
+### Per-child outcomes (`children_driven`)
+
+The `result` field distinguishes the three tiers (plus the pre-existing
+values):
+
+| `result` | Meaning |
+|---|---|
+| `finished` | The child's session exited successfully. |
+| `terminal-reconciled` | The child's `finish` failed but the child was already terminal; recorded as done, the chain continues. Carries `status`, `stage`, `evidence` and `finish_attempts`. |
+| `reset-for-retry` | The child was non-terminal after the finish bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Carries `reset: true`, `status`, `stage`, `evidence` and `finish_attempts`. |
+| `completed-late` | Session timeout/exit after the child reached a terminal state (see the timeout section). |
+| `finalised` | A stranded child was finalised via `--finalise-stranded`. |
+| `failed` | The child is not terminal; the chain stops and `failed_child` is set. |
+
+Additional report fields:
+
+- `finish_attempts` — map of child id → failing `finish` executions observed;
+- `finish_attempt_limit` — the bound applied to this invocation;
+- `terminal_reconciled` — count of children recorded as done after a failed
+  finish;
+- `reset_for_retry` — count of children reset for a fresh session.
+
+The human rendering uses a distinct `🕓` icon for `terminal-reconciled` and
+`♻` for `reset-for-retry`, and prints the `Terminal-reconciled: N` / `Reset
+for retry: N` counts. All additions are additive: the existing keys keep
+their meaning and types.
+
+### Invariants
+
+- **Terminal children are never touched.** The existing `skip-terminal`
+  precedence in `_classify_child` runs before any worktree or finish
+  handling, and neither the reconciliation nor the reset path can reach a
+  terminal child (regression-covered).
+- **`parent_advanced: false` always means real work remains** — a
+  non-terminal or blocked child. The parent advances only when every child
+  is terminal.
+- **Session-per-child isolation, per-child worktree semantics and
+  dependency-order driving are unchanged.**
+
+### Tests
+
+```bash
+pytest -q tests/test_implement_drive_recovery.py tests/test_implement_drive.py
+```
+
+`tests/test_implement_drive_recovery.py` covers the finish-failure harness
+(`DriveHarness`, `finishing_failed_report`), the terminal-child regression,
+the bounded finish attempts, terminal reconciliation and the reset-for-retry
+path (including a real in-repo git worktree fixture proving only the child's
+worktree is reset).
+
+### Reinstall after landing
+
+The canonical source is this repository's `skill/` tree. Once the change is
+on `dev`, run `scripts/install_pi.sh` so the installed
+`~/.pi/agent/skills/implement/` copy matches it — never edit the installed
+tree directly (repository-boundary rule).
+
 ## Build step for repos without a build script
 
 The `implement.py finish` build step (`run_build()`) is tolerant of repos

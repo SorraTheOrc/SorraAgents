@@ -610,7 +610,9 @@ that child's own worktree, waits for it to exit, then continues. A single
 `drive` call therefore completes every child and advances the parent, while
 each child keeps its own clean context window and its own worktree. Options:
 `--json` (machine-readable per-child report), `--max-child-sessions N`
-(default 1) to bound retries, `--child-timeout S` (default 3600),
+(default 1) to bound retries, `--finish-attempt-limit N` (default: the
+`--max-child-sessions` value) to bound failing `finish` retries,
+`--child-timeout S` (default 3600),
 `--finalise-stranded` (opt-in, evidence-gated finalisation of stranded
 children — see below). When no Pi executable is available it stops with
 actionable manual instructions rather than silently skipping a child
@@ -626,8 +628,10 @@ child handling:
 
 | `result` | Meaning |
 |---|---|
-| `ok` | The child session exited successfully. |
+| `finished` | The child session exited successfully. |
 | `completed-late` | The session timed out/failed **but** the child is terminal (status `completed`/`done`/`in_review`, stage `in_review`, or soft-deleted). The chain continues. |
+| `terminal-reconciled` | The child's `finish` failed but the child was already terminal; recorded as done, the chain continues. |
+| `reset-for-retry` | The child was non-terminal after its finish-attempt bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. |
 | `finalised` | A stranded child was finalised via `--finalise-stranded` (verified pushed commit, still in-progress, no other agent, clean worktree). The chain continues. |
 | `failed` | The child is not terminal — the chain stops and `failed_child` is set. |
 
@@ -640,6 +644,21 @@ evidence (read-only: report plus one parent comment, no status mutation).
 `--finalise-stranded` additionally finalises such children through
 `StatusLifecycle` (`completed`/`in_review`) when every safety gate holds, and
 lists them in `report["finalised_children"]`.
+
+**A failing `finish` is bounded, reconciled, then reset
+(SA-0MVLIZ33M009C5QY).** A child whose worktree is dirty after a dead session
+makes `phase_parent` re-run the same failing `finish`, which used to livelock
+the epic. `phase_drive` now (1) counts failing finish executions per child and
+retries only up to `--finish-attempt-limit` (default
+`--max-child-sessions`); (2) re-fetches the child with `wl show` and records
+`terminal-reconciled` when it reached a terminal state anyway; (3) otherwise
+resets the child's **own** worktree to the parent-branch HEAD (`git reset
+--hard <parent_branch>` + `git clean -fd`, isolation-gated) and its status to
+`open` via `StatusLifecycle`, with an audit comment naming the failure and the
+reset, then continues with a fresh session (`reset-for-retry`, at most once
+per child per invocation). `parent_advanced: false` therefore always means
+real non-terminal or blocked work remains. Full contract:
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#drive-failure-recovery-bounded-finish-attempts-reconciliation-and-reset).
 
 > **Child sessions run extensions-disabled.** The spawner builds
 > `pi -p "/skill:implement <child>" --approve --no-extensions` so a globally
