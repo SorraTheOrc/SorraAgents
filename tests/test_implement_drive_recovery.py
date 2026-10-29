@@ -1,9 +1,4 @@
 
-# <!-- REFACTOR-SA-0MVTPH99O008YX29
-# smell: unused_import
-# severity: critical
-# description: Redefinition of unused `implement_mod` from line 57: `implement_mod` redefined here
-# -->
 """Drive-recovery test harness + terminal-child regression
 (SA-0MVLJXKB60088SND, parent SA-0MVLIZ33M009C5QY).
 
@@ -278,7 +273,7 @@ class DriveHarness:
 
 
 @pytest.fixture
-def drive_harness(implement_mod):
+def drive_harness(implement_mod):  # noqa: F811 — fixture param, not a redefinition
     """Factory fixture building a :class:`DriveHarness` bound to the module."""
     def _make(**kwargs) -> DriveHarness:
         return DriveHarness(implement_mod, **kwargs)
@@ -465,7 +460,7 @@ class TestTerminalChildRegression:
         ],
     )
     def test_skip_terminal_precedence_is_preserved(
-        self, implement_mod, overrides,
+        self, implement_mod, overrides,  # noqa: F811 — fixture param
     ):
         """``skip-terminal`` outranks ``skip-in-progress`` in
         classification."""
