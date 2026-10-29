@@ -39,6 +39,8 @@ Optional flags:
   --worktree-path <path>    Override worktree path
   --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
   --max-child-sessions N    Max fresh sessions per child when driving (default: 1)
+  --finish-attempt-limit N  Max failing finish executions per child when driving
+                            (default: the --max-child-sessions value)
   --child-timeout N         Per-child session timeout in seconds (default: 3600)
   --finalise-stranded       Finalise evidence-gated stranded children when driving
   -v, --verbose             Verbose logging
@@ -6724,6 +6726,7 @@ def phase_drive(
     verbose: bool = False,
     max_child_sessions: int = DEFAULT_MAX_CHILD_SESSIONS,
     child_timeout: int | None = None,
+    finish_attempt_limit: int | None = None,
     spawn_session: Callable[..., dict[str, Any]] | None = None,
     parent_runner: Callable[..., dict[str, Any] | None] | None = None,
     commit_evidence: Callable[[str], str | None] | None = None,
@@ -6757,6 +6760,17 @@ def phase_drive(
     ``completed-late`` and the chain continues; a genuinely incomplete child
     keeps the pre-existing hard failure (SA-0MVHXWLPG007OQVN).
 
+    Failing ``finish`` executions are bounded too (SA-0MVLJXS7R000XIFL): a
+    ``finishing_failed`` parent report is counted per child in
+    ``finish_attempts`` (distinct from the session-spawn ``attempts``), and
+    the loop re-runs ``parent`` — which retries the ``finish`` — only while
+    the child's count stays below ``finish_attempt_limit``. Once the bound is
+    exhausted the chain stops and the report carries the count, so the same
+    failing ``finish`` (e.g. an abandoned dirty worktree whose build/tests
+    are red) can never be executed unboundedly. The bound defaults to
+    ``max_child_sessions``, so the default behaviour (one attempt) is
+    unchanged from before this feature.
+
     Args:
         work_item_id: The parent work item ID.
         json_output: If True, emit JSON.
@@ -6766,6 +6780,9 @@ def phase_drive(
         max_child_sessions: Max fresh sessions per child before stopping.
         child_timeout: Per-child session timeout in seconds (default from
             :func:`_resolve_child_session_timeout`).
+        finish_attempt_limit: Max failing ``finish`` executions per child in
+            one drive invocation (default: ``max_child_sessions``). A
+            non-positive value is clamped to 1.
         spawn_session: Injectable spawner (tests); defaults to
             :func:`_default_session_spawner`.
         parent_runner: Injectable ``parent`` runner (tests); defaults to
@@ -6790,7 +6807,10 @@ def phase_drive(
         ``terminal_stage`` so the two timeout outcomes are distinguishable
         (SA-0MVLJWOJ8004ABBA). A non-terminal child whose work is already on
         the parent branch additionally appears in ``stranded_children`` with
-        its pushed-commit evidence (SA-0MVLJWRVO000QQNP).
+        its pushed-commit evidence (SA-0MVLJWRVO000QQNP). ``finish_attempts``
+        maps each child whose ``finish`` failed to the number of failing
+        finish executions observed, and ``finish_attempt_limit`` reports the
+        bound applied (SA-0MVLJXS7R000XIFL).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -6800,6 +6820,8 @@ def phase_drive(
         "sessions_spawned": 0,
         "children_driven": [],
         "completed_late": 0,
+        "finish_attempts": {},
+        "finish_attempt_limit": None,
         "message": "",
     }
 
@@ -6857,15 +6879,24 @@ def phase_drive(
     spawner = spawn_session or _default_session_spawner
     timeout = child_timeout or _resolve_child_session_timeout()
     max_child_sessions = max(1, int(max_child_sessions))
+    finish_attempt_limit = (
+        max_child_sessions if finish_attempt_limit is None
+        else max(1, int(finish_attempt_limit))
+    )
+    report["finish_attempt_limit"] = finish_attempt_limit
 
     attempts: dict[str, int] = {}
+    finish_attempts: dict[str, int] = {}
     driven: list[dict[str, Any]] = []
     stranded_comment_posted = False
     finaliser = finalise_child or _finalise_stranded_child
     # Hard bound on the loop: each child may consume at most
-    # max_child_sessions spawns plus one terminal classification, and the
-    # final iteration advances the parent.
-    max_iterations = (len(children) * (max_child_sessions + 1)) + 1
+    # max_child_sessions spawns plus finish_attempt_limit failing finish
+    # retries plus one terminal classification, and the final iteration
+    # advances the parent.
+    max_iterations = (
+        len(children) * (max_child_sessions + finish_attempt_limit + 1)
+    ) + 1
 
     for _ in range(max_iterations):
         parent_report = runner(
@@ -6894,6 +6925,39 @@ def phase_drive(
             break
 
         if parent_report.get("success") is False:
+            failed_cid = parent_report.get("next_child")
+            if parent_report.get("finishing_failed") and failed_cid:
+                # Bound the retries of a failing `finish`: every re-run of
+                # `parent` re-executes the same finish for that child, so the
+                # count is the number of real finish executions observed
+                # (SA-0MVLJXS7R000XIFL).
+                finish_attempts[failed_cid] = (
+                    finish_attempts.get(failed_cid, 0) + 1
+                )
+                if finish_attempts[failed_cid] < finish_attempt_limit:
+                    LOG.warning(
+                        "Child %s finish failed (attempt %d/%d) — bounded "
+                        "retry: re-running `parent` so finish is attempted "
+                        "again.",
+                        failed_cid,
+                        finish_attempts[failed_cid],
+                        finish_attempt_limit,
+                    )
+                    continue
+                LOG.error(
+                    "Child %s finish failed %d time(s), exhausting the "
+                    "finish-attempt bound (%d); stopping the drive chain.",
+                    failed_cid,
+                    finish_attempts[failed_cid],
+                    finish_attempt_limit,
+                )
+                report["message"] = (
+                    f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                    f"(finish-attempt bound {finish_attempt_limit} exhausted "
+                    f"after {finish_attempts[failed_cid]} attempt(s))."
+                )
+                report["failed_child"] = failed_cid
+                break
             report["message"] = parent_report.get(
                 "message",
                 f"Phase parent reported a failure for {work_item_id}.",
@@ -7073,6 +7137,7 @@ def phase_drive(
         )
 
     report["children_driven"] = driven
+    report["finish_attempts"] = dict(finish_attempts)
     _emit_phase_report(report, json_output)
     return report
 
@@ -7399,6 +7464,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--finish-attempt-limit",
+        type=int,
+        default=None,
+        help=(
+            "Max failing finish executions per child in one drive invocation "
+            "(default: the --max-child-sessions value)"
+        ),
+    )
+    parser.add_argument(
         "--finalise-stranded",
         action="store_true",
         default=False,
@@ -7505,6 +7579,7 @@ def _main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 max_child_sessions=args.max_child_sessions,
                 child_timeout=args.child_timeout,
+                finish_attempt_limit=args.finish_attempt_limit,
                 finalise_stranded=args.finalise_stranded,
             )
             _emit_timing(_root_timer)

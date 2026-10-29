@@ -355,6 +355,132 @@ class TestFinishingFailedReports:
 
 
 # ---------------------------------------------------------------------------
+# Parent AC1 (SA-0MVLJXS7R000XIFL): bounded finish-attempt accounting
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedFinishAttempts:
+    """Failing ``finish`` executions are counted per child and bounded.
+
+    AC1: ``phase_drive`` distinguishes ``finishing_failed`` reports from other
+    parent failures and counts them per child (a counter distinct from the
+    session-spawn ``attempts``). AC2: the finish-attempt bound is configurable
+    and defaults to the per-child session cap, so the same child's failing
+    ``finish`` is never executed beyond the bound within one drive
+    invocation. AC5: a single ``finishing_failed`` at the default bound still
+    aborts exactly as before this feature.
+    """
+
+    def test_default_limit_preserves_immediate_stop(
+        self, drive_harness, finishing_failed_parent_runner,
+    ):
+        """The default bound is the session cap, so the first failing finish
+        stops the chain exactly as before this feature."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=finishing_failed_parent_runner("SA-C1"),
+        )
+
+        report = harness.run()
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["finish_attempts"] == {"SA-C1": 1}
+        assert report["finish_attempt_limit"] == 1
+        # Only the single failing parent report was consumed — no re-runs,
+        # no invented session spawn.
+        assert len(harness.runner.returned) == 1
+        assert harness.spawner.calls == []
+
+    def test_finish_failures_retried_up_to_configured_bound(
+        self, drive_harness, finishing_failed_parent_runner,
+    ):
+        """The same child's failing ``finish`` is retried only up to the
+        configured bound, then the chain stops with the attempt count."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=finishing_failed_parent_runner("SA-C1", times=10),
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["finish_attempts"] == {"SA-C1": 3}
+        assert report["finish_attempt_limit"] == 3
+        # The parent was re-run 3 times (3 real finish executions observed)
+        # and never beyond the bound; the scripted runner is not exhausted.
+        assert len(harness.runner.returned) == 3
+        assert harness.spawner.calls == []
+        assert "finish-attempt bound 3 exhausted" in report["message"]
+
+    def test_finish_attempt_bound_is_independent_of_session_cap(
+        self, drive_harness, finishing_failed_parent_runner,
+    ):
+        """The finish-attempt bound can exceed the per-child session cap."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=finishing_failed_parent_runner("SA-C1", times=10),
+        )
+
+        report = harness.run(max_child_sessions=4, finish_attempt_limit=2)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["finish_attempts"] == {"SA-C1": 2}
+        assert report["finish_attempt_limit"] == 2
+        assert len(harness.runner.returned) == 2
+
+    def test_bounded_retry_resumes_when_parent_recovers(
+        self, drive_harness,
+    ):
+        """A transient finish failure inside the bound is not chain-fatal:
+        when the next parent report returns to progress, the drive loop
+        continues normally (session spawn + parent advance)."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            reports=[
+                finishing_failed_report("SA-C1"),
+                {
+                    "success": True,
+                    "next_child": "SA-C1",
+                    "worktree_path": "/wt/SA-C1",
+                },
+                {"success": True, "parent_advanced": True},
+            ],
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert harness.spawn_calls == ["SA-C1"]
+        assert report["finish_attempts"] == {"SA-C1": 1}
+
+    def test_generic_parent_failure_is_not_counted_as_finish(
+        self, drive_harness,
+    ):
+        """Non-``finishing_failed`` parent failures (start_failed, placement
+        violation) still stop immediately and are not finish-attempt counts."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            reports=[{
+                "success": False,
+                "message": "start failed",
+                "next_child": "SA-C1",
+                "start_failed": True,
+            }],
+        )
+
+        report = harness.run(finish_attempt_limit=5)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["finish_attempts"] == {}
+        assert "start failed" in report["message"]
+
+
+# ---------------------------------------------------------------------------
 # AC3 (parent AC5): terminal children are never touched
 # ---------------------------------------------------------------------------
 
