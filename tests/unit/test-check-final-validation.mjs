@@ -925,14 +925,15 @@ describe('ship skill documentation', () => {
 
 // ---------------------------------------------------------------------------
 // Probe contract, upgrade, regression and no-contradictory-block invariant
-// (SA-0MVTU1WHS002HN1C, Step 3.7 half of parent AC2/AC3/AC4)
+// (SA-0MVTU1WHS002HN1C, SA-0MVTU22MB0057T2L, Step 3.7 half of parent
+// AC2/AC3/AC4)
 //
 // The Step-3.7 sweep shares `getAuditStatus()`, `queryContentFreshness()` and
 // `attemptAuditRemediation()` with the Step-2 audit gate, so these tests pin
 // the same contract for the *other* consumer of the shared probe. Tests that
-// pin behaviour not yet implemented carry an explicit `skip` naming the
-// implementing sibling (SA-0MVTU22MB0057T2L) — never a placeholder body — and
-// that sibling removes the marker.
+// pinned behaviour not yet implemented were landed by the tests sibling with
+// an explicit `skip` naming the implementing sibling (SA-0MVTU22MB0057T2L);
+// that sibling implemented the behaviour and removed the markers.
 //
 // Hermetic: the only stubbed boundaries are the command executors; the real
 // `queryContentFreshness()` builds the argv and JSON-parses the reply.
@@ -1079,11 +1080,7 @@ describe('checkFinalValidation - time-stale passing audit upgrade (parent AC2)',
 });
 
 describe('checkFinalValidation - no contradictory block invariant (parent AC3)', () => {
-  test('no fixture produces a blocking entry whose reason says it passed', {
-    skip:
-      'TRACER BULLET — fails until SA-0MVTU22MB0057T2L stops the ' +
-      'post-remediation passing+stale block; that item removes this marker.',
-  }, async () => {
+  test('no fixture produces a blocking entry whose reason says it passed', async () => {
     const mod = await import(MODULE_PATH);
 
     const audits = [
@@ -1151,12 +1148,7 @@ describe('checkFinalValidation - no contradictory block invariant (parent AC3)',
 });
 
 describe('checkFinalValidation - ContextHub regression (parent AC4)', () => {
-  test('a short-circuiting remediation never blocks the release', {
-    skip:
-      'TRACER BULLET — reproduces the ContextHub failure and fails until ' +
-      'SA-0MVTU22MB0057T2L resolves the post-remediation passing+stale state; ' +
-      'that item removes this marker.',
-  }, async () => {
+  test('a short-circuiting remediation never blocks the release', async () => {
     const mod = await import(MODULE_PATH);
     let remediationCalls = 0;
     let shows = 0;

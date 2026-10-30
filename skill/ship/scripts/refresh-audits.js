@@ -20,6 +20,7 @@ import { execSync } from 'node:child_process';
 import {
   getAuditStatus,
   attemptAuditRemediation,
+  queryContentFreshness,
   resolveAuditRunner,
 } from './check-audit-gate.js';
 import { getInReviewItems } from './check-final-validation.js';
@@ -105,6 +106,10 @@ export function planAuditRefresh(options = {}) {
  * @param {() => string} [options.resolveAuditRunnerFn] - Resolves the runner path.
  * @param {() => import('./audit-remediation.js').RemediationBudget} [options.createRemediationBudgetFn] -
  *   Bounded-remediation budget factory.
+ * @param {(workItemId: string) => { fresh: boolean, reason: string, hasFingerprint: boolean, auditedAt: string|null }} [options.queryContentFreshnessFn] -
+ *   Read-only content-freshness probe consumed by the shared remediation path
+ *   (`attemptAuditRemediation`); defaults to `queryContentFreshness`.
+ *   Injectable for hermetic tests.
  * @returns {Promise<{
  *   dryRun: boolean,
  *   plan: object,
@@ -129,6 +134,7 @@ export async function refreshAudits(options = {}) {
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
     createRemediationBudgetFn = () => new RemediationBudget(),
+    queryContentFreshnessFn = queryContentFreshness,
   } = options;
 
   const plan = planAuditRefresh({ getItemsFn, runAuditShow });
@@ -172,6 +178,10 @@ export async function refreshAudits(options = {}) {
       runAuditShow,
       runAuditCommand,
       resolveAuditRunnerFn,
+      // Shared post-remediation resolution (SA-0MVTU22MB0057T2L): a
+      // passing-but-time-stale audit is resolved by content freshness in the
+      // shared path, never duplicated here.
+      queryContentFreshnessFn,
     });
     budget.record();
     if (remediation.status === 'passing') {

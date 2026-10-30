@@ -1698,17 +1698,15 @@ describe('attemptAuditRemediation - abort-recovery cleanup after the runner', ()
 
 // ---------------------------------------------------------------------------
 // 24. Probe contract, upgrade, regression and post-remediation invariants
-//     (SA-0MVTU1WHS002HN1C)
+//     (SA-0MVTU1WHS002HN1C, SA-0MVTU22MB0057T2L)
 //
 // Tracer-bullet slice for SA-0MVTPAV4N005WPWF. The *green* tests pin the
 // contract that must never drift again: the argv `queryContentFreshness()`
 // builds, and the fact that a content-fresh probe upgrades a time-stale
-// passing audit without a re-audit. The tests that pin behaviour not yet
-// implemented carry an explicit `skip` naming the implementing sibling
-// (SA-0MVTU22MB0057T2L) — never a placeholder body — and that sibling removes
-// the marker. (`node:test` has no strict-xfail equivalent of
-// `pytest.mark.xfail(strict=True)`; a `todo` marker would be parsed as a
-// `not ok` line by the test-skill runner, so `skip` is the convention here.)
+// passing audit without a re-audit. The post-remediation and invariant tests
+// were landed by the tests sibling with an explicit `skip` marker naming the
+// implementing sibling (SA-0MVTU22MB0057T2L); that sibling has implemented
+// the behaviour and removed the markers — never a placeholder body.
 //
 // Hermetic: the only stubbed boundaries are the command executors
 // (`runAuditShow`, `runAuditCommand` and the probe's own `runCommand`). The
@@ -1880,13 +1878,7 @@ describe('checkAuditReadyToClose - time-stale passing audit upgrade (parent AC2)
 });
 
 describe('attemptAuditRemediation - post-remediation content freshness (parent AC3)', () => {
-  const POST_REMEDIATION_SKIP =
-    'TRACER BULLET — fails until SA-0MVTU22MB0057T2L resolves passing+stale ' +
-    'post-remediation by content freshness; that item removes this marker.';
-
-  test('an unchanged fingerprint resolves to passing with a content-fresh basis', {
-    skip: POST_REMEDIATION_SKIP,
-  }, async () => {
+  test('an unchanged fingerprint resolves to passing with a content-fresh basis', async () => {
     const mod = await import(MODULE_PATH);
 
     const result = await mod.attemptAuditRemediation(PROBE_ITEM, {
@@ -1902,9 +1894,7 @@ describe('attemptAuditRemediation - post-remediation content freshness (parent A
     assert.doesNotMatch(result.reason, /Ready to close/);
   });
 
-  test('a changed fingerprint blocks naming the real condition and the --force remedy', {
-    skip: POST_REMEDIATION_SKIP,
-  }, async () => {
+  test('a changed fingerprint blocks naming the real condition and the --force remedy', async () => {
     const mod = await import(MODULE_PATH);
 
     const result = await mod.attemptAuditRemediation(PROBE_ITEM, {
@@ -1922,11 +1912,7 @@ describe('attemptAuditRemediation - post-remediation content freshness (parent A
 });
 
 describe('checkAuditReadyToClose - no contradictory block invariant (parent AC3)', () => {
-  test('no fixture produces a blocking entry whose reason says it passed', {
-    skip:
-      'TRACER BULLET — fails until SA-0MVTU22MB0057T2L stops the ' +
-      'post-remediation passing+stale block; that item removes this marker.',
-  }, async () => {
+  test('no fixture produces a blocking entry whose reason says it passed', async () => {
     const mod = await import(MODULE_PATH);
 
     const audits = [
@@ -1996,12 +1982,7 @@ describe('checkAuditReadyToClose - no contradictory block invariant (parent AC3)
 });
 
 describe('checkAuditReadyToClose - ContextHub regression (parent AC4)', () => {
-  test('a short-circuiting remediation never blocks the release', {
-    skip:
-      'TRACER BULLET — reproduces the ContextHub failure and fails until ' +
-      'SA-0MVTU22MB0057T2L resolves the post-remediation passing+stale state; ' +
-      'that item removes this marker.',
-  }, async () => {
+  test('a short-circuiting remediation never blocks the release', async () => {
     const mod = await import(MODULE_PATH);
     let remediationCalls = 0;
     let shows = 0;
@@ -2041,5 +2022,35 @@ describe('checkAuditReadyToClose - ContextHub regression (parent AC4)', () => {
     assert.equal(report.blockingItems.length, 0);
     assert.equal(report.remediatedItems.length, 1);
     assert.equal(report.remediatedItems[0].workItemId, PROBE_ITEM.id);
+  });
+});
+
+describe('checkAuditReadyToClose - passing+stale block reasons (parent AC3)', () => {
+  test('--skip-audit-remediation never blocks a passing audit with its own verdict', async () => {
+    const mod = await import(MODULE_PATH);
+    let remediationCalls = 0;
+
+    const report = await mod.checkAuditReadyToClose({
+      skipRemediation: true,
+      getCandidateItemsFn: () => [PROBE_ITEM],
+      // Time-stale passing audit whose content has genuinely changed: the
+      // read-only probe reports it, so the skip path must name that condition
+      // rather than repeating `Ready to close`.
+      runAuditShow: () => JSON.stringify(probeAudit()),
+      runAuditCommand: () => {
+        remediationCalls += 1;
+        return SHORT_CIRCUIT_STDOUT;
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      queryContentFreshnessFn: () => CONTENT_CHANGED_REPLY,
+    });
+
+    assert.equal(remediationCalls, 0, '--skip-audit-remediation must not re-audit');
+    assert.equal(report.hasBlockingItems, true);
+    const entry = report.blockingItems[0];
+    assert.doesNotMatch(String(entry.reason), /Ready to close/);
+    assert.match(String(entry.reason), /time-stale but content changed/);
+    assert.match(String(entry.reason), /issue SA-PROBE-1 --force/);
+    assert.equal(entry.summary, null, 'a blocking entry must not report a passing verdict');
   });
 });

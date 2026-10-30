@@ -614,6 +614,30 @@ export function checkProducerReviewStatus(items) {
   };
 }
 
+// ── stalePassingBlockReason ──────────────────────────────────────────────────
+
+/**
+ * Build the non-contradictory block reason for a **passing but time-stale**
+ * audit whose content freshness cannot be confirmed (SA-0MVTU22MB0057T2L).
+ *
+ * A passing-but-time-stale audit must never surface its own verdict
+ * (`Ready to close`) as a blocking reason — that reads as "blocks because it
+ * passed". Instead the reason names the real condition (the time gate is the
+ * only basis left once the content fingerprint could not confirm the audit)
+ * and carries the actionable `--force` remedy, which is the only way to
+ * restamp an audit the runner considers content-fresh.
+ *
+ * @param {string} workItemId - Work item id (used in the remedy command).
+ * @param {object|null} [freshness] - Result of `queryContentFreshness()` when
+ *   a probe actually ran; `null` when no v2 fingerprint was available.
+ * @returns {string}
+ */
+export function stalePassingBlockReason(workItemId, freshness = null) {
+  const detail = freshness && freshness.reason ? ` — ${freshness.reason}` : '';
+  return `Audit is time-stale but content changed (or could not be confirmed unchanged)${detail}; `
+    + `re-audit with: python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --force`;
+}
+
 // ── attemptAuditRemediation ──────────────────────────────────────────────────
 
 /**
@@ -627,6 +651,19 @@ export function checkProducerReviewStatus(items) {
  * failure (non-zero exit / thrown exception / timeout) is treated as blocking
  * for that item and never silently passes.
  *
+ * **Passing-but-time-stale resolution (SA-0MVTU22MB0057T2L).** The runner
+ * short-circuits `issue <id>` for a content-fresh audit, so a remediation run
+ * can legitimately leave a `{passing: true, stale: true}` audit whose
+ * `auditedAt` was never restamped. Blocking on that state would report a
+ * *passing* audit as blocking with the reason `Ready to close`. Instead the
+ * post-remediation status is resolved by **content freshness**: with a v2
+ * content fingerprint, the read-only probe is re-queried and an unchanged
+ * fingerprint resolves the item as `passing` (naming the content-fresh basis);
+ * a changed/unconfirmable fingerprint (or a probe failure, which fails open)
+ * blocks with {@link stalePassingBlockReason}. Legacy/fingerprint-less audits
+ * cannot be compared by content, so they fall back to the conservative time
+ * gate and block with the same actionable reason.
+ *
  * @param {{ id: string, title: string }} workItem - The work item to remediate.
  * @param {object} boundaries - Injectable command boundaries.
  * @param {(workItemId: string) => string} boundaries.runAuditShow - Runs
@@ -638,9 +675,18 @@ export function checkProducerReviewStatus(items) {
  * @param {(workItemId: string) => boolean} [boundaries.checkStuckAuditFn] -
  *   Abort-recovery cleanup; defaults to {@link checkAndRestoreStuckAudit}.
  *   Injectable for hermetic tests.
+ * @param {(workItemId: string) => { fresh: boolean, reason: string, hasFingerprint: boolean, auditedAt: string|null }} [boundaries.queryContentFreshnessFn] -
+ *   Read-only content-freshness probe; defaults to
+ *   {@link queryContentFreshness}. Injectable for hermetic tests.
  * @returns {Promise<{ status: 'passing'|'blocking'|'runner-failed', reason: string, summary: string|null }>}
  */
-export async function attemptAuditRemediation(workItem, { runAuditShow, runAuditCommand, resolveAuditRunnerFn, checkStuckAuditFn = checkAndRestoreStuckAudit }) {
+export async function attemptAuditRemediation(workItem, {
+  runAuditShow,
+  runAuditCommand,
+  resolveAuditRunnerFn,
+  checkStuckAuditFn = checkAndRestoreStuckAudit,
+  queryContentFreshnessFn = queryContentFreshness,
+}) {
   try {
     const runnerPath = resolveAuditRunnerFn();
     runAuditCommand(runnerPath, workItem.id);
@@ -672,6 +718,31 @@ export async function attemptAuditRemediation(workItem, { runAuditShow, runAudit
     const output = runAuditShow(workItem.id);
     const auditData = JSON.parse(output);
     const status = getAuditStatus(workItem, auditData);
+
+    // A passing-but-time-stale audit is resolved by content freshness, never
+    // by its own verdict (SA-0MVTU22MB0057T2L). Protecting this branch here
+    // means every consumer of the shared remediation path (Step-2 audit gate,
+    // Step-3.7 sweep, `refresh-audits.js`) gets the fix without duplicating
+    // the logic.
+    if (status.passing && status.stale) {
+      const freshness = hasContentFingerprint(auditData)
+        ? queryContentFreshnessFn(workItem.id)
+        : null;
+      if (freshness && freshness.fresh) {
+        return {
+          status: 'passing',
+          reason: `Content-fresh audit after remediation (${freshness.reason})`,
+          summary: status.summary,
+        };
+      }
+      return {
+        status: 'blocking',
+        reason: stalePassingBlockReason(workItem.id, freshness),
+        // Never surface the passing verdict in a blocking entry.
+        summary: null,
+      };
+    }
+
     if (status.isBlocking || status.transient || status.stale) {
       return {
         status: 'blocking',
@@ -707,7 +778,10 @@ export async function attemptAuditRemediation(workItem, { runAuditShow, runAudit
  * re-checks `wl audit-show`; the item blocks only if it still fails after
  * the re-run. Genuine (fresh) "not ready to close" verdicts block immediately
  * with no re-audit attempt (conservative remediation, SA-0MSUT8GQP004WSYN AC2;
- * stale handling shared with Step 3.7 per SA-0MUOO5UEB008RXBP).
+ * stale handling shared with Step 3.7 per SA-0MUOO5UEB008RXBP). A re-run that
+ * leaves a *passing but time-stale* audit is resolved by content freshness in
+ * the shared remediation path — never blocked with the reason `Ready to
+ * close` (SA-0MVTU22MB0057T2L).
  *
  * Command boundaries are injectable (mirroring the
  * `closeWorkItemsAfterRelease` `runCloseCommand` pattern) so unit tests are
@@ -727,6 +801,11 @@ export async function attemptAuditRemediation(workItem, { runAuditShow, runAudit
  * @param {() => import('./audit-remediation.js').RemediationBudget} [options.createRemediationBudgetFn] -
  *   Factory for the bounded remediation budget; defaults to a fresh
  *   `RemediationBudget` (env-configured). Injectable for deterministic tests.
+ * @param {(workItemId: string) => { fresh: boolean, reason: string, hasFingerprint: boolean, auditedAt: string|null }} [options.queryContentFreshnessFn] -
+ *   Read-only content-freshness probe; defaults to
+ *   {@link queryContentFreshness}. Used by the fast path and by the shared
+ *   post-remediation resolution (SA-0MVTU22MB0057T2L). Injectable for
+ *   hermetic tests.
  * @returns {Promise<{
  *   hasBlockingItems: boolean,
  *   blockingItems: Array<{
@@ -819,8 +898,12 @@ export async function checkAuditReadyToClose(options = {}) {
     // runner read-only and upgrade the classification accordingly:
     //   - passing + content-fresh → treat as fresh (no remediation);
     //   - failing + content-fresh → the verdict is current, so block immediately.
+    // The probe result is kept so a later block (skip/budget) can name the real
+    // condition instead of repeating the passing verdict (SA-0MVTU22MB0057T2L).
+    let contentFreshness = null;
     if (status.stale && hasContentFingerprint(auditData)) {
       const freshness = queryContentFreshnessFn(item.id);
+      contentFreshness = freshness;
       if (freshness.fresh) {
         status = status.passing
           ? { ...status, stale: false, reason: `Content fingerprint unchanged (${freshness.reason})` }
@@ -850,11 +933,16 @@ export async function checkAuditReadyToClose(options = {}) {
           `Audit gate: skipping in-gate remediation for ${item.id} `
           + '(--skip-audit-remediation) — blocking.',
         );
+        // A passing-but-time-stale audit must not block with its own verdict
+        // (`Ready to close`) as the reason (SA-0MVTU22MB0057T2L).
+        const skipReason = status.passing && status.stale
+          ? stalePassingBlockReason(item.id, contentFreshness)
+          : status.reason;
         blockingItems.push({
           workItemId: item.id,
           title: item.title,
-          reason: `${status.reason} (in-gate remediation skipped)`,
-          summary: status.summary || null,
+          reason: `${skipReason} (in-gate remediation skipped)`,
+          summary: status.passing && status.stale ? null : (status.summary || null),
           remediation: `${buildRemediationCommand(item.id)}\n  # ${OFFLINE_AUDIT_REFRESH_HINT}`,
         });
         continue;
@@ -892,6 +980,7 @@ export async function checkAuditReadyToClose(options = {}) {
         runAuditShow,
         runAuditCommand,
         resolveAuditRunnerFn,
+        queryContentFreshnessFn,
       });
       budget.record();
       if (remediation.status === 'passing') {
