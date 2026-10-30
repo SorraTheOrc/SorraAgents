@@ -863,6 +863,93 @@ def _describe_child_lock_holder(holder: dict[str, Any] | None) -> str:
     )
 
 
+#: Holder metadata keys surfaced for a reclaimed stale lock. The ownership
+#: token is deliberately excluded: it must never be copied into a report.
+RECLAIM_REPORTED_KEYS = ("agent", "pid", "session_id", "started_at")
+
+
+def _reclaim_warning(work_item_id: str, holder: dict[str, Any] | None) -> str:
+    """Human-readable warning naming the reclaimed (dead) lock holder."""
+    return (
+        f"Reclaimed a stale per-child lock for {work_item_id} from "
+        f"{_describe_child_lock_holder(holder)}; the recorded holder pid is "
+        "dead, so the lock was taken over (the previous session crashed)."
+    )
+
+
+def _record_child_lock_reclamation(
+    report: dict[str, Any],
+    work_item_id: str,
+    lock_result: Any,
+) -> str:
+    """Surface a reclaimed stale holder in *report* (never only in the log).
+
+    The parent epic ``SA-0MVOABYW00004978`` requires the reclamation warning
+    to be logged **and** surfaced in the report, so an operator (or a
+    ``--json`` consumer) can see who was reclaimed without reading stderr
+    (``SA-0MVUX6Q4S006KII3``).
+
+    Args:
+        report: The caller's report dict (mutated in place).
+        work_item_id: The work item whose lock was reclaimed.
+        lock_result: The :class:`LockResult` carrying ``reclaimed``/``path``.
+
+    Returns:
+        The warning string that was appended to ``report["warnings"]``.
+    """
+    holder = getattr(lock_result, "reclaimed", None) or {}
+    path = getattr(lock_result, "path", None)
+    report["lock_reclaimed"] = True
+    report["reclaimed_from"] = {
+        key: holder.get(key) for key in RECLAIM_REPORTED_KEYS
+    }
+    report["lock_path"] = str(path) if path is not None else ""
+    warning = _reclaim_warning(work_item_id, holder)
+    report.setdefault("warnings", []).append(warning)
+    return warning
+
+
+def _forward_child_lock_reclamation(
+    report: dict[str, Any],
+    child_id: str,
+    child_report: dict[str, Any] | None,
+) -> bool:
+    """Copy a child's reclaimed-lock evidence into a parent/drive report.
+
+    ``phase_parent``/``phase_drive`` consumers must see a reclamation that
+    happened while the child was started, so it is forwarded (with the child
+    named) instead of staying buried in the child's own report or log.
+
+    Args:
+        report: The parent/drive report (mutated in place).
+        child_id: The child the evidence belongs to (may be empty).
+        child_report: The child ``start`` report, if any.
+
+    Returns:
+        True when reclamation evidence was forwarded.
+    """
+    if not child_report or not child_report.get("lock_reclaimed"):
+        return False
+    report["lock_reclaimed"] = True
+    report["reclaimed_from"] = child_report.get("reclaimed_from")
+    report["lock_path"] = child_report.get("lock_path", "")
+    if child_id:
+        report["reclaimed_children"] = sorted(
+            set(report.get("reclaimed_children", [])) | {child_id}
+        )
+    warnings = report.setdefault("warnings", [])
+    forwarded = list(child_report.get("warnings") or [])
+    if not forwarded:
+        forwarded = [
+            f"Reclaimed a stale per-child lock for {child_id} from "
+            f"{_describe_child_lock_holder(child_report.get('reclaimed_from'))}."
+        ]
+    for warning in forwarded:
+        if warning not in warnings:
+            warnings.append(warning)
+    return True
+
+
 def _skipped_held_report(
     report: dict[str, Any],
     work_item_id: str,
@@ -5357,10 +5444,9 @@ def phase_start(
             work_item_id,
         )
     elif lock_result.reclaimed:
+        # Logged AND surfaced in the report (parent AC3, SA-0MVUX6Q4S006KII3).
         LOG.warning(
-            "Reclaimed a stale per-child lock for %s from %s (dead pid).",
-            work_item_id,
-            _describe_child_lock_holder(lock_result.reclaimed),
+            "%s", _record_child_lock_reclamation(report, work_item_id, lock_result)
         )
 
     # Register the signal handler from the claim onwards: an interruption
@@ -7049,8 +7135,14 @@ def phase_parent(
 
     def _report_implement_next(
         cid: str, worktree_path: str, branch: str, message: str,
+        start_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Populate and return the report for a child awaiting implementation."""
+        if _forward_child_lock_reclamation(report, cid, start_result):
+            message = (
+                f"{message} {cid} lock reclaimed from a dead holder "
+                "(see warnings)."
+            )
         report["next_child"] = cid
         report["worktree_path"] = worktree_path
         report["branch"] = branch
@@ -7070,6 +7162,8 @@ def phase_parent(
             print(f"  Worktree: {worktree_path}")
             if branch:
                 print(f"  Branch:   {branch}")
+            for warning in report.get("warnings") or []:
+                print(f"  ⚠ {warning}")
             print()
             print("  Next steps:")
             print(f"  1. cd {worktree_path}")
@@ -7273,6 +7367,7 @@ def phase_parent(
             cid, wt, start_result.get("branch", ""),
             f"Started child {cid}. Implement in {wt}, then "
             f"re-run `implement.py parent {work_item_id}`.",
+            start_result=start_result,
         )
 
     # ── Step 7: Advance only when every child is terminal ──────────
@@ -8669,6 +8764,14 @@ def phase_drive(
                 "implementation session; no session was spawned.",
             )
             break
+
+        # A stale-lock reclamation recorded while the parent phase started the
+        # child is forwarded into the drive report, so a ``drive --json``
+        # consumer sees it without scraping the child's log
+        # (SA-0MVUX6Q4S006KII3, parent AC3).
+        _forward_child_lock_reclamation(
+            report, str(parent_report.get("next_child") or ""), parent_report
+        )
 
         child_id = parent_report.get("next_child")
         if not child_id:

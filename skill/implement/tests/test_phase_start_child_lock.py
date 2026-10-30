@@ -44,6 +44,7 @@ import os
 import signal
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -258,6 +259,39 @@ def _patched_phase_start(
             patch.object(implement, "worktree_path_for", return_value=wt)
         )
         yield
+
+
+def _reaped_pid() -> int:
+    """Return the pid of an already-exited (and reaped) process.
+
+    A reaped pid is reliably dead for ``os.kill(pid, 0)`` lookups, which is
+    what stale-holder detection uses (mirrors the shared lock unit suite).
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    return proc.pid
+
+
+def _write_stale_lock(
+    store: Path,
+    *,
+    agent: str = "crashed-driver",
+    session_id: str = "sess-dead",
+) -> dict:
+    """Write a lock file recording a dead holder (a crashed driver)."""
+    metadata = {
+        "agent": agent,
+        "pid": _reaped_pid(),
+        "session_id": session_id,
+        "started_at": (
+            datetime.now(timezone.utc) - timedelta(hours=3)
+        ).isoformat(),
+        "token": "dead-holder-token",
+    }
+    path = lock_file_path(ITEM_ID, store)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+    return metadata
 
 
 def _store_snapshot(store: Path) -> dict[str, bytes]:
@@ -637,3 +671,159 @@ def test_phase_start_reenters_its_own_lock_by_token(worklog_dir, monkeypatch):
     finally:
         implement._child_lock_global = None
         holder.release()
+
+
+# ---------------------------------------------------------------------------
+# AC7 - stale-holder reclamation is surfaced in the report (not only logged)
+# ---------------------------------------------------------------------------
+
+
+def test_stale_lock_reclamation_is_surfaced_in_the_start_report(
+    worklog_dir, capsys, caplog
+):
+    """A reclaimed dead holder appears in the report as well as the log.
+
+    The parent epic's AC3 requires the reclamation warning to be logged *and*
+    surfaced in the report, so an operator (or a ``--json`` consumer) can see
+    who was reclaimed without reading stderr.
+    """
+    stale = _write_stale_lock(worklog_dir, agent="crashed-driver")
+    lifecycle = MagicMock()
+    with _patched_phase_start(lifecycle=lifecycle):
+        report = implement.phase_start(ITEM_ID, json_output=True)
+
+    printed = json.loads(capsys.readouterr().out)
+    assert report == printed
+    assert report["success"] is True, report
+
+    # The reclamation is machine-readable and names the dead holder.
+    assert report["lock_reclaimed"] is True
+    reclaimed = report["reclaimed_from"]
+    assert set(reclaimed) >= {"agent", "pid", "session_id", "started_at"}
+    assert reclaimed["agent"] == "crashed-driver"
+    assert reclaimed["pid"] == stale["pid"]
+    assert reclaimed["session_id"] == stale["session_id"]
+    assert reclaimed["started_at"] == stale["started_at"]
+    # The ownership token is never copied into a report.
+    assert "token" not in reclaimed
+
+    # The lock path and a human-readable warning are surfaced too.
+    assert report["lock_path"] == str(lock_file_path(ITEM_ID, worklog_dir))
+    warnings = report["warnings"]
+    assert isinstance(warnings, list) and len(warnings) == 1
+    assert "crashed-driver" in warnings[0]
+    assert str(stale["pid"]) in warnings[0]
+
+    # The item still started normally and the holder was replaced.
+    assert report["worktree_path"] != ""
+    assert json.loads(
+        lock_file_path(ITEM_ID, worklog_dir).read_text()
+    )["agent"] != "crashed-driver"
+
+
+def test_clean_acquire_reports_no_phantom_reclamation(worklog_dir, capsys):
+    """A free lock never fabricates reclamation fields or warnings."""
+    lifecycle = MagicMock()
+    with _patched_phase_start(lifecycle=lifecycle):
+        report = implement.phase_start(ITEM_ID, json_output=True)
+
+    printed = json.loads(capsys.readouterr().out)
+    assert report == printed
+    assert report["success"] is True, report
+    assert report.get("lock_reclaimed") is not True
+    assert report.get("reclaimed_from") is None
+    assert report.get("warnings") in (None, [])
+
+
+def test_phase_parent_surfaces_a_child_lock_reclamation(worklog_dir):
+    """The parent report carries the reclamation of the child it started."""
+    child = {"id": ITEM_ID, "title": "Child", "status": "open", "sortIndex": 1}
+    reclaimed_from = {
+        "agent": "crashed-driver",
+        "pid": 424242,
+        "session_id": "sess-dead",
+        "started_at": "2026-10-30T00:00:00+00:00",
+    }
+    warning = (
+        f"Reclaimed a stale per-child lock for {ITEM_ID} from "
+        "crashed-driver@pid 424242 (session sess-dead); the dead holder's "
+        "lock was taken over."
+    )
+    start_result = {
+        "success": True,
+        "worktree_path": "/tmp/wt-child",
+        "branch": "wl-child",
+        "lock_reclaimed": True,
+        "reclaimed_from": reclaimed_from,
+        "lock_path": f"/tmp/.worklog/locks/child-{ITEM_ID}.lock",
+        "warnings": [warning],
+    }
+
+    with (
+        patch.object(implement, "is_code_freeze_active", return_value=False),
+        patch.object(implement, "wl_show", return_value={"id": PARENT_ID}),
+        patch.object(implement, "wl_show_children", return_value=[child]),
+        patch.object(implement, "wl_dep_blockers", return_value=[]),
+        patch.object(implement, "_discover_worktree", return_value=None),
+        patch.object(implement, "_invoke_implement", return_value=start_result) as invoke,
+        patch.object(implement, "wl_add_comment") as comment,
+    ):
+        report = implement.phase_parent(PARENT_ID, json_output=True)
+
+    invoke.assert_called_once()
+    comment.assert_not_called()
+    assert report["next_child"] == ITEM_ID
+    assert report["lock_reclaimed"] is True
+    assert report["reclaimed_from"] == reclaimed_from
+    assert report["lock_path"] == start_result["lock_path"]
+    assert warning in report["warnings"]
+    assert f"{ITEM_ID} lock reclaimed" in report["message"]
+
+
+def test_phase_drive_forwards_a_parent_reclamation(worklog_dir):
+    """``phase_drive`` forwards the reclamation so a drive --json consumer sees it."""
+    calls: list[str] = []
+
+    def parent_runner(action, work_item_id, no_refactor=False, verbose=False):
+        calls.append(action)
+        return {
+            "success": True,
+            "next_child": ITEM_ID,
+            "worktree_path": "/tmp/wt-child",
+            "branch": "wl-child",
+            "lock_reclaimed": True,
+            "reclaimed_from": {
+                "agent": "crashed-driver",
+                "pid": 424242,
+                "session_id": "sess-dead",
+                "started_at": "2026-10-30T00:00:00+00:00",
+            },
+            "warnings": [f"Reclaimed a stale per-child lock for {ITEM_ID}."],
+            "message": "Started child",
+        }
+
+    def spawner(child_id, worktree_path, timeout, env, verbose=False):
+        calls.append(f"spawn:{child_id}")
+        return {"success": True, "returncode": 0, "reason": ""}
+
+    with (
+        patch.object(implement, "wl_show", return_value={"id": PARENT_ID}),
+        patch.object(
+            implement,
+            "wl_show_children",
+            return_value=[{"id": ITEM_ID, "title": "Child", "status": "open"}],
+        ),
+    ):
+        report = implement.phase_drive(
+            PARENT_ID,
+            json_output=True,
+            parent_runner=parent_runner,
+            spawn_session=spawner,
+        )
+
+    assert calls[0] == "parent", calls
+    assert calls.count(f"spawn:{ITEM_ID}") == 1, calls
+    assert report["lock_reclaimed"] is True
+    assert report["reclaimed_from"]["agent"] == "crashed-driver"
+    assert report["reclaimed_children"] == [ITEM_ID]
+    assert f"Reclaimed a stale per-child lock for {ITEM_ID}." in report["warnings"]

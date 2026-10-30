@@ -788,7 +788,9 @@ a manual `start` all share this choke point:
 - **Release is kernel-guaranteed.** Normal exit, exceptions and
   `SIGINT`/`SIGTERM` release the lock explicitly; `SIGKILL`/crash release it
   when the kernel closes the descriptor. A recorded holder whose pid is dead is
-  reclaimed automatically with a logged warning naming it.
+  reclaimed automatically with a logged warning naming it **and surfaced in the
+  report** (`lock_reclaimed`, `reclaimed_from`, `lock_path`, `warnings`, also
+  forwarded by `parent`/`drive`).
 - **Not the same as `--assignee`.** A non-empty assignee is a human-visible
   scheduling hold; the lock is proof of a live process. Never infer a live
   holder from `assignee`, and never treat a live lock as an assignee.

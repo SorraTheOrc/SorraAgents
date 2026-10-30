@@ -980,9 +980,26 @@ reclaimed stale work item lock <path>: previous holder <agent> (pid <pid>) is no
 ```
 
 The `LockResult.reclaimed` field carries the previous holder's metadata and
-`phase_start` logs the reclamation, naming the previous holder. A `SIGKILL`ed
-holder needs no manual cleanup: killing the process releases the flock, and the
-next acquire reclaims the stale metadata.
+`phase_start` logs the reclamation **and surfaces it in the report**, naming
+the previous holder (SA-0MVUX6Q4S006KII3 — the parent epic's AC3 requires the
+reclamation to be visible to a `--json` consumer, not only in the log). A
+`SIGKILL`ed holder needs no manual cleanup: killing the process releases the
+flock, and the next acquire reclaims the stale metadata.
+
+Report fields recorded when a stale lock is reclaimed:
+
+| Field | Meaning |
+|---|---|
+| `lock_reclaimed` | `true` when this acquire reclaimed a dead holder's lock (absent or `false` otherwise — never a phantom `true`) |
+| `reclaimed_from` | The reclaimed holder's `agent`, `pid`, `session_id` and `started_at` (the ownership `token` is deliberately **not** copied into a report) |
+| `lock_path` | The lock file that was taken over, `<worklog>/locks/child-<id>.lock` |
+| `warnings` | Human-readable line(s) naming the reclaimed holder, e.g. `Reclaimed a stale per-child lock for <id> from <agent>@pid <pid> (session <session>, since <started_at>); the recorded holder pid is dead, so the lock was taken over (the previous session crashed).` |
+
+`parent` and `drive` forward a child's reclamation into their own reports, so a
+drive-level consumer sees it without reading the child's log:
+`lock_reclaimed`, `reclaimed_from`, `lock_path`, the child id in
+`reclaimed_children`, the same `warnings` entry, and a `message` that names the
+reclaimed child. A clean acquire never emits any of these fields.
 
 ### Diagnosing a held child
 
@@ -997,9 +1014,10 @@ When `start`, `parent` or `drive` reports `skipped-held`:
    it finish and re-run the parent/drive command; never start a second writer.
 3. **When reclamation happens automatically.** Only when the recorded pid is
    provably dead (`ProcessLookupError`) *and* the kernel lock is free — the next
-   acquire reclaims and warns. A pid owned by another user (`PermissionError`)
-   or an ambiguous `OSError` is treated as alive (fail closed), so it is never
-   stolen.
+   acquire reclaims and warns, and surfaces the reclaimed holder in the report
+   (`lock_reclaimed`, `reclaimed_from`, `warnings`). A pid owned by another user
+   (`PermissionError`) or an ambiguous `OSError` is treated as alive (fail
+   closed), so it is never stolen.
 4. **Corrupt metadata** is never auto-reclaimed: the warning names the file.
    Inspect it, confirm no live holder exists, and only then remove it.
 
