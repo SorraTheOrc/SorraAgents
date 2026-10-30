@@ -155,8 +155,18 @@ def test_lock_released_on_holder_sigkill(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+#: Stable full commit hash the fake git resolves every revision to. The
+#: verified local-dev fast-forward and the post-push ancestry assertion
+#: (SA-0MVPZG7A0000N66U) resolve refs with ``git rev-parse --verify``; a
+#: resolvable published commit keeps both paths real instead of tripping the
+#: fail-closed assertion (covered separately by
+#: ``tests/test_implement_finish_local_dev_verified_sync.py``).
+_FAKE_COMMIT = "1" * 40
+
+
 def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    stdout = f"{_FAKE_COMMIT}\n" if len(cmd) > 1 and cmd[1] == "rev-parse" else ""
+    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
 
 
 def _build_result() -> dict:

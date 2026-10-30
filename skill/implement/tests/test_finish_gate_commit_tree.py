@@ -148,14 +148,26 @@ def _cleanup_result() -> dict:
     return {"method": "wl_cleanup_worktree", "terminated": 0, "warning": ""}
 
 
+#: Stable full commit hash the fake git resolves every revision to. The
+#: verified local-dev fast-forward and the post-push ancestry assertion
+#: (SA-0MVPZG7A0000N66U) resolve refs with ``git rev-parse --verify``; a
+#: resolvable published commit keeps both paths real instead of tripping the
+#: fail-closed assertion (covered separately by
+#: ``tests/test_implement_finish_local_dev_verified_sync.py``).
+_FAKE_COMMIT = "1" * 40
+
+
 def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProcess:
     """Stand-in for ``run_cmd``: every git sub-command "succeeds".
 
-    ``phase_finish``'s fast-forward main-checkout block and the main-checkout
-    status snapshot run against the stubbed main checkout; none of that must
-    touch a real repository here.
+    ``phase_finish``'s fast-forward main-checkout block, its post-push ancestry
+    assertion and the main-checkout status snapshot run against the stubbed
+    main checkout; none of that must touch a real repository here. Revision
+    lookups resolve to :data:`_FAKE_COMMIT` so the fast-forward and the
+    ancestry check complete as they would in a healthy repository.
     """
-    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    stdout = f"{_FAKE_COMMIT}\n" if len(cmd) > 1 and cmd[1] == "rev-parse" else ""
+    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
 
 
 @contextlib.contextmanager

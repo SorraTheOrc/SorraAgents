@@ -31,15 +31,29 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from skill.implement.scripts import implement
 
+#: Stable full commit hash the fake git resolves every revision to.
+#: ``phase_finish`` fast-forwards local ``dev`` before the push and then
+#: asserts that the pushed commit is an ancestor of ``refs/remotes/origin/dev``
+#: (SA-0MVPZG7A0000N66U). Both paths resolve their refs with
+#: ``git rev-parse --verify``; modelling a published commit keeps those paths
+#: exercised for real instead of tripping the fail-closed assertion, whose own
+#: behaviour is covered by
+#: ``tests/test_implement_finish_local_dev_verified_sync.py``.
+_FAKE_COMMIT = "1" * 40
+
 
 def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProcess:
     """Stand-in for ``run_cmd``: every git sub-command "succeeds".
 
-    ``phase_finish`` runs a fast-forward block (fetch/checkout/merge) against
-    the main checkout; none of that must touch a real repository in tests.
+    ``phase_finish`` runs a fast-forward block (fetch/checkout/merge) and a
+    post-push ancestry assertion against the main checkout; neither must touch
+    a real repository in tests. Revision lookups resolve to
+    :data:`_FAKE_COMMIT` so both code paths succeed as they would in a healthy
+    repository.
     """
+    stdout = f"{_FAKE_COMMIT}\n" if len(cmd) > 1 and cmd[1] == "rev-parse" else ""
     return subprocess.CompletedProcess(
-        args=cmd, returncode=0, stdout="", stderr=""
+        args=cmd, returncode=0, stdout=stdout, stderr=""
     )
 
 

@@ -236,6 +236,26 @@ def _mocked_phase_finish(worktree_path: Path):
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
         )
+        # The post-push ancestry assertion (SA-0MVPZG7A0000N66U) resolves the
+        # pushed commit and ``refs/remotes/origin/dev`` in the fixture repo.
+        # This harness stubs ``git_commit`` and reports the synthetic hash
+        # ``abc1234``, which cannot exist as a git object, so the assertion is
+        # stubbed with a verified result here — its own behaviour is covered by
+        # ``tests/test_implement_finish_local_dev_verified_sync.py``.
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_assert_commit_on_origin_dev",
+                return_value={
+                    "verified": True,
+                    "commit": "abc1234",
+                    "resolved_commit": "1" * 40,
+                    "target": "refs/remotes/origin/dev",
+                    "origin_tip": "1" * 40,
+                    "fetched": True,
+                },
+            )
+        )
         stack.enter_context(
             patch.object(
                 implement,
