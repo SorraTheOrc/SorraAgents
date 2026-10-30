@@ -11,6 +11,7 @@ aggregates both so ``guarded_run_all`` consumers see them at the top level.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -21,6 +22,9 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"
 if str(_RUNNER_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNNER_DIR))
+_REPO_ROOT = _SCRIPT_DIR.parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import run_tests
 from run_tests import (
@@ -31,6 +35,10 @@ from run_tests import (
     run_all,
     run_suite,
 )
+
+# Deterministic infrastructure-failure simulations shared with the finish-gate
+# contract tests (SA-0MVU8XQTU006DP37).
+from skill.shared.tests import gate_failure_fixtures as fx
 
 _CMD = "pytest -q -r a --disable-warnings"
 
@@ -171,3 +179,230 @@ class TestRunAllAggregation:
         assert result["notice_codes"] == [NOTICE_SLOT_BUSY]
         assert "tail-of-stdout" in result["stdout"]
         assert "tail-of-stderr" in result["stderr"]
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure-failure contract (SA-0MVU8XQTU006DP37)
+#
+# A timeout, a kill and an unparsed non-zero exit are each *provably distinct*
+# from a code failure: `run_suite` must name what happened (configured timeout
+# vs elapsed, signal vs exit code, the command, bounded tails) instead of
+# leaving a consumer to infer it. Every case below is simulated through the
+# shared fixture module, so no test sleeps for minutes, allocates gigabytes or
+# contends for a host test slot.
+#
+# Red until the runner slice SA-0MVU8XRBQ000DG9D emits the facts.
+# ---------------------------------------------------------------------------
+
+_RUNNER_FACTS_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Contract pinned test-first by SA-0MVU8XQTU006DP37; the runner slice "
+        "SA-0MVU8XRBQ000DG9D emits elapsed_seconds, configured_timeout and "
+        "slot_wait_seconds plus the killed/unparsed_failure notice codes. "
+        "Remove this marker in that slice (strict xfail fails on XPASS)."
+    ),
+)
+
+
+def _run_fixture_suite(
+    run_cmd,
+    tmp_path: Path,
+    *,
+    timeout: int = fx.FIXTURE_TIMEOUT,
+    slot=None,
+) -> dict:
+    """Run the fixture repo's suite with the command boundary stubbed."""
+    slot_factory = slot or (lambda: fx.slot_acquisition(wait=0))
+    with mock.patch.object(run_tests, "_run_cmd", side_effect=run_cmd), \
+         mock.patch.object(run_tests, "_test_concurrency_slot", slot_factory):
+        return run_suite(
+            "all", cwd=_repo(tmp_path), use_cache=False, timeout=timeout
+        )
+
+
+def _slow_then(result):
+    """Side effect: burn a short, real interval before returning *result*.
+
+    The interval is what ``elapsed_seconds`` must measure, so it must be real
+    (a stub clock would make the assertion test the stub).
+    """
+
+    def _run(*args, **kwargs):
+        time.sleep(fx.FIXTURE_EXECUTION_DELAY)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    return _run
+
+
+class TestRunSuiteInfrastructureFacts:
+    """Every non-green suite result states *what* happened, not just *that*."""
+
+    @_RUNNER_FACTS_XFAIL
+    def test_successful_suite_reports_measured_elapsed_seconds(self, tmp_path) -> None:
+        result = _run_fixture_suite(_slow_then(fx.healthy()), tmp_path)
+
+        assert result["success"] is True
+        assert result["notice_code"] == ""
+        assert result["elapsed_seconds"] >= fx.FIXTURE_EXECUTION_DELAY * 0.8, (
+            "elapsed_seconds must measure the command execution, not be a "
+            f"placeholder (got {result['elapsed_seconds']!r})"
+        )
+
+    @_RUNNER_FACTS_XFAIL
+    def test_timeout_reports_configured_timeout_and_elapsed(self, tmp_path) -> None:
+        result = _run_fixture_suite(
+            _slow_then(fx.timeout_expired(fx.FIXTURE_TIMEOUT)),
+            tmp_path,
+            timeout=fx.FIXTURE_TIMEOUT,
+        )
+
+        assert result["notice_code"] == NOTICE_SUITE_TIMEOUT
+        assert result["configured_timeout"] == fx.FIXTURE_TIMEOUT, (
+            "a timeout must name the timeoutPerCommand it exceeded"
+        )
+        assert result["elapsed_seconds"] >= fx.FIXTURE_EXECUTION_DELAY * 0.8, (
+            "a timeout must report how long the suite had been running"
+        )
+
+    @_RUNNER_FACTS_XFAIL
+    def test_killed_suite_reports_signal_exit_code_and_command(self, tmp_path) -> None:
+        result = _run_fixture_suite(_slow_then(fx.killed(signal=9)), tmp_path)
+
+        assert result["notice_code"] == fx.NOTICE_KILLED
+        assert result["signal"] == 9, "the killing signal must be reported"
+        assert result["exit_code"] == -9, "a killed child's code is -signal"
+        assert fx.FIXTURE_COMMAND in result["command"]
+        assert result["failures"] == [], (
+            "a kill yields no structured failures; it must not be presented "
+            "as a code failure"
+        )
+
+    @_RUNNER_FACTS_XFAIL
+    def test_killed_suite_reports_bounded_output_tails(self, tmp_path) -> None:
+        result = _run_fixture_suite(
+            _slow_then(fx.killed(stderr=fx.noisy_lines())), tmp_path
+        )
+
+        assert result["notice_code"] == fx.NOTICE_KILLED
+        assert "stderr-line-1999" in result["stderr"], (
+            "the tail of a killed run's output is the only diagnostic a "
+            "consumer gets"
+        )
+        assert "stderr-line-0" not in result["stderr"]
+        assert len(result["stderr"]) < len(fx.noisy_lines())
+
+    @_RUNNER_FACTS_XFAIL
+    def test_unparsed_non_zero_exit_reports_command_exit_code_and_tails(
+        self, tmp_path
+    ) -> None:
+        result = _run_fixture_suite(
+            _slow_then(fx.unparsed(exit_code=3, stderr=fx.noisy_lines())), tmp_path
+        )
+
+        assert result["notice_code"] == fx.NOTICE_UNPARSED_FAILURE
+        assert result["exit_code"] == 3
+        assert fx.FIXTURE_COMMAND in result["command"]
+        assert result["failures"] == []
+        assert "stderr-line-1999" in result["stderr"]
+        assert len(result["stderr"]) < len(fx.noisy_lines())
+
+    @_RUNNER_FACTS_XFAIL
+    def test_slot_busy_reports_the_bounded_wait_as_slot_wait_seconds(
+        self, tmp_path
+    ) -> None:
+        waits: list[float] = []
+        busy = run_tests.TestConcurrencyTimeout(
+            f"{SLOT_BUSY_NOTICE_PREFIX} no free slot within 600s"
+        )
+        result = _run_fixture_suite(
+            _slow_then(fx.healthy()),
+            tmp_path,
+            slot=lambda: fx.slot_acquisition(
+                wait=fx.FIXTURE_SLOT_WAIT, raises=busy, waits=waits
+            ),
+        )
+
+        assert result["notice_code"] == NOTICE_SLOT_BUSY
+        assert waits == [fx.FIXTURE_SLOT_WAIT], (
+            "the stubbed slot supplied the delay — no host semaphore was "
+            "touched"
+        )
+        assert result["slot_wait_seconds"] >= fx.FIXTURE_SLOT_WAIT * 0.8, (
+            "a bounded wait that expired must report the time it waited"
+        )
+
+
+def test_structured_failures_are_never_classified_as_infrastructure(
+    tmp_path,
+) -> None:
+    """Precedence guard: a real code failure is never reclassified.
+
+    Passes today and must keep passing — the new codes apply only when no
+    failure could be parsed.
+    """
+    result = _run_fixture_suite(_slow_then(fx.structured_failure()), tmp_path)
+
+    assert result["notice_code"] == ""
+    assert result["failures"], "the parsable failure must be reported"
+    assert result["returncode"] != 0
+
+
+def test_published_notice_codes_match_the_runner_constants() -> None:
+    """The fixture vocabulary *is* the runner's contract, not a copy of it."""
+    assert fx.NOTICE_SUITE_TIMEOUT == run_tests.NOTICE_SUITE_TIMEOUT
+    assert fx.NOTICE_SLOT_BUSY == run_tests.NOTICE_SLOT_BUSY
+
+
+@_RUNNER_FACTS_XFAIL
+def test_new_notice_codes_are_exported_by_the_runner() -> None:
+    """``killed`` and ``unparsed_failure`` are stable exported codes."""
+    assert run_tests.NOTICE_KILLED == fx.NOTICE_KILLED
+    assert run_tests.NOTICE_UNPARSED_FAILURE == fx.NOTICE_UNPARSED_FAILURE
+
+
+@_RUNNER_FACTS_XFAIL
+def test_run_all_aggregates_elapsed_and_slot_wait_separately(monkeypatch) -> None:
+    """Aggregation keeps elapsed and queue wait as distinct sums."""
+    suites = {
+        "all": {
+            "success": True,
+            "returncode": 0,
+            "command": "pytest -q skill/test/tests/",
+            "failures": [],
+            "notice": "",
+            "notice_code": "",
+            "elapsed_seconds": 12.5,
+            "slot_wait_seconds": 30.0,
+            "scope": "full",
+            "type": "full",
+            "changed_files": [],
+        },
+        "node": {
+            "success": False,
+            "returncode": -9,
+            "command": "npm --silent test",
+            "failures": [],
+            "notice": "suite killed by signal 9",
+            "notice_code": fx.NOTICE_KILLED,
+            "signal": 9,
+            "elapsed_seconds": 7.5,
+            "slot_wait_seconds": 0.0,
+            "scope": "full",
+            "type": "full",
+            "changed_files": [],
+        },
+    }
+    monkeypatch.setattr(run_tests, "run_suite", lambda name, **kw: suites[name])
+
+    result = run_all(("all", "node"), use_cache=False)
+
+    assert result["elapsed_seconds_total"] == pytest.approx(20.0), (
+        "aggregate elapsed is the sum of command executions only"
+    )
+    assert result["slot_wait_seconds"] == pytest.approx(30.0), (
+        "queue wait is aggregated separately and never folded into elapsed"
+    )
+    assert result["notice_codes"] == [fx.NOTICE_KILLED]
