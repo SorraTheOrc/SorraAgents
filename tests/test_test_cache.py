@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_cache
+from shared import git_sandbox as gs
 from test_cache import (
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
@@ -63,8 +64,14 @@ def make_sequence_runner(outputs: list[str]):
 
 
 def git(repo: Path, *args: str) -> None:
-    """Run a git command inside *repo*, asserting success."""
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    """Run a git command inside *repo* with a hermetic fixture environment.
+
+    Hermetic on purpose: the finish gate runs this suite with its temporary
+    index exported, and these fixtures must operate on their own repository
+    (``tests/conftest.py`` drops the ambient ``GIT_INDEX_FILE``; the shared
+    helper also scrubs repository overrides and pins a fixture identity).
+    """
+    gs.run_git(repo, args, check=True)
 
 
 @pytest.fixture
@@ -316,6 +323,170 @@ def test_generated_metadata_is_invisible_to_the_git_state_fingerprint(
     assert served["cached"] is True
     assert served["stdout"] == SUCCESS_OUTPUT
     assert calls == ["pytest -q -r a --disable-warnings"]  # one execution only
+
+
+# ---------------------------------------------------------------------------
+# Indeterminate git state: never serve or store a stale verdict
+#
+# Symptom 1 of WL-0MVPO9P610055UQ3: a GREEN verdict recorded for one dirty tree
+# was served for a different dirty tree, so a RED witness "passed" without the
+# fix. The content-hash fingerprint is correct when git reports the tree; the
+# residual stale hit came from the *silent degradation* paths — whenever a git
+# call (or a dirty path's content read) failed, the fingerprint was replaced
+# with a state-independent marker, so every dirty tree shared one cache key for
+# the whole TTL. The cache must fail closed instead: an unfingerprintable state
+# is never a hit and never a stored key.
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_git_index(repo: Path) -> None:
+    """Make ``git status`` fail while ``git rev-parse HEAD`` still succeeds.
+
+    This is the deterministic shape of the transient failures seen in the
+    incident (a corrupt or half-written index, a locked repository under
+    concurrent agent load, a 30 s git timeout): the pre-fix fingerprint lost
+    the dirty-path set and kept only HEAD, so two different dirty trees
+    produced the *same* cache key.
+    """
+    (repo / ".git" / "index").write_bytes(b"not a git index")
+
+
+def test_indeterminate_git_state_never_serves_a_stale_verdict(
+    git_repo: Path,
+) -> None:
+    """A content-only edit must re-run even when the tree cannot be fingerprinted.
+
+    Regression witness for AC1/symptom 1: run A records a verdict, the *same*
+    already-dirty file is edited again (content only — the path and its status
+    code are unchanged), and run B must never be served run A's result. The
+    pre-fix code served it because a failed ``git status`` degraded the
+    fingerprint to HEAD alone.
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+
+    (git_repo / "tracked.txt").write_text("two\n")
+    _corrupt_git_index(git_repo)
+    first = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert first["cached"] is False
+
+    # Content-only edit of a path that was already dirty: same status code,
+    # same path, different content.
+    (git_repo / "tracked.txt").write_text("three\n")
+    second = run_cached("pytest", cwd=str(git_repo), runner=runner)
+
+    assert second["cached"] is False, (
+        "an unfingerprintable git state must never serve a cached verdict"
+    )
+    assert len(calls) == 2, "the second run must execute rather than reuse run A"
+    # Nothing was recorded under the degraded (HEAD-only) key either, so no
+    # later run can be served a verdict for a state nobody fingerprinted.
+    assert query_cached("pytest", cwd=str(git_repo)) is None
+
+
+def test_unreadable_dirty_path_is_never_assumed_unchanged(git_repo: Path) -> None:
+    """A dirty path whose content cannot be read still invalidates the cache.
+
+    The content hash is the only thing that distinguishes two edits of an
+    already-dirty file. When the content cannot be read (a root-owned file in
+    an agent checkout, a resource error) the fingerprint must be treated as
+    unavailable rather than collapsing both edits onto one marker.
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+    target = git_repo / "tracked.txt"
+
+    target.write_text("two\n")
+    assert run_cached("pytest", cwd=str(git_repo), runner=runner)["cached"] is False
+    assert len(calls) == 1
+
+    target.write_text("three\n")
+    readable_open = Path.open
+
+    def deny_target(self: Path, *args, **kwargs):
+        if self.name == target.name:
+            raise PermissionError(13, "Permission denied", str(self))
+        return readable_open(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "open", deny_target)
+        unreadable = run_cached("pytest", cwd=str(git_repo), runner=runner)
+        repeat = run_cached("pytest", cwd=str(git_repo), runner=runner)
+
+    assert unreadable["cached"] is False
+    assert repeat["cached"] is False, (
+        "an unreadable dirty path must not become a stable 'unchanged' marker"
+    )
+    assert len(calls) == 3, "both unreadable-state runs must execute"
+
+
+def test_repository_override_env_cannot_poison_the_fingerprint(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leaked ``GIT_DIR``/``GIT_WORK_TREE`` must not key the fingerprint.
+
+    Git honours repository-override variables over ``cwd``, so a leaked value
+    made ``compute_git_state`` describe a *different* repository: one constant
+    key for every state of the tree being tested (the leak class behind the
+    2026-09-24/26 live-checkout incidents, SA-0MUIA3OE40001QJX). The
+    fingerprint must always describe the repository containing ``cwd``.
+    """
+    clean = compute_git_state(str(git_repo))
+    (git_repo / "tracked.txt").write_text("two\n")
+    dirty = compute_git_state(str(git_repo))
+    assert clean != dirty
+
+    other = git_repo.parent / "other"
+    other.mkdir()
+    git(other, "init", "-q")
+    git(other, "config", "user.email", "cache-test@example.com")
+    git(other, "config", "user.name", "Cache Test")
+    (other / "other.txt").write_text("other\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-q", "-m", "other")
+
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+
+    assert compute_git_state(str(git_repo)) == dirty, (
+        "a leaked repository-override env must not change the fingerprint"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Post-run keying: the entry describes the state consumers can observe
+# ---------------------------------------------------------------------------
+
+
+def test_entry_is_keyed_on_the_post_run_state(git_repo: Path) -> None:
+    """A verdict is keyed on the tree the run *left behind*, not the one it found.
+
+    Symptom 2 of WL-0MVPO9P610055UQ3: the run started with transient churn
+    (here ``scratch.txt``) that it cleaned up itself, so the entry was keyed on
+    a state that existed only before the run and could never be queried again.
+    The next consumer (``--summary``, the audit's ``query_cached``, the next
+    run's pre-check) sees the post-run state, so that is the key.
+    """
+    clean_state = compute_git_state(str(git_repo))
+    scratch = git_repo / "scratch.txt"
+    scratch.write_text("churn\n")
+    assert compute_git_state(str(git_repo)) != clean_state
+
+    calls: list[str] = []
+
+    def runner(command: str, cwd: str | Path, timeout: int) -> SimpleNamespace:
+        calls.append(command)
+        (Path(cwd) / "scratch.txt").unlink()  # the run cleans up after itself
+        return SimpleNamespace(stdout=SUCCESS_OUTPUT, stderr="", returncode=0)
+
+    result = run_cached("pytest", cwd=str(git_repo), runner=runner)
+
+    assert result["cached"] is False
+    assert result["git_state"] == clean_state
+    entry = query_cached("pytest", cwd=str(git_repo))
+    assert entry is not None, "the entry must be queryable from the resulting tree"
+    assert entry["stdout"] == SUCCESS_OUTPUT
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------

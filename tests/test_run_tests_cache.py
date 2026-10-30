@@ -8,12 +8,12 @@ All tests use a stub/temp git repo so no real suite is ever executed.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import test.scripts.run_tests as rt
+from shared import git_sandbox as gs
 
 # Output that looks like a vitest/pytest summary (grep targets in production).
 SUMMARY_OUTPUT = (
@@ -25,7 +25,14 @@ SUMMARY_OUTPUT = (
 
 
 def git(repo: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    """Run a git command inside *repo* with a hermetic fixture environment.
+
+    Hermetic on purpose: the finish gate runs this suite with its temporary
+    index exported, and these fixtures must operate on their own repository
+    (``tests/conftest.py`` drops the ambient ``GIT_INDEX_FILE``; the shared
+    helper also scrubs repository overrides and pins a fixture identity).
+    """
+    gs.run_git(repo, args, check=True)
 
 
 @pytest.fixture
@@ -338,6 +345,67 @@ def test_expired_ttl_causes_reexecution(
 
 
 # ---------------------------------------------------------------------------
+# Post-run keying: a freshly stored entry must be queryable
+#
+# Symptom 2 of WL-0MVPO9P610055UQ3: a full-suite run finished green, but
+# ``--summary`` immediately afterwards reported ``missing``. The run was keyed
+# on the state the checkout was in *before* it started, which included
+# transient churn (plugin/wl/dist/test scratch files) that no longer existed
+# when the run finished — so the entry could never be queried again. Entries
+# must be keyed on the state consumers will observe: the post-run state.
+# ---------------------------------------------------------------------------
+
+
+def test_entry_stored_for_a_run_is_queryable_after_transient_churn_disappears(
+    cache_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A completed run must be readable by ``--summary`` from the resulting tree.
+
+    The checkout carries transient churn when the run starts (a concurrent or
+    previous step's scratch files) and is clean at the same HEAD when the run
+    finishes. Keying the entry on the pre-run state made it unqueryable, so the
+    audit re-executed the whole suite (F3) and the implement/pre-push
+    verification reported ``missing`` evidence for a run that had just passed.
+    """
+    # A pytest marker makes ``--suite all`` resolve a real command set.
+    (cache_repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    git(cache_repo, "add", "-A")
+    git(cache_repo, "commit", "-q", "-m", "suite config")
+
+    transient = cache_repo / "scratch-artifact.txt"
+    transient.write_text("transient\n", encoding="utf-8")  # dirty at run start
+
+    calls: list[str] = []
+
+    def fake(cmd: list[str], **kwargs):
+        calls.append(" ".join(cmd))
+        # The suite cleans up the scratch churn as it runs: by the time it
+        # finishes, the checkout is clean at the same HEAD.
+        transient.unlink(missing_ok=True)
+        return SimpleNamespace(returncode=0, stdout=SUMMARY_OUTPUT, stderr="")
+
+    monkeypatch.setattr(rt, "_run_cmd", fake)
+
+    run = rt.run_suite("all", cwd=cache_repo, scope="full")
+    assert run["success"] is True
+    assert run["cached"] is False
+    assert len(calls) == 1
+    assert not transient.exists()
+
+    code, summary = run_main_json(
+        capsys, ["--scope", "full", "--suite", "all", "--summary", "--json"]
+    )
+    assert code == 0
+    assert summary["missing"] == [], (
+        "the entry stored by the run must be queryable from the resulting tree"
+    )
+    assert "Test Files  3 passed (3)" in summary["lines"]["all"]
+    assert summary["scopes"]["all"] == "full"
+
+
+# ---------------------------------------------------------------------------
 # Non-JSON output shows the [cached] marker
 # ---------------------------------------------------------------------------
 
@@ -345,14 +413,25 @@ def test_expired_ttl_causes_reexecution(
 def test_non_json_output_marks_cached_runs(
     cache_repo: Path, fake_run: list[str], capsys: pytest.CaptureFixture
 ) -> None:
-    """Non-JSON output must visibly mark runs served from cache."""
+    """Non-JSON output must visibly mark runs served from cache.
+
+    AC3 of WL-0MVPO9P610055UQ3: a cache-served result is never mistaken for a
+    fresh one. The marker is pinned on the suite's own summary line (not just
+    somewhere in the output) so it cannot silently regress into invisibility.
+    """
     run_main(["--suite", "pytest"])
-    out1 = capsys.readouterr().out
-    assert "[cached]" not in out1
+    fresh_out = capsys.readouterr().out
+    assert "[cached]" not in fresh_out
+    fresh_suite_lines = [line for line in fresh_out.splitlines() if "pytest" in line]
+    assert fresh_suite_lines, "expected a per-suite line in the non-JSON output"
 
     run_main(["--suite", "pytest"])
-    out2 = capsys.readouterr().out
-    assert "[cached]" in out2
+    cached_out = capsys.readouterr().out
+    cached_suite_lines = [line for line in cached_out.splitlines() if "pytest" in line]
+    assert cached_suite_lines, "expected a per-suite line in the non-JSON output"
+    assert any("[cached]" in line for line in cached_suite_lines), (
+        "the cached marker must appear on the suite line that reports the result"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,27 @@ module adds a caching layer so repeated verification is cheap:
   untracked files), resolved against the repo containing the working
   directory (worktree-aware). Hashing file **contents** — not just the
   status text, which lists paths only — means editing a file that is
-  *already* dirty yields a new fingerprint too (AH-0MVFGIV6700329SZ).
+  *already* dirty yields a new fingerprint too (AH-0MVFGIV6700329SZ). The
+  fingerprint always describes the repository containing the working
+  directory: repository-override variables (``GIT_DIR``, ``GIT_WORK_TREE``,
+  ``GIT_CONFIG*``, …) are scrubbed before every git call, so a leaked value
+  cannot make the cache describe a different repository
+  (SA-0MUIA3OE40001QJX).
+- **Fail closed on an indeterminate state**: when the state cannot be
+  determined — a failing/locked/corrupt index, a git timeout under load, an
+  unreadable dirty path — the run is *not* looked up and *not* stored. A
+  degraded, state-independent fallback fingerprint would make every dirty
+  tree share one key and serve stale green results for the whole TTL
+  (WL-0MVPO9P610055UQ3). Correctness first: an unfingerprintable run simply
+  executes fresh.
+- **Keyed on the post-run state**: the entry records the state the run
+  **left behind**, because that is the state every later consumer observes
+  (the next run's pre-check, ``query_cached()``, ``--summary``). Keying on
+  the pre-run state made a completed run unqueryable whenever transient
+  churn (plugin/dist/scratch files) disappeared while it ran
+  (WL-0MVPO9P610055UQ3). When the tree moved during the run, the pre-run
+  state is still recorded as ``git_state_at_start`` metadata for diagnosis;
+  it never keys the entry.
 - **2-hour TTL** (configurable): expired entries are re-run and replaced.
   Failed (non-zero-exit) runs use a short 5-minute TTL instead
   (SA-0MSJELL44009XYIL) so transient infra failures are not re-served as
@@ -33,12 +53,19 @@ Entry layout (stable, documented for read-only consumers)::
 
     <cache_dir>/<key>/
         metadata.json   {"version":1, "command":..., "git_state":...,
+                         "git_state_at_start":...,
                          "scope": "full"|"changed",
                          "test_type": "full"|"unit"|...,
                          "interpreter": "<pytest interpreter/exe>",
                          "exit_code":..., "completed_at": <epoch float>}
         stdout.txt      full stdout of the run
         stderr.txt      full stderr of the run
+
+``git_state`` is the key the entry is stored under — the state the run left
+behind (see above). ``git_state_at_start`` records the state the run started
+in and is informational only (it differs when the tree moved during the run,
+which is exactly the transient-churn case that used to make entries
+unqueryable); entries predating the field omit it.
 
 ``interpreter`` records the concrete interpreter/executable that actually ran
 pytest (empty for non-pytest commands and for older entries predating the
@@ -67,6 +94,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -81,8 +109,27 @@ from test_runner import (
     log_repository_override_scrub,
     normalize_test_command,
     resolve_pytest_executable,
+    scrub_repository_overrides,
     subprocess_env_with_scrubbed_overrides,
 )
+
+LOG = logging.getLogger("skill.test_cache")
+
+
+class GitStateUnavailable(RuntimeError):
+    """The working tree's git state could not be fully determined.
+
+    A cache verdict is only meaningful for a state built from every input
+    (HEAD plus the content of every dirty path). Raised by
+    :func:`compute_git_state` in strict mode when git cannot report that
+    input — a failing/locked/corrupt index, a git timeout under load, a
+    repository whose work tree cannot be resolved — or when a dirty path's
+    content cannot be read. Callers that can serve a *stale* result
+    (:func:`run_cached`, :func:`query_cached`) turn this into "no cache":
+    the run executes and stores nothing, because a degraded fingerprint makes
+    every dirty tree share one key (WL-0MVPO9P610055UQ3).
+    """
+
 
 DEFAULT_TTL_SECONDS = 2 * 60 * 60  # 2 hours (operator decision)
 # Non-zero-exit runs get a much shorter TTL (SA-0MSJELL44009XYIL): a failed
@@ -108,7 +155,17 @@ Runner = Callable[[str, str, int], Any]
 
 
 def _run_git(cwd: str, *args: str) -> str | None:
-    """Run a git command in *cwd*, returning stdout or None on failure."""
+    """Run a git command in *cwd*, returning stdout or None on failure.
+
+    The environment is the shared repository-override scrub
+    (SA-0MUIA3OE40001QJX): git honours ``GIT_DIR``/``GIT_WORK_TREE``/
+    ``GIT_CONFIG*`` over ``cwd``, so a leaked value made the fingerprint
+    describe a *different* repository — one constant key for every state of
+    the tree being tested, i.e. stale results for the whole TTL
+    (WL-0MVPO9P610055UQ3). The fingerprint always describes the repository
+    containing ``cwd``.
+    """
+    log_repository_override_scrub()
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -117,6 +174,7 @@ def _run_git(cwd: str, *args: str) -> str | None:
             text=True,
             timeout=30,
             check=False,
+            env=scrub_repository_overrides(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -125,7 +183,21 @@ def _run_git(cwd: str, *args: str) -> str | None:
     return proc.stdout
 
 
-def compute_git_state(cwd: str | Path | None = None) -> str:
+def _has_git_directory(cwd: str) -> bool:
+    """Whether *cwd* or any ancestor carries a ``.git`` directory or file.
+
+    Distinguishes a genuinely non-git directory (documented TTL-only
+    fallback) from a git checkout whose state git could not report (which
+    must fail closed instead of falling back to a state-independent key).
+    """
+    path = Path(cwd)
+    for candidate in (path, *path.parents):
+        if os.path.lexists(candidate / ".git"):
+            return True
+    return False
+
+
+def compute_git_state(cwd: str | Path | None = None, *, strict: bool = False) -> str:
     """Return a fingerprint of the git state at *cwd*.
 
     The fingerprint combines the HEAD commit sha with the **content** of every
@@ -135,42 +207,78 @@ def compute_git_state(cwd: str | Path | None = None) -> str:
     edit to a file that is already dirty leaves the status text unchanged and
     would otherwise serve a stale cached result (AH-0MVFGIV6700329SZ).
 
-    Git commands run with ``cwd`` as the working directory, so the fingerprint
-    reflects the *worktree containing cwd* (implement loops run suites inside
-    git worktrees). Porcelain paths are repository-root relative, so content is
-    resolved against ``git rev-parse --show-toplevel``.
+    Git commands run with ``cwd`` as the working directory and a scrubbed
+    environment, so the fingerprint reflects the *worktree containing cwd*
+    (implement loops run suites inside git worktrees) and never a repository
+    named by a leaked ``GIT_DIR``. Porcelain paths are repository-root
+    relative, so content is resolved against ``git rev-parse --show-toplevel``.
 
     For non-git directories a stable per-directory fingerprint is returned so
     the cache still works (TTL-only invalidation), documented fallback.
+
+    *strict* raises :class:`GitStateUnavailable` instead of degrading when the
+    state cannot be determined: a git checkout whose work tree, HEAD or dirty
+    paths cannot be read, or a dirty path whose content cannot be read. A
+    caller that may serve a stale result must pass ``strict=True`` — a
+    degraded fingerprint (HEAD only, or a per-directory constant) cannot
+    distinguish two dirty trees and would serve one tree's verdict for the
+    other (WL-0MVPO9P610055UQ3).
     """
     cwd = str(Path(cwd or os.getcwd()).resolve())
-    head = _run_git(cwd, "rev-parse", "HEAD")
-    if head is None:
+    in_git_checkout = _has_git_directory(cwd)
+    toplevel = _run_git(cwd, "rev-parse", "--show-toplevel")
+    if toplevel is None:
+        if strict and in_git_checkout:
+            raise GitStateUnavailable(
+                f"git cannot report the work tree containing {cwd} "
+                "(corrupt/locked index, timeout, or a broken repository)"
+            )
         # Not a git repository: stable per-directory key.
         digest = hashlib.sha256(f"no-git:{cwd}".encode()).hexdigest()
         return digest[:16]
 
+    head = _run_git(cwd, "rev-parse", "HEAD")
+    if head is None:
+        # An unborn branch (a repository with no commits yet) has no HEAD but
+        # is otherwise fingerprinted normally; any other HEAD failure is an
+        # indeterminate state.
+        unborn = _run_git(cwd, "symbolic-ref", "-q", "HEAD") is not None
+        if not unborn and strict:
+            raise GitStateUnavailable(
+                f"git cannot resolve HEAD in {cwd} (corrupt repository or git timeout)"
+            )
+        head_token = b"unborn" if unborn else b""
+    else:
+        head_token = head.strip().encode()
+
     hasher = hashlib.sha256()
-    hasher.update(head.strip().encode())
-    base = Path((_run_git(cwd, "rev-parse", "--show-toplevel") or cwd).strip())
-    for status, path in sorted(_status_entries(cwd)):
+    hasher.update(head_token)
+    base = Path(toplevel.strip())
+    for status, path in sorted(_status_entries(cwd, strict=strict)):
         hasher.update(b"\0status\0" + status.encode("utf-8", "surrogateescape"))
-        _update_with_path_content(hasher, base, path)
+        _update_with_path_content(hasher, base, path, strict=strict)
     return hasher.hexdigest()
 
 
-def _status_entries(cwd: str) -> list[tuple[str, str]]:
+def _status_entries(cwd: str, *, strict: bool = False) -> list[tuple[str, str]]:
     """Return ``(status, path)`` for every dirty path in *cwd*.
 
     ``--untracked-files=all`` expands untracked directories into individual
     files so each file's content is fingerprinted. ``-z`` keeps paths
     NUL-terminated (no quoting) and places a rename/copy's original path in
     the field following the entry.
+
+    With *strict* a failing ``git status`` raises :class:`GitStateUnavailable`
+    rather than reporting an empty (and therefore state-independent) dirty
+    set.
     """
-    output = _run_git(
-        cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all"
-    )
+    output = _run_git(cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     if output is None:
+        if strict:
+            raise GitStateUnavailable(
+                f"git cannot report the working tree state in {cwd} "
+                "(corrupt/locked index, timeout, or a broken repository)"
+            )
         return []
     fields = output.split("\0")
     entries: list[tuple[str, str]] = []
@@ -189,15 +297,21 @@ def _status_entries(cwd: str) -> list[tuple[str, str]]:
 
 
 def _update_with_path_content(
-    hasher: Any, base: Path, relpath: str
+    hasher: Any, base: Path, relpath: str, *, strict: bool = False
 ) -> None:
     """Feed the content at ``base/relpath`` into *hasher*.
 
-    A missing or unreadable path contributes a stable marker instead of
-    raising (a deleted dirty file is a legitimate state). Symlinks hash their
-    target. A directory (a submodule gitlink) hashes its own HEAD and status
-    rather than walking into another repository; a plain directory falls back
-    to a sorted recursive walk.
+    A missing path contributes a stable marker instead of raising (a deleted
+    dirty file is a legitimate state). Symlinks hash their target. A directory
+    (a submodule gitlink) hashes its own HEAD and status rather than walking
+    into another repository; a plain directory falls back to a sorted
+    recursive walk.
+
+    With *strict* an unreadable path raises :class:`GitStateUnavailable`
+    instead of contributing an "unreadable" marker: the marker is
+    content-blind, so two different edits of an unreadable file would share
+    one fingerprint and be served each other's cached verdict
+    (WL-0MVPO9P610055UQ3).
     """
     path = base / relpath
     hasher.update(b"\0path\0" + relpath.encode("utf-8", "surrogateescape"))
@@ -220,7 +334,7 @@ def _update_with_path_content(
                 if child.is_dir() and not child.is_symlink():
                     continue
                 _update_with_path_content(
-                    hasher, base, child.relative_to(base).as_posix()
+                    hasher, base, child.relative_to(base).as_posix(), strict=strict
                 )
             return
         if path.is_file():
@@ -229,8 +343,29 @@ def _update_with_path_content(
                     hasher.update(chunk)
             return
         hasher.update(b"\0missing")
-    except OSError:
+    except OSError as exc:
+        if strict:
+            raise GitStateUnavailable(
+                f"cannot read the dirty path {path} to fingerprint it ({exc})"
+            ) from exc
         hasher.update(b"\0unreadable")
+
+
+def _fingerprint_for_cache(cwd: str) -> str | None:
+    """Return the fresh fingerprint for *cwd*, or None when indeterminate.
+
+    The cache never serves or stores a verdict without a fresh, complete
+    fingerprint: a degraded one cannot distinguish two dirty trees, so using
+    it would return one tree's result for another (WL-0MVPO9P610055UQ3).
+    """
+    try:
+        return compute_git_state(cwd, strict=True)
+    except GitStateUnavailable as exc:
+        LOG.warning(
+            "test cache bypassed: the git state cannot be fingerprinted (%s)",
+            exc,
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -375,12 +510,23 @@ def store(
     scope: str = "full",
     test_type: str = "full",
     interpreter: str = "",
+    git_state_at_start: str = "",
 ) -> Path:
     """Persist a run result, replacing any existing entry for the same key.
 
     Writes stdout/stderr first, then metadata last (atomic each); a partial
     write is therefore treated as corrupt by :func:`lookup` and degrades to a
     fresh run.
+
+    *git_state* is the fingerprint **the entry is keyed on**. Callers that
+    can serve the entry later (:func:`run_cached`) pass the *post-run* state,
+    because that is the state the next consumer observes; keying on the
+    pre-run state leaves a completed run unqueryable whenever transient churn
+    disappears while it runs (WL-0MVPO9P610055UQ3).
+
+    *git_state_at_start* optionally records the state the run started in. It
+    is informational metadata only — it never keys the entry — and differs
+    from *git_state* when the tree moved during the run.
 
     *scope* records whether the run covered the full suite (``"full"``,
     default — the only scope before scope-aware selection existed) or a
@@ -406,6 +552,7 @@ def store(
         "version": _CACHE_VERSION,
         "command": normalized,
         "git_state": git_state,
+        "git_state_at_start": git_state_at_start,
         "scope": scope,
         "test_type": test_type,
         "interpreter": interpreter,
@@ -478,6 +625,19 @@ def run_cached(
       stores the result, and returns it.
     - ``force=True`` bypasses lookup but still stores (refresh).
     - ``no_cache=True`` bypasses lookup AND storage (pure bypass).
+    - The stored entry is keyed on the **post-run** state — the state the
+      checkout is in once the run finishes, which is what the next consumer
+      (the next run's pre-check, ``query_cached()``, ``--summary``) observes.
+      Keying on the pre-run state made a completed run unqueryable whenever
+      transient churn disappeared while it ran: the ``missing`` summary
+      reported immediately after a green full-suite run
+      (WL-0MVPO9P610055UQ3). The pre-run state is recorded as
+      ``git_state_at_start`` metadata for diagnosis.
+    - When the git state cannot be fingerprinted (corrupt/locked index, git
+      timeout, unreadable dirty path) the cache is bypassed entirely: no
+      lookup, no store, a fresh execution. A degraded fingerprint would make
+      every dirty tree share one key and serve stale verdicts
+      (WL-0MVPO9P610055UQ3).
     - *scope* (default ``"full"``) is recorded in the stored metadata so
       read-only consumers can tell partial runs from full-suite evidence.
     - *test_type* (default ``"full"``) selects the typed-profile cache
@@ -485,17 +645,23 @@ def run_cached(
       populates the audit-accepted full-suite entry.
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
-    (epoch float), ``command`` (normalized), ``git_state``, ``scope``,
-    ``test_type``, ``interpreter`` (the concrete interpreter/executable that
-    ran pytest, empty for non-pytest commands) and ``cached`` (True when
-    served from cache).
+    (epoch float), ``command`` (normalized), ``git_state`` (the state the
+    entry is keyed on — empty when the cache was bypassed for an
+    indeterminate state), ``scope``, ``test_type``, ``interpreter`` (the
+    concrete interpreter/executable that ran pytest, empty for non-pytest
+    commands) and ``cached`` (True when served from cache).
     """
     cwd_path = Path(cwd or os.getcwd()).resolve()
     cwd_str = str(cwd_path)
-    git_state = compute_git_state(cwd_str)
 
-    if not force and not no_cache:
-        hit = lookup(command, git_state, cwd=cwd_str, ttl=ttl, test_type=test_type)
+    # ``no_cache`` never reads or writes the cache, so it needs no fingerprint
+    # (and must not fail when the tree cannot be fingerprinted).
+    git_state_before = None if no_cache else _fingerprint_for_cache(cwd_str)
+
+    if not force and git_state_before is not None:
+        hit = lookup(
+            command, git_state_before, cwd=cwd_str, ttl=ttl, test_type=test_type
+        )
         # A cached entry recorded under a different scope is not a valid hit
         # for this request (scope is stored in metadata; the cache key is the
         # command+state, so this only matters if command sets ever converge —
@@ -512,19 +678,29 @@ def run_cached(
     # (SA-0MVK154IE007OS3D AC2). Non-pytest commands record an empty string.
     interpreter = resolve_pytest_executable() if is_pytest_command(normalized) else ""
 
+    git_state = git_state_before or ""
     if not no_cache:
-        store(
-            normalized,
-            git_state,
-            cwd=cwd_str,
-            stdout=proc.stdout or "",
-            stderr=proc.stderr or "",
-            exit_code=proc.returncode,
-            completed_at=completed_at,
-            scope=scope,
-            test_type=test_type,
-            interpreter=interpreter,
-        )
+        # Key the entry on the state the run left behind: that is the state
+        # every later consumer computes, so a completed run is always
+        # queryable. The pre-run state is kept as metadata only — it never
+        # keys the entry, because transient churn present when a run starts
+        # can be gone by the time it finishes (WL-0MVPO9P610055UQ3).
+        git_state_after = _fingerprint_for_cache(cwd_str)
+        if git_state_after is not None:
+            git_state = git_state_after
+            store(
+                normalized,
+                git_state_after,
+                cwd=cwd_str,
+                stdout=proc.stdout or "",
+                stderr=proc.stderr or "",
+                exit_code=proc.returncode,
+                completed_at=completed_at,
+                scope=scope,
+                test_type=test_type,
+                interpreter=interpreter,
+                git_state_at_start=git_state_before or "",
+            )
 
     return {
         "stdout": proc.stdout or "",
@@ -553,9 +729,15 @@ def query_cached(
     *test_type*, or None on miss. Defaults to the ``full`` profile so the
     audit skill's full-suite verification is unchanged; read-only consumers
     must pass a non-``full`` *test_type* to inspect a typed profile.
+
+    An indeterminate git state is a miss, never a hit: the cache cannot prove
+    the entry was recorded for this tree, and a degraded fingerprint would
+    match every dirty tree (WL-0MVPO9P610055UQ3).
     """
     cwd_str = str(Path(cwd or os.getcwd()).resolve())
-    git_state = compute_git_state(cwd_str)
+    git_state = _fingerprint_for_cache(cwd_str)
+    if git_state is None:
+        return None
     return lookup(command, git_state, cwd=cwd_str, ttl=ttl, test_type=test_type)
 
 
@@ -587,6 +769,7 @@ def summary_lines(
 __all__ = [
     "DEFAULT_TTL_SECONDS",
     "FAILED_RUN_TTL_SECONDS",
+    "GitStateUnavailable",
     "cache_dir",
     "cache_key",
     "compute_git_state",

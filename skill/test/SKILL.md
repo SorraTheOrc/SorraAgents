@@ -132,6 +132,25 @@ execution-dependent ACs (SA-0MSIU5HFI0024D7W). Failed (non-zero-exit) runs use
 a short 5-minute TTL so transient infra failures are not re-served as current
 results (SA-0MSJELL44009XYIL).
 
+**Evidence runs must bypass the cache (`--no-cache`).** A cache hit is a
+*reused* verdict: nothing executed for the tree in front of you. Any run whose
+result is consumed as evidence — proving a RED witness fails before the fix and
+passes after it, or supplying the green full-suite run an audit, the implement
+finish gate or the pre-push gate relies on — must execute fresh:
+
+```bash
+python3 $(skill_path test)/scripts/run_tests.py --scope changed --no-cache --json
+python3 $(skill_path test)/scripts/run_tests.py --scope full --no-cache --json
+```
+
+The cache is defensive: it never serves a verdict for a git state it could not
+fingerprint (a failing/locked index, a leaked `GIT_DIR`, an unreadable dirty
+path) and it keys each entry on the state the run *left behind*, so a completed
+run is always queryable afterwards. It cannot know whether **you** need fresh
+evidence, though — that is what `--no-cache` is for. Cache-served runs are
+marked `[cached]` in non-JSON output and carry `cached: true` per suite in JSON
+(SA-0MSGN5OJ4002OZKY).
+
 **Scope-aware execution (SA-0MT6BYQHB008DOGC):** `run_tests.py --scope full|changed`
 — the FULL suite by default, or only the tests affected by changes since
 `--target-branch` (default `origin/dev`) via convention mapping + AST
