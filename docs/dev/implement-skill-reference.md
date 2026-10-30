@@ -710,30 +710,54 @@ verdicts per stage, own-churn list, final verdict). Regression pins:
 `skill/implement/tests/test_finish_no_diff_status.py` (must stay green — a
 clean finish is unaffected).
 
-## Single-owner main-checkout lock (WL-0MVPADZ1Z000FOSG AC5)
+## Single-owner per-repository lock (WL-0MVPADZ1Z000FOSG AC5, SA-0MVPZG3IQ009IJMO)
 
 `implement.py finish` serialises its main-checkout critical section (commit →
-fast-forward → push → worktree removal) with a **per-checkout exclusive
-advisory lock**: `<main-checkout>/.worklog/locks/main-checkout.lock`
-(`acquire_main_checkout_lock`). Concurrency contract:
+fast-forward → push → worktree removal → post-push parent-branch sync) with a
+**per-repository exclusive advisory lock**:
+`<main-checkout>/.worklog/locks/main-checkout.lock`. The mechanics live in the
+shared helper `skill/shared/repo_lock.py` (`RepoLock`, beside
+`process_semaphore.py` and the per-work-item `work_item_lock.py`), so the same
+lock also guards the adjacent window in `start` that moves the shared ref.
+Concurrency contract:
 
 - **One finish per main checkout.** Acquisition is a single non-blocking
-  `flock(LOCK_EX | LOCK_NB)` — no measurable latency when free, and no wait
-  when held: a second finish exits **non-zero** with a message naming the
-  holder (work item id, PID, ISO start time, repo root, host — recorded in the
-  lock file after acquisition) and **without modifying the checkout or the
+  `flock(LOCK_EX | LOCK_NB)` by default — no measurable latency when free, and
+  no wait when held: a second finish exits **non-zero** with a message naming
+  the holder (work item id, PID, ISO start time, repo root, host — recorded in
+  the lock file after acquisition) and **without modifying the checkout or the
   work item** (no status write, no comment). Re-run once the holder
   completes.
+- **Bounded wait, never a hang.** `IMPLEMENT_FINISH_LOCK_TIMEOUT` (seconds,
+  default `0` = fail fast) opts into waiting for a concurrent finish. The wait
+  is always bounded by that deadline; on expiry the refusal states the deadline
+  and still names the lock path, the holder and the recovery step. An
+  indefinite wait is rejected outright (`RepoLock.acquire(timeout=None)` raises
+  `ValueError`), so no code path can block forever.
 - **No stale locks are possible.** The lock is the kernel's flock on the lock
   file's open file description, so a killed holder (SIGKILL included) releases
-  it automatically — there is no PID bookkeeping to trust or clean up. The
-  lock is also released on every in-process exit path (success, `RuntimeError`
-  abort, escaping exception) via the `try/finally` around the critical
-  section.
+  it automatically — there is no PID bookkeeping to trust or clean up. Holder
+  metadata is written for refusal messages **only**; it never decides
+  ownership, so a lock file left behind by a crashed run cannot block anyone.
+  The lock is also released on every in-process exit path (success,
+  `RuntimeError` abort, escaping exception) via the `try/finally` around the
+  critical section.
+- **The adjacent `start` window is locked too.** `phase_start` refreshes the
+  parent branch before forking a worktree, and that refresh fast-forwards the
+  same shared local parent ref a finish moves. It takes the same lock
+  (`_sync_parent_branch_locked`), **fail-open**: it waits at most
+  `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then skips the refresh with
+  a warning naming the lock (`reason: "lock_held"`) — a start is never blocked
+  or failed by a concurrent finish, and the local branch remains a valid base.
+  The abort-path `_restore_repo_state` is deliberately unlocked: it runs in a
+  process that may already hold the lock, and a dying process releases the
+  lock itself.
 - **Per-checkout scope.** Finishes in different repositories on the same host
   are unaffected (the lock file lives inside each checkout).
 - **Observability.** `report["steps"]["main_checkout_lock"]` records the lock
-  path, whether it was acquired, when, and the holder description when refused.
+  path, whether it was acquired, when, the configured bounded wait and the
+  holder description when refused; `phase_start`'s
+  `report["steps"]["sync_parent_branch"]` carries the same under `lock`.
 - **Hygiene reporting.** `scripts/hygiene_check.sh` reports a held lock
   (`check_main_checkout_lock`) and any **tracked-file deletions** in the main
   checkout (`check_tracked_deletions`) in both human and `--json` output,
@@ -741,9 +765,13 @@ advisory lock**: `<main-checkout>/.worklog/locks/main-checkout.lock`
 
 The flock pattern mirrors `skill/shared/process_semaphore.py` (kernel-released
 locks, holder metadata for messages only). Regression pins:
+`skill/shared/tests/test_repo_lock.py` (bounded wait, timeout message,
+metadata-never-trusted, context-manager release),
 `skill/implement/tests/test_finish_main_checkout_lock.py` (contention, holder
 metadata, SIGKILL crash release, cross-checkout independence, `phase_finish`
-refusal/success, hygiene script JSON + human output).
+refusal/success, hygiene script JSON + human output) and
+`tests/test_implement_finish_concurrent_orphan.py` (dev-ref window scenarios,
+including the bounded-wait timeout message and the `start` refresh window).
 
 ### The main-checkout invariant these finish behaviours enforce
 

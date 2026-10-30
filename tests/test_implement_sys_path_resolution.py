@@ -106,6 +106,12 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
         _REPO_ROOT / "skill" / "shared" / "work_item_lock.py"
     ).read_text()
     (skill_pkg / "shared" / "work_item_lock.py").write_text(real_wil)
+    # Provide the per-repository lock module (SA-0MVPZG3IQ009IJMO) —
+    # implement.py imports RepoLock / release_repo_lock from it at module load.
+    real_rl = (
+        _REPO_ROOT / "skill" / "shared" / "repo_lock.py"
+    ).read_text()
+    (skill_pkg / "shared" / "repo_lock.py").write_text(real_rl)
     # Provide the test cache + runner modules (SA-0MSGN5OJ4002OZKY) —
     # implement.py's run_tests() routes through the cache at import time.
     real_tc = (_REPO_ROOT / "skill" / "test_cache.py").read_text()

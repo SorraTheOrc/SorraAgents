@@ -67,7 +67,6 @@ import re
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -95,6 +94,8 @@ from import_guard import guard_shared_import
 
 try:
     from shared.code_freeze import is_code_freeze_active
+    from shared.repo_lock import DEFAULT_LOCK_RELPATH as _REPO_LOCK_RELPATH
+    from shared.repo_lock import RepoLock, release_repo_lock
     from shared.skill_extensions import (
         SkillExtension,
         SkillExtensionError,
@@ -1977,115 +1978,100 @@ def _verify_main_checkout(
 #: Lock-file path relative to the main checkout root. One exclusive advisory
 #: ``flock`` holder per repository — two finishes on the same main checkout
 #: can never overlap (2026-10-26 incident: two concurrent finishes plus a
-#: full-scope test run on one shared checkout).
-MAIN_CHECKOUT_LOCK_RELPATH = os.path.join(".worklog", "locks", "main-checkout.lock")
+#: full-scope test run on one shared checkout). The mechanics live in the
+#: shared :mod:`shared.repo_lock` helper (SA-0MVPZG3IQ009IJMO) so the same
+#: lock also guards the adjacent parent-branch refresh window in
+#: :func:`phase_start`.
+MAIN_CHECKOUT_LOCK_RELPATH = _REPO_LOCK_RELPATH
+
+#: Bounded wait for the per-repository lock in ``finish`` (seconds). Default
+#: ``0`` = fail fast: a second finish refuses immediately with an actionable
+#: message naming the holder (AC3 allows fail-fast). Set to a positive value
+#: (env ``IMPLEMENT_FINISH_LOCK_TIMEOUT``) to wait that long for a concurrent
+#: finish instead — the wait is always bounded, never indefinite.
+DEFAULT_FINISH_LOCK_TIMEOUT = 0.0
+
+#: Bounded wait for the parent-branch refresh window in ``start`` (seconds).
+#: ``start`` must never be blocked by a concurrent finish: after this bound the
+#: refresh is skipped (fail-open) and the local branch is used as the base.
+DEFAULT_START_LOCK_TIMEOUT = 30.0
+
+ENV_FINISH_LOCK_TIMEOUT = "IMPLEMENT_FINISH_LOCK_TIMEOUT"
+ENV_START_LOCK_TIMEOUT = "IMPLEMENT_START_LOCK_TIMEOUT"
+
+
+def _resolve_lock_timeout(env_var: str, default: float) -> float:
+    """Resolve a bounded lock wait from the environment (fail-safe default)."""
+    raw = os.environ.get(env_var)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        LOG.warning(
+            "Ignoring invalid %s=%r (expected seconds); using %gs",
+            env_var, raw, default,
+        )
+        return default
+    if value < 0:
+        LOG.warning(
+            "Ignoring negative %s=%r; using %gs", env_var, raw, default,
+        )
+        return default
+    return value
+
+
+def _finish_lock_timeout() -> float:
+    """Bounded wait used by ``phase_finish`` for the main-checkout lock."""
+    return _resolve_lock_timeout(ENV_FINISH_LOCK_TIMEOUT, DEFAULT_FINISH_LOCK_TIMEOUT)
+
+
+def _start_lock_timeout() -> float:
+    """Bounded wait used by ``phase_start`` for the parent-branch refresh."""
+    return _resolve_lock_timeout(ENV_START_LOCK_TIMEOUT, DEFAULT_START_LOCK_TIMEOUT)
 
 
 def _main_checkout_lock_path(repo_root: str) -> Path:
     """Absolute path of the main-checkout finish lock file."""
-    return Path(repo_root) / MAIN_CHECKOUT_LOCK_RELPATH
-
-
-def _main_checkout_lock_holder(repo_root: str) -> dict[str, Any] | None:
-    """Read the holder metadata from the lock file (best-effort)."""
-    lock_path = _main_checkout_lock_path(repo_root)
-    try:
-        data = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _describe_lock_holder(holder: dict[str, Any] | None) -> str:
-    """Human-readable holder description for refusal messages.
-
-    Carries every metadata field available in the lock file (work item id,
-    PID, ISO start time, repo root, host) so the refusal names the concurrent
-    actor; degrades to a generic "unknown" when no metadata was written.
-    """
-    if not holder:
-        return "unknown (lock file present but no holder metadata)"
-    parts: list[str] = []
-    wid = holder.get("work_item_id")
-    parts.append(f"work item {wid}" if wid else "unknown work item")
-    if holder.get("pid"):
-        parts.append(f"pid {holder['pid']}")
-    if holder.get("started_at"):
-        parts.append(f"started {holder['started_at']}")
-    if holder.get("repo_root"):
-        parts.append(f"repo {holder['repo_root']}")
-    if holder.get("host"):
-        parts.append(f"host {holder['host']}")
-    return ", ".join(parts)
+    return RepoLock(repo_root, relpath=MAIN_CHECKOUT_LOCK_RELPATH).path
 
 
 def _release_main_checkout_lock(fd: int | None) -> None:
     """Release the held main-checkout lock. Idempotent (None/no-op)."""
-    if fd is None:
-        return
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except (OSError, AttributeError):
-        pass
-    try:
-        os.close(fd)
-    except OSError:
-        pass
+    release_repo_lock(fd)
 
 
 def acquire_main_checkout_lock(
     repo_root: str,
     work_item_id: str,
+    timeout: float = 0.0,
 ) -> tuple[int | None, str | None]:
-    """Take the exclusive per-checkout finish lock (non-blocking).
+    """Take the exclusive per-checkout lock (fail fast by default).
 
-    The lock is an advisory ``flock`` on
-    ``<main-checkout>/.worklog/locks/main-checkout.lock``, so it is released
-    by the kernel when the holder dies (SIGKILL included) — no stale-lock
-    bookkeeping exists to trust (WL-0MVPADZ1Z000FOSG AC4/AC5). Holder metadata
-    (work item id, PID, ISO start time, repo root, host) is written into the
-    lock file after acquisition for the refusal message only; a metadata write
-    failure never fails the acquisition.
+    Thin ``implement.py`` wrapper over :class:`shared.repo_lock.RepoLock`. The
+    lock is an advisory ``flock`` on
+    ``<main-checkout>/.worklog/locks/main-checkout.lock``, released by the
+    kernel when the holder dies (SIGKILL included) — no stale-lock bookkeeping
+    exists to trust (WL-0MVPADZ1Z000FOSG AC4/AC5). Holder metadata is written
+    into the lock file after acquisition for the refusal message only; it never
+    decides ownership and a metadata write failure never fails the acquisition.
 
     Args:
         repo_root: Absolute path to the main checkout.
-        work_item_id: The work item this finish run belongs to.
+        work_item_id: The work item this run belongs to (recorded in the
+            refusal message as the requester).
+        timeout: Bounded wait in seconds (``0`` = fail fast). A positive value
+            waits up to that deadline, then refuses with an actionable
+            timeout message — never an indefinite hang.
 
     Returns:
         ``(fd, None)`` on success (caller must release via
-        :func:`_release_main_checkout_lock`), or ``(None, description)`` with a
-        human-readable holder description when the lock is already held.
+        :func:`_release_main_checkout_lock`), or ``(None, message)`` with a
+        complete, actionable refusal message when the lock is held.
     """
-    lock_path = _main_checkout_lock_path(repo_root)
-    try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return None, f"cannot create lock directory {lock_path.parent}: {exc}"
-    try:
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError as exc:
-        return None, f"cannot open lock file {lock_path}: {exc}"
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, AttributeError) as exc:
-        os.close(fd)
-        if isinstance(exc, OSError) and exc.errno in (errno.EACCES, errno.EAGAIN):
-            return None, _describe_lock_holder(_main_checkout_lock_holder(repo_root))
-        return None, f"flock failed on {lock_path}: {exc}"
-    holder = {
-        "work_item_id": work_item_id,
-        "pid": os.getpid(),
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "repo_root": repo_root,
-        "host": socket.gethostname(),
-    }
-    try:
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, json.dumps(holder, indent=2).encode("utf-8"))
-    except OSError:  # holder metadata is best-effort; the flock is the lock
-        pass
-    return fd, None
+    return RepoLock(repo_root, relpath=MAIN_CHECKOUT_LOCK_RELPATH).acquire(
+        work_item_id, timeout=timeout
+    )
 
 
 def git_worktree_add(
@@ -2738,6 +2724,12 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
 def _restore_repo_state(repo_root: str) -> None:
     """Restore the repo to the dev branch.
 
+    Deliberately **outside** the per-repository lock: this runs on the abort
+    path (signal handler / crash cleanup), where the process may already hold
+    the lock — a second ``flock`` on a new descriptor would fail against its
+    own hold and skip the restore. A dying process releases the lock itself
+    (kernel-guaranteed), so no other run can be interleaving at this point.
+
     Args:
         repo_root: Path to the repo root.
     """
@@ -2897,6 +2889,73 @@ def _sync_parent_branch(
 
     result["method"] = "synced"
     LOG.info("Synced parent branch %s to origin/%s", parent_branch, parent_branch)
+    return result
+
+
+def _sync_parent_branch_locked(
+    repo_root: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    work_item_id: str = "",
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Sync the local parent branch while holding the per-repository lock.
+
+    ``phase_start`` refreshes the parent branch before forking a worktree, and
+    that refresh fast-forwards the **shared** local parent ref — the very ref a
+    concurrent ``finish`` moves inside its locked commit → fast-forward → push
+    → sync window. Taking the same per-repository lock keeps the two windows
+    from interleaving (SA-0MVPZG3IQ009IJMO): a refresh that ran between a
+    finish's local fast-forward and its push could move the shared ref and make
+    the finish's own fast-forward fail, or leave the shared ref pointing at an
+    unpublished commit.
+
+    **Fail-open by design.** ``start`` must never be blocked or failed by a
+    concurrent finish, so a held lock is waited on only up to *timeout*
+    (default :data:`DEFAULT_START_LOCK_TIMEOUT`, env
+    ``IMPLEMENT_START_LOCK_TIMEOUT``) and then the refresh is skipped with a
+    logged warning — the local branch is still a perfectly usable base.
+
+    Args:
+        repo_root: Path to the main checkout (where the shared ref lives).
+        parent_branch: Parent branch to sync (default ``dev``).
+        work_item_id: Work item this run belongs to (named in refusal text).
+        timeout: Bounded wait for the lock; ``None`` resolves the default.
+
+    Returns:
+        The :func:`_sync_parent_branch` result, plus a ``lock`` sub-dict
+        describing the acquisition. On a held lock: ``method="skipped"``,
+        ``success=True``, ``reason="lock_held"``.
+    """
+    if timeout is None:
+        timeout = _start_lock_timeout()
+    lock_fd, refusal = acquire_main_checkout_lock(
+        repo_root, work_item_id, timeout=timeout
+    )
+    lock_report = {
+        "lock_path": str(_main_checkout_lock_path(repo_root)),
+        "acquired": lock_fd is not None,
+        "timeout_seconds": timeout,
+        "holder": refusal if lock_fd is None else None,
+    }
+    if lock_fd is None:
+        result: dict[str, Any] = {
+            "method": "skipped",
+            "success": True,
+            "reason": "lock_held",
+            "lock": lock_report,
+            "warning": (
+                f"Skipped refreshing parent branch {parent_branch}: a "
+                f"concurrent run holds the repository lock "
+                f"({lock_report['lock_path']}). {refusal}"
+            ),
+        }
+        LOG.info("%s", result["warning"])
+        return result
+    try:
+        result = _sync_parent_branch(repo_root, parent_branch)
+    finally:
+        _release_main_checkout_lock(lock_fd)
+    result["lock"] = lock_report
     return result
 
 
@@ -4973,9 +5032,15 @@ def _phase_start_locked(
     # when another actor pushed to origin/<parent> between the last
     # finish and this start. Degrades gracefully (dirty/offline/diverged
     # → fall back to the local branch; never fails the start phase).
+    # The refresh fast-forwards the SHARED local parent ref, so it takes the
+    # same per-repository lock a concurrent ``finish`` holds
+    # (SA-0MVPZG3IQ009IJMO) — bounded, fail-open: a held lock skips the
+    # refresh rather than blocking or failing the start.
     repo_root = _get_repo_root() or str(Path.cwd().resolve())
     LOG.info("Refreshing parent branch %s from origin...", parent_branch)
-    refresh_result = _sync_parent_branch(repo_root, parent_branch)
+    refresh_result = _sync_parent_branch_locked(
+        repo_root, parent_branch, work_item_id
+    )
     report["steps"] = report.get("steps", {})
     report["steps"]["sync_parent_branch"] = refresh_result
     if refresh_result.get("warning"):
@@ -5525,11 +5590,13 @@ def phase_finish(
     # ── Step 3c: Single-owner main-checkout lock (WL-0MVPADZ1Z000FOSG AC5) ─
     # Everything from the commit onwards operates on the main checkout, so
     # exactly one finish per checkout may hold this critical section at a
-    # time. The lock is a non-blocking advisory flock — no measurable latency
-    # when free, kernel-released when the holder dies, and recorded in the
-    # report for observability.
-    lock_fd, lock_holder_description = acquire_main_checkout_lock(
-        repo_root, work_item_id
+    # time. The lock is an advisory flock — no measurable latency when free,
+    # kernel-released when the holder dies, and recorded in the report for
+    # observability. The wait is bounded by ``IMPLEMENT_FINISH_LOCK_TIMEOUT``
+    # (default 0 = fail fast), so a concurrent finish never hangs this one.
+    lock_timeout = _finish_lock_timeout()
+    lock_fd, lock_refusal = acquire_main_checkout_lock(
+        repo_root, work_item_id, timeout=lock_timeout
     )
     report["steps"]["main_checkout_lock"] = {
         "lock_path": str(_main_checkout_lock_path(repo_root)),
@@ -5537,16 +5604,18 @@ def phase_finish(
         "acquired_at": (
             datetime.now(timezone.utc).isoformat() if lock_fd is not None else None
         ),
-        "holder": lock_holder_description,
+        "timeout_seconds": lock_timeout,
+        "holder": lock_refusal if lock_fd is None else None,
     }
     if lock_fd is None:
-        msg = (
-            f"Another finish holds the main-checkout lock "
+        # The helper's refusal is already actionable: it names the lock path,
+        # the holder and the recovery step, and states the bounded wait that
+        # expired when a timeout was configured.
+        msg = lock_refusal or (
+            f"Another run holds the main-checkout lock "
             f"({report['steps']['main_checkout_lock']['lock_path']}). "
-            f"Holder: {lock_holder_description}. Aborting without modifying "
-            f"the checkout or the work item — two finishes on the same main "
-            f"checkout must never overlap. Re-run finish once the holder "
-            f"completes."
+            f"Aborting without modifying the checkout or the work item — "
+            f"re-run finish once the holder completes."
         )
         report["success"] = False
         report["message"] = msg

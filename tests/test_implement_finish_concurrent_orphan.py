@@ -27,7 +27,10 @@ regression contract the sibling features must satisfy —
 
 - **Lock** (SA-0MVPZG3IQ009IJMO): the shared ``dev`` window is single-owner; a
   concurrent ``finish`` fails fast with an actionable, holder-naming message
-  and a lock file left by a crashed run never blocks a later ``finish``.
+  (or waits a bounded, configured time and then times out actionably) and a
+  lock file left by a crashed run never blocks a later ``finish``. The
+  adjacent ``start`` parent-branch refresh — which moves the same shared ref —
+  takes the same lock and skips the refresh (fail-open) when it is held.
 - **Verified sync + ancestry** (SA-0MVPZG7A0000N66U): a failed push restores
   local ``dev`` to ``refs/remotes/origin/dev``, and a ``finish`` whose commit
   did not reach ``origin/dev`` fails loudly instead of reporting success.
@@ -54,6 +57,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -604,3 +608,138 @@ def test_finish_releases_the_lock_after_a_failed_push(
         )
     finally:
         implement_mod._release_main_checkout_lock(fd)
+
+
+def test_finish_lock_wait_is_bounded_and_times_out_actionably(
+    implement_mod, sandbox, monkeypatch
+):
+    """A configured wait is bounded and its expiry is actionable.
+
+    Contract (parent AC3, SA-0MVPZG3IQ009IJMO): the wait is always bounded by
+    a deadline — never an indefinite hang — and the expiry names the lock, the
+    holder and how to proceed, leaving the shared refs and the uncommitted
+    work untouched. With no timeout configured ``finish`` fails fast instead
+    (covered above); here ``IMPLEMENT_FINISH_LOCK_TIMEOUT`` opts into waiting.
+    """
+    work = sandbox["work"]
+    wt_a = sandbox["wt_a"]
+    lock_path = implement_mod._main_checkout_lock_path(str(work))
+    monkeypatch.setenv("IMPLEMENT_FINISH_LOCK_TIMEOUT", "0.3")
+
+    holding_fd, holder = implement_mod.acquire_main_checkout_lock(
+        str(work), _ITEM_A
+    )
+    assert holding_fd is not None, holder
+    try:
+        dev_before = _local_dev(sandbox)
+        origin_before = _origin_dev(sandbox)
+
+        (wt_a / "feature_a.txt").write_text("a\n", encoding="utf-8")
+        started = time.monotonic()
+        report = _run_finish(implement_mod, sandbox, wt_a, _ITEM_A)
+        elapsed = time.monotonic() - started
+
+        assert report["success"] is False, report
+        assert elapsed < 60.0, (
+            f"the lock wait must be bounded by the configured timeout; "
+            f"took {elapsed}s"
+        )
+        message = report["message"]
+        assert "Timed out" in message, message
+        assert str(lock_path) in message, message
+        assert _ITEM_A in message, message
+        assert "concurrent finish" in message, message
+        assert "re-run" in message.lower(), message
+
+        lock_step = report["steps"]["main_checkout_lock"]
+        assert lock_step["acquired"] is False
+        assert lock_step["timeout_seconds"] == pytest.approx(0.3)
+
+        # Nothing moved: no commit, no ref update, work still uncommitted.
+        assert _local_dev(sandbox) == dev_before
+        assert _origin_dev(sandbox) == origin_before
+        assert (wt_a / "feature_a.txt").exists()
+    finally:
+        implement_mod._release_main_checkout_lock(holding_fd)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5 — the adjacent parent-branch refresh window (phase_start)
+# ---------------------------------------------------------------------------
+
+
+def _advance_origin_dev(sandbox: dict, filename: str) -> str:
+    """Push a new commit to ``origin/dev`` from a second clone.
+
+    Leaves the sandbox's main checkout with a local ``dev`` that is *behind*
+    ``origin/dev`` — the state a ``start`` refresh is meant to correct.
+    """
+    other = gs.run_git(sandbox["tmp"], ["clone", "-q", str(sandbox["remote"]),
+                                        str(sandbox["tmp"] / "other")])
+    assert other.returncode == 0, other.stderr
+    other_repo = sandbox["tmp"] / "other"
+    gs.run_git(other_repo, ["checkout", "-q", "dev"], check=True)
+    (other_repo / filename).write_text("upstream\n", encoding="utf-8")
+    commit = gs.commit_all(other_repo, f"upstream {filename}")
+    gs.run_git(other_repo, ["push", "-q", "origin", "dev"], check=True)
+    return commit
+
+
+def test_start_refresh_waits_for_the_finish_lock_then_syncs(
+    implement_mod, sandbox, monkeypatch
+):
+    """The start-window refresh takes the lock and syncs once it is free.
+
+    The parent-branch refresh in ``phase_start`` fast-forwards the same shared
+    local ``dev`` ref a concurrent ``finish`` moves, so it must hold the same
+    per-repository lock (parent AC3's "adjacent window" clause). With the lock
+    free it syncs local ``dev`` to ``origin/dev`` as before.
+    """
+    work = sandbox["work"]
+    upstream = _advance_origin_dev(sandbox, "upstream.txt")
+
+    result = implement_mod._sync_parent_branch_locked(
+        str(work), "dev", _ITEM_A, timeout=5.0
+    )
+
+    assert result["success"] is True, result
+    assert result["method"] == "synced", result
+    assert result["lock"]["acquired"] is True
+    assert _rev(work, "refs/heads/dev") == upstream
+    assert _local_dev(sandbox) == _origin_dev(sandbox)
+
+
+def test_start_refresh_skips_when_the_finish_lock_is_held(
+    implement_mod, sandbox
+):
+    """A held finish lock never blocks or fails the start refresh (fail-open).
+
+    ``start`` must stay usable while a finish runs: the refresh waits only up
+    to its bound, then skips with a warning naming the lock and leaves the
+    shared ref alone (the local branch is still a valid base).
+    """
+    work = sandbox["work"]
+    _advance_origin_dev(sandbox, "upstream.txt")
+    lock_path = implement_mod._main_checkout_lock_path(str(work))
+    dev_before = _local_dev(sandbox)
+
+    holding_fd, holder = implement_mod.acquire_main_checkout_lock(
+        str(work), _ITEM_B
+    )
+    assert holding_fd is not None, holder
+    try:
+        result = implement_mod._sync_parent_branch_locked(
+            str(work), "dev", _ITEM_A, timeout=0.2
+        )
+    finally:
+        implement_mod._release_main_checkout_lock(holding_fd)
+
+    assert result["success"] is True, result
+    assert result["method"] == "skipped", result
+    assert result["reason"] == "lock_held", result
+    assert result["lock"]["acquired"] is False
+    assert str(lock_path) in result["warning"], result["warning"]
+    assert _ITEM_B in result["warning"], result["warning"]
+    assert _local_dev(sandbox) == dev_before, (
+        "a skipped refresh must not move the shared parent ref"
+    )
