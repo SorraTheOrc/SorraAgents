@@ -253,3 +253,48 @@ test('ship skill: reference docs mirror the release work-item exemption', () => 
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// 13. Content-freshness contract mirrored in both ship references
+//     (SA-0MVTU2643004QTQN, parent AC5/AC6)
+// ---------------------------------------------------------------------------
+test('ship skill: reference docs state the content-freshness contract', () => {
+  const paths = [
+    join(REPO_ROOT, 'docs', 'dev', 'ship-skill-reference.md'),
+    join(REPO_ROOT, 'skill', 'ship', 'docs', 'dev', 'ship-skill-reference.md'),
+  ];
+
+  for (const path of paths) {
+    const plain = stripEmphasis(readFileSync(path, 'utf-8')).replace(/\s+/g, ' ');
+
+    // (i) A content-fresh audit is trusted even when updatedAt moved after it.
+    assert.ok(
+      plain.includes('content-fresh audits are trusted regardless of'),
+      `${path} should state that content-fresh audits are trusted regardless of updatedAt`,
+    );
+    // (ii) A passing-but-time-stale audit from in-gate remediation must not block.
+    assert.ok(
+      plain.includes('passing-but-time-stale audit must not block'),
+      `${path} should state that an in-gate-remediated passing-but-time-stale audit must not block`,
+    );
+    // The documented probe invocation is the one the JS call site builds.
+    assert.ok(
+      plain.includes('check-freshness <id> --json'),
+      `${path} should document "check-freshness <id> --json" as the supported probe`,
+    );
+  }
+});
+
+test('ship skill: audit reference documents --json as accepted for check-freshness', () => {
+  const path = join(REPO_ROOT, 'docs', 'dev', 'audit-skill-reference.md');
+  const content = readFileSync(path, 'utf-8');
+
+  assert.ok(
+    content.includes('check-freshness <id> --json'),
+    'audit reference should document the probe invocation with --json',
+  );
+  assert.ok(
+    content.includes('accepted for compatibility'),
+    'audit reference should state that --json is accepted for compatibility',
+  );
+});

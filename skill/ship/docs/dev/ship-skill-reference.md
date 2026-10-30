@@ -201,6 +201,23 @@ fingerprint-less items never spawn the runner. Legacy unversioned reports
 fingerprints were computed with superseded formulas and cannot be recomputed,
 so they fall back to the time gate exactly like fingerprint-less audits.
 
+**Content-freshness contract (SA-0MVTU2643004QTQN):** content-fresh audits are
+trusted regardless of `updatedAt` — when the stored v2 content fingerprint
+still matches the work item, the time gate never overrides that verdict, so a
+`wl sync`-moved `updatedAt` can never force a re-audit of unchanged content.
+The probe invocation is `audit_runner.py check-freshness <id> --json`; the
+runner accepts `--json` (its output is already a single JSON object), and the
+command string built by `queryContentFreshness()` is pinned to that accepted
+argument shape by tests on both sides. In-gate remediation inherits the same
+contract: when `audit_runner.py issue <id>` short-circuits on a content-fresh
+audit and leaves a passing-but-time-stale verdict, the shared
+`attemptAuditRemediation()` re-queries content freshness and reports the item
+as passing (naming the content-fresh basis) — a **passing-but-time-stale audit
+must not block** the release. Only a content-changed or unconfirmable audit
+blocks, and its reason names the real condition (`time-stale but content
+changed`) plus the `audit_runner.py issue <id> --force` remedy. No blocking
+entry is ever emitted with the reason `Ready to close`.
+
 ### Step 3.7: Final validation sweep (exit 12)
 
 The final validation sweep (`check-final-validation.js`, SA-0MTMSPKEX003JGIX,

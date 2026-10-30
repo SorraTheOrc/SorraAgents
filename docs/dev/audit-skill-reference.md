@@ -289,6 +289,13 @@ host audit slot. A lookup failure is reported as ``fresh: false`` with a
 time gate. This lets the ship gates treat a time-stale but content-unchanged
 audit as fresh instead of spending the release window re-auditing it.
 
+The ``--json`` flag is **accepted for compatibility** (SA-0MVTU2268007BBYO):
+the probe always prints a single JSON object, so the flag is parsed but has no
+effect on the output. It exists because the ship gates
+(``queryContentFreshness()``) and the documentation already invoke
+``check-freshness <id> --json`` — accepting it keeps the CLI in sync with its
+callers instead of failing with ``unrecognized arguments: --json``.
+
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). Children use the **same simplified item-data-only fingerprint**: a child whose stored audit carries an unchanged v2 fingerprint AND a parseable verdict is reused — its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
 
 ## Re-audit coordination check
