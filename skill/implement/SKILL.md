@@ -818,6 +818,26 @@ Guards (deterministic, in `phase_parent`):
   `coordination_blockers` (parent/leaf report) or `external_blockers`
   (per-child classification).
 - **Terminal children are never re-implemented** (skipped, reported).
+- **`do-not-delegate` children are never auto-started** — a child tagged
+  `do-not-delegate` (matched case- and whitespace-insensitively; a missing or
+  `None` `tags` field is simply unguarded) classifies as
+  `skip-do-not-delegate`. `phase_parent` neither claims it, nor creates a
+  worktree for it, nor spawns a session for it; it records
+  `action: "skipped-do-not-delegate"` in `children_processed` and lists the
+  ids in the additive `guarded_children` report field, then continues with
+  the next startable sibling. Guarded ≠ terminal: the child still counts as
+  pending, so the parent is **never** advanced past it, and when only guarded
+  children remain the waiting message names them and the tag (never the
+  dependency-blocked wording) and no `next_child` is reported — a re-run is
+  idempotent (no claim, no worktree, no status change, same report).
+  `phase_drive` spawns no session for such a child and forwards
+  `guarded_children`. This mirrors `wl delegate`'s own guard rail (it refuses
+  a tagged item without `--force`); naming the child explicitly
+  (`implement.py start|finish|drive <child>`) is the documented override and
+  is unaffected — only automatic selection inside parent recursion is gated.
+  Terminal and in-progress tagged children keep their previous
+  classification, so an operator's manual work is still finished, never
+  re-started (SA-0MUWNKUIU007N876).
 - **Held children are never raced** — a child whose per-work-item lock is held
   by another live session is reported as `skipped-held` (with `held_by`) and no
   second session is started; the phase stops cleanly and can be re-run once the
@@ -836,8 +856,8 @@ Guards (deterministic, in `phase_parent`):
   `blocked_by` payload) — cross-project blockers stay coordination notes and
   never gate.
 - **No premature parent advance** — if any non-terminal child remains
-  (in-progress elsewhere or blocked), the parent is not advanced; the phase
-  reports waiting instead.
+  (in-progress elsewhere, guarded by `do-not-delegate`, or blocked), the
+  parent is not advanced; the phase reports waiting instead.
 - **Abort/failure** in a child resets THAT child to `open` (StatusLifecycle
   abort semantics) and stops the chain with a report of what completed and
   what failed; already-completed siblings are not regressed.

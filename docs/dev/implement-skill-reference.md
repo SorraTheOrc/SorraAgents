@@ -1078,3 +1078,93 @@ from `assignee`.
   reports) and `skill/implement/tests/test_drive_child_lock.py` (two concurrent
   subprocesses: exactly one acquires, the loser writes nothing and the winner's
   files are not diverged).
+
+## The `do-not-delegate` guard in parent recursion (SA-0MUWNKUIU007N876)
+
+`wl delegate` already refuses to hand a `do-not-delegate`-tagged item to an
+automated agent without `--force`. Automatic parent recursion
+(`implement.py parent` / `implement.py drive`) is the same delegation, so a
+tagged child is **guarded**: it is reported and skipped instead of being
+claimed, worktree'd and started on every dispatch cycle (the livelock this
+fixes — the epic re-attempted the guarded child forever and never reached its
+genuinely startable siblings).
+
+### Classification
+
+`_classify_child()` returns a dedicated `skip-do-not-delegate` for a
+non-terminal child carrying the tag, matched by `_has_do_not_delegate_tag()`:
+
+- case- and whitespace-insensitive (`" Do-Not-Delegate "` matches);
+- safe against a missing or `None` `tags` field (a child with no `tags` key is
+  simply unguarded — never an exception);
+- a scalar `tags` value is treated as a single tag rather than iterated
+  character-wise (defensive; the documented `wl show --children` shape is an
+  array);
+- reads the `tags` already returned by `wl show --children`, so the guard adds
+  **no** `wl` subprocess and no schema change.
+
+Precedence is deliberate, as with every other classification rule here:
+
+| Order | Class | Why |
+|---|---|---|
+| 1 | `skip-terminal` | A completed/tagged item keeps `skip-terminal`; the tag is present on many finished items and must never be re-reported as guarded. |
+| 2 | `skipped-held` | A live lock is a fact about a running process; an explicit session owns the child. |
+| 3 | `skip-in-progress` | No behaviour change: an operator's manual work on a tagged child is still finished, never re-started. |
+| 4 | `skip-do-not-delegate` | Only automatic *selection* of an otherwise startable child changes. |
+| 5 | `implement` | Unchanged. |
+
+`_next_child_to_implement()` skips the guarded class exactly like a terminal
+one — but a guarded child is **not** terminal, so it never unblocks a sibling
+that depends on it (`_next_child_to_implement` still returns `None` in that
+shape).
+
+### Report contract
+
+`phase_parent()` adds guarded children to the pending set (so the parent is
+never advanced past them) and records, additively:
+
+| Field | Value |
+|---|---|
+| `children_processed[].action` | `"skipped-do-not-delegate"` (with `id`, `title`, `status`) |
+| `guarded_children` | Sorted-by-emission list of the guarded child ids; present on a mixed report (started sibling) and on the all-guarded waiting report |
+| `message` | On the waiting path, names each guarded child **and** the tag, plus the explicit-override hint — never the dependency-`blocked` / held wording |
+
+`phase_drive()` spawns no session for a guarded child (it never becomes
+`next_child`), forwards `guarded_children`, and states the guard explicitly
+rather than stopping with the misleading "blocked or held" wording. It appends
+the explicit sentence itself if a forwarded parent message does not already
+name the tag.
+
+Existing fields keep their meaning: `blocked_children` lists only
+dependency-blocked / held children, `next_child` only ever names a child that
+may actually be started.
+
+### Guarded ≠ terminal, and idempotence
+
+- A guarded child is pending, not done: the parent is not advanced to
+  `completed`/`in_review` while it is the only non-terminal child remaining.
+- Re-running `parent` (or `drive`) is idempotent for an all-guarded epic: no
+  claim, no worktree, no status/assignee mutation, no comment, identical
+  report.
+- An already-terminal tagged child is never re-reported as guarded (see the
+  precedence table).
+
+### Explicit override is unchanged
+
+Only automatic selection inside parent recursion is gated. `implement.py
+start <child>`, `finish <child>` and `drive <child>` on a `do-not-delegate`
+item behave exactly as before — `phase_start` does not consult the tag at all.
+That mirrors `wl delegate --force`: naming the item explicitly is the
+documented override.
+
+### Tests
+
+`skill/implement/tests/test_phase_parent_do_not_delegate.py` pins the
+classifier (guarded / unguarded / case-and-whitespace variants / missing,
+`None` and scalar `tags` / terminal and in-progress precedence),
+`_next_child_to_implement` (lowest-`sortIndex` guarded child skipped, all
+guarded → `None`, guarded child never unblocks a dependent), the mixed parent
+shape that broke (guarded child first, sibling still started, guarded child
+reported and neither claimed nor worktree'd), the all-guarded parent (no
+advance, distinct message, idempotent re-run) and `drive` (no session spawned,
+`guarded_children` surfaced, startable sibling still driven).

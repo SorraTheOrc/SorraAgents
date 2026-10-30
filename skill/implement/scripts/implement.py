@@ -212,6 +212,17 @@ WORKTREE_ENV = "IMPLEMENT_WORKTREE_PATH"
 #: holder (another driver/session). The refused party performs no work and
 #: reports the holder identity instead of racing it (SA-0MVQ5AXLF002PAQ3).
 ACTION_SKIPPED_HELD = "skipped-held"
+#: Tag marking a work item that must never be handed to an unattended agent.
+#: ``wl delegate`` refuses such an item without ``--force``; automatic parent
+#: recursion (``parent``/``drive``) is the same delegation, so a tagged child
+#: is *guarded* — reported, never claimed, never given a worktree
+#: (SA-0MUWNKUIU007N876). Naming the child explicitly is the documented
+#: override and is unaffected.
+DO_NOT_DELEGATE_TAG = "do-not-delegate"
+#: :func:`_classify_child` result for a ``do-not-delegate`` tagged child.
+ACTION_SKIP_DO_NOT_DELEGATE = "skip-do-not-delegate"
+#: ``children_processed`` action recorded for a guarded child.
+ACTION_SKIPPED_DO_NOT_DELEGATE = "skipped-do-not-delegate"
 
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
@@ -1335,6 +1346,34 @@ def _outbound_gate(
     }
 
 
+def _has_do_not_delegate_tag(child: dict[str, Any]) -> bool:
+    """Whether *child* carries the ``do-not-delegate`` tag.
+
+    Matching is case- and whitespace-insensitive and never raises: the tags
+    come straight from ``wl show --children``, so a child dict may omit the
+    field entirely or carry ``None``. A scalar ``tags`` value (defensive — the
+    documented shape is an array) is treated as a single tag rather than
+    iterated character-wise.
+
+    Args:
+        child: A child work-item dict from ``wl show --children``.
+
+    Returns:
+        True when the child must not be delegated to an unattended agent.
+    """
+    tags = child.get("tags")
+    if tags is None:
+        return False
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, (list, tuple, set, frozenset)):
+        return False
+    return any(
+        isinstance(tag, str) and tag.strip().lower() == DO_NOT_DELEGATE_TAG
+        for tag in tags
+    )
+
+
 def _classify_child(child: dict[str, Any]) -> str:
     """Classify a child for the parent-recursion plan.
 
@@ -1343,12 +1382,20 @@ def _classify_child(child: dict[str, Any]) -> str:
       - ``"skipped-held"`` — a live holder owns the child's per-work-item
         lock (another driver/session); reported, never raced.
       - ``"skip-in-progress"`` — claimed by another agent; reported, not clobbered.
+      - ``"skip-do-not-delegate"`` — tagged :data:`DO_NOT_DELEGATE_TAG`, so
+        automatic parent recursion must never start it; reported as guarded
+        (SA-0MUWNKUIU007N876).
       - ``"implement"`` — the standard workflow should run on this child.
 
     Precedence is deliberate: a terminal child is never re-implemented (even
     with a stale lock file lying around), and a live holder outranks the
     status-based ``in-progress`` guess because it is a fact about a running
-    process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3).
+    process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3). The
+    ``do-not-delegate`` guard is checked **last**, immediately before
+    ``"implement"``, so terminal and in-progress children keep exactly their
+    previous classification (an operator's manual work on a tagged child is
+    still finished, never re-started) — only automatic *selection* of an
+    otherwise startable child changes.
 
     Args:
         child: A child work-item dict from ``wl show --children``.
@@ -1363,6 +1410,8 @@ def _classify_child(child: dict[str, Any]) -> str:
         return ACTION_SKIPPED_HELD
     if status in ("in-progress", "in_progress"):
         return "skip-in-progress"
+    if _has_do_not_delegate_tag(child):
+        return ACTION_SKIP_DO_NOT_DELEGATE
     return "implement"
 
 
@@ -1441,9 +1490,12 @@ def _next_child_to_implement(
 ) -> dict[str, Any] | None:
     """Return the next child to run through the standard implement workflow.
 
-    Children already terminal or in progress elsewhere are skipped
-    (AC-4/AC-7). The *children* argument must already be in dependency
-    order (see :func:`_resolve_implementation_order`). A child is startable
+    Children already terminal, in progress elsewhere or guarded by the
+    ``do-not-delegate`` tag are skipped (AC-4/AC-7,
+    SA-0MUWNKUIU007N876 — a guarded child is skipped exactly like a terminal
+    one, but it is *not* terminal and so never unblocks a dependent). The
+    *children* argument must already be in dependency order (see
+    :func:`_resolve_implementation_order`). A child is startable
     only when every in-chain blocker (a blocker that is also one of these
     children) is already terminal — a blocked child is never implemented
     before its blockers (AC-2). Independent siblings of an in-progress
@@ -1456,8 +1508,8 @@ def _next_child_to_implement(
 
     Returns:
         The next child dict, or None when no child is startable (every
-        remaining child is terminal, in progress elsewhere, or blocked by a
-        non-terminal sibling).
+        remaining child is terminal, in progress elsewhere, guarded by
+        ``do-not-delegate``, or blocked by a non-terminal sibling).
     """
     blockers_map = blockers_map or {}
     child_ids = {str(c.get("id")) for c in children}
@@ -1474,6 +1526,8 @@ def _next_child_to_implement(
             continue  # a live holder owns it; never a second session
         if action == "skip-in-progress":
             continue  # never clobber another agent's claim
+        if action == ACTION_SKIP_DO_NOT_DELEGATE:
+            continue  # guarded: never delegated to an unattended agent
         cid = str(child.get("id", ""))
         in_chain_blockers = [
             str(b.get("id"))
@@ -7227,9 +7281,12 @@ def phase_parent(
        are reported as coordination notes.
     5. Classify children: terminal → skip; a live lock holder →
        ``skipped-held`` (report the holder and stop cleanly); in_progress
-       elsewhere → skip+report; blocked by a non-terminal sibling or by a
-       same-project item outside the epic → not startable (reported);
-       otherwise → implementable.
+       elsewhere → skip+report; tagged ``do-not-delegate`` → guarded
+       (``skipped-do-not-delegate``: never claimed, never worktreed, never
+       spawned — reported in ``guarded_children`` and counted as pending so
+       the parent is never advanced past it); blocked by a non-terminal
+       sibling or by a same-project item outside the epic → not startable
+       (reported); otherwise → implementable.
     6. All children terminal → advance the parent to ``completed``/``in_review``
        (existing Step 5.1 advancement retained) and comment a per-child summary.
     7. Otherwise → start the next startable child (claim + worktree via
@@ -7256,6 +7313,12 @@ def phase_parent(
         report carries ``blocked: true``, ``parent_blocked_by`` (blocker ids
         and statuses), ``parent_blocked_reason`` and no ``next_child`` /
         ``parent_advanced`` — a soft wait, not a failure (SA-0MVS1QS9J009DGPT).
+        ``guarded_children`` lists the non-terminal children skipped because
+        they carry the ``do-not-delegate`` tag; such a child appears in
+        ``children_processed`` with ``action: "skipped-do-not-delegate"`` and
+        is never claimable, worktree-able or spawnable by this phase — naming
+        it explicitly (``start``/``drive``) is the documented override
+        (SA-0MUWNKUIU007N876).
     """
     report: dict[str, Any] = {
         "phase": "parent",
@@ -7483,6 +7546,7 @@ def phase_parent(
     }
     pending_ids: list[str] = []
     blocked_ids: list[str] = []
+    guarded_ids: list[str] = []
 
     def _in_chain_blockers(child_id: str) -> list[str]:
         return [
@@ -7506,6 +7570,11 @@ def phase_parent(
         report["branch"] = branch
         report["message"] = message
         report["children_processed"] = child_results
+        if guarded_ids:
+            # Surface the guarded children alongside the started sibling so
+            # an operator sees why the epic will stop here
+            # (SA-0MUWNKUIU007N876).
+            report["guarded_children"] = list(guarded_ids)
         if blocked_ids:
             # Surface the children that are still waiting so the operator can
             # see which siblings the started child is not blocked behind.
@@ -7629,6 +7698,24 @@ def phase_parent(
             worktree_path and _has_worktree_changes(worktree_path)
         )
 
+        if action == ACTION_SKIP_DO_NOT_DELEGATE:
+            # Guarded: the child is tagged ``do-not-delegate``, so automatic
+            # parent recursion must never claim it, create a worktree for it
+            # or spawn a session for it — the same semantics as `wl`'s own
+            # delegate guard rail. It is reported distinctly (never as
+            # dependency-``blocked``), it counts as pending (guarded ≠
+            # terminal, so the parent is never advanced past it), and the
+            # loop continues with its genuinely startable siblings
+            # (SA-0MUWNKUIU007N876, AC2/AC3).
+            guarded_ids.append(cid)
+            pending_ids.append(cid)
+            child_results.append({
+                "id": cid, "title": title,
+                "action": ACTION_SKIPPED_DO_NOT_DELEGATE,
+                "status": child.get("status", ""),
+            })
+            continue
+
         if action == "skip-in-progress":
             # A started child may be ours (worktree exists) or another
             # agent's claim (no worktree → never clobbered).
@@ -7730,12 +7817,32 @@ def phase_parent(
 
     # ── Step 7: Advance only when every child is terminal ──────────
     if pending_ids:
+        # The waiting message names the *actual* reason per child: a guarded
+        # child must never be described with the dependency-blocked/held
+        # wording, which would send the operator looking for a blocker that
+        # does not exist (SA-0MUWNKUIU007N876, AC3).
+        reasons: list[str] = []
+        if guarded_ids:
+            verb = "is" if len(guarded_ids) == 1 else "are"
+            reasons.append(
+                f"{', '.join(sorted(guarded_ids))} {verb} guarded by the "
+                f"`{DO_NOT_DELEGATE_TAG}` tag and {verb} never started by "
+                "automatic parent recursion (name the child explicitly to "
+                "override)"
+            )
+        if blocked_ids:
+            verb = "is" if len(blocked_ids) == 1 else "are"
+            reasons.append(
+                f"{', '.join(sorted(blocked_ids))} {verb} blocked by a "
+                "non-terminal blocker or held by another agent"
+            )
         report["message"] = (
             f"No child of {work_item_id} is currently startable: "
-            f"non-terminal children not in progress are blocked by "
-            f"non-terminal siblings or another agent holds them. Re-run "
-            f"this phase after one completes."
+            + "; ".join(reasons)
+            + ". Re-run this phase after one completes."
         )
+        if guarded_ids:
+            report["guarded_children"] = list(guarded_ids)
         if blocked_ids:
             report["blocked_children"] = blocked_ids
         report["children_processed"] = child_results
@@ -8709,6 +8816,15 @@ def phase_drive(
     ``completed-late`` and the chain continues; a genuinely incomplete child
     keeps the pre-existing hard failure (SA-0MVHXWLPG007OQVN).
 
+    A child tagged ``do-not-delegate`` is **never spawned**
+    (SA-0MUWNKUIU007N876): ``phase_parent`` reports it as guarded, so it never
+    becomes ``next_child`` and no session is created for it. When the guarded
+    children are all that remains, the drive report forwards
+    ``guarded_children`` and states explicitly that they are guarded by
+    ``do-not-delegate`` rather than stopping with the misleading "blocked or
+    held" wording. Driving a guarded item *explicitly* (``drive <child>``)
+    is unaffected — only automatic selection is gated.
+
     Failing ``finish`` executions are bounded too (SA-0MVLJXS7R000XIFL): a
     ``finishing_failed`` parent report is counted per child in
     ``finish_attempts`` (distinct from the session-spawn ``attempts``), and
@@ -8784,7 +8900,9 @@ def phase_drive(
         (SA-0MVLJXVND0015LPW). A child whose per-work-item lock is held by
         another live session is reported with ``action: "skipped-held"``,
         ``skipped_held: True``, ``held_by`` and ``held_children`` — and no
-        session is spawned for it (SA-0MVQ5AXLF002PAQ3).
+        session is spawned for it (SA-0MVQ5AXLF002PAQ3). ``guarded_children``
+        lists the children skipped because they carry the
+        ``do-not-delegate`` tag (SA-0MUWNKUIU007N876).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -9133,11 +9251,24 @@ def phase_drive(
 
         child_id = parent_report.get("next_child")
         if not child_id:
-            report["message"] = parent_report.get(
-                "message",
+            # Nothing startable. A guarded child (``do-not-delegate``) must
+            # never be described with the misleading "blocked or held"
+            # wording, and the guarded set is surfaced so a ``drive --json``
+            # consumer sees the real stop reason (SA-0MUWNKUIU007N876, AC4).
+            guarded = list(parent_report.get("guarded_children") or [])
+            if guarded:
+                report["guarded_children"] = guarded
+            report["message"] = parent_report.get("message") or (
                 "No startable child: remaining children are blocked or held "
-                "by another agent.",
+                "by another agent."
             )
+            if guarded and DO_NOT_DELEGATE_TAG not in report["message"]:
+                report["message"] = (
+                    f"{report['message']} Child(ren) {', '.join(guarded)} "
+                    f"{('is' if len(guarded) == 1 else 'are')} guarded by the "
+                    f"`{DO_NOT_DELEGATE_TAG}` tag; no session was spawned for "
+                    "them."
+                )
             if parent_report.get("blocked_children"):
                 report["blocked_children"] = parent_report["blocked_children"]
             break
