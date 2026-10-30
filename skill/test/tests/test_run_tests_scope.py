@@ -6,7 +6,10 @@ Tests cover:
 - `map_changed_to_tests()` import-graph expansion
 - `changed_scope_commands()` integration with full_suite_commands
 - Scope carried in run_suite/run_all results
-- Custom suiteCommands fallback to full scope
+- Custom suiteCommands no longer disable changed-scope selection
+- TypeScript/vitest .test.ts / .spec.ts convention mapping
+- Named test groups honoured by the changed-file selector
+- Specific (not generic) fallback reasons
 - CLI flag parsing
 """
 
@@ -36,8 +39,13 @@ _REPO_ROOT = _SCRIPT_DIR.parents[2]
 
 import run_tests
 from run_tests import (
+    CHANGED_SCOPE_NO_CHANGES,
+    CHANGED_SCOPE_NO_GROUP,
+    CHANGED_SCOPE_NO_SOURCE,
+    CHANGED_SCOPE_NO_TOOLING,
     build_parser,
     changed_scope_commands,
+    changed_scope_selection,
     compute_changed_files,
     map_changed_to_tests,
     run_all,
@@ -145,6 +153,46 @@ def _init_repo_with_dev(repo: Path, *, message: str = "initial") -> Path:
     return repo
 
 
+def _make_vitest_repo(tmp_path: Path, config: dict | None = None) -> Path:
+    """Create a hermetic vitest/TypeScript repo on branch ``dev``.
+
+    Carries ``tests/{cli,unit}/*.test.ts`` files, a co-located
+    ``tests/unit/utils.test.ts`` for ``src/utils.ts`` and a package.json that
+    declares vitest. An optional ``.pi/test-config.json`` *config* is written
+    before the initial commit so it is part of the repo baseline.
+    """
+    repo = tmp_path / "vitest_repo"
+    (repo / "tests" / "cli").mkdir(parents=True)
+    (repo / "tests" / "unit").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {"test": "vitest run"},
+                "devDependencies": {"vitest": "^1.0.0"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (repo / "src" / "utils.ts").write_text("export const x = 1;\n")
+    (repo / "tests" / "unit" / "utils.test.ts").write_text(
+        "import { test } from 'vitest';\n"
+    )
+    (repo / "tests" / "cli" / "foo.test.ts").write_text(
+        "import { test } from 'vitest';\n"
+    )
+    (repo / "tests" / "cli" / "foo.spec.ts").write_text(
+        "import { test } from 'vitest';\n"
+    )
+    if config is not None:
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+    _init_repo_with_dev(repo)
+    return repo
+
+
 class _CompletedProcess:
     """Minimal mock of subprocess.CompletedProcess."""
 
@@ -231,14 +279,19 @@ class TestComputeChangedFiles:
             "src/utils.py"
         }
 
-    def test_ignores_untracked_files(self, tmp_path: Path) -> None:
-        """Untracked files are not included in changed files."""
+    def test_includes_untracked_files(self, tmp_path: Path) -> None:
+        """New (untracked) files are part of the working-tree change set.
+
+        During the implement flow tests run before the first commit, so a
+        newly created test file has no diff entry — it must still be
+        selectable (SA-0MVL7YOMJ006UMDO).
+        """
         repo = _make_repo(tmp_path)
         (repo / "src" / "utils.py").write_text("# utils — modified\n")
         (repo / "src" / "untracked.py").write_text("# new file\n")
 
         result = compute_changed_files(repo, base_ref="dev")
-        assert "src/untracked.py" not in result
+        assert "src/untracked.py" in result
         assert "src/utils.py" in result
 
     def test_fixture_repo_ignores_an_inherited_index_file(
@@ -381,8 +434,9 @@ class TestChangedScopeCommands:
         assert "pytest" in cmd.lower()
         assert "tests/test_utils.py" in cmd
 
-    def test_falls_back_to_full_for_custom_suite_commands(self, tmp_path: Path) -> None:
-        """When .pi/test-config.json has suiteCommands, changed scope returns None."""
+    def test_suite_commands_do_not_disable_file_selection(self, tmp_path: Path) -> None:
+        """Declared suiteCommands define the full suite only — changed scope
+        still selects the affected test file (SA-0MVL7YOMJ006UMDO)."""
         repo = _make_repo(tmp_path)
         (repo / ".pi").mkdir()
         (repo / ".pi" / "test-config.json").write_text(
@@ -392,7 +446,8 @@ class TestChangedScopeCommands:
         (repo / "src" / "utils.py").write_text("# modified\n")
 
         cmds = changed_scope_commands(repo, base_ref="dev")
-        assert cmds is None  # custom commands → fall back to full scope
+        assert cmds is not None
+        assert "tests/test_utils.py" in cmds[0]
 
     def test_returns_none_for_no_pytest_repo(self, tmp_path: Path) -> None:
         """A repo with no pytest config returns None (full scope fallback)."""
@@ -474,6 +529,179 @@ class TestChangedScopeCommands:
         assert cmds == [
             "pytest -q -r a --disable-warnings .pi/skills/demo/tests/test_demo.py"
         ]
+
+
+# ---------------------------------------------------------------------------
+# TypeScript/vitest changed-scope selection (SA-0MVL7YOMJ006UMDO)
+# ---------------------------------------------------------------------------
+
+
+class TestTypeScriptChangedScope:
+    """Vitest ``*.test.ts`` / ``*.spec.ts`` files are selectable."""
+
+    def test_changed_test_ts_selected(self, tmp_path: Path) -> None:
+        """A changed vitest .test.ts file is selected and runs via vitest."""
+        repo = _make_vitest_repo(tmp_path)
+
+        cmds = changed_scope_commands(
+            repo, base_ref="dev", changed_files={"tests/cli/foo.test.ts"}
+        )
+
+        assert cmds is not None
+        assert len(cmds) == 1
+        assert "vitest run" in cmds[0]
+        assert "tests/cli/foo.test.ts" in cmds[0]
+
+    def test_changed_spec_ts_selected(self, tmp_path: Path) -> None:
+        """A changed vitest .spec.ts file is selected conservatively too."""
+        repo = _make_vitest_repo(tmp_path)
+
+        cmds = changed_scope_commands(
+            repo, base_ref="dev", changed_files={"tests/cli/foo.spec.ts"}
+        )
+
+        assert cmds is not None
+        assert "vitest run" in cmds[0]
+        assert "tests/cli/foo.spec.ts" in cmds[0]
+
+    def test_changed_source_ts_selects_stem_test(self, tmp_path: Path) -> None:
+        """src/utils.ts maps to tests/unit/utils.test.ts by stem convention."""
+        repo = _make_vitest_repo(tmp_path)
+
+        cmds = changed_scope_commands(
+            repo, base_ref="dev", changed_files={"src/utils.ts"}
+        )
+
+        assert cmds is not None
+        assert "vitest run" in cmds[0]
+        assert "tests/unit/utils.test.ts" in cmds[0]
+
+    def test_new_untracked_test_ts_is_computed(self, tmp_path: Path) -> None:
+        """A newly created (untracked) test file is part of the change set."""
+        repo = _make_vitest_repo(tmp_path)
+        (repo / "tests" / "cli" / "new.test.ts").write_text(
+            "import { test } from 'vitest';\n"
+        )
+
+        assert "tests/cli/new.test.ts" in compute_changed_files(repo, base_ref="dev")
+
+        cmds = changed_scope_commands(repo, base_ref="dev")
+        assert cmds is not None
+        assert "tests/cli/new.test.ts" in cmds[0]
+
+    def test_ts_without_vitest_reports_no_tooling(self, tmp_path: Path) -> None:
+        """Without a known vitest runner the fallback names the reason."""
+        repo = tmp_path / "plain_ts_repo"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "tests" / "foo.test.ts").write_text("// test\n")
+        _init_repo_with_dev(repo)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"tests/foo.test.ts"}
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_NO_TOOLING
+
+
+# ---------------------------------------------------------------------------
+# Named groups in changed-scope selection (SA-0MVL7YOMJ006UMDO)
+# ---------------------------------------------------------------------------
+
+_GROUP_CONFIG = {
+    "suiteCommands": ["npm --silent test"],
+    "groups": {
+        "cli": {
+            "commands": ["npm --silent test -- tests/cli"],
+            "paths": ["tests/cli/**"],
+        },
+        "unit": {
+            "commands": ["npm --silent test -- tests/unit"],
+            "paths": ["tests/unit/**"],
+        },
+    },
+}
+
+
+class TestChangedScopeGroups:
+    """Declared groups are honoured even when suiteCommands is present."""
+
+    def test_suite_commands_present_with_matching_group(self, tmp_path: Path) -> None:
+        """A matching group's commands are selected despite suiteCommands."""
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"tests/cli/foo.test.ts"}
+        )
+
+        assert selection.commands == ["npm --silent test -- tests/cli"]
+        assert selection.group == "cli"
+        assert "cli" in selection.reason
+
+    def test_suite_commands_present_no_group_reports_group_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """No group and no convention match → the named group fallback reason."""
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"src/unrelated.ts"}
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_NO_GROUP
+
+    def test_docs_only_change_reports_no_source_reason(self, tmp_path: Path) -> None:
+        """A docs-only change names the no-source reason, not a generic list."""
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"docs/guide.md"}
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_NO_SOURCE
+
+    def test_no_changed_files_reports_no_changes_reason(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files=set()
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_NO_CHANGES
+
+    def test_run_suite_reports_changed_scope_for_group(self, tmp_path: Path) -> None:
+        """run_suite reports scope 'changed' with the selected group commands."""
+        from types import SimpleNamespace
+
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+        (repo / "tests" / "cli" / "foo.test.ts").write_text(
+            "import { test } from 'vitest';\n// changed\n"
+        )
+
+        captured: list[str] = []
+
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "all",
+                cwd=repo,
+                scope="changed",
+                base_ref="dev",
+                use_cache=False,
+                force=True,
+            )
+
+        assert result["scope"] == "changed"
+        assert captured == ["npm --silent test -- tests/cli"], captured
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +882,10 @@ class TestExplicitSuiteFallbackHonoursPins:
         (repo / "pytest.ini").write_text("[pytest]\n")
         (repo / "tests" / "test_foo.py").write_text("def test_foo(): pass\n")
         _init_repo_with_dev(repo, message="init")
-        (repo / "src" / "foo.py").write_text("CHANGED\n")
+        # A docs-only change maps to no test, so changed scope must fall back
+        # to the full suite — the fallback whose pinned-command handling these
+        # tests cover. (Source changes are now selectable, SA-0MVL7YOMJ006UMDO.)
+        (repo / "README.md").write_text("# changed\n")
         return repo
 
     def test_changed_scope_fallback_pytest_uses_pinned_command(self, tmp_path: Path) -> None:
@@ -707,7 +938,8 @@ class TestExplicitSuiteFallbackHonoursPins:
         (repo / "tests" / "node").mkdir()
         (repo / "tests" / "node" / "utils.test.mjs").write_text("import test from \"node:test\";\n")
         _init_repo_with_dev(repo, message="init")
-        (repo / "src" / "foo.py").write_text("CHANGED\n")
+        # Docs-only change → nothing selectable → the full-suite fallback.
+        (repo / "README.md").write_text("# changed\n")
 
         captured: list[str] = []
 

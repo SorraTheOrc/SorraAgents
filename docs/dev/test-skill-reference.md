@@ -592,15 +592,24 @@ evidence.
 
 **Changed-file → test selection** combines:
 
-1. **Convention mapping** — a changed file maps to its own tests:
+1. **Named test groups** — the smallest group in `.pi/test-config.json`
+   whose `paths` match a changed file wins and its `commands` run
+   (SA-0MUJKF2HP001BR51). `suiteCommands` no longer disables selection: it
+   defines the full suite only, never the changed-scope subset
+   (SA-0MVL7YOMJ006UMDO).
+2. **Convention mapping** — a changed file maps to its own tests:
    `src/foo.py` → `tests/test_foo.py`, a changed `tests/test_x.py` → itself,
-   etc.
-2. **AST import-graph expansion** — the mapping adds test files that import
-the changed module (deterministic, no heuristic coverage tools).
+   a changed `src/utils.ts` → `tests/unit/utils.test.ts`, a changed vitest
+   `*.test.ts` / `*.spec.ts` (and the `.js`/`.tsx` variants) → itself. New
+   (untracked) files are part of the change set so a test created before the
+   first commit is selectable.
+3. **AST import-graph expansion** (Python) — the mapping adds test files
+   that import the changed module (deterministic, no heuristic coverage
+   tools).
 
-Selected test files are passed explicitly (`pytest tests/test_foo.py ...`),
-so a scoped run is deterministic and cache-keyed distinctly from the full
-suite.
+Selected test files are passed explicitly (`pytest tests/test_foo.py ...`,
+`node --test ...`, or `vitest run tests/unit/foo.test.ts`), so a scoped run
+is deterministic and cache-keyed distinctly from the full suite.
 
 **Deleted / non-existent paths (LP-0MTZYRTNF0092JKW).** A deleted or
 renamed-away test file still appears in `git diff` even though it is absent
@@ -616,11 +625,20 @@ this: a scoped pytest exit 4 is treated as "selection unavailable" →
 full-scope fallback, while a genuine failure (exit 1) still blocks.
 
 **Fallback to full scope** (with a logged warning) happens when no subset
-can be selected: no diff base / no changed files, all changed files are
-non-test/unmapped, the selection references only deleted/non-existent paths,
-the repo declares custom `suiteCommands` in `.pi/test-config.json` (not
-introspectable), or the repo has no subsettable tooling. A scoped run never
-silently skips testing.
+can be selected, and the warning names the **specific** reason rather than a
+generic list (SA-0MVL7YOMJ006UMDO):
+
+| Reason | Meaning |
+|---|---|
+| `no changed files` | No diff against the base (and no untracked files). |
+| `no changed source or test files` | Only docs/config changed. |
+| `no matching group and no convention-matched test files` | Groups are declared but none match, and no test maps to the change. |
+| `no convention-matched test files` | No group matched and no test maps to the change. |
+| `selected test files have no runnable suite tooling` | A test is selected (e.g. a `.test.ts`) but no pytest/node/vitest runner is declared. |
+
+A scoped run never silently skips testing. `changed_scope_selection()`
+returns the reason alongside the commands (`None` commands = fallback);
+`changed_scope_commands()` is the thin commands-only wrapper.
 
 **The fallback honours pinned suite commands
 (OSL-0MVNWYRQB0095WXQ).** When the fallback fires, the full-scope command set

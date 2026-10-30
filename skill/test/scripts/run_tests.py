@@ -100,7 +100,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2]
 _SKILLS_ROOT_STR = str(_SKILLS_ROOT)
@@ -327,7 +327,43 @@ _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
 # Scope-aware test selection
 # ---------------------------------------------------------------------------
 
-TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts")
+TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts", ".tsx")
+
+#: Suffixes recognised as test files by the convention mapper. The
+#: TypeScript/JavaScript forms cover vitest (``*.test.ts`` / ``*.spec.ts``),
+#: which previously mapped to nothing and forced the full suite
+#: (SA-0MVL7YOMJ006UMDO). ``_test.mjs`` and ``*.test.mjs`` keep the node
+#: suite conventions.
+JS_TS_TEST_SUFFIXES = (
+    ".test.mjs",
+    ".spec.mjs",
+    "_test.mjs",
+    ".test.js",
+    ".spec.js",
+    ".test.ts",
+    ".spec.ts",
+    ".test.tsx",
+    ".spec.tsx",
+)
+
+#: Directories never scanned for test files (VCS metadata, dependency trees,
+#: build output, caches). Pruning them keeps the scan bounded in a monorepo
+#: and avoids selecting a vendored ``node_modules`` test.
+_TEST_SCAN_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".worklog",
+        "node_modules",
+        "dist",
+        "build",
+        "coverage",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+    }
+)
 
 
 def _git_inspection_env(root: Path) -> dict[str, str]:
@@ -365,11 +401,14 @@ def compute_changed_files(
     3. ``HEAD~1`` — when neither dev ref exists (fallback for repos without
        a dev branch, so the diff is against the last commit)
 
-    Untracked files are not included (they have no diff and would be
-    reported only by ``git status``, not a diff). The merge-base is used so
-    only files changed on the current branch since it forked from the base
-    are returned — files changed on the base after the fork point are not
-    attributed to this branch.
+    New (untracked, not-yet-committed) files ARE included: during the
+    implement flow the tests run before the first commit, so a newly created
+    test file has no diff entry yet and would otherwise be invisible to
+    changed-scope selection. ``git ls-files --others --exclude-standard``
+    adds them while keeping ignored build/dependency churn out. The
+    merge-base is used so only files changed on the current branch since it
+    forked from the base are returned — files changed on the base after the
+    fork point are not attributed to this branch.
 
     Args:
         project_root: Repo root (default: detected from calling repo).
@@ -396,7 +435,28 @@ def compute_changed_files(
     )
     if proc.returncode != 0:
         return set()
-    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    changed = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+    # New (untracked) files are part of the working-tree change set but have
+    # no diff entry against *base*. Include them so a newly created test file
+    # (the common implement-flow case: tests run before the first commit) is
+    # selectable. ``--exclude-standard`` keeps ignored files out.
+    try:
+        others = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        others = None
+    if others is not None and others.returncode == 0:
+        changed.update(
+            line.strip() for line in others.stdout.splitlines() if line.strip()
+        )
+    return changed
 
 def _resolve_merge_base(root: Path, base_ref: str) -> str | None:
     """Find the merge-base commit for diffing, following the fallback chain.
@@ -445,19 +505,22 @@ def map_changed_to_tests(
     Two mechanisms, unioned:
 
     1. **Convention mapping**: ``src/foo.py`` → ``tests/test_foo.py``;
-       ``tests/test_foo.py`` itself; any ``test_*.py`` / ``*_test.py`` in the
-       same directory tree as a non-test change whose basename matches the
-       changed file's stem.
+       ``tests/test_foo.py`` itself; any test file in the repository whose
+       basename matches the changed file's stem. Recognised test files are
+       pytest (``test_*.py`` / ``*_test.py``), node (``*.test.mjs`` /
+       ``*_test.mjs`` / ``*.spec.mjs``) and vitest/TypeScript
+       (``*.test.ts`` / ``*.spec.ts``, plus the ``.js``/``.tsx`` variants).
     2. **Import-graph expansion**: AST-scan every test file once; for each
        changed module (dotted name derived from its path relative to the
        project root), find test files whose import statements reference the
        changed module OR any module that (transitively) imports it. This
        catches indirect breakage — e.g. ``utils.py`` changed →
-       ``test_report.py`` imported via a chain.
+       ``test_report.py`` imported via a chain. (Python only; the TypeScript
+       side uses the conservative stem convention.)
 
     ``changed_files`` defaults to :func:`compute_changed_files` against the
-    calling repo. Non-Python changes (README, yaml, …) never map to tests
-    (they return an empty selection) unless they are themselves test files.
+    calling repo. Non-source changes (README, yaml, …) never map to tests
+    unless they are themselves test files.
 
     Args:
         project_root: Repo root.
@@ -472,23 +535,10 @@ def map_changed_to_tests(
     if not changed:
         return set()
 
-    # All test files under tests/test dirs (matching run_tests conventions).
-    test_dirs = [d for d in ("tests", "test") if (root / d).is_dir()]
-    all_tests: set[str] = set()
-    for d in test_dirs:
-        all_tests.update(
-            str(p.relative_to(root))
-            for p in (root / d).rglob("*.py")
-        )
-    # Node suite dirs also carry test files (tests/node|cli|unit/**/*.mjs)
-    # — included so a changed source can select its node tests by convention.
-    for d in NODE_SUITE_DIRS:
-        node_dir = root / d
-        if not node_dir.is_dir():
-            continue
-        for p in node_dir.rglob("*.mjs"):
-            if _is_test_file(Path(str(p.relative_to(root)))):
-                all_tests.add(str(p.relative_to(root)))
+    # Every recognisable test file in the repo — py, node and vitest/TS — so
+    # a changed source can select its tests by convention regardless of where
+    # the suite lives (``tests/``, ``test/`` or co-located ``src/``).
+    all_tests: set[str] = set(_iter_test_files(root))
 
     # 1. Convention mapping
     selected: set[str] = set()
@@ -505,16 +555,25 @@ def map_changed_to_tests(
         if rel.suffix not in TRACKED_SOURCE_EXTENSIONS:
             continue  # non-source change → no test selection
 
-        # Direct convention: changed_stem → test_<stem>.py in same tree
+        # Direct convention: changed_stem → the matching test file name in
+        # any test directory (pytest, node and vitest/TypeScript forms).
+        candidates = {
+            f"test_{rel.stem}.py",
+            f"{rel.stem}_test.py",
+            f"test_{rel.stem}.mjs",
+            f"{rel.stem}_test.mjs",
+            f"{rel.stem}.test.mjs",
+            f"{rel.stem}.spec.mjs",
+            f"{rel.stem}.test.js",
+            f"{rel.stem}.spec.js",
+            f"{rel.stem}.test.ts",
+            f"{rel.stem}.spec.ts",
+            f"{rel.stem}.test.tsx",
+            f"{rel.stem}.spec.tsx",
+        }
         for test in all_tests:
             test_rel = Path(test)
-            if test_rel.name in {
-                f"test_{rel.stem}.py",
-                f"{rel.stem}_test.py",
-                f"test_{rel.stem}.mjs",
-                f"{rel.stem}_test.mjs",
-                f"{rel.stem}.test.mjs",
-            }:
+            if test_rel.name in candidates:
                 selected.add(test)
             elif (
                 rel.name == "__init__.py"
@@ -536,12 +595,32 @@ def map_changed_to_tests(
 
 
 def _is_test_file(rel: Path) -> bool:
-    """True for names matching test-file conventions (test_*.py / *_test.py)."""
+    """True for names matching a recognised test-file convention.
+
+    Covers pytest (``test_*.py`` / ``*_test.py``), node
+    (``*_test.mjs`` / ``*.test.mjs`` / ``*.spec.mjs``) and vitest/TypeScript
+    (``*.test.ts`` / ``*.spec.ts`` and the ``.js``/``.tsx`` variants).
+    """
     name = rel.name
-    return (
-        name.startswith("test_")
-        or name.endswith(("_test.py", ".test.mjs", "_test.mjs"))
+    return name.startswith("test_") or name.endswith(
+        ("_test.py", *JS_TS_TEST_SUFFIXES)
     )
+
+
+def _iter_test_files(root: Path) -> Iterator[str]:
+    """Yield repo-relative paths of every recognisable test file under *root*.
+
+    The whole tree is scanned (pruning VCS, dependency, build and worklog
+    directories) so co-located vitest tests (``src/foo.test.ts``) and the
+    conventional ``tests/``/``test/`` trees are both discovered — not only
+    the Python/node suite directories the previous implementation knew about.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _TEST_SCAN_EXCLUDED_DIRS]
+        for filename in filenames:
+            rel = Path(dirpath, filename).relative_to(root)
+            if _is_test_file(rel):
+                yield rel.as_posix()
 
 
 def _has_python_changes(changed: set[str]) -> bool:
@@ -670,70 +749,112 @@ def _ast_imports(root: Path, test_file: str) -> set[str]:
     return imports
 
 
-def changed_scope_commands(
-    project_root: Path | None = None,
-    base_ref: str = "origin/dev",
-    changed_files: set[str] | None = None,
-) -> list[str] | None:
-    """Return the test commands for changed-file scope, or None for full scope.
+#: Stable reason strings returned by :func:`changed_scope_selection` when no
+#: subset is available. Consumers surface the specific cause instead of a
+#: generic list of every possible cause (SA-0MVL7YOMJ006UMDO).
+CHANGED_SCOPE_NO_CHANGES = "no changed files"
+CHANGED_SCOPE_NO_SOURCE = "no changed source or test files"
+CHANGED_SCOPE_NO_GROUP = "no matching group and no convention-matched test files"
+CHANGED_SCOPE_NO_TESTS = "no convention-matched test files"
+CHANGED_SCOPE_NO_TOOLING = "selected test files have no runnable suite tooling"
 
-    Returns None (meaning "fall back to the full suite") when:
 
-    - The repo declares custom ``suiteCommands`` in ``.pi/test-config.json``
-      (not introspectable → cannot select a subset).
-    - No changed files are found (nothing to select → full scope).
-    - The resolved changed-file selection is empty (e.g. only non-source
-      changes like README edits).
-    - The repo has no test tooling of a kind we can subset (no pytest, no
-      node suite dirs).
+class ChangedScopeSelection(NamedTuple):
+    """Result of changed-file → test-command selection.
 
-    When a selection IS possible, returns a list with, per applicable suite:
+    ``commands`` is ``None`` when no safe subset is available, in which case
+    ``reason`` names the specific cause. ``group`` records the named test
+    group that matched when selection came from ``.pi/test-config.json``.
+    """
 
-    - pytest: ``pytest <selected test files>`` (canonicalized quiet form).
-    - node: ``node --test <selected node test files>`` per node suite dir.
+    commands: list[str] | None
+    reason: str
+    group: str | None = None
 
-    The selected test files are always passed explicitly so the partial run
-    is deterministic and cache-keyed distinctly from the full suite.
 
-    *changed_files* may be passed in to avoid a second ``git diff`` when the
-    caller already computed it (single source for the fallback warning).
+def _selectable_changed(changed: set[str]) -> set[str]:
+    """Return changed paths that can drive test selection.
+
+    A path is selectable when it is itself a recognised test file or a
+    tracked source extension. Documentation/config-only change sets return
+    an empty set (nothing to map to tests).
+    """
+    return {
+        path
+        for path in changed
+        if _is_test_file(Path(path)) or Path(path).suffix in TRACKED_SOURCE_EXTENSIONS
+    }
+
+
+def repo_uses_vitest(project_root: Path | None = None) -> bool:
+    """Whether *project_root* runs its TypeScript tests with vitest.
+
+    Detected from a local ``node_modules/.bin/vitest`` binary or from
+    ``package.json`` (a ``vitest`` dependency or a script whose command
+    mentions vitest). This gates the convention-mapped ``*.test.ts`` /
+    ``*.spec.ts`` commands: without a known runner the selector reports
+    "no runnable suite tooling" instead of emitting a bogus command.
     """
     root = Path(project_root or REPO_ROOT).resolve()
+    if (root / "node_modules" / ".bin" / "vitest").exists():
+        return True
+    pkg_json = root / "package.json"
+    if not pkg_json.is_file():
+        return False
+    try:
+        data = json.loads(pkg_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    for key in ("dependencies", "devDependencies"):
+        deps = data.get(key)
+        if isinstance(deps, dict) and "vitest" in deps:
+            return True
+    scripts = data.get("scripts")
+    if isinstance(scripts, dict):
+        return any(
+            isinstance(value, str) and "vitest" in value
+            for value in scripts.values()
+        )
+    return False
 
-    # Custom suite commands are not introspectable — fall back to full scope.
-    if extension_suite_commands(root) is not None:
+
+def _vitest_test_command(root: Path, files: list[str]) -> str | None:
+    """Build a ``vitest run <files>`` command, or None when vitest is absent."""
+    if not files or not repo_uses_vitest(root):
         return None
+    local_bin = root / "node_modules" / ".bin" / "vitest"
+    if local_bin.exists():
+        executable = "node_modules/.bin/vitest"
+    else:
+        # A declared-but-not-yet-installed dependency: resolve the local
+        # package without allowing npx to fetch a different version.
+        executable = "npx --no-install vitest"
+    file_args = " ".join(shlex.quote(f) for f in files)
+    return f"{executable} run {file_args}"
 
-    changed = (
-        changed_files
-        if changed_files is not None
-        else compute_changed_files(root, base_ref=base_ref)
-    )
-    if not changed:
-        return None
 
-    selected = map_changed_to_tests(root, changed)
-    # Anything changed that is itself a test file is already in `selected`;
-    # leaf-only changes (e.g. a lone docs edit) → full scope.
-    if not selected:
-        return None
+def _commands_for_selected_tests(root: Path, selected: set[str]) -> list[str]:
+    """Build runnable commands for *selected* test files, grouped by tooling.
 
-    # Defensive existence filter: never emit a command referencing a path that
-    # is absent from the worktree (deleted/renamed away). If filtering leaves
-    # nothing selectable, fall back to full scope rather than emitting a
-    # degenerate command that would exit 4 (LP-0MTZYRTNF0092JKW).
-    selected = {f for f in selected if (root / f).exists()}
-    if not selected:
-        return None
+    - pytest for ``.py`` tests (only when the repo declares a pytest suite),
+    - ``node --test`` per node suite directory for ``.mjs`` tests,
+    - ``vitest run`` for TypeScript/JavaScript tests when vitest is declared.
 
-    pytest_files = sorted(f for f in selected if f.endswith(".py") and not f.endswith(".mjs"))
-    node_files = sorted(f for f in selected if f.endswith(".mjs"))
-
+    Files are always passed explicitly so a scoped run is deterministic and
+    cache-keyed distinctly from the full suite.
+    """
     commands: list[str] = []
+
+    pytest_files = sorted(
+        f for f in selected if f.endswith(".py") and (root / f).is_file()
+    )
     if pytest_files and repo_has_pytest_suite(root):
         file_args = " ".join(shlex.quote(f) for f in pytest_files)
         commands.append(canonicalize_quiet_test_command(f"pytest {file_args}"))
 
+    node_files = sorted(f for f in selected if f.endswith(".mjs"))
     if node_files:
         # Group by node suite dir (tests/node, tests/cli, tests/unit) so we
         # emit one node --test command per dir, mirroring full_suite_commands.
@@ -747,7 +868,100 @@ def changed_scope_commands(
             file_args = " ".join(shlex.quote(f) for f in files)
             commands.append(f"node --test {file_args}")
 
-    return commands or None
+    js_ts_files = sorted(
+        f
+        for f in selected
+        if f.endswith((".ts", ".tsx", ".js")) and not f.endswith(".mjs")
+    )
+    vitest_cmd = _vitest_test_command(root, js_ts_files)
+    if vitest_cmd is not None:
+        commands.append(vitest_cmd)
+
+    return commands
+
+
+def changed_scope_selection(
+    project_root: Path | None = None,
+    base_ref: str = "origin/dev",
+    changed_files: set[str] | None = None,
+) -> ChangedScopeSelection:
+    """Resolve the changed-file subset and the reason when none is available.
+
+    Selection order:
+
+    1. **Declared ``groups``** in ``.pi/test-config.json`` — the smallest
+       group whose ``paths`` match a changed file wins and its ``commands``
+       run. ``suiteCommands`` no longer disables selection: it defines the
+       *full* suite only, never the changed-scope subset.
+    2. **Convention mapping** — a changed test file itself, or a source whose
+       stem maps to a test file (pytest, node ``.mjs``, vitest
+       ``.test.ts``/``.spec.ts``).
+    3. **Full-scope fallback**, with a specific ``reason``.
+
+    *changed_files* may be passed in to avoid a second ``git diff`` when the
+    caller already computed it.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    changed = (
+        changed_files
+        if changed_files is not None
+        else compute_changed_files(root, base_ref=base_ref)
+    )
+    if not changed:
+        return ChangedScopeSelection(None, CHANGED_SCOPE_NO_CHANGES)
+
+    # 1. Declared named groups (coarser than file-level, but still targeted).
+    group_name = select_group_from_changed_files(changed, root)
+    if group_name is not None:
+        group_cmds = group_commands(group_name, root)
+        if group_cmds:
+            return ChangedScopeSelection(
+                list(group_cmds), f"matched group '{group_name}'", group_name
+            )
+
+    groups_declared = _read_groups(root) is not None
+    if not _selectable_changed(changed):
+        return ChangedScopeSelection(None, CHANGED_SCOPE_NO_SOURCE)
+
+    # 2. Convention mapping. The existence filter never emits a command that
+    # references a path absent from the worktree (LP-0MTZYRTNF0092JKW).
+    selected = {f for f in map_changed_to_tests(root, changed) if (root / f).exists()}
+    commands = _commands_for_selected_tests(root, selected)
+    if commands:
+        return ChangedScopeSelection(
+            commands, f"selected {len(selected)} affected test file(s)"
+        )
+
+    if selected:
+        return ChangedScopeSelection(None, CHANGED_SCOPE_NO_TOOLING)
+    if groups_declared:
+        return ChangedScopeSelection(None, CHANGED_SCOPE_NO_GROUP)
+    return ChangedScopeSelection(None, CHANGED_SCOPE_NO_TESTS)
+
+
+def changed_scope_commands(
+    project_root: Path | None = None,
+    base_ref: str = "origin/dev",
+    changed_files: set[str] | None = None,
+) -> list[str] | None:
+    """Return the test commands for changed-file scope, or None for full scope.
+
+    Thin wrapper over :func:`changed_scope_selection` for callers that only
+    need the commands. Selection now honours declared test ``groups`` and
+    TypeScript/vitest ``*.test.ts``/``*.spec.ts`` files, and is NOT disabled
+    by ``suiteCommands`` (which describes the full suite only).
+
+    Returns None (meaning "fall back to the full suite") when no changed
+    files exist, only non-source changes were made, no group matches, no
+    test file maps to the change, or the selected tests have no runnable
+    tooling. Call :func:`changed_scope_selection` when the specific fallback
+    reason is needed.
+    """
+    return changed_scope_selection(
+        project_root=project_root,
+        base_ref=base_ref,
+        changed_files=changed_files,
+    ).commands
 
 
 # ---------------------------------------------------------------------------

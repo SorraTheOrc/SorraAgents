@@ -228,6 +228,56 @@ class TestChangedScope:
         assert captured == [SCOPED_CMD], f"got {captured}"
         assert result["scope"] == "changed"
 
+    def test_changed_scope_runs_non_pytest_selection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SA-0MVL7YOMJ006UMDO: a vitest/TS (or group) selection runs and is
+        reported as scope 'changed' — it is no longer dropped because it is
+        not a pytest command."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _write_suite_commands(repo, [CLI_CMD, UNIT_CMD])
+        mod = _load_implement()
+        captured = _record_runs(mod, monkeypatch)
+        vitest_cmd = "npx --no-install vitest run tests/cli/foo.test.ts"
+        monkeypatch.setattr(
+            mod, "_changed_scope_commands", lambda *a, **k: [vitest_cmd]
+        )
+
+        result = mod.run_tests(str(repo), scope="changed")
+
+        assert captured == [vitest_cmd], f"got {captured}"
+        assert result["scope"] == "changed"
+
+    def test_changed_scope_fallback_warning_names_specific_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        """The fallback warning carries the selector's specific reason."""
+        from types import SimpleNamespace
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _write_suite_commands(repo, [CLI_CMD, UNIT_CMD])
+        mod = _load_implement()
+        _record_runs(mod, monkeypatch)
+        monkeypatch.setattr(mod, "_changed_scope_commands", lambda *a, **k: None)
+        monkeypatch.setattr(
+            mod,
+            "_changed_scope_selection",
+            lambda *a, **k: SimpleNamespace(
+                reason="no matching group and no convention-matched test files"
+            ),
+        )
+
+        with caplog.at_level("WARNING"):
+            mod.run_tests(str(repo), scope="changed")
+
+        assert any(
+            "changed-scope selection unavailable" in rec.getMessage()
+            and "no matching group" in rec.getMessage()
+            for rec in caplog.records
+        )
+
 
 class TestConventionDetectionDelegation:
     def test_pytest_convention_delegates_to_full_suite_commands(

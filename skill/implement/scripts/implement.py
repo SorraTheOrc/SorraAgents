@@ -127,6 +127,9 @@ try:
         changed_scope_commands as _changed_scope_commands,
     )
     from test.scripts.run_tests import (
+        changed_scope_selection as _changed_scope_selection,
+    )
+    from test.scripts.run_tests import (
         extension_suite_commands as _extension_suite_commands,
     )
     from test.scripts.run_tests import (
@@ -138,6 +141,7 @@ try:
     from test.scripts.run_tests import paced_runner as _test_paced_runner
 except ModuleNotFoundError:
     _changed_scope_commands = None  # type: ignore[assignment]
+    _changed_scope_selection = None  # type: ignore[assignment]
     _extension_suite_commands = None  # type: ignore[assignment]
     _full_suite_commands = None  # type: ignore[assignment]
     _guarded_run_all = None  # type: ignore[assignment]
@@ -5183,6 +5187,59 @@ def _run_changed_scope_pytest(
     return run
 
 
+def _run_changed_scope_selection(
+    cwd: str, base_ref: str | None = None, fingerprint: str | None = None
+) -> tuple[dict[str, Any] | None, str]:
+    """Run the changed-file-selected commands (any tooling) via the guard.
+
+    Unlike :func:`_run_changed_scope_pytest` (the legacy pytest-only path),
+    this runs whatever the shared selector resolves — a named group's
+    commands, a vitest ``*.test.ts`` selection, pytest, or node — so a repo
+    that declares ``suiteCommands`` or ``groups`` reports ``scope: changed``
+    instead of falling back to the full suite (SA-0MVL7YOMJ006UMDO).
+
+    *fingerprint* is the finish gate's would-be-commit tree SHA, forwarded to
+    the run cache so the verdict is keyed by the tree the commit produces
+    (SA-0MVQHVHXI007PQAB).
+
+    Returns ``(result, reason)``. ``result`` is ``None`` when no subset is
+    available; ``reason`` then names the specific fallback cause so the
+    caller can log it instead of a generic list of possibilities.
+    """
+    if _changed_scope_commands is None:
+        return None, "changed-scope selector unavailable"
+    commands = _changed_scope_commands(
+        Path(cwd), base_ref=base_ref or "origin/dev"
+    )
+    if not commands:
+        reason = "no selection available"
+        if _changed_scope_selection is not None:
+            reason = _changed_scope_selection(
+                Path(cwd), base_ref=base_ref or "origin/dev"
+            ).reason
+        return None, reason
+    run = _run_guarded_suite(
+        list(commands),
+        cwd,
+        scope="changed",
+        base_ref=base_ref,
+        tooling="changed-scope",
+        fingerprint=fingerprint,
+    )
+    # pytest exit 4 is a usage error ("file or directory not found"), not a
+    # test failure. Treat it as selection unavailable so the caller falls
+    # back to the full suite (LP-0MTZYRTNF0092JKW).
+    if run.get("exit_code") == 4:
+        LOG.warning(
+            "Implement run_tests: changed-scope run exited 4 (no valid test "
+            "paths — likely a deleted/renamed test file) in %s — falling "
+            "back to full scope.",
+            cwd,
+        )
+        return None, "selection references no valid test paths (exit 4)"
+    return run, "changed-scope selection available"
+
+
 def _run_commands(
     commands: list[str],
     cwd: str,
@@ -5323,7 +5380,7 @@ def _run_group_from_changed_files(
         group_cmds,
         cwd,
         tooling=f"group:{group_name}",
-        scope="full",
+        scope="changed",
         fingerprint=fingerprint,
     )
 
@@ -5393,16 +5450,16 @@ def _run_resolved_suite(
                 cwd,
             )
             return group_result
-        scoped = _run_changed_scope_pytest(
+        scoped, scope_reason = _run_changed_scope_selection(
             cwd, base_ref=base_ref, fingerprint=fingerprint
         )
         if scoped is not None:
             return scoped
         LOG.warning(
             "Implement run_tests: changed-scope selection unavailable in "
-            "%s (no dev baseline, no changed tests, custom suiteCommands, "
-            "or node-only selection) — falling back to full scope.",
+            "%s (%s) — falling back to full scope.",
             cwd,
+            scope_reason,
         )
     return _run_commands(
         commands, cwd, tooling="suite", scope="full", fingerprint=fingerprint

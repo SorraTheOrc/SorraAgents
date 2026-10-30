@@ -153,14 +153,19 @@ marked `[cached]` in non-JSON output and carry `cached: true` per suite in JSON
 
 **Scope-aware execution (SA-0MT6BYQHB008DOGC):** `run_tests.py --scope full|changed`
 — the FULL suite by default, or only the tests affected by changes since
-`--target-branch` (default `origin/dev`) via convention mapping + AST
+`--target-branch` (default `origin/dev`) via named test groups, convention
+mapping (pytest, node and vitest/TypeScript `*.test.ts`/`*.spec.ts`) and AST
 import-graph expansion. `full` is the only scope accepted as full-suite
 evidence: changed-scope runs get independent cache keys, record `scope:
 changed` in their metadata, and NEVER populate the full-suite cache entry —
 the audit's read-only full-suite query rejects `changed` entries, so a
-partial run can never satisfy a "full test suite passes" AC. When no subset
-can be selected (no diff base, only non-test changes, custom
-`suiteCommands`), changed scope falls back to the full suite with a warning.
+partial run can never satisfy a "full test suite passes" AC. `suiteCommands`
+describes the **full** suite only and no longer disables changed-scope
+selection (SA-0MVL7YOMJ006UMDO); a declared `groups` entry whose `paths` match
+the change is preferred, then file-level mapping. When no subset can be
+selected the fallback names the **specific** reason (no changed files, no
+changed source/test files, no matching group, no convention-matched tests, or
+no runnable tooling for the selection) instead of a generic list.
 **Deleted/non-existent paths are never selected (LP-0MTZYRTNF0092JKW):**
 `map_changed_to_tests()` excludes any changed path absent from the worktree
 (a deleted or renamed-away test file still appears in `git diff`), and
