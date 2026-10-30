@@ -168,7 +168,7 @@ def _stubbed_finish_boundaries(repo: Path, tmp_path: Path):
     repository.
     """
     main_checkout = tmp_path / "main-checkout"
-    (main_checkout / ".worklog").mkdir(parents=True)
+    (main_checkout / ".worklog").mkdir(parents=True, exist_ok=True)
     state = implement.ImplementState(
         work_item_id="SA-TEST",
         worktree_path=str(repo),

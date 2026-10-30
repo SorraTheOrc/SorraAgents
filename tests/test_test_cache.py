@@ -10,10 +10,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import test_cache
 from test_cache import (
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
@@ -695,3 +697,195 @@ def test_default_runner_skips_dup_when_local_bin_already_on_path(git_repo: Path)
             sp.run = orig_run  # type: ignore[assignment]
     finally:
         os.environ["PATH"] = original_path
+
+
+# ---------------------------------------------------------------------------
+# Verdict provenance: explicit fingerprint binding (F4, SA-0MVQHVBCC0083VK5)
+#
+# The finish gate must accept a cached verdict only for the tree the commit
+# will produce (parent SA-0MVL2NH1G0094FA2 AC2/AC4). The contract these tests
+# pin — implemented by F8 (SA-0MVQHVBHXI007PQAB) — is:
+#
+#   run_cached(command, *, cwd=..., fingerprint: str | None = None, ...)
+#
+#   * ``fingerprint is None``  -> historical behaviour, byte for byte:
+#     ``compute_git_state(cwd)`` keys the entry, kind ``"worktree"``.
+#   * ``fingerprint`` supplied -> that string keys the entry and the lookup
+#     (kind ``"tree"``), and the entry records its provenance kind.
+#   * an entry whose recorded provenance kind is absent (legacy) or differs is
+#     a MISS for a ``"tree"`` request — fail closed, never serve a verdict
+#     recorded for a differently-identified tree.
+# ---------------------------------------------------------------------------
+
+#: Two distinct, opaque fingerprints standing in for would-be-commit tree SHAs.
+TREE_FP_A = "a" * 40
+TREE_FP_B = "b" * 40
+
+
+def _write_legacy_entry(
+    repo: Path,
+    command: str,
+    fingerprint: str,
+    *,
+    stdout: str = "legacy green\n",
+) -> Path:
+    """Write a cache entry as a *pre-provenance* version would have stored it.
+
+    The entry predates the ``fingerprint_kind`` metadata field: it is a real
+    entry (correct version, matching finger and exit code) that carries no
+    statement about which kind of fingerprint keys it. A lookup requesting a
+    tree fingerprint must therefore treat it as a miss (fail closed), while a
+    default (loose worktree) request keeps serving it.
+    """
+    entry_dir = test_cache._entry_dir(command, fingerprint, repo, "full")
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "version": test_cache._CACHE_VERSION,
+        "command": normalize_test_command(command),
+        "git_state": fingerprint,
+        "exit_code": 0,
+        "completed_at": time.time(),
+        "scope": "full",
+        "test_type": "full",
+    }
+    (entry_dir / "metadata.json").write_text(json.dumps(metadata))
+    (entry_dir / "stdout.txt").write_text(stdout)
+    (entry_dir / "stderr.txt").write_text("")
+    return entry_dir
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Pre-fix baseline (F8 / SA-0MVQHVBHXI007PQAB not landed): run_cached "
+        "has no explicit fingerprint override, so a gate cannot key a verdict "
+        "by the would-be-commit tree. Remove this marker when F8 lands."
+    ),
+)
+def test_explicit_fingerprint_mismatch_misses_and_reruns(git_repo: Path) -> None:
+    """A stored verdict for another tree is a miss: the command re-runs."""
+    calls: list[str] = []
+    runner = make_runner(calls)
+    first = run_cached("pytest", cwd=str(git_repo), fingerprint=TREE_FP_A,
+                       runner=runner)
+    assert first["cached"] is False
+    assert first["git_state"] == TREE_FP_A
+
+    second = run_cached("pytest", cwd=str(git_repo), fingerprint=TREE_FP_B,
+                        runner=runner)
+    assert second["cached"] is False, "a foreign fingerprint must never hit"
+    assert second["git_state"] == TREE_FP_B
+    assert len(calls) == 2, "the command must re-run for a foreign fingerprint"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Pre-fix baseline (F8 / SA-0MVQHVBHXI007PQAB not landed): run_cached "
+        "has no explicit fingerprint override, so a matching-tree verdict "
+        "cannot be requested. Remove this marker when F8 lands."
+    ),
+)
+def test_explicit_fingerprint_match_within_ttl_is_a_hit(git_repo: Path) -> None:
+    """An identical fingerprint inside the TTL reuses the entry — no spawn."""
+    calls: list[str] = []
+    runner = make_runner(calls)
+    first = run_cached("pytest", cwd=str(git_repo), fingerprint=TREE_FP_A,
+                       runner=runner)
+    assert first["cached"] is False
+
+    second = run_cached("pytest", cwd=str(git_repo), fingerprint=TREE_FP_A,
+                        runner=runner)
+    assert second["cached"] is True
+    assert second["completed_at"] == first["completed_at"]
+    assert len(calls) == 1, "a matching fingerprint must not re-execute"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Pre-fix baseline (F8 / SA-0MVQHVBHXI007PQAB not landed): run_cached "
+        "has no explicit fingerprint override, so a stale tree-bound verdict "
+        "cannot be requested. Remove this marker when F8 lands."
+    ),
+)
+def test_identical_fingerprint_outside_ttl_misses_and_reruns(
+    git_repo: Path,
+) -> None:
+    """A matching fingerprint is not enough: a stale entry still misses.
+
+    Provenance narrows *which* entry may be served; it must not extend its
+    lifetime. An entry recorded days ago for the same tree is still stale and
+    the suite must run again.
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+    first = run_cached("pytest", cwd=str(git_repo), fingerprint=TREE_FP_A,
+                       runner=runner)
+    assert first["cached"] is False
+
+    entry_dir = test_cache._entry_dir("pytest", TREE_FP_A, git_repo, "full")
+    metadata = json.loads((entry_dir / "metadata.json").read_text())
+    metadata["completed_at"] = time.time() - 10 * 24 * 60 * 60
+    (entry_dir / "metadata.json").write_text(json.dumps(metadata))
+
+    second = run_cached("pytest", cwd=str(git_repo), fingerprint=TREE_FP_A,
+                        runner=runner)
+    assert second["cached"] is False, "an expired entry must never be served"
+    assert len(calls) == 2
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Pre-fix baseline (F8 / SA-0MVQHVBHXI007PQAB not landed): entries "
+        "record no fingerprint provenance, so a legacy entry keyed by the "
+        "same string would be served for a tree-fingerprint request. Remove "
+        "this marker when F8 lands."
+    ),
+)
+def test_legacy_entry_without_provenance_misses_for_a_tree_fingerprint(
+    git_repo: Path,
+) -> None:
+    """Fail closed: a provenance-less entry never satisfies a tree request."""
+    _write_legacy_entry(git_repo, "pytest", TREE_FP_A)
+    calls: list[str] = []
+    runner = make_runner(calls)
+
+    result = run_cached("pytest", cwd=str(git_repo), fingerprint=TREE_FP_A,
+                        runner=runner)
+
+    assert result["cached"] is False, (
+        "an entry without provenance metadata must never be served as a "
+        "tree-bound verdict"
+    )
+    assert len(calls) == 1, "the provenance-less entry must be bypassed"
+
+
+def test_default_request_keeps_loose_worktree_fingerprint_semantics(
+    git_repo: Path,
+) -> None:
+    """Existing consumers are untouched: no override => historical behaviour.
+
+    Without an explicit fingerprint the cache keys by ``compute_git_state``
+    and keeps serving entries that predate provenance metadata — the test
+    skill CLI, audit and pre-push paths must be byte-for-byte unaffected by
+    the provenance work (F8 AC3).
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+    loose_state = compute_git_state(str(git_repo))
+    first = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert first["cached"] is False
+    assert first["git_state"] == loose_state
+
+    second = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert second["cached"] is True
+    assert len(calls) == 1
+
+    # A legacy entry (no provenance metadata) at the loose state is still a hit.
+    _write_legacy_entry(git_repo, "node --test", loose_state, stdout="legacy\n")
+    legacy = run_cached("node --test", cwd=str(git_repo), runner=runner)
+    assert legacy["cached"] is True
+    assert legacy["stdout"] == "legacy\n"
+    assert len(calls) == 1, "a legacy entry must still be served by default"
