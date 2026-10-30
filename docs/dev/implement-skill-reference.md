@@ -487,6 +487,36 @@ addition to `success`/`stdout`/`stderr`/`exit_code`/`failures` — and, for a
 guarded (test-skill) run, `notices`/`notice_codes` so callers can explain a
 failure without any structured failures.
 
+### Would-be-commit tree staging (SA-0MVQHVGFR006W8LG)
+
+The finish gate must validate the tree the commit will produce, not the loose
+working tree. `phase_finish` therefore delegates its test step to
+`run_gate_suite()`, which wraps `run_tests()` in
+`would_be_commit_index()`:
+
+- The real index is copied to a temporary file (`<git-dir>/implement-gate-*.index`),
+  the change set is staged into the copy with `git add -A` under
+  `GIT_INDEX_FILE`, and that variable is exported for the suite so every
+  child `git` command a test spawns (including `git ls-files` guards) — and
+  the cache fingerprint computed by `test_cache` — sees the staged file set.
+  `GIT_INDEX_FILE` stays out of the repository-override scrub for this reason
+  (`tests/test_git_index_file_env.py`).
+- The temp index is recorded in `report["steps"]["would_be_commit"]`
+  (tree, path, staged paths, `index_unchanged`) and is removed, with the
+  previous `GIT_INDEX_FILE` restored, on **every** exit path — including
+  SIGTERM/SIGINT, which shares `_remove_gate_index()`.
+- A suite that stages into the inherited index changes the tested tree. The
+  post-suite `git write-tree` check forces the verdict red with a
+  "gate evidence invalid" notice rather than attributing it to a tree that
+  was never tested.
+- Only on a green gate does `stage_tested_tree()` write the real index
+  (`git add -A`) and assert its `git write-tree` equals the tested tree before
+  `git_commit` runs. A mismatch unstages the change set again, creates no
+  commit, and returns an actionable drift message.
+- `run_cmd()` drops an ambient `GIT_INDEX_FILE` by default so the gate's own
+  git commands always act on the real index while the suite runs; suite
+  runners opt in with `keep_git_index=True`.
+
 ## Push timeout (SA-0MUH9R74O002MQDU)
 
 `implement.py finish` pushes to `dev` via `git_push_to_dev()`.  The push

@@ -248,6 +248,28 @@ def sanitized_git_env() -> dict[str, str]:
     return scrub_repository_overrides(os.environ)
 
 
+def fixture_git_env(
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Environment for **fixture** git commands: hermetic, own index.
+
+    In addition to the repository-override scrub, an ambient
+    ``GIT_INDEX_FILE`` is removed. The finish gate exports a temporary index
+    for the suite it runs (SA-0MVQHVGFR006W8LG) and ``GIT_INDEX_FILE``
+    deliberately survives ``scrub_repository_overrides`` so tests can observe
+    that staged tree (F3, SA-0MVQHV9Y3001RNNW). A hermetic fixture must
+    therefore drop it explicitly, or its ``git init``/``add``/``commit``
+    would write into the *gate's* index instead of the fixture's own — which
+    is exactly what happens when the suite itself runs under the gate.
+
+    Callers that intentionally target a specific index pass it explicitly
+    (``run_git(..., env={"GIT_INDEX_FILE": path})``); the explicit value wins.
+    """
+    env = scrub_repository_overrides(base)
+    env.pop("GIT_INDEX_FILE", None)
+    return env
+
+
 def run_git(
     cwd: str | os.PathLike[str],
     args: list[str] | tuple[str, ...],
@@ -263,7 +285,7 @@ def run_git(
     Raises:
         GitSandboxError: when *check* is true and git exits non-zero.
     """
-    base_env = sanitized_git_env()
+    base_env = fixture_git_env()
     if env:
         base_env.update(env)
     cmd = [

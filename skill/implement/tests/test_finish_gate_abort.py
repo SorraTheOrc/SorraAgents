@@ -2,12 +2,11 @@
 
 What this module pins
 ---------------------
-The finish gate (``phase_finish``'s test step) is about to gain **temp-index
-staging** (F6, SA-0MVQHVGFR006W8LG): the change set is applied to a *copy* of
-the real index, the suite runs with ``GIT_INDEX_FILE`` pointing at that copy,
-and the real index is only touched once the gate is green. That design makes a
-contract possible which did not exist before, and which this module specifies
-**test-first** so F6 can be implemented against it:
+The finish gate (``phase_finish``'s test step) gained **temp-index staging**
+(F6, SA-0MVQHVGFR006W8LG): the change set is applied to a *copy* of the real
+index, the suite runs with ``GIT_INDEX_FILE`` pointing at that copy, and the
+real index is only touched once the gate is green. This module specifies that
+contract (test-first) and keeps it pinned now that F6 has landed:
 
 * **AC1/AC4 — no partial commit on abort.** A failing gate (test failure,
   aborted fix loop, or an exception escaping the gate) creates no commit:
@@ -40,20 +39,17 @@ detector's canary: it proves the probe really captures the gate's suite
 environment, so an unset ``GIT_INDEX_FILE`` means "no temp index in play"
 rather than "the detector is broken".
 
-Tracer-bullet convention
-------------------------
-``test_every_exit_path_uses_and_removes_the_temporary_index`` is
-``xfail(strict=True)`` until F6 lands: today the gate runs the suite against
-the loose working tree with no temp index at all, so the "a temp index was
-used" assertion cannot hold. When F6 lands and cleans up correctly the test
-passes and — being a strict xfail — fails loudly as an ``XPASS``, forcing the
-marker's removal in the F6 work item (the same convention as the F1/F2 markers
-in ``test_finish_gate_commit_tree.py`` and F4's in
-``test_finish_gate_provenance.py``).
+Tracer-bullet history
+---------------------
+``test_every_exit_path_uses_and_removes_the_temporary_index`` was
+``xfail(strict=True)`` until F6 landed (the gate then ran the suite against the
+loose working tree with no temp index at all). F6 landed the staging and its
+marker was removed here — an XPASS under the strict marker is what forced the
+removal.
 
-The invariant tests themselves pass **today** and must keep passing after F6:
-they are the regression guards against a fix that stages into the real index
-on a failure path, or that leaks its temp index.
+The invariant tests passed before F6 and still pass after it: they are the
+regression guards against a fix that stages into the real index on a failure
+path, or that leaks its temp index.
 
 Hermetic by construction: a temp git repository (``git_sandbox`` factories, no
 environment leakage) plus the F1 module's stubbed finish boundaries (build,
@@ -581,16 +577,6 @@ def test_crash_after_the_suite_leaves_real_index_worktree_and_head_untouched(
 
 
 @pytest.mark.parametrize("exit_path", ["success", "failure", "abort", "exception"])
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F6 / SA-0MVQHVGFR006W8LG not landed): the finish "
-        "gate runs the suite against the loose working tree and never creates "
-        "a temporary index, so there is nothing to remove. Temp-index staging "
-        "exports GIT_INDEX_FILE and removes the file on every exit path; "
-        "remove this marker then (the F1/F2/F4 tracer-bullet convention)."
-    ),
-)
 def test_every_exit_path_uses_and_removes_the_temporary_index(
     exit_path, tmp_path, monkeypatch
 ):

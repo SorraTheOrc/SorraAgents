@@ -15,26 +15,23 @@ only the external boundaries (build, git commit/push, worktree removal, the
 ``wl``/``StatusLifecycle`` store) are stubbed, in the style of
 ``test_finish_no_diff_status.py``.
 
-Captured baseline (pre-fix — F6 / SA-0MVQHVGFR006W8LG not landed)
------------------------------------------------------------------
-The gate reports::
+Captured baseline (pre-fix) and the fixed behaviour
+---------------------------------------------------
+Before F6 (SA-0MVQHVGFR006W8LG) the gate reported::
 
     {"scope": "full", "success": true}
 
-while the tree the commit produces is red: staging the change set exactly as
+while the tree the commit produces was red: staging the change set exactly as
 ``git_commit`` does (``git add -A``) makes the guard test fail by name. That
-green verdict on a red commit tree is the bug evidence
-(``test_baseline_capture_false_green_at_finish_gate_entry_point``).
+green verdict on a red commit tree was the bug evidence.
 
-After F6 (temp-index staging)
------------------------------
-The same fixture must fail the gate red with the guard test named in the gate
-``failures``. ``test_gate_fails_red_naming_the_guard_test_after_fix`` pins that
-expectation as a strict ``xfail`` — the repository's tracer-bullet convention
-(see ``skill/shared/tests/test_git_sandbox.py`` and
-``tests/test_repository_override_isolation.py``). F6 removes the marker when
-the temp-index gate lands, at which point the baseline capture above must be
-inverted to assert the red verdict instead.
+After F6 (temp-index staging) the same fixture fails the gate red with the
+guard test named in the gate ``failures``, because the suite now runs against
+the tree the commit will produce (the change set is staged into a temporary
+index and ``GIT_INDEX_FILE`` is exported for the suite). Both halves are
+pinned: ``test_gate_fails_red_naming_the_guard_test_after_fix`` and the
+inverted historical reproduction
+(``test_baseline_capture_false_green_at_finish_gate_entry_point``).
 
 Hermetic by construction: a temp git repository (``git_sandbox`` factories, no
 environment leakage) plus stubbed boundaries — no real worklog, no real main
@@ -268,42 +265,45 @@ def _assert_real_gate_execution(attempt: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC1 — baseline capture of the pre-fix cross-tree false green
+# AC1 — the historical cross-tree false green, now inverted by the fix
 # ---------------------------------------------------------------------------
 
 
 def test_baseline_capture_false_green_at_finish_gate_entry_point(tmp_path, monkeypatch):
-    """Captured bug evidence: the gate reports ``{"scope": "full", "success": true}``
-    for a change set whose committed tree is red.
+    """The gate no longer reports a green verdict for a red commit tree.
 
     The fixture change set adds ``content/episode-1.md``, which the suite's
-    tracked-file guard rejects — but only once the commit stages it. Because
-    ``phase_finish`` tests before it stages, today's gate sees the loose
-    working tree (``git ls-files`` does not list the new file) and reports a
-    green full-scope run. Staging the change set exactly as ``git_commit``
-    does turns the same suite red, proving the verdict was produced against a
-    different tree than the commit (parent AC1).
+    tracked-file guard rejects — but only once the commit stages it. Before
+    the temp-index gate this was the captured false green: the gate saw the
+    loose working tree (``git ls-files`` does not list the new file) and
+    reported a green full-scope run while the committed tree was red.
 
-    F6 (SA-0MVQHVGFR006W8LG) inverts this expectation: when the temp-index
-    gate lands, replace this assertion with the red-verdict assertion in
-    ``test_gate_fails_red_naming_the_guard_test_after_fix`` and drop that
-    test's ``xfail`` marker.
+    F6 (SA-0MVQHVGFR006W8LG) landed temp-index staging, so the same fixture
+    now fails the gate **red**, naming the guard test: the suite runs against
+    the tree the commit will produce. The former baseline assertion is
+    inverted here deliberately — this test is the historical reproduction and
+    keeps both halves of the story (red gate now, staging makes the tree red
+    either way) in one place.
     """
     repo = _build_fixture_repo(tmp_path)
 
     report = _finish_gate_report(repo, tmp_path, monkeypatch)
 
-    assert report["success"] is True, report["message"]
+    assert report["success"] is False, (
+        "the gate must reject a change set its own suite rejects once "
+        f"committed; got {report}"
+    )
     attempt = _gate_test_attempt(report)
     _assert_real_gate_execution(attempt)
-    # The captured pre-fix verdict — the false green, verbatim.
     assert {
         "scope": attempt["scope"],
         "success": attempt["success"],
-    } == {"scope": "full", "success": True}
+    } == {"scope": "full", "success": False}
+    failures = [str(failure) for failure in attempt["failures"]]
+    assert any(GUARD_TEST_NAME in failure for failure in failures), failures
 
     # The tree the commit produces is red the moment it is staged: this is
-    # exactly what `git_commit` runs after the gate.
+    # exactly what `git_commit` runs after the gate — and the gate now agrees.
     gs.run_git(repo, ["add", "-A"], check=True)
     committed_tree = _run_fixture_suite(repo)
     assert committed_tree.returncode == 1, committed_tree.stdout
@@ -315,15 +315,6 @@ def test_baseline_capture_false_green_at_finish_gate_entry_point(tmp_path, monke
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F6 / SA-0MVQHVGFR006W8LG not landed): the finish "
-        "gate tests the loose working tree, so the added content file is "
-        "invisible to the git ls-files guard. Temp-index staging makes the "
-        "gate fail red and names the guard test; remove this marker then."
-    ),
-)
 def test_gate_fails_red_naming_the_guard_test_after_fix(tmp_path, monkeypatch):
     """With temp-index staging the identical fixture fails the finish gate red.
 
@@ -561,22 +552,30 @@ def test_parity_verdict_reflects_the_gate_tree_when_the_suite_genuinely_runs(
 
 
 # ---------------------------------------------------------------------------
-# F2 AC1(b) — baseline capture of the parity false pass (foreign cache entry)
+# F2 AC1(b) — the historical parity false pass, now inverted by the fix
 # ---------------------------------------------------------------------------
 
 
 def test_baseline_capture_parity_false_pass_from_a_foreign_cache_entry(
     tmp_path, monkeypatch
 ):
-    """Captured bug evidence: a green verdict served for a red parity tree.
+    """The foreign green verdict is no longer served for the red parity tree.
 
     A green entry recorded by a genuine run against the rebuilt-metadata tree
-    is served for the lagging-metadata tree because generated metadata is
-    invisible to the loose fingerprint. The gate reports green while the same
-    tree's suite is red on disk — the parity false pass from OSL-0MVK2F1Z300996SA
-    reproduced at the finish-gate entry point without relying on untracked
-    files. F7 (SA-0MVQHVHXI007PQAB) inverts this expectation: see
-    ``test_parity_foreign_cache_entry_misses_once_f7_lands``.
+    used to be served for the lagging-metadata tree because generated metadata
+    is invisible to the loose fingerprint — the parity false pass from
+    OSL-0MVK2F1Z300996SA (F2). After F6 (SA-0MVQHVGFR006W8LG) the gate stages
+    the change set into a temporary index and exports ``GIT_INDEX_FILE`` for
+    the suite, so its cache lookup is keyed by the **staged** state rather
+    than the loose one: the loose-fingerprint foreign entry misses, the parity
+    suite genuinely runs against the gate's own tree, and the verdict is red
+    with the parity test named.
+
+    The premise of the original reproduction is still asserted (generated,
+    gitignored metadata is invisible to the loose fingerprint), and the
+    foreign entry is left untouched in the cache — it was not served. F7
+    (SA-0MVQHVHXI007PQAB) still binds verdict acceptance to the would-be-commit
+    **tree** SHA; see ``test_parity_foreign_cache_entry_misses_once_f7_lands``.
     """
     repo = _build_parity_fixture_repo(tmp_path)
     primed, command = _record_foreign_green_verdict(repo)
@@ -585,24 +584,18 @@ def test_baseline_capture_parity_false_pass_from_a_foreign_cache_entry(
 
     report = _finish_gate_report(repo, tmp_path, monkeypatch)
 
-    assert report["success"] is True, report.get("message")
+    assert report["success"] is False, (
+        "a verdict recorded for a different tree must not be served for the "
+        f"gate's tree; got {report}"
+    )
     attempt = _gate_test_attempt(report)
     _assert_real_gate_execution(attempt)
-    # The captured finding, verbatim: full scope, green — for a red tree.
     assert {
         "scope": attempt["scope"],
         "success": attempt["success"],
-    } == {"scope": "full", "success": True}
-
-    # The verdict was SERVED, not produced: no new entry was recorded.
-    served_after = test_cache.query_cached(command, cwd=str(repo))
-    assert served_after is not None
-    assert served_after["completed_at"] == served_before["completed_at"]
-
-    # ... while the gate's own tree is red the moment its suite actually runs.
-    genuine = _run_fixture_suite(repo)
-    assert genuine.returncode == 1, genuine.stdout
-    assert PARITY_TEST_NAME in genuine.stdout
+    } == {"scope": "full", "success": False}
+    failures = [str(failure) for failure in attempt["failures"]]
+    assert any(PARITY_TEST_NAME in failure for failure in failures), failures
 
 
 # ---------------------------------------------------------------------------

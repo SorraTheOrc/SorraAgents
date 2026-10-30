@@ -59,6 +59,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import logging
@@ -365,6 +366,9 @@ def _handle_signal_cleanup(signum: int) -> None:
         # ``os._exit`` closes the descriptor): no stale holder survives a
         # signal, and the release is observable in tests.
         _release_child_lock()
+        # The suite may have been running against the finish gate's temporary
+        # index; a signal must not leave that file (or its lock) behind.
+        _remove_gate_index(_gate_index_global)
 
 
 def _signal_handler(signum: int, frame: Any) -> None:
@@ -420,6 +424,7 @@ def run_cmd(
     timeout: int = 300,
     env: dict[str, str] | None = None,
     start_new_session: bool = False,
+    keep_git_index: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run a shell command and return the result.
 
@@ -434,6 +439,11 @@ def run_cmd(
             process group so process-group kills performed inside it can
             never reach the caller or its siblings
             (SA-0MVJC5KNT0044L2B).
+        keep_git_index: If True, inherit an ambient ``GIT_INDEX_FILE``. By
+            default it is dropped so the finish gate's own git commands (and
+            any non-suite command it spawns) always act on the real index
+            while the gate exports a temporary index for the suite
+            (SA-0MVQHVGFR006W8LG). Suite runners opt in explicitly.
 
     Returns:
         ``subprocess.CompletedProcess``
@@ -443,6 +453,10 @@ def run_cmd(
         ``subprocess.CalledProcessError`` if *check* is True and exit != 0.
     """
     LOG.debug("Running: %s (cwd=%s)", " ".join(cmd), cwd or os.getcwd())
+    child_env = dict(os.environ)
+    if not keep_git_index:
+        child_env.pop("GIT_INDEX_FILE", None)
+    child_env.update(env or {})
     return subprocess.run(
         cmd,
         cwd=cwd,
@@ -450,7 +464,7 @@ def run_cmd(
         text=True,
         check=check,
         timeout=timeout,
-        env={**os.environ, **(env or {})},
+        env=child_env,
         start_new_session=start_new_session,
     )
 
@@ -2290,6 +2304,323 @@ def git_worktree_add(
         timeout=120,
     )
     return result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Temp-index staging: test the tree the commit will produce
+# (SA-0MVQHVGFR006W8LG, F6 of SA-0MVL2NH1G0094FA2)
+# ---------------------------------------------------------------------------
+
+#: Temporary finish-gate index names. The prefix is also the marker the abort
+#: contract's artefact detector looks for, so it is part of the contract.
+GATE_INDEX_PREFIX = "implement-gate-"
+GATE_INDEX_SUFFIX = ".index"
+
+#: The temporary index currently exported to a running suite, or None. Kept
+#: module-level so the signal handler can remove it on SIGTERM/SIGINT.
+_gate_index_global: str | None = None
+
+
+def _remove_gate_index(index_path: str | None) -> None:
+    """Best-effort removal of a temporary finish-gate index (and its lock).
+
+    Shared by the staging context manager's ``finally`` and the signal
+    handler, so no exit path can leave an index-shaped artefact in the git
+    directory (the F5 abort contract, SA-0MVQHVCRE0070YO6).
+    """
+    if not index_path:
+        return
+    for candidate in (index_path, f"{index_path}.lock"):
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:  # noqa: BLE001 - cleanup is best-effort
+            LOG.warning(
+                "Could not remove the finish gate's temporary index %s: %s",
+                candidate,
+                exc,
+            )
+
+
+def _run_git_plumbing(
+    cwd: str,
+    args: list[str],
+    *,
+    index_file: str | None = None,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess:
+    """Run ``git <args>`` in *cwd* against an explicitly chosen index.
+
+    The finish gate's temp-index plumbing must act on the real worktree and on
+    a *specific* index file, never on whatever ``GIT_INDEX_FILE`` happens to be
+    exported into this process (the gate exports it while the suite runs).
+    ``index_file`` is therefore authoritative: a path is exported to the child,
+    and ``None`` **removes** any ambient value so the real index is used.
+
+    Deliberately not routed through :func:`run_cmd`: these are fast, local
+    plumbing calls that must reach the real repository even when a caller (or a
+    test harness) stubs the surrounding git boundary.
+    """
+    env = dict(os.environ)
+    env.pop("GIT_INDEX_FILE", None)
+    if index_file is not None:
+        env["GIT_INDEX_FILE"] = index_file
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def _git_absolute_git_dir(cwd: str) -> str:
+    """The absolute git directory of the repository/worktree at *cwd*."""
+    proc = _run_git_plumbing(cwd, ["rev-parse", "--absolute-git-dir"])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError(
+            "Cannot resolve the git directory for the finish gate's "
+            f"temporary index at {cwd}: "
+            f"{proc.stderr.strip() or 'git rev-parse failed'}"
+        )
+    return proc.stdout.strip()
+
+
+@dataclass
+class WouldBeCommitIndex:
+    """The temporary index the finish gate tests the would-be-commit tree in.
+
+    ``tree`` is the ``git write-tree`` SHA of the change set staged into the
+    temporary index — the tree the suite therefore ran against. The real index
+    and the working tree are never modified while the gate runs.
+    """
+
+    worktree: str
+    index_path: str
+    real_index: str
+    tree: str
+    staged_paths: list[str]
+
+    def summary(self) -> dict[str, Any]:
+        """Report-shaped summary of the tested tree (recorded by finish)."""
+        return {
+            "tree": self.tree,
+            "index_path": self.index_path,
+            "real_index": self.real_index,
+            "staged_paths": list(self.staged_paths),
+            "staged_count": len(self.staged_paths),
+        }
+
+    def verify_unchanged(self) -> dict[str, Any]:
+        """Re-derive the temporary index's tree after the suite has run.
+
+        A fixture (or a child ``git`` invocation) that honoured the inherited
+        ``GIT_INDEX_FILE`` and staged into it would change the tree the gate
+        believes it tested. Comparing the tree before and after makes that
+        unattributable verdict detectable instead of silently accepted.
+        """
+        proc = _run_git_plumbing(
+            self.worktree, ["write-tree"], index_file=self.index_path
+        )
+        current = proc.stdout.strip()
+        return {
+            "unchanged": proc.returncode == 0 and current == self.tree,
+            "tree": current,
+            "expected": self.tree,
+        }
+
+
+@contextlib.contextmanager
+def would_be_commit_index(cwd: str) -> Iterator[WouldBeCommitIndex]:
+    """Stage the pending change set into a copy of the real index.
+
+    The finish gate must validate the exact tree the commit will produce, not
+    the loose working tree (SA-0MVL2NH1G0094FA2). Before the suite runs, the
+    real index is copied to a temporary file, the change set is applied to the
+    copy (``git add -A`` under ``GIT_INDEX_FILE``), and ``GIT_INDEX_FILE`` is
+    exported for the duration so every child ``git`` command the suite spawns
+    — including ``git ls-files`` guards inside tests — sees the staged file
+    set. ``GIT_INDEX_FILE`` survives the test skill's repository-override
+    scrub (F3, SA-0MVQHV9Y3001RNNW) for exactly that reason.
+
+    The temporary index is removed and the previous ``GIT_INDEX_FILE`` value
+    restored on **every** exit path (success, gate failure, fix-loop abort,
+    exception), and the real index is never written: a failed gate leaves no
+    residual staging (F5, SA-0MVQHVCRE0070YO6).
+
+    Raises:
+        RuntimeError: when the index cannot be prepared or the change set
+            cannot be staged — with no temporary index and no environment
+            change left behind.
+    """
+    global _gate_index_global
+
+    git_dir = Path(_git_absolute_git_dir(cwd))
+    real_index = git_dir / "index"
+    fd, index_path = tempfile.mkstemp(
+        prefix=GATE_INDEX_PREFIX, suffix=GATE_INDEX_SUFFIX, dir=str(git_dir)
+    )
+    os.close(fd)
+    _gate_index_global = index_path
+    previous_index_env = os.environ.get("GIT_INDEX_FILE")
+    try:
+        if real_index.exists():
+            shutil.copyfile(real_index, index_path)
+        else:
+            read_tree = _run_git_plumbing(
+                cwd, ["read-tree", "HEAD"], index_file=index_path
+            )
+            if read_tree.returncode != 0:
+                raise RuntimeError(
+                    "Cannot seed the finish gate's temporary index from "
+                    f"HEAD: {read_tree.stderr.strip() or 'git read-tree failed'}"
+                )
+
+        add = _run_git_plumbing(cwd, ["add", "-A"], index_file=index_path)
+        if add.returncode != 0:
+            raise RuntimeError(
+                "Cannot stage the change set in the finish gate's temporary "
+                f"index: {add.stderr.strip() or 'git add -A failed'}"
+            )
+
+        write_tree = _run_git_plumbing(cwd, ["write-tree"], index_file=index_path)
+        if write_tree.returncode != 0 or not write_tree.stdout.strip():
+            raise RuntimeError(
+                "Cannot compute the would-be-commit tree of the finish gate's "
+                f"temporary index: "
+                f"{write_tree.stderr.strip() or 'git write-tree failed'}"
+            )
+
+        staged = _run_git_plumbing(
+            cwd,
+            ["diff", "--cached", "--name-only", "HEAD"],
+            index_file=index_path,
+        )
+
+        os.environ["GIT_INDEX_FILE"] = index_path
+        LOG.info(
+            "Finish gate: testing the would-be-commit tree %s "
+            "(temporary index %s)",
+            write_tree.stdout.strip(),
+            index_path,
+        )
+
+        yield WouldBeCommitIndex(
+            worktree=cwd,
+            index_path=index_path,
+            real_index=str(real_index),
+            tree=write_tree.stdout.strip(),
+            staged_paths=[
+                line.strip() for line in staged.stdout.splitlines() if line.strip()
+            ],
+        )
+    finally:
+        if previous_index_env is None:
+            os.environ.pop("GIT_INDEX_FILE", None)
+        else:
+            os.environ["GIT_INDEX_FILE"] = previous_index_env
+        _remove_gate_index(index_path)
+        _gate_index_global = None
+
+
+def run_gate_suite(
+    cwd: str, scope: str = "changed", base_ref: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the finish gate's suite against the would-be-commit tree.
+
+    Returns ``(test_result, summary)``: the normal ``run_tests`` result and the
+    temp-index summary (recorded under ``steps.would_be_commit``). When the
+    suite mutated the temporary index the verdict is invalid — a test staged
+    into the inherited ``GIT_INDEX_FILE`` instead of its own repository's
+    index — so the result is forced red with an explanatory notice rather than
+    being attributed to a tree that was never the one tested.
+    """
+    with would_be_commit_index(cwd) as gate_index:
+        result = run_tests(cwd, scope=scope, base_ref=base_ref)
+        integrity = gate_index.verify_unchanged()
+        summary = gate_index.summary()
+
+    summary["index_unchanged"] = integrity["unchanged"]
+    if integrity["unchanged"]:
+        return result, summary
+
+    notice = (
+        "gate evidence invalid: the temporary index changed while the suite "
+        f"ran (tested tree {integrity['expected']}, index now "
+        f"{integrity['tree'] or 'unreadable'}). A test staged into the "
+        "inherited GIT_INDEX_FILE instead of its own repository's index; the "
+        "verdict cannot be attributed to the would-be-commit tree. Fixture "
+        "git commands must use a hermetic environment (for example "
+        "shared.git_sandbox.fixture_git_env())."
+    )
+    LOG.error("Finish gate: %s", notice)
+    return (
+        {
+            **result,
+            "success": False,
+            "notices": [*(result.get("notices") or []), notice],
+        },
+        summary,
+    )
+
+
+def stage_tested_tree(cwd: str, tested_tree: str | None) -> dict[str, Any]:
+    """Stage the change set in the **real** index and prove it is the tested tree.
+
+    Called only once the gate is green: the change set is staged exactly as
+    :func:`git_commit` does (``git add -A``) and ``git write-tree`` is compared
+    with the tree the suite ran against, so a commit can never be created for
+    a tree the suite did not test. On a mismatch the just-staged change set is
+    unstaged again, leaving no residual staging (the F5 abort contract).
+
+    Returns a report dict with ``success``, ``tree``, ``expected`` and, on
+    failure, an actionable ``message``.
+    """
+    add = _run_git_plumbing(cwd, ["add", "-A"])
+    if add.returncode != 0:
+        return {
+            "success": False,
+            "expected": tested_tree,
+            "message": "Could not stage the change set in the real index: "
+            f"{add.stderr.strip() or 'git add -A failed'}",
+        }
+
+    write_tree = _run_git_plumbing(cwd, ["write-tree"])
+    if write_tree.returncode != 0 or not write_tree.stdout.strip():
+        return {
+            "success": False,
+            "expected": tested_tree,
+            "message": "Could not compute the committed tree: "
+            f"{write_tree.stderr.strip() or 'git write-tree failed'}",
+        }
+
+    actual = write_tree.stdout.strip()
+    if tested_tree and actual != tested_tree:
+        # Leave no residual staging: the gate refused this tree, so the real
+        # index must be as untouched as an aborted gate leaves it.
+        _run_git_plumbing(cwd, ["reset", "--quiet"])
+        return {
+            "success": False,
+            "expected": tested_tree,
+            "tree": actual,
+            "message": (
+                "The commit's tree does not match the tree the finish gate "
+                f"tested (tested {tested_tree}, would commit {actual}). The "
+                "change set was unstaged again and no commit was created; "
+                "re-run `implement.py finish` after investigating the tree "
+                "drift (a build step or a concurrent writer changed files "
+                "after the gate ran)."
+            ),
+        }
+    return {
+        "success": True,
+        "tree": actual,
+        "expected": tested_tree,
+        "verified": bool(tested_tree) and actual == tested_tree,
+    }
 
 
 def git_commit(cwd: str, message: str) -> bool:
@@ -4202,6 +4533,7 @@ def _shell_command_runner(
         check=False,
         timeout=timeout,
         capture=True,
+        keep_git_index=True,
     )
 
 
@@ -4653,7 +4985,8 @@ def _run_commands_direct(
             cwd=cwd,
             timeout=_resolve_test_timeout(cwd),
             runner=lambda command, cwd_, timeout_: run_cmd(
-                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True,
+                keep_git_index=True,
             ),
             scope=scope,
         )
@@ -4931,7 +5264,8 @@ def run_tests(cwd: str, scope: str = "changed",
             cwd=cwd,
             timeout=_resolve_test_timeout(cwd),
             runner=lambda command, cwd_, timeout_: run_cmd(
-                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True,
+                keep_git_index=True,
             ),
             scope="full",
         )
@@ -4944,7 +5278,8 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
                 runner=lambda command, cwd_, timeout_: run_cmd(
-                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True,
+                    keep_git_index=True,
                 ),
                 scope="full",
             )
@@ -4971,7 +5306,8 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
                 runner=lambda command, cwd_, timeout_: run_cmd(
-                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True,
+                    keep_git_index=True,
                 ),
                 scope="full",
             ),
@@ -6172,9 +6508,15 @@ def phase_finish(
         return report
 
     # ── Step 3: Test with fix-and-re-run loop ──────────────────────
-    LOG.info("Running test suite (changed scope)...")
+    # The suite runs against the **would-be-commit tree**: the change set is
+    # staged into a temporary copy of the index and exported as
+    # ``GIT_INDEX_FILE``, so tracked-file guards (``git ls-files``) see exactly
+    # what the commit will produce (SA-0MVQHVGFR006W8LG). The real index and
+    # the working tree are not touched until the gate is green.
+    LOG.info("Running test suite (changed scope, would-be-commit tree)...")
     test_attempts = 0
-    test_result = run_tests(worktree_path, scope="changed")
+    test_result, gate_tree = run_gate_suite(worktree_path, scope="changed")
+    report["steps"]["would_be_commit"] = gate_tree
     report["steps"]["tests"] = []
     report["steps"]["tests"].append({
         "attempt": test_attempts + 1,
@@ -6255,7 +6597,8 @@ def phase_finish(
         # Re-run tests
         LOG.info("Re-running test suite (attempt %d/%d, changed scope)...",
                  test_attempts + 1, max_retry)
-        test_result = run_tests(worktree_path, scope="changed")
+        test_result, gate_tree = run_gate_suite(worktree_path, scope="changed")
+        report["steps"]["would_be_commit"] = gate_tree
         report["steps"]["tests"].append({
             "attempt": test_attempts + 1,
             "success": test_result["success"],
@@ -6353,6 +6696,21 @@ def phase_finish(
         with StatusLifecycle(
             work_item_id, target_stage="in_review", clear_assignee_on_exit=True
         ):
+            # ── Step 3d: Prove the real index matches the tested tree ─────
+            # The gate ran against a temporary index. Stage the change set in
+            # the real index exactly as ``git_commit`` does and assert its
+            # ``write-tree`` equals the tree the suite ran against, so no
+            # commit can be created for a tree that was never tested. On a
+            # mismatch ``stage_tested_tree`` unstages again and raises below,
+            # leaving the abort contract intact (SA-0MVQHVGFR006W8LG).
+            staged = stage_tested_tree(worktree_path, gate_tree.get("tree"))
+            report["steps"]["would_be_commit_assertion"] = staged
+            if not staged["success"]:
+                raise RuntimeError(staged["message"])
+            LOG.info(
+                "Finish gate tree verified: committing tree %s", staged["tree"]
+            )
+
             # ── Step 4: Commit ─────────────────────────────────────────────
             commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"
             LOG.info("Committing changes...")
