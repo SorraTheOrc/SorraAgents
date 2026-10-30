@@ -564,6 +564,11 @@ Regression coverage: `tests/test_repository_override_isolation.py` (victim-repo
 proof for every production path, plus an assertion that `refs/heads/dev` and
 `refs/remotes/origin/dev` cannot be moved by a fixture),
 `skill/shared/tests/test_git_sandbox.py` (scrub helper contract),
+`tests/test_git_index_file_env.py` (**pass-through** contract: `GIT_INDEX_FILE`
+is deliberately *not* an override and must survive the scrub so the finish
+gate's temporary would-be-commit index reaches child `git ls-files` commands;
+the file also fails if the name is ever added to
+`REPOSITORY_OVERRIDE_ENV_VARS`, SA-0MVQHV9Y3001RNNW),
 `skill/audit/tests/test_audit_runner_concurrency.py` (host cap + orphan
 detection), `tests/test_run_tests_cache.py` (strict release gate,
 including the worktree-hook exemption and the non-worktree refusal,
