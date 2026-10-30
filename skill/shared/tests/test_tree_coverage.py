@@ -483,6 +483,218 @@ Some text but no bullets.
         acs = extract_acceptance_criteria(desc)
         assert acs == ["Indented bullet one", "Indented bullet two"]
 
+    # ------------------------------------------------------------------
+    # Hard-wrapped (multi-line) AC bullets: continuation joining
+    # LP-0MVSB0E7W003IMH4
+    # ------------------------------------------------------------------
+
+    def test_hard_wrapped_bullet_yields_one_complete_ac(self):
+        """A bullet wrapped over N physical lines yields exactly one AC
+        containing the whole sentence, with whitespace collapsed."""
+        desc = """## Acceptance Criteria
+- A ≥24 h post-deploy window is analysed with `proxy-usage-analysis` and reports,
+  next to the baselines above: `local_idle_admit` count, local serve share,
+  `large_context_bypass` count, remote fallback count.
+- Second criterion stays on one line.
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            (
+                "A ≥24 h post-deploy window is analysed with `proxy-usage-analysis` "
+                "and reports, next to the baselines above: `local_idle_admit` "
+                "count, local serve share, `large_context_bypass` count, remote "
+                "fallback count."
+            ),
+            "Second criterion stays on one line.",
+        ]
+
+    def test_mixed_wrapped_and_unwrapped_bullets_and_wrapped_ordered_item(self):
+        """Wrapped and unwrapped bullets and a wrapped ordered item interleave
+        in document order, each wrapping to one complete entry."""
+        desc = """## Acceptance Criteria
+- Unwrapped bullet
++ Wrapped bullet that continues
+  onto a second line
+1. Wrapped ordered item that continues
+   onto a second line
+2) Unwrapped ordered item
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Unwrapped bullet",
+            "Wrapped bullet that continues onto a second line",
+            "Wrapped ordered item that continues onto a second line",
+            "Unwrapped ordered item",
+        ]
+
+    def test_wrapped_bullet_with_nested_sub_list(self):
+        """A nested sub-list is excluded as an AC and its text is not
+        appended to the parent AC, which stays complete."""
+        desc = """## Acceptance Criteria
+- Parent criterion wrapped across
+  two lines
+  - Nested detail that must not join the parent
+    - Deeper nested detail that must not join either
+  - Another nested detail
+- Second criterion
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Parent criterion wrapped across two lines",
+            "Second criterion",
+        ]
+
+    def test_hyphen_broken_word_rejoined_without_space(self):
+        """A wrapping hyphen attached to the preceding word is rejoined without
+        a space; a hyphen preceded by whitespace keeps the space."""
+        desc = """## Acceptance Criteria
+- Latency for high-
+  priority requests is unchanged within noise.
+- A spaced dash -
+  keeps the separator space.
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Latency for high-priority requests is unchanged within noise.",
+            "A spaced dash - keeps the separator space.",
+        ]
+
+    def test_blank_line_terminates_entry(self):
+        """An unmarked prose paragraph after a blank line is not merged into
+        the preceding AC."""
+        desc = """## Acceptance Criteria
+- Criterion one wrapped
+  over two lines
+
+This prose paragraph must not be merged into the bullet above.
+
+- Criterion two
+- Criterion three that also wraps
+  onto a second line
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Criterion one wrapped over two lines",
+            "Criterion two",
+            "Criterion three that also wraps onto a second line",
+        ]
+
+    def test_fenced_code_block_content_not_appended(self):
+        """Lines inside a fenced code block are not appended to an AC."""
+        desc = """## Acceptance Criteria
+- Criterion with a traversal example
+```bash
+wl next --json
+```
+- Criterion two
+  ```python
+  print('nested fence content')
+  ```
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["Criterion with a traversal example", "Criterion two"]
+        assert not any("wl next" in ac for ac in acs)
+        assert not any("nested fence content" in ac for ac in acs)
+
+    def test_table_rows_not_appended(self):
+        """Markdown table rows are not appended to an AC entry."""
+        desc = """## Acceptance Criteria
+- Criterion before the table
+| Metric | Target |
+|---|---|
+| p50 | 100 ms |
+- Criterion after the table
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["Criterion before the table", "Criterion after the table"]
+
+    def test_thematic_break_and_lone_marker_not_appended(self):
+        """A thematic break or a lone list marker terminates the open entry and
+        is not appended to it (anti-over-merge guard)."""
+        desc = """## Acceptance Criteria
+- Criterion one wraps
+  onto a second line
+---
+- Criterion two
+-
+- Criterion three
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "Criterion one wraps onto a second line",
+            "Criterion two",
+            "Criterion three",
+        ]
+
+    def test_heading_inside_ac_section_not_appended(self):
+        """A deeper heading inside the section flushes but is not appended."""
+        desc = """## Acceptance Criteria
+- Criterion one
+### Notes
+- Criterion two
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["Criterion one", "Criterion two"]
+
+    def test_wrapped_entry_whitespace_collapsed(self):
+        """Intra-entry whitespace across wrapped lines collapses to single
+        spaces."""
+        desc = """## Acceptance Criteria
+- Criterion   wrapped with   irregular
+  spacing   inside
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == ["Criterion wrapped with irregular spacing inside"]
+
+    def test_single_line_entry_text_preserved_verbatim(self):
+        """An unwrapped single-line entry keeps its interior spacing exactly as
+        before (no whitespace normalisation for single-line ACs)."""
+        desc = """## Acceptance Criteria
+- AC with  double  interior spaces
+1. Numbered with   triple   spaces
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            "AC with  double  interior spaces",
+            "Numbered with   triple   spaces",
+        ]
+
+    def test_wrapped_ordered_items_real_world_shape(self):
+        """Regression for LP-0MVGHXD59008UOUD: five hard-wrapped ordered ACs
+        with 3-space continuation indent, blank-line boundaries and one
+        hyphen-broken word extract as five complete, untruncated ACs."""
+        desc = """## Acceptance Criteria
+
+1. A ≥24 h post-deploy window is analysed with `proxy-usage-analysis` and reports,
+   next to the baselines above: `local_idle_admit` count, local serve share,
+   `large_context_bypass` count, remote fallback count.
+2. Idle-admitted requests' `dispatch_first_byte_ms` percentiles and total prefill
+   slot-seconds are reported and compared with non-idle local dispatches at the
+   same context bucket.
+3. `local_dispatch_denied` does not increase and no mid-stream timeouts
+   (`ReadTimeout`, `empty_response`) are attributable to idle-admitted requests.
+4. Interactive traffic is not harmed: p50/p90 `dispatch_first_byte_ms` for high-
+   priority requests is unchanged within noise.
+5. Either the override is confirmed worth enabling by default, or a concrete
+   follow-up records the tuning and why.
+
+## Risks / notes
+
+- An idle-admitted 120K prompt can hold a slot for minutes; unrelated prose.
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert len(acs) == 5
+        assert acs[0].endswith("remote fallback count.")
+        assert "same context bucket." in acs[1]
+        assert "`ReadTimeout`, `empty_response`" in acs[2]
+        assert "for high-priority requests is unchanged within noise." in acs[3]
+        assert acs[4] == (
+            "Either the override is confirmed worth enabling by default, or a "
+            "concrete follow-up records the tuning and why."
+        )
+        assert "unrelated prose" not in " ".join(acs)
+        assert [len(ac.split()) for ac in acs] == [26, 21, 15, 14, 18]
+
 
 # =========================================================================
 # 4. Coverage computation

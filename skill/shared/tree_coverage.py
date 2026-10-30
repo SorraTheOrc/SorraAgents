@@ -370,6 +370,12 @@ def _get_child_dependency_ids(
 # Ordered-list AC marker: ``1. text`` or ``1) text`` (any number of digits).
 _ORDERED_AC_RE = re.compile(r"^\d+[.)]\s+(.+)$")
 
+# Fenced-code-block delimiter (````` or ``~~~``); the fence's content is not AC text.
+_CODE_FENCE_RE = re.compile(r"^(```|~~~)")
+
+# A lone list marker or a thematic break: an entry boundary, never AC text.
+_AC_BOUNDARY_RE = re.compile(r"^(?:[-+*]|\d+[.)])$|^(?:[-*_]\s*){3,}$")
+
 
 def extract_acceptance_criteria(description: str) -> list[str]:
     """Extract acceptance criteria entries from a work item description.
@@ -383,11 +389,29 @@ def extract_acceptance_criteria(description: str) -> list[str]:
     Strips the leading list marker (``- `` / ``+ `` or the trailing ``digits.)``
     plus whitespace) and surrounding whitespace from each entry. Text after an
     ordered-list marker is kept verbatim, so bold-led items such as
-    ``1. **Title.** text`` yield ``**Title.** text``.
+    ``1. **Title.** text`` yield ``**Title.** text``; an unwrapped single-line
+    entry is returned exactly as written.
 
-    Only *top-level* list items are collected: a marker indented deeper than
-    the first AC marker is nested detail inside an AC item (a sub-list or
-    explanatory bullet), not an AC itself.
+    **Continuation joining (hard-wrapped bullets).** Only *top-level* list
+    items start an AC: a marker indented deeper than the first AC marker is
+    nested detail inside an AC item (a sub-list or explanatory bullet), not an
+    AC itself, and its text is never appended to the parent AC. A line with no
+    list marker (a wrapped continuation line) that is not blank, not a heading,
+    not a table row, and not inside a fenced code block is appended to the
+    open AC, so a bullet hard-wrapped over N physical lines yields exactly one
+    complete AC. Continuation lines are joined with a single space, except
+    where the accumulated text ends with a hyphen attached to the preceding
+    word (``high-`` + ``priority``), which is rejoined without a space; a
+    hyphen preceded by whitespace (``text -``) keeps the separating space.
+    Joined entries have intra-entry whitespace collapsed to single spaces.
+
+    **Entry boundaries.** An AC entry is flushed by the next top-level list
+    marker, by a blank line, by a heading, by a table row, by a code fence, by
+    a lone list marker or thematic break, or by the end of the section. Text
+    after a blank line is therefore never merged into the preceding AC.
+
+    **Ignored content.** Fenced code-block lines, markdown table rows, and
+    lone list markers / thematic breaks are never appended to an AC.
 
     Arguments:
         description: The work item description text.
@@ -398,34 +422,99 @@ def extract_acceptance_criteria(description: str) -> list[str]:
     lines = description.split("\n")
     acs: list[str] = []
     in_ac_section = False
+    in_code_fence = False
     # Leading-whitespace depth of the first AC marker; any marker indented
     # deeper is nested detail under an AC item, not a top-level AC.
     base_indent: int | None = None
+    # Lines accumulated for the AC entry currently being built (its first line
+    # plus any wrapped continuation lines).
+    pending: list[str] = []
+
+    def _flush() -> None:
+        """Close the pending AC entry, if any."""
+        if not pending:
+            return
+        acs.append(_join_ac_continuations(pending))
+        pending.clear()
 
     for line in lines:
         stripped = line.strip()
         # Check for the AC section header
         if re.match(r"^#+\s+Acceptance\s+Criteria", stripped, re.IGNORECASE):
+            # A repeated header terminates any open entry and re-enters.
+            _flush()
             in_ac_section = True
+            in_code_fence = False
+            continue
+        if not in_ac_section:
+            continue
+        # Fenced code blocks are not AC text (and end the open entry).
+        if _CODE_FENCE_RE.match(stripped):
+            _flush()
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
             continue
         # Exit the section if we hit another heading
-        if in_ac_section and re.match(r"^##\s+", stripped):
+        if re.match(r"^##\s+", stripped):
             break
-        if not in_ac_section:
+        if not stripped:
+            # A blank line terminates the current AC entry.
+            _flush()
+            continue
+        if stripped.startswith("|"):
+            # Markdown table row: not AC text, and ends the open entry.
+            _flush()
+            continue
+        if _AC_BOUNDARY_RE.match(stripped):
+            # A lone list marker or thematic break: ends the open entry and is
+            # itself not AC text.
+            _flush()
+            continue
+        if re.match(r"^#+\s", stripped):
+            # Deeper heading inside the section: ends the open entry.
+            _flush()
             continue
         # Collect AC entries: markdown bullets and ordered-list items
         ac_text = _strip_ac_list_marker(stripped)
-        if not ac_text:
+        if ac_text:
+            indent = len(line) - len(line.lstrip())
+            if base_indent is None:
+                base_indent = indent
+            _flush()
+            if indent > base_indent:
+                # Deeper-indented marker: nested detail under an AC item.
+                # It is not an AC and its text must not join the parent AC.
+                continue
+            pending.append(ac_text)
             continue
-        indent = len(line) - len(line.lstrip())
-        if base_indent is None:
-            base_indent = indent
-        if indent > base_indent:
-            # Deeper-indented marker: nested detail under an AC item.
-            continue
-        acs.append(ac_text)
+        # Unmarked continuation line: append it to the open AC entry.
+        if pending:
+            pending.append(stripped)
 
+    _flush()
     return acs
+
+
+def _join_ac_continuations(parts: list[str]) -> str:
+    """Join an AC's first line with its wrapped continuation lines.
+
+    Continuation lines are separated by a single space, except when the text
+    accumulated so far ends with a hyphen attached to the preceding word
+    (``high-`` + ``priority``), where the parts are rejoined without a space.
+    Multi-line entries have intra-entry whitespace collapsed to single spaces;
+    a single-line entry is returned unchanged so pre-existing behaviour is
+    preserved byte for byte.
+    """
+    if len(parts) == 1:
+        return parts[0]
+    joined = parts[0]
+    for part in parts[1:]:
+        if len(joined) > 1 and joined.endswith("-") and not joined[-2].isspace():
+            joined += part
+        else:
+            joined += " " + part
+    return re.sub(r"\s+", " ", joined).strip()
 
 
 def has_acceptance_criteria_section(description: str) -> bool:
