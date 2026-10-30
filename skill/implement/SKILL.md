@@ -688,6 +688,38 @@ python3 $(skill_path implement)/scripts/implement.py parent <parent-id>
   carries `children_processed` (per-child action/status), the started child
   (`next_child` plus its `worktree_path`/`branch`), or the parent
   advancement when every child is terminal.
+- **The invoked item is itself blocked** → when the parent's **own** outbound
+  (`depends-on`) blocker is unmet, or its own `status` is `blocked`, every
+  child is reported as `blocked-parent` and **nothing** is started: no child
+  claim, no worktree, no code. The report carries `parent_blocked_by` (blocker
+  ids + statuses), `parent_blocked_reason` (`outbound-dependency`,
+  `status-blocked`, or both joined by `+`), `blocked: true`, no `next_child`
+  and no `parent_advanced`; `success` stays true because a blocked wait is not
+  a failure. `drive` forwards the same fields and spawns no session. A
+  `blocked` status with no unmet recorded dependency is still honoured (never
+  silently overridden); the message names the remedy — `wl update <id>
+  --status open` — because `wl dep add` sets `blocked` automatically and
+  nothing clears it when the dependency completes.
+
+**The invoked item's own outbound edges gate starting
+(SA-0MVS1QS9J009DGPT).** `phase_parent`/`phase_drive` and `phase_start` all
+resolve `wl_dep_blockers(<the invoked item>)` before doing any work. An unmet
+(non-terminal) blocker — `_is_terminal_child` semantics, so `in_review`,
+`completed`, `done`, `deleted` and soft-deleted items are terminal — means the
+item waits. A producer's `depends-on` edge (or a `blocked` status) is therefore
+never silently overridden: a blocked epic can no longer start editing files an
+in-progress dependency still owns. This mirrors `wl next`, which skips
+dependency-blocked items.
+
+Scope of the gate: **same-project** edges (the same id prefix, e.g. `SA-` on
+`SA-`) gate. An edge to another project (e.g. `OSL-…` on an `SA-…` item) is a
+**coordination note**, reported in `coordination_blockers` and never blocking
+— that is the SA-0MSQBM2FK005NW1T assumption, clarified here: it covers
+*cross-project* edges only, **not** same-project edges recorded on the invoked
+parent itself. A child blocked by a same-project item outside the epic is
+reported as `blocked` (in `blocked_children`) and is not started; `phase_start`
+refuses the equivalent leaf case with the blocker list, before the claim, so no
+orphaned `in_progress` item and no worktree are left behind.
 
 Then implement that child by recursing into this procedure (steps 1–8), and
 re-run `implement.py parent <parent-id>`. The parent phase **finishes the
@@ -773,6 +805,16 @@ Guards (deterministic, in `phase_parent`):
 
 - **Dependency order** — a child `blocked` by another item is implemented
   only after its blockers; the chain is resolved dependency-order correct.
+- **The invoked item is never started while blocked** — the parent's own
+  outbound blockers and its own `blocked` status are resolved *before* any
+  child is classified; an unmet same-project outbound blocker or a `blocked`
+  status yields the dedicated `blocked` verdict (`parent_blocked_by`) and no
+  child worktree. `phase_start` applies the same outbound gate to a leaf,
+  before the claim.
+- **Cross-project edges are coordination notes** — an edge to another project
+  (different id prefix) never gates; it is reported in
+  `coordination_blockers` (parent/leaf report) or `external_blockers`
+  (per-child classification).
 - **Terminal children are never re-implemented** (skipped, reported).
 - **Held children are never raced** — a child whose per-work-item lock is held
   by another live session is reported as `skipped-held` (with `held_by`) and no
@@ -787,7 +829,10 @@ Guards (deterministic, in `phase_parent`):
   never regressed.
 - **Cycles fail fast** with a clear error (no infinite recursion).
 - **Blocked children wait** — a child is only started once every in-chain
-  blocker is terminal; otherwise it is reported in `blocked_children`.
+  blocker is terminal; otherwise it is reported in `blocked_children`. The
+  same applies to a same-project blocker outside the epic (reported with its
+  `blocked_by` payload) — cross-project blockers stay coordination notes and
+  never gate.
 - **No premature parent advance** — if any non-terminal child remains
   (in-progress elsewhere or blocked), the parent is not advanced; the phase
   reports waiting instead.

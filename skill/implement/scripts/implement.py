@@ -1124,6 +1124,116 @@ def _is_terminal_child(child: dict[str, Any]) -> bool:
     return _is_terminal_status(str(child.get("status", "")))
 
 
+#: ``parent_blocked_reason`` values for the invoked item's blocked verdict.
+PARENT_BLOCKED_REASON_DEPENDENCY = "outbound-dependency"
+PARENT_BLOCKED_REASON_STATUS = "status-blocked"
+
+#: Per-child action used when the invoked parent itself is blocked.
+ACTION_BLOCKED_PARENT = "blocked-parent"
+
+
+def _work_item_prefix(work_item_id: str) -> str:
+    """Return the project prefix of a work-item id (``SA`` for ``SA-0MVS1Q``).
+
+    The prefix before the first ``-`` identifies the worklog project, so two
+    ids with different prefixes belong to different projects.
+
+    Args:
+        work_item_id: A work-item id.
+
+    Returns:
+        The upper-cased prefix (empty when the id has no ``-``).
+    """
+    return work_item_id.split("-", 1)[0].strip().upper()
+
+
+def _is_same_project(owner_id: str, other_id: str) -> bool:
+    """Whether two work-item ids belong to the same worklog project.
+
+    A dependency edge to an item with a different prefix is a cross-project
+    coordination note rather than an orchestrator gate — the documented
+    assumption introduced with parent recursion (SA-0MSQBM2FK005NW1T).
+
+    Args:
+        owner_id: The item whose edges are being evaluated.
+        other_id: The id of the item on the other end of the edge.
+
+    Returns:
+        True when both ids share a non-empty project prefix.
+    """
+    prefix = _work_item_prefix(owner_id)
+    return bool(prefix) and prefix == _work_item_prefix(other_id)
+
+
+def _blocker_payload(blocker: dict[str, Any]) -> dict[str, str]:
+    """Render a dependency edge as a compact, JSON-friendly description.
+
+    Args:
+        blocker: An outbound edge dict from ``wl dep list``.
+
+    Returns:
+        A dict with ``id``, ``status`` and ``title`` string fields.
+    """
+    return {
+        "id": str(blocker.get("id", "")),
+        "status": str(blocker.get("status", "")),
+        "title": str(blocker.get("title", "")),
+    }
+
+
+def _format_blockers(blockers: list[dict[str, str]]) -> str:
+    """Render a blocker payload list as ``id (status), …`` for messages."""
+    return ", ".join(
+        f"{b.get('id', '?')} ({b.get('status') or 'unknown'})" for b in blockers
+    )
+
+
+def _outbound_gate(
+    work_item_id: str,
+    blockers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate the invoked item's **own** outbound (depends-on) blockers.
+
+    ``phase_parent``/``phase_drive`` used to build their dependency graph
+    only from the children's edges, so a producer's sequencing hold recorded
+    on the parent itself was silently overridden and the first startable
+    child's worktree was created mid-flight (SA-0MVS1QS9J009DGPT). The same
+    gate applies to a leaf item in ``phase_start``.
+
+    Terminal blockers — ``in_review``/``completed``/``done``/``deleted``, and
+    soft-deleted items (``deletedBy`` set) — never gate, matching
+    :func:`_is_terminal_child`. Cross-project blockers (a different id prefix)
+    are reported as coordination notes and never gate
+    (SA-0MSQBM2FK005NW1T).
+
+    Args:
+        work_item_id: The invoked work item.
+        blockers: The item's outbound edges; fetched via
+            :func:`wl_dep_blockers` when omitted.
+
+    Returns:
+        ``{"blocked": bool, "blockers": [...], "coordination_blockers":
+        [...]}`` where ``blockers`` holds the unmet same-project edges that
+        gate starting and ``coordination_blockers`` the unmet cross-project
+        edges (informational only).
+    """
+    edges = wl_dep_blockers(work_item_id) if blockers is None else blockers
+    unmet = [edge for edge in edges if not _is_terminal_child(edge)]
+    blocking = [
+        edge
+        for edge in unmet
+        if _is_same_project(work_item_id, str(edge.get("id", "")))
+    ]
+    coordination = [edge for edge in unmet if edge not in blocking]
+    return {
+        "blocked": bool(blocking),
+        "blockers": [_blocker_payload(edge) for edge in blocking],
+        "coordination_blockers": [
+            _blocker_payload(edge) for edge in coordination
+        ],
+    }
+
+
 def _classify_child(child: dict[str, Any]) -> str:
     """Classify a child for the parent-recursion plan.
 
@@ -5139,6 +5249,10 @@ def phase_start(
     2.5. Acquire the per-work-item child lock (before the claim and before
         any worktree creation/resume); a held child is reported as
         ``skipped-held`` and performs no writes (AC1)
+    2.6. Outbound (depends-on) gate: refuse when the item's own same-project
+        outbound blockers are unmet — reported as a ``blocked`` verdict with
+        the blocker list, before the claim so no claim/worktree is left
+        behind (SA-0MVS1QS9J009DGPT)
     3. Claim the work item (status → in_progress)
     4. Safety gate: check for dirty working tree
     5. Stash hygiene gate: warn on orphaned stashes (fail-open, --allow-orphaned-stashes to skip)
@@ -5283,6 +5397,42 @@ def _phase_start_locked(
     mutating section without re-indenting it. ``report`` is populated by the
     caller (validation and Code Freeze gates) and returned here.
     """
+
+    # ── Step 3.0: Outbound (depends-on) gate (SA-0MVS1QS9J009DGPT) ──
+    # The invoked item's own outbound edges are authoritative producer
+    # sequencing decisions: an unmet same-project blocker means the item must
+    # wait. The gate sits BEFORE the claim (Assumption A3) so a blocked item
+    # is never left ``in_progress`` with no worktree, and no worktree is
+    # created. It runs *under* the per-child lock: a losing contender must
+    # leave the worklog store untouched (no read/write at all), so the gate
+    # cannot run before the lock is acquired. Cross-project edges remain
+    # coordination notes and do not refuse (SA-0MSQBM2FK005NW1T).
+    outbound = _outbound_gate(work_item_id)
+    if outbound["coordination_blockers"]:
+        LOG.info(
+            "Cross-project dependency note(s) for %s: %s",
+            work_item_id,
+            _format_blockers(outbound["coordination_blockers"]),
+        )
+        report["coordination_blockers"] = outbound["coordination_blockers"]
+    if outbound["blocked"]:
+        msg = (
+            f"Work item {work_item_id} is blocked by unmet outbound "
+            f"dependency: {_format_blockers(outbound['blockers'])}. "
+            "No implementation was started (no claim, no worktree). Wait for "
+            "the blocker(s) to reach a terminal state, or remove the "
+            "dependency edge, then re-run."
+        )
+        LOG.warning(msg)
+        report["success"] = False
+        report["blocked"] = True
+        report["blocked_by"] = outbound["blockers"]
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n\u26d4 {msg}\n")
+        return report
 
     # ── Step 3: Claim the work item via shared helper ─────────────
     # Status-only claim: the workflow stage must NOT be advanced here.
@@ -6621,18 +6771,24 @@ def phase_parent(
     invocation of this phase advances the chain by one child:
 
     1. Fetch the parent and its children (``wl show --children``).
-    2. No children → behave like a leaf (no status change; use start/finish).
-    3. Resolve the dependency graph among children (outbound
+    2. Resolve the parent's **own** outbound (``depends-on``) edges and its
+       own status: an unmet same-project blocker, or ``status: blocked``,
+       yields a dedicated soft ``blocked`` verdict (``parent_blocked_by``,
+       no ``next_child``, no worktree) — the producer's sequencing hold is
+       never overridden (SA-0MVS1QS9J009DGPT).
+    3. No children → behave like a leaf (no status change; use start/finish).
+    4. Resolve the dependency graph among children (outbound
        ``wl dep list`` edges): in-chain blockers are implemented before
        the children they block; cycles fail fast; cross-project blockers
        are reported as coordination notes.
-    4. Classify children: terminal → skip; a live lock holder →
+    5. Classify children: terminal → skip; a live lock holder →
        ``skipped-held`` (report the holder and stop cleanly); in_progress
-       elsewhere → skip+report; blocked by a non-terminal sibling → not
-       startable (reported); otherwise → implementable.
-    5. All children terminal → advance the parent to ``completed``/``in_review``
+       elsewhere → skip+report; blocked by a non-terminal sibling or by a
+       same-project item outside the epic → not startable (reported);
+       otherwise → implementable.
+    6. All children terminal → advance the parent to ``completed``/``in_review``
        (existing Step 5.1 advancement retained) and comment a per-child summary.
-    6. Otherwise → start the next startable child (claim + worktree via
+    7. Otherwise → start the next startable child (claim + worktree via
        ``phase_start``) and report the worktree path; the caller implements
        that child with the standard workflow (``implement.py finish
        <child>``), then re-invokes this phase for the next child.
@@ -6652,7 +6808,10 @@ def phase_parent(
     Returns:
         Dict with the recursion plan: per-child classifications, the next
         child started (with its worktree), or parent advancement when all
-        children are terminal.
+        children are terminal. When the invoked item is itself blocked, the
+        report carries ``blocked: true``, ``parent_blocked_by`` (blocker ids
+        and statuses), ``parent_blocked_reason`` and no ``next_child`` /
+        ``parent_advanced`` — a soft wait, not a failure (SA-0MVS1QS9J009DGPT).
     """
     report: dict[str, Any] = {
         "phase": "parent",
@@ -6702,6 +6861,85 @@ def phase_parent(
         return report
     children = wl_show_children(work_item_id)
 
+    # ── Step 3.5: Outbound (depends-on) gate for the invoked item ──
+    # The parent's OWN outbound edges and its own ``blocked`` status are
+    # producer sequencing decisions. Both are resolved BEFORE any child is
+    # classified, so a deliberately blocked epic can never have its first
+    # startable child started — which used to create a worktree and edit files
+    # a still-pending dependency owns (SA-0MVS1QS9J009DGPT). The verdict is a
+    # dedicated soft ``blocked`` report (``blocked``/``parent_blocked_by``, no
+    # ``next_child``, no ``parent_advanced``, ``success`` true), so callers can
+    # tell a legitimate wait from a hard failure. Assumption A1: a plain
+    # ``blocked`` status with no outbound edges also waits, mirroring
+    # ``wl next``'s blocked-item semantics.
+    outbound = _outbound_gate(work_item_id)
+    parent_status = str(parent.get("status", ""))
+    status_blocked = parent_status == "blocked"
+    if outbound["coordination_blockers"]:
+        LOG.info(
+            "Cross-project dependency note(s) for %s: %s",
+            work_item_id,
+            _format_blockers(outbound["coordination_blockers"]),
+        )
+        report["coordination_blockers"] = outbound["coordination_blockers"]
+    if outbound["blocked"] or status_blocked:
+        reasons = []
+        details = []
+        if outbound["blocked"]:
+            reasons.append(PARENT_BLOCKED_REASON_DEPENDENCY)
+            details.append(
+                "unmet outbound dependency: "
+                f"{_format_blockers(outbound['blockers'])}"
+            )
+        if status_blocked:
+            reasons.append(PARENT_BLOCKED_REASON_STATUS)
+            if outbound["blockers"]:
+                details.append("parent status is 'blocked'")
+            else:
+                # ``wl dep add`` sets ``status: blocked`` automatically and
+                # nothing clears it when the dependency completes, so a
+                # status with no unmet recorded dependency may be stale —
+                # never silently override it, but name the remedy.
+                details.append(
+                    "parent status is 'blocked' (no unmet recorded "
+                    f"dependency explains it; clear it with `wl update "
+                    f"{work_item_id} --status open` if the hold no longer "
+                    "applies)"
+                )
+        msg = (
+            f"{work_item_id} is blocked — " + " and ".join(details) + ". "
+            "No child was started and no worktree was created. Resolve the "
+            "blocker(s) (or clear the blocked status) and re-run."
+        )
+        LOG.warning(msg)
+        report["success"] = True  # soft stop: a blocked wait is not a failure
+        report["blocked"] = True
+        report["parent_blocked_by"] = outbound["blockers"]
+        report["parent_blocked_reason"] = "+".join(reasons)
+        report["parent_status"] = parent_status
+        # Classifications are skipped: every child is reported as held by the
+        # parent-level block, never as startable.
+        report["children"] = [
+            {
+                "id": str(child.get("id", "")),
+                "title": child.get("title", ""),
+                "status": child.get("status", ""),
+                "action": ACTION_BLOCKED_PARENT,
+            }
+            for child in children
+        ]
+        report["children_processed"] = []
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  \u26d4 {msg}")
+            print("=" * 60)
+            print()
+        return report
+
     # ── Step 4: No children → behave like a leaf ───────────────────
     if not children:
         report["leaf"] = True
@@ -6723,6 +6961,11 @@ def phase_parent(
     # ── Step 5: Classify children ──────────────────────────────────
     classifications: list[dict[str, Any]] = []
     blockers_map: dict[str, list[dict[str, Any]]] = {}
+    # Same-project blockers OUTSIDE the children set: they cannot be ordered
+    # within the epic, but they still gate the child (consistent with the
+    # ``phase_start`` leaf gate). Cross-project edges stay coordination notes
+    # (SA-0MSQBM2FK005NW1T).
+    out_of_chain_blocked: dict[str, list[dict[str, str]]] = {}
     for child in children:
         cid = str(child.get("id", ""))
         # Outbound (depends-on) edges: what this child is blocked by.
@@ -6731,11 +6974,22 @@ def phase_parent(
         # Blockers outside the children set (e.g. cross-project) are
         # coordination notes, not in-chain edges (SA-0MSQBM2FK005NW1T).
         in_chain_ids = {str(c.get("id")) for c in children}
+        out_of_chain = [
+            b for b in child_blockers if str(b.get("id")) not in in_chain_ids
+        ]
         external = [
             str(b.get("id"))
-            for b in child_blockers
-            if str(b.get("id")) not in in_chain_ids
+            for b in out_of_chain
+            if not _is_same_project(cid, str(b.get("id", "")))
         ]
+        unmet_same_project = [
+            _blocker_payload(b)
+            for b in out_of_chain
+            if _is_same_project(cid, str(b.get("id", "")))
+            and not _is_terminal_child(b)
+        ]
+        if unmet_same_project:
+            out_of_chain_blocked[cid] = unmet_same_project
         classifications.append({
             "id": cid,
             "title": child.get("title", ""),
@@ -6744,6 +6998,8 @@ def phase_parent(
             "external_blockers": external,
         })
         entry = classifications[-1]
+        if unmet_same_project:
+            entry["out_of_chain_blockers"] = unmet_same_project
         if entry["action"] == ACTION_SKIPPED_HELD:
             # Surface the live holder's identity so the operator can diagnose
             # who owns the child (AC3).
@@ -6800,6 +7056,10 @@ def phase_parent(
         report["branch"] = branch
         report["message"] = message
         report["children_processed"] = child_results
+        if blocked_ids:
+            # Surface the children that are still waiting so the operator can
+            # see which siblings the started child is not blocked behind.
+            report["blocked_children"] = list(blocked_ids)
         if json_output:
             print(format_json_output(report))
         else:
@@ -6944,9 +7204,23 @@ def phase_parent(
                 })
             continue
 
-        # action == "implement" (child is open). A child is startable only
-        # when every in-chain blocker is already terminal (never before its
-        # blockers — AC-2).
+        # action == "implement" (child is open). A child whose same-project
+        # blocker lies OUTSIDE the epic cannot be ordered in-chain and must
+        # wait for it (the ``phase_start`` leaf gate would refuse anyway) —
+        # report it blocked instead of attempting a start that cannot succeed.
+        if out_of_chain_blocked.get(cid):
+            pending_ids.append(cid)
+            blocked_ids.append(cid)
+            child_results.append({
+                "id": cid, "title": title,
+                "action": "blocked",
+                "status": child.get("status", ""),
+                "blocked_by": out_of_chain_blocked[cid],
+            })
+            continue
+
+        # A child is startable only when every in-chain blocker is already
+        # terminal (never before its blockers — AC-2).
         if not all(b in terminal_ids for b in _in_chain_blockers(cid)):
             pending_ids.append(cid)
             blocked_ids.append(cid)
@@ -7966,6 +8240,15 @@ def phase_drive(
     4. Repeat. A child is retried at most ``max_child_sessions`` times so a
        session that never reaches a terminal state cannot loop forever.
 
+    A parent report carrying the blocked verdict (``blocked: true`` /
+    ``parent_blocked_by``) stops the chain **without** spawning a session: the
+    invoked item is itself blocked by an unmet same-project outbound edge or a
+    ``blocked`` status, so starting a child would override a producer's hold
+    and edit files the pending dependency owns (SA-0MVS1QS9J009DGPT). This is
+    a soft wait — the drive report forwards ``parent_blocked_by`` /
+    ``parent_blocked_reason``, keeps ``success`` true and does **not** set
+    ``failed_child`` — distinct from a hard per-child failure.
+
     A per-child session timeout (or non-zero exit) is treated as a *bound*,
     not a verdict: after a failed spawn the child is re-fetched and classified
     with :func:`_reconcile_spawn_failure`. A child that already reached a
@@ -8163,6 +8446,35 @@ def phase_drive(
                     f"(session timed out but the child had already reached a "
                     f"terminal state)."
                 )
+            break
+
+        if parent_report.get("blocked"):
+            # The invoked item is blocked by its OWN outbound dependency edge
+            # and/or its own ``blocked`` status (SA-0MVS1QS9J009DGPT). This is
+            # a legitimate producer-mandated wait, not a failure: forward the
+            # verdict (with the blocker ids/statuses) and spawn NOTHING — a
+            # child session would create a worktree and edit files the
+            # still-pending dependency owns.
+            report["blocked"] = True
+            report["success"] = True
+            report["parent_advanced"] = False
+            report["parent_blocked_by"] = parent_report.get(
+                "parent_blocked_by", []
+            )
+            report["parent_blocked_reason"] = parent_report.get(
+                "parent_blocked_reason", PARENT_BLOCKED_REASON_DEPENDENCY
+            )
+            if parent_report.get("coordination_blockers"):
+                report["coordination_blockers"] = parent_report[
+                    "coordination_blockers"
+                ]
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            report["message"] = parent_report.get(
+                "message",
+                f"{work_item_id} is blocked; no child session was spawned.",
+            )
             break
 
         if parent_report.get("success") is False:
