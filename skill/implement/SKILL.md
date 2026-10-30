@@ -924,7 +924,7 @@ Finish lock, verified sync and refusal recovery
 → push → worktree removal → post-push parent-branch sync — is serialised by a
 **per-repository exclusive advisory lock**
 (`<main-checkout>/.worklog/locks/main-checkout.lock`,
-`skill/shared/repo_lock.py`). `start`'s pre-worktree parent-branch refresh
+`$(skill_path shared)/repo_lock.py`). `start`'s pre-worktree parent-branch refresh
 takes the same lock (`_sync_parent_branch_locked`), so two runs can never
 interleave moves of the shared local `dev` ref — the 2026-10-25 shape where
 finish A's commit became reachable only from its feature branch while both
@@ -1016,7 +1016,7 @@ divergence.
 **Runtime copy.** These behaviours live in the installed skill copy
 (`~/.pi/agent/skills/`). The fix takes effect in subsequent sessions **only
 after** `scripts/install_pi.sh` has refreshed the runtime skill copy, so re-run
-it after pulling a change to `skill/implement/` — then later sessions run the
+it after pulling a change to the implement skill — then later sessions run the
 fixed `implement.py` and read the updated skill text.
 
 Pre-push blocking check
