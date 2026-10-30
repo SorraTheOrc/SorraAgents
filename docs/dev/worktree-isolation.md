@@ -181,7 +181,7 @@ Only these main-checkout mutations are legitimate during a worktree-scoped run:
 
 | Mutation | Actor | Why it is legitimate |
 |---|---|---|
-| Fast-forward of the main checkout's `dev` to the finished commit | `implement.py finish` Step 5 | Keeps the push baseline current; its own working-tree churn is attributed to finish (`own_churn`) and never aborts |
+| Fast-forward of the main checkout's `dev` to the finished commit | `implement.py finish` Step 5 | Keeps the push baseline current; its own working-tree churn is attributed to finish (`own_churn`) and never aborts. `--ff-only` only, and restored to `origin/dev` if the push fails |
 | Writes under `<main-checkout>/.worklog/` | `wl` (comments, status, cache), the finish lock file | Worklog bookkeeping is the store's own surface, never a source change |
 | Project-declared expected-dirty paths | the project (`.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`) | Read-only background state the project explicitly declares |
 | Nothing else | — | Any other tracked-file deletion or modification is foreign |
@@ -192,15 +192,21 @@ Only these main-checkout mutations are legitimate during a worktree-scoped run:
 |---|---|---|
 | A test run mutates the guarded checkout, or the main checkout of a worktree-scoped run | outer `guarded_run_all` guard and the inner `live_repo_guard` plugin (both snapshot **every reachable checkout**) | `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`), `skill/test/tests/test_guarded_run_all.py`, `tests/test_live_repo_mutation_guard.py` |
 | A foreign mutation of the main checkout is observed by `finish` (deletion **or** modification) | finish main-checkout guard (`_snapshot_main_checkout` → `_verify_main_checkout` at `pre_push` and `pre_worktree_removal`): aborts loudly, names every offending path, the concurrent-actor evidence and `git checkout -- <path>`; the item stays `open` | `skill/implement/tests/test_finish_main_checkout_guard.py` |
-| Two finishes operate on the same main checkout concurrently | per-checkout exclusive `flock` on `<main-checkout>/.worklog/locks/main-checkout.lock`: the second finish exits non-zero naming the holder, without touching the checkout or the work item | `skill/implement/tests/test_finish_main_checkout_lock.py` |
+| Two finishes operate on the same main checkout concurrently | per-checkout exclusive `flock` on `<main-checkout>/.worklog/locks/main-checkout.lock` (bounded wait, kernel-released, stale lock files never block): the second finish exits non-zero naming the holder, without touching the checkout or the work item | `skill/implement/tests/test_finish_main_checkout_lock.py` |
+| A finish commit never reaches `origin/dev` (including the rebased replacement hash produced by non-fast-forward recovery) | post-push ancestry assertion (`git merge-base --is-ancestor <commit> refs/remotes/origin/dev`) fails closed: worktree + branch retained, item `open`, refusal comment posted | `tests/test_implement_finish_local_dev_verified_sync.py` |
+| A failed push leaves local `dev` pointing at an unpushed commit (the 2026-10-25 orphan shape) | push-failure restore returns local `dev` to `refs/remotes/origin/dev` (`reset --merge` when checked out, never `--hard`; compare-and-swap `update-ref` otherwise) | `tests/test_implement_finish_local_dev_verified_sync.py` |
 | A driven child writes to the main checkout instead of its worktree | placement guard in `phase_parent`/`phase_drive`: fails closed, names the offending paths, does not advance the parent | `skill/implement/tests/test_implement_parent_safety.py` |
 | A periodic/operator check of main-checkout hygiene | `scripts/hygiene_check.sh`: `main_checkout_lock` and `tracked_deletions` checks (human and `--json`) | `tests/test_implement_stash_hygiene.py` |
 | The shared workspace build output is missing, breaking `wl` | `wl` preflight (`src/cli.ts` in ContextHub): one actionable diagnostic and a non-zero exit instead of `ERR_MODULE_NOT_FOUND` | `tests/cli/missing-shared-dist.test.ts` (ContextHub), [dev note](https://github.com/SorraTheOrc/ContextHub/blob/dev/docs/dev/wl-shared-dist-diagnostic.md) |
 
-The finish-side details (report keys `report["steps"]["main_checkout_guard"]`
-and `report["steps"]["main_checkout_lock"]`, the `own_churn` allow-list and the
-per-checkout lock contract) are documented in the
-[implement skill reference](implement-skill-reference.md#finish-main-checkout-guard-wl-0mvpadz1z000fosg-ac3).
+The finish-side details (report keys `report["steps"]["main_checkout_guard"]`,
+`report["steps"]["main_checkout_lock"]`, `["local_dev_fast_forward"]`,
+`["local_dev_restore"]` and `["ancestry_assertion"]`, the `own_churn`
+allow-list, the per-checkout lock contract and the refusal-recovery path) are
+documented in the
+[implement skill reference](implement-skill-reference.md#finish-main-checkout-guard-wl-0mvpadz1z000fosg-ac3)
+and its
+[verified sync / ancestry assertion section](implement-skill-reference.md#verified-reversible-local-dev-sync-and-post-push-ancestry-assertion-sa-0mvpzg7a0000n66u).
 
 ### Residual risk
 

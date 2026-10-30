@@ -131,6 +131,8 @@ class TestMainCheckoutGuardedSurface:
             "live_repo_guard",
             "main-checkout guard",
             "main-checkout.lock",
+            "post-push ancestry assertion",
+            "push-failure restore",
             "placement guard",
             "hygiene_check.sh",
             "shared workspace build output",
@@ -139,6 +141,7 @@ class TestMainCheckoutGuardedSurface:
         for test_pin in (
             "test_finish_main_checkout_guard.py",
             "test_finish_main_checkout_lock.py",
+            "test_implement_finish_local_dev_verified_sync.py",
             "test_guarded_run_all.py",
             "test_implement_stash_hygiene.py",
             "missing-shared-dist.test.ts",
@@ -162,3 +165,6 @@ class TestMainCheckoutGuardedSurface:
         doc = _read(_REPO_ROOT / "docs" / "dev" / "implement-skill-reference.md")
         assert 'report["steps"]["main_checkout_guard"]' in doc
         assert 'report["steps"]["main_checkout_lock"]' in doc
+        assert 'report["steps"]["local_dev_fast_forward"]' in doc
+        assert 'report["steps"]["local_dev_restore"]' in doc
+        assert 'report["steps"]["ancestry_assertion"]' in doc

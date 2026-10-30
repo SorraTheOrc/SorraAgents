@@ -773,6 +773,98 @@ refusal/success, hygiene script JSON + human output) and
 `tests/test_implement_finish_concurrent_orphan.py` (dev-ref window scenarios,
 including the bounded-wait timeout message and the `start` refresh window).
 
+## Verified reversible local-dev sync and post-push ancestry assertion (SA-0MVPZG7A0000N66U)
+
+The pre-push fast-forward of the main checkout's local parent branch exists so
+the dev-push integration gate measures the **main checkout** with the new
+files already present (SA-0MVECQUGF0064U81). That advance is inherently
+unverified — the commit is by definition not on `origin/dev` yet — so
+`phase_finish` decomposes it into three cooperating guarantees, all inside
+the per-repository lock above:
+
+| Step | Helper | Report key | Guarantee |
+|---|---|---|---|
+| Pre-push advance | `_fast_forward_local_dev_for_push` | `report["steps"]["local_dev_fast_forward"]` | `git merge --ff-only` only (never a rewrite); records `pre_advance_tip`; refuses loudly when the advance would be unsafe |
+| Push-failure restore | `_restore_local_dev_after_failed_push` | `report["steps"]["local_dev_restore"]` | Local `dev` returns to `refs/remotes/origin/dev`; uncommitted work survives (no `reset --hard`) |
+| Post-push verification | `_assert_commit_on_origin_dev` | `report["steps"]["ancestry_assertion"]` | Finish succeeds only when the pushed commit is an ancestor of `refs/remotes/origin/dev` |
+
+### The advance is verified and reversible
+
+- **Fast-forward only, never a rewrite.** Local `dev` is moved with `git merge
+  --ff-only` (first onto `refs/remotes/origin/dev`, then onto the finish
+  commit); no local commit is discarded and no history is rewritten.
+- **Refuse rather than silently skip.** The previous broad `except` could
+  disable the whole fast-forward without a trace. Every unsafe precondition
+  now returns `method="refused"`, a loud warning naming the refs and hashes,
+  and a machine-readable `reason`: `fetch_failed`,
+  `no_remote_tracking_ref`, `checkout_failed`, `local_dev_diverged` (local
+  `dev` carries commits the remote does not have, or cannot fast-forward to
+  the remote tip) and `commit_not_based_on_remote_tip` (a sibling landed
+  first). A refusal never fails the finish: the push (with its rebase-and-retry
+  recovery) and the post-push ancestry assertion remain authoritative.
+- **Reversal on a failed push.** Every push-failure path (`PushTimeoutError`,
+  `PushNonFastForwardError`, a plain push failure) calls
+  `_restore_local_dev_after_failed_push`, so the shared local `dev` is never
+  left pointing at an unpushed finish commit — the state that made the
+  2026-10-25 orphan possible. The restore is deliberately conservative:
+  - the target is `refs/remotes/origin/dev`, a commit known to be published;
+  - only finish's **own** advance is undone — when the branch moved since
+    (`branch_moved_since_advance`) another actor owns that move and nothing is
+    touched;
+  - checked out → `git reset --merge` (uncommitted work in the shared checkout
+    survives; an overlapping local modification is reported as
+    `reset_conflict` and never clobbered — `reset --hard` is never used);
+  - not checked out → atomic compare-and-swap `git update-ref`.
+- **Own churn is still attributed.** The fast-forward's file churn is recorded
+  as `own_churn` so the main-checkout guard never aborts on it
+  (WL-0MVPADZ1Z000FOSG AC3/AC4).
+
+### The post-push ancestry assertion fails closed
+
+`_assert_commit_on_origin_dev` refreshes `refs/remotes/origin/dev` (best
+effort — the push already updates it), resolves the commit to its **full**
+40-character hash (short hashes are display-only and unsafe to assert with)
+and requires `git merge-base --is-ancestor <commit> refs/remotes/origin/dev`
+to succeed. Anything else raises `AncestryAssertionError` (a `RuntimeError`
+subclass, so `phase_finish`'s existing handler resets the item to `open`):
+
+- the commit or the remote-tracking ref cannot be resolved → publication
+  cannot be verified;
+- the commit is not on the remote branch → it did not land.
+
+This closes the false-positive shape of the 2026-10-25 incident: the
+non-fast-forward recovery rebases and rewrites the commit hash, so a success
+signal from the push alone can describe a commit the remote never received.
+The assertion is evaluated against the hash that was actually pushed (the
+rebased one when recovery ran), and the refusal comment names the resolved
+commit, the target ref and its tip, the reason, and the retained branch and
+worktree.
+
+### State left behind by a refusal, and the recovery path
+
+| Refusal | State left behind | Recovery |
+|---|---|---|
+| Lock held by a live run | Checkout and work item byte-identical (no status write, no comment) | Read the holder from the message / `report["steps"]["main_checkout_lock"]` / the lock file; re-run `finish` when it completes. A dead holder's lock file does not block anything — the kernel released the flock. |
+| `AncestryAssertionError` | Worktree + feature branch retained, item `open`, refusal comment posted | Rebase the branch onto `origin/dev`, push it, re-run `finish` on the retained worktree (idempotent: it re-verifies commit → ancestry → status) |
+| Non-fast-forward recovery failed | Same state; the recovery comment carries the commit, branch, worktree and rebase/push commands | Resolve the rebase conflicts (or push manually), then re-run `finish` |
+| `local_dev_diverged` on the advance | Local `dev` untouched by this finish; the commit is pushed from the feature branch and verified afterwards | Inspect `git -C <main> log --oneline origin/dev..dev`; publish those commits (or merge them into `origin/dev`) before re-running, or deliberately `git reset --merge origin/dev` if stale — never `--hard` |
+| Push failed / timed out | Worktree retained, item `open`, local `dev` restored to `origin/dev` | Re-run `finish`, or push manually: `git push origin <branch>:refs/heads/dev` |
+
+The retained worktree is intentional: the commit, its tests and the manual
+recovery commands all live there. Remove it only after the commit is on
+`origin/dev` and `finish` has marked the item `in_review`.
+
+**Runtime copy.** `~/.pi/agent/skills/` is installed by
+`scripts/install_pi.sh`. The fixed behaviour reaches subsequent sessions
+**only after** that script has refreshed the runtime skill copy, so re-run it
+after pulling a change to `skill/implement/` (the `implement.py` it runs and
+the skill text it reads).
+
+Regression pins: `tests/test_implement_finish_local_dev_verified_sync.py`
+(advance/refuse/restore/ancestry contracts), and
+`tests/test_implement_finish_concurrent_orphan.py` (the end-to-end orphan
+scenario).
+
 ### The main-checkout invariant these finish behaviours enforce
 
 The normative statement — which main-checkout mutations are legitimate, which
@@ -785,6 +877,9 @@ keys added for it are:
 |---|---|
 | `report["steps"]["main_checkout_guard"]` | Snapshot time, per-stage verify times/verdicts (`pre_push`, `pre_worktree_removal`), the own-fast-forward churn allow-list and the final verdict |
 | `report["steps"]["main_checkout_lock"]` | Lock path, whether it was acquired, when, and the holder description when the finish was refused |
+| `report["steps"]["local_dev_fast_forward"]` | Whether the pre-push advance ran (`advanced`), why it refused (`reason`), the pre-advance and remote tips, and the `own_churn` allow-list |
+| `report["steps"]["local_dev_restore"]` | Whether a failed push restored local `dev` to `origin/dev`, and why not when it was skipped |
+| `report["steps"]["ancestry_assertion"]` | The resolved commit, target ref and remote tip verified after the push |
 | `report["steps"]["status_readback"]` | Confirms the terminal `completed`/`in_review` transition actually stuck in the store |
 
 Sibling behaviour outside this repository: the `wl` CLI (ContextHub) prints a

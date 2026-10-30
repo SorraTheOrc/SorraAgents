@@ -851,8 +851,8 @@ See ``../refactor/SKILL.md``.
   fast-forwards the main checkout's **local parent branch** (`dev`) to the
   pushed tip *after* a successful push, so the next `implement.py parent` /
   `start` forks the following child worktree from an up-to-date base instead
-  of a stale one. The sync is **safe-skip**: it performs a `git fetch origin
-  dev` followed by a `--ff-only` merge (when `dev` is checked out) or a
+  of a stale one. The sync itself is **safe-skip**: it performs a `git fetch
+  origin dev` followed by a `--ff-only` merge (when `dev` is checked out) or a
   non-checked-out ref fetch (`git fetch origin dev:dev`) — it never
   force-updates and never loses local commits. It is skipped (with a logged
   warning, and without failing the already-successful finish) when the main
@@ -860,6 +860,17 @@ See ``../refactor/SKILL.md``.
   diverged. `implement.py start` also refreshes the parent branch before
   `git worktree add`, so children never start from a stale base even when
   another actor pushed concurrently.
+
+  That whole window — commit → local `dev` fast-forward → push → worktree
+  removal → sync — is serialised by a **per-repository finish lock**, the
+  advance only ever moves with `git merge --ff-only` and is **restored to
+  `origin/dev` when the push fails**, and the push is followed by an
+  **ancestry assertion** that fails closed when the commit never reached
+  `origin/dev` (SA-0MVPZG3IQ009IJMO, SA-0MVPZG7A0000N66U). When any of them
+  refuses, the worktree and branch are retained and the item stays `open` —
+  see [Finish lock, verified sync and refusal
+  recovery](#finish-lock-verified-sync-and-refusal-recovery) for the state
+  left behind and the exact recovery commands.
 - After pushing, clean up the worktree:
 
   ```bash
@@ -905,6 +916,108 @@ See ``../refactor/SKILL.md``.
   - **Parent/epic runs:** parent/epic items are validated per child at each
     child's Step 9; the parent itself is covered by the per-child test runs
     at Step 6.1.
+
+Finish lock, verified sync and refusal recovery
+-----------------------------------------------
+
+`finish`'s main-checkout critical section — commit → local `dev` fast-forward
+→ push → worktree removal → post-push parent-branch sync — is serialised by a
+**per-repository exclusive advisory lock**
+(`<main-checkout>/.worklog/locks/main-checkout.lock`,
+`skill/shared/repo_lock.py`). `start`'s pre-worktree parent-branch refresh
+takes the same lock (`_sync_parent_branch_locked`), so two runs can never
+interleave moves of the shared local `dev` ref — the 2026-10-25 shape where
+finish A's commit became reachable only from its feature branch while both
+runs reported success.
+
+- **Bounded wait, never a hang.** A second `finish` fails fast by default
+  (`IMPLEMENT_FINISH_LOCK_TIMEOUT=0`); a positive value waits at most that many
+  seconds and then refuses with the lock path, the holder (work item, pid,
+  start time, repo, host) and the recovery step. `start` waits at most
+  `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then **skips** the refresh
+  fail-open (`reason: "lock_held"`) — a start is never blocked by a finish.
+  An indefinite wait is rejected outright, so no code path blocks forever.
+- **Crash-safe.** Ownership is the kernel's `flock`, released when the holder
+  dies — `SIGKILL`, an exception or a hard crash included. The metadata in the
+  lock file is for the refusal message only and never decides ownership, so a
+  **stale lock file cannot block a later finish**.
+- **Verified fast-forward.** Local `dev` only ever advances with `git merge
+  --ff-only` (its history is never rewritten) and the pre-advance tip is
+  recorded. When local `dev` moved since the worktree base, the commit is not
+  based on the current `origin/dev`, the fetch fails or the checkout cannot
+  switch, the helper **refuses loudly** (`local_dev_diverged`,
+  `commit_not_based_on_remote_tip`, `fetch_failed`, `checkout_failed`) instead
+  of silently skipping — so an unsafe advance is never taken and the refusal
+  is reported rather than swallowed.
+- **Reversible on push failure.** A failed push restores local `dev` to
+  `refs/remotes/origin/dev`: `git reset --merge` when `dev` is checked out
+  (uncommitted work in the shared checkout survives; an overlapping local
+  modification is reported, never clobbered — `reset --hard` is never used),
+  otherwise an atomic compare-and-swap `git update-ref`. An unpushed commit is
+  therefore never left as the next worktree's base.
+- **Ancestry assertion (fails closed).** After a successful push, `finish`
+  resolves the commit to its full hash and requires `git merge-base
+  --is-ancestor <commit> refs/remotes/origin/dev`. A commit that did not land —
+  including the rebased replacement hash produced by non-fast-forward recovery
+  — raises `AncestryAssertionError`, so `finish` can never report success for
+  an orphaned commit.
+- **Observability.** `report["steps"]["main_checkout_lock"]`,
+  `["local_dev_fast_forward"]`, `["local_dev_restore"]` and
+  `["ancestry_assertion"]` record each decision. Full contract:
+  [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#verified-reversible-local-dev-sync-and-post-push-ancestry-assertion-sa-0mvpzg7a0000n66u).
+
+### When `finish` refuses
+
+**Lock refused.** Nothing changed: the checkout, the work item and the branch
+are untouched (no status write, no comment). Read the holder from the refusal
+message, `report["steps"]["main_checkout_lock"]`, or
+`<main-checkout>/.worklog/locks/main-checkout.lock`, and check it is alive
+(`ps -p <pid>`). A dead holder's lock file does not block you: re-run `finish`
+(or `start`) — there is nothing to clean up.
+
+**Ancestry assertion or non-fast-forward recovery refused.** The worktree and
+the feature branch are **retained**, the work item stays `open` (never
+`in_review`), and a comment records the commit, the target ref, the reason,
+the branch and the worktree path. The commit is complete and already
+published on its feature branch — only its arrival on `origin/dev` failed.
+Publish it, then re-run `finish`:
+
+```bash
+cd <retained worktree>
+git fetch origin dev
+git rebase origin/dev          # resolve conflicts if dev advanced
+git push origin HEAD:refs/heads/dev
+python3 $(skill_path implement)/scripts/implement.py finish <work-item-id>
+```
+
+If the push is rejected again, another commit landed in the meantime: rebase
+and retry once more. Re-running `finish` on the retained worktree is
+idempotent — it re-verifies commit → ancestry → status and marks the item
+`in_review`.
+
+**When a manual merge is needed.** Only in two cases. First, when the rebase
+conflicts: resolve them, commit, push, and re-run `finish`. Second, when the
+pre-push fast-forward reports `local_dev_diverged` because the **main
+checkout's local `dev` carries commits `origin/dev` does not have**:
+
+```bash
+git -C <main-checkout> log --oneline origin/dev..dev   # what is local-only
+```
+
+Those commits are someone's unpublished work, so `finish` neither discards nor
+merges them for you. If they are intended, publish them (push `dev`, or merge
+them into `origin/dev`) and re-run `finish`; if they are stale, restore local
+`dev` deliberately with `git -C <main-checkout> reset --merge origin/dev` —
+`--merge`, never `--hard`, because the shared checkout may hold uncommitted
+work from another session. `finish` has already restored its **own** advance
+after the failed push, so this is the residual case of a pre-existing local
+divergence.
+
+**Runtime copy.** These behaviours live in the installed skill copy
+(`~/.pi/agent/skills/`). The fix takes effect in subsequent sessions **only
+after** `scripts/install_pi.sh` has refreshed the runtime skill copy, so re-run
+it after pulling a change to `skill/implement/` — then later sessions run the
+fixed `implement.py` and read the updated skill text.
 
 Pre-push blocking check
 -----------------------
