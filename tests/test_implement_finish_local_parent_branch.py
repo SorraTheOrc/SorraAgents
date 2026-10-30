@@ -466,6 +466,15 @@ def test_phase_finish_syncs_parent_branch_after_push(implement_mod, tmp_path):
         ),
         mock.patch.object(implement_mod, "remove_state"),
         mock.patch.object(implement_mod, "_remove_worktree", return_value=True),
+        # The post-push ancestry assertion runs against the *main checkout*
+        # (real git); this harness uses placeholder directories, so the
+        # verification seam is mocked exactly like the push itself
+        # (SA-0MVPZG7A0000N66U AC2).
+        mock.patch.object(
+            implement_mod,
+            "_assert_commit_on_origin_dev",
+            return_value={"verified": True, "target": "refs/remotes/origin/dev"},
+        ),
         mock.patch.object(
             implement_mod, "git_push_to_dev", side_effect=_record_push
         ),

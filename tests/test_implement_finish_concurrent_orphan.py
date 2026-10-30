@@ -415,6 +415,12 @@ def test_failed_push_restores_local_dev_and_keeps_commit_on_its_branch(
     final_dev = _local_dev(sandbox)
     final_origin = _origin_dev(sandbox)
 
+    # The failed push must record that it undid its own advance, and local dev
+    # must be back on the remote tip, not on the unpushed commit
+    # (SA-0MVPZG7A0000N66U AC1).
+    restore = report_a["steps"]["local_dev_restore"]
+    assert restore["restored"] is True, restore
+
     if after_failed_push_dev != after_failed_push_origin:
         pytest.xfail(
             "verified/reversible local-dev sync not implemented "
@@ -585,6 +591,64 @@ def test_concurrent_finish_fails_fast_with_an_actionable_message(
     # Released (file left behind): the next finish proceeds normally.
     report_retry = _run_finish(implement_mod, sandbox, wt_a, _ITEM_A)
     assert report_retry["success"] is True, report_retry.get("message")
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5 — the verified-sync / ancestry report contract
+# ---------------------------------------------------------------------------
+
+
+def test_successful_finish_records_verified_ancestry_and_local_dev_advance(
+    implement_mod, sandbox
+):
+    """A landed finish records the verified advance and the ancestry verdict.
+
+    ``finish`` may only claim success when its own commit is verifiably on
+    ``origin/dev``; both the reversible pre-push advance and the post-push
+    ancestry verdict are observable in the JSON report so an operator can see
+    *why* it succeeded.
+    """
+    work = sandbox["work"]
+    wt_a = sandbox["wt_a"]
+
+    (wt_a / "feature_a.txt").write_text("a\n", encoding="utf-8")
+    report = _run_finish(implement_mod, sandbox, wt_a, _ITEM_A)
+    commit_a = _rev(work, "refs/heads/" + _BRANCH_A)
+
+    assert report["success"] is True, report.get("message")
+    advance = report["steps"]["local_dev_fast_forward"]
+    assert advance["advanced"] is True, advance
+    assert advance["pre_advance_tip"] == sandbox["base"], advance
+    assert advance["advanced_to"] == commit_a, advance
+
+    verdict = report["steps"]["ancestry_assertion"]
+    assert verdict["verified"] is True, verdict
+    assert verdict["resolved_commit"] == commit_a, verdict
+    assert verdict["target"] == "refs/remotes/origin/dev", verdict
+    assert _is_ancestor(work, commit_a, "refs/remotes/origin/dev")
+
+
+def test_failed_push_report_names_the_local_dev_restore(
+    implement_mod, sandbox
+):
+    """A failed push records the restore back to ``origin/dev``."""
+    work = sandbox["work"]
+    wt_a = sandbox["wt_a"]
+    (wt_a / "feature_a.txt").write_text("a\n", encoding="utf-8")
+
+    report = _run_finish(
+        implement_mod, sandbox, wt_a, _ITEM_A, push=_push_fails
+    )
+    commit_a = _rev(work, "refs/heads/" + _BRANCH_A)
+
+    assert report["success"] is False, report
+    assert report["steps"]["push"]["success"] is False
+    assert report["steps"]["push"]["reason"] == "push_failed"
+    restore = report["steps"]["local_dev_restore"]
+    assert restore["restored"] is True, restore
+    assert _local_dev(sandbox) == _origin_dev(sandbox) == sandbox["base"]
+    # The unpushed commit is retained on its feature branch for recovery.
+    assert _rev(wt_a, "HEAD") == commit_a
 
 
 def test_finish_releases_the_lock_after_a_failed_push(

@@ -274,6 +274,18 @@ class TestNonFastForwardRecoveryEndToEnd:
             "the pushed dev tip must be the rebased feature commit"
         )
         assert _rev(wt, "HEAD") == remote_tip
+
+        # AC2 (SA-0MVPZG7A0000N66U): the *rebased replacement hash* — not the
+        # pre-rebase commit — is what finish asserts against the pushed
+        # origin/dev tip, so the assertion is exercised with the rewritten
+        # commit exactly as phase_finish does after recovery.
+        ancestry = implement_mod._assert_commit_on_origin_dev(
+            str(work), result_hash
+        )
+        assert ancestry["verified"] is True, ancestry
+        assert ancestry["resolved_commit"] == remote_tip
+        assert ancestry["target"] == "refs/remotes/origin/dev"
+
         # The rebased commit sits on top of the concurrent sibling advance.
         ancestor = _git(
             ["merge-base", "--is-ancestor", sibling_hash, remote_tip], sandbox["remote"]

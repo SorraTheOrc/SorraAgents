@@ -2165,6 +2165,43 @@ class PushNonFastForwardError(RuntimeError):
         )
 
 
+class AncestryAssertionError(RuntimeError):
+    """Raised when finish's own commit did not reach the pushed dev tip.
+
+    Carries the commit hash (full and as reported), the remote-tracking ref it
+    was asserted against, and that ref's tip so the refusal message can name
+    every hash involved (SA-0MVPZG7A0000N66U AC2). A finish that raises this
+    must not report success and must not advance the work item to
+    ``in_review``.
+    """
+
+    def __init__(
+        self,
+        commit_hash: str,
+        resolved_commit: str | None,
+        target_ref: str,
+        target_tip: str | None,
+        reason: str,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.resolved_commit = resolved_commit
+        self.target_ref = target_ref
+        self.target_tip = target_tip
+        self.reason = reason
+        named = resolved_commit or commit_hash or "unknown"
+        super().__init__(
+            f"Ancestry assertion failed: commit {named} (reported as "
+            f"{commit_hash or 'unknown'}) is not verifiably on {target_ref} "
+            f"(tip {target_tip or 'unresolved'}): {reason}. finish did not "
+            f"publish this commit to origin/dev, so it must not report "
+            f"success. The worktree and the feature branch are retained for "
+            f"recovery; the work item is not advanced to in_review. "
+            f"Recovery: git log --oneline {target_ref}; then "
+            f"git push origin HEAD:refs/heads/dev from the worktree (rebase "
+            f"onto {target_ref} first if the push is rejected)."
+        )
+
+
 def _kill_process_group(pid: int) -> None:
     """Kill the entire process group rooted at *pid* (POSIX only).
 
@@ -2888,6 +2925,7 @@ def _sync_parent_branch(
             return result
 
     result["method"] = "synced"
+    result["target"] = remote_parent_ref
     LOG.info("Synced parent branch %s to origin/%s", parent_branch, parent_branch)
     return result
 
@@ -2956,6 +2994,448 @@ def _sync_parent_branch_locked(
     finally:
         _release_main_checkout_lock(lock_fd)
     result["lock"] = lock_report
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Verified, reversible local-dev sync + post-push ancestry assertion
+# (SA-0MVPZG7A0000N66U, parent SA-0MVNQURZM001TKJY AC1/AC2)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_full_commit(cwd: str, rev: str) -> str | None:
+    """Full 40-character commit hash for *rev* in *cwd*, or ``None``.
+
+    Ref-membership decisions are never taken on an abbreviated hash:
+    ``git_get_commit_hash`` returns a short hash (fine to display, unsafe to
+    assert with), so every ancestry check resolves the commit to its full
+    object name first.
+    """
+    if not rev:
+        return None
+    result = run_cmd(
+        ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
+        cwd=cwd,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _resolve_origin_parent_tip(
+    repo_root: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> str | None:
+    """Full hash of ``refs/remotes/origin/<parent_branch>``, or ``None``."""
+    return _resolve_full_commit(
+        repo_root, f"refs/remotes/origin/{parent_branch}"
+    )
+
+
+def _fast_forward_local_dev_for_push(
+    repo_root: str,
+    commit_hash: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any]:
+    """Advance the main checkout's local parent branch to *commit_hash*.
+
+    The pre-push fast-forward exists so the dev-push integration gate measures
+    the **main checkout** with the new files already present (commits touching
+    ``AGENTS.md`` and friends would otherwise be rejected against a stale
+    checkout — SA-0MVECQUGF0064U81). The advance is therefore inherently
+    unverified: the commit is by definition not on ``origin/<parent_branch>``
+    yet. Instead of the previous silent best-effort (a broad ``except`` that
+    disabled the whole fast-forward), it is made **loud and reversible**:
+
+    * local ``dev`` is only ever advanced with ``git merge --ff-only`` — its
+      history is never rewritten;
+    * the pre-advance tip is returned as ``pre_advance_tip`` so a failed push
+      can restore local ``dev`` to ``refs/remotes/origin/<parent_branch>``
+      (:func:`_restore_local_dev_after_failed_push`);
+    * when the advance is impossible — local ``dev`` has diverged from the
+      remote tip, or the commit is not based on the current remote tip (a
+      sibling landed first) — the helper **refuses loudly**, naming the refs
+      and hashes, and leaves local ``dev`` at ``origin/<parent_branch>``;
+    * it never fails the finish: the push (with its rebase-and-retry
+      recovery) and the post-push ancestry assertion
+      (:func:`_assert_commit_on_origin_dev`) remain authoritative.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        commit_hash: The commit finish is about to push.
+        parent_branch: The shared parent branch (default: ``dev``).
+
+    Returns:
+        Dict with ``method`` (``advanced`` | ``refused``), ``success``
+        (always ``True`` — a refusal never fails a finish), ``advanced``,
+        ``advanced_to`` / ``pre_advance_tip`` when advanced, ``local_tip``,
+        ``remote_tip``, ``own_churn`` and, on refusal, ``reason`` +
+        ``warning``.
+    """
+    result: dict[str, Any] = {
+        "method": "none",
+        "success": True,
+        "advanced": False,
+        "commit": commit_hash,
+        "own_churn": [],
+    }
+    remote_ref = f"refs/remotes/origin/{parent_branch}"
+
+    def _refuse(reason: str, warning: str) -> dict[str, Any]:
+        result["method"] = "refused"
+        result["reason"] = reason
+        result["warning"] = warning
+        LOG.warning("%s", warning)
+        return result
+
+    # 0. Capture the pre-fast-forward HEAD so the main-checkout guard can
+    #    attribute the fast-forward's own file churn.
+    before_head_result = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_root)
+    before_head = (
+        before_head_result.stdout.strip()
+        if before_head_result.returncode == 0
+        else ""
+    )
+
+    # 1. Refresh the remote-tracking ref the advance is measured against.
+    #    Without it the remote tip cannot be verified, so no advance happens.
+    fetch_result = run_cmd(
+        ["git", "fetch", "origin", parent_branch],
+        cwd=repo_root,
+        check=False,
+        timeout=120,
+    )
+    if fetch_result.returncode != 0:
+        return _refuse(
+            "fetch_failed",
+            f"Refusing to advance local {parent_branch}: git fetch origin "
+            f"{parent_branch} failed, so the remote tip cannot be verified "
+            f"({fetch_result.stderr.strip()[:200]}). The push proceeds from "
+            f"the current checkout; commit {commit_hash} is verified against "
+            f"{remote_ref} after the push.",
+        )
+    remote_tip = _resolve_origin_parent_tip(repo_root, parent_branch)
+    result["remote_tip"] = remote_tip
+    if not remote_tip:
+        return _refuse(
+            "no_remote_tracking_ref",
+            f"Refusing to advance local {parent_branch}: {remote_ref} does "
+            f"not resolve after a successful fetch. The push proceeds; "
+            f"commit {commit_hash} is verified after it.",
+        )
+
+    # 2. Ensure the main checkout is on the parent branch: the pre-push gate
+    #    measures this working tree, so the new files must be checked out.
+    checkout_result = run_cmd(
+        ["git", "checkout", parent_branch], cwd=repo_root, check=False
+    )
+    if checkout_result.returncode != 0:
+        return _refuse(
+            "checkout_failed",
+            f"Refusing to advance local {parent_branch}: git checkout "
+            f"{parent_branch} failed in {repo_root} "
+            f"({checkout_result.stderr.strip()[:200]}). The push proceeds "
+            f"from the current checkout; commit {commit_hash} is verified "
+            f"after the push.",
+        )
+    local_tip = _resolve_full_commit(repo_root, f"refs/heads/{parent_branch}")
+    result["local_tip"] = local_tip
+
+    # 2b. A local branch that already carries commits origin/dev does not have
+    #     has moved since this worktree's base. Merging the remote ref into it
+    #     would be a silent no-op (the remote tip is an ancestor), leaving the
+    #     shared branch ahead of the remote and making the finish commit
+    #     impossible to fast-forward onto — so refuse loudly *before*
+    #     touching anything (AC1).
+    if local_tip and remote_tip and local_tip != remote_tip:
+        local_ahead_result = run_cmd(
+            ["git", "merge-base", "--is-ancestor", remote_tip, local_tip],
+            cwd=repo_root,
+            check=False,
+        )
+        if local_ahead_result.returncode == 0:
+            return _refuse(
+                "local_dev_diverged",
+                f"Refusing to advance local {parent_branch}: it has moved "
+                f"since the worktree base and carries commits {remote_ref} "
+                f"does not have (local={local_tip}, origin={remote_tip}). "
+                f"Local {parent_branch} is left untouched; commit "
+                f"{commit_hash} is pushed from the feature branch and "
+                f"verified against {remote_ref} after the push.",
+            )
+
+    # 3. Fast-forward local dev to origin/dev only (never rewrite history).
+    merge_origin_result = run_cmd(
+        ["git", "merge", "--ff-only", remote_ref], cwd=repo_root, check=False
+    )
+    if merge_origin_result.returncode != 0:
+        return _refuse(
+            "local_dev_diverged",
+            f"Refusing to advance local {parent_branch}: it has moved since "
+            f"the worktree base and cannot be fast-forwarded to "
+            f"{remote_ref} (local={local_tip}, origin={remote_tip}) "
+            f"({merge_origin_result.stderr.strip()[:200]}). Local "
+            f"{parent_branch} is left untouched; commit {commit_hash} is "
+            f"pushed from the feature branch and verified against "
+            f"{remote_ref} after the push.",
+        )
+
+    # 4. Fast-forward local dev onto the finish commit.
+    merge_commit_result = run_cmd(
+        ["git", "merge", "--ff-only", commit_hash],
+        cwd=repo_root,
+        check=False,
+    )
+    if merge_commit_result.returncode != 0:
+        return _refuse(
+            "commit_not_based_on_remote_tip",
+            f"Refusing to advance local {parent_branch} to {commit_hash}: the "
+            f"commit is not a descendant of {remote_ref} ({remote_tip}) — "
+            f"local {parent_branch} has moved since this worktree's base "
+            f"({merge_commit_result.stderr.strip()[:200]}). Local "
+            f"{parent_branch} stays at {remote_tip}; the push will land or "
+            f"fail non-fast-forward and be rebased, and the post-push "
+            f"ancestry assertion decides success.",
+        )
+
+    result["method"] = "advanced"
+    result["advanced"] = True
+    result["pre_advance_tip"] = local_tip
+    result["advanced_to"] = _resolve_full_commit(repo_root, commit_hash)
+    # The fast-forward's own file churn is expected — record it so the
+    # main-checkout guard never aborts on it (WL-0MVPADZ1Z000FOSG AC3/AC4).
+    result["own_churn"] = _record_finish_own_churn(
+        repo_root, before_head, commit_hash
+    )
+    LOG.info(
+        "Fast-forwarded local %s to %s (was %s)",
+        parent_branch,
+        commit_hash,
+        local_tip,
+    )
+    return result
+
+
+def _restore_local_dev_after_failed_push(
+    repo_root: str,
+    fast_forward: dict[str, Any] | None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any]:
+    """Undo finish's own pre-push fast-forward after a failed push (AC1).
+
+    Invariant: local ``dev`` must never be left pointing at an unpushed finish
+    commit after a failed push. Otherwise the next child worktree forks from a
+    base that ``origin/dev`` does not have and the commit is silently orphaned
+    (the 2026-10-25 incident). The restore is deliberately conservative:
+
+    * the target is ``refs/remotes/origin/<parent>`` — a commit known to be on
+      the remote (never a locally-created commit);
+    * only finish's **own** advance is undone: when the branch has moved since
+      (another session, or the operator) nothing is touched and the refusal is
+      reported loudly;
+    * when the branch is checked out, ``git reset --merge`` is used so
+      uncommitted work in the shared checkout survives — never
+      ``reset --hard``; if a local modification overlaps the commit being
+      undone the reset is skipped and reported loudly;
+    * when the branch is not checked out, the ref is moved with an atomic
+      compare-and-swap ``git update-ref``.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        fast_forward: The :func:`_fast_forward_local_dev_for_push` result.
+        parent_branch: The shared parent branch (default: ``dev``).
+
+    Returns:
+        Dict recording what happened (``restored``, ``target``, ``reason``,
+        hashes and an optional loud ``warning``).
+    """
+    result: dict[str, Any] = {
+        "restored": False,
+        "success": True,
+        "target": f"refs/remotes/origin/{parent_branch}",
+    }
+    if not fast_forward or not fast_forward.get("advanced"):
+        result["reason"] = "no_advance_to_undo"
+        return result
+
+    advanced_to = _resolve_full_commit(
+        repo_root, str(fast_forward.get("advanced_to") or fast_forward.get("commit"))
+    )
+    current = _resolve_full_commit(repo_root, f"refs/heads/{parent_branch}")
+    result["advanced_to"] = advanced_to
+    result["current"] = current
+    if advanced_to and current and current != advanced_to:
+        result["reason"] = "branch_moved_since_advance"
+        result["warning"] = (
+            f"Not restoring local {parent_branch}: it moved from the tip this "
+            f"finish advanced to ({advanced_to}) to {current}, so another "
+            f"actor owns that move and the shared checkout is left untouched."
+        )
+        LOG.warning("%s", result["warning"])
+        return result
+
+    target_tip = _resolve_origin_parent_tip(repo_root, parent_branch)
+    result["target_tip"] = target_tip
+    if not target_tip:
+        result["reason"] = "no_remote_tracking_ref"
+        result["warning"] = (
+            f"Cannot restore local {parent_branch}: {result['target']} does "
+            f"not resolve. Local {parent_branch} may still point at the "
+            f"unpushed commit {current or 'unknown'} — the next finish refuses "
+            f"to advance it and reports the divergence."
+        )
+        LOG.warning("%s", result["warning"])
+        return result
+    if current == target_tip:
+        result["restored"] = True
+        result["reason"] = "already_at_remote_tip"
+        return result
+
+    head_result = run_cmd(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_root, check=False
+    )
+    on_parent_branch = (
+        head_result.returncode == 0
+        and head_result.stdout.strip() == parent_branch
+    )
+    if on_parent_branch:
+        # ``--merge`` resets the index/worktree for the files our own advance
+        # touched and keeps every other uncommitted change; it aborts rather
+        # than clobber a conflicting local modification (never ``--hard``).
+        reset_result = run_cmd(
+            ["git", "reset", "--merge", target_tip],
+            cwd=repo_root,
+            check=False,
+        )
+        if reset_result.returncode != 0:
+            result["reason"] = "reset_conflict"
+            result["warning"] = (
+                f"Cannot restore local {parent_branch} to {target_tip}: "
+                f"uncommitted changes in {repo_root} overlap the commit being "
+                f"undone ({reset_result.stderr.strip()[:200]}). Nothing was "
+                f"reset — the shared checkout keeps its uncommitted work; "
+                f"local {parent_branch} still points at {current}. Restore "
+                f"manually: git -C {repo_root} reset --merge {target_tip}"
+            )
+            LOG.warning("%s", result["warning"])
+            return result
+    else:
+        # Not checked out here: move the ref only, with an atomic
+        # compare-and-swap on the tip we created.
+        update_result = run_cmd(
+            [
+                "git",
+                "update-ref",
+                f"refs/heads/{parent_branch}",
+                target_tip,
+                current or "",
+            ],
+            cwd=repo_root,
+            check=False,
+        )
+        if update_result.returncode != 0:
+            result["reason"] = "update_ref_failed"
+            result["warning"] = (
+                f"Cannot restore local {parent_branch} to {target_tip}: "
+                f"git update-ref failed "
+                f"({update_result.stderr.strip()[:200]}). Local "
+                f"{parent_branch} still points at {current}."
+            )
+            LOG.warning("%s", result["warning"])
+            return result
+
+    result["restored"] = True
+    LOG.info(
+        "Restored local %s to %s after the failed push (was %s)",
+        parent_branch,
+        target_tip,
+        current,
+    )
+    return result
+
+
+def _assert_commit_on_origin_dev(
+    repo_root: str,
+    commit_hash: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    branch: str | None = None,
+    worktree_path: str | None = None,
+) -> dict[str, Any]:
+    """Assert finish's own commit is on the pushed ``origin/<parent>`` (AC2).
+
+    The assertion fails **closed**: ``finish`` may only report success when
+    ``git merge-base --is-ancestor <commit> refs/remotes/origin/<parent>``
+    positively holds. A commit that was not published — including a rebased
+    replacement hash produced by non-fast-forward recovery — therefore can
+    never be reported as success (the 2026-10-25 orphan's false positive).
+
+    The remote-tracking ref is refreshed first (best effort: a push already
+    updates it, a fetch just makes the verdict independent of that).
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        commit_hash: The commit finish pushed (short or full hash).
+        parent_branch: The shared parent branch (default: ``dev``).
+        branch: Feature branch, for the refusal message only.
+        worktree_path: Retained worktree, for the refusal message only.
+
+    Returns:
+        Dict with ``verified``, ``commit``, ``resolved_commit``, ``target``,
+        ``origin_tip`` and ``fetched``.
+
+    Raises:
+        AncestryAssertionError: when the commit is not an ancestor of the
+            remote-tracking parent ref, or the check cannot be performed.
+    """
+    target_ref = f"refs/remotes/origin/{parent_branch}"
+    result: dict[str, Any] = {
+        "verified": False,
+        "commit": commit_hash,
+        "target": target_ref,
+        "branch": branch,
+        "worktree_path": worktree_path,
+    }
+    fetch_result = run_cmd(
+        ["git", "fetch", "origin", parent_branch],
+        cwd=repo_root,
+        check=False,
+        timeout=120,
+    )
+    result["fetched"] = fetch_result.returncode == 0
+
+    resolved = _resolve_full_commit(repo_root, commit_hash)
+    origin_tip = _resolve_origin_parent_tip(repo_root, parent_branch)
+    result["resolved_commit"] = resolved
+    result["origin_tip"] = origin_tip
+    if not resolved or not origin_tip:
+        raise AncestryAssertionError(
+            commit_hash,
+            resolved,
+            target_ref,
+            origin_tip,
+            "the commit or the remote-tracking ref could not be resolved, so "
+            "publication cannot be verified",
+        )
+
+    ancestor_result = run_cmd(
+        ["git", "merge-base", "--is-ancestor", resolved, target_ref],
+        cwd=repo_root,
+        check=False,
+    )
+    if ancestor_result.returncode != 0:
+        raise AncestryAssertionError(
+            commit_hash,
+            resolved,
+            target_ref,
+            origin_tip,
+            "git merge-base --is-ancestor reports the commit is not on the "
+            "remote branch",
+        )
+
+    result["verified"] = True
+    LOG.info(
+        "Ancestry verified: %s is on %s (%s)", resolved, target_ref, origin_tip
+    )
     return result
 
 
@@ -5265,14 +5745,18 @@ def phase_finish(
     3. Build
     4. Test (with fix-and-re-run loop)
     5. Commit
-    6. Fast-forward dev in the main checkout (AC1 — context-budget fix)
+    6. Verified, reversible fast-forward of dev in the main checkout
+       (context-budget fix; restored to origin/dev on push failure)
     7. Push to dev (rebase + retry on concurrent advance)
-    8. Clean up worktree processes (post-push, before removal —
+    8. Post-push ancestry assertion: the pushed commit must be an ancestor
+       of refs/remotes/origin/dev or finish fails loudly naming the hash
+       (SA-0MVPZG7A0000N66U AC2)
+    9. Clean up worktree processes (post-push, before removal —
        self-exclusion-safe, SA-0MVJC5KNT0044L2B)
-    9. Remove worktree
-    10. Sync local parent branch (post-push, AC1/AC2)
-    11. Mark in_review
-    12. Read back the terminal status from the main-checkout store and
+    10. Remove worktree
+    11. Sync local parent branch (post-push, AC1/AC2)
+    12. Mark in_review
+    13. Read back the terminal status from the main-checkout store and
         fail loudly if it did not stick (OSL-0MVME1PI5005WU58)
 
     All implementation work MUST be done inside the worktree created by
@@ -5315,6 +5799,10 @@ def phase_finish(
 
     # Read state for metadata
     state = read_state(worktree_path)
+    # The shared parent branch this finish syncs and verifies against (dev).
+    # Resolved once here so the verified fast-forward (Step 5), the restore
+    # (Step 6) and the ancestry assertion (Step 6a) all use the same ref.
+    parent_branch = state.parent_branch if state else DEFAULT_PARENT_BRANCH
 
     report["worktree_path"] = worktree_path
     # Compute branch name from the worktree
@@ -5642,78 +6130,35 @@ def phase_finish(
             }
             LOG.info("Committed at %s", commit_hash)
 
-            # ── Step 5: Fast-forward dev in the main checkout ──────────────
+            # ── Step 5: Verified, reversible local-dev fast-forward ───────
             # Before removing the worktree, bring the main checkout's local
-            # dev branch up to the new commit (AC1).  This ensures that when
-            # the pre-push hook measures the working tree (which is the main
+            # dev branch up to the new commit. This ensures that when the
+            # pre-push hook measures the working tree (which is the main
             # checkout at push time), it sees the updated files — so
             # context-budget compliant commits that modify AGENTS.md etc. no
             # longer trigger the stale-checkout failure.
             # ``repo_root`` was resolved (stale state rejected) at Step 0.75.
-            try:
-                LOG.info(
-                    "Fast-forwarding dev in main checkout (%s) to %s ...",
-                    repo_root,
-                    commit_hash,
-                )
-                # 0. Capture the pre-fast-forward HEAD so the guard can
-                #    attribute the fast-forward's own file churn.
-                before_head_result = run_cmd(
-                    ["git", "rev-parse", "HEAD"], cwd=repo_root,
-                )
-                before_head = (
-                    before_head_result.stdout.strip()
-                    if before_head_result.returncode == 0
-                    else ""
-                )
-                # 1. Fetch latest origin/dev so our local-tracking ref is current.
-                fetch_result = run_cmd(
-                    ["git", "fetch", "origin", "dev"], cwd=repo_root,
-                )
-                if fetch_result.returncode != 0:
-                    raise RuntimeError(
-                        f"git fetch origin dev failed: {fetch_result.stderr.strip()}"
-                    )
-                # 2. Ensure the main checkout is on dev (and clean).
-                checkout_result = run_cmd(
-                    ["git", "checkout", "dev"], cwd=repo_root,
-                )
-                if checkout_result.returncode != 0:
-                    raise RuntimeError(
-                        f"git checkout dev failed: {checkout_result.stderr.strip()}"
-                    )
-                # 3. Fast-forward origin/dev → local dev (synchronises with any
-                #    concurrent pushes before we merge our commit).
-                merge_origin_result = run_cmd(
-                    ["git", "merge", "--ff-only", "origin/dev"], cwd=repo_root,
-                )
-                if merge_origin_result.returncode != 0:
-                    raise RuntimeError(
-                        f"git merge origin/dev failed (non-fast-forward or conflict): "
-                        f"{merge_origin_result.stderr.strip()}"
-                    )
-                # 4. Fast-forward our new commit onto dev.
-                merge_commit_result = run_cmd(
-                    ["git", "merge", "--ff-only", commit_hash], cwd=repo_root,
-                )
-                if merge_commit_result.returncode != 0:
-                    raise RuntimeError(
-                        f"git merge --ff-only {commit_hash} failed: "
-                        f"{merge_commit_result.stderr.strip()}"
-                    )
-                LOG.info("Fast-forward to %s succeeded", commit_hash)
-                # 5. The fast-forward's own file churn is expected — record it
-                #    so the main-checkout guard never aborts on it
-                #    (WL-0MVPADZ1Z000FOSG AC3/AC4).
-                main_checkout_guard["own_churn"] = _record_finish_own_churn(
-                    repo_root, before_head, commit_hash
-                )
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning(
-                    "Fast-forward dev failed (%s); push will proceed from the "
-                    "stale checkout — the context-budget gate may reject the push.",
-                    exc,
-                )
+            #
+            # The advance is *loud and reversible* (SA-0MVPZG7A0000N66U AC1):
+            # it is recorded in the report, undoable on push failure (restore
+            # to refs/remotes/origin/dev), and refuses loudly — naming the
+            # refs and hashes — instead of the previous silent
+            # ``except Exception`` whenever it cannot fast-forward safely.
+            # The commit is inherently unpublishable at this point, so the
+            # post-push ancestry assertion (Step 6a) is the authority on
+            # whether it actually landed.
+            LOG.info(
+                "Fast-forwarding dev in main checkout (%s) to %s ...",
+                repo_root,
+                commit_hash,
+            )
+            local_dev_fast_forward = _fast_forward_local_dev_for_push(
+                repo_root, commit_hash, parent_branch
+            )
+            report["steps"]["local_dev_fast_forward"] = local_dev_fast_forward
+            main_checkout_guard["own_churn"] = list(
+                local_dev_fast_forward.get("own_churn") or []
+            )
 
             # ── Step 5b: Main-checkout guard verify (pre-push) ───────────
             # A foreign mutation of the main checkout must abort before the
@@ -5736,20 +6181,46 @@ def phase_finish(
                     raise RuntimeError("git push to dev failed.")
             except PushTimeoutError as exc:
                 # AC3: recoverable state — commit is safe, branch info retained.
-                # Post a manual-push comment and re-raise so the outer handler
-                # resets status to open.
+                # Restore local dev off the unpushed commit (AC1) so the next
+                # finish/sibling does not fork from a base origin/dev lacks,
+                # post a manual-push comment, and re-raise so the outer
+                # handler resets status to open.
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": "timeout",
+                    "hash": commit_hash,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
                 wl_add_comment(
                     work_item_id,
                     f"Push to dev timed out after {exc.timeout}s (pre-push hook "
                     f"still running, likely the full test suite). Commit "
                     f"{exc.commit_hash} is local on branch {exc.branch}.\n"
+                    f"Local dev was restored to origin/dev (the commit stays "
+                    f"on its feature branch).\n"
                     f"Push manually: git push origin {exc.branch}:refs/heads/dev",
                 )
                 raise RuntimeError(f"git push to dev timed out: {exc}") from exc
             except PushNonFastForwardError as exc:
-                # AC1/AC2/AC3: dev advanced concurrently — rebase and retry
-                # inside the (still-present) worktree instead of losing the
-                # completed implementation.
+                # AC1/AC2/AC3: dev advanced concurrently — restore local dev
+                # (it must never point at the unpushed commit), then rebase
+                # and retry inside the (still-present) worktree instead of
+                # losing the completed implementation. The ancestry assertion
+                # below re-checks the rebased replacement hash.
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": "non_fast_forward",
+                    "hash": commit_hash,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
                 LOG.info(
                     "Push failed (non-fast-forward); attempting rebase and retry "
                     "...",
@@ -5764,9 +6235,49 @@ def phase_finish(
                 )
                 # The rebase rewrote HEAD; keep the reported commit in sync.
                 report["steps"]["commit"]["hash"] = commit_hash
-
-            report["steps"]["push"] = {"success": True, "hash": commit_hash}
+                report["steps"]["push"] = {
+                    "success": True,
+                    "recovered": "non_fast_forward",
+                    "hash": commit_hash,
+                }
+            except RuntimeError:
+                # A generic push failure: nothing reached origin. Undo our own
+                # fast-forward so local dev never stays on the unpushed commit
+                # (the exact orphan that made the next finish fork from a base
+                # origin/dev did not have).
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": "push_failed",
+                    "hash": commit_hash,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
+                raise
+            else:
+                report["steps"]["push"] = {
+                    "success": True,
+                    "hash": commit_hash,
+                }
             LOG.info("Push to dev succeeded")
+
+            # ── Step 6a: Post-push ancestry assertion (AC2) ───────────────
+            # The push's return value is not trusted on its own: finish may
+            # only report success when its own commit (including a rebased
+            # replacement hash) is an ancestor of the pushed origin/dev tip
+            # (SA-0MVPZG7A0000N66U AC2). The assertion fails closed — raising
+            # `AncestryAssertionError` here keeps the worktree and the feature
+            # branch, leaves the work item un-advanced, and is reported by the
+            # outer handler with the commit hash.
+            report["steps"]["ancestry_assertion"] = _assert_commit_on_origin_dev(
+                repo_root,
+                commit_hash,
+                parent_branch=parent_branch,
+                branch=branch,
+                worktree_path=worktree_path,
+            )
 
             # ── Step 6b: Clean up worktree processes ───────────────────────
             # Runs *after* the push (historically it ran before, at Step 5b):
@@ -5809,9 +6320,7 @@ def phase_finish(
             # After a successful push, bring the main checkout's local
             # parent branch (dev) up to date so the next child worktree
             # does not start from a stale base.
-            sync_parent_branch = (
-                state.parent_branch if state else DEFAULT_PARENT_BRANCH
-            )
+            sync_parent_branch = parent_branch
             LOG.info("Syncing local parent branch %s...", sync_parent_branch)
             sync_result = _sync_parent_branch(repo_root, sync_parent_branch)
             report["steps"]["sync_parent_branch"] = sync_result
@@ -5852,6 +6361,22 @@ def phase_finish(
             )
         elif "git commit failed" in msg:
             wl_add_comment(work_item_id, "Commit failed during finish phase.")
+        elif isinstance(e, AncestryAssertionError):
+            # AC2: the push claimed success but the commit never reached
+            # origin/dev. Record the refusal (and the retained recovery
+            # state) on the work item; the status reset above keeps it open.
+            wl_add_comment(
+                work_item_id,
+                "Finish refused: ancestry assertion failed.\n"
+                f"- Commit: {e.resolved_commit or e.commit_hash}\n"
+                f"- Target: {e.target_ref} (tip {e.target_tip or 'unresolved'})\n"
+                f"- Reason: {e.reason}\n"
+                f"- Branch: {branch} (retained)\n"
+                f"- Worktree: {worktree_path} (retained)\n"
+                "The work item stays open; re-run finish once the commit is "
+                "pushed (rebase onto the remote branch if the push is "
+                "rejected).",
+            )
         if json_output:
             print(format_json_output(report))
         else:
