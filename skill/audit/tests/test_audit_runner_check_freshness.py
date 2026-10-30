@@ -14,8 +14,6 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -116,17 +114,13 @@ def test_check_freshness_reports_no_stored_audit(capsys):
 # payload*; the paired JS test pins the exact command string that
 # ``queryContentFreshness()`` builds, so the two sides cannot drift apart again.
 #
-# TRACER BULLET: both tests are red for the right reason (argparse exits 2 with
-# ``unrecognized arguments: --json``) and are marked ``xfail(strict=True)``
-# until SA-0MVTU2268007BBYO accepts the flag. That item removes the markers —
-# a strict unexpected pass is itself a failure, so the markers cannot be left
-# behind silently.
+# TRACER BULLET (retired by SA-0MVTU2268007BBYO): both tests were red for the
+# right reason (argparse exited 2 with ``unrecognized arguments: --json``) and
+# were marked ``xfail(strict=True)`` until the subparser accepted the flag. The
+# implementation sibling added it, so the markers are removed and the tests now
+# pin the accepted shape and payload permanently.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="tracer bullet: SA-0MVTU2268007BBYO accepts --json on the subparser",
-)
 def test_check_freshness_subcommand_accepts_json_flag():
     """AC1: the probe argv built by the ship gates parses.
 
@@ -144,10 +138,6 @@ def test_check_freshness_subcommand_accepts_json_flag():
     assert args.json is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="tracer bullet: SA-0MVTU2268007BBYO accepts --json on the subparser",
-)
 def test_check_freshness_json_flag_leaves_the_payload_unchanged(capsys):
     """AC1: accepting the flag is additive — the probe payload is identical.
 

@@ -14940,6 +14940,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_freshness.add_argument("issue_id", help="Work item id to check")
     p_freshness.add_argument("--worklog-dir", default=None,
                              help="Explicit .worklog directory to target (overrides auto-resolution)")
+    # Accepted for compatibility with the documented ship-gate invocation
+    # (``queryContentFreshness()`` in check-audit-gate.js builds
+    # ``check-freshness <id> --json``). The subcommand already prints JSON, so
+    # the flag is parsed but unused — it only keeps the CLI in sync with the
+    # callers and the docs (SA-0MVTU2268007BBYO).
+    p_freshness.add_argument("--json", action="store_true", default=False,
+                             help=("Accepted for compatibility: the probe output is "
+                                   "already a single JSON object (no-op)"))
 
     return p
 
