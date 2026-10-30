@@ -39,8 +39,8 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
 
 #: The suite command the fixtures pretend to run. Matches the shape
 #: ``.pi/test-config.json`` gives the fixture repository in the runner tests.
