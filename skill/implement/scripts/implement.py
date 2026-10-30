@@ -2335,7 +2335,7 @@ def _remove_gate_index(index_path: str | None) -> None:
             os.unlink(candidate)
         except FileNotFoundError:
             continue
-        except OSError as exc:  # noqa: BLE001 - cleanup is best-effort
+        except OSError as exc:
             LOG.warning(
                 "Could not remove the finish gate's temporary index %s: %s",
                 candidate,
@@ -2387,6 +2387,18 @@ def _git_absolute_git_dir(cwd: str) -> str:
             f"{proc.stderr.strip() or 'git rev-parse failed'}"
         )
     return proc.stdout.strip()
+
+
+def _is_git_worktree(cwd: str) -> bool:
+    """Whether *cwd* is inside a git work tree.
+
+    The precondition of the finish gate's would-be-commit staging: a directory
+    outside a work tree has no commit tree to attribute a verdict to, so the
+    gate degrades to a plain suite run instead of refusing to run at all
+    (SA-0MVVKJGKP003QVNM).
+    """
+    proc = _run_git_plumbing(cwd, ["rev-parse", "--is-inside-work-tree"])
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
 @dataclass
@@ -2537,7 +2549,27 @@ def run_gate_suite(
     into the inherited ``GIT_INDEX_FILE`` instead of its own repository's
     index — so the result is forced red with an explanatory notice rather than
     being attributed to a tree that was never the one tested.
+
+    *cwd* outside a git work tree has no would-be-commit tree to verify: the
+    suite runs plainly and the summary reports ``available: False`` with the
+    stable ``not_a_git_worktree`` reason (SA-0MVVKJGKP003QVNM).
     """
+    if not _is_git_worktree(cwd):
+        notice = (
+            "finish gate tree check unavailable: "
+            f"{cwd} is not inside a git work tree, so there is no "
+            "would-be-commit tree to verify; the suite ran against the "
+            "working tree as-is."
+        )
+        LOG.warning("Finish gate: %s", notice)
+        result = run_tests(cwd, scope=scope, base_ref=base_ref)
+        return result, {
+            "available": False,
+            "reason": "not_a_git_worktree",
+            "notice": notice,
+            "staged_paths": [],
+        }
+
     with would_be_commit_index(cwd) as gate_index:
         result = run_tests(cwd, scope=scope, base_ref=base_ref)
         integrity = gate_index.verify_unchanged()
@@ -6703,13 +6735,31 @@ def phase_finish(
             # commit can be created for a tree that was never tested. On a
             # mismatch ``stage_tested_tree`` unstages again and raises below,
             # leaving the abort contract intact (SA-0MVQHVGFR006W8LG).
-            staged = stage_tested_tree(worktree_path, gate_tree.get("tree"))
+            if gate_tree.get("available", True):
+                staged = stage_tested_tree(worktree_path, gate_tree.get("tree"))
+            else:
+                # No repository, no commit tree: the gate recorded why the
+                # verification was unavailable (SA-0MVVKJGKP003QVNM).
+                staged = {
+                    "success": True,
+                    "skipped": True,
+                    "verified": False,
+                    "reason": gate_tree.get("reason"),
+                    "notice": gate_tree.get("notice", ""),
+                }
             report["steps"]["would_be_commit_assertion"] = staged
             if not staged["success"]:
                 raise RuntimeError(staged["message"])
-            LOG.info(
-                "Finish gate tree verified: committing tree %s", staged["tree"]
-            )
+            if staged.get("skipped"):
+                LOG.warning(
+                    "Finish gate tree verification skipped: %s",
+                    staged.get("notice", ""),
+                )
+            else:
+                LOG.info(
+                    "Finish gate tree verified: committing tree %s",
+                    staged["tree"],
+                )
 
             # ── Step 4: Commit ─────────────────────────────────────────────
             commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"

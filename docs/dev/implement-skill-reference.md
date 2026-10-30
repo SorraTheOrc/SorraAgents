@@ -517,6 +517,19 @@ working tree. `phase_finish` therefore delegates its test step to
   git commands always act on the real index while the suite runs; suite
   runners opt in with `keep_git_index=True`.
 
+**Fail-soft outside a git work tree (SA-0MVVKJGKP003QVNM).** Staging a
+would-be-commit tree needs a repository, so the gate first checks
+`git rev-parse --is-inside-work-tree`. Outside a work tree there is no commit
+tree to attribute a verdict to: the suite then runs plainly (no temp index,
+no `GIT_INDEX_FILE`) and `report["steps"]["would_be_commit"]` records
+`available: false` with the stable `reason: "not_a_git_worktree"` and a
+`notice`. `phase_finish` records
+`report["steps"]["would_be_commit_assertion"]["skipped"] = true` instead of
+running `stage_tested_tree()` and logs a warning. Every real finish runs
+inside a worktree, so the tree-verification guarantee above is unchanged in
+production; the degradation exists so a stubbed finish harness (or any
+non-repository caller) is not refused before the suite runs.
+
 ## Push timeout (SA-0MUH9R74O002MQDU)
 
 `implement.py finish` pushes to `dev` via `git_push_to_dev()`.  The push

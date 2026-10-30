@@ -417,3 +417,70 @@ def test_suite_that_stages_into_the_inherited_index_fails_the_gate(
         gs.run_git(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
         == head_before
     )
+
+
+# ---------------------------------------------------------------------------
+# Fail-soft — a cwd outside a git work tree has no commit tree to verify
+# ---------------------------------------------------------------------------
+#
+# Regression pin (SA-0MVVKJGKP003QVNM): the would-be-commit staging made every
+# ``phase_finish`` call whose worktree is not a git repository raise before the
+# suite ran, breaking the stubbed-harness finish tests (lifecycle, lock and
+# main-checkout-guard contracts) whose worktrees are plain temp directories.
+# A directory outside a git work tree has no commit tree to attribute a
+# verdict to, so the gate runs the suite plainly and records why the tree
+# check was unavailable instead of refusing to run at all.
+
+
+def test_gate_runs_plainly_outside_a_git_worktree(tmp_path, monkeypatch):
+    """The suite still runs when there is no repository to stage a tree in.
+
+    The gate must not raise before the suite: it runs the plain command and
+    records ``available: false`` plus a stable reason, so a caller can tell an
+    unverifiable tree from a verified one.
+    """
+    plain = tmp_path / "plain-directory"
+    plain.mkdir()
+    green = {
+        "success": True,
+        "failures": [],
+        "scope": "changed",
+        "notices": [],
+    }
+    ran: list[str] = []
+
+    def _fake_run_tests(cwd, **kwargs):
+        ran.append(cwd)
+        return green
+
+    monkeypatch.setattr(implement, "run_tests", _fake_run_tests)
+
+    result, summary = implement.run_gate_suite(str(plain), scope="changed")
+
+    assert result is green
+    assert ran == [str(plain)], "the suite must still run outside a repository"
+    assert summary["available"] is False, summary
+    assert summary["reason"] == "not_a_git_worktree", summary
+    assert summary["notice"], summary
+    assert not summary.get("tree"), summary
+    assert not list(plain.iterdir()), "no temporary index may be left behind"
+
+
+def test_gate_still_verifies_the_tree_inside_a_git_worktree(tmp_path, monkeypatch):
+    """A real repository keeps the tree verification (the fail-soft is narrow)."""
+    repo = _build_clean_repo(tmp_path)
+    green = {
+        "success": True,
+        "failures": [],
+        "scope": "changed",
+        "notices": [],
+    }
+    monkeypatch.setattr(implement, "run_tests", lambda cwd, **kwargs: green)
+
+    result, summary = implement.run_gate_suite(str(repo), scope="changed")
+
+    assert result is green
+    assert summary.get("available", True) is not False, summary
+    assert summary["tree"], summary
+    assert summary["staged_paths"] == ["README.md"], summary
+    assert not Path(summary["index_path"]).exists(), summary
