@@ -274,6 +274,48 @@ def test_git_state_is_cwd_aware_worktree_fingerprint(git_repo: Path) -> None:
         git(git_repo, "worktree", "remove", "--force", str(worktree))
 
 
+def test_generated_metadata_is_invisible_to_the_git_state_fingerprint(
+    git_repo: Path,
+) -> None:
+    """A green verdict recorded for one on-disk metadata state is served for another.
+
+    ``compute_git_state`` covers HEAD plus the content of every path ``git
+    status`` reports, so gitignored generated metadata is invisible to it. A
+    suite that reads on-disk files (a generated wiki registry compared against
+    the on-disk document set) therefore cannot be distinguished by the cache
+    key: the green entry recorded against a rebuilt-metadata tree is served for
+    a tree whose metadata lags — the disk-reading parity false pass
+    (SA-0MVQHV8JE007MAK3, parent SA-0MVL2NH1G0094FA2). Binding gate acceptance
+    to the would-be-commit tree fingerprint (F7, SA-0MVQHVHXI007PQAB) is what
+    closes it; the loose-key behaviour asserted here is why the gate needs it.
+    """
+    (git_repo / ".gitignore").write_text("_build/\n", encoding="utf-8")
+    git(git_repo, "add", "-A")
+    git(git_repo, "commit", "-q", "-m", "ignore generated metadata")
+    registry = git_repo / "_build" / "registry.json"
+    registry.parent.mkdir()
+    registry.write_text(json.dumps({"documents": ["welcome.md"]}), encoding="utf-8")
+    lagging_state = compute_git_state(str(git_repo))
+
+    calls: list[str] = []
+    runner = make_runner(calls)
+    fresh = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert fresh["cached"] is False
+
+    registry.write_text(
+        json.dumps({"documents": ["welcome.md", "synthesis.md"]}),
+        encoding="utf-8",
+    )
+    # Rebuilt metadata does not move the fingerprint: both on-disk tree states
+    # share one cache key.
+    assert compute_git_state(str(git_repo)) == lagging_state
+
+    served = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert served["cached"] is True
+    assert served["stdout"] == SUCCESS_OUTPUT
+    assert calls == ["pytest -q -r a --disable-warnings"]  # one execution only
+
+
 # ---------------------------------------------------------------------------
 # Corrupt entries and force bypass
 # ---------------------------------------------------------------------------
