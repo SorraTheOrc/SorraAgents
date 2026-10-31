@@ -619,6 +619,16 @@ actionable manual instructions rather than silently skipping a child
 (`IMPLEMENT_DRIVE_PI_BIN` overrides the binary). A driven session is marked
 `IMPLEMENT_DRIVE_ACTIVE=1` and refuses to re-enter `drive`.
 
+**The driver owns the child's worktree (SA-0MVTE8XAJ002IUDR).** A driven
+child's `finish` defers worktree removal (the tree is that session's own cwd,
+so deleting it inside `finish` breaks every later command). Once the child's
+session has exited, `drive` removes the tree itself — only when the child is
+terminal **and** the tree is clean, never while a session may still be alive.
+A non-terminal or dirty tree is retained and named in
+`report["retained_worktrees"]` with the exact `git worktree remove … && git
+worktree prune` remedy, and leftover trees of terminal children are swept at
+the start of the next drive (recorded in `report["worktree_sweep"]`).
+
 **A timeout is a bound, not a verdict (SA-0MVHXWLPG007OQVN).** After a failed
 child spawn (timeout or non-zero exit) `drive` re-fetches the child and
 classifies it: a child that already reached a terminal state is recorded as
@@ -918,7 +928,7 @@ See ``../refactor/SKILL.md``.
   see [Finish lock, verified sync and refusal
   recovery](#finish-lock-verified-sync-and-refusal-recovery) for the state
   left behind and the exact recovery commands.
-- After pushing, clean up the worktree:
+- After pushing, clean up the worktree — **but only if this session owns it**:
 
   ```bash
   git worktree remove .worklog/worktrees/wl-<WIP-id>-<short-slug>
@@ -926,6 +936,28 @@ See ``../refactor/SKILL.md``.
   git checkout dev && git pull origin dev
   npm run build 2>/dev/null || echo "No build script, skipping rebuild"
   ```
+
+  > **Worktree removal ownership (SA-0MVTE8XAJ002IUDR).** `finish` removes
+  > the worktree itself by default, and the first command above is then a
+  > harmless no-op. Two cases are different, and in both the worktree still
+  > exists after `finish` returns:
+  >
+  > - **Driven child session** (`IMPLEMENT_DRIVE_ACTIVE=1`): `finish` **defers**
+  >   removal, because the worktree is this session's own cwd — deleting it
+  >   makes every later bash call fail with `Working directory does not exist`.
+  >   **Do not remove your own worktree:** `implement.py drive` removes it once
+  >   this session has exited. Never run `git worktree remove` on it.
+  > - **Plain leaf session that opted in** with `finish <id> --keep-worktree`
+  >   (or `IMPLEMENT_KEEP_WORKTREE=1`): removal is deferred so this session
+  >   keeps its cwd for the completion comment, the report and the post-push
+  >   verification. Remove the tree as the **last** bash command of the
+  >   session — after which no bash works in it.
+  >
+  > `finish` records the deferral in `report["steps"]["worktree_removal"]`
+  > (`deferred`, `reason`, `worktree_path`) and names the retained path in its
+  > completion comment. See
+  > [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr)
+  > and [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md#worktree-removal-ownership).
 
   > **Why rebuild?** `dist/` is gitignored; `git pull` does not update it. See [[concepts/git-worktree-best-practices-for-agent-workflows]].
 - Add a work-item comment with the commit hash: `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`

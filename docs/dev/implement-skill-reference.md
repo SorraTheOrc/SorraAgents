@@ -260,6 +260,118 @@ fake, injected commit-evidence provider, recording mutation fake).
 - No fetch/network in the evidence path; a stale `origin/dev` ref is accepted
   evidence on the failure path.
 
+## Worktree removal ownership (SA-0MVTE8XAJ002IUDR)
+
+Exactly one owner removes a worktree, decided by context. `finish` used to
+remove it unconditionally right after the dev push, which deleted the
+**finishing session's own cwd** whenever that session was standing in the
+tree: Pi's bash tool then refuses every command with `Working directory does
+not exist`, while absolute-path `read`/`write` keep working. The session
+degrades exactly when it must write its completion comment, render its report
+and verify the pushed commit (evidence: driven child sessions
+`RISE-0MVPZ31UJ000BC33` — 8 × `Working directory does not exist` — and
+`RISE-0MVPZ32R1001LWWX`, which burned ~73 minutes that way).
+
+| Flow | Who removes the worktree | When |
+|---|---|---|
+| Driven child session (`IMPLEMENT_DRIVE_ACTIVE=1`) | `implement.py drive` | After that child's session has exited, and only when the child is terminal and the tree is clean |
+| Plain leaf session that opted in (`--keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session (or an operator) | After the completion comment, the report and the post-push verification — as the session's **last** bash command |
+| Plain leaf session (default) | `finish` | Immediately after a successful dev push (unchanged) |
+| Aborted item | `abort` | Unconditionally — an aborted item is abandoned, not resumed |
+
+### One predicate, two removal sites
+
+`_should_defer_worktree_removal(keep_worktree)` is the single deferral
+predicate. It reads only `IMPLEMENT_DRIVE_ACTIVE` (`"1"`), the explicit
+`--keep-worktree` flag and `IMPLEMENT_KEEP_WORKTREE` (`"1"`) — the same `"1"`
+convention as the drive recursion guard. It returns `(deferred, reason)` with
+a **stable** reason token, in fixed precedence order:
+
+| `reason` | Input |
+|---|---|
+| `driven-session` | `IMPLEMENT_DRIVE_ACTIVE=1` |
+| `keep-worktree-env` | `IMPLEMENT_KEEP_WORKTREE=1` |
+| `keep-worktree-flag` | `finish --keep-worktree` |
+
+Combining them is idempotent (the tree is deferred once); `drive` refuses to
+run inside a driven session, so the driver itself never inherits the
+deferral.
+
+Deferral is never silent — the `finish` report carries
+
+```json
+"steps": {
+  "worktree_removal": {"deferred": true, "reason": "driven-session", "worktree_path": "…"},
+  "worktree_removed": false
+}
+```
+
+and the completion comment names the retained path with the exact remedy.
+When removal is **not** deferred the report carries `deferred: false` and
+`worktree_removed: true` on success (`false` when the removal failed).
+
+### What is skipped when removal is deferred
+
+`finish` skips Step 6b (`cleanup_worktree_processes`) and Step 7
+(`remove_state` + `_remove_worktree`) — the tree, its `wl-*` branch and
+`.implement_state.json` all survive, so an interrupted run resumes onto the
+same worktree instead of failing on `git worktree add`. Everything else is
+unchanged: the main-checkout guard (Step 6c), the verified local-dev
+fast-forward, the push, the ancestry assertion, the parent-branch sync, the
+terminal-status write and its read-back all operate on the **main checkout**,
+so deferring the removal cannot affect them.
+
+The signal handler honours the same predicate: a `SIGTERM`/`SIGINT` during a
+deferred finish still releases the item (`_safety_reset_if_in_progress`) but
+leaves the tree in place. `phase_abort` is deliberately **not** deferral-aware
+— abort removes the worktree unconditionally.
+
+### Driver-side removal
+
+`_remove_finished_worktree(work_item_id, worktree_path, repo_root)` is the one
+removal path used by the driver (and by any other deferred caller):
+
+1. the path is known and exists — an absent tree is a reported no-op
+   (`already_absent: true`, `removed: false`), so a repeat run is idempotent;
+2. `_worktree_has_uncommitted_changes` must be false — uncommitted work is
+   never discarded and the tree is retained (`retained_dirty: true`);
+3. `cleanup_worktree_processes` runs first (self-exclusion contract
+   SA-0MVJC5KNT0044L2B), then `_remove_worktree` with its own repo-root and
+   `.git/`-directory safety gates; `remove_state` runs last.
+
+`phase_drive` calls it **after** `spawner(...)` returns, on both terminal
+paths: the spawn-success path and the `completed-late` branch (the exact path
+the production incident took, where the session died after its push). The
+child's `children_driven` entry records `worktree_removed` plus the
+`worktree_cleanup` outcome, and every retained tree is named once in
+`report["retained_worktrees"]` with a copy-pasteable remedy:
+
+```bash
+git worktree remove <path> && git worktree prune
+```
+
+A cleanup problem never fails the drive: a refused or failed removal is
+recorded on the entry (and in `retained_worktrees`) and the chain continues.
+
+### Start-of-run sweep
+
+A drive interrupted between a session's exit and the driver-side removal
+would strand that child's tree forever, so a drive sweeps leftover worktrees
+of **terminal** children when it starts (`report["worktree_sweep"]`). The
+sweep is bounded and best-effort — terminal children only, clean trees only,
+never fatal. Note that `scripts/hygiene_check.sh` reports orphaned worktrees
+only when their branch was deleted, so a deferred tree is otherwise invisible
+to it.
+
+### Tests
+
+- `skill/implement/tests/test_finish_deferred_worktree_removal.py` — driven /
+  flag / env deferral, default removal unchanged, signal-handler deferral,
+  `abort` unchanged.
+- `tests/test_implement_drive_worktree_cleanup.py` — driver removal after
+  session exit (both terminal paths), dirty/non-terminal retention,
+  already-absent no-op, failing removal, sweep.
+
 ## Drive failure recovery: bounded finish attempts, reconciliation and reset
 
 `implement.py drive` must terminate reliably and advance an epic even when a

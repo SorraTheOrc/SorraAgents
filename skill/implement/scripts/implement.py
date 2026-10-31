@@ -202,8 +202,17 @@ DEFAULT_MAX_CHILD_SESSIONS = 1
 DEFAULT_CHILD_SESSION_TIMEOUT = 3600
 #: Environment marker set on driven child sessions. When present,
 #: ``phase_drive`` refuses to run — a driven session implements its own work
-#: item with the leaf workflow and must never re-enter the driver.
+#: item with the leaf workflow and must never re-enter the driver. It also
+#: marks "a driven child session owns this worktree", so ``finish`` defers
+#: worktree removal to the driver instead of deleting the session's cwd
+#: (SA-0MVTE8XAJ002IUDR).
 DRIVE_RECURSION_ENV = "IMPLEMENT_DRIVE_ACTIVE"
+#: Explicit opt-in that defers worktree removal in ``finish`` (and in the
+#: signal handler) for **any** session, not just a driven child — the escape
+#: hatch an operator (or a future pane transport) uses when the finishing
+#: session still needs its cwd. Same ``"1"`` convention as
+#: :data:`DRIVE_RECURSION_ENV`.
+KEEP_WORKTREE_ENV = "IMPLEMENT_KEEP_WORKTREE"
 #: Absolute path to the driven child's worktree, injected into its environment
 #: so the child can verify its worktree root before its first edit — ``cwd``
 #: alone does not confine an agent (it can ``cd`` to the main checkout).
@@ -305,6 +314,10 @@ _repo_root_global: str | None = None
 #: Kept module-level so the signal handler can release it deterministically
 #: before exiting, and so spawned processes inherit its ownership token.
 _child_lock_global: WorkItemLock | None = None
+#: The ``--keep-worktree`` decision of the running ``finish`` phase, kept
+#: module-level so the signal handler defers removal for a session that
+#: opted out of it (SA-0MVTE8XAJ002IUDR AC4).
+_keep_worktree_global = False
 _cleanup_done = False
 
 
@@ -354,7 +367,21 @@ def _handle_signal_cleanup(signum: int) -> None:
                         signame, wid, exc,
                     )
 
-        if wt and Path(wt).exists():
+        # A session that owns the worktree as its cwd must not lose it to an
+        # interrupt either: the same deferral predicate as ``finish`` applies
+        # (SA-0MVTE8XAJ002IUDR AC4). The item is still released above, so an
+        # interrupted run never leaves an orphaned ``in_progress`` claim.
+        deferred, defer_reason = _should_defer_worktree_removal(
+            bool(_keep_worktree_global)
+        )
+        if deferred:
+            LOG.info(
+                "Signal cleanup: worktree removal deferred (%s); the session "
+                "still owns %s.",
+                defer_reason,
+                wt,
+            )
+        elif wt and Path(wt).exists():
             cleanup_worktree_processes(wt)
             _remove_worktree(wt)
         if rr:
@@ -409,6 +436,12 @@ def _store_signal_globals(
     _worktree_path_global = worktree_path
     _work_item_id_global = work_item_id
     _repo_root_global = repo_root
+
+
+def _set_keep_worktree_global(enabled: bool) -> None:
+    """Record the ``--keep-worktree`` decision for the signal handler."""
+    global _keep_worktree_global
+    _keep_worktree_global = bool(enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -3190,6 +3223,43 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
             exc,
         )
         return False
+
+
+def _should_defer_worktree_removal(
+    keep_worktree: bool = False,
+) -> tuple[bool, str]:
+    """Whether this process must leave the worktree in place.
+
+    One predicate, one owner per worktree (SA-0MVTE8XAJ002IUDR):
+
+    - **driven child session** (``IMPLEMENT_DRIVE_ACTIVE=1``) — the worktree
+      is the session's cwd; ``implement.py drive`` removes it once that
+      session has actually exited. Reason token: ``driven-session``.
+    - **explicit opt-in** — ``IMPLEMENT_KEEP_WORKTREE=1`` or the parsed
+      ``--keep-worktree`` flag defer removal for any session; the caller (the
+      session itself, or an operator cleanup pass) owns the removal.
+      Reason tokens: ``keep-worktree-env`` / ``keep-worktree-flag``.
+    - **everything else** — ``finish``/``abort`` remove the tree exactly as
+      before (``deferred`` is ``False`` and the reason is empty).
+
+    Precedence is fixed and stable (driven > env > flag) so the reason token
+    is deterministic when switches are combined; combining them is
+    idempotent — the tree is deferred once, never twice.
+
+    Args:
+        keep_worktree: The parsed ``--keep-worktree`` flag.
+
+    Returns:
+        ``(deferred, reason)`` — ``reason`` is a stable token, empty when the
+        removal should proceed.
+    """
+    if os.environ.get(DRIVE_RECURSION_ENV) == "1":
+        return True, "driven-session"
+    if os.environ.get(KEEP_WORKTREE_ENV) == "1":
+        return True, "keep-worktree-env"
+    if keep_worktree:
+        return True, "keep-worktree-flag"
+    return False, ""
 
 
 def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
@@ -6307,6 +6377,7 @@ def phase_finish(
     commit_msg_override: str | None = None,
     max_retry: int = DEFAULT_MAX_RETRY,
     verbose: bool = False,
+    keep_worktree: bool = False,
 ) -> dict[str, Any]:
     """Phase 2: Complete the implementation.
 
@@ -6325,7 +6396,14 @@ def phase_finish(
        (SA-0MVPZG7A0000N66U AC2)
     9. Clean up worktree processes (post-push, before removal —
        self-exclusion-safe, SA-0MVJC5KNT0044L2B)
-    10. Remove worktree
+    10. Remove worktree — **deferred** when the finishing process belongs to
+        a driven child session (``IMPLEMENT_DRIVE_ACTIVE=1``) or when the
+        caller opted in with ``--keep-worktree`` /
+        ``IMPLEMENT_KEEP_WORKTREE=1``. Deferral keeps the tree, its branch
+        and ``.implement_state.json`` so the session that owns the tree as
+        its cwd keeps working after finish returns; the driver (or the
+        caller) removes it afterwards. Recorded in
+        ``report["steps"]["worktree_removal"]`` (SA-0MVTE8XAJ002IUDR)
     11. Sync local parent branch (post-push, AC1/AC2)
     12. Mark in_review
     13. Read back the terminal status from the main-checkout store and
@@ -6342,6 +6420,8 @@ def phase_finish(
         commit_msg_override: Custom commit message.
         max_retry: Max test-fix retries.
         verbose: Enable verbose logging.
+        keep_worktree: Defer worktree removal (``--keep-worktree``); the
+            caller then owns the cleanup so the session keeps its cwd.
 
     Returns:
         Dict with result information.
@@ -6873,42 +6953,83 @@ def phase_finish(
                 worktree_path=worktree_path,
             )
 
-            # ── Step 6b: Clean up worktree processes ───────────────────────
-            # Runs *after* the push (historically it ran before, at Step 5b):
-            # a cleanup that misbehaves can no longer pre-empt the push,
-            # which is the failure mode that stranded commits local-only
-            # (SA-0MVJC5KNT0044L2B). The cleanup still precedes the worktree
-            # removal so stray sessions holding cwd in the tree do not block
-            # ``git worktree remove``. cleanup_worktree_processes itself is
-            # additionally self-exclusion-safe (see its docstring).
-            LOG.info("Cleaning up worktree processes...")
-            cleanup_result = cleanup_worktree_processes(worktree_path)
-            report["steps"]["cleanup"] = cleanup_result
-            if cleanup_result.get("warning"):
-                LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
+            # ── Step 6b: Worktree removal ownership ───────────────────────
+            # One owner per worktree (SA-0MVTE8XAJ002IUDR): a driven child
+            # session's worktree belongs to the driver (removed once that
+            # session has exited), and ``--keep-worktree`` /
+            # ``IMPLEMENT_KEEP_WORKTREE=1`` hands ownership to the caller.
+            # Removing it here would delete the finishing session's own cwd
+            # and leave it unable to run any later command.
+            defer_removal, defer_reason = _should_defer_worktree_removal(
+                keep_worktree
+            )
+            report["steps"]["worktree_removal"] = {
+                "deferred": defer_removal,
+                "reason": defer_reason,
+                "worktree_path": worktree_path,
+            }
+
+            if defer_removal:
+                # Keep the tree, its branch and .implement_state.json: the
+                # session keeps working and a resume can re-enter it. The
+                # deferral is never silent — the report, a log line and the
+                # completion comment all name the retained path.
+                report["steps"]["worktree_removed"] = False
+                LOG.info(
+                    "Worktree removal deferred (%s); retained at %s.\n"
+                    "  The driver removes it for a driven child session; "
+                    "otherwise remove it yourself once this session is "
+                    "finished with it:\n"
+                    "  git worktree remove %s && git worktree prune",
+                    defer_reason,
+                    worktree_path,
+                    worktree_path,
+                )
+            else:
+                # ── Step 6b: Clean up worktree processes ──────────────────
+                # Runs *after* the push (historically it ran before, at Step
+                # 5b): a cleanup that misbehaves can no longer pre-empt the
+                # push, which is the failure mode that stranded commits
+                # local-only (SA-0MVJC5KNT0044L2B). The cleanup still
+                # precedes the worktree removal so stray sessions holding cwd
+                # in the tree do not block ``git worktree remove``.
+                # cleanup_worktree_processes itself is additionally
+                # self-exclusion-safe (see its docstring).
+                LOG.info("Cleaning up worktree processes...")
+                cleanup_result = cleanup_worktree_processes(worktree_path)
+                report["steps"]["cleanup"] = cleanup_result
+                if cleanup_result.get("warning"):
+                    LOG.warning(
+                        "Process cleanup warning: %s", cleanup_result["warning"]
+                    )
 
             # ── Step 6c: Main-checkout guard verify (pre-removal) ────────
             # Re-verify once more before tearing the worktree down: a
             # mutation that appeared during the push (e.g. the pre-push
             # hook) must still abort loudly instead of being left silently
-            # in place.
+            # in place. Runs on the deferred path too — the guard is about
+            # the main checkout, not the worktree.
             _abort_on_main_checkout_violation(
                 "pre_worktree_removal", main_checkout_guard["own_churn"]
             )
 
-            # ── Step 7: Remove worktree ───────────────────────────────────
+            # ── Step 7: Remove worktree (unless deferred) ─────────────────
             # Only after a successful push — a failed push keeps the
             # worktree so the recovery rebase and manual recovery remain
             # possible (WL-0MV533YSW004D1E1).
-            LOG.info("Removing worktree...")
-            remove_state(worktree_path)
-            if not _remove_worktree(
-                worktree_path,
-                repo_root=repo_root,
-            ):
-                msg = f"Failed to remove worktree at {worktree_path}"
-                LOG.warning(msg)
-                report["steps"]["worktree_removed"] = False
+            if not defer_removal:
+                LOG.info("Removing worktree...")
+                remove_state(worktree_path)
+                report["steps"]["worktree_removed"] = bool(
+                    _remove_worktree(
+                        worktree_path,
+                        repo_root=repo_root,
+                    )
+                )
+                if not report["steps"]["worktree_removed"]:
+                    LOG.warning(
+                        "Failed to remove worktree at %s", worktree_path
+                    )
 
             # ── Step 8: Sync local parent branch (AC1 / AC2) ──────────────
             # After a successful push, bring the main checkout's local
@@ -6983,10 +7104,24 @@ def phase_finish(
         _release_main_checkout_lock(lock_fd)
 
     # ── Step 9: Add completion comment ─────────────────────────────
-    wl_add_comment(
-        work_item_id,
-        f"Implementation complete.\n- Commit: {commit_hash}\n- Branch: {branch}\n- Worktree: {worktree_path}",
+    completion_comment = (
+        f"Implementation complete.\n- Commit: {commit_hash}\n"
+        f"- Branch: {branch}\n- Worktree: {worktree_path}"
     )
+    removal_step = report["steps"].get("worktree_removal") or {}
+    if removal_step.get("deferred"):
+        # Never let a deferred cleanup disappear: name the retained tree, the
+        # reason and the exact remedy on the work item itself
+        # (SA-0MVTE8XAJ002IUDR AC2).
+        completion_comment += (
+            f"\n- Worktree retained (deferred removal: "
+            f"{removal_step.get('reason', 'unknown')}).\n"
+            f"  A driven child session's worktree is removed by "
+            f"`implement.py drive` once the session exits. Otherwise remove "
+            f"it when this session no longer needs its cwd:\n"
+            f"  git worktree remove {worktree_path} && git worktree prune"
+        )
+    wl_add_comment(work_item_id, completion_comment)
 
     report["success"] = True
     report["hash"] = commit_hash
@@ -8510,6 +8645,349 @@ def _worktree_has_uncommitted_changes(worktree_path: str) -> bool:
     return bool(result.stdout.strip())
 
 
+def _retained_worktree_entry(
+    work_item_id: str, worktree_path: str, reason: str
+) -> dict[str, Any]:
+    """Describe a retained worktree with a copy-pasteable remedy.
+
+    Retained trees are reported (never deleted silently and never forgotten):
+    every entry names the path, why it survived and the exact commands that
+    remove it (SA-0MVTE8XAJ002IUDR AC7).
+
+    Args:
+        work_item_id: The work item that owns the tree.
+        worktree_path: Absolute path to the retained worktree.
+        reason: Why it was retained.
+
+    Returns:
+        A small report entry dict.
+    """
+    return {
+        "id": work_item_id,
+        "path": worktree_path,
+        "reason": reason,
+        "remedy": (
+            f"git worktree remove {worktree_path} && git worktree prune"
+        ),
+    }
+
+
+def _remove_finished_worktree(
+    work_item_id: str,
+    worktree_path: str,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Remove a finished item's worktree behind the existing safety gates.
+
+    The single removal path shared by the driver (after a driven child's
+    session has exited) and every other deferred-removal caller: no second
+    deletion mechanism, no ``rm -rf`` shortcut.
+
+    Gates, in order — a failure at any of them **retains** the tree and is
+    reported, never forced past:
+
+    1. the path is known and exists (an absent tree is a reported no-op
+       success: ``already_absent``),
+    2. the tree holds no uncommitted work
+       (:func:`_worktree_has_uncommitted_changes`, untracked included) —
+       uncommitted work is never discarded,
+    3. :func:`_remove_worktree`'s own gates refuse the repository root and any
+       tree with a ``.git/`` directory.
+
+    ``cleanup_worktree_processes`` runs first so a stray ``wl`` process cannot
+    block ``git worktree remove`` (its self-exclusion contract is
+    SA-0MVJC5KNT0044L2B), and ``remove_state`` runs last so no
+    ``.implement_state.json`` is left behind.
+
+    Args:
+        work_item_id: The work item that owns the tree.
+        worktree_path: Absolute path to the worktree.
+        repo_root: The main checkout root (passed to ``_remove_worktree`` so
+            its repo-root refusal is authoritative).
+
+    Returns:
+        A result dict with ``removed``, ``already_absent``,
+        ``retained_dirty``, ``refused``, ``removed_state``, ``path``,
+        ``reason`` and (when retained) ``remedy``.
+    """
+    result: dict[str, Any] = {
+        "work_item_id": work_item_id,
+        "id": work_item_id,
+        "path": worktree_path,
+        "removed": False,
+        "already_absent": False,
+        "retained_dirty": False,
+        "refused": False,
+        "removed_state": False,
+        "reason": "",
+    }
+
+    if not worktree_path or not Path(worktree_path).exists():
+        # Idempotent: an interrupted/swept run must not fail on a tree that is
+        # already gone. ``remove_state`` is a no-op when the file is absent,
+        # but it still clears a stale state file left by an odd removal.
+        result["already_absent"] = True
+        result["reason"] = "worktree already absent"
+        if worktree_path:
+            remove_state(worktree_path)
+        return result
+
+    if _worktree_has_uncommitted_changes(worktree_path):
+        result["retained_dirty"] = True
+        result["reason"] = "worktree has uncommitted changes"
+        result["remedy"] = (
+            f"git worktree remove {worktree_path} && git worktree prune"
+        )
+        return result
+
+    # ``_remove_worktree`` chdirs the calling process out of the tree when cwd
+    # is inside it; in the driver that would move the driver's own cwd, so
+    # restore it afterwards.
+    try:
+        cwd_before: str | None = os.getcwd()
+    except OSError:  # pragma: no cover - cwd already gone
+        cwd_before = None
+
+    cleanup_worktree_processes(worktree_path)
+    try:
+        removed = bool(_remove_worktree(worktree_path, repo_root=repo_root or None))
+    except RuntimeError as exc:
+        # A safety-gate refusal (repository root, .git/ directory): retain the
+        # tree and report it rather than turning the caller into a failure.
+        result["refused"] = True
+        result["reason"] = f"removal refused: {exc}"
+        result["remedy"] = (
+            f"inspect {worktree_path} and remove it manually once safe"
+        )
+        return result
+    finally:
+        if cwd_before and Path(cwd_before).exists():
+            try:
+                os.chdir(cwd_before)
+            except OSError:  # pragma: no cover - defensive
+                LOG.debug("Could not restore cwd %s", cwd_before)
+
+    result["removed"] = removed
+    if removed:
+        remove_state(worktree_path)
+        result["removed_state"] = not (
+            Path(worktree_path) / STATE_FILE_NAME
+        ).exists()
+        result["reason"] = "worktree removed"
+    else:
+        result["reason"] = "worktree removal failed"
+        result["remedy"] = (
+            f"git worktree remove {worktree_path} && git worktree prune"
+        )
+    return result
+
+
+def _maybe_remove_child_worktree(
+    child_id: str,
+    worktree_path: str,
+    entry: dict[str, Any],
+    report: dict[str, Any],
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Remove a driven child's worktree once terminality is established.
+
+    This is the removal-owner side of the driven flow
+    (SA-0MVTE8XAJ002IUDR): a driven child's ``finish`` defers worktree
+    removal so the session keeps its cwd, making the driver the owner. The
+    caller establishes that the child is **terminal** first (via the next
+    ``phase_parent`` report's ``children_processed``, or via the
+    spawn-failure reconciliation on the ``completed-late`` path); this helper
+    only applies the removal gates:
+
+    - dirty tree ⇒ retained, never discarded;
+    - already absent ⇒ reported no-op (``already_absent``);
+    - refusal/failure ⇒ retained and reported, the drive chain continues.
+
+    Every retained tree is added to ``report["retained_worktrees"]`` with a
+    copy-pasteable remedy. Never raises.
+
+    Args:
+        child_id: The child work item id.
+        worktree_path: The child's worktree path.
+        entry: The ``report["children_driven"]`` entry to record the outcome on.
+        report: The drive report (receives ``retained_worktrees``).
+        repo_root: The main checkout root (defaults to discovery).
+
+    Returns:
+        The :func:`_remove_finished_worktree` result.
+    """
+    try:
+        outcome = _remove_finished_worktree(
+            child_id, worktree_path, repo_root or _get_repo_root()
+        )
+    except Exception as exc:  # noqa: BLE001 - never break the drive chain
+        LOG.warning("Worktree cleanup for %s failed: %s", child_id, exc)
+        outcome = {
+            "id": child_id,
+            "path": worktree_path,
+            "removed": False,
+            "reason": f"cleanup failed: {exc}",
+        }
+
+    entry["worktree_removed"] = bool(outcome["removed"])
+    entry["worktree_cleanup"] = outcome
+    if outcome.get("removed"):
+        LOG.info("Driver removed %s's worktree at %s", child_id, worktree_path)
+    else:
+        entry["worktree_retained"] = worktree_path
+        report.setdefault("retained_worktrees", []).append(
+            _retained_worktree_entry(
+                child_id, worktree_path, outcome.get("reason", "retained")
+            )
+        )
+    return outcome
+
+
+def _resolve_pending_worktree_cleanups(
+    parent_report: dict[str, Any] | None,
+    pending: dict[str, str],
+    report: dict[str, Any],
+    repo_root: str | None = None,
+) -> None:
+    """Remove queued child worktrees once the parent reports their status.
+
+    The spawn-success path queues the child in *pending* instead of
+    re-fetching it (the pinned "reconciliation only on the failure path"
+    contract, risk R1 of SA-0MVHXWLPG007OQVN). Every ``phase_parent`` report
+    carries ``children_processed`` with each child's status/action, so the
+    next report after a finished session names the child — that is the
+    terminality signal. Resolving here means the hot path performs **no**
+    extra store fetch.
+
+    Args:
+        parent_report: The latest ``phase_parent`` report.
+        pending: ``{child_id: worktree_path}`` awaiting a terminal verdict.
+        report: The drive report (receives ``retained_worktrees``).
+        repo_root: The main checkout root (defaults to discovery).
+    """
+    processed: dict[str, dict[str, Any]] = {}
+    for item in (parent_report or {}).get("children_processed") or []:
+        cid = str(item.get("id") or "")
+        if cid:
+            processed[cid] = item
+
+    for child_id in list(pending):
+        info = processed.get(child_id)
+        if info is None:
+            continue  # the parent has not reported this child yet
+        status = str(info.get("status") or "")
+        action = str(info.get("action") or "")
+        worktree_path = pending.pop(child_id)
+        entry = next(
+            (e for e in report.get("children_driven", []) if e.get("id") == child_id),
+            {},
+        )
+        if not (_is_terminal_status(status) or action in ("finished", "skipped-terminal")):
+            # The parent still sees the child non-terminal: retain the tree as
+            # debug evidence and never remove it. Reported with its remedy so
+            # it is not silently stranded.
+            entry["worktree_removed"] = False
+            entry["worktree_retained"] = worktree_path
+            report.setdefault("retained_worktrees", []).append(
+                _retained_worktree_entry(
+                    child_id, worktree_path, "child is not terminal"
+                )
+            )
+            continue
+        _maybe_remove_child_worktree(
+            child_id, worktree_path, entry, report, repo_root=repo_root
+        )
+
+
+def _retain_pending_worktree_cleanups(
+    pending: dict[str, str], report: dict[str, Any]
+) -> None:
+    """Report queued worktrees the drive ended before resolving.
+
+    A drive that stops (failure, blocked parent, advanced parent) before the
+    follow-up ``parent`` report named a child leaves that child's queued
+    worktree unresolved. It is never silently stranded: it is listed in
+    ``report["retained_worktrees"]`` with its remedy, and the next drive's
+    start-of-run sweep removes it once the child is terminal.
+    """
+    for child_id, worktree_path in pending.items():
+        entry = next(
+            (e for e in report.get("children_driven", []) if e.get("id") == child_id),
+            {},
+        )
+        entry.setdefault("worktree_removed", False)
+        entry.setdefault("worktree_retained", worktree_path)
+        report.setdefault("retained_worktrees", []).append(
+            _retained_worktree_entry(
+                child_id,
+                worktree_path,
+                "drive ended before the parent reported this child's state; "
+                "the next drive sweep (or the remedy below) removes it",
+            )
+        )
+
+
+def _sweep_terminal_child_worktrees(
+    children: list[dict[str, Any]],
+    report: dict[str, Any],
+    repo_root: str | None = None,
+) -> None:
+    """Remove leftover worktrees of terminal children at the start of a drive.
+
+    A drive that was interrupted between a child session's exit and the
+    driver-side removal strands that child's tree; sweeping at the start of
+    the next drive keeps deferred worktrees from leaking (SA-0MVTE8XAJ002IUDR
+    AC7). Bounded and best-effort: terminal children only, clean trees only,
+    never fatal — the outcome is recorded in ``report["worktree_sweep"]`` and
+    retained trees are named in ``report["retained_worktrees"]``.
+
+    Args:
+        children: The parent's children (``wl_show_children`` shape).
+        report: The drive report to annotate.
+        repo_root: The main checkout root (defaults to discovery).
+    """
+    sweep: list[dict[str, Any]] = []
+    for child in children or []:
+        if not _is_terminal_child(child):
+            continue
+        child_id = str(child.get("id") or "")
+        if not child_id:
+            continue
+        try:
+            path = _discover_worktree(child_id)
+        except Exception as exc:  # noqa: BLE001 - sweep is best-effort
+            LOG.debug("Worktree discovery for %s failed: %s", child_id, exc)
+            continue
+        if not path:
+            continue
+        try:
+            outcome = _remove_finished_worktree(
+                child_id, path, repo_root or _get_repo_root()
+            )
+        except Exception as exc:  # noqa: BLE001 - sweep is best-effort
+            LOG.warning("Sweep of %s worktree failed: %s", child_id, exc)
+            sweep.append({
+                "id": child_id,
+                "path": path,
+                "removed": False,
+                "reason": f"sweep failed: {exc}",
+            })
+            continue
+        LOG.info(
+            "Worktree sweep: %s at %s (%s)",
+            "removed" if outcome["removed"] else "retained",
+            path,
+            outcome["reason"],
+        )
+        sweep.append(outcome)
+        if not outcome["removed"]:
+            report.setdefault("retained_worktrees", []).append(
+                _retained_worktree_entry(child_id, path, outcome["reason"])
+            )
+    if sweep:
+        report["worktree_sweep"] = sweep
+
+
 def _finalise_stranded_child(
     child_id: str,
     evidence: dict[str, Any],
@@ -8784,7 +9262,13 @@ def phase_drive(
         (SA-0MVLJXVND0015LPW). A child whose per-work-item lock is held by
         another live session is reported with ``action: "skipped-held"``,
         ``skipped_held: True``, ``held_by`` and ``held_children`` — and no
-        session is spawned for it (SA-0MVQ5AXLF002PAQ3).
+        session is spawned for it (SA-0MVQ5AXLF002PAQ3). Worktree removal is
+        driver-owned: each driven child's ``finish`` defers it, so a terminal
+        child's clean tree is removed once its session exits and the entry
+        records ``worktree_removed`` plus its ``worktree_cleanup`` outcome;
+        ``retained_worktrees`` lists every tree that was kept (with a
+        remedy) and ``worktree_sweep`` records the start-of-run sweep of
+        terminal children's leftover trees (SA-0MVTE8XAJ002IUDR).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -8864,7 +9348,13 @@ def phase_drive(
     attempts: dict[str, int] = {}
     finish_attempts: dict[str, int] = {}
     reset_cids: set[str] = set()
-    driven: list[dict[str, Any]] = []
+    # The report's own list, so entries recorded mid-loop (worktree cleanup
+    # outcomes) are visible to the resolvers and to the final report.
+    driven: list[dict[str, Any]] = report["children_driven"]
+    #: Child worktrees awaiting a terminal verdict from the next
+    #: ``phase_parent`` report (the success path performs no extra store
+    #: fetch — SA-0MVHXWLPG007OQVN risk R1).
+    pending_cleanup: dict[str, str] = {}
     stranded_comment_posted = False
     finaliser = finalise_child or _finalise_stranded_child
     # Hard bound on the loop: each child may consume at most
@@ -8875,6 +9365,15 @@ def phase_drive(
         len(children) * (max_child_sessions + finish_attempt_limit + 1)
     ) + 1
 
+    # ── Start-of-run sweep: terminal children's leftover worktrees ──
+    # A driven child's ``finish`` defers worktree removal (the session owns
+    # its cwd), so the driver is its owner. A drive interrupted between a
+    # session's exit and this removal would strand the tree forever; sweeping
+    # leftover trees of *terminal* children at the start keeps the deferral
+    # from leaking (SA-0MVTE8XAJ002IUDR AC7). Bounded, clean trees only,
+    # never fatal.
+    _sweep_terminal_child_worktrees(children, report)
+
     for _ in range(max_iterations):
         parent_report = runner(
             "parent", work_item_id, no_refactor=no_refactor, verbose=verbose,
@@ -8884,6 +9383,12 @@ def phase_drive(
                 f"`implement.py parent {work_item_id}` failed (see logs)."
             )
             break
+
+        # Resolve queued worktree removals from this report's per-child
+        # statuses before acting on anything else (SA-0MVTE8XAJ002IUDR AC5).
+        _resolve_pending_worktree_cleanups(
+            parent_report, pending_cleanup, report
+        )
 
         if parent_report.get("parent_advanced"):
             report["parent_advanced"] = True
@@ -9180,6 +9685,12 @@ def phase_drive(
         }
         driven.append(entry)
 
+        if spawn_result.get("success"):
+            # Queue the tree for removal: the follow-up `parent` report names
+            # the child's terminal state, which is the signal to remove it
+            # without an extra store fetch on the hot path.
+            pending_cleanup[child_id] = worktree_path
+
         if not spawn_result.get("success"):
             # A failed spawn is a bound, not a verdict: reconcile against the
             # child's actual work-item state (SA-0MVHXWLPG007OQVN). A child
@@ -9201,6 +9712,14 @@ def phase_drive(
                 LOG.info(
                     "Child %s completed late (%s); continuing the drive loop.",
                     child_id, reconciliation["evidence"],
+                )
+                # This is the exact path the production incident took: the
+                # session was killed after its push, so the deferred worktree
+                # must be released here too — a hook on the success path only
+                # would leak it. The reconciliation already established
+                # terminality, so removal is immediate (no extra fetch).
+                _maybe_remove_child_worktree(
+                    child_id, worktree_path, entry, report
                 )
                 continue
 
@@ -9304,6 +9823,9 @@ def phase_drive(
 
     report["children_driven"] = driven
     report["finish_attempts"] = dict(finish_attempts)
+    # A drive that ended before the follow-up parent report resolved a child's
+    # queued worktree never strands it silently (SA-0MVTE8XAJ002IUDR AC7).
+    _retain_pending_worktree_cleanups(pending_cleanup, report)
     _emit_phase_report(report, json_output)
     return report
 
@@ -9597,6 +10119,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Parent branch for worktree (default: {DEFAULT_PARENT_BRANCH})",
     )
     parser.add_argument(
+        "--keep-worktree",
+        action="store_true",
+        help=(
+            "finish: defer worktree removal — the caller owns the cleanup, so "
+            "the finishing session keeps its cwd. Implied for driven child "
+            f"sessions ({DRIVE_RECURSION_ENV}=1); also settable with "
+            f"{KEEP_WORKTREE_ENV}=1."
+        ),
+    )
+    parser.add_argument(
         "--worktree-path",
         default=None,
         help="Override worktree path",
@@ -9686,6 +10218,10 @@ def _main(argv: list[str] | None = None) -> int:
     # phase_start() later overwrites these globals with the real worktree
     # path and repo root once they are known.
     _store_signal_globals("", args.work_item_id, "")
+    # The ``--keep-worktree`` decision must survive into the signal handler so
+    # an interrupted opt-in finish keeps the session's cwd
+    # (SA-0MVTE8XAJ002IUDR AC4).
+    _set_keep_worktree_global(getattr(args, "keep_worktree", False))
     _register_signal_handlers()
 
     logging.basicConfig(
@@ -9715,6 +10251,7 @@ def _main(argv: list[str] | None = None) -> int:
                 commit_msg_override=args.commit_msg,
                 max_retry=args.max_retry,
                 verbose=args.verbose,
+                keep_worktree=args.keep_worktree,
             )
             _emit_timing(_root_timer)
     elif args.action == "abort":
