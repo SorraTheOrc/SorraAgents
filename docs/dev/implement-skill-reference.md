@@ -773,6 +773,32 @@ inside a worktree, so the tree-verification guarantee above is unchanged in
 production; the degradation exists so a stubbed finish harness (or any
 non-repository caller) is not refused before the suite runs.
 
+#### Harness contract for `phase_finish`
+
+A harness that drives `phase_finish` from a bare temp directory should stub
+**both** gate seams in addition to `run_tests`, so the outcome never depends on
+the absence of a repository and the `would_be_commit` /
+`would_be_commit_assertion` report fields keep describing a real staged tree:
+
+- `implement.run_gate_suite` → `(tests_result, gate_summary)`, where
+  `gate_summary` carries `tree` and `index_unchanged=True`;
+- `implement.stage_tested_tree` →
+  `{"success": True, "tree": <tested tree>, "expected": <same tree>}`.
+
+Stubbing only `run_tests` leaves the real temp-index staging to run against a
+non-git directory whenever the fail-soft path does not apply (or is later
+tightened), which fails the harness for reasons unrelated to the behaviour
+under test (SA-0MVVX85KW001ZHE7).
+
+Harnesses that run **fixture** git commands must pass
+`shared.git_sandbox.fixture_git_env()`: the gate exports its temporary index as
+`GIT_INDEX_FILE`, so an ambient index would redirect the fixture's
+`git add`/`commit` into the gate's index — invalidating the verdict with the
+"gate evidence invalid" notice *and* corrupting the fixture's own state
+(`tests/test_implement_finish_local_parent_branch.py`). The gate's staging
+behaviour itself is covered by `skill/implement/tests/test_finish_gate_*.py`,
+so the harness stubs do not duplicate core coverage.
+
 ## Push timeout (SA-0MUH9R74O002MQDU)
 
 `implement.py finish` pushes to `dev` via `git_push_to_dev()`.  The push
