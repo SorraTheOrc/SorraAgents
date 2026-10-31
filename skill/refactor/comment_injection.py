@@ -333,6 +333,36 @@ def has_existing_comment(file_path: str, smell_type: str) -> bool:
     return False
 
 
+def _split_leading_shebang(content: str) -> tuple[str, str]:
+    """Split a leading interpreter directive from the rest of a file.
+
+    A shebang (``#!``) is only honoured by the kernel when it is the very
+    first line of the file, so a comment block prepended above it breaks
+    direct script execution (SA-0MVPUVM8F006270F). This helper isolates the
+    directive so callers can insert content *after* it.
+
+    Args:
+        content: The full text content of a source file.
+
+    Returns:
+        A ``(shebang, rest)`` tuple. ``shebang`` includes its trailing
+        newline (one is added when the file consists solely of a directive
+        with no line terminator) so it stays a valid standalone first line;
+        it is an empty string when the file does not start with ``#!``.
+        ``rest`` is the remaining file content, unmodified.
+    """
+    if not content.startswith("#!"):
+        return "", content
+
+    newline_index = content.find("\n")
+    if newline_index == -1:
+        # Directive-only file with no line terminator: terminate the shebang
+        # line so injected content starts on its own line.
+        return content + "\n", ""
+
+    return content[: newline_index + 1], content[newline_index + 1 :]
+
+
 def _build_comment_block(
     work_item_id: str,
     smell: dict[str, Any],
@@ -389,7 +419,10 @@ def inject_refactor_comment(
 ) -> bool:
     """Inject a REFACTOR comment into a source file.
 
-    The comment is placed at the top of the file. If a REFACTOR comment
+    The comment is placed at the top of the file. When the file starts with
+    an interpreter directive (``#!``) the comment is placed immediately
+    *after* that line instead, so the shebang stays on line 1 and the file
+    remains directly executable (SA-0MVPUVM8F006270F). If a REFACTOR comment
     already exists for the same smell type, the injection is skipped and
     ``False`` is returned.
 
@@ -436,8 +469,15 @@ def inject_refactor_comment(
         LOG.warning("Failed to read %s: %s", file_path, exc)
         return False
 
-    # Place comment at the top of the file
-    new_content = comment_block + original_content
+    # Place the comment at the top of the file — but never above a leading
+    # interpreter directive, which is only honoured on line 1. The block's
+    # own leading newline is dropped in that case so the marker starts on the
+    # line directly after the shebang.
+    shebang, body = _split_leading_shebang(original_content)
+    if shebang:
+        new_content = shebang + comment_block.lstrip("\n") + body
+    else:
+        new_content = comment_block + original_content
 
     try:
         with open(file_path, "w", encoding="utf-8") as f:
