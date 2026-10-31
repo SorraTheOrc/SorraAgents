@@ -13,6 +13,7 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import shutil
 
 # Resolve the module under test — same pattern as run_tests.py itself.
 # The runner lives at <skills>/test/scripts/run_tests.py; inserting that
@@ -30,6 +31,9 @@ _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"  # <skills>/test/scripts
 if str(_RUNNER_DIR) not in _sys.path:
     _sys.path.insert(0, str(_RUNNER_DIR))
 
+# Repository root of the checkout under test (…/skill/test/tests → root).
+_REPO_ROOT = _SCRIPT_DIR.parents[2]
+
 import run_tests
 from run_tests import (
     build_parser,
@@ -45,6 +49,38 @@ from shared.git_sandbox import commit_all, init_repo, run_git
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
+
+
+def _hermetic_git_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop an inherited ``GIT_INDEX_FILE`` for a fixture-repo test.
+
+    The finish gate exports a *temporary* index for the whole suite
+    (SA-0MVQHVGFR006W8LG): every ``git`` command the suite spawns then reads
+    that index, which is how ``git ls-files`` guards observe the
+    would-be-commit tree. ``GIT_INDEX_FILE`` deliberately survives the test
+    skill's repository-override scrub for exactly that reason
+    (SA-0MVQHV9Y3001RNNW).
+
+    A test that builds its **own** repository must therefore neutralise it
+    (``shared.git_sandbox.fixture_git_env()`` documents the rule). Here it is
+    not only the fixture's own ``git`` calls that matter: the production
+    helpers under test (``compute_changed_files``, ``changed_scope_commands``,
+    ``run_suite``) spawn ``git`` themselves and inherit the ambient
+    environment. With a foreign index in ``GIT_INDEX_FILE`` — an index from
+    the gate's repository, which lists none of the fixture's paths —
+    ``git diff <base>`` reports **every** file in the fixture as changed, so
+    the baseline assertions below fail only when the suite runs under the
+    gate.
+    """
+    monkeypatch.delenv("GIT_INDEX_FILE", raising=False)
+
+
+# ``monkeypatch.delenv`` is undone by pytest at test teardown, so the
+# neutralisation never leaks into another test.
+@pytest.fixture(autouse=True)
+def _gate_index_neutralised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test in this module hermetic under the finish gate."""
+    _hermetic_git_index(monkeypatch)
 
 
 def _make_repo(tmp_path: Path) -> Path:
@@ -149,6 +185,31 @@ class TestComputeChangedFiles:
         repo = _make_repo(tmp_path)
         result = compute_changed_files(repo, base_ref="dev")
         assert result == set()
+
+    def test_changed_files_are_hermetic_under_the_finish_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A foreign ``GIT_INDEX_FILE`` (the finish gate's staged index) must
+        not turn a fixture repo's own clean history into "everything changed".
+
+        The gate exports its temporary index for the whole suite, so the
+        ambient ``GIT_INDEX_FILE`` points at a file listing none of this
+        fixture's paths. Changed-file detection must still read the fixture's
+        own working tree: the only change is the one this test makes.
+        """
+        repo = _make_repo(tmp_path)
+        (repo / "src" / "utils.py").write_text("# utils — modified\n")
+
+        foreign_index = tmp_path / "gate.index"
+        shutil.copyfile(repo / ".git" / "index", foreign_index)
+        monkeypatch.setenv("GIT_INDEX_FILE", str(foreign_index))
+        # The module-level hermetic fixture is what neutralises the gate's
+        # exported index before any production helper spawns git.
+        _hermetic_git_index(monkeypatch)
+
+        assert compute_changed_files(repo, base_ref="origin/dev") == {
+            "src/utils.py"
+        }
 
     def test_ignores_untracked_files(self, tmp_path: Path) -> None:
         """Untracked files are not included in changed files."""
@@ -314,6 +375,58 @@ class TestChangedScopeCommands:
         # Only the affected node test is selected
         assert any("utils.test.mjs" in c for c in cmds)
         assert all("other.test.mjs" not in c for c in cmds)
+
+    # -- F0 baseline (SA-0MVQQ9HXV000V6Z4 AC3) -----------------------------
+    # Pins today's changed-scope selection before the hidden skill-test rule
+    # (SA-0MVQJSGLY0098DVB) lands. That item's D5 keeps changed-scope
+    # selection untouched: hidden project-local skill tests are enforced at
+    # full scope only. These assertions must stay green after F1–F3.
+
+    def test_skill_test_file_change_emits_subset_command(self) -> None:
+        """A changed *test* file under ``skill/test/`` selects exactly that
+        file (the current subset-command expectation)."""
+        cmds = changed_scope_commands(
+            _REPO_ROOT,
+            changed_files={"skill/test/tests/test_suite_resolution.py"},
+        )
+        assert cmds == [
+            (
+                "pytest -q -r a --disable-warnings "
+                "skill/test/tests/test_suite_resolution.py"
+            )
+        ]
+
+    def test_skill_script_change_falls_back_to_full_scope(self) -> None:
+        """A non-test change under ``skill/test/`` selects no subset today
+        (skill sources are not in the heuristic's test trees), so the caller
+        falls back to the full suite."""
+        cmds = changed_scope_commands(
+            _REPO_ROOT,
+            changed_files={"skill/test/scripts/run_tests.py"},
+        )
+        assert cmds is None
+
+    def test_hidden_skill_test_file_change_selects_that_file(
+        self, tmp_path: Path,
+    ) -> None:
+        """A changed test file under ``.pi/skills/<name>/tests`` is selected
+        by changed scope today (it is itself a test file). The new full-suite
+        rule adds a command at full scope only and must not alter this."""
+        repo = tmp_path / "hidden_skill_repo"
+        repo.mkdir()
+        (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        hidden_tests = repo / ".pi" / "skills" / "demo" / "tests"
+        hidden_tests.mkdir(parents=True)
+        (hidden_tests / "test_demo.py").write_text(
+            "def test_demo() -> None:\n    assert True\n", encoding="utf-8",
+        )
+
+        cmds = changed_scope_commands(
+            repo, changed_files={".pi/skills/demo/tests/test_demo.py"},
+        )
+        assert cmds == [
+            "pytest -q -r a --disable-warnings .pi/skills/demo/tests/test_demo.py"
+        ]
 
 
 # ---------------------------------------------------------------------------
