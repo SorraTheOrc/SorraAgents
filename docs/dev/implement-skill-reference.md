@@ -599,38 +599,169 @@ addition to `success`/`stdout`/`stderr`/`exit_code`/`failures` — and, for a
 guarded (test-skill) run, `notices`/`notice_codes` so callers can explain a
 failure without any structured failures.
 
-### Would-be-commit tree staging (SA-0MVQHVGFR006W8LG)
+### Finish gate: testing the tree the commit produces (SA-0MVL2NH1G0094FA2)
 
-The finish gate must validate the tree the commit will produce, not the loose
-working tree. `phase_finish` therefore delegates its test step to
-`run_gate_suite()`, which wraps `run_tests()` in
-`would_be_commit_index()`:
+The finish gate is `phase_finish`'s test step, and its contract is one
+sentence: **a green gate must mean the suite passed on exactly the tree the
+commit will produce**. Before F6/F7/F8 neither half of that sentence was true
+— the suite ran against the loose working tree while `git_commit` staged
+*after* the test step, and a top-level full-suite run could be served from a
+cache entry recorded for a different state. The two properties below are only
+meaningful together, and both are pinned by regression tests.
 
-- The real index is copied to a temporary file (`<git-dir>/implement-gate-*.index`),
-  the change set is staged into the copy with `git add -A` under
-  `GIT_INDEX_FILE`, and that variable is exported for the suite so every
-  child `git` command a test spawns (including `git ls-files` guards) — and
-  the cache fingerprint computed by `test_cache` — sees the staged file set.
-  `GIT_INDEX_FILE` stays out of the repository-override scrub for this reason
-  (`tests/test_git_index_file_env.py`).
-- The temp index is recorded in `report["steps"]["would_be_commit"]`
-  (tree, path, staged paths, `index_unchanged`) and is removed, with the
-  previous `GIT_INDEX_FILE` restored, on **every** exit path — including
-  SIGTERM/SIGINT, which shares `_remove_gate_index()`.
-- A suite that stages into the inherited index changes the tested tree. The
-  post-suite `git write-tree` check forces the verdict red with a
-  "gate evidence invalid" notice rather than attributing it to a tree that
-  was never tested.
-- Only on a green gate does `stage_tested_tree()` write the real index
-  (`git add -A`) and assert its `git write-tree` equals the tested tree before
-  `git_commit` runs. A mismatch unstages the change set again, creates no
-  commit, and returns an actionable drift message.
-- `run_cmd()` drops an ambient `GIT_INDEX_FILE` by default so the gate's own
-  git commands always act on the real index while the suite runs; suite
-  runners opt in with `keep_git_index=True`.
+1. **The suite runs against the would-be-commit tree.** The pending change
+   set is staged into a temporary copy of the index and exported as
+   `GIT_INDEX_FILE`, so `git ls-files` guards (and any other tracked-file
+   reader in the suite) see exactly what the commit will contain.
+2. **The verdict is bound to that tree.** The cache key, the report's
+   fingerprint and the completion comment all name the tree SHA of that
+   staged index (`git write-tree`), never the loose working-tree state. A
+   result can therefore not be attributed to a tree whose suite never ran.
 
-**Fail-soft outside a git work tree (SA-0MVVKJGKP003QVNM).** Staging a
-would-be-commit tree needs a repository, so the gate first checks
+#### Gate semantics: the tested tree is the would-be-commit tree (SA-0MVQHVGFR006W8LG)
+
+`phase_finish` delegates its test step to `run_gate_suite()`, which wraps
+`run_tests()` in `would_be_commit_index()`:
+
+- **Temporary index.** The real index is copied to
+  `<git-dir>/implement-gate-*.index` (a missing real index is seeded with
+  `git read-tree HEAD`), the change set is staged into the copy with
+  `git add -A` under `GIT_INDEX_FILE`, and its tree SHA is computed with
+  `git write-tree`. The real index and the working tree are not modified.
+- **`GIT_INDEX_FILE` is exported for the suite.** Every child `git` command a
+  test spawns inherits it, so tracked-file guards see the staged file set
+  instead of the loose working tree. `GIT_INDEX_FILE` intentionally stays out
+  of the test skill's repository-override scrub for this reason — the
+  pass-through is itself pinned by `tests/test_git_index_file_env.py`
+  (SA-0MVQHV9Y3001RNNW).
+- **The real index receives the change set only on green.** `stage_tested_tree()`
+  runs the same `git add -A` `git_commit` would run and asserts the real
+  index's `git write-tree` equals the tested tree. A mismatch (a build step
+  or concurrent writer changed files after the gate ran) unstages again,
+  creates no commit, and returns an actionable drift message.
+- **The temp index cannot be silently mutated.** After the suite,
+  `verify_unchanged()` recomputes the temporary index's tree; a difference
+  means a test staged into the inherited index, so the verdict is forced red
+  with a `gate evidence invalid` notice instead of being attributed to a tree
+  that was never tested.
+- **The gate's own git commands act on the real index.** `run_cmd()` drops an
+  ambient `GIT_INDEX_FILE` by default; only suite runners opt back in with
+  `keep_git_index=True`, and the plumbing helper `_run_git_plumbing()` always
+  selects its index explicitly (`index_file=…` sets it, `None` removes it).
+- **Report.** `report["steps"]["would_be_commit"]` records the tested tree,
+  the temporary index path, the real index path, the staged paths and
+  `index_unchanged`; `report["steps"]["would_be_commit_assertion"]` records
+  the real-index verification (`success`, `tree`, `expected`, `verified`).
+
+**Scope stays changed-only at finish.** The gate runs `scope="changed"` as the
+development-time (pre-commit) gate; the **full** suite is deferred to the
+dev-push integration gate — the pre-push hook's `run_tests.py --scope full`
+and the ship release gate (SA-0MVECQUGF0064U81). The tree-binding contract
+applies to whichever scope the gate runs.
+
+#### Verdict provenance (SA-0MVQHVJEX0071R7G)
+
+Every finish-gate verdict is self-describing. Each entry of
+`report["steps"]["tests"]` (one per gate attempt) records:
+
+| Key | Meaning |
+| --- | --- |
+| `attempt` | 1-based attempt number. |
+| `success` | The attempt's verdict. |
+| `failures` | Structured failures reported by the suite (empty on green). |
+| `skipped` | `true` only when a human chose `skip` in the interactive fix loop. |
+| `tooling` | Suite tooling that ran (`"suite"`, a legacy runner name, or `null`). |
+| `scope` | `"changed"` for the finish gate (the full suite runs at the dev-push gate). |
+| `tree` | Absolute path of the worktree the suite ran in (`.resolve()`d). |
+| `git_fingerprint` | The **would-be-commit tree** SHA (`git write-tree` of the staged temporary index) the verdict is bound to — not the loose working-tree state. `null` outside a git work tree. |
+| `cached` | `true` only when the whole verdict was served from the per-repo test cache. |
+| `cache_entry` | Present only for a cache-served verdict: the served entry's `command`, `completed_at` (epoch float), `scope` and `fingerprint_kind`. |
+
+A cached green is accepted only when its fingerprint is the would-be-commit
+tree's fingerprint: `run_gate_suite()` passes the temporary index's tree SHA
+into `run_tests(..., fingerprint=...)`, which keys the lookup with
+`fingerprint_kind="tree"` (SA-0MVQHVHXI007PQAB, contract documented in
+[test-skill-reference.md](test-skill-reference.md)). An entry recorded for a
+loose worktree state, for another tree, or without the provenance metadata is
+a miss, so the suite runs and the fresh verdict is recorded for the gate's
+tree — no green verdict can exist for a state whose suite never ran.
+
+`report["steps"]["would_be_commit"]` records the same tree (plus the temp
+index path, the staged paths and `index_unchanged`), so the report can be read
+against the cache independently of the attempt list.
+
+**The completion comment carries the same provenance.** After a successful
+push the comment posted on the work item includes a *Test gate verdict* block
+— tree, fingerprint, cached flag and (for a cache-served verdict) the cache
+entry's command, completion time, scope and fingerprint kind, plus the attempt
+count when the interactive fix loop re-ran — so an operator reading only the
+work item can attribute the accepted green.
+
+#### Abort behaviour: a failed gate leaves no trace (SA-0MVQHVCRE0070YO6)
+
+Every non-green exit — a failing suite, an abort in the interactive fix loop,
+an exception escaping the gate, or a signal — leaves the repository exactly as
+the gate found it:
+
+- **No commit.** `HEAD` is unchanged: `git_commit` and the real-index staging
+  (`stage_tested_tree()`) only run after a green verdict.
+- **No residual staging.** The real index is byte-identical to its pre-gate
+  state and `git diff --cached --quiet` holds; the change set lives only in
+  the temporary index while the gate runs. A tree-drift mismatch reverses the
+  staging it just performed with `git reset --quiet`.
+- **The working tree is untouched.** No gate path writes a file.
+- **The temporary index is removed on every exit path.** The staging context
+  manager's `finally` and the SIGTERM/SIGINT handler share
+  `_remove_gate_index()`, which deletes the index (and any `*.lock`) and also
+  restores any previously exported `GIT_INDEX_FILE` value. The abort
+  regression module (`skill/implement/tests/test_finish_gate_abort.py`) proves
+  this from two independent detectors — the path the suite actually observed,
+  and index-shaped artefacts in the git directory and an isolated `TMPDIR`.
+- **A mutated temporary index is a red verdict, not an abort.** If a test
+  stages into the inherited index, the gate reports `gate evidence invalid`
+  and the temp index is still removed; the refusal message names the remedy
+  (`shared.git_sandbox.fixture_git_env()` for fixture git commands).
+
+The work item is reset to `open` on a failed gate (`StatusLifecycle` abort
+semantics), so a red gate never leaves a stranded `in_progress` item.
+
+#### Single-execution guarantee (SA-0MVL2NH1G0094FA2 AC5)
+
+A clean change set costs exactly **one** suite execution per gate verdict:
+
+- `phase_finish` calls `run_gate_suite()` once, then `stage_tested_tree()`, then
+  commits. There is no second, duplicate run of the changed-scope suite, and no
+  full-suite run at finish (deferred to the dev-push gate).
+- A **cache-served** verdict is served, not produced: the suite does not run a
+  second time, and the attempt is recorded with `cached: true` plus the served
+  entry's metadata so the reuse is visible rather than implicit.
+- A further execution happens only after a **failure**, and only in the
+  interactive fix loop (`Enter` to re-run, up to the retry bound,
+  `--max-retry`). Non-interactive (JSON) runs report the failing attempt and
+  return without re-running. Each attempt appends its own provenance record.
+- A `skip` chosen in the interactive fix loop marks that attempt
+  `skipped: true`; it does not spawn another suite execution.
+
+#### No default bypass (SA-0MVL2NH1G0094FA2 constraints)
+
+The gate has no environment-variable or default bypass: there is no
+`TEST_SCOPE_SKIP`-style switch, and `implement.py` exposes no “skip the test
+step” setting. The only ways past a failing gate are (a) fixing the failures
+and re-running (the fix loop), or (b) a **human** typing `skip` at the
+interactive prompt, which is recorded in the report as
+`report["steps"]["tests"][-1]["skipped"] = true`. Neither weakens the overall
+contract: the **dev-push pre-push hook and the ship release gate run the full
+suite independently**, so a skipped or stale finish gate can never land a red
+tree on `dev` and still be reported as a verified release.
+
+Guard ownership (`LIVE_REPO_GUARD_ACTIVE`) and the nested-run stand-down
+contract are unchanged by tree binding: the suite still runs through
+`guarded_run_all()` and consumes a host-wide test slot exactly as documented
+above.
+
+#### Fail-soft outside a git work tree (SA-0MVVKJGKP003QVNM)
+
+Staging a would-be-commit tree needs a repository, so the gate first checks
 `git rev-parse --is-inside-work-tree`. Outside a work tree there is no commit
 tree to attribute a verdict to: the suite then runs plainly (no temp index,
 no `GIT_INDEX_FILE`) and `report["steps"]["would_be_commit"]` records
@@ -641,36 +772,6 @@ running `stage_tested_tree()` and logs a warning. Every real finish runs
 inside a worktree, so the tree-verification guarantee above is unchanged in
 production; the degradation exists so a stubbed finish harness (or any
 non-repository caller) is not refused before the suite runs.
-
-### Verifiable verdicts (SA-0MVQHVJEX0071R7G)
-
-Every finish-gate verdict is self-describing. Each entry of
-`report["steps"]["tests"]` (one per attempt) records:
-
-| Key | Meaning |
-| --- | --- |
-| `tree` | Absolute path of the worktree the suite ran in (`.resolve()`d). |
-| `git_fingerprint` | The **would-be-commit tree** SHA (`git write-tree` of the staged temporary index) the verdict is bound to — not the loose working-tree state. `null` outside a git work tree. |
-| `cached` | `true` only when the whole verdict was served from the per-repo test cache. |
-| `cache_entry` | Present only for a cache-served verdict: the served entry's `command`, `completed_at` (epoch float), `scope` and `fingerprint_kind`. |
-
-A cached green is accepted only when its fingerprint is the would-be-commit
-tree's fingerprint: `run_gate_suite()` passes the temporary index's tree SHA
-into `run_tests(..., fingerprint=...)`, which keys the lookup with
-`fingerprint_kind="tree"` (F7, SA-0MVQHVHXI007PQAB). An entry recorded for a
-loose worktree state, for another tree, or without provenance metadata is a
-miss, so the suite runs and the fresh verdict is recorded for the gate's tree
-— no green verdict exists for a state whose suite never ran.
-
-`report["steps"]["would_be_commit"]` records the same tree (plus the temp
-index path, staged paths and `index_unchanged`), so the report can be read
-against the cache independent of the attempt list.
-
-**The completion comment carries the same provenance.** After a successful
-push the comment posted on the work item includes a *Test gate verdict* block
-— tree, fingerprint, cached flag and (for a cache-served verdict) the cache
-entry's command, completion time, scope and fingerprint kind — so an operator
-reading only the work item can attribute the accepted green.
 
 ## Push timeout (SA-0MUH9R74O002MQDU)
 

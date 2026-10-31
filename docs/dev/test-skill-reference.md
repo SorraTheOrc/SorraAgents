@@ -101,6 +101,94 @@ hit the same entries because both resolve the same project root.
   clean for callers that already have the directory configured (no duplicate
   entry).
 
+#### Cache fingerprint contract (SA-0MVQHVHXI007PQAB, SA-0MVQHVKUH009VQMD)
+
+The cache key is `command + fingerprint (+ test_type)`, and the fingerprint's
+*provenance* is part of the entry, not just its value. Two kinds exist, and a
+consumer can never be served one kind's verdict for a request expecting the
+other.
+
+**Worktree fingerprint (the default).** `compute_git_state(cwd, *, strict=False)`
+combines the HEAD SHA with the **content** of every path `git status` reports
+as dirty (tracked, staged, deleted, untracked), so a second edit to an
+already-dirty file is a different state (AH-0MVFGIV6700329SZ). It reflects the
+worktree containing `cwd`; an ambient `GIT_INDEX_FILE` is honoured only when
+it belongs to `cwd`'s own repository (`git_env_for_repo`), never one inherited
+from a foreign fixture repository (SA-0MVTET8KQ0031R6Z). With `strict=True`,
+an unreadable work tree, HEAD, index or dirty path raises
+`GitStateUnavailable` instead of degrading — a degraded fingerprint would make
+every dirty tree share one key (WL-0MVPO9P610055UQ3).
+
+**Tree fingerprint (would-be-commit).** `compute_tree_state(index_file, *,
+cwd=None)` returns the SHA `git write-tree` reports for **`index_file`**,
+run in `cwd` with the shared scrubbed environment plus an explicit
+`GIT_INDEX_FILE`. That SHA is exactly the tree a commit built from that index
+will contain: unlike the worktree fingerprint it sees generated, gitignored
+metadata that is present on disk but untracked, so it binds a verdict to the
+file set the suite actually validated
+(SA-0MVL2NH1G0094FA2 AC4). It is **fail-closed**: a missing repository or an
+unreadable index raises `RuntimeError` rather than falling back to the loose
+worktree fingerprint (that fallback would reintroduce the unattributable
+verdict it exists to prevent). The implement finish gate calls it through its
+temporary index and passes the SHA in as the verdict's fingerprint.
+
+**Provenance kinds.** `FINGERPRINT_KIND_WORKTREE` (`"worktree"`) and
+`FINGERPRINT_KIND_TREE` (`"tree"`) are recorded as `fingerprint_kind` in each
+entry's `metadata.json`. Entries predating the field read as `"worktree"` —
+the historical default — so existing consumers keep their historical hits.
+
+**Explicit-fingerprint override.** `run_cached(..., fingerprint=<sha>)` binds
+a run to a caller-supplied fingerprint (normally a would-be-commit tree SHA):
+
+- the value keys **both** the lookup and the stored entry, and the entry is
+  recorded with `fingerprint_kind="tree"`;
+- the loose `compute_git_state` value is **not computed at all**, so the run's
+  cost and its key cannot drift with unrelated working-tree churn;
+- the supplied value is stored **as-is** after the run — it describes the tree
+  the caller named and cannot be recomputed from a possibly-churned worktree;
+- callers that pass nothing keep the historical worktree keys byte for byte
+  (test-skill CLI, audit, pre-push).
+
+`lookup(..., fingerprint_kind=...)` and `store(..., fingerprint_kind=...)`
+expose the same distinction to callers that manage execution themselves.
+`run_suite()` / `run_all()` / `guarded_run_all()` thread an optional
+`fingerprint` through to the cache, so the finish gate reaches it through the
+same canonical runner as every other consumer.
+
+**Legacy and foreign entries miss (fail closed).** A cache hit requires the
+command, `test_type`, `fingerprint_kind` and fingerprint to match, plus the
+TTL (and, for exactness, the recorded `scope`). Therefore:
+
+- an entry with **no** `fingerprint_kind` (a legacy entry) is read as
+  `"worktree"`, so a **tree request always misses it** and the suite runs;
+- an entry recorded for a **different kind** or a **different tree** is a
+  miss;
+- a corrupt or unreadable entry is a miss and never raises into the caller;
+- `query_cached()` remains a read-only **worktree** query: the finish gate's
+tree-bound entry is intentionally not visible to it (the audit's full-suite
+evidence is recorded at the pushed commit's loose state, not at a
+pre-commit staged tree).
+
+Consequence for the finish gate: no green verdict can be served for a tree
+whose suite never ran. A tree-keyed green exists only where the suite executed
+against that exact tree, and a served green is reported as cached together
+with the reused entry's metadata (see the
+[implement finish-gate contract](implement-skill-reference.md#finish-gate-testing-the-tree-the-commit-produces-sa-0mvl2nh1g0094fa2)).
+
+**`GIT_INDEX_FILE` pass-through (SA-0MVQHV9Y3001RNNW).** The finish gate's
+tree binding depends on the suite inheriting its temporary index, so
+`GIT_INDEX_FILE` must survive the runner's repository-override scrub —
+`scrub_repository_overrides()` and `subprocess_env_with_scrubbed_overrides()`
+preserve a set `GIT_INDEX_FILE` (name and value) while still stripping genuine
+overrides such as `GIT_DIR`. It is deliberately **not** in
+`REPOSITORY_OVERRIDE_ENV_VARS` (`skill/shared/git_sandbox.py`);
+`tests/test_git_index_file_env.py` pins both halves (a scrubbed child
+`git ls-files` sees the temporary index's file set, and a guard test fails if
+`GIT_INDEX_FILE` is ever added to the scrub list). Fixture git commands must
+use a hermetic environment (`shared.git_sandbox.fixture_git_env()`) so they do
+not stage into an inherited index — see
+[test-isolation.md](test-isolation.md#92-prevention-layers-defence-in-depth).
+
 Query a cached run without executing anything:
 
 ```bash
