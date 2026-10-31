@@ -607,6 +607,19 @@ evidence.
    that import the changed module (deterministic, no heuristic coverage
    tools).
 
+**TypeScript import-graph expansion is deliberately descoped
+(SA-0MVL7YOMJ006UMDO, OPEN QUESTION 1 default).** The TypeScript side uses
+only the conservative stem convention (`src/foo.ts` → `foo.test.ts` /
+`foo.spec.ts` anywhere in the repo), plus a declared `groups` entry. A
+trustworthy TS import graph needs a resolver for `tsconfig` paths and
+package aliases; a wrong graph narrows the run and hides breakage, whereas
+the stem convention can only ever *under*-match (and then fall back to the
+full suite). The full-suite gate at the dev push still covers whatever a
+narrowed selection misses, so under-matching costs time, not correctness.
+Consequence: a changed `src/foo.ts` whose tests are named differently (e.g.
+`tests/cli/commands.test.ts` importing it) falls back to the full suite
+unless a `groups` entry matches the path.
+
 Selected test files are passed explicitly (`pytest tests/test_foo.py ...`,
 `node --test ...`, or `vitest run tests/unit/foo.test.ts`), so a scoped run
 is deterministic and cache-keyed distinctly from the full suite.

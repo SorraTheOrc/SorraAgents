@@ -2372,7 +2372,7 @@ def _remove_gate_index(index_path: str | None) -> None:
             os.unlink(candidate)
         except FileNotFoundError:
             continue
-        except OSError as exc:
+        except OSError as exc:  # noqa: BLE001 - cleanup is best-effort
             LOG.warning(
                 "Could not remove the finish gate's temporary index %s: %s",
                 candidate,
@@ -5447,10 +5447,11 @@ def _run_resolved_suite(
     """Run a resolved full-suite command list, honouring changed scope.
 
     ``scope="changed"`` first tries the test skill's changed-file selector
-    (named group, then file-level selection). When no subset is available
-    (custom ``suiteCommands``, no dev baseline, no matching tests, or a
-    node-only selection) it warns and runs the full command list so a scoped
-    run never silently skips testing.
+    (named group, then file-level selection). ``.pi/test-config.json``
+    ``suiteCommands`` never disables selection — it describes the full suite
+    only (SA-0MVL7YOMJ006UMDO). When no subset is available the selector's
+    specific reason is warned and the full command list runs, so a scoped run
+    never silently skips testing.
     """
     if scope == "changed":
         group_result = _run_group_from_changed_files(

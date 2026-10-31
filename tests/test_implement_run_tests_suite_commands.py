@@ -193,7 +193,13 @@ class TestChangedScope:
     def test_changed_scope_with_suite_commands_warns_and_runs_full(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
     ) -> None:
-        """AC3: custom suiteCommands aren't introspectable → full fallback."""
+        """A non-git repo with no selectable changes falls back to the full
+        suite.
+
+        Declared ``suiteCommands`` is NOT the reason for the fallback any
+        more — they define the full suite only and never disable selection
+        (SA-0MVL7YOMJ006UMDO); here nothing is selectable at all.
+        """
         repo = tmp_path / "repo"
         repo.mkdir()
         _write_suite_commands(repo, [CLI_CMD, UNIT_CMD])

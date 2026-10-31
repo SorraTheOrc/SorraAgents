@@ -2051,7 +2051,10 @@ def run_suite(
         if scope == "changed" and test_type == DEFAULT_TEST_TYPE:
             # Changed-file selection drives every suite name; the selection is
             # narrowed to the named suite below. Any failure to produce a
-            # subset (custom suiteCommands, no selection) falls back to full.
+            # subset (no changed/selectable files, no matching group) falls
+            # back to full. Declared ``suiteCommands`` never disable
+            # selection — they define the full suite only
+            # (SA-0MVL7YOMJ006UMDO).
             changed_files = compute_changed_files(cwd, base_ref=base_ref)
             changed_commands = changed_scope_commands(
                 cwd, base_ref=base_ref, changed_files=changed_files
