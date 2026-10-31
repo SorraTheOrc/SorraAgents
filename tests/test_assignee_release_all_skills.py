@@ -48,10 +48,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from audit.scripts import audit_runner, verify_context_reduction  # noqa: E402
-from intake.scripts import intake  # noqa: E402
-from shared import status_lifecycle  # noqa: E402
-from skill.implement.scripts import implement  # noqa: E402
+from audit.scripts import audit_runner, verify_context_reduction
+from intake.scripts import intake
+from shared import status_lifecycle
+
+from skill.implement.scripts import implement
 
 _AGENT = "matrix-agent"
 _WORK_ITEM_ID_RE = re.compile(r"^[A-Z][A-Z0-9]*-[A-Z0-9-]+$")
@@ -387,7 +388,7 @@ class ReleaseExercise:
     name: str
     source: str
     entry_points: tuple[str, ...]
-    exercise: Callable[["FakeWorklogStore"], None] = field(compare=False)
+    exercise: Callable[[FakeWorklogStore], None] = field(compare=False)
     classification: str = "must-release-on-terminal"
 
 
