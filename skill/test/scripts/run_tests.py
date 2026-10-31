@@ -440,7 +440,11 @@ def compute_changed_files(
     # New (untracked) files are part of the working-tree change set but have
     # no diff entry against *base*. Include them so a newly created test file
     # (the common implement-flow case: tests run before the first commit) is
-    # selectable. ``--exclude-standard`` keeps ignored files out.
+    # selectable. ``--exclude-standard`` keeps ignored files out. The
+    # inspection environment is the same one the diff uses, so a *foreign*
+    # gate index is never inherited — under one, every fixture file looks
+    # untracked and would both pollute the change set and invalidate the
+    # gate's evidence (SA-0MVTET8KQ0031R6Z).
     try:
         others = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
@@ -449,6 +453,7 @@ def compute_changed_files(
             text=True,
             timeout=30,
             check=False,
+            env=_git_inspection_env(root),
         )
     except (OSError, subprocess.TimeoutExpired):
         others = None
