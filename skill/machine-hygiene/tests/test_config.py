@@ -65,6 +65,13 @@ class TestDefaults(unittest.TestCase):
         self.assertEqual(cfg["warning"], 50)
         self.assertEqual(cfg["critical"], 80)
 
+    def test_memory_pressure_defaults(self):
+        """AC5: memory_pressure has PSI-calibrated defaults (full line)."""
+        cfg = _DEFAULTS["memory_pressure"]
+        self.assertEqual(cfg["low"], 0)
+        self.assertEqual(cfg["warning"], 5)
+        self.assertEqual(cfg["critical"], 20)
+
     def test_load_average_defaults(self):
         cfg = _DEFAULTS["load_average"]
         self.assertEqual(cfg["low"], 0)
@@ -131,6 +138,27 @@ class TestLoadConfig(unittest.TestCase):
             os.unlink(temp_path)
 
     @mock.patch("machine_hygiene_config._config_path")
+    def test_memory_pressure_override(self, mock_path):
+        """AC5: a config.yaml memory_pressure block overrides the defaults."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False
+        ) as fh:
+            fh.write("memory_pressure:\n  warning: 12\n")
+            temp_path = fh.name
+
+        try:
+            mock_path.return_value = temp_path
+            cfg = load_config()
+            self.assertEqual(cfg["memory_pressure"]["warning"], 12)
+            # Unspecified keys retain the PSI-calibrated defaults.
+            self.assertEqual(cfg["memory_pressure"]["critical"], 20)
+            # memory_usage is a separate category and keeps its own values.
+            self.assertEqual(cfg["memory_usage"]["warning"], 80)
+            self.assertEqual(cfg["memory_usage"]["critical"], 95)
+        finally:
+            os.unlink(temp_path)
+
+    @mock.patch("machine_hygiene_config._config_path")
     def test_partial_file_preserves_other_categories(self, mock_path):
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".yaml", delete=False
@@ -170,6 +198,7 @@ class TestLoadConfig(unittest.TestCase):
         cfg = load_config()
         self.assertIsInstance(cfg, dict)
         self.assertIn("cpu_pressure", cfg)
+        self.assertIn("memory_pressure", cfg)
         self.assertIn("memory_usage", cfg)
         self.assertIn("io_pressure", cfg)
         self.assertIn("load_average", cfg)

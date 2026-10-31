@@ -102,19 +102,69 @@ def _read_file_lines(path: str) -> list[str] | None:
         return None
 
 
-def _read_proc_pressure(key: str) -> float | None:
-    """Read a ``/proc/pressure/`` metric (cpu, memory, or io).
+#: PSI line selectors — ``some`` (at least one task stalled) and ``full``
+#: (all tasks stalled). The value is the line prefix in /proc/pressure/*.
+_PSI_LINES = {"some": "some ", "full": "full "}
 
-    Returns the avg10 stall percentage as a float, or None if unavailable.
+#: Human-readable basis for each PSI line, used in metric descriptions.
+_PSI_BASIS = {
+    "some": "% of time any task stalled",
+    "full": "% of time all tasks stalled",
+}
+
+
+def _read_proc_pressure(key: str, which: str = "some") -> float | None:
+    """Read a PSI stall percentage from ``/proc/pressure/<key>``.
+
+    Pressure stall information (PSI) files expose up to two lines:
+
+    * ``some`` — at least one task was stalled on the resource;
+    * ``full`` — *all* tasks were stalled (the CPU file has no ``full``
+      line, because a CPU is never entirely idle-stalled for every task).
+
+    ``which`` selects the line and ``avg10`` (the 10-second rolling
+    percentage) is returned. There is **no fallback** between the lines: a
+    requested ``full`` line the kernel does not expose returns ``None``
+    rather than silently reporting the less severe ``some`` value, because
+    mixing the two would misstate severity.
+
+    Args:
+        key: The pressure resource — ``cpu``, ``memory`` or ``io``.
+        which: Which PSI line to read — ``some`` (default) or ``full``.
+
+    Returns
+    -------
+    float | None
+        The ``avg10`` stall percentage, or ``None`` when the file is
+        missing, empty or unparsable, or the requested line is absent.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is not ``some`` or ``full`` (a programming error).
     """
+    if which not in _PSI_LINES:
+        raise ValueError(
+            f"which must be one of {sorted(_PSI_LINES)}, got {which!r}"
+        )
+
     lines = _read_file_lines(f"/proc/pressure/{key}")
-    if lines is None:
+    if not lines:
         return None
+
+    prefix = _PSI_LINES[which]
     for line in lines:
-        if line.startswith("avg"):
-            parts = line.split()
-            if len(parts) >= 4:
-                return float(parts[1])
+        if not line.startswith(prefix):
+            continue
+        for token in line.split():
+            if not token.startswith("avg10="):
+                continue
+            try:
+                return float(token.split("=", 1)[1])
+            except ValueError:
+                return None
+        # The requested line is present but carries no avg10 token.
+        return None
     return None
 
 
@@ -349,20 +399,24 @@ def collect_metrics() -> dict[str, Any]:
     }
 
     # --- Pressure stall metrics ---
-    # cpu_pressure/memory_usage/io_pressure hold the percentage thresholds
-    # applied to the corresponding /proc/pressure avg10 stall percentage.
+    # Each spec is (proc file key, metric key, config key, PSI line, label).
+    # cpu reads the ``some`` line (current kernels expose no ``full`` line);
+    # memory and io read ``full`` — total stall is the actionable signal.
     pressure_specs = (
-        ("cpu", "cpu_pressure", "cpu_pressure", "CPU stall pressure"),
-        ("memory", "memory_pressure", "memory_usage", "Memory stall pressure"),
-        ("io", "io_pressure", "io_pressure", "I/O stall pressure"),
+        ("cpu", "cpu_pressure", "cpu_pressure", "some", "CPU stall pressure"),
+        ("memory", "memory_pressure", "memory_pressure", "full",
+         "Memory stall pressure"),
+        ("io", "io_pressure", "io_pressure", "full", "I/O stall pressure"),
     )
-    for proc_key, metric_key, cfg_key, label in pressure_specs:
-        value = _read_proc_pressure(proc_key)
+    for proc_key, metric_key, cfg_key, which, label in pressure_specs:
+        value = _read_proc_pressure(proc_key, which)
         if value is not None:
             metrics[metric_key] = {
                 "value": round(value, 2),
                 "status": classify_metric(value, cfg[cfg_key])["status"],
-                "description": label,
+                "description": (
+                    f"{label} ({which} avg10, {_PSI_BASIS[which]})"
+                ),
             }
         else:
             metrics[metric_key] = {
@@ -370,7 +424,8 @@ def collect_metrics() -> dict[str, Any]:
                 "status": "warning",
                 "description": (
                     f"/proc/pressure/{proc_key} unavailable "
-                    "(non-Linux or kernel missing pressure stall info)"
+                    "(non-Linux or kernel missing pressure stall info; "
+                    f"requested line: {which} avg10)"
                 ),
             }
 

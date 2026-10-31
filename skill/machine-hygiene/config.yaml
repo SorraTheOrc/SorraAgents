@@ -9,8 +9,10 @@
 # Usage: load via scripts/config.py::load_config()
 
 # ---------------------------------------------------------------------------
-# CPU Pressure (from /proc/pressure/cpu)
-#   Percentage of time the CPU group has been throttled (0–100%).
+# CPU Pressure (from /proc/pressure/cpu, "some" line, avg10)
+#   Percentage of the last 10 s during which *at least one* task was stalled
+#   waiting for CPU. This is a stall percentage, NOT a utilisation figure.
+#   The CPU pressure file exposes no "full" line on current kernels.
 # ---------------------------------------------------------------------------
 cpu_pressure:
   low: 0
@@ -18,8 +20,9 @@ cpu_pressure:
   critical: 85    # >85% indicates severe CPU starvation
 
 # ---------------------------------------------------------------------------
-# Memory Pressure (from /proc/pressure/memory)
-#   Percentage of time memory operations were stalled (0–100%).
+# Memory Usage (from /proc/meminfo)
+#   Percentage of RAM in use (total minus available). Distinct from
+#   memory_pressure below: this is a capacity figure, not a stall signal.
 # ---------------------------------------------------------------------------
 memory_usage:
   low: 0
@@ -27,8 +30,23 @@ memory_usage:
   critical: 95    # >95% memory used — imminent OOM risk
 
 # ---------------------------------------------------------------------------
-# I/O Pressure (from /proc/pressure/io)
-#   Percentage of time I/O operations were stalled (0–100%).
+# Memory Pressure (from /proc/pressure/memory, "full" line, avg10)
+#   Percentage of the last 10 s during which *all* tasks were stalled waiting
+#   for memory. Deliberately much lower than memory_usage: a system can sit at
+#   50% RAM and still stall for 20% of wall time under reclaim/refault churn,
+#   and 95% RAM used with no stalls is not a memory *stall* problem. Usage % and
+#   stall % are different quantities and are not comparable, so this metric has
+#   its own block rather than borrowing memory_usage's 80/95 (which would leave
+#   it permanently green now that parsing works).
+# ---------------------------------------------------------------------------
+memory_pressure:
+  low: 0
+  warning: 5     # >5% of wall time fully stalled on memory — reclaim churn
+  critical: 20   # >20% fully stalled — severe reclaim/thrash, OOM risk
+
+# ---------------------------------------------------------------------------
+# I/O Pressure (from /proc/pressure/io, "full" line, avg10)
+#   Percentage of the last 10 s during which *all* tasks were stalled on I/O.
 # ---------------------------------------------------------------------------
 io_pressure:
   low: 0
