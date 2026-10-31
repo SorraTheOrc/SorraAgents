@@ -65,7 +65,10 @@ the assignee when it ends, regardless of how it ends (assignee-hold
 convention: non-empty assignee = scheduling hold; clear to release):
 
 - successful `finish` clears the assignee together with the
-  `completed`/`in_review` transition (`clear_assignee_on_exit=True`)
+  `completed`/`in_review` transition: the context manager is built with the
+  agent's `assignee=`, and `StatusLifecycle` releases the claim it holds on
+  every exit path by default (`preserve_assignee_on_exit=True` is the only,
+  documented, opt-out)
 - every failure/abort reset to `open` (`phase_start`, `phase_finish`,
   `phase_abort`, the signal/KeyboardInterrupt safety reset) also passes
   `assignee=""`
@@ -1125,7 +1128,7 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 |-------|-----------|--------|-------|
 | Claim (Step 1) | `update_status(id, "in_progress", assignee="<AGENT>")` / `phase_start()` (status-only; stage unchanged) | in_progress | unchanged |
 | Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review", assignee="")` | completed | in_review |
-| Final (Step 9) | `with StatusLifecycle(id, target_stage="in_review", clear_assignee_on_exit=True):` / `phase_finish()` | completed | in_review |
+| Final (Step 9) | `with StatusLifecycle(id, assignee="<AGENT>", target_stage="in_review"):` / `phase_finish()` (release is the helper's default) | completed | in_review |
 | Abort (dirty/gate/user/error/termination) | `update_status(id, "open", assignee="")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
 
 > **All abort/failure transitions reset to `open` and clear the assignee.** Never leave a work item in `in_progress` unless actively implementing; never leave a completed or released item on an assignee hold.

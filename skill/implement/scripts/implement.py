@@ -7074,8 +7074,15 @@ def phase_finish(
         return report
 
     try:
+        # Assignee release is the helper's default, but it only ever clears an
+        # assignee the context manager holds — so finish declares the agent
+        # claim it owns here and releases it with the terminal
+        # ``completed``/``in_review`` transition. A producer hold on the item
+        # is therefore never wiped by finishing it (SA-0MVVF6OJY000JZBL).
         with StatusLifecycle(
-            work_item_id, target_stage="in_review", clear_assignee_on_exit=True
+            work_item_id,
+            assignee=os.environ.get("IMPLEMENT_AGENT_NAME") or "implement",
+            target_stage="in_review",
         ):
             # ── Step 3d: Prove the real index matches the tested tree ─────
             # The gate ran against a temporary index. Stage the change set in

@@ -183,9 +183,10 @@ class _RecordingLifecycle:
 
     transitions: list[tuple[str, str, str | None]] = []
 
-    def __init__(self, work_item_id, target_stage=None, clear_assignee_on_exit=False):
+    def __init__(self, work_item_id, target_stage=None, assignee=None, **kwargs):
         self.work_item_id = work_item_id
         self.target_stage = target_stage
+        self.assignee = assignee
 
     def __enter__(self):
         return self

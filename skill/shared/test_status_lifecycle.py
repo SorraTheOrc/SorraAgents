@@ -58,11 +58,15 @@ def _make_wl_show_proc(
     status: str = "open",
     stage: str = "idea",
     deleted_by: str = "",
+    assignee: str = "",
 ):
     """Build a mock CompletedProcess for ``wl show <id> --json``.
 
     ``deleted_by`` (SA-0MUJBLZC60085DI9) populates the soft-delete
     attribution field ``deletedBy``; an empty value means the item is live.
+
+    ``assignee`` reports the scheduling hold already on the item (a
+    pre-existing producer hold when the context manager never set one).
     """
     data = {
         "success": True,
@@ -71,6 +75,7 @@ def _make_wl_show_proc(
             "status": status,
             "stage": stage,
             "deletedBy": deleted_by,
+            "assignee": assignee,
         },
     }
     return subprocess.CompletedProcess(
@@ -227,8 +232,21 @@ class TestStatusLifecycleUnit:
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert "--stage" not in calls[0]
 
-    def test_assignee_on_entry(self, mock_run):
-        """Entry with assignee sets assignee, success does NOT clear."""
+    @staticmethod
+    def _release_value(call: list[str]) -> str | None:
+        """Return the ``--assignee`` value of a ``wl update`` argv (or None)."""
+        if "--assignee" not in call:
+            return None
+        return call[call.index("--assignee") + 1]
+
+    def test_assignee_held_on_entry_released_on_success(self, mock_run):
+        """A claim the context manager holds is released on the success exit.
+
+        Implement/intake claim with an assignee (a scheduling hold) and must
+        clear it when the run completes; the release is folded into the
+        terminal ``completed`` update (assignee-hold convention). Release is
+        the **default** — no opt-in flag is passed (SA-0MVVF6OJY000JZBL).
+        """
         mock_run.side_effect = [
             _make_wl_show_proc(status="open"),
             _make_wl_update_proc(),
@@ -241,10 +259,30 @@ class TestStatusLifecycleUnit:
         calls = [c.args[0] for c in mock_run.call_args_list]
         # Entry sets assignee
         assert calls[1][:5] == ["wl", "update", "TEST-123", "--status", "in-progress"]
-        assert "--assignee" in calls[1]
-        assert "bot" in calls[1]
-        # Exit is completed without assignee
+        assert calls[1][calls[1].index("--assignee") + 1] == "bot"
+        # Exit is completed AND releases the hold it set
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
+        assert self._release_value(calls[2]) == ""
+
+    def test_success_exit_keeps_preexisting_hold_it_never_held(self, mock_run):
+        """A pre-existing producer hold is never wiped on the success exit.
+
+        The context manager was constructed without ``assignee=``, so it never
+        held the claim's assignee: a hold already on the item (e.g. the
+        producer's ``Map``) must survive (no silent widening of the release).
+        """
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", assignee="Map"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123"):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
+        assert self._release_value(calls[2]) is None
 
     def test_assignee_cleared_on_failure(self, mock_run):
         """Failure with assignee restores status AND clears assignee."""
@@ -261,31 +299,56 @@ class TestStatusLifecycleUnit:
         calls = [c.args[0] for c in mock_run.call_args_list]
         # Restore status AND clear assignee
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
-        assert "--assignee" in calls[2]
+        assert self._release_value(calls[2]) == ""
 
-    def test_clear_assignee_on_success_exit(self, mock_run):
-        """clear_assignee_on_exit releases the assignee on the success exit.
+    def test_failure_exit_keeps_preexisting_hold_it_never_held(self, mock_run):
+        """A rollback does not wipe a hold the context manager never held."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", assignee="Map"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
 
-        Implement/intake claim with an assignee (a scheduling hold) and must
-        clear it when the run completes successfully; the clear is folded into
-        the terminal ``completed`` update (assignee-hold convention).
-        """
+        with pytest.raises(RuntimeError):  # noqa: SIM117
+            with StatusLifecycle("TEST-123"):
+                raise RuntimeError("boom")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
+        assert self._release_value(calls[2]) is None
+
+    def test_restore_on_exit_releases_held_assignee(self, mock_run):
+        """restore_on_exit restores the status AND releases a held assignee."""
         mock_run.side_effect = [
             _make_wl_show_proc(status="open"),
             _make_wl_update_proc(),
             _make_wl_update_proc(),
         ]
 
-        with StatusLifecycle("TEST-123", clear_assignee_on_exit=True):
+        with StatusLifecycle("TEST-123", assignee="bot", restore_on_exit=True):
             pass
 
         calls = [c.args[0] for c in mock_run.call_args_list]
-        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
-        assert "--assignee" in calls[2]
-        assert calls[2][calls[2].index("--assignee") + 1] == ""
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
+        assert self._release_value(calls[2]) == ""
 
-    def test_clear_assignee_on_exit_keeps_entry_claim_held(self, mock_run):
-        """The hold is held during the run and only released on exit."""
+    def test_restore_on_exit_keeps_preexisting_hold_it_never_held(self, mock_run):
+        """Read-only analysis must not release a producer hold it never held."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", assignee="Map"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123", restore_on_exit=True):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
+        assert self._release_value(calls[2]) is None
+
+    def test_preserve_assignee_on_exit_keeps_hold_on_success(self, mock_run):
+        """The documented opt-out preserves the hold on the success exit."""
         mock_run.side_effect = [
             _make_wl_show_proc(status="open"),
             _make_wl_update_proc(),
@@ -293,18 +356,141 @@ class TestStatusLifecycleUnit:
         ]
 
         with StatusLifecycle(
-            "TEST-123", assignee="bot", clear_assignee_on_exit=True
+            "TEST-123", assignee="bot", preserve_assignee_on_exit=True
         ):
             pass
 
         calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
+        assert self._release_value(calls[2]) is None
+
+    def test_preserve_assignee_on_exit_keeps_hold_on_failure(self, mock_run):
+        """The opt-out also preserves the hold on a rollback exit."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with pytest.raises(RuntimeError):  # noqa: SIM117
+            with StatusLifecycle(
+                "TEST-123", assignee="bot", preserve_assignee_on_exit=True
+            ):
+                raise RuntimeError("boom")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
+        assert self._release_value(calls[2]) is None
+
+    def test_preserve_assignee_on_exit_keeps_hold_on_restore(self, mock_run):
+        """The opt-out preserves the hold on a restore_on_exit exit."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle(
+            "TEST-123",
+            assignee="bot",
+            restore_on_exit=True,
+            preserve_assignee_on_exit=True,
+        ):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
+        assert self._release_value(calls[2]) is None
+
+    def test_hold_is_held_during_run_and_released_on_exit(self, mock_run):
+        """The hold is held during the run and only released on exit."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123", assignee="bot"):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
         # Entry still sets the assignee, so the claim is held while working...
-        assert "--assignee" in calls[1]
-        assert "bot" in calls[1]
+        assert calls[1][calls[1].index("--assignee") + 1] == "bot"
         # ...and the exit clears it together with the completed transition.
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
-        assert "--assignee" in calls[2]
-        assert calls[2][calls[2].index("--assignee") + 1] == ""
+        assert self._release_value(calls[2]) == ""
+
+    def test_legacy_clear_flag_is_deprecated_and_has_no_effect(self, mock_run):
+        """``clear_assignee_on_exit`` warns and no longer decides the release.
+
+        Release is already the default, so the legacy flag cannot change the
+        outcome: a context manager that holds no assignee still does not clear
+        a pre-existing hold, even when the flag is passed as ``True``.
+        """
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", assignee="Map"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with (
+            pytest.warns(DeprecationWarning, match="clear_assignee_on_exit"),
+            StatusLifecycle("TEST-123", clear_assignee_on_exit=True),
+        ):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
+        assert self._release_value(calls[2]) is None
+
+    def test_legacy_clear_flag_warns_when_false_too(self, mock_run):
+        """Passing the deprecated flag at all (even ``False``) warns."""
+        with pytest.warns(DeprecationWarning, match="clear_assignee_on_exit"):
+            StatusLifecycle("TEST-123", clear_assignee_on_exit=False)
+
+        assert mock_run.call_count == 0
+
+    def test_legacy_flag_cannot_contradict_the_preserve_opt_out(self, mock_run):
+        """Two flags never contradict: the documented opt-out wins."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with (
+            pytest.warns(DeprecationWarning, match="clear_assignee_on_exit"),
+            StatusLifecycle(
+                "TEST-123",
+                assignee="bot",
+                clear_assignee_on_exit=True,
+                preserve_assignee_on_exit=True,
+            ),
+        ):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert self._release_value(calls[2]) is None
+
+    def test_release_is_idempotent_across_runs(self, mock_run):
+        """Releasing an already-released assignee is a harmless no-op write."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+            _make_wl_show_proc(status="completed", stage="in_review"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123", assignee="bot"):
+            pass
+        with StatusLifecycle("TEST-123", assignee="bot"):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert self._release_value(calls[2]) == ""
+        assert self._release_value(calls[5]) == ""
 
     def test_wl_show_failure_then_update_fails(self, mock_run):
         """wl show failure is caught, but in_progress update failure raises."""
@@ -971,13 +1157,11 @@ class TestStatusLifecycleIntegration:
             inside = json.loads(show.stdout)
             assert inside["workItem"]["assignee"] == "integration-test"
 
-    def test_clear_assignee_on_success_exit_real(self, temp_work_item):
-        """Verify the real store clears the assignee with the completion."""
+    def test_assignee_released_on_success_exit_real(self, temp_work_item):
+        """Verify the real store releases a held assignee by default."""
         item_id = temp_work_item
 
-        with StatusLifecycle(
-            item_id, assignee="integration-test", clear_assignee_on_exit=True
-        ):
+        with StatusLifecycle(item_id, assignee="integration-test"):
             pass
 
         show = subprocess.run(
@@ -987,6 +1171,23 @@ class TestStatusLifecycleIntegration:
         after = json.loads(show.stdout)
         assert after["workItem"]["status"] == "completed"
         assert after["workItem"]["assignee"] == ""
+
+    def test_preserve_assignee_on_exit_real(self, temp_work_item):
+        """Verify the documented opt-out keeps the hold in the real store."""
+        item_id = temp_work_item
+
+        with StatusLifecycle(
+            item_id, assignee="integration-test", preserve_assignee_on_exit=True
+        ):
+            pass
+
+        show = subprocess.run(
+            ["wl", "show", item_id, "--json"],
+            capture_output=True, text=True, check=True,
+        )
+        after = json.loads(show.stdout)
+        assert after["workItem"]["status"] == "completed"
+        assert after["workItem"]["assignee"] == "integration-test"
 
     def test_work_item_not_found(self):
         """Verify RuntimeError for non-existent work item."""
