@@ -268,9 +268,8 @@ def test_context_manager_raises_when_lock_is_held(worklog_dir: Path):
     holder_result = holder.acquire()
     try:
         intruder = _make_lock(worklog_dir, agent="intruder", session="sess-intruder")
-        with pytest.raises(WorkItemLockHeld) as excinfo:
-            with intruder:
-                pytest.fail("a held lock must never be entered")
+        with pytest.raises(WorkItemLockHeld) as excinfo, intruder:
+            pytest.fail("a held lock must never be entered")
 
         held = excinfo.value.result
         assert held.acquired is False
