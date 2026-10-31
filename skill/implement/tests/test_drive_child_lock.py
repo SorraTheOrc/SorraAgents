@@ -98,6 +98,7 @@ if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
 
 pytest.importorskip("shared.work_item_lock")
 
+from shared.git_sandbox import fixture_git_env
 from shared.work_item_lock import (
     ENV_LOCK_TOKEN,
     WorkItemLock,
@@ -136,7 +137,14 @@ class Project:
 
 
 def _run(cmd: list[str], cwd: Path, *, timeout: int = 120) -> subprocess.CompletedProcess:
-    """Run *cmd* in *cwd*; raise a descriptive assertion on failure."""
+    """Run *cmd* in *cwd*; raise a descriptive assertion on failure.
+
+    The environment is hermetic (``fixture_git_env()``): the finish gate
+    exports a temporary ``GIT_INDEX_FILE`` for the whole suite it runs, and a
+    fixture ``git init``/``add``/``commit`` would otherwise write into the
+    gate's index instead of the fixture's own — corrupting both the fixture
+    and the gate's evidence (SA-0MVL7YOMJ006UMDO).
+    """
     proc = subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -144,6 +152,7 @@ def _run(cmd: list[str], cwd: Path, *, timeout: int = 120) -> subprocess.Complet
         text=True,
         timeout=timeout,
         stdin=subprocess.DEVNULL,
+        env=fixture_git_env(),
     )
     if proc.returncode != 0:
         raise AssertionError(
@@ -268,8 +277,15 @@ def _child_env(
     ``IMPLEMENT_CHILD_LOCK_TOKEN`` is removed unconditionally: a contender must
     never inherit this session's driver token, or the loser would re-enter the
     winner's lock as self-owned instead of being refused.
+
+    The base environment is hermetic (``fixture_git_env()``), so the finish
+    gate's exported ``GIT_INDEX_FILE`` never reaches the contender. Without
+    this, ``implement.py start``'s ``git worktree add`` rewrites the gate's
+    temporary index and the gate correctly rejects its own evidence ("index
+    now unreadable") while every assertion in this module fails
+    (SA-0MVL7YOMJ006UMDO).
     """
-    env = dict(os.environ)
+    env = fixture_git_env()
     env.pop(ENV_LOCK_TOKEN, None)
     env.pop("IMPLEMENT_DRIVE_ACTIVE", None)
     # Keep the contender faithful to a production invocation: the fixture's
