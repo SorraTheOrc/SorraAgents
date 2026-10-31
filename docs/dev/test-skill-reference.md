@@ -232,14 +232,45 @@ never blocks a test run and vice-versa. Each workload has its own ceiling.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TEST_MAX_CONCURRENCY` | `2` | Maximum concurrent test-suite executions |
-| `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot |
+| `TEST_MAX_CONCURRENCY` | `6` | Maximum concurrent **full-suite** executions (calibrated — see *Concurrency lanes*) |
+| `TEST_MAX_CONCURRENCY_FAST` | `4` | Maximum concurrent **partial** runs (`--scope changed`, non-`full` types) |
+| `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot in either lane |
 | `TEST_LOCK_JITTER` | `0.1` | Per-waiter stagger fraction of the bounded wait (`0` = off) — see *Staggered-wait contract* below |
 | `VITEST_MAX_WORKERS` | `4` | Maximum workers in a single vitest suite (per-suite fan-out bound) — resolved value is **exported** to every suite command; see *Per-suite vitest worker bound* below |
 
 The numeric env vars are validated at runtime: invalid values produce a stderr
 warning and fall back to the documented default (never breaking the test run).
 Values below 1 are clamped to 1.
+
+### Concurrency lanes (SA-0MVWZQ269009SJXV)
+
+Executions are bounded in two **independent** semaphore namespaces so a short
+partial run can never queue behind a long full suite:
+
+| Lane | Selection | Namespace | Ceiling |
+|---|---|---|---|
+| `full` | `--scope full` **and** `--type full` | `test` | `TEST_MAX_CONCURRENCY` (default 6) |
+| `fast` | `--scope changed`, **or** any `--type` other than `full` (`unit`, `smoke`, `group:<name>`), or a per-test rerun | `test-fast` | `TEST_MAX_CONCURRENCY_FAST` (default 4) |
+
+- The lane is derived from the **resolved** scope: a `--scope changed` run that
+  falls back to the full suite reports — and contends in — the `full` lane.
+- Cache hits never acquire a slot in either lane
+  (SA-0MTG5U75A001F1RG AC4).
+- `TEST_LOCK_TIMEOUT` bounds both lanes; the slot-busy notice names the lane
+  and the ceiling env var that produced it.
+- Every suite result carries `slot_lane` and `slot_wait_seconds` (queue time),
+  kept separate from `elapsed_seconds` (execution time,
+  SA-0MVU8XRBQ000DG9D); the aggregate adds `slot_lanes` and the summed
+  `slot_wait_seconds`. Text output prints a `queued N s for a <lane>-lane test
+  slot` line whenever the wait reaches 1 s.
+
+**Why the ceilings are 6 and 4 (not 2).** The previous default of 2 was an
+uncalibrated first cut. The 2026-10-31 production measurement
+([test-ceiling-validation.json](test-ceiling-validation.json)) found 41 full
+suites at 382–465 s (median 441 s) regardless of whether one or two ran
+concurrently, each suite using < 1 core, the host 92 % CPU idle while this pool
+sat at 100 % capacity, and 7.5–18.2 min slot waits for partial runs whose pytest
+body took 0.65–2.88 s. Queue depth, not compute, was the binding constraint.
 
 **Per-suite vitest worker bound (SA-0MVE98T1M006A17T):** the host-wide
 `TEST_MAX_CONCURRENCY` ceiling bounds how many *suites* run at once, but a

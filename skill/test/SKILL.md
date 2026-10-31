@@ -118,6 +118,23 @@ python3 $(skill_path test)/scripts/run_tests.py --type full --json   # release e
 the same git state within the **2-hour TTL** is served from cache. Details:
 [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
 
+### 0.1 Concurrency lanes (SA-0MVWZQ269009SJXV)
+
+Actual executions are bounded host-wide in **two independent semaphore lanes**
+so a short partial run never queues behind a long full suite:
+
+| Lane | Used by | Namespace | Ceiling (default) |
+|---|---|---|---|
+| `full` | whole-suite runs (`--scope full`, `--type full`) | `test` | `TEST_MAX_CONCURRENCY` (`6`) |
+| `fast` | partial runs (`--scope changed`, `--type unit`/`smoke`/`group:*`, per-test reruns) | `test-fast` | `TEST_MAX_CONCURRENCY_FAST` (`4`) |
+
+Cache hits acquire nothing. Both lanes use `TEST_LOCK_TIMEOUT` (default
+`600` s) as their bounded wait. Every result reports `slot_lane` plus
+`slot_wait_seconds` (queue time) **separately** from `elapsed_seconds`
+(execution time), so a queue-delayed run can never be mistaken for a slow
+suite; the aggregate adds `slot_lanes`. The ceilings are calibrated, not
+guessed: [docs/dev/test-ceiling-validation.json](../../docs/dev/test-ceiling-validation.json).
+
 Query a cached run without executing:
 
 ```bash

@@ -26,12 +26,17 @@ per-command timeout (F2 AC1).
 Results are cached per-repo (see skill/test_cache.py) by default so repeated
 verification at the same git state is served without re-executing the suite.
 
-Concurrent suite executions are bounded host-wide via the shared "test"
-semaphore (skill/shared/process_semaphore.py): TEST_MAX_CONCURRENCY (default
-2) ceilings concurrent runs, TEST_LOCK_TIMEOUT (default 600s) bounds the wait
-for a free slot. Only ACTUAL executions acquire a slot — cache hits are
-served without executing and never block on the semaphore
-(SA-0MTG5U75A001F1RG).
+Concurrent suite executions are bounded host-wide via two shared semaphore
+namespaces (skill/shared/process_semaphore.py): the "test" lane carries FULL
+suites (TEST_MAX_CONCURRENCY, default 6 — calibrated, see the constant block)
+and the "test-fast" lane carries PARTIAL runs (TEST_MAX_CONCURRENCY_FAST,
+default 4), so a 1-3 s changed-scope run never queues behind a 7-minute full
+suite (SA-0MVWZQ269009SJXV). TEST_LOCK_TIMEOUT (default 600s) bounds the wait
+for either lane's free slot. Only ACTUAL executions acquire a slot — cache
+hits are served without executing and never block on the semaphore
+(SA-0MTG5U75A001F1RG). Every result reports ``slot_wait_seconds`` (queue time)
+separately from ``elapsed_seconds`` (execution time) so a queue-delayed run
+can never read as a slow suite (SA-0MVU8XRBQ000DG9D).
 
 Per-suite worker pools are bounded independently of that suite ceiling
 (SA-0MVE98T1M006A17T): a single vitest suite otherwise sizes its tinypool to
@@ -89,6 +94,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextvars
 import json
 import os
 import re
@@ -159,9 +165,30 @@ NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
 # semaphore (skill/shared/process_semaphore.py) — a separate namespace
 # from the "audit" semaphore so the two workloads have independent
 # ceilings. Cache hits never execute and never consume a slot.
+#
+# Full-suite ceiling calibration (SA-0MVWZQ269009SJXV; evidence committed to
+# docs/dev/test-ceiling-validation.json): 6, not the original uncalibrated 2.
+# Measured on the 32-thread host 2026-10-31 — 41 full suites at 382-465 s
+# (median 441 s) whether one or two ran concurrently, each suite using < 1
+# core, the host 92% CPU idle while this pool sat at 100% capacity (22 suites
+# in 83 min), and 7-18 min slot waits for partial runs whose pytest body took
+# 1-3 s. Queueing, not compute, was the binding constraint; six suites is at
+# most six cores of thirty-two.
 TEST_SEMAPHORE_NAME = "test"
 TEST_MAX_CONCURRENCY_ENV = "TEST_MAX_CONCURRENCY"
-TEST_MAX_CONCURRENCY_DEFAULT = 2
+TEST_MAX_CONCURRENCY_DEFAULT = 6
+#: Independent lane for PARTIAL runs (``--scope changed``, or a ``--type``
+#: other than ``full``): its own namespace, so partial runs neither queue
+#: behind full suites nor evict them (SA-0MVWZQ269009SJXV AC1). The ceiling is
+#: separate from the full-suite ceiling: partial runs are short, so the pool is
+#: sized for burst absorbtion rather than for suite throughput.
+TEST_FAST_SEMAPHORE_NAME = "test-fast"
+TEST_MAX_CONCURRENCY_FAST_ENV = "TEST_MAX_CONCURRENCY_FAST"
+TEST_MAX_CONCURRENCY_FAST_DEFAULT = 4
+#: Lane names carried on every suite result and used to resolve the
+#: (semaphore namespace, ceiling) pair.
+TEST_SLOT_LANE_FULL = "full"
+TEST_SLOT_LANE_FAST = "fast"
 TEST_LOCK_TIMEOUT_ENV = "TEST_LOCK_TIMEOUT"
 TEST_LOCK_TIMEOUT_DEFAULT = 600.0
 #: Per-waiter stagger fraction of the bounded wait (SA-0MVEDOF7A004TSWD):
@@ -1642,26 +1669,108 @@ class TestConcurrencyTimeout(RuntimeError):
 
 
 def _test_semaphore_max_workers() -> int:
-    """Resolve the test-run concurrency ceiling.
+    """Resolve the FULL-suite concurrency ceiling.
 
-    Precedence: ``TEST_MAX_CONCURRENCY`` env var > default 2. Values below
-    1 are clamped to 1; an invalid (non-integer) value is ignored with a
-    warning so a misconfigured environment cannot break test runs. The
-    ceiling bounds concurrent suite executions host-wide via the shared
-    "test" semaphore — a separate namespace from the audit semaphore
-    (SA-0MTG5U75A001F1RG AC1/AC2/AC3).
+    Precedence: ``TEST_MAX_CONCURRENCY`` env var > calibrated default 6. Values
+    below 1 are clamped to 1; an invalid (non-integer) value is ignored with a
+    warning so a misconfigured environment cannot break test runs. The ceiling
+    bounds concurrent full-suite executions host-wide via the shared "test"
+    semaphore — a separate namespace from both the audit semaphore and the
+    partial-run "test-fast" lane (SA-0MTG5U75A001F1RG AC1/AC2/AC3,
+    SA-0MVWZQ269009SJXV AC2).
     """
-    env_value = os.environ.get(TEST_MAX_CONCURRENCY_ENV)
+    return _resolve_ceiling(TEST_MAX_CONCURRENCY_ENV, TEST_MAX_CONCURRENCY_DEFAULT)
+
+
+def _test_fast_semaphore_max_workers() -> int:
+    """Resolve the PARTIAL-run ("test-fast" lane) concurrency ceiling.
+
+    Precedence: ``TEST_MAX_CONCURRENCY_FAST`` env var > default 4, with the
+    same clamping and invalid-value handling as the full-suite ceiling
+    (:func:`_test_semaphore_max_workers`). Partial runs are short, so a modest
+    pool absorbs a burst of concurrent agents without ever waiting behind a
+    full suite (SA-0MVWZQ269009SJXV AC1).
+    """
+    return _resolve_ceiling(
+        TEST_MAX_CONCURRENCY_FAST_ENV, TEST_MAX_CONCURRENCY_FAST_DEFAULT
+    )
+
+
+def _resolve_ceiling(env_name: str, default: int) -> int:
+    """Return the env-configured ceiling, or *default* when unset/invalid.
+
+    Shared by both lanes so clamping (< 1 -> 1) and the invalid-value warning
+    are implemented exactly once.
+    """
+    env_value = os.environ.get(env_name)
     if env_value:
         try:
             return max(1, int(env_value))
         except ValueError:
             print(
-                f"Warning: invalid {TEST_MAX_CONCURRENCY_ENV} value "
+                f"Warning: invalid {env_name} value "
                 f"{env_value!r}; using default ceiling",
                 file=sys.stderr,
             )
-    return TEST_MAX_CONCURRENCY_DEFAULT
+    return default
+
+
+def slot_lane_for(scope: str, test_type: str) -> str:
+    """Return the semaphore lane a run belongs to.
+
+    A run is *partial* — and therefore belongs to the "test-fast" lane —
+    whenever it does not select the whole suite: ``scope`` other than
+    ``"full"`` (i.e. ``"changed"``) or a ``test_type`` other than ``full``
+    (``unit``, ``smoke``, ``group:<name>``). Everything else is a full suite
+    and keeps the "test" lane. Callers must pass the **resolved** scope (after
+    a changed-scope run falls back to the full suite, the lane is "full"), so
+    a lane label always matches what actually executed
+    (SA-0MVWZQ269009SJXV AC1/AC4).
+    """
+    if scope != "full" or test_type != DEFAULT_TEST_TYPE:
+        return TEST_SLOT_LANE_FAST
+    return TEST_SLOT_LANE_FULL
+
+
+#: Lane of the slot acquisitions happening in this execution context. Kept as
+#: ambient state (rather than a parameter on every call) so a caller can wrap a
+#: whole execution in :func:`_slot_lane` and every nested acquisition inherits
+#: it — and so existing zero-argument test doubles of
+#: :func:`_test_concurrency_slot` keep working.
+_SLOT_LANE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "test_slot_lane", default=TEST_SLOT_LANE_FULL
+)
+
+
+@contextmanager
+def _slot_lane(lane: str) -> Iterator[None]:
+    """Run nested slot acquisitions in *lane* (``"full"`` or ``"fast"``).
+
+    Sets the ambient lane for the duration of the block; an explicit ``lane=``
+    argument to :func:`_test_concurrency_slot` still wins, so a caller that
+    needs a one-off lane does not have to wrap the execution.
+    """
+    token = _SLOT_LANE.set(lane)
+    try:
+        yield
+    finally:
+        _SLOT_LANE.reset(token)
+
+
+def _lane_semaphore_config(lane: str) -> tuple[str, str, int]:
+    """Return ``(lane, semaphore_name, max_workers)`` for *lane*.
+
+    An unknown lane name is treated as ``"full"``: an unexpected value must
+    degrade to the conservative pool, never to an unbounded one.
+    """
+    if lane == TEST_SLOT_LANE_FAST:
+        return (
+            TEST_SLOT_LANE_FAST,
+            TEST_FAST_SEMAPHORE_NAME,
+            _test_fast_semaphore_max_workers(),
+        )
+    return TEST_SLOT_LANE_FULL, TEST_SEMAPHORE_NAME, _test_semaphore_max_workers()
+
 
 
 def _test_lock_timeout() -> float:
@@ -1745,14 +1854,24 @@ def _test_vitest_max_workers() -> int:
 
 
 @contextmanager
-def _test_concurrency_slot() -> Iterator[None]:
+def _test_concurrency_slot(lane: str | None = None) -> Iterator[None]:
     """Hold a shared test-run slot for the duration of an actual execution.
 
-    Bounds concurrent test suite executions via the shared "test"
-    semaphore (ceiling ``TEST_MAX_CONCURRENCY``, bounded wait
-    ``TEST_LOCK_TIMEOUT``). Only ACTUAL executions acquire a slot — a
-    cached result is served without executing and never blocks on the
-    semaphore, so cache behavior is unchanged (SA-0MTG5U75A001F1RG AC4).
+    Bounds concurrent test suite executions via a shared semaphore, in the
+    lane named by *lane* — or, when omitted, the ambient lane set by
+    :func:`_slot_lane` (SA-0MVWZQ269009SJXV AC1):
+
+    - ``"full"`` (default) — the ``"test"`` namespace, ceiling
+      ``TEST_MAX_CONCURRENCY``, for whole-suite executions.
+    - ``"fast"`` — the ``"test-fast"`` namespace, ceiling
+      ``TEST_MAX_CONCURRENCY_FAST``, for partial runs (``--scope changed``,
+      ``--type unit|smoke|group:*``). Independent of the full-suite pool, so a
+      1-3 s partial run never queues behind a 7-minute full suite.
+
+    Both lanes use the bounded wait ``TEST_LOCK_TIMEOUT``. Only ACTUAL
+    executions acquire a slot — a cached result is served without executing
+    and never blocks on the semaphore, so cache behavior is unchanged
+    (SA-0MTG5U75A001F1RG AC4).
 
     Nested-run isolation (SA-0MUY6U05F008RG86): fixtures that spawn a nested
     ``run_tests.py`` (or call the runner in-process) set ``PI_SEMAPHORE_DIR``
@@ -1765,10 +1884,17 @@ def _test_concurrency_slot() -> Iterator[None]:
     Raises:
         TestConcurrencyTimeout: when no slot frees within the bound.
     """
-    max_workers = _test_semaphore_max_workers()
+    lane, semaphore_name, max_workers = _lane_semaphore_config(
+        lane if lane is not None else _SLOT_LANE.get()
+    )
     lock_timeout = _test_lock_timeout()
+    ceiling_env = (
+        TEST_MAX_CONCURRENCY_FAST_ENV
+        if lane == TEST_SLOT_LANE_FAST
+        else TEST_MAX_CONCURRENCY_ENV
+    )
     sem = Semaphore(
-        TEST_SEMAPHORE_NAME,
+        semaphore_name,
         max_workers=max_workers,
         timeout=lock_timeout,
         # Per-waiter stagger within the bound so a herd of concurrent
@@ -1782,7 +1908,7 @@ def _test_concurrency_slot() -> Iterator[None]:
     except TimeoutError as exc:
         raise TestConcurrencyTimeout(
             f"{SLOT_BUSY_NOTICE_PREFIX} no free slot within "
-            f"{lock_timeout:.0f}s (TEST_MAX_CONCURRENCY={max_workers}) "
+            f"{lock_timeout:.0f}s (lane={lane}, {ceiling_env}={max_workers}) "
             f"— wait a staggered delay before retrying (do not re-run "
             f"immediately; concurrent waiters re-enter the pool in lockstep "
             f"otherwise), or raise TEST_LOCK_TIMEOUT to wait longer."
@@ -1885,6 +2011,7 @@ def _timed_suite_runner(elapsed_samples: list[float]) -> Runner:
 def paced_runner(
     runner: Runner | None = None,
     on_wait: Callable[[float, float], None] | None = None,
+    lane: str = TEST_SLOT_LANE_FULL,
 ) -> Runner:
     """Wrap a cache *runner* so each real execution holds a test-run slot.
 
@@ -1905,9 +2032,15 @@ def paced_runner(
     immediately after the slot is acquired and before the command is spawned,
     so callers can emit pacing telemetry (SA-0MUA8BSAG000YZA2 AC3).
 
+    *lane* selects the semaphore namespace: ``"full"`` (default) for a whole
+    suite, ``"fast"`` for a partial run (``--scope changed``, ``--type`` other
+    than ``full``). The two pools are independent, so a partial run never
+    queues behind a full suite. An unknown lane degrades to ``"full"``
+    (SA-0MVWZQ269009SJXV AC1).
+
     This is the single pacer entry point other code paths (e.g.
     ``implement.py``'s finish-gate suites, SA-0MUKHCO02009EQFG) use to route
-    their executions through the same host-wide ``"test"`` namespace as
+    their executions through the same host-wide namespace as
     ``run_tests.py`` (SA-0MTG5U75A001F1RG). A caller that does not pace keeps
     its previous unpaced behaviour, so this is opt-in.
 
@@ -1919,7 +2052,7 @@ def paced_runner(
 
     def _paced(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
         queued_at = time.time()
-        with _test_concurrency_slot():
+        with _slot_lane(lane), _test_concurrency_slot():
             if on_wait is not None:
                 on_wait(queued_at, time.time() - queued_at)
             return runner(command, cwd, timeout)
@@ -2125,6 +2258,11 @@ def run_suite(
         # partial run as full-suite evidence (SA-0MUH1MJL6003767Q).
         resolvable_scope = scope if scope in ("full", "changed") else "full"
     command = " && ".join(commands)
+    # Lane selection (SA-0MVWZQ269009SJXV AC1): a partial run gets its own
+    # "test-fast" pool so it never queues behind a full suite. Derived from the
+    # RESOLVED scope, so a changed-scope run that fell back to the full suite
+    # correctly reports (and contends in) the full lane.
+    slot_lane = slot_lane_for(resolvable_scope, test_type)
 
     all_failures: list[dict[str, str]] = []
     overall_returncode = 0
@@ -2167,6 +2305,7 @@ def run_suite(
             "configured_timeout": timeout,
             "elapsed_seconds": _measured_seconds(elapsed_samples),
             "slot_wait_seconds": sum(slot_waits),
+            "slot_lane": slot_lane,
             "exit_code": None,
             "signal": None,
             # Verdict provenance (SA-0MVQHVJEX0071R7G): every return path
@@ -2193,7 +2332,9 @@ def run_suite(
             _sink.append(wait_seconds)
 
         paced = paced_runner(
-            runner=_timed_suite_runner(command_elapsed), on_wait=_record_wait
+            runner=_timed_suite_runner(command_elapsed),
+            on_wait=_record_wait,
+            lane=slot_lane,
         )
         queued_at = time.monotonic()
         try:
@@ -2304,6 +2445,8 @@ def _render_suite_facts(result: dict[str, Any]) -> str:
     slot_wait = result.get("slot_wait_seconds")
     if slot_wait:
         parts.append(f"slot_wait={slot_wait:.2f}s")
+    if result.get("slot_lane"):
+        parts.append(f"lane={result['slot_lane']}")
     exit_code = result.get("exit_code")
     if exit_code is not None:
         parts.append(f"exit_code={exit_code}")
@@ -2421,6 +2564,16 @@ def run_all(
         "resolved_scopes": resolved_scopes,
         "elapsed_seconds_total": elapsed_total if elapsed_measured else None,
         "slot_wait_seconds": slot_wait_total,
+        # Lane provenance (SA-0MVWZQ269009SJXV AC4): which semaphore namespace(s)
+        # the selected suites contended in, so an operator can tell a slow run
+        # from a queue-delayed one without reading stderr.
+        "slot_lanes": sorted(
+            {
+                result["slot_lane"]
+                for result in results.values()
+                if result.get("slot_lane")
+            }
+        ),
         # Verdict provenance (SA-0MVQHVJEX0071R7G): the aggregate is
         # cache-served only when every suite was, and the entries reported are
         # the union of the suites' served entries (one per cached command).
@@ -2455,7 +2608,10 @@ def rerun_failures(
             stable.append(failure)
             continue
         try:
-            with _test_concurrency_slot():
+            # A per-test rerun is a partial run: it belongs to the fast lane so
+            # it never queues behind the full suite that just failed
+            # (SA-0MVWZQ269009SJXV AC1).
+            with _slot_lane(TEST_SLOT_LANE_FAST), _test_concurrency_slot():
                 proc = _run_cmd(
                     shlex.split(executable_test_command(cmd)),
                     cwd=cwd or REPO_ROOT,
@@ -3022,12 +3178,19 @@ def main(argv: list[str] | None = None) -> int:
                 cached = " [cached]" if suite_result.get("cached") else ""
                 scope = f" [{suite_result.get('scope', 'full')} scope]"
                 type_info = f" [type {suite_result.get('type', test_type)}]"
+                lane_info = f" [{suite_result.get('slot_lane', 'full')} lane]"
                 interpreter = suite_result.get("interpreter") or ""
                 interpreter_info = f" [pytest interpreter: {interpreter}]" if interpreter else ""
                 print(
-                    f"{name}: {status}{cached}{scope}{type_info}{interpreter_info} "
+                    f"{name}: {status}{cached}{scope}{type_info}{lane_info}{interpreter_info} "
                     f"({suite_result['command']})"
                 )
+                if (suite_result.get("slot_wait_seconds") or 0.0) >= 1.0:
+                    print(
+                        f"  queued {suite_result['slot_wait_seconds']:.1f}s for a "
+                        f"{suite_result.get('slot_lane', 'full')}-lane test slot "
+                        f"(wait, not execution — see elapsed in the facts below)"
+                    )
                 if suite_result.get("notice"):
                     print(f"  notice: {suite_result['notice']}")
                 if not suite_result["success"]:

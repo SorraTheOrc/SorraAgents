@@ -1,0 +1,126 @@
+{
+  "work_item": "SA-0MVWZQ269009SJXV",
+  "supersedes": "SA-0MVE995PV0077QB5 (deleted; no calibration landed)",
+  "harness": "production observation (no synthetic fan-out)",
+  "method": "Today's real suite executions were read from the per-worktree test caches (<git-dir>/test-cache/*/stdout.txt, metadata.json) and cross-checked against the pi session tool-call durations (toolResult.durationMs for every run_tests.py / wait_for_job.py call), /var/log/llama-proxy/proxy.log and ss/top snapshots taken while the pool was saturated. No extra suite load was generated: the host was already carrying ~44 live agent sessions, so a synthetic F7 burst would only have distorted the measurement it measured.",
+  "host": {
+    "cpu_count": 32,
+    "memory_gib": 124,
+    "test_pool_ceiling_measured": 2,
+    "audit_pool_ceiling": 6
+  },
+  "caveat": "Timing comes from pytest's own reported duration, so it excludes interpreter start-up and the runner's own overhead (<1 s per run). Suite duration is flat at both observed concurrency levels, which is the point: the pool was never compute-bound. Absolute latencies of the 1-3 s partial runs are taken from the pi session logs of the sessions that experienced them.",
+  "generated_at": "2026-10-31T22:40:00Z",
+  "saturation_evidence": {
+    "full_suites_completed_21_00_to_22_23": 22,
+    "wall_minutes_available": 83,
+    "execution_minutes_available_with_ceiling_2": 166,
+    "execution_minutes_demanded": 161,
+    "pool_utilisation_percent": 97.0,
+    "host_cpu_idle_percent_during_saturation": 92.2,
+    "load_average_1min": 3.7,
+    "pytest_process_cpu_percent_each": [
+      21.3,
+      9.1
+    ]
+  },
+  "runs": [
+    {
+      "concurrency_observed": 1,
+      "sample_size": 6,
+      "note": "early-day runs, nothing else in the pool",
+      "median_seconds": 388.0
+    },
+    {
+      "concurrency_observed": 2,
+      "sample_size": 34,
+      "note": "later runs while the pool was saturated",
+      "median_seconds": 443.0
+    }
+  ],
+  "full_suite_seconds": {
+    "sample_size": 40,
+    "min": 381.84,
+    "median": 441.62,
+    "p90": 455.64,
+    "max": 471.27,
+    "samples": [
+      381.84,
+      383.69,
+      389.58,
+      390.7,
+      409.52,
+      418.27,
+      431.24,
+      431.56,
+      432.5,
+      432.75,
+      433.75,
+      437.32,
+      437.75,
+      438.15,
+      438.46,
+      440.82,
+      441.05,
+      441.26,
+      441.29,
+      441.44,
+      441.81,
+      441.84,
+      442.18,
+      442.3,
+      442.61,
+      442.62,
+      443.31,
+      443.94,
+      444.67,
+      445.13,
+      447.09,
+      449.88,
+      449.89,
+      450.06,
+      450.44,
+      453.57,
+      455.64,
+      462.41,
+      465.02,
+      471.27
+    ]
+  },
+  "starvation_evidence": [
+    {
+      "lane": "fast (would be)",
+      "pytest_body_seconds": 1.83,
+      "call_blocked_minutes": 18.2,
+      "pytest_summary": "217 passed, 12 xfailed in 1.83s"
+    },
+    {
+      "lane": "fast (would be)",
+      "pytest_body_seconds": 2.88,
+      "call_blocked_minutes": 14.3,
+      "pytest_summary": "297 passed, 12 xfailed in 2.88s"
+    },
+    {
+      "lane": "fast (would be)",
+      "pytest_body_seconds": 0.65,
+      "call_blocked_minutes": 7.5,
+      "pytest_summary": "87 passed in 0.65s"
+    }
+  ],
+  "agent_wait_budget_2026_10_31": {
+    "wait_for_job_calls": 447,
+    "wait_for_job_wall_hours": 127.2,
+    "wait_for_job_median_minutes": 10.0,
+    "wait_for_job_p90_minutes": 45.0,
+    "run_tests_calls": 458,
+    "run_tests_wall_hours": 11.1,
+    "sessions_measured": 155,
+    "concurrent_sessions_peak": 44
+  },
+  "decision": {
+    "TEST_MAX_CONCURRENCY_DEFAULT": 6,
+    "TEST_MAX_CONCURRENCY_FAST_DEFAULT": 4,
+    "rationale": "Six concurrent suites cost at most six of thirty-two cores at the measured <1 core per suite, and leave 26 cores plus the GPU for the agent sessions that submit the work; four occupies the fast lane's burst peak without letting a storm of 1-3 s partial runs crowd out a finishing suite. The binding constraint was queue depth (97% pool utilisation at 92% host idle), so raising the ceiling and splitting the lanes attack the measured constraint rather than adding capacity nobody needed.",
+    "residual_risk": "A repo whose full suite is genuinely CPU-bound (e.g. a vitest/Chromium suite with an unbounded worker pool) must still set TEST_MAX_CONCURRENCY=1; the per-suite VITEST_MAX_WORKERS cap (default 4) remains in force for those."
+  }
+}
