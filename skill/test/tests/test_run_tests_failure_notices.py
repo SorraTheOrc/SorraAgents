@@ -182,7 +182,8 @@ class TestRunAllAggregation:
 
 
 # ---------------------------------------------------------------------------
-# Infrastructure-failure contract (SA-0MVU8XQTU006DP37)
+# Infrastructure-failure contract (SA-0MVU8XQTU006DP37, implemented by
+# SA-0MVU8XRBQ000DG9D)
 #
 # A timeout, a kill and an unparsed non-zero exit are each *provably distinct*
 # from a code failure: `run_suite` must name what happened (configured timeout
@@ -190,19 +191,7 @@ class TestRunAllAggregation:
 # leaving a consumer to infer it. Every case below is simulated through the
 # shared fixture module, so no test sleeps for minutes, allocates gigabytes or
 # contends for a host test slot.
-#
-# Red until the runner slice SA-0MVU8XRBQ000DG9D emits the facts.
 # ---------------------------------------------------------------------------
-
-_RUNNER_FACTS_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Contract pinned test-first by SA-0MVU8XQTU006DP37; the runner slice "
-        "SA-0MVU8XRBQ000DG9D emits elapsed_seconds, configured_timeout and "
-        "slot_wait_seconds plus the killed/unparsed_failure notice codes. "
-        "Remove this marker in that slice (strict xfail fails on XPASS)."
-    ),
-)
 
 
 def _run_fixture_suite(
@@ -240,7 +229,6 @@ def _slow_then(result):
 class TestRunSuiteInfrastructureFacts:
     """Every non-green suite result states *what* happened, not just *that*."""
 
-    @_RUNNER_FACTS_XFAIL
     def test_successful_suite_reports_measured_elapsed_seconds(self, tmp_path) -> None:
         result = _run_fixture_suite(_slow_then(fx.healthy()), tmp_path)
 
@@ -251,7 +239,6 @@ class TestRunSuiteInfrastructureFacts:
             f"placeholder (got {result['elapsed_seconds']!r})"
         )
 
-    @_RUNNER_FACTS_XFAIL
     def test_timeout_reports_configured_timeout_and_elapsed(self, tmp_path) -> None:
         result = _run_fixture_suite(
             _slow_then(fx.timeout_expired(fx.FIXTURE_TIMEOUT)),
@@ -267,7 +254,6 @@ class TestRunSuiteInfrastructureFacts:
             "a timeout must report how long the suite had been running"
         )
 
-    @_RUNNER_FACTS_XFAIL
     def test_killed_suite_reports_signal_exit_code_and_command(self, tmp_path) -> None:
         result = _run_fixture_suite(_slow_then(fx.killed(signal=9)), tmp_path)
 
@@ -280,7 +266,6 @@ class TestRunSuiteInfrastructureFacts:
             "as a code failure"
         )
 
-    @_RUNNER_FACTS_XFAIL
     def test_killed_suite_reports_bounded_output_tails(self, tmp_path) -> None:
         result = _run_fixture_suite(
             _slow_then(fx.killed(stderr=fx.noisy_lines())), tmp_path
@@ -294,7 +279,6 @@ class TestRunSuiteInfrastructureFacts:
         assert "stderr-line-0" not in result["stderr"]
         assert len(result["stderr"]) < len(fx.noisy_lines())
 
-    @_RUNNER_FACTS_XFAIL
     def test_unparsed_non_zero_exit_reports_command_exit_code_and_tails(
         self, tmp_path
     ) -> None:
@@ -309,7 +293,6 @@ class TestRunSuiteInfrastructureFacts:
         assert "stderr-line-1999" in result["stderr"]
         assert len(result["stderr"]) < len(fx.noisy_lines())
 
-    @_RUNNER_FACTS_XFAIL
     def test_slot_busy_reports_the_bounded_wait_as_slot_wait_seconds(
         self, tmp_path
     ) -> None:
@@ -334,6 +317,50 @@ class TestRunSuiteInfrastructureFacts:
             "a bounded wait that expired must report the time it waited"
         )
 
+    def test_queue_wait_is_not_folded_into_elapsed_seconds(self, tmp_path) -> None:
+        """A long queue wait must not inflate the suite's execution time.
+
+        The stub sleeps for the wait only; the command execution is the tiny
+        fixture delay. If the wait were folded in, ``elapsed_seconds`` would
+        be in the same order as the wait (parent AC3/AC4).
+        """
+        result = _run_fixture_suite(
+            _slow_then(fx.healthy()),
+            tmp_path,
+            slot=lambda: fx.slot_acquisition(wait=1.0),
+        )
+
+        assert result["slot_wait_seconds"] >= 0.8
+        assert result["elapsed_seconds"] < result["slot_wait_seconds"], (
+            "elapsed_seconds must measure the command only, not the queue wait "
+            f"(elapsed={result['elapsed_seconds']!r}, "
+            f"slot_wait={result['slot_wait_seconds']!r})"
+        )
+
+    def test_cache_served_failure_is_classified_without_an_elapsed_time(
+        self, tmp_path
+    ) -> None:
+        """A cached non-zero result is classified, and its elapsed stays null.
+
+        Nothing executes on a cache hit, so the execution time is unknown:
+        reporting ``0`` would read as an instantaneous suite.
+        """
+        cached_failure = {
+            "stdout": "",
+            "stderr": "error TS5023: unknown compiler option",
+            "exit_code": 3,
+            "cached": True,
+            "scope": "full",
+        }
+        with mock.patch.object(run_tests, "run_cached", return_value=cached_failure):
+            result = run_suite("all", cwd=_repo(tmp_path), use_cache=True)
+
+        assert result["notice_code"] == fx.NOTICE_UNPARSED_FAILURE
+        assert result["exit_code"] == 3
+        assert result["elapsed_seconds"] is None, (
+            "a cache hit has no elapsed time — report null, never 0"
+        )
+
 
 def test_structured_failures_are_never_classified_as_infrastructure(
     tmp_path,
@@ -356,14 +383,12 @@ def test_published_notice_codes_match_the_runner_constants() -> None:
     assert fx.NOTICE_SLOT_BUSY == run_tests.NOTICE_SLOT_BUSY
 
 
-@_RUNNER_FACTS_XFAIL
 def test_new_notice_codes_are_exported_by_the_runner() -> None:
     """``killed`` and ``unparsed_failure`` are stable exported codes."""
     assert run_tests.NOTICE_KILLED == fx.NOTICE_KILLED
     assert run_tests.NOTICE_UNPARSED_FAILURE == fx.NOTICE_UNPARSED_FAILURE
 
 
-@_RUNNER_FACTS_XFAIL
 def test_run_all_aggregates_elapsed_and_slot_wait_separately(monkeypatch) -> None:
     """Aggregation keeps elapsed and queue wait as distinct sums."""
     suites = {

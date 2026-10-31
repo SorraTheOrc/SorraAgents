@@ -172,13 +172,23 @@ TEST_LOCK_JITTER_DEFAULT = 0.1
 
 #: Stable, machine-readable notice codes carried on a suite result that fails
 #: WITHOUT structured test failures (WL-0MVGUT787000LNDG): no free test slot,
-#: command-not-found, suite timeout. Consumers (e.g. ``implement.py``'s finish
-#: gate) classify on the code — never on the human-readable notice text — so
-#: rewording a notice can never silently reclassify a genuine test failure as
-#: an infrastructure condition.
+#: command-not-found, suite timeout, killed child, unparsable non-zero exit.
+#: Consumers (e.g. ``implement.py``'s finish gate) classify on the code —
+#: never on the human-readable notice text — so rewording a notice can never
+#: silently reclassify a genuine test failure as an infrastructure condition.
 NOTICE_SLOT_BUSY = "slot_busy"
 NOTICE_COMMAND_NOT_FOUND = "command_not_found"
 NOTICE_SUITE_TIMEOUT = "suite_timeout"
+#: The child was terminated by a signal (``returncode < 0``): an OOM kill or a
+#: worker/supervisor crash. No failure is parsable from a killed child, so
+#: without this code the run reads as an unexplained non-zero exit
+#: (SA-0MVU8XRBQ000DG9D).
+NOTICE_KILLED = "killed"
+#: The child exited non-zero and NO structured test failure could be parsed
+#: from its output (bad flag, unloadable config, missing binary wrapper, …).
+#: Structured failures always win: this code applies only when ``failures``
+#: is empty (SA-0MVU8XRBQ000DG9D).
+NOTICE_UNPARSED_FAILURE = "unparsed_failure"
 
 #: Prefix of the no-free-slot notice produced by :func:`_test_concurrency_slot`.
 #: Exposed as a stable constant so a consumer handling a legacy result that
@@ -204,6 +214,18 @@ def _output_tail(text: str | None, limit: int = NOTICE_OUTPUT_TAIL_CHARS) -> str
     if len(text) <= limit:
         return text
     return text[-limit:]
+
+
+def _measured_seconds(samples: list[float]) -> float | None:
+    """Total measured command-execution time, or ``None`` when none ran.
+
+    ``None`` (never ``0``) distinguishes an *unmeasured* execution — every
+    command was served from the cache, or a slot wait expired before the
+    command was spawned — from one that finished in under a millisecond, so
+    a consumer can never read "unavailable" as "instantaneous"
+    (SA-0MVU8XRBQ000DG9D).
+    """
+    return sum(samples) if samples else None
 
 
 #: Per-suite vitest/tinypool worker-pool bound (SA-0MVE98T1M006A17T): the
@@ -1567,8 +1589,8 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
     )
 
 
-def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
-    """Adapter exposing _run_cmd to the cache runner protocol.
+def _run_suite_command(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Spawn one suite command, with no concurrency-slot handling.
 
     Uses shlex.split (not str.split) so quoted args like
     ``node --test "tests/node/**/*.mjs"`` pass the glob without literal
@@ -1579,10 +1601,41 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
     the runner's interpreter (or the first probed candidate that can run
     pytest) instead of a PATH ``pytest`` bound to a foreign interpreter
     (SA-0MVK154IE007OS3D); the canonical command (cache key) is unchanged.
+
+    Slot acquisition is deliberately left to the caller: :func:`_cached_runner`
+    acquires it directly for legacy callers, while :func:`run_suite` routes
+    through :func:`paced_runner` so the queue wait can be reported separately
+    (SA-0MVU8XRBQ000DG9D).
     """
     executable = executable_test_command(command)
+    return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
+
+
+def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Adapter exposing slot-bounded execution to the cache runner protocol."""
     with _test_concurrency_slot():
-        return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
+        return _run_suite_command(command, cwd, timeout)
+
+
+def _timed_suite_runner(elapsed_samples: list[float]) -> Runner:
+    """Wrap :func:`_run_suite_command` so each execution's wall time is recorded.
+
+    The sample is appended in a ``finally`` block, so a ``TimeoutExpired``
+    still reports how long the command had been running when it stopped — the
+    fact an operator needs to tell a slow suite from an endlessly hanging one.
+    Only the command execution is timed: the queue wait for a host test slot
+    happens in the pacer *outside* this runner, so ``elapsed_seconds`` and
+    ``slot_wait_seconds`` can never double-count (SA-0MVU8XRBQ000DG9D).
+    """
+
+    def _runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+        started = time.monotonic()
+        try:
+            return _run_suite_command(command, cwd, timeout)
+        finally:
+            elapsed_samples.append(time.monotonic() - started)
+
+    return _runner
 
 
 def paced_runner(
@@ -1695,6 +1748,27 @@ def run_suite(
     ``cached``, ``scope``, ``type``; on a failure WITHOUT structured failures a
     ``notice`` (human-readable) plus a stable ``notice_code`` and bounded
     ``stdout``/``stderr`` tails (WL-0MVGUT787000LNDG).
+
+    Diagnostic facts (SA-0MVU8XRBQ000DG9D), present on **every** result so a
+    consumer never infers what happened:
+
+    * ``configured_timeout`` — the per-command timeout that was applied
+      (seconds).
+    * ``elapsed_seconds`` — wall time of the command executions only, queue
+      wait excluded; ``None`` (never ``0``) when nothing executed (a fully
+      cache-served suite, or a slot wait that expired before spawning).
+    * ``slot_wait_seconds`` — time spent queued for a host test slot, measured
+      once by the pacer's ``on_wait`` callback and never folded into
+      ``elapsed_seconds``; on a slot-busy result it is the elapsed bounded
+      wait.
+    * ``exit_code`` — the process exit code (``None`` when no child ran);
+      negative means signal-terminated.
+    * ``signal`` — the terminating signal number when ``exit_code < 0``, else
+      ``None``.
+
+    Non-zero results without parsable failures carry ``killed`` (signal-
+    terminated) or ``unparsed_failure`` (non-zero exit, no parsable failure)
+    as ``notice_code``; structured failures always win over those codes.
     """
     cwd = cwd or REPO_ROOT
     resolvable_scope = "full"
@@ -1786,7 +1860,64 @@ def run_suite(
     interpreters: set[str] = set()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    #: Command-execution wall times (queue wait excluded) and queue waits, both
+    #: measured per executed command so a partially cached suite still reports
+    #: exactly what it measured (SA-0MVU8XRBQ000DG9D).
+    elapsed_samples: list[float] = []
+    slot_waits: list[float] = []
+
+    def _result(**overrides: Any) -> dict[str, Any]:
+        """Suite result carrying the shared facts and diagnostics.
+
+        Every return path — green, structured failure, timeout, kill,
+        unparsed exit, slot busy, command not found — reports the same fact
+        fields, so no consumer has to infer what happened from prose
+        (SA-0MVU8XRBQ000DG9D).
+        """
+        result: dict[str, Any] = {
+            "success": False,
+            "returncode": None,
+            "command": command,
+            "failures": [],
+            "notice": "",
+            "notice_code": "",
+            "stdout": _output_tail("\n".join(stdout_parts)),
+            "stderr": _output_tail("\n".join(stderr_parts)),
+            "scope": resolvable_scope,
+            "type": test_type,
+            "interpreter": (
+                "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
+            ),
+            "changed_files": (
+                sorted(changed_files) if resolvable_scope == "changed" else []
+            ),
+            "configured_timeout": timeout,
+            "elapsed_seconds": _measured_seconds(elapsed_samples),
+            "slot_wait_seconds": sum(slot_waits),
+            "exit_code": None,
+            "signal": None,
+        }
+        result.update(overrides)
+        return result
+
     for cmd in commands:
+        command_waits: list[float] = []
+        command_elapsed: list[float] = []
+
+        def _record_wait(
+            _queued_at: float,
+            wait_seconds: float,
+            _sink: list[float] = command_waits,
+        ) -> None:
+            # The pacer reports the queue wait exactly once per execution, so
+            # this is the single measurement — never a second timer, and never
+            # folded into the command's own elapsed time (SA-0MVU8XRBQ000DG9D).
+            _sink.append(wait_seconds)
+
+        paced = paced_runner(
+            runner=_timed_suite_runner(command_elapsed), on_wait=_record_wait
+        )
+        queued_at = time.monotonic()
         try:
             if use_cache:
                 run = run_cached(
@@ -1796,7 +1927,7 @@ def run_suite(
                     no_cache=no_cache,
                     ttl=CACHE_TTL_SECONDS,
                     timeout=timeout,
-                    runner=_cached_runner,
+                    runner=paced,
                     scope=resolvable_scope,
                     test_type=test_type,
                     fingerprint=fingerprint,
@@ -1808,69 +1939,34 @@ def run_suite(
                 if run.get("interpreter"):
                     interpreters.add(run["interpreter"])
             else:
-                with _test_concurrency_slot():
-                    proc = _run_cmd(
-                        shlex.split(executable_test_command(cmd)),
-                        cwd=cwd,
-                        timeout=timeout,
-                    )
+                proc = paced(cmd, str(cwd), timeout)
                 cached_flags.append(False)
                 if is_pytest_command(cmd):
                     interpreters.add(resolve_pytest_executable())
         except FileNotFoundError as exc:
-            return {
-                "success": False,
-                "returncode": None,
-                "command": command,
-                "failures": [],
-                "notice": f"command not found: {exc.filename}",
-                "notice_code": NOTICE_COMMAND_NOT_FOUND,
-                "stdout": _output_tail("\n".join(stdout_parts)),
-                "stderr": _output_tail("\n".join(stderr_parts)),
-                "scope": resolvable_scope,
-                "type": test_type,
-                "interpreter": (
-                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
-                ),
-                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
-            }
+            slot_waits.extend(command_waits)
+            elapsed_samples.extend(command_elapsed)
+            return _result(
+                command=command,
+                notice=f"command not found: {exc.filename}",
+                notice_code=NOTICE_COMMAND_NOT_FOUND,
+            )
         except subprocess.TimeoutExpired:
-            return {
-                "success": False,
-                "returncode": None,
-                "command": command,
-                "failures": [],
-                "notice": f"suite timed out after {timeout}s: {name}",
-                "notice_code": NOTICE_SUITE_TIMEOUT,
-                "stdout": _output_tail("\n".join(stdout_parts)),
-                "stderr": _output_tail("\n".join(stderr_parts)),
-                "scope": resolvable_scope,
-                "type": test_type,
-                "interpreter": (
-                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
-                ),
-                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
-            }
+            slot_waits.extend(command_waits)
+            elapsed_samples.extend(command_elapsed)
+            return _result(
+                notice=f"suite timed out after {timeout}s: {name}",
+                notice_code=NOTICE_SUITE_TIMEOUT,
+            )
         except TestConcurrencyTimeout as exc:
             # Concurrency ceiling stayed saturated past the bounded wait:
             # report a clear failure notice (never a crash, never fail-fast
-            # before the bound) — SA-0MTG5U75A001F1RG AC1.
-            return {
-                "success": False,
-                "returncode": None,
-                "command": command,
-                "failures": [],
-                "notice": str(exc),
-                "notice_code": NOTICE_SLOT_BUSY,
-                "stdout": _output_tail("\n".join(stdout_parts)),
-                "stderr": _output_tail("\n".join(stderr_parts)),
-                "scope": resolvable_scope,
-                "type": test_type,
-                "interpreter": (
-                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
-                ),
-                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
-            }
+            # before the bound) — SA-0MTG5U75A001F1RG AC1. Nothing executed,
+            # so the whole bounded window was queue wait (SA-0MVU8XRBQ000DG9D).
+            slot_waits.append(time.monotonic() - queued_at)
+            return _result(notice=str(exc), notice_code=NOTICE_SLOT_BUSY)
+        slot_waits.extend(command_waits)
+        elapsed_samples.extend(command_elapsed)
 
         output = f"{proc.stdout}\n{proc.stderr}"
         stdout_parts.append(proc.stdout or "")
@@ -1883,21 +1979,62 @@ def run_suite(
         if proc.returncode != 0:
             overall_returncode = proc.returncode
 
-    return {
-        "success": overall_returncode == 0 and not all_failures,
-        "returncode": overall_returncode,
-        "command": command,
-        "failures": all_failures,
-        "cached": use_cache and all(cached_flags) if cached_flags else False,
-        "scope": resolvable_scope,
-        "type": test_type,
-        "interpreter": "mixed" if len(interpreters) > 1 else next(iter(interpreters), ""),
-        "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
-        "notice": "",
-        "notice_code": "",
-        "stdout": _output_tail("\n".join(stdout_parts)),
-        "stderr": _output_tail("\n".join(stderr_parts)),
-    }
+    result = _result(
+        success=overall_returncode == 0 and not all_failures,
+        returncode=overall_returncode,
+        exit_code=overall_returncode,
+        command=command,
+        failures=all_failures,
+        cached=use_cache and all(cached_flags) if cached_flags else False,
+    )
+    # Classification precedence (SA-0MVU8XRBQ000DG9D): a parsable failure is
+    # always a code failure. Only a non-zero suite with NO parsable failure is
+    # classified as an infrastructure condition, and a signal-terminated child
+    # (negative return code — OOM kill, worker crash) is distinguished from a
+    # plain non-zero exit. Cache-served non-zero results are classified from
+    # their stored exit code and output too (their elapsed time is ``None``).
+    if not all_failures and overall_returncode != 0:
+        if overall_returncode < 0:
+            signal_number = abs(overall_returncode)
+            result["signal"] = signal_number
+            result["notice_code"] = NOTICE_KILLED
+            result["notice"] = f"suite killed by signal {signal_number}: {name}"
+        else:
+            result["notice_code"] = NOTICE_UNPARSED_FAILURE
+            result["notice"] = (
+                f"suite exited {overall_returncode} with no parsable "
+                f"failures: {name}"
+            )
+    return result
+
+
+def _render_seconds(value: float | None) -> str:
+    """Render a measured duration for humans, naming an unmeasured one."""
+    return "n/a (not measured)" if value is None else f"{value:.2f}s"
+
+
+def _render_suite_facts(result: dict[str, Any]) -> str:
+    """One-line human rendering of a suite result's diagnostic facts.
+
+    Mirrors the machine-readable fields (SA-0MVU8XRBQ000DG9D) so an operator
+    reading the CLI sees the same configured timeout, elapsed time, queue
+    wait, exit code/signal and command the JSON report carries.
+    """
+    parts = [f"elapsed={_render_seconds(result.get('elapsed_seconds'))}"]
+    slot_wait = result.get("slot_wait_seconds")
+    if slot_wait:
+        parts.append(f"slot_wait={slot_wait:.2f}s")
+    exit_code = result.get("exit_code")
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+    signal_number = result.get("signal")
+    if signal_number is not None:
+        parts.append(f"signal={signal_number}")
+    if result.get("configured_timeout") is not None:
+        parts.append(f"configured_timeout={result['configured_timeout']}s")
+    if result.get("command"):
+        parts.append(f"command={result['command']}")
+    return ", ".join(parts)
 
 
 def run_all(
@@ -1932,6 +2069,13 @@ def run_all(
 
     *group*: when set, runs the named test group instead of suite-based
     resolution (SA-0MUJKF2HP001BR51).
+
+    In addition to the per-suite detail (kept intact under ``suites``) the
+    aggregate carries ``notice_codes``, ``elapsed_seconds_total`` (sum of
+    measured command executions, ``None`` when nothing ran) and
+    ``slot_wait_seconds`` (sum of queue waits) — the two durations are
+    aggregated separately so neither can be mistaken for the other
+    (SA-0MVU8XRBQ000DG9D).
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
@@ -1940,6 +2084,12 @@ def run_all(
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     resolved_scopes: list[str] = []
+    # Diagnostic aggregates (SA-0MVU8XRBQ000DG9D): execution time and queue
+    # wait are summed SEPARATELY, so a queued run can never look like a slow
+    # suite (or vice versa). Per-suite detail stays in ``suites``.
+    elapsed_total = 0.0
+    elapsed_measured = False
+    slot_wait_total = 0.0
     with Timer("run_all") as _all_timer:
         for name in suites:
             with Timer(f"suite:{name}"):
@@ -1959,6 +2109,11 @@ def run_all(
                 )
             results[name] = result
             resolved_scopes.append(result["scope"])
+            suite_elapsed = result.get("elapsed_seconds")
+            if suite_elapsed is not None:
+                elapsed_total += suite_elapsed
+                elapsed_measured = True
+            slot_wait_total += result.get("slot_wait_seconds") or 0.0
             for failure in result["failures"]:
                 all_failures.append({**failure, "suite": name})
             if result.get("notice"):
@@ -1980,6 +2135,8 @@ def run_all(
         "scope": scope,
         "type": test_type,
         "resolved_scopes": resolved_scopes,
+        "elapsed_seconds_total": elapsed_total if elapsed_measured else None,
+        "slot_wait_seconds": slot_wait_total,
         "timing": _all_timer.to_dict(),
     }
 
@@ -2580,6 +2737,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if suite_result.get("notice"):
                     print(f"  notice: {suite_result['notice']}")
+                if not suite_result["success"]:
+                    print(f"  facts: {_render_suite_facts(suite_result)}")
                 for failure in suite_result["failures"]:
                     print(f"  FAILED: {failure['test_name']}")
             for notice in result["notices"]:

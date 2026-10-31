@@ -171,11 +171,13 @@ immediately or crashing. This means multiple agents running tests concurrently
 will serialize gracefully — each waits its turn and succeeds once a slot
 becomes free.
 
-**Failure-notice contract (WL-0MVGUT787000LNDG):** a suite that fails
-WITHOUT structured test failures reports a stable machine-readable
-`notice_code` alongside the human-readable `notice` — `slot_busy`
-(`NOTICE_SLOT_BUSY`), `command_not_found` (`NOTICE_COMMAND_NOT_FOUND`) or
-`suite_timeout` (`NOTICE_SUITE_TIMEOUT`). `run_suite` also carries bounded
+**Failure-notice contract (WL-0MVGUT787000LNDG, SA-0MVU8XRBQ000DG9D):** a
+suite that fails WITHOUT structured test failures reports a stable
+machine-readable `notice_code` alongside the human-readable `notice` —
+`slot_busy` (`NOTICE_SLOT_BUSY`), `command_not_found`
+(`NOTICE_COMMAND_NOT_FOUND`), `suite_timeout` (`NOTICE_SUITE_TIMEOUT`),
+`killed` (`NOTICE_KILLED`) or `unparsed_failure`
+(`NOTICE_UNPARSED_FAILURE`). `run_suite` also carries bounded
 `stdout`/`stderr` tails (`_output_tail`, 4000 chars) and `run_all`
 aggregates them into top-level `notice_codes`/`stdout`/`stderr`. Consumers
 (e.g. `implement.py`'s finish gate) classify failures on the codes — never
@@ -183,6 +185,44 @@ by string-matching the notice text — so rewording a notice can never
 silently reclassify a genuine test failure as infrastructure contention.
 The slot-busy notice text itself is anchored to the exported
 `SLOT_BUSY_NOTICE_PREFIX` constant.
+
+#### Notice codes (stable strings)
+
+| Code | Meaning |
+| --- | --- |
+| `slot_busy` | No host test slot freed within `TEST_LOCK_TIMEOUT`; no command ran. |
+| `command_not_found` | The suite binary/executable could not be spawned. |
+| `suite_timeout` | The command exceeded `timeoutPerCommand` (`TimeoutExpired`). |
+| `killed` | The child was terminated by a signal (`returncode < 0`, e.g. an OOM kill or a worker crash) and produced no parsable failure. |
+| `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). |
+
+**Precedence.** Structured (parsable) test failures always win: `killed` and
+`unparsed_failure` are set only when `failures` is empty, so a genuine code
+failure is never reclassified as an infrastructure condition. A non-zero
+result served **from cache** is classified too — its stored exit code and
+output are enough, and its elapsed time is reported as `null` (see below).
+
+#### Diagnostic fact fields
+
+Every `run_suite` result (and therefore every `run_all` per-suite entry)
+carries these fields, on green and non-green runs alike, so no consumer has
+to infer what happened from prose:
+
+| Field | Unit / semantics |
+| --- | --- |
+| `configured_timeout` | Seconds (int) — the per-command `timeoutPerCommand` that was applied. |
+| `elapsed_seconds` | Seconds (float) — wall time of the **command executions only**, queue wait excluded. `null` (never `0`) when nothing executed: a fully cache-served suite, or a slot wait that expired before spawning. On a `suite_timeout` result it is how long the command had been running when it was cut off. |
+| `slot_wait_seconds` | Seconds (float) — time spent queued for a host test slot, measured **once** by the pacer's `on_wait` callback (`paced_runner`) and never folded into `elapsed_seconds`. On a `slot_busy` result it is the elapsed bounded wait (nothing executed, so the whole window was queue wait). `0` when no wait occurred. |
+| `exit_code` | The command's process exit code (int), `null` when no child ran (timeout/slot busy/command not found). Negative means signal-terminated. |
+| `signal` | The terminating signal number when `exit_code < 0`, otherwise `null`. |
+
+**Aggregates (`run_all`).** Alongside the untouched per-suite detail under
+`suites`, the aggregate carries `notice_codes`, `elapsed_seconds_total` (sum
+of the measured command executions; `null` when no suite executed anything)
+and `slot_wait_seconds` (sum of queue waits). Execution time and queue wait
+are summed **separately**, so a queued run can never look like a slow suite
+(or vice versa). The CLI's non-green output prints the same facts on a
+`facts:` line.
 
 **Staggered-wait contract (SA-0MVEDOF7A004TSWD):** under a saturated pool,
 \*concurrent* waiters all enqueue with the same `TEST_LOCK_TIMEOUT` bound and,
