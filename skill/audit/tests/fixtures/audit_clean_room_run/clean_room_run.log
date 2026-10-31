@@ -1,0 +1,32 @@
+# Committed single-item audit measurement fixture (SA-0MVQ6OXOA003RQFU).
+#
+# One real audit run, captured from the runner's stderr. Only the runner's own
+# `Per-call timing:` lines and its single `AUDIT_RELIABILITY_SUMMARY` line are
+# kept, so `scripts/measure_audit_performance.py --root <this dir> --json` can
+# re-derive every figure recorded in
+# docs/dev/audit-performance-baseline.md § "Clean-room re-measurement
+# (SA-0MVQ6OXOA003RQFU)". Lines beginning with `#` are ignored by the harness.
+#
+# Run metadata
+#   work item      : SA-0MVQ6OXOA003RQFU (Lane A of SA-0MVKXNWRS005EKBM)
+#   date (UTC)     : 2026-10-31T04:47:26Z .. 2026-10-31T04:51:22Z
+#   target item    : SA-0MVI3608M0080QLW (6 ACs, no children)
+#   command        : python3 skill/audit/scripts/audit_runner.py issue \
+#                      SA-0MVI3608M0080QLW --do-not-persist --force --json \
+#                      --green-run HEAD \
+#                      --worklog-dir /home/rgardler/projects/SorraAgents/.worklog \
+#                      --debug-log <tmp>/debug.jsonl
+#   model served   : Local Proxy/plan (DEFAULT_MODEL)
+#   ceiling        : ceiling=1 source=slots available_slots=1 total_slots=2
+#   end to end     : 236 s (secondary context; the gate measures LLM wall clock)
+#   calls          : 2 — `parent` + `phase2_deep`; the false-positive screen was
+#                    not issued because the run reported zero ruff findings
+#                    (code_quality.total_findings=0), so this profile is not
+#                    directly comparable with the 2026-10-23 three-call run.
+#   concurrency    : other cross-project audits were live on the shared 2-slot
+#                    proxy during the run, but this run never waited for a slot
+#                    (concurrency_waits=0, both calls wait_seconds=0.00), so the
+#                    measured wall clock can only be inflated, never shortened.
+Per-call timing: issue_id=SA-0MVI3608M0080QLW context=parent elapsed_seconds=164.30 input_tokens=3018 model=Local Proxy/plan
+Per-call timing: issue_id=SA-0MVI3608M0080QLW context=phase2_deep elapsed_seconds=63.36 input_tokens=3314 ac_count=6 avg_ac_elapsed_seconds=10.56 model=Local Proxy/plan
+AUDIT_RELIABILITY_SUMMARY calls=2 parse_ok=2 parse_failed=0 timeouts=0 child_skips=0 provider_errors=0 concurrency_waits=0 verdict_reasks=0 child_screen_timeouts=0 parent_screen_timeouts=0 elapsed_seconds=230.25
