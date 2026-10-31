@@ -844,10 +844,11 @@ Guards (deterministic, in `phase_parent`):
 - **No orphaned `in_progress`** — a child start failure or abort leaves no
   in-progress state behind; re-run the parent phase after resolving the
   blocker to continue the chain.
-- **Worktree placement guard** — a non-terminal child whose worktree is clean
-  at the parent-HEAD while the main checkout is dirty outside `.worklog/` has
-  written to the main checkout; the phase fails closed with the offending
-  paths (and does not advance the parent) instead of silently proceeding.
+- **Worktree placement guard** — a non-terminal child whose worktree holds no
+  work (no dirty files, no commits ahead of the parent branch) while the main
+  checkout is dirty outside `.worklog/` has written to the main checkout; the
+  phase fails closed with the offending paths (and does not advance the
+  parent) instead of silently proceeding.
 - A parent with no children or all-terminal children behaves as today.
 
 Worktree isolation per child is preserved: every child is implemented in

@@ -7238,16 +7238,23 @@ def _invoke_implement(
         return None
 
 
-def _has_worktree_changes(worktree_path: str) -> bool:
+def _has_worktree_changes(
+    worktree_path: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> bool:
     """Check if the worktree has uncommitted changes or commits ahead.
+
+    A worktree that is only *behind* the parent branch has no work and is
+    reported as clean.
 
     Args:
         worktree_path: Absolute path to the worktree.
+        parent_branch: Branch the worktree forked from (default: ``dev``).
 
     Returns:
-        True if the worktree is dirty or ahead of the parent branch.
+        True if the worktree is dirty or has commits ahead of the parent
+        branch.
     """
-    return _git_path_has_changes(Path(worktree_path), DEFAULT_PARENT_BRANCH)
+    return _git_path_has_changes(Path(worktree_path), parent_branch)
 
 
 def phase_parent(
@@ -7676,7 +7683,7 @@ def phase_parent(
 
         worktree_path = _discover_worktree(cid)
         has_changes = bool(
-            worktree_path and _has_worktree_changes(worktree_path)
+            worktree_path and _has_worktree_changes(worktree_path, parent_branch)
         )
 
         if action == "skip-in-progress":
@@ -9388,8 +9395,9 @@ def _worktree_placement_violation(
 
     1. the current directory is not the worktree (or a subdirectory of it),
     2. the main checkout holds uncommitted changes outside ``.worklog/``, and
-    3. the worktree itself holds NO changes (clean and at the parent branch
-       HEAD) — i.e. the work was done in the main checkout, not the worktree.
+    3. the worktree itself holds NO changes (no dirty files and no commits
+       ahead of the parent branch) — i.e. the work was done in the main
+       checkout, not the worktree.
 
     Condition 3 keeps the gate precise: pre-existing/unrelated dirt in the
     main checkout does not block a legitimate finish when the work actually
@@ -9439,7 +9447,12 @@ def _git_path_has_changes(
 ) -> bool:
     """True when the git directory at *path* contains implementation changes.
 
-    Detects both uncommitted changes and commits ahead of *parent_branch*.
+    Detects uncommitted changes and commits **ahead of** *parent_branch*. A
+    worktree that is merely *behind* the parent branch (HEAD differs from it,
+    but zero commits ahead and no dirty files) holds no work and is reported
+    as clean, so a long-running child is never handed to ``finish`` just
+    because unrelated commits landed on the parent branch
+    (SA-0MVRN5Q67005H3M5).
 
     Args:
         path: Directory to check (e.g. the worktree root).
@@ -9447,22 +9460,25 @@ def _git_path_has_changes(
         expected_dirty: Project-declared path prefixes to exclude.
 
     Returns:
-        True if the directory is dirty or its HEAD differs from the parent
-        branch; False only when it is clean AND at the parent branch HEAD.
+        True if the directory is dirty or has commits ahead of
+        *parent_branch*; False when it is clean and has none.
     """
     if git_has_dirty_files(
         git_status(cwd=str(path)), expected_dirty=expected_dirty
     ):
         return True
-    head = run_cmd(
-        ["git", "rev-parse", "HEAD"], cwd=str(path), check=False, capture=True
+    ahead = run_cmd(
+        ["git", "rev-list", "--count", f"{parent_branch}..HEAD"],
+        cwd=str(path),
+        check=False,
+        capture=True,
     )
-    parent = run_cmd(
-        ["git", "rev-parse", parent_branch], cwd=str(path), check=False, capture=True
-    )
-    if head.returncode == 0 and parent.returncode == 0:
-        return head.stdout.strip() != parent.stdout.strip()
-    return True  # cannot compare; fail open
+    if ahead.returncode == 0:
+        try:
+            return int(ahead.stdout.strip()) > 0
+        except ValueError:
+            return True  # unparseable count; fail open
+    return True  # cannot compare (missing ref, git error); fail open
 
 
 def _child_main_checkout_violation(
@@ -9482,8 +9498,8 @@ def _child_main_checkout_violation(
 
     1. the child is non-terminal (the caller enforces this),
     2. the main checkout holds uncommitted changes outside ``.worklog/``, and
-    3. the child's worktree holds NO changes (clean and at the parent branch
-       HEAD) — so the work did not land in the worktree.
+    3. the child's worktree holds NO changes (no dirty files and no commits
+       ahead of the parent branch) — so the work did not land in the worktree.
 
     Condition 3 keeps the guard precise: pre-existing/unrelated dirt in the
     main checkout does not block a child whose work legitimately lives in its
@@ -9526,8 +9542,9 @@ def _child_main_checkout_violation(
         listing += f"\n  … and {len(offending) - 20} more"
     return (
         f"Child {child_id} produced changes in the main checkout at {root} "
-        f"instead of its worktree {wt}. The worktree has no changes (clean at "
-        f"{parent_branch} HEAD), so the child's work did not land in its own "
+        f"instead of its worktree {wt}. The worktree has no changes (no "
+        f"dirty files and no commits ahead of {parent_branch}), so the "
+        f"child's work did not land in its own "
         f"worktree — `cwd` is not sufficient. Offending main-checkout paths:\n"
         f"{listing}\n"
         f"Move these changes into {wt} (or discard them), then re-run. A "

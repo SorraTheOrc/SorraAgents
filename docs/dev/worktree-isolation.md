@@ -150,14 +150,18 @@ Regression coverage (real temp git repo plus linked worktree, no
 ## The placement guard
 
 `phase_parent`/`phase_drive` fail closed when a **non-terminal** child's
-worktree is clean at the parent-HEAD (`dev`) while the main checkout holds
-uncommitted changes outside `.worklog/` — evidence the child wrote to the main
+worktree holds no work — no dirty files and **no commits ahead of** the parent
+HEAD (`dev`), however far *behind* it is — while the main checkout holds
+uncommitted changes outside `.worklog/`: evidence the child wrote to the main
 checkout instead of its worktree. The failure names the offending
 main-checkout paths and does **not** advance the parent.
 
 The guard is deliberately precise: a legitimate child whose work is already in
 its worktree, a clean main checkout, or `.worklog/`-only dirt never trigger
-it.
+it. The ahead-count (rather than a HEAD comparison) is what keeps a
+behind-only worktree — a long-running drive whose branch fell behind after
+unrelated commits landed on `dev` — on the "no work" side of the guard and on
+the "implement next" side of `phase_parent` (SA-0MVRN5Q67005H3M5).
 
 ## The main checkout is a guarded surface
 
