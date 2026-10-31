@@ -82,25 +82,80 @@ class TestMultiplierThresholds(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # _read_proc_pressure
+#
+# Fixtures are verbatim kernel output captured from a PSI-enabled host
+# (Ubuntu, kernel >= 4.20: cpu exposes only a ``some`` line, memory and io
+# expose ``some`` + ``full``). A fabricated fixture previously blessed the
+# buggy parser, so these samples must stay byte-faithful to /proc/pressure.
 # ---------------------------------------------------------------------------
 
+PSI_CPU_SOME_ONLY = (
+    "some avg10=11.58 avg60=9.30 avg300=4.71 total=84206005618\n"
+)
+PSI_MEMORY_SOME_FULL = (
+    "some avg10=2.50 avg60=1.20 avg300=0.80 total=64384303\n"
+    "full avg10=1.25 avg60=0.60 avg300=0.40 total=35437059\n"
+)
+PSI_IO_SOME_FULL = (
+    "some avg10=0.05 avg60=0.11 avg300=0.10 total=398915844\n"
+    "full avg10=0.03 avg60=0.07 avg300=0.06 total=270870893\n"
+)
+
+
+def _with_pressure_content(content: str):
+    """Patch the pressure-file reader with ``content`` (verbatim kernel text)."""
+    return mock.patch.object(
+        metrics, "_read_file_lines", return_value=content.splitlines(keepends=True)
+    )
+
+
 class TestReadProcPressure(unittest.TestCase):
-    def test_valid_pressure_file(self):
-        content = "some:stuff\navg10  60.00 60.00 60.00\n"
-        with mock.patch.object(
-            metrics, "_read_file_lines", return_value=content.split("\n")
-        ):
-            self.assertEqual(metrics._read_proc_pressure("cpu"), 60.0)
+    def test_cpu_some_line_is_parsed(self):
+        """AC1: real cpu output (some only) yields the avg10 percentage."""
+        with _with_pressure_content(PSI_CPU_SOME_ONLY):
+            self.assertEqual(metrics._read_proc_pressure("cpu"), 11.58)
+            self.assertEqual(metrics._read_proc_pressure("cpu", "some"), 11.58)
+
+    def test_selector_picks_different_lines_of_the_same_sample(self):
+        """AC1: ``some`` and ``full`` select different lines of one file."""
+        with _with_pressure_content(PSI_MEMORY_SOME_FULL):
+            self.assertEqual(metrics._read_proc_pressure("memory", "some"), 2.5)
+            self.assertEqual(metrics._read_proc_pressure("memory", "full"), 1.25)
+
+    def test_io_full_line_is_parsed(self):
+        with _with_pressure_content(PSI_IO_SOME_FULL):
+            self.assertEqual(metrics._read_proc_pressure("io", "full"), 0.03)
 
     def test_missing_file_returns_none(self):
+        """AC2: missing /proc/pressure/<key> degrades to None."""
         with mock.patch.object(metrics, "_read_file_lines", return_value=None):
             self.assertIsNone(metrics._read_proc_pressure("cpu"))
 
-    def test_no_avg_line_returns_none(self):
-        with mock.patch.object(
-            metrics, "_read_file_lines", return_value=["just a line\n"]
-        ):
+    def test_empty_file_returns_none(self):
+        """AC2: an empty pressure file degrades to None."""
+        with _with_pressure_content(""):
+            self.assertIsNone(metrics._read_proc_pressure("memory", "full"))
+
+    def test_unparsable_avg10_returns_none(self):
+        """AC2: a non-numeric avg10 value degrades to None (no crash)."""
+        content = "some avg10=abc avg60=0.00 avg300=0.00 total=1\n"
+        with _with_pressure_content(content):
             self.assertIsNone(metrics._read_proc_pressure("cpu"))
+
+    def test_missing_requested_line_returns_none_without_fallback(self):
+        """AC2: an absent ``full`` line is None — never a silent fallback."""
+        with _with_pressure_content(PSI_CPU_SOME_ONLY):
+            self.assertIsNone(metrics._read_proc_pressure("cpu", "full"))
+
+    def test_unrelated_content_returns_none(self):
+        with _with_pressure_content("just a line\n"):
+            self.assertIsNone(metrics._read_proc_pressure("cpu"))
+
+    def test_invalid_selector_raises(self):
+        """A selector other than some/full is a programming error."""
+        with _with_pressure_content(PSI_MEMORY_SOME_FULL), \
+             self.assertRaises(ValueError):
+            metrics._read_proc_pressure("memory", "avg10")
 
 
 # ---------------------------------------------------------------------------
@@ -269,13 +324,84 @@ class TestCollectMetrics(unittest.TestCase):
             self.assertIn(info["status"], {"low", "warning", "critical"}, key)
 
     def test_pressure_fallback_marks_warning(self):
-        """AC4: unavailable /proc/pressure degrades gracefully."""
+        """AC6: unavailable /proc/pressure degrades gracefully.
+
+        The description names the requested line so an ``n/a`` row explains
+        which PSI metric was expected.
+        """
         with mock.patch.object(metrics, "_read_proc_pressure", return_value=None):
             result = metrics.collect_metrics()
-        for key in ("cpu_pressure", "memory_pressure", "io_pressure"):
+        expected_line = {
+            "cpu_pressure": "some avg10",
+            "memory_pressure": "full avg10",
+            "io_pressure": "full avg10",
+        }
+        for key, line in expected_line.items():
             self.assertIsNone(result[key]["value"])
             self.assertEqual(result[key]["status"], "warning")
             self.assertIn("unavailable", result[key]["description"])
+            self.assertIn(line, result[key]["description"])
+
+    def test_pressure_metrics_select_their_psi_lines(self):
+        """AC3: cpu reads ``some``, memory and io read ``full``."""
+        with mock.patch.object(
+            metrics, "_read_proc_pressure", return_value=0.0
+        ) as reader:
+            metrics.collect_metrics()
+        self.assertEqual(
+            [call.args for call in reader.call_args_list],
+            [("cpu", "some"), ("memory", "full"), ("io", "full")],
+        )
+
+    def test_pressure_values_and_descriptions_render(self):
+        """AC3: parsed stall percentages render with their selected line."""
+        psi = {("cpu", "some"): 12.5, ("memory", "full"): 6.0, ("io", "full"): 85.0}
+
+        def fake_read(key, which="some"):
+            return psi[(key, which)]
+
+        with mock.patch.object(metrics, "_read_proc_pressure", side_effect=fake_read):
+            result = metrics.collect_metrics()
+
+        self.assertEqual(result["cpu_pressure"]["value"], 12.5)
+        self.assertEqual(result["cpu_pressure"]["status"], "low")
+        self.assertEqual(result["memory_pressure"]["value"], 6.0)
+        self.assertEqual(result["memory_pressure"]["status"], "warning")
+        self.assertEqual(result["io_pressure"]["value"], 85.0)
+        self.assertEqual(result["io_pressure"]["status"], "critical")
+
+        self.assertIn("some avg10", result["cpu_pressure"]["description"])
+        self.assertIn("full avg10", result["memory_pressure"]["description"])
+        self.assertIn("full avg10", result["io_pressure"]["description"])
+
+    def test_memory_pressure_uses_its_own_psi_thresholds(self):
+        """AC3/AC5: memory_pressure is not classified as memory_usage.
+
+        10 % of *full* memory stalls is warning under the PSI-calibrated
+        ``memory_pressure`` block (5/20) but would be low under the
+        ``memory_usage`` block (80/95).
+        """
+        psi = {("cpu", "some"): 0.0, ("memory", "full"): 10.0, ("io", "full"): 0.0}
+
+        def fake_read(key, which="some"):
+            return psi[(key, which)]
+
+        mem_info = {
+            "total_mb": 16000.0,
+            "free_mb": 2000.0,
+            "available_mb": 8000.0,
+            "buffers_mb": 0.0,
+            "cached_mb": 0.0,
+            "swap_total_mb": 0.0,
+            "swap_free_mb": 0.0,
+        }
+        with mock.patch.object(metrics, "_read_proc_pressure", side_effect=fake_read), \
+             mock.patch.object(metrics, "_get_memory_info", return_value=mem_info):
+            result = metrics.collect_metrics()
+
+        self.assertEqual(result["memory_pressure"]["status"], "warning")
+        # 50 % RAM used stays low under the memory_usage block (80/95).
+        self.assertEqual(result["memory_usage"]["status"], "low")
 
     def test_rss_breakdown_structure(self):
         result = metrics.collect_metrics()
@@ -313,6 +439,11 @@ class TestCategoryBoundaries(unittest.TestCase):
         self.assertEqual(self._classify("io_pressure", 49.9), "low")
         self.assertEqual(self._classify("io_pressure", 50), "warning")
         self.assertEqual(self._classify("io_pressure", 80), "critical")
+
+    def test_memory_pressure_boundaries(self):
+        self.assertEqual(self._classify("memory_pressure", 4.9), "low")
+        self.assertEqual(self._classify("memory_pressure", 5), "warning")
+        self.assertEqual(self._classify("memory_pressure", 20), "critical")
 
     def test_swap_usage_boundaries(self):
         self.assertEqual(self._classify("swap_usage", 29.9), "low")
