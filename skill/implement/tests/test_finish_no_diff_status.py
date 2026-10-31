@@ -127,6 +127,39 @@ def _mocked_phase_finish(*, update_status=None, store_show=None, tmp_path=None):
             patch.object(implement, "_worktree_placement_violation", return_value=None)
         )
         stack.enter_context(patch.object(implement, "run_build", return_value=_build_result()))
+        # ``phase_finish`` runs its gate against the **would-be-commit tree**
+        # through ``run_gate_suite`` (temp-index staging,
+        # SA-0MVQHVGFR006W8LG) and, once green, stages the change set in the
+        # real index through ``stage_tested_tree``. Both act on a real git
+        # repository; this harness drives ``phase_finish`` from a bare temp
+        # directory, so both boundaries are stubbed green (the gate's own
+        # behaviour is covered by ``test_finish_gate_*.py``).
+        stack.enter_context(
+            patch.object(
+                implement,
+                "run_gate_suite",
+                return_value=(
+                    _tests_result(),
+                    {
+                        "tree": "abc1234",
+                        "scope": "changed",
+                        "cached": False,
+                        "index_unchanged": True,
+                    },
+                ),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                implement,
+                "stage_tested_tree",
+                return_value={
+                    "success": True,
+                    "tree": "abc1234",
+                    "expected": "abc1234",
+                },
+            )
+        )
         stack.enter_context(patch.object(implement, "run_tests", return_value=_tests_result()))
         stack.enter_context(patch.object(implement, "git_commit", return_value=True))
         stack.enter_context(

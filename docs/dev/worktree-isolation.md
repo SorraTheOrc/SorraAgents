@@ -147,6 +147,38 @@ supplied to them, the gates are never relaxed.
 Regression coverage (real temp git repo plus linked worktree, no
 `_get_repo_root` mocking): `skill/implement/tests/test_repo_root_resolution.py`.
 
+## Worktree removal ownership
+
+A worktree must never be deleted out from under the session that owns it as
+its cwd: doing so makes every later `bash` call fail with `Working directory
+does not exist` (absolute-path file tools keep working), exactly when the
+session still has to write its completion comment, render its report and
+verify the pushed commit (SA-0MVTE8XAJ002IUDR). Exactly one owner removes a
+worktree, decided by context:
+
+| Flow | Owner | When |
+|---|---|---|
+| Driven child session (`IMPLEMENT_DRIVE_ACTIVE=1`) | `implement.py drive` | After the child's session exits; terminal child, clean tree only |
+| Opted-in plain leaf (`finish --keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session itself (or an operator) | The session's **last** bash command, after the comment, report and post-push verification |
+| Plain leaf (default) | `finish` | Immediately after a successful dev push |
+| Aborted item | `abort` | Unconditionally |
+
+`_should_defer_worktree_removal()` is the single deferral predicate
+(`IMPLEMENT_DRIVE_ACTIVE`, `--keep-worktree`, `IMPLEMENT_KEEP_WORKTREE`); it
+gates `finish`'s Step 6b/7 so the tree, its branch and
+`.implement_state.json` survive a deferred finish, and it is honoured by the
+signal handler (`SIGTERM`/`SIGINT` still releases the item, never the tree).
+Removal itself stays `cleanup_worktree_processes` + `_remove_worktree` (plus
+`remove_state`) — no second deletion mechanism.
+
+**Interruption safety.** A deferred finish leaves the tree present and
+reported, never half-removed: `phase_start` resumes onto the retained
+worktree instead of failing on `git worktree add`, and the driver's
+start-of-run sweep (terminal children only) plus its `retained_worktrees`
+report (each with a `git worktree remove … && git worktree prune` remedy) keep
+a deferred tree from leaking. Full contract:
+[implement-skill-reference.md](implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr).
+
 ## The placement guard
 
 `phase_parent`/`phase_drive` fail closed when a **non-terminal** child's

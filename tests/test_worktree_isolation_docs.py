@@ -168,3 +168,101 @@ class TestMainCheckoutGuardedSurface:
         assert 'report["steps"]["local_dev_fast_forward"]' in doc
         assert 'report["steps"]["local_dev_restore"]' in doc
         assert 'report["steps"]["ancestry_assertion"]' in doc
+
+
+_REFERENCE_DOC = _REPO_ROOT / "docs" / "dev" / "implement-skill-reference.md"
+
+
+class TestWorktreeRemovalOwnership:
+    """SA-0MVTE8XAJ002IUDR AC8: the removal-ownership rule is documented.
+
+    A session must never be told to delete a worktree it is standing in. The
+    contract is stated in three places — the skill's finish step, the
+    implementation reference and the isolation doc — and the retention
+    mechanism (`--keep-worktree`, driver-side removal, the retained-worktree
+    report) is named in each.
+    """
+
+    def _skill_finish_block(self) -> str:
+        content = _read(_SKILL_MD)
+        start = content.find("After pushing, clean up the worktree")
+        assert start != -1, (
+            "SKILL.md must keep a finish-step worktree-cleanup instruction"
+        )
+        end = content.find("**Why rebuild?**", start)
+        assert end != -1 and end > start, "the cleanup block must precede the rebuild note"
+        return " ".join(content[start:end].split())
+
+    def _reference_section(self) -> str:
+        content = _read(_REFERENCE_DOC)
+        start = content.find("## Worktree removal ownership (SA-0MVTE8XAJ002IUDR)")
+        assert start != -1, (
+            "implement-skill-reference.md must contain the "
+            "'Worktree removal ownership' section"
+        )
+        end = content.find("## Drive failure recovery", start)
+        assert end != -1 and end > start, "the ownership section must precede drive recovery"
+        return content[start:end]
+
+    def _isolation_section(self) -> str:
+        content = _read(_ISOLATION_DOC)
+        start = content.find("## Worktree removal ownership")
+        assert start != -1, "worktree-isolation.md must contain the ownership section"
+        end = content.find("## The placement guard", start)
+        assert end != -1 and end > start, "the ownership section must precede the placement guard"
+        return content[start:end]
+
+    def test_skill_state_driven_session_must_not_remove_its_worktree(self) -> None:
+        block = self._skill_finish_block()
+        assert "IMPLEMENT_DRIVE_ACTIVE" in block
+        assert "do not remove your own worktree" in block.lower()
+        assert "implement.py drive" in block
+
+    def test_skill_documents_the_keep_worktree_hatch(self) -> None:
+        block = self._skill_finish_block()
+        assert "--keep-worktree" in block
+        assert "IMPLEMENT_KEEP_WORKTREE" in block
+        assert "last" in block.lower()
+
+    def test_reference_documents_the_owner_table_and_predicate(self) -> None:
+        section = self._reference_section()
+        for token in (
+            "driven-session",
+            "keep-worktree-env",
+            "keep-worktree-flag",
+            "_should_defer_worktree_removal",
+            "`--keep-worktree`",
+            "`IMPLEMENT_KEEP_WORKTREE=1`",
+            "`implement.py drive`",
+            "abort",
+        ):
+            assert token in section, f"missing from the ownership section: {token}"
+
+    def test_reference_documents_the_report_contract(self) -> None:
+        section = self._reference_section()
+        assert '"deferred": true' in section
+        assert "worktree_removed" in section
+        assert "retained_worktrees" in section
+        assert "worktree_sweep" in section
+        assert "git worktree remove" in section
+        assert "git worktree prune" in section
+
+    def test_isolation_doc_documents_the_ownership_rule(self) -> None:
+        section = " ".join(self._isolation_section().split())
+        assert "IMPLEMENT_DRIVE_ACTIVE" in section
+        assert "--keep-worktree" in section
+        assert "IMPLEMENT_KEEP_WORKTREE" in section
+        assert "last" in section.lower()
+        assert "Interruption safety" in section
+        assert "implement-skill-reference.md" in section
+
+    def test_no_instruction_tells_a_session_to_remove_its_live_cwd(self) -> None:
+        """The competing instruction must not return unqualified.
+
+        A bare `git worktree remove` step, with no ownership qualification,
+        is exactly the drift that produced the incident: driving or
+        opted-in sessions would try to delete the tree they are standing in.
+        """
+        block = self._skill_finish_block()
+        assert "ownership" in block.lower()
+        assert "defer" in block.lower()
