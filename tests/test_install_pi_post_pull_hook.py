@@ -1,9 +1,11 @@
 """Regression tests for the central Worklog post-pull hook install (SA-0MU8CRX1X008IORP).
 
 The committed project hooks (`.githooks/post-checkout`, `post-merge`,
-`post-rewrite`, all `worklog:post-pull-hook:v1`) delegate to a single
-per-machine script at `$HOME/.config/pi/.githooks/worklog-post-pull`. Nothing
-used to create that script, so a fresh environment produced
+`post-rewrite`, all `worklog:post-pull-hook:v1`) resolve the shared post-pull
+script portably: the repository's own `.githooks/worklog-post-pull` first, then
+the per-machine `$HOME/.config/pi/.githooks/worklog-post-pull`, then a single
+stderr notice and exit 0 (SA-0MVK1Q30O0067NXX). Nothing used to create that
+per-machine script, so a fresh environment produced
 
     exec: /home/<user>/.config/pi/.githooks/worklog-post-pull: not found
 
@@ -18,7 +20,11 @@ These tests verify that `scripts/install_pi.sh`:
 - AC3: honours the existing `PI_SKIP_HOOK_INSTALL=1` opt-out.
 
 Every install run uses a sandboxed `$HOME` and a sandbox working directory, so
-the real installation and the real checkout are never touched.
+the real installation and the real checkout are never touched. Fixture `git`
+commands and the installer run with `shared.git_sandbox.fixture_git_env()`: the
+finish gate exports a temporary `GIT_INDEX_FILE` for the suite it runs
+(SA-0MVQHVGFR006W8LG), and a fixture that inherited it would stage into the
+gate's index instead of its own repository.
 """
 from __future__ import annotations
 
@@ -29,6 +35,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import fixture_git_env
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_pi.sh"
@@ -65,8 +72,11 @@ def _run_install(
 
     `cwd` is always provided explicitly: running the installer from inside the
     real checkout with hook wiring enabled would mutate the real repository.
+    The environment is hermetic (`GIT_DIR`/`GIT_INDEX_FILE` scrubbed) so the
+    installer's `git rev-parse`/`git config` act on `cwd`, not on an inherited
+    repository or the finish gate's temporary index.
     """
-    env = os.environ.copy()
+    env = fixture_git_env()
     env["HOME"] = str(home)
     env.pop("PI_SKIP_HOOK_INSTALL", None)
     if skip_hook_install:
@@ -91,6 +101,7 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
         check=True,
         capture_output=True,
         text=True,
+        env=fixture_git_env(),
         timeout=60,
     )
 
@@ -196,6 +207,14 @@ class TestCentralHookInstall:
 
 
 class TestInstalledHookBehaviour:
+    """Behaviour of the installed central script when git runs it.
+
+    Every run pins ``cwd`` to the (non-repository) sandbox: the script skips a
+    linked git worktree so a hook fired by `git worktree add` never starts a
+    nested sync (SA-0MVK1Q30O0067NXX), and this suite itself usually runs
+    inside one.
+    """
+
     def _install(self, sandbox: Path) -> Path:
         home = _fresh_home(sandbox)
         result = _run_install(home, cwd=sandbox)
@@ -207,7 +226,7 @@ class TestInstalledHookBehaviour:
         marker = sandbox / "wl-calls.txt"
         _fake_wl(sandbox / "bin", marker)
         env = {
-            **os.environ,
+            **fixture_git_env(),
             "PATH": f"{sandbox / 'bin'}{os.pathsep}{os.environ['PATH']}",
         }
         env.pop("WORKLOG_SKIP_POST_PULL", None)
@@ -217,6 +236,7 @@ class TestInstalledHookBehaviour:
             capture_output=True,
             text=True,
             env=env,
+            cwd=str(sandbox),
             timeout=60,
             check=False,
         )
@@ -230,7 +250,7 @@ class TestInstalledHookBehaviour:
         marker = sandbox / "wl-calls.txt"
         _fake_wl(sandbox / "bin", marker)
         env = {
-            **os.environ,
+            **fixture_git_env(),
             "PATH": f"{sandbox / 'bin'}{os.pathsep}{os.environ['PATH']}",
             "WORKLOG_SKIP_POST_PULL": "1",
         }
@@ -240,6 +260,7 @@ class TestInstalledHookBehaviour:
             capture_output=True,
             text=True,
             env=env,
+            cwd=str(sandbox),
             timeout=60,
             check=False,
         )
@@ -255,7 +276,7 @@ class TestInstalledHookBehaviour:
         # Resolve `sh` before narrowing PATH so the hook itself can start.
         sh = shutil.which("sh")
         assert sh is not None, "precondition: sh must be available"
-        env = {**os.environ, "PATH": str(empty_bin)}
+        env = {**fixture_git_env(), "PATH": str(empty_bin)}
         env.pop("WORKLOG_SKIP_POST_PULL", None)
 
         result = subprocess.run(
@@ -263,6 +284,7 @@ class TestInstalledHookBehaviour:
             capture_output=True,
             text=True,
             env=env,
+            cwd=str(sandbox),
             timeout=60,
             check=False,
         )
@@ -290,7 +312,7 @@ class TestGitCheckoutIntegration:
         marker = sandbox / "wl-calls.txt"
         _fake_wl(sandbox / "bin", marker)
         env = {
-            **os.environ,
+            **fixture_git_env(),
             "HOME": str(home),
             "PATH": f"{sandbox / 'bin'}{os.pathsep}{os.environ['PATH']}",
         }
@@ -310,8 +332,8 @@ class TestGitCheckoutIntegration:
         assert marker.exists(), "post-checkout did not trigger the post-pull wl sync"
 
     def test_warns_when_project_hook_points_elsewhere(self, sandbox):
-        """A committed wrapper that delegates to a different central path would
-        still break checkout, so the installer must say so (fail-open)."""
+        """A legacy wrapper that `exec`s a literal absolute path breaks on any
+        machine where it is absent, so the installer must say so (fail-open)."""
         home = _fresh_home(sandbox)
         project = _make_git_project(sandbox)
         foreign = home / "elsewhere" / "worklog-post-pull"

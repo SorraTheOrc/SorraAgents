@@ -99,28 +99,54 @@ cwd, so shared skill helpers inject `--worklog-dir` with this precedence
 This means skill scripts resolve the correct worklog store regardless of which
 directory they are invoked from.
 
-## Post-pull sync hooks (central install)
+## Post-pull sync hooks (portable wrappers + central install)
 
 Every framework project commits three git hooks — `.githooks/post-checkout`,
 `post-merge`, `post-rewrite` (all `worklog:post-pull-hook:v1`) — that delegate
-`wl sync` to one **per-machine** script:
+the post-pull sync to the shared script `.githooks/worklog-post-pull`. The
+wrappers resolve that script **portably** and in this order
+(SA-0MVK1Q30O0067NXX):
 
-```sh
-exec "$HOME/.config/pi/.githooks/worklog-post-pull" "$@"
-```
+1. **Repository-relative** — `<git rev-parse --show-toplevel>/.githooks/`
+   `worklog-post-pull` (falling back to `dirname "$0"`), i.e. the project's own
+   committed copy. This is the normal path and needs no per-machine install.
+2. **`$HOME/.config/pi/.githooks/worklog-post-pull`** — the central install
+   `scripts/install_pi.sh` creates (an executable symlink to the framework
+   repo's committed `.githooks/worklog-post-pull`), kept as a second candidate
+   for machines/projects without a local copy.
+3. **No-op** — one line on stderr naming both attempted locations, then
+   `exit 0`. A missing script must never fail the git command: a hook that
+   exits 127 aborts `git checkout`, `git merge` and `git worktree add` — and
+   because `wl sync` syncs through a temporary worktree, an aborting hook also
+   breaks `wl sync` itself.
 
-`scripts/install_pi.sh` installs that central script (an executable symlink to
-the repo's committed `.githooks/worklog-post-pull`) as an idempotent,
-`PI_SKIP_HOOK_INSTALL=1`-gated step, so a fresh machine's checkouts/merges do
-not error with `exec: ... not found` and the post-pull `wl sync` runs
-(SA-0MU8CRX1X008IORP). The central script skips sync when
-`WORKLOG_SKIP_POST_PULL=1` and is fail-open when `wl` is not installed.
+No committed hook contains a hard-coded per-user path, so the hooks work on any
+username, a clean machine and CI. Every resolution step is best-effort and
+silent (`git rev-parse` errors are discarded) because hooks inherit git's
+environment, which earlier incidents showed can carry stray `GIT_DIR`/`GIT_*`
+values (SA-0MUIZSXEY008NGR8).
 
-> **Portability caveat (SA-0MVK1Q30O0067NXX):** the committed wrappers
-> hard-code the delegating path. `install_pi.sh` warns (fail-open) when the
-> current project's `.githooks/post-checkout` does not reference the central
-> path it just installed — on machines whose `$HOME` differs, the wrappers
-> must be made `$HOME`-relative before checkout/merge stops erroring.
+`scripts/install_pi.sh` still installs the central script (idempotent,
+`PI_SKIP_HOOK_INSTALL=1`-gated) and still warns (fail-open) — but only about
+**legacy or forked** wrappers that `exec` a literal absolute path, since those
+still break on a machine where that path is absent; the committed wrappers
+never trigger the warning.
+
+### Where the sync runs, and where it does not
+
+`.githooks/worklog-post-pull` runs `wl sync` from the **main checkout** only:
+
+- it exits immediately when `WORKLOG_SKIP_POST_PULL=1` (bypass variable);
+- it exits when the working directory path contains `tmp-worktree-` — the
+  temporary worktree `wl sync` itself creates for its git operations, so a
+  hook-triggered sync can never recurse into `wl sync`;
+- it exits inside a **linked worktree** (`git rev-parse --git-dir` differs from
+  `--git-common-dir`), so creating a feature worktree never starts a sync;
+- it is fail-open when neither `wl` nor `worklog` is on `PATH`.
+
+`wl sync` therefore completes its push step on a host without the central hook
+install, with no `WORKLOG_SKIP_POST_PULL=1` or `core.hooksPath=/dev/null`
+workaround. Regression coverage: `tests/test_githooks_portability.py`.
 
 ## `wl sync` on a repo with no commits (unborn HEAD)
 
