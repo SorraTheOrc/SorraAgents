@@ -1708,6 +1708,25 @@ def paced_runner(
     return _paced
 
 
+def _cache_entry_metadata(
+    run: dict[str, Any], command: str
+) -> dict[str, Any]:
+    """Reportable metadata of the cache entry a verdict was served from.
+
+    ``run`` is a ``run_cached`` result (a cache hit). The returned mapping
+    carries the entry's ``command``, ``completed_at`` (epoch float), ``scope``
+    and ``fingerprint_kind`` so a consumer — the finish gate's report, a
+    completion comment, an auditor — can state *what* was reused rather than
+    only that something was (SA-0MVQHVJEX0071R7G).
+    """
+    return {
+        "command": run.get("command") or command,
+        "completed_at": run.get("completed_at", 0),
+        "scope": run.get("scope", "full"),
+        "fingerprint_kind": run.get("fingerprint_kind", ""),
+    }
+
+
 def run_suite(
     name: str,
     cwd: Path | None = None,
@@ -1794,6 +1813,12 @@ def run_suite(
     Non-zero results without parsable failures carry ``killed`` (signal-
     terminated) or ``unparsed_failure`` (non-zero exit, no parsable failure)
     as ``notice_code``; structured failures always win over those codes.
+
+    Verdict provenance (SA-0MVQHVJEX0071R7G): ``cached`` states whether every
+    command of the suite was served from the cache, and ``cache_entries``
+    carries one metadata mapping per cache-served command (``command``,
+    ``completed_at``, ``scope``, ``fingerprint_kind``) so a consumer can
+    attribute — and audit — a verdict without re-reading the cache.
     """
     cwd = cwd or REPO_ROOT
     resolvable_scope = "full"
@@ -1882,6 +1907,7 @@ def run_suite(
     all_failures: list[dict[str, str]] = []
     overall_returncode = 0
     cached_flags: list[bool] = []
+    cache_entries: list[dict[str, Any]] = []
     interpreters: set[str] = set()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -1921,6 +1947,11 @@ def run_suite(
             "slot_wait_seconds": sum(slot_waits),
             "exit_code": None,
             "signal": None,
+            # Verdict provenance (SA-0MVQHVJEX0071R7G): every return path
+            # states whether the verdict was cache-served and, if so, which
+            # entries were reused.
+            "cached": use_cache and all(cached_flags) if cached_flags else False,
+            "cache_entries": cache_entries,
         }
         result.update(overrides)
         return result
@@ -1961,6 +1992,8 @@ def run_suite(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
                 )
                 cached_flags.append(run["cached"])
+                if run["cached"]:
+                    cache_entries.append(_cache_entry_metadata(run, cmd))
                 if run.get("interpreter"):
                     interpreters.add(run["interpreter"])
             else:
@@ -2101,6 +2134,10 @@ def run_all(
     ``slot_wait_seconds`` (sum of queue waits) — the two durations are
     aggregated separately so neither can be mistaken for the other
     (SA-0MVU8XRBQ000DG9D).
+    Verdict provenance (SA-0MVQHVJEX0071R7G): the aggregate carries ``cached``
+    (True only when every selected suite was served from the cache) and
+    ``cache_entries`` (the metadata of every served entry, one per cached
+    command) so consumers can attribute the aggregate verdict.
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
@@ -2162,6 +2199,15 @@ def run_all(
         "resolved_scopes": resolved_scopes,
         "elapsed_seconds_total": elapsed_total if elapsed_measured else None,
         "slot_wait_seconds": slot_wait_total,
+        # Verdict provenance (SA-0MVQHVJEX0071R7G): the aggregate is
+        # cache-served only when every suite was, and the entries reported are
+        # the union of the suites' served entries (one per cached command).
+        "cached": bool(results) and all(r.get("cached") for r in results.values()),
+        "cache_entries": [
+            entry
+            for result in results.values()
+            for entry in result.get("cache_entries") or []
+        ],
         "timing": _all_timer.to_dict(),
     }
 

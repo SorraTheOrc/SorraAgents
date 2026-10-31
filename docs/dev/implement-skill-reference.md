@@ -642,6 +642,36 @@ inside a worktree, so the tree-verification guarantee above is unchanged in
 production; the degradation exists so a stubbed finish harness (or any
 non-repository caller) is not refused before the suite runs.
 
+### Verifiable verdicts (SA-0MVQHVJEX0071R7G)
+
+Every finish-gate verdict is self-describing. Each entry of
+`report["steps"]["tests"]` (one per attempt) records:
+
+| Key | Meaning |
+| --- | --- |
+| `tree` | Absolute path of the worktree the suite ran in (`.resolve()`d). |
+| `git_fingerprint` | The **would-be-commit tree** SHA (`git write-tree` of the staged temporary index) the verdict is bound to — not the loose working-tree state. `null` outside a git work tree. |
+| `cached` | `true` only when the whole verdict was served from the per-repo test cache. |
+| `cache_entry` | Present only for a cache-served verdict: the served entry's `command`, `completed_at` (epoch float), `scope` and `fingerprint_kind`. |
+
+A cached green is accepted only when its fingerprint is the would-be-commit
+tree's fingerprint: `run_gate_suite()` passes the temporary index's tree SHA
+into `run_tests(..., fingerprint=...)`, which keys the lookup with
+`fingerprint_kind="tree"` (F7, SA-0MVQHVHXI007PQAB). An entry recorded for a
+loose worktree state, for another tree, or without provenance metadata is a
+miss, so the suite runs and the fresh verdict is recorded for the gate's tree
+— no green verdict exists for a state whose suite never ran.
+
+`report["steps"]["would_be_commit"]` records the same tree (plus the temp
+index path, staged paths and `index_unchanged`), so the report can be read
+against the cache independent of the attempt list.
+
+**The completion comment carries the same provenance.** After a successful
+push the comment posted on the work item includes a *Test gate verdict* block
+— tree, fingerprint, cached flag and (for a cache-served verdict) the cache
+entry's command, completion time, scope and fingerprint kind — so an operator
+reading only the work item can attribute the accepted green.
+
 ## Push timeout (SA-0MUH9R74O002MQDU)
 
 `implement.py finish` pushes to `dev` via `git_push_to_dev()`.  The push

@@ -1,3 +1,15 @@
+
+# <!-- REFACTOR-SA-0MVWWENFV005VXW3
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `spawn_log` is never used
+# -->
+
+# <!-- REFACTOR-SA-0MVWWENFV005VXW3
+# smell: simplification
+# severity: medium
+# description: Use a single `with` statement with multiple contexts instead of nested `with` statements
+# -->
 """F4: verdict provenance and cache contract at the finish gate.
 
 Contract tests for the finish gate's *verdict provenance* (F4,
@@ -34,11 +46,10 @@ run is impossible to hide.
 
 Tracer-bullet convention
 ------------------------
-The report-shape expectations are ``xfail(strict=True)`` until F9 lands: the
-repository's established convention for test-first work on this epic (see the
-F1/F2 markers in ``test_finish_gate_commit_tree.py``). When F9 records the
-provenance keys these tests must pass — remove the markers then, in the F9
-work item.
+The report-shape expectations were ``xfail(strict=True)`` while F4 landed the
+contract ahead of the behaviour (the repository's established convention for
+test-first work on this epic). F9 (SA-0MVQHVJEX0071R7G) landed the provenance
+keys, so the markers are gone and these are ordinary regression tests.
 
 The two execution-count contracts (``..._exactly_once`` and
 ``..._reuses_the_cached_verdict``) pass **today** and must keep passing: they
@@ -55,8 +66,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-
-import pytest
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 for _path in (str(REPO_ROOT), str(REPO_ROOT / "skill")):
@@ -68,11 +78,13 @@ from shared import git_sandbox as gs
 # The F1 harness: fixture-repo factories plus the stubbed finish boundaries.
 # The gate's test step is deliberately NOT stubbed, so every test here drives
 # the real suite execution path.
+from skill.implement.scripts import implement
 from skill.implement.tests.test_finish_gate_commit_tree import (
     _assert_real_gate_execution,
     _finish_gate_report,
     _gate_suite_command,
     _gate_test_attempt,
+    _stubbed_finish_boundaries,
     _would_be_commit_tree_sha,
 )
 
@@ -146,15 +158,6 @@ def _suite_spawns(spawn_log: Path) -> int:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F9 / SA-0MVQHVJEX0071R7G not landed): gate attempts "
-        "carry only scope/success/tooling/failures, so neither the tree the "
-        "suite ran against nor its fingerprint nor the cached flag is "
-        "recorded. F9 adds the provenance keys; remove this marker then."
-    ),
-)
 def test_fresh_gate_attempt_records_tree_fingerprint_and_cached_flag(
     tmp_path, monkeypatch
 ):
@@ -189,15 +192,6 @@ def test_fresh_gate_attempt_records_tree_fingerprint_and_cached_flag(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F9 / SA-0MVQHVJEX0071R7G not landed): a "
-        "cache-served verdict is indistinguishable from a fresh one in the "
-        "gate report. F9 records 'cached' plus the entry metadata (command / "
-        "completed_at / scope); remove this marker then."
-    ),
-)
 def test_cache_hit_attempt_records_the_entry_metadata(tmp_path, monkeypatch):
     """A cached verdict states which entry was served, not just that it passed.
 
@@ -283,3 +277,94 @@ def test_identical_tree_reuses_the_cached_verdict_without_spawning(
         "an identical tree inside the TTL must be served from the cache, not "
         "re-executed"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC2 — the completion comment carries the verdict provenance
+# ---------------------------------------------------------------------------
+
+
+def _finish_gate_report_capturing_comments(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> tuple[dict, object]:
+    """Drive the finish gate and capture every comment it records.
+
+    The shared harness stubs ``wl_add_comment`` to a no-op, so the recorder is
+    applied *inside* it (a later patch wins) — the comment under test is the
+    real one ``phase_finish`` writes, not a re-derived string.
+    """
+    monkeypatch.delenv("IMPLEMENT_TEST_COMMAND", raising=False)
+    with _stubbed_finish_boundaries(repo, tmp_path):
+        with patch.object(implement, "wl_add_comment") as comment:
+            report = implement.phase_finish(
+                "SA-TEST", json_output=True, no_refactor=True
+            )
+    return report, comment
+
+
+def _completion_comment_text(mock_comment) -> str:
+    """The text of every comment ``phase_finish`` recorded on the work item."""
+    texts = [
+        str(call.args[1])
+        for call in mock_comment.call_args_list
+        if len(call.args) > 1
+    ]
+    matching = [text for text in texts if "Implementation complete" in text]
+    assert matching, f"no completion comment recorded: {texts}"
+    return matching[-1]
+
+
+def test_completion_comment_records_the_fresh_verdict_provenance(
+    tmp_path, monkeypatch
+):
+    """The completion comment names the tree, its fingerprint and the cache flag.
+
+    An agent (or an auditor) reading only the work item must be able to tell
+    *which* tree the green verdict belongs to and whether the suite actually
+    ran for it — the provenance is not allowed to live only in the JSON report
+    ephemeral output.
+    """
+    repo, spawn_log = _build_clean_fixture_repo(tmp_path)
+
+    report, comment = _finish_gate_report_capturing_comments(
+        repo, tmp_path, monkeypatch
+    )
+
+    assert report["success"] is True, report.get("message")
+    attempt = _gate_test_attempt(report)
+    text = _completion_comment_text(comment)
+
+    assert f"- Tree: {Path(attempt['tree']).resolve()}" in text, text
+    assert f"- Fingerprint: {attempt['git_fingerprint']}" in text, text
+    assert "- Cached: false" in text, text
+    assert "Cache entry" not in text, text
+
+
+def test_completion_comment_records_the_cached_verdict_provenance(
+    tmp_path, monkeypatch
+):
+    """A cache-served completion states the entry it reused.
+
+    The second gate run on the identical tree is served from the cache; the
+    comment must say so *and* identify the entry (command, completion time,
+    scope) so a partially-scoped run can never read as full-suite evidence.
+    """
+    repo, spawn_log = _build_clean_fixture_repo(tmp_path)
+
+    first = _finish_gate_report(repo, tmp_path, monkeypatch)
+    assert first["success"] is True, first.get("message")
+
+    second, comment = _finish_gate_report_capturing_comments(
+        repo, tmp_path, monkeypatch
+    )
+
+    assert second["success"] is True, second.get("message")
+    attempt = _gate_test_attempt(second)
+    assert attempt["cached"] is True, attempt
+    entry = attempt["cache_entry"]
+    text = _completion_comment_text(comment)
+
+    assert "- Cached: true" in text, text
+    assert f"- Cache entry: command {entry['command']}" in text, text
+    assert f"scope {entry['scope']}" in text, text
+    assert str(entry["completed_at"]) in text, text

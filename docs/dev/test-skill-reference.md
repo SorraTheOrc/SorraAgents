@@ -82,6 +82,16 @@ hit the same entries because both resolve the same project root.
   the pytest interpreter used (`[pytest interpreter: <path>]`). The concrete
   interpreter/executable is also stored in `metadata.json` (`interpreter`)
   — see *pytest interpreter resolution* below (SA-0MVK154IE007OS3D).
+- **Verdict provenance in results (SA-0MVQHVJEX0071R7G)**: a run result
+  states whether it was served from the cache and, when it was, which entry
+  was reused. `run_suite()` returns `cached` (True only when every command of
+  the suite was served) plus `cache_entries` — one mapping per cache-served
+  command carrying the entry's `command`, `completed_at` (epoch float),
+  `scope` and `fingerprint_kind` (`worktree` or `tree`). `run_all()` /
+  `guarded_run_all()` aggregate the same two keys (`cached` is True only when
+  every selected suite was cached). Consumers such as the implement finish
+  gate therefore record *what* a green verdict is based on rather than only
+  that something passed.
 - **PATH augmentation for user-installed executables (SA-0MSUZAJPC003BS66)**: the
   default runner (`_default_runner` in `test_cache.py`) prepends
   `~/.local/bin` to the subprocess `PATH` when it is not already present, so

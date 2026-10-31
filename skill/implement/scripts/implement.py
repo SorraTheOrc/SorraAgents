@@ -2586,7 +2586,15 @@ def run_gate_suite(
     *cwd* outside a git work tree has no would-be-commit tree to verify: the
     suite runs plainly and the summary reports ``available: False`` with the
     stable ``not_a_git_worktree`` reason (SA-0MVVKJGKP003QVNM).
+
+    Verdict provenance (SA-0MVQHVJEX0071R7G): the returned ``test_result``
+    carries ``tree`` (the absolute worktree path the suite ran in) and
+    ``git_fingerprint`` (the would-be-commit tree SHA the verdict is bound to),
+    alongside the ``cached``/``cache_entry`` provenance the suite run reported.
+    Every verdict therefore states both *which tree* it belongs to and whether
+    it was produced or served.
     """
+    tested_tree = str(Path(cwd).resolve())
     if not _is_git_worktree(cwd):
         notice = (
             "finish gate tree check unavailable: "
@@ -2596,6 +2604,10 @@ def run_gate_suite(
         )
         LOG.warning("Finish gate: %s", notice)
         result = run_tests(cwd, scope=scope, base_ref=base_ref)
+        # Attribute the verdict to the directory the suite ran in: there is no
+        # would-be-commit tree to fingerprint outside a work tree.
+        result["tree"] = tested_tree
+        result["git_fingerprint"] = None
         return result, {
             "available": False,
             "reason": "not_a_git_worktree",
@@ -2615,6 +2627,12 @@ def run_gate_suite(
         summary = gate_index.summary()
 
     summary["index_unchanged"] = integrity["unchanged"]
+    # Attribute the verdict to the tree it was bound to: the absolute worktree
+    # the suite ran in and the would-be-commit tree SHA its cache key used
+    # (SA-0MVQHVJEX0071R7G). Recorded on the run result in place so callers
+    # keep the result object the suite returned.
+    result["tree"] = tested_tree
+    result["git_fingerprint"] = gate_index.tree
     if integrity["unchanged"]:
         return result, summary
 
@@ -2636,6 +2654,67 @@ def run_gate_suite(
         },
         summary,
     )
+
+
+def _gate_attempt_record(
+    attempt: int, test_result: dict[str, Any]
+) -> dict[str, Any]:
+    """One finish-gate test attempt, with the provenance of its verdict.
+
+    Every attempt records the tree the suite ran against (``tree``), the
+    would-be-commit tree SHA the verdict is bound to (``git_fingerprint``) and
+    whether the verdict was served from the cache (``cached``, plus
+    ``cache_entry`` metadata — command / completed_at / scope — when it was).
+    A green verdict is therefore self-describing: it names the state whose
+    suite ran, so a stale or foreign cached green cannot be mistaken for it
+    (SA-0MVQHVJEX0071R7G).
+    """
+    record: dict[str, Any] = {
+        "attempt": attempt,
+        "success": test_result["success"],
+        "failures": test_result.get("failures", []),
+        "skipped": test_result.get("skipped", False),
+        "tooling": test_result.get("tooling"),
+        "scope": test_result.get("scope", "changed"),
+        "tree": test_result.get("tree"),
+        "git_fingerprint": test_result.get("git_fingerprint"),
+        "cached": bool(test_result.get("cached", False)),
+    }
+    entry = test_result.get("cache_entry")
+    if record["cached"] and entry:
+        record["cache_entry"] = dict(entry)
+    return record
+
+
+def _verdict_provenance_lines(report: dict[str, Any]) -> list[str]:
+    """Completion-comment lines describing the finish gate's verdict provenance.
+
+    The comment on the work item must carry what the JSON report carries: the
+    tree the accepted verdict belongs to, its would-be-commit fingerprint and
+    whether the suite ran for it or the verdict was served from the cache
+    (SA-0MVQHVJEX0071R7G).
+    """
+    attempts = list((report.get("steps") or {}).get("tests") or [])
+    if not attempts:
+        return ["- Test gate verdict: not recorded (no test step ran)"]
+    final = attempts[-1]
+    lines = [
+        "- Test gate verdict:",
+        f"  - Tree: {final.get('tree')}",
+        f"  - Fingerprint: {final.get('git_fingerprint')}",
+        f"  - Cached: {'true' if final.get('cached') else 'false'}",
+    ]
+    entry = final.get("cache_entry") or {}
+    if entry:
+        lines.append(
+            f"  - Cache entry: command {entry.get('command')}, "
+            f"completed_at {entry.get('completed_at')}, "
+            f"scope {entry.get('scope')}, "
+            f"fingerprint_kind {entry.get('fingerprint_kind')}"
+        )
+    if len(attempts) > 1:
+        lines.append(f"  - Attempts: {len(attempts)}")
+    return lines
 
 
 def stage_tested_tree(cwd: str, tested_tree: str | None) -> dict[str, Any]:
@@ -4598,7 +4677,49 @@ def _skip_test_result(message: str, tooling: str | None,
         "skipped": True,
         "tooling": tooling,
         "scope": scope,
+        "cached": False,
+        "cache_entries": [],
     }
+
+
+def _cache_entry_from_run(
+    run: dict[str, Any], command: str
+) -> dict[str, Any]:
+    """Reportable metadata of the cache entry a verdict was served from.
+
+    ``run`` is a ``run_cached`` result that was a cache hit. The mapping
+    carries the entry's ``command``, ``completed_at`` (epoch float), ``scope``
+    and ``fingerprint_kind`` so the finish report and the completion comment
+    can state *what* was reused, not merely that something was
+    (SA-0MVQHVJEX0071R7G).
+    """
+    return {
+        "command": run.get("command") or command,
+        "completed_at": run.get("completed_at", 0),
+        "scope": run.get("scope", "full"),
+        "fingerprint_kind": run.get("fingerprint_kind", ""),
+    }
+
+
+def _with_cache_provenance(
+    result: dict[str, Any],
+    *,
+    cached: bool,
+    entries: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Attach verdict provenance (cache flag + entry metadata) to *result*.
+
+    ``cached`` is True only when the whole verdict was served from the cache;
+    ``cache_entry`` then identifies the entry that was served (command,
+    completion time, scope, fingerprint kind) so a partially-scoped or foreign
+    entry can never masquerade as a fresh full-tree verdict
+    (SA-0MVQHVJEX0071R7G).
+    """
+    result["cached"] = bool(cached)
+    result["cache_entries"] = list(entries or [])
+    if cached and result["cache_entries"]:
+        result["cache_entry"] = result["cache_entries"][0]
+    return result
 
 
 def _finalize_test_result(result: dict[str, Any], tooling: str | None,
@@ -4832,7 +4953,14 @@ def _adapt_guarded_result(
     ]
     if excluded:
         result["live_repo_excluded"] = excluded
-    return result
+    # Verdict provenance (SA-0MVQHVJEX0071R7G): carry the cache flag and the
+    # served entry's metadata through from the guarded run so the finish
+    # report can attribute the verdict (fresh run vs. which cached entry).
+    return _with_cache_provenance(
+        result,
+        cached=bool(guarded.get("cached", False)),
+        entries=list(guarded.get("cache_entries") or []),
+    )
 
 
 #: Classification of a test-gate failure (WL-0MVGUT787000LNDG). ``phase_finish``
@@ -5115,6 +5243,8 @@ def _run_commands_direct(
     exit_code = 0
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    cached_flags: list[bool] = []
+    cache_entries: list[dict[str, Any]] = []
     for command in commands:
         run = _run_cached_paced(
             command,
@@ -5127,20 +5257,27 @@ def _run_commands_direct(
             scope=scope,
             fingerprint=fingerprint,
         )
+        cached_flags.append(bool(run.get("cached")))
+        if run.get("cached"):
+            cache_entries.append(_cache_entry_from_run(run, command))
         if run["exit_code"] != 0 and exit_code == 0:
             exit_code = run["exit_code"]
         if run.get("stdout"):
             stdout_parts.append(run["stdout"])
         if run.get("stderr"):
             stderr_parts.append(run["stderr"])
-    return _finalize_test_result(
-        {
-            "exit_code": exit_code,
-            "stdout": "\n".join(stdout_parts),
-            "stderr": "\n".join(stderr_parts),
-        },
-        tooling=tooling,
-        scope=scope,
+    return _with_cache_provenance(
+        _finalize_test_result(
+            {
+                "exit_code": exit_code,
+                "stdout": "\n".join(stdout_parts),
+                "stderr": "\n".join(stderr_parts),
+            },
+            tooling=tooling,
+            scope=scope,
+        ),
+        cached=bool(cached_flags) and all(cached_flags),
+        entries=cache_entries,
     )
 
 
@@ -6699,14 +6836,9 @@ def phase_finish(
     test_result, gate_tree = run_gate_suite(worktree_path, scope="changed")
     report["steps"]["would_be_commit"] = gate_tree
     report["steps"]["tests"] = []
-    report["steps"]["tests"].append({
-        "attempt": test_attempts + 1,
-        "success": test_result["success"],
-        "failures": test_result.get("failures", []),
-        "skipped": test_result.get("skipped", False),
-        "tooling": test_result.get("tooling"),
-        "scope": test_result.get("scope", "changed"),
-    })
+    report["steps"]["tests"].append(
+        _gate_attempt_record(test_attempts + 1, test_result)
+    )
 
     while not test_result["success"] and test_attempts < max_retry:
         test_attempts += 1
@@ -6780,14 +6912,9 @@ def phase_finish(
                  test_attempts + 1, max_retry)
         test_result, gate_tree = run_gate_suite(worktree_path, scope="changed")
         report["steps"]["would_be_commit"] = gate_tree
-        report["steps"]["tests"].append({
-            "attempt": test_attempts + 1,
-            "success": test_result["success"],
-            "failures": test_result.get("failures", []),
-            "skipped": test_result.get("skipped", False),
-            "tooling": test_result.get("tooling"),
-            "scope": test_result.get("scope", "changed"),
-        })
+        report["steps"]["tests"].append(
+            _gate_attempt_record(test_attempts + 1, test_result)
+        )
 
     if not test_result["success"]:
         msg = (
@@ -7225,9 +7352,14 @@ def phase_finish(
         _release_main_checkout_lock(lock_fd)
 
     # ── Step 9: Add completion comment ─────────────────────────────
+    # The comment carries the gate's verdict provenance (tree path, tree
+    # fingerprint, cache flag and, for a cache-served verdict, the entry
+    # metadata) so the accepted green is attributable from the work item alone
+    # (SA-0MVQHVJEX0071R7G).
+    verdict_lines = "\n".join(_verdict_provenance_lines(report))
     completion_comment = (
         f"Implementation complete.\n- Commit: {commit_hash}\n"
-        f"- Branch: {branch}\n- Worktree: {worktree_path}"
+        f"- Branch: {branch}\n- Worktree: {worktree_path}\n{verdict_lines}"
     )
     removal_step = report["steps"].get("worktree_removal") or {}
     if removal_step.get("deferred"):
