@@ -6,6 +6,8 @@
  * - Supports major, minor, patch (default) bump types
  * - Handles invalid version strings gracefully
  * - Handles missing version field gracefully
+ * - Resolves the version source by convention: `package.json` when present,
+ *   else `pyproject.toml` `[project].version` (SA-0MVN2B0DJ00135W0)
  *
  * Run with:
  *   node tests/node/test-bump-version.mjs
@@ -13,10 +15,22 @@
 
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
-import { bumpVersion } from '../../skill/ship/scripts/release/bump-version.js';
+import { dirname, join, resolve } from 'node:path';
+import {
+  bumpVersion,
+  readPyprojectVersion,
+  replaceProjectVersion,
+  resolveVersionSource,
+} from '../../skill/ship/scripts/release/bump-version.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -189,5 +203,204 @@ if (!existsSync(pkgPath)) {
   cliTest('CLI: invalid --bump value', ['--bump', 'foo'], /Invalid bump type/);
   cliTest('CLI: --help exits with 0', ['--help'], 0);
 }
+
+// ── pyproject.toml version source (SA-0MVN2B0DJ00135W0) ────────────────────
+
+/**
+ * A realistic pyproject.toml. It deliberately contains:
+ * - comments that must survive the rewrite,
+ * - a decoy `version` key in another table ([tool.pytest.ini_options]), and
+ * - a version assignment mid-table (not the first key).
+ */
+const PYPROJECT_FIXTURE = `[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tts-server"
+# The released version — bumped by the ship skill's release pipeline.
+version = "0.1.0"   # keep in sync with the git tag
+description = "A text-to-speech server"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.100",  # pinned for the v0.1 cycle
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+version = "9.9.9"   # NOT the project version — must never be touched
+`;
+
+console.log('pyproject.toml version resolution (pure helpers):\n');
+
+test('readPyprojectVersion reads [project].version, ignoring other tables', () => {
+  assert.equal(readPyprojectVersion(PYPROJECT_FIXTURE), '0.1.0');
+});
+
+test('replaceProjectVersion rewrites only the [project].version value', () => {
+  const updated = replaceProjectVersion(PYPROJECT_FIXTURE, '0.1.1');
+  assert.equal(
+    updated,
+    PYPROJECT_FIXTURE.replace('version = "0.1.0"', 'version = "0.1.1"'),
+    'every byte outside the [project].version value must be preserved',
+  );
+  assert.ok(updated.includes('version = "9.9.9"'), 'decoy version key must be untouched');
+  assert.ok(updated.includes('# keep in sync with the git tag'), 'trailing comments must survive');
+});
+
+test('replaceProjectVersion preserves single quotes', () => {
+  const src = '[project]\nname = "x"\nversion = \'2.3.4\'  # note\n';
+  assert.equal(replaceProjectVersion(src, '2.4.0'), '[project]\nname = "x"\nversion = \'2.4.0\'  # note\n');
+});
+
+test('replaceProjectVersion preserves CRLF line endings', () => {
+  const src = '[project]\r\nname = "x"\r\nversion = "1.2.3"\r\n';
+  assert.equal(replaceProjectVersion(src, '1.2.4'), '[project]\r\nname = "x"\r\nversion = "1.2.4"\r\n');
+  assert.equal(readPyprojectVersion(src), '1.2.3');
+});
+
+test('readPyprojectVersion rejects a dynamic version with an actionable message', () => {
+  assert.throws(
+    () => readPyprojectVersion('[project]\nname = "x"\nversion = "dynamic"\n'),
+    /dynamic/i,
+  );
+});
+
+test('readPyprojectVersion rejects a missing [project].version with candidate sections named', () => {
+  assert.throws(
+    () => readPyprojectVersion('[project]\nname = "x"\ndynamic = ["version"]\n'),
+    (err) => /\[project\]\.version/.test(err.message)
+      && /\[tool\.poetry\]/.test(err.message)
+      && /dynamic/.test(err.message),
+  );
+});
+
+console.log('\n--- All pyproject.toml helper tests complete ---\n');
+
+// ── CLI tests against fixture repositories ─────────────────────────────────
+
+/** Create a throwaway git repo root holding *files*. */
+function makeFixtureRepo(files = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'bump-version-fixture-'));
+  spawnSync('git', ['init', '-b', 'dev'], { cwd: dir, encoding: 'utf-8' });
+  for (const [name, content] of Object.entries(files)) {
+    writeFileSync(join(dir, name), content, 'utf-8');
+  }
+  return dir;
+}
+
+/** Run the bump-version CLI with *cwd* as the repository root. */
+function runCli(cwd, args) {
+  const scriptPath = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    '../../skill/ship/scripts/release/bump-version.js',
+  );
+  return spawnSync('node', [scriptPath, ...args], { encoding: 'utf-8', cwd });
+}
+
+function withFixture(files, fn) {
+  const dir = makeFixtureRepo(files);
+  try {
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const SIMPLE_PYPROJECT = '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = []\n';
+
+console.log('pyproject.toml version source (CLI):\n');
+
+for (const [bump, expected] of [['patch', '0.1.1'], ['minor', '0.2.0'], ['major', '1.0.0']]) {
+  test(`CLI: pyproject.toml ${bump} bump writes the new version`, () => {
+    withFixture({ 'pyproject.toml': SIMPLE_PYPROJECT }, (dir) => {
+      const res = runCli(dir, ['--bump', bump]);
+      assert.equal(res.status, 0, `expected success, stderr: ${res.stderr}`);
+      assert.equal(res.stdout.trim(), expected);
+      assert.equal(
+        readFileSync(join(dir, 'pyproject.toml'), 'utf-8'),
+        SIMPLE_PYPROJECT.replace('"0.1.0"', `"${expected}"`),
+      );
+    });
+  });
+}
+
+test('CLI: pyproject.toml --dry-run does not write', () => {
+  withFixture({ 'pyproject.toml': SIMPLE_PYPROJECT }, (dir) => {
+    const res = runCli(dir, ['--bump', 'minor', '--dry-run']);
+    assert.equal(res.status, 0, `expected success, stderr: ${res.stderr}`);
+    assert.match(res.stdout, /New version/);
+    assert.equal(readFileSync(join(dir, 'pyproject.toml'), 'utf-8'), SIMPLE_PYPROJECT);
+  });
+});
+
+test('CLI: package.json wins over pyproject.toml when both exist', () => {
+  const pkg = '{\n  "name": "demo",\n  "version": "2.0.0"\n}\n';
+  withFixture({ 'package.json': pkg, 'pyproject.toml': SIMPLE_PYPROJECT }, (dir) => {
+    const res = runCli(dir, ['--bump', 'patch']);
+    assert.equal(res.status, 0, `expected success, stderr: ${res.stderr}`);
+    assert.equal(JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8')).version, '2.0.1');
+    assert.equal(readFileSync(join(dir, 'pyproject.toml'), 'utf-8'), SIMPLE_PYPROJECT);
+  });
+});
+
+test('CLI: neither package.json nor pyproject.toml → combined actionable error', () => {
+  withFixture({ 'README.md': '# demo\n' }, (dir) => {
+    const res = runCli(dir, ['--bump', 'patch']);
+    assert.notEqual(res.status, 0);
+    assert.match(res.stderr, /package\.json/);
+    assert.match(res.stderr, /pyproject\.toml/);
+  });
+});
+
+test('CLI: dynamic version → non-zero exit, file unmodified', () => {
+  const src = '[project]\nname = "demo"\ndynamic = ["version"]\n';
+  withFixture({ 'pyproject.toml': src }, (dir) => {
+    const res = runCli(dir, ['--bump', 'patch']);
+    assert.notEqual(res.status, 0);
+    assert.match(res.stderr, /dynamic/i);
+    assert.equal(readFileSync(join(dir, 'pyproject.toml'), 'utf-8'), src);
+  });
+});
+
+test('CLI: invalid semver in pyproject.toml → non-zero exit, file unmodified', () => {
+  const src = '[project]\nname = "demo"\nversion = "not-a-version"\n';
+  withFixture({ 'pyproject.toml': src }, (dir) => {
+    const res = runCli(dir, ['--bump', 'patch']);
+    assert.notEqual(res.status, 0);
+    assert.match(res.stderr, /Cannot parse version/i);
+    assert.equal(readFileSync(join(dir, 'pyproject.toml'), 'utf-8'), src);
+  });
+});
+
+console.log('\nresolveVersionSource():\n');
+
+test('resolveVersionSource prefers package.json and reports its version', () => {
+  withFixture(
+    { 'package.json': '{\n  "version": "1.0.0"\n}\n', 'pyproject.toml': SIMPLE_PYPROJECT },
+    (dir) => {
+      const source = resolveVersionSource(dir);
+      assert.equal(source.kind, 'package.json');
+      assert.equal(source.version, '1.0.0');
+    },
+  );
+});
+
+test('resolveVersionSource falls back to pyproject.toml for Python-only repos', () => {
+  withFixture({ 'pyproject.toml': SIMPLE_PYPROJECT }, (dir) => {
+    const source = resolveVersionSource(dir);
+    assert.equal(source.kind, 'pyproject.toml');
+    assert.equal(source.version, '0.1.0');
+    assert.ok(source.path.endsWith('pyproject.toml'));
+  });
+});
+
+test('resolveVersionSource throws when no candidate file exists', () => {
+  withFixture({}, (dir) => {
+    assert.throws(() => resolveVersionSource(dir), /package\.json[\s\S]*pyproject\.toml/);
+  });
+});
 
 console.log('\n');
