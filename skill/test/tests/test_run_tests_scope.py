@@ -90,7 +90,6 @@ def _gate_index_neutralised(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep every test in this module hermetic under the finish gate."""
     _hermetic_git_index(monkeypatch)
 
-
 def _make_repo(tmp_path: Path) -> Path:
     """Create a minimal git repo with test and source files."""
     repo = init_repo(tmp_path / "test_repo")

@@ -5140,12 +5140,14 @@ def _run_changed_scope_pytest(
     partial run is never mistaken for full-suite evidence).
 
     Returns ``None`` when no subset is possible so the caller falls back to
-    the full suite: no dev baseline/changed files, only non-test changes,
-    custom ``suiteCommands`` in ``.pi/test-config.json``, a selection
-    that resolves to node-only commands (implement's pytest channel cannot
-    run them), or a partial skill install without the test skill's
-    selector. npm / repo-script / override / unity toolings are not
-    subsettable — the caller warns and runs full scope.
+    the full suite: no dev baseline/changed files, only non-test changes, a
+    selection that resolves to non-pytest commands (this legacy channel can
+    only run pytest), or a partial skill install without the test skill's
+    selector. ``.pi/test-config.json`` ``suiteCommands`` does NOT disable
+    selection — it describes the full suite only (SA-0MVL7YOMJ006UMDO).
+    npm / repo-script / override / unity toolings are not subsettable — the
+    caller warns and runs full scope. The resolved-suite path uses
+    :func:`_run_changed_scope_selection` instead, which runs any tooling.
     """
     if _changed_scope_commands is None:
         LOG.warning(
@@ -5187,6 +5189,22 @@ def _run_changed_scope_pytest(
     return run
 
 
+def _changed_scope_unavailable_reason(cwd: str, base_ref: str | None = None) -> str:
+    """The shared selector's specific reason for having no subset, or a
+    generic fallback when the selector itself is unavailable.
+
+    Keeping the reason in one place means every implement.py entry point
+    (the resolved-suite path and the legacy pytest-only path) reports the
+    same specific cause instead of restating a generic list of possibilities
+    (SA-0MVL7YOMJ006UMDO).
+    """
+    if _changed_scope_selection is None:
+        return "changed-scope selector unavailable"
+    return _changed_scope_selection(
+        Path(cwd), base_ref=base_ref or "origin/dev"
+    ).reason
+
+
 def _run_changed_scope_selection(
     cwd: str, base_ref: str | None = None, fingerprint: str | None = None
 ) -> tuple[dict[str, Any] | None, str]:
@@ -5212,12 +5230,7 @@ def _run_changed_scope_selection(
         Path(cwd), base_ref=base_ref or "origin/dev"
     )
     if not commands:
-        reason = "no selection available"
-        if _changed_scope_selection is not None:
-            reason = _changed_scope_selection(
-                Path(cwd), base_ref=base_ref or "origin/dev"
-            ).reason
-        return None, reason
+        return None, _changed_scope_unavailable_reason(cwd, base_ref=base_ref)
     run = _run_guarded_suite(
         list(commands),
         cwd,
@@ -5616,9 +5629,9 @@ def run_tests(cwd: str, scope: str = "changed",
                 return scoped
             LOG.warning(
                 "Implement run_tests: changed-scope selection unavailable in "
-                "%s (no dev baseline, no changed tests, no matching groups, "
-                "or custom suiteCommands) — falling back to full scope.",
+                "%s (%s) — falling back to full scope.",
                 cwd,
+                _changed_scope_unavailable_reason(cwd, base_ref=base_ref),
             )
         pytest_run = _run_cached_paced(
             PYTEST_CMD,
