@@ -40,6 +40,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from shared.git_sandbox import fixture_git_env
 
 # ---------------------------------------------------------------------------
 # Paths / module loading
@@ -290,7 +291,9 @@ class TestMainCheckoutFor:
     def test_git_derived_main_checkout(self, implement_mod, tmp_path):
         main = tmp_path / "main"
         main.mkdir()
-        subprocess.run(["git", "init", "-q", str(main)], check=True)
+        subprocess.run(
+            ["git", "init", "-q", str(main)], check=True, env=fixture_git_env()
+        )
         wt = main / ".worklog" / "worktrees" / "wl-SA-TEST0001-slug"
         wt.mkdir(parents=True)
         assert implement_mod._main_checkout_for(str(wt)) == str(main.resolve())

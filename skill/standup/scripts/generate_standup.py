@@ -64,7 +64,7 @@ if str(_SKILLS_ROOT) not in sys.path:
 from import_guard import guard_shared_import
 
 try:
-    from shared.git_sandbox import scrub_repository_overrides
+    from shared.git_sandbox import git_env_for_repo
     from shared.worklog_sync import sync_worklog
 except ModuleNotFoundError as _missing_shared:  # pragma: no cover
     guard_shared_import(_missing_shared.name)
@@ -1045,15 +1045,20 @@ def _default_git_runner(project_root):
 
     Repository-override environment variables (``GIT_DIR`` &c.) are stripped so
     a leaked value cannot redirect the commit to another checkout (see
-    ``docs/dev/test-isolation.md``). The runner mirrors :func:`_run_git` and
-    never raises: any error is returned as ``(False, "", message)``.
+    ``docs/dev/test-isolation.md``). An inherited ``GIT_INDEX_FILE`` is kept
+    **only when it belongs to *project_root*** (``git_env_for_repo``): the
+    finish gate exports a temporary would-be-commit index for the suite it
+    runs, and this runner must honour it for the repository under test while
+    never staging a *fixture* repository's files into the gate's index
+    (SA-0MVWQ4FZ4003S0GE). The runner mirrors :func:`_run_git` and never
+    raises: any error is returned as ``(False, "", message)``.
     """
     def _run(args):
         try:
             result = subprocess.run(
                 ["git", *args],
                 cwd=str(project_root),
-                env=scrub_repository_overrides(),
+                env=git_env_for_repo(project_root),
                 capture_output=True,
                 text=True,
                 timeout=COMMIT_TIMEOUT,

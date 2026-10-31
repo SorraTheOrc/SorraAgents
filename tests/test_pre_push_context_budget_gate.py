@@ -12,9 +12,10 @@ full-suite gate itself is covered end-to-end by ``test_pre_push_test_gate.py``.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
+
+from shared.git_sandbox import fixture_git_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for candidate in (REPO_ROOT, Path(__file__).resolve().parents[2]):
@@ -53,7 +54,12 @@ def _run_hook(
     repo.mkdir()
     marker = tmp_path / "measure-marker.txt"
 
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "-q", str(repo)],
+        check=True,
+        capture_output=True,
+        env=fixture_git_env(),
+    )
     git_hooks = repo / ".git" / "hooks"
     hook_dst = git_hooks / "pre-push"
     hook_dst.write_text(HOOK_PATH.read_text(encoding="utf-8"), encoding="utf-8")
@@ -70,7 +76,7 @@ def _run_hook(
         thresholds.write_text("{}\n", encoding="utf-8")
 
     env = {
-        **os.environ,
+        **fixture_git_env(),
         # Isolate the context-budget gate from the other hook stages.
         "BRANCH_POLICY_SKIP": "1",
         "WORKLOG_SKIP_PRE_PUSH": "1",

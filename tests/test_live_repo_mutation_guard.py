@@ -48,8 +48,13 @@ def _child_env() -> dict[str, str]:
     nested runner never contends for the host-wide ``"test"`` slot this outer
     suite holds (SA-0MUY6U05F008RG86). It is copied explicitly so the
     isolation is visible at the call site rather than an implicit inheritance.
+
+    ``fixture_git_env`` (not ``sanitized_git_env``) is used so the nested suites'
+    own ``git add``/``commit`` in throwaway repositories can never stage into an
+    inherited ``GIT_INDEX_FILE`` — the finish gate's temporary index
+    (SA-0MVWQ4FZ4003S0GE).
     """
-    env = gs.sanitized_git_env()
+    env = gs.fixture_git_env()
     env.pop(MARKER_ENV, None)
     if "PI_SEMAPHORE_DIR" in os.environ:
         env["PI_SEMAPHORE_DIR"] = os.environ["PI_SEMAPHORE_DIR"]

@@ -96,8 +96,11 @@ else:
         timeout=30,
         # The runner calls ``_worktree_placement_violation``, which shells out
         # to git using the inherited environment. Scrub repository overrides so
-        # a poisoned ``GIT_DIR`` cannot make the gate inspect the wrong repo.
-        env=gs.sanitized_git_env(),
+        # a poisoned ``GIT_DIR`` cannot make the gate inspect the wrong repo,
+        # and drop an inherited ``GIT_INDEX_FILE`` so the fixture repos can never
+        # stage into the finish gate's temporary index
+        # (SA-0MVWQ4FZ4003S0GE).
+        env=gs.fixture_git_env(),
     )
 
 

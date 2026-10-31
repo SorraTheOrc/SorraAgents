@@ -15,11 +15,11 @@ actual install_pi.sh source when present, else a known reference block is used.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import fixture_git_env
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PI = REPO_ROOT / "scripts" / "install_pi.sh"
@@ -82,7 +82,7 @@ def _run_install_pi_in_sandbox(sandbox: Path) -> subprocess.CompletedProcess:
     shutil_copy_file(INSTALL_PI, fake_src / "scripts" / "install_pi.sh")
 
     env = {
-        **os.environ,
+        **fixture_git_env(),
         "HOME": str(fake_home),
         "SRC_DIR": str(fake_src),  # in case the script honours an override
     }
@@ -144,22 +144,30 @@ def _install_into_git_project(
     shutil_copy_file(INSTALL_PI, fake_src / "scripts" / "install_pi.sh")
 
     # Target project: a real git repo so the hook-wiring block activates.
-    subprocess.run(["git", "init", "-q", str(fake_proj)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "-q", str(fake_proj)],
+        check=True,
+        capture_output=True,
+        env=fixture_git_env(),
+    )
     subprocess.run(
         ["git", "-C", str(fake_proj), "config", "user.email", "t@t"],
         check=True,
         capture_output=True,
+        env=fixture_git_env(),
     )
     subprocess.run(
         ["git", "-C", str(fake_proj), "config", "user.name", "t"],
         check=True,
         capture_output=True,
+        env=fixture_git_env(),
     )
     # Avoid the branch-policy check depending on the default branch name.
     subprocess.run(
         ["git", "-C", str(fake_proj), "checkout", "-q", "-b", "feature-wl-x"],
         check=True,
         capture_output=True,
+        env=fixture_git_env(),
     )
 
     if with_runner:
@@ -168,7 +176,7 @@ def _install_into_git_project(
         runner.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n", encoding="utf-8")
 
     env = {
-        **os.environ,
+        **fixture_git_env(),
         "HOME": str(fake_home),
         "SRC_DIR": str(fake_src),  # in case the script honours an override
     }
@@ -187,7 +195,7 @@ def _install_into_git_project(
 def _simulate_dev_push(project: Path) -> subprocess.CompletedProcess:
     """Run the project's installed pre-push hook with a simulated dev push."""
     env = {
-        **os.environ,
+        **fixture_git_env(),
         "CONTEXT_BUDGET_SKIP": "1",
         "WORKLOG_SKIP_PRE_PUSH": "1",
         "BRANCH_POLICY_SKIP": "1",

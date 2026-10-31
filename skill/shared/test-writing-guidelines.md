@@ -207,7 +207,13 @@ with mock.patch.object(audit_runner.subprocess, "run",
    `tmp_path` path with only `cwd=` for isolation. The guard in
    [`skill/shared/live_repo_guard.py`](../shared/live_repo_guard.py) (armed by
    the repo-root [`conftest.py`](../../conftest.py)) fails the session if a test
-   mutates the checkout.
+   mutates the checkout. The same `conftest.py` arms
+   [`skill/shared/inherited_index_guard.py`](../shared/inherited_index_guard.py),
+   which fails the test that stages into an inherited `GIT_INDEX_FILE` — the
+   finish gate exports its temporary would-be-commit index, so a raw `git add`
+   in a fixture repository would corrupt the gate's evidence
+   (SA-0MVWQ4FZ4003S0GE; see
+   [docs/dev/test-isolation.md](../../docs/dev/test-isolation.md#97-inherited-git_index_file-fixture-rule-and-per-test-guard-sa-0mvwq4fz4003s0ge)).
 8. **Tests that reach the audit child-cascade / suite subprocess must mock
    `audit_runner.subprocess.run`** (see anti-pattern 10) so no real
    `audit_runner.py issue` child is spawned; assert the mocked invocation

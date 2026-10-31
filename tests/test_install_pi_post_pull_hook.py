@@ -29,6 +29,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import fixture_git_env, run_git
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_pi.sh"
@@ -86,13 +87,8 @@ def _run_install(
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    """Run a git command in the fixture repo, hermetically."""
+    return run_git(repo, args, check=True)
 
 
 def _make_git_project(root: Path, name: str = "project") -> Path:
@@ -207,7 +203,7 @@ class TestInstalledHookBehaviour:
         marker = sandbox / "wl-calls.txt"
         _fake_wl(sandbox / "bin", marker)
         env = {
-            **os.environ,
+            **fixture_git_env(),
             "PATH": f"{sandbox / 'bin'}{os.pathsep}{os.environ['PATH']}",
         }
         env.pop("WORKLOG_SKIP_POST_PULL", None)
@@ -230,7 +226,7 @@ class TestInstalledHookBehaviour:
         marker = sandbox / "wl-calls.txt"
         _fake_wl(sandbox / "bin", marker)
         env = {
-            **os.environ,
+            **fixture_git_env(),
             "PATH": f"{sandbox / 'bin'}{os.pathsep}{os.environ['PATH']}",
             "WORKLOG_SKIP_POST_PULL": "1",
         }
@@ -255,7 +251,7 @@ class TestInstalledHookBehaviour:
         # Resolve `sh` before narrowing PATH so the hook itself can start.
         sh = shutil.which("sh")
         assert sh is not None, "precondition: sh must be available"
-        env = {**os.environ, "PATH": str(empty_bin)}
+        env = {**fixture_git_env(), "PATH": str(empty_bin)}
         env.pop("WORKLOG_SKIP_POST_PULL", None)
 
         result = subprocess.run(
@@ -290,7 +286,7 @@ class TestGitCheckoutIntegration:
         marker = sandbox / "wl-calls.txt"
         _fake_wl(sandbox / "bin", marker)
         env = {
-            **os.environ,
+            **fixture_git_env(),
             "HOME": str(home),
             "PATH": f"{sandbox / 'bin'}{os.pathsep}{os.environ['PATH']}",
         }

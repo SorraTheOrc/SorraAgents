@@ -21,6 +21,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import fixture_git_env
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -40,7 +41,10 @@ def _make_repo(
     -f`` so they can be *tracked yet gitignored* (the case AC2 pins).
     """
     subprocess.run(
-        ["git", "init", "-q", str(root)], check=True, capture_output=True
+        ["git", "init", "-q", str(root)],
+        check=True,
+        capture_output=True,
+        env=fixture_git_env(),
     )
     if gitignore is not None:
         (root / ".gitignore").write_text(gitignore, encoding="utf-8")
@@ -49,13 +53,17 @@ def _make_repo(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
     subprocess.run(
-        ["git", "-C", str(root), "add", "-A"], check=True, capture_output=True
+        ["git", "-C", str(root), "add", "-A"],
+        check=True,
+        capture_output=True,
+        env=fixture_git_env(),
     )
     for rel in force_add:
         subprocess.run(
             ["git", "-C", str(root), "add", "-f", rel],
             check=True,
             capture_output=True,
+            env=fixture_git_env(),
         )
     return root
 
@@ -67,6 +75,7 @@ def _tracked_files(root: Path) -> list[str]:
         capture_output=True,
         text=True,
         check=True,
+        env=fixture_git_env(),
     )
     return [line for line in proc.stdout.splitlines() if line.strip()]
 

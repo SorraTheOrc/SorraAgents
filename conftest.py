@@ -18,6 +18,19 @@ package (``ModuleNotFoundError: No module named 'tests.<name>'``). This conftest
 hooks ``pytest_ignore_collect`` to skip any ``skill/<name>/`` directory that
 is **not** tracked by git, so the full suite always passes regardless of
 concurrent WIP.
+
+Inherited-``GIT_INDEX_FILE`` guard (SA-0MVWQ4FZ4003S0GE): ``implement.py
+finish`` exports its temporary would-be-commit index for the suite it runs
+(SA-0MVQHVGFR006W8LG) and that variable deliberately survives the
+repository-override scrub (SA-0MVQHV9Y3001RNNW). A fixture git helper that
+runs raw ``git add`` in its own throwaway repository therefore stages into the
+*gate's* index, and the gate can no longer attribute its verdict — historically
+reported post-hoc as ``gate evidence invalid`` with no culprit named. The
+autouse fixture below polls the inherited index after every test and fails the
+test that wrote it, naming the test and the remediation (the hermetic helpers
+in ``skill/shared/git_sandbox.py``). It is inert without an inherited index and
+is bound to the index inherited at session start, so a test that exports its
+own index on purpose is unaffected.
 """
 
 from __future__ import annotations
@@ -25,6 +38,7 @@ from __future__ import annotations
 import functools
 import importlib.util
 import subprocess
+import sys
 import warnings
 from pathlib import Path
 
@@ -32,6 +46,7 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _GUARD_PATH = _REPO_ROOT / "skill" / "shared" / "live_repo_guard.py"
+_INDEX_GUARD_PATH = _REPO_ROOT / "skill" / "shared" / "inherited_index_guard.py"
 
 
 def _load_guard_module():
@@ -43,7 +58,47 @@ def _load_guard_module():
     return module
 
 
+def _load_index_guard_module():
+    spec = importlib.util.spec_from_file_location(
+        "_inherited_index_guard", _INDEX_GUARD_PATH
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise RuntimeError(f"cannot load index guard from {_INDEX_GUARD_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec: ``dataclasses`` resolves ``cls.__module__`` through
+    # ``sys.modules`` while the class body is being processed, so a module
+    # loaded by location without this entry fails at import time.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 _guard = _load_guard_module()
+
+#: Watch on the inherited ``GIT_INDEX_FILE``, armed at session start when the
+#: finish gate exported one (``None`` for an ordinary ``pytest`` invocation).
+_index_watch = None
+
+#: ``pytest_configure`` can run more than once in a process (a test that calls
+#: ``pytest.main`` / ``run_tests`` in-process). The baseline must stay the index
+#: inherited by the *outermost* session — a nested run's own gate index (a
+#: throwaway repository's) is deliberately not watched.
+_index_guard_armed = False
+
+
+def _arm_inherited_index_guard(config) -> None:
+    """Arm the inherited-index guard for this session, when applicable."""
+    global _index_watch, _index_guard_armed
+    if _index_guard_armed:
+        return
+    if getattr(config.option, "collectonly", False):
+        return
+    if hasattr(config, "workerinput"):
+        # An xdist worker must not fail a test for a write another worker made:
+        # the file is shared, the ownership of the write is not.
+        return
+    _index_guard_armed = True
+    _index_watch = _load_index_guard_module().IndexWatch.capture(_REPO_ROOT)
 
 
 @functools.cache
@@ -107,6 +162,7 @@ def pytest_ignore_collect(collection_path: Path, config):
 
 def pytest_configure(config):
     _guard.register(config, root=_REPO_ROOT)
+    _arm_inherited_index_guard(config)
     untracked = _untracked_skill_dirs()
     if untracked:
         warnings.warn(
@@ -114,6 +170,31 @@ def pytest_configure(config):
             "excluded from collection: " + ", ".join(untracked),
             stacklevel=1,
         )
+
+
+@pytest.fixture(autouse=True)
+def _inherited_index_unchanged(request):
+    """Fail the test that staged into the finish gate's inherited index.
+
+    The suite runs under ``implement.py finish`` with ``GIT_INDEX_FILE``
+    pointing at the gate's temporary would-be-commit index
+    (SA-0MVQHVGFR006W8LG), which deliberately survives the repository-override
+    scrub (SA-0MVQHV9Y3001RNNW). A fixture that runs raw ``git add`` in its own
+    repository then rewrites that index instead of its own, and the gate can no
+    longer attribute its verdict. This fixture names the offending test instead
+    of leaving the failure anonymous at the end of the suite
+    (SA-0MVWQ4FZ4003S0GE).
+
+    It is a no-op without an inherited index, and it watches only the index
+    inherited at session start — a test that deliberately exports its own
+    ``GIT_INDEX_FILE`` is exercising that contract, not violating it.
+    """
+    yield
+    if _index_watch is None:
+        return
+    report = _index_watch.poll()
+    if report:
+        pytest.fail(f"{report}\n  offending test: {request.node.nodeid}", pytrace=False)
 
 
 @pytest.fixture(autouse=True)

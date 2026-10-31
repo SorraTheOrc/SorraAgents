@@ -216,7 +216,16 @@ Every test helper that shells out to **real `git`** must:
    (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG`, `GIT_CONFIG_GLOBAL`) and set
    fixture-local identity (`user.name`/`user.email`) explicitly;
 4. avoid `git init`-on-an-existing-repo patterns that silently re-target an
-   enclosing repository.
+   enclosing repository;
+5. never inherit an ambient `GIT_INDEX_FILE` — the finish gate exports its
+   temporary would-be-commit index for the suite it runs, and a fixture that
+   inherits it stages into the *gate's* index instead of its own (see §9.7).
+
+The single way to satisfy (3) and (5) is to run fixture git commands through
+`shared.git_sandbox.run_git(...)`, or to pass
+`shared.git_sandbox.fixture_git_env()` as the subprocess `env`. A command that
+deliberately targets a specific index passes that path explicitly
+(`env={"GIT_INDEX_FILE": path}`); the explicit value wins.
 
 The shared sandbox helper and the two regression guards (a `run_tests.py`
 pre/post snapshot and a repo-root autouse `conftest` fixture) are delivered by
@@ -697,6 +706,118 @@ rather than inheriting them. The production hook's documented
 (pollutes the parent environment, asserts `_env()` omits every bypass switch,
 and asserts the mismatched-identity case still reports `git identity mismatch`
 and skips `wl sync`).
+
+### 9.7 Inherited `GIT_INDEX_FILE`: fixture rule and per-test guard (SA-0MVWQ4FZ4003S0GE)
+
+`implement.py finish` stages the *would-be commit* into a temporary index
+inside the repository's git directory and exports `GIT_INDEX_FILE` for the
+suite it runs (SA-0MVQHVGFR006W8LG). That variable **deliberately survives**
+the repository-override scrub (§9.2) so child `git ls-files` guards see the
+staged tree (SA-0MVQHV9Y3001RNNW). The consequence for fixtures is direct:
+every `git` subprocess a test spawns inherits the gate's index, so a helper
+that runs raw `git init` / `add` / `commit` in its own throwaway repository
+stages into the **gate's** index. The gate then refuses its own verdict —
+
+```
+gate evidence invalid: the temporary index changed while the suite ran …
+Fixture git commands must use a hermetic environment
+```
+
+— and the failure is unattributable: the verdict belongs to the whole suite,
+not to the test that wrote the index.
+
+#### The rule
+
+Fixture git commands use the hermetic helpers:
+
+```python
+from shared.git_sandbox import commit_all, fixture_git_env, init_repo, run_git
+
+repo = init_repo(tmp_path / "repo", sandbox_root=tmp_path)   # own index, pinned identity
+(repo / "f.txt").write_text("x\n", encoding="utf-8")
+run_git(repo, ["add", "-A"], check=True)                     # never the inherited index
+commit_all(repo, "init")
+```
+
+- `run_git` / `fixture_git_env` scrub the repository overrides **and** drop an
+  inherited `GIT_INDEX_FILE` (`fixture_git_env`); `git_env_for_repo` — the
+  *inspection* helper used by production paths — keeps the ambient index only
+  when it belongs to the repository being inspected.
+- A test that intentionally drives a specific index passes it explicitly
+  (`run_git(repo, [...], env={"GIT_INDEX_FILE": str(index)})`); the explicit
+  value wins over the scrub.
+- The variables that must stay inherited (`GIT_INDEX_FILE`, and by design every
+  other non-override variable) are pinned by
+  `tests/test_git_index_file_env.py`.
+
+#### The guard
+
+The repo-root `conftest.py` arms `skill/shared/inherited_index_guard.py`
+(`IndexWatch`) at session start:
+
+- it records the **inherited** index path, its staged tree (`git write-tree`)
+  and a content digest — only when `GIT_INDEX_FILE` names an existing file, so
+  an ordinary `pytest` run is unaffected;
+- an autouse fixture polls it after **every** test and fails the offending test
+  **by name**, with the index path, the tested tree vs the index tree now, and
+  the `run_git` / `fixture_git_env` remediation;
+- the stat signature is only a *trigger*: a rewrite that stages the same
+  entries (a git stat-cache refresh) is not a violation, so there are no false
+  positives;
+- after reporting, the watch re-baselines on the current state, so only the
+  first offending test is named instead of every later test in the session;
+- it is bound to the index inherited at **session start**, so a test that
+  exports its own `GIT_INDEX_FILE` on purpose (the finish-gate tests) is not
+  affected;
+- it stands down under `--collect-only` and under xdist workers, where a write
+  cannot be attributed to the test in this process.
+
+#### Relationship to the package-level env isolation
+
+`tests/conftest.py` (session- and function-scoped), `skill/implement/tests/`
+and `skill/test/tests/` keep autouse fixtures that *delete* the inherited
+`GIT_INDEX_FILE` for their tests. Those remain deliberately, as a complementary
+layer, not a substitute for the rule above:
+
+- they cover tests that drive **production** git-inspecting code against a
+  fixture repository (e.g. `refactor.session_boundary.get_all_source_files`,
+  `generate_standup.commit_report_file`, `implement.phase_finish`). Production
+  code must honour an index that belongs to the repository it inspects, so its
+  environment cannot be scrubbed; the isolation has to happen at the test
+  boundary instead;
+- the guard therefore only ever fires where the inherited index is visible
+  (`skill/*/tests/` packages without such a fixture, or a fixture that
+  explicitly re-inherits it), and it names the test when it does;
+- where the isolation applies, the guard is inert by construction, which is why
+  the fixture-level rule (hermetic helpers) is the primary control and the
+  sweep above matters even for packages that pop the variable.
+
+#### Regression coverage
+
+- `skill/shared/tests/test_inherited_index_guard.py` — `IndexWatch` unit
+  behaviour (no inherited index → inert; hermetic fixture stays silent; raw
+  fixture staging into the inherited index is reported once and re-baselined;
+  a same-tree rewrite is not a violation) plus an end-to-end **simulated gate
+  run**: the real `conftest.py` and guard modules are copied, unchanged, into a
+  throwaway project whose suite contains one hermetic and one poisoning test.
+  The hermetic run stays green and leaves the index byte-identical; the
+  poisoning run fails and the output names the offending test and the
+  remediation.
+- `tests/test_finish_gate_temp_index.py` — the gate's own post-suite integrity
+  check (the last line of defence when a nested suite has no conftest).
+- The fixture sweep itself — `tests/` and `skill/*/tests/` helpers now route
+  their git commands through the shared hermetic helpers (the sentinel case
+  being `tests/test_test_cache.py`, whose raw `git add -A` produced the
+  measured gate index corruption on 2026-10-31). Production paths that inspect
+  a *named* repository keep an ambient index only when it belongs to that
+  repository (`git_env_for_repo`), which is why
+  `generate_standup.commit_report_file`'s default runner no longer inherits a
+  foreign index.
+- `skill/implement/tests/test_repo_root_resolution.py` clears
+  `IMPLEMENT_DRIVE_ACTIVE` for the removal assertion: a driven child session
+  defers worktree removal by design, so without it the test fails inside any
+  driven session's own `finish` gate run — an environment-dependent failure of
+  the same family as the ones this item fixes.
 
 ## 10. Tests never emit real release notifications (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL)
 

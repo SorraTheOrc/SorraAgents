@@ -44,6 +44,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from shared.git_sandbox import run_git
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -598,11 +599,8 @@ class TestFinishFailureTerminalReconciliation:
 
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
-    """Run a git command in *cwd* and raise on failure (test helper)."""
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd), check=True,
-        capture_output=True, text=True,
-    )
+    """Run a git command in *cwd* hermetically, raising on failure."""
+    return run_git(cwd, args, check=True)
 
 
 @pytest.fixture

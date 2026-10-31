@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import run_git
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
@@ -59,14 +60,8 @@ def implement_mod():
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    """Run a git command, raising on failure."""
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    """Run a git command hermetically, asserting it succeeded."""
+    proc = run_git(cwd, args)
     assert proc.returncode == 0, (
         f"git {' '.join(args)} failed in {cwd}\n"
         f"STDOUT:{proc.stdout}\nSTDERR:{proc.stderr}"

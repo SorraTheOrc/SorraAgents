@@ -23,7 +23,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +34,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) in sys.path:
     sys.path.remove(str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT))
+
+from shared.git_sandbox import fixture_git_env
 
 from skill.implement.scripts import implement
 
@@ -55,14 +56,19 @@ _gate_calls: list[tuple[str, str | None]] = []
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    """Run a real git command in *cwd* with a hermetic identity."""
+    """Run a real git command in *cwd* with a hermetic environment/identity.
+
+    ``fixture_git_env`` drops repository overrides *and* an inherited
+    ``GIT_INDEX_FILE`` (the finish gate's temporary index), so the fixture
+    repositories below can never stage into it (SA-0MVWQ4FZ4003S0GE).
+    """
     return subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         check=True,
         capture_output=True,
         text=True,
-        env={**os.environ, **_GIT_ENV},
+        env={**fixture_git_env(), **_GIT_ENV},
     )
 
 
@@ -361,14 +367,23 @@ def test_fresh_start_from_main_checkout_records_main_checkout_as_repo_root(
 
 
 def test_finish_rejects_stale_state_repo_root_and_removes_worktree(
-    repo_with_worktree, caplog
+    repo_with_worktree, caplog, monkeypatch
 ):
     """A state file naming the worktree as ``repo_root`` no longer strands it.
 
     ``phase_finish`` must treat that value as stale, derive the main checkout
     root from the worktree (logging both values at WARNING) and hand the
     correct root to ``_remove_worktree`` — never the worktree itself (AC2).
+
+    ``IMPLEMENT_DRIVE_ACTIVE`` is cleared for the test: a driven child session
+    defers worktree removal by design (the tree is that session's cwd), so the
+    assertion below only describes the non-driven behaviour. Without this the
+    test is environment-dependent — it fails inside any driven session, e.g. a
+    child's own ``implement.py finish`` gate run (SA-0MVWQ4FZ4003S0GE).
     """
+    monkeypatch.delenv("IMPLEMENT_DRIVE_ACTIVE", raising=False)
+    monkeypatch.delenv("IMPLEMENT_KEEP_WORKTREE", raising=False)
+
     main, worktree = repo_with_worktree
     implement.write_state(
         implement.ImplementState(
