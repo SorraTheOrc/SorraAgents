@@ -483,29 +483,33 @@ class TestChangedScopeCommands:
     # selection untouched: hidden project-local skill tests are enforced at
     # full scope only. These assertions must stay green after F1–F3.
 
-    def test_skill_test_file_change_emits_subset_command(self) -> None:
-        """A changed *test* file under ``skill/test/`` selects exactly that
-        file (the current subset-command expectation)."""
+    def test_skill_test_file_change_selects_the_test_group(self) -> None:
+        """A changed *test* file under ``skill/test/`` matches this repo's
+        declared ``test`` group, so the group's command is selected.
+
+        Declared ``groups`` take precedence over file-level convention
+        mapping for a repo that declares them (SA-0MVL7YOMJ006UMDO), so the
+        selection is the group command rather than a single-file command.
+        """
         cmds = changed_scope_commands(
             _REPO_ROOT,
             changed_files={"skill/test/tests/test_suite_resolution.py"},
         )
-        assert cmds == [
-            (
-                "pytest -q -r a --disable-warnings "
-                "skill/test/tests/test_suite_resolution.py"
-            )
-        ]
+        assert cmds == ["pytest -q -r a --disable-warnings skill/test/tests/"]
 
-    def test_skill_script_change_falls_back_to_full_scope(self) -> None:
-        """A non-test change under ``skill/test/`` selects no subset today
-        (skill sources are not in the heuristic's test trees), so the caller
-        falls back to the full suite."""
+    def test_skill_script_change_selects_the_test_group(self) -> None:
+        """A non-test change under ``skill/test/`` matches the declared
+        ``test`` group's ``paths``, so the group command runs instead of the
+        full suite (SA-0MVL7YOMJ006UMDO).
+
+        Before group honouring this change set selected nothing (skill
+        sources are not test files) and fell back to the full suite.
+        """
         cmds = changed_scope_commands(
             _REPO_ROOT,
             changed_files={"skill/test/scripts/run_tests.py"},
         )
-        assert cmds is None
+        assert cmds == ["pytest -q -r a --disable-warnings skill/test/tests/"]
 
     def test_hidden_skill_test_file_change_selects_that_file(
         self, tmp_path: Path,
