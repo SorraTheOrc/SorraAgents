@@ -22,6 +22,7 @@ import pytest
 import test.scripts.run_tests as rt
 import test_cache as tc
 import test_runner as tr
+from shared.git_sandbox import fixture_git_env
 from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
@@ -31,7 +32,16 @@ from test_runner import (
 
 
 def git(repo: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    """Run a git command in the fixture repo with a hermetic environment.
+
+    The finish gate exports a temporary ``GIT_INDEX_FILE`` for the suite it
+    runs (SA-0MVQHVGFR006W8LG); a fixture must not stage into that index or
+    the gate cannot attribute its verdict to the would-be-commit tree
+    (SA-0MVQHVHXI007PQAB).
+    """
+    subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, env=fixture_git_env()
+    )
 
 
 def _reset_pytest_cache() -> None:

@@ -37,6 +37,7 @@ for _path in (str(REPO_ROOT), str(_SKILLS_ROOT), str(_RUNNER_DIR)):
         sys.path.insert(0, _path)
 
 from run_tests import nested_semaphore_dir
+from shared.git_sandbox import fixture_git_env
 from shared.process_semaphore import Semaphore
 
 RUN_TESTS_PY = _RUNNER_DIR / "run_tests.py"
@@ -94,15 +95,27 @@ def _make_noop_project(tmp_path: Path, name: str = "nested-repo") -> Path:
         ["git", "config", "user.email", "nested-test@example.com"],
         ["git", "config", "user.name", "Nested Test"],
     ):
-        subprocess.run(args, cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            args, cwd=repo, check=True, capture_output=True, env=fixture_git_env()
+        )
     (repo / ".pi").mkdir()
     (repo / ".pi" / "test-config.json").write_text(
         json.dumps({"suiteCommands": ["bash noop.sh"]}), encoding="utf-8"
     )
     (repo / "noop.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
     subprocess.run(
-        ["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, capture_output=True
+        ["git", "add", "-A"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=fixture_git_env(),
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=fixture_git_env(),
     )
     return repo
 

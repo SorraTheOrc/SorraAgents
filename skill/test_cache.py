@@ -56,6 +56,7 @@ Entry layout (stable, documented for read-only consumers)::
                          "git_state_at_start":...,
                          "scope": "full"|"changed",
                          "test_type": "full"|"unit"|...,
+                         "fingerprint_kind": "worktree"|"tree",
                          "interpreter": "<pytest interpreter/exe>",
                          "exit_code":..., "completed_at": <epoch float>}
         stdout.txt      full stdout of the run
@@ -86,6 +87,15 @@ historical default, so older entries without the field read as full). Only
 ``test_type == "full"`` populates the audit-accepted full-suite entry; other
 types use independent cache keys (the type is part of the key) so a partial
 typed run can never satisfy a "full test suite passes" acceptance criterion.
+
+``fingerprint_kind`` records *which kind* of fingerprint keys the entry —
+``"worktree"`` (the default: :func:`compute_git_state`, HEAD plus the loose
+working-tree contents) or ``"tree"`` (a would-be-commit tree SHA computed by
+:func:`compute_tree_state`). It is the entry's provenance: a consumer that asks
+for a tree fingerprint is never served an entry recorded for a loose state, and
+an entry that predates the field reads as ``"worktree"`` (historical
+default), so a tree request misses it and fails closed rather than accepting a
+verdict recorded for a differently-identified tree (SA-0MVL2NH1G0094FA2 AC4).
 
 Writes are atomic (temp file + ``os.replace``); no locking is used.
 """
@@ -130,6 +140,12 @@ class GitStateUnavailable(RuntimeError):
     every dirty tree share one key (WL-0MVPO9P610055UQ3).
     """
 
+
+#: Fingerprint provenance kinds. ``worktree`` is the historical default (the
+#: loose :func:`compute_git_state` fingerprint); ``tree`` is an explicitly
+#: supplied would-be-commit tree SHA (:func:`compute_tree_state`).
+FINGERPRINT_KIND_WORKTREE = "worktree"
+FINGERPRINT_KIND_TREE = "tree"
 
 DEFAULT_TTL_SECONDS = 2 * 60 * 60  # 2 hours (operator decision)
 # Non-zero-exit runs get a much shorter TTL (SA-0MSJELL44009XYIL): a failed
@@ -258,6 +274,65 @@ def compute_git_state(cwd: str | Path | None = None, *, strict: bool = False) ->
         hasher.update(b"\0status\0" + status.encode("utf-8", "surrogateescape"))
         _update_with_path_content(hasher, base, path, strict=strict)
     return hasher.hexdigest()
+
+
+def compute_tree_state(
+    index_file: str | Path, *, cwd: str | Path | None = None
+) -> str:
+    """Return the tree SHA (``git write-tree``) of the index at *index_file*.
+
+    This is the fingerprint of a *would-be commit tree*: the gate stages the
+    pending change set into an index (a temporary copy when it must not touch
+    the real one) and the commit that follows produces exactly this tree.
+    Unlike :func:`compute_git_state` it is not blind to generated, gitignored
+    metadata — the tree records what the commit would contain, so a suite that
+    reads on-disk generated files is bound to the tree it actually validated
+    (SA-0MVL2NH1G0094FA2 AC4).
+
+    Args:
+        index_file: Path to the index to read — the repository's real
+            ``.git/index`` or a temporary copy (never left modified here).
+        cwd: Repository/worktree to run ``git`` in. Defaults to the current
+            working directory; the finish gate passes its worktree explicitly.
+
+    Returns:
+        The 40-character tree SHA ``git write-tree`` reports for *index_file*.
+
+    Raises:
+        RuntimeError: when the index cannot be read or ``git write-tree``
+            fails (missing repository, unreadable index). Failing loudly is
+            deliberate: a silent fallback to the loose working-tree
+            fingerprint would reintroduce the unattributable verdict this
+            fingerprint exists to prevent.
+    """
+    resolved_index = str(Path(index_file).resolve())
+    resolved_cwd = str(Path(cwd or os.getcwd()).resolve())
+    # GIT_INDEX_FILE names the index explicitly and is *not* one of the
+    # repository-override variables the shared scrub removes (F3,
+    # SA-0MVQHV9Y3001RNNW), so it survives here.
+    env = subprocess_env_with_scrubbed_overrides()
+    env["GIT_INDEX_FILE"] = resolved_index
+    try:
+        proc = subprocess.run(
+            ["git", "write-tree"],
+            cwd=resolved_cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"Cannot compute the tree state of index {resolved_index}: {exc}"
+        ) from exc
+    tree = proc.stdout.strip()
+    if proc.returncode != 0 or not tree:
+        raise RuntimeError(
+            f"Cannot compute the tree state of index {resolved_index}: "
+            f"{proc.stderr.strip() or 'git write-tree failed'}"
+        )
+    return tree
 
 
 def _status_entries(cwd: str, *, strict: bool = False) -> list[tuple[str, str]]:
@@ -445,21 +520,31 @@ def lookup(
     cwd: str | Path | None = None,
     ttl: float = DEFAULT_TTL_SECONDS,
     test_type: str = "full",
+    fingerprint_kind: str = FINGERPRINT_KIND_WORKTREE,
 ) -> dict[str, Any] | None:
     """Return a cached run entry or None on miss/corruption/expiry.
 
     A hit requires the stored git state to match *git_state*, the stored
-    ``test_type`` to match *test_type*, AND the run to be within *ttl*
-    seconds old. Corrupt or unreadable entries are treated as a miss (fresh
-    run) and never raise into the caller.
+    ``test_type`` to match *test_type*, the stored ``fingerprint_kind`` to
+    match *fingerprint_kind*, AND the run to be within *ttl* seconds old.
+    Corrupt or unreadable entries are treated as a miss (fresh run) and never
+    raise into the caller.
+
+    *fingerprint_kind* names the fingerprint namespace *git_state* belongs to:
+    ``"worktree"`` (default — the loose :func:`compute_git_state` fingerprint;
+    entries that predate the provenance field read as worktree, so existing
+    consumers keep their historical hits) or ``"tree"`` (an explicit
+    would-be-commit tree SHA from :func:`compute_tree_state`; an entry without
+    provenance metadata, or recorded for a loose state, is a miss so a verdict
+    is never accepted for a differently-identified tree).
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
-    (epoch float), ``command`` (normalized), ``git_state``, ``scope``
-    (``"full"`` for historical entries lacking the field — see module docs),
-    ``test_type`` (``"full"`` for historical entries lacking the field) and
-    ``cached: True``. ``interpreter`` names the concrete interpreter/executable
-    recorded for a pytest run (empty for non-pytest commands and entries that
-    predate the field).
+    (epoch float), ``command`` (normalized), ``git_state``, ``fingerprint_kind``,
+    ``scope`` (``"full"`` for historical entries lacking the field — see module
+    docs), ``test_type`` (``"full"`` for historical entries lacking the field)
+    and ``cached: True``. ``interpreter`` names the concrete
+    interpreter/executable recorded for a pytest run (empty for non-pytest
+    commands and entries that predate the field).
     """
     entry_dir = _entry_dir(command, git_state, cwd or os.getcwd(), test_type)
     meta_path = entry_dir / "metadata.json"
@@ -476,6 +561,12 @@ def lookup(
         return None  # stale state: never return stale data silently
     if meta.get("test_type", "full") != test_type:
         return None  # type mismatch: never serve one profile as another
+    # Provenance: an entry with no recorded kind is a loose-worktree entry
+    # (the historical default). A tree request therefore always misses it,
+    # and a worktree request never accepts a tree-bound verdict.
+    stored_kind = meta.get("fingerprint_kind", FINGERPRINT_KIND_WORKTREE)
+    if stored_kind != fingerprint_kind:
+        return None
     completed_at = float(meta.get("completed_at", 0))
     exit_code = int(meta.get("exit_code", 0))
     # Failed runs expire after the short failed-run TTL; green runs keep the
@@ -491,6 +582,7 @@ def lookup(
         "completed_at": completed_at,
         "command": meta.get("command", normalize_test_command(command)),
         "git_state": git_state,
+        "fingerprint_kind": fingerprint_kind,
         "scope": meta.get("scope", "full"),
         "test_type": meta.get("test_type", "full"),
         "interpreter": meta.get("interpreter", ""),
@@ -511,6 +603,7 @@ def store(
     test_type: str = "full",
     interpreter: str = "",
     git_state_at_start: str = "",
+    fingerprint_kind: str = FINGERPRINT_KIND_WORKTREE,
 ) -> Path:
     """Persist a run result, replacing any existing entry for the same key.
 
@@ -542,6 +635,11 @@ def store(
     the cache key — so the choice of interpreter is auditable per entry
     (SA-0MVK154IE007OS3D AC2).
 
+    *fingerprint_kind* records the provenance of *git_state*: ``"worktree"``
+    (default — the loose :func:`compute_git_state` fingerprint) or ``"tree"``
+    (an explicit would-be-commit tree SHA). Read-only consumers and later
+    lookups use it to refuse verdicts recorded for a different kind of tree.
+
     Returns the entry directory path.
     """
     entry_dir = _entry_dir(command, git_state, cwd or os.getcwd(), test_type)
@@ -555,6 +653,7 @@ def store(
         "git_state_at_start": git_state_at_start,
         "scope": scope,
         "test_type": test_type,
+        "fingerprint_kind": fingerprint_kind,
         "interpreter": interpreter,
         "exit_code": int(exit_code),
         "completed_at": completed_at if completed_at is not None else time.time(),
@@ -615,6 +714,7 @@ def run_cached(
     runner: Runner = _default_runner,
     scope: str = "full",
     test_type: str = "full",
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run *command* through the cache.
 
@@ -643,24 +743,47 @@ def run_cached(
     - *test_type* (default ``"full"``) selects the typed-profile cache
       namespace; non-``full`` types use independent keys and only ``full``
       populates the audit-accepted full-suite entry.
+    - *fingerprint* (default ``None``) is an **explicit expected fingerprint**
+      — normally a would-be-commit tree SHA from :func:`compute_tree_state`.
+      When supplied it keys the entry and the lookup instead of the loose
+      :func:`compute_git_state` value (which is then not computed at all), and
+      the entry is recorded with ``fingerprint_kind="tree"``. A stored entry
+      whose fingerprint differs, or that predates the provenance metadata, is
+      a miss: a cached verdict is accepted only for a matching tree. Callers
+      that pass nothing keep the historical loose-worktree keys byte for byte
+      (test skill CLI, audit, pre-push).
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
     (epoch float), ``command`` (normalized), ``git_state`` (the state the
     entry is keyed on — empty when the cache was bypassed for an
-    indeterminate state), ``scope``, ``test_type``, ``interpreter`` (the
-    concrete interpreter/executable that ran pytest, empty for non-pytest
-    commands) and ``cached`` (True when served from cache).
+    indeterminate state), ``fingerprint_kind`` (``"worktree"`` or ``"tree"``),
+    ``scope``, ``test_type``, ``interpreter`` (the concrete
+    interpreter/executable that ran pytest, empty for non-pytest commands) and
+    ``cached`` (True when served from cache).
     """
     cwd_path = Path(cwd or os.getcwd()).resolve()
     cwd_str = str(cwd_path)
 
     # ``no_cache`` never reads or writes the cache, so it needs no fingerprint
     # (and must not fail when the tree cannot be fingerprinted).
-    git_state_before = None if no_cache else _fingerprint_for_cache(cwd_str)
+    if fingerprint is not None:
+        # Explicit expected fingerprint (a would-be-commit tree SHA): bind the
+        # verdict to the tree the caller named and never recompute — or let it
+        # be replaced by — the loose worktree state.
+        git_state_before = None if no_cache else str(fingerprint)
+        fingerprint_kind = FINGERPRINT_KIND_TREE
+    else:
+        git_state_before = None if no_cache else _fingerprint_for_cache(cwd_str)
+        fingerprint_kind = FINGERPRINT_KIND_WORKTREE
 
     if not force and git_state_before is not None:
         hit = lookup(
-            command, git_state_before, cwd=cwd_str, ttl=ttl, test_type=test_type
+            command,
+            git_state_before,
+            cwd=cwd_str,
+            ttl=ttl,
+            test_type=test_type,
+            fingerprint_kind=fingerprint_kind,
         )
         # A cached entry recorded under a different scope is not a valid hit
         # for this request (scope is stored in metadata; the cache key is the
@@ -680,17 +803,13 @@ def run_cached(
 
     git_state = git_state_before or ""
     if not no_cache:
-        # Key the entry on the state the run left behind: that is the state
-        # every later consumer computes, so a completed run is always
-        # queryable. The pre-run state is kept as metadata only — it never
-        # keys the entry, because transient churn present when a run starts
-        # can be gone by the time it finishes (WL-0MVPO9P610055UQ3).
-        git_state_after = _fingerprint_for_cache(cwd_str)
-        if git_state_after is not None:
-            git_state = git_state_after
+        if fingerprint is not None:
+            # An explicit fingerprint describes the tree the caller named; it
+            # cannot be recomputed from the (possibly churned) worktree after
+            # the run, so it keys the entry as-is.
             store(
                 normalized,
-                git_state_after,
+                git_state,
                 cwd=cwd_str,
                 stdout=proc.stdout or "",
                 stderr=proc.stderr or "",
@@ -700,7 +819,31 @@ def run_cached(
                 test_type=test_type,
                 interpreter=interpreter,
                 git_state_at_start=git_state_before or "",
+                fingerprint_kind=FINGERPRINT_KIND_TREE,
             )
+        else:
+            # Key the entry on the state the run left behind: that is the
+            # state every later consumer computes, so a completed run is
+            # always queryable. The pre-run state is kept as metadata only —
+            # it never keys the entry, because transient churn present when a
+            # run starts can be gone by the time it finishes
+            # (WL-0MVPO9P610055UQ3).
+            git_state_after = _fingerprint_for_cache(cwd_str)
+            if git_state_after is not None:
+                git_state = git_state_after
+                store(
+                    normalized,
+                    git_state_after,
+                    cwd=cwd_str,
+                    stdout=proc.stdout or "",
+                    stderr=proc.stderr or "",
+                    exit_code=proc.returncode,
+                    completed_at=completed_at,
+                    scope=scope,
+                    test_type=test_type,
+                    interpreter=interpreter,
+                    git_state_at_start=git_state_before or "",
+                )
 
     return {
         "stdout": proc.stdout or "",
@@ -709,6 +852,7 @@ def run_cached(
         "completed_at": completed_at,
         "command": normalized,
         "git_state": git_state,
+        "fingerprint_kind": fingerprint_kind,
         "scope": scope,
         "test_type": test_type,
         "interpreter": interpreter,
@@ -769,10 +913,13 @@ def summary_lines(
 __all__ = [
     "DEFAULT_TTL_SECONDS",
     "FAILED_RUN_TTL_SECONDS",
+    "FINGERPRINT_KIND_TREE",
+    "FINGERPRINT_KIND_WORKTREE",
     "GitStateUnavailable",
     "cache_dir",
     "cache_key",
     "compute_git_state",
+    "compute_tree_state",
     "lookup",
     "normalize_test_command",
     "query_cached",

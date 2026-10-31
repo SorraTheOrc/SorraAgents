@@ -426,7 +426,11 @@ def test_guarded_run_fast_forward_of_main_checkout_dev_is_expected_churn(
 
     script = tmp_path / "fast_forward_dev.py"
     script.write_text(
+        "import os\n"
         "import subprocess, sys\n"
+        "# Hermetic: the finish gate exports GIT_INDEX_FILE while the suite runs;"
+        "# a playback session must never stage into the gate's index (SA-0MVQHVHXI007PQAB).\n"
+        "os.environ.pop('GIT_INDEX_FILE', None)\n"
         f"from pathlib import Path\n"
         f"main = Path({str(main)!r})\n"
         "(main / 'shared.txt').write_text('new\\n', encoding='utf-8')\n"
@@ -517,8 +521,12 @@ def test_guarded_run_reports_excluded_churn_without_failing(tmp_path, monkeypatc
 
     repo = _attribution_repo(tmp_path)
     sibling_commit = (
+        "import os\n"
         "import subprocess\n"
         "import sys\n"
+        # Hermetic: the finish gate exports GIT_INDEX_FILE while the suite runs;
+        # a playback session must never stage into the gate's index (SA-0MVQHVHXI007PQAB).
+        "os.environ.pop('GIT_INDEX_FILE', None)\n"
         f"repo = {str(repo)!r}\n"
         "subprocess.run(['git', '-C', repo, '-c', 'user.name=Sibling',\n"
         "                '-c', 'user.email=sibling@example.invalid',\n"

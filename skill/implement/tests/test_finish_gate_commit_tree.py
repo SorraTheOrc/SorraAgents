@@ -46,8 +46,6 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 for _path in (str(REPO_ROOT), str(REPO_ROOT / "skill")):
     if _path not in sys.path:
@@ -603,25 +601,15 @@ def test_baseline_capture_parity_false_pass_from_a_foreign_cache_entry(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F7 / SA-0MVQHVHXI007PQAB not landed): the gate "
-        "accepts a cache entry keyed by the loose working-tree fingerprint, so "
-        "a green verdict recorded against a different on-disk tree is served "
-        "for the gate's tree. Tree-fingerprint binding makes the entry miss "
-        "and the suite re-run; remove this marker then and invert the baseline "
-        "capture above."
-    ),
-)
 def test_parity_foreign_cache_entry_misses_once_f7_lands(tmp_path, monkeypatch):
     """The foreign green entry must miss; the suite re-runs and reports red.
 
-    Once F7 lands the gate accepts a cached verdict only for the
-    would-be-commit tree's fingerprint. The entry below was recorded under a
-    loose working-tree state — a different fingerprint entirely — so it must
-    be rejected and the parity suite must run against the gate's own tree and
-    fail, naming the parity test.
+    After F7 (SA-0MVQHVHXI007PQAB) the gate accepts a cached verdict only for
+    the would-be-commit **tree** fingerprint (``git write-tree`` of the staged
+    index). The entry below was recorded under a loose working-tree state — a
+    different fingerprint entirely — so it must be rejected and the parity
+    suite must run against the gate's own tree and fail, naming the parity
+    test.
     """
     repo = _build_parity_fixture_repo(tmp_path)
     primed, command = _record_foreign_green_verdict(repo)
@@ -642,7 +630,22 @@ def test_parity_foreign_cache_entry_misses_once_f7_lands(tmp_path, monkeypatch):
     failures = [str(failure) for failure in attempt["failures"]]
     assert any(PARITY_TEST_NAME in failure for failure in failures), failures
 
-    # The suite really re-ran: the stale entry was replaced by the red result.
-    served_after = test_cache.query_cached(command, cwd=str(repo))
-    assert served_after is not None
+    # The suite really re-ran: the fresh (red) verdict is recorded against the
+    # would-be-commit tree, so a tree-bound lookup sees it while the foreign
+    # loose-state entry is untouched.
+    tree = _would_be_commit_tree_sha(repo)
+    served_after = test_cache.lookup(
+        command,
+        tree,
+        cwd=str(repo),
+        fingerprint_kind=test_cache.FINGERPRINT_KIND_TREE,
+    )
+    assert served_after is not None, (
+        "the gate must record its fresh verdict against the would-be-commit "
+        "tree"
+    )
     assert served_after["completed_at"] != served_before["completed_at"]
+    assert served_after["exit_code"] != 0, served_after["stdout"]
+    untouched = test_cache.query_cached(command, cwd=str(repo))
+    assert untouched is not None
+    assert untouched["completed_at"] == served_before["completed_at"]

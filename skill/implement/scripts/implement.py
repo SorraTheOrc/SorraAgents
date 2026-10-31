@@ -2571,7 +2571,13 @@ def run_gate_suite(
         }
 
     with would_be_commit_index(cwd) as gate_index:
-        result = run_tests(cwd, scope=scope, base_ref=base_ref)
+        # Bind verdict acceptance to the would-be-commit tree: the cache key
+        # is the tree SHA, so a verdict recorded for any other tree (or a
+        # legacy entry without provenance) misses and the suite really runs
+        # (SA-0MVQHVHXI007PQAB).
+        result = run_tests(
+            cwd, scope=scope, base_ref=base_ref, fingerprint=gate_index.tree
+        )
         integrity = gate_index.verify_unchanged()
         summary = gate_index.summary()
 
@@ -4873,6 +4879,7 @@ def _run_guarded_suite(
     scope: str,
     base_ref: str | None,
     tooling: str | None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Execute *commands* through the canonical guard-owning runner.
 
@@ -4883,6 +4890,10 @@ def _run_guarded_suite(
     environment (a nested run): ``guarded_run_all`` then stands down because
     the outer guard already owns the checkout.
 
+    *fingerprint* is the finish gate's would-be-commit tree SHA; it is
+    forwarded to the cache so the verdict is keyed by the tree the commit
+    produces rather than the loose working tree (SA-0MVQHVHXI007PQAB).
+
     When the test skill is unavailable (partial install), or the delegation
     raises, falls back to the direct ``_run_commands_direct`` path (the
     inner conftest guard remains armed), preserving graceful degradation.
@@ -4890,7 +4901,9 @@ def _run_guarded_suite(
     if _guarded_run_all is None or _full_suite_commands is None:
         # Partial install, or the legacy convention path: only the inner
         # conftest guard is armed, so run directly (no delegation).
-        return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+        return _run_commands_direct(
+            commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
+        )
     try:
         guarded = _guarded_run_all(
             cwd=Path(cwd),
@@ -4899,6 +4912,7 @@ def _run_guarded_suite(
             scope=scope,
             base_ref=base_ref or "origin/dev",
             use_cache=True,
+            fingerprint=fingerprint,
         )
     except Exception as exc:  # noqa: BLE001 - degrade to the direct path
         LOG.warning(
@@ -4906,11 +4920,15 @@ def _run_guarded_suite(
             "back to the direct cached runner (inner guard only).",
             exc,
         )
-        return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+        return _run_commands_direct(
+            commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
+        )
     return _adapt_guarded_result(guarded, tooling=tooling, scope=scope)
 
 
-def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
+def _run_changed_scope_pytest(
+    cwd: str, base_ref: str | None = None, fingerprint: str | None = None
+) -> dict[str, Any] | None:
     """Run only the tests affected by the worktree's changes vs *base_ref*.
 
     Reuses the shared changed-file → test selector from the test skill
@@ -4947,6 +4965,7 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
         scope="changed",
         base_ref=base_ref,
         tooling="pytest",
+        fingerprint=fingerprint,
     )
     # pytest exit 4 is a *usage* error: "file or directory not found" (or a
     # similar no-valid-items condition). It means the selection referenced a
@@ -4967,7 +4986,11 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
 
 
 def _run_commands(
-    commands: list[str], cwd: str, tooling: str, scope: str = "full"
+    commands: list[str],
+    cwd: str,
+    tooling: str,
+    scope: str = "full",
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Execute *commands* through the canonical guard-owning runner.
 
@@ -4978,13 +5001,24 @@ def _run_commands(
     """
     if _guarded_run_all is not None and _full_suite_commands is not None:
         return _run_guarded_suite(
-            commands, cwd, scope=scope, base_ref=None, tooling=tooling
+            commands,
+            cwd,
+            scope=scope,
+            base_ref=None,
+            tooling=tooling,
+            fingerprint=fingerprint,
         )
-    return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+    return _run_commands_direct(
+        commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
+    )
 
 
 def _run_commands_direct(
-    commands: list[str], cwd: str, tooling: str, scope: str = "full"
+    commands: list[str],
+    cwd: str,
+    tooling: str,
+    scope: str = "full",
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run each command through the per-repo cache and combine the results.
 
@@ -5021,6 +5055,7 @@ def _run_commands_direct(
                 keep_git_index=True,
             ),
             scope=scope,
+            fingerprint=fingerprint,
         )
         if run["exit_code"] != 0 and exit_code == 0:
             exit_code = run["exit_code"]
@@ -5039,7 +5074,9 @@ def _run_commands_direct(
     )
 
 
-def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
+def _run_group_from_changed_files(
+    cwd: str, base_ref: str | None = None, fingerprint: str | None = None
+) -> dict[str, Any] | None:
     """Try to select a named test group from changed files and run it.
 
     Uses the shared :func:`select_group_from_changed_files` to map touched
@@ -5076,7 +5113,11 @@ def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict
         return None
 
     return _run_commands(
-        group_cmds, cwd, tooling=f"group:{group_name}", scope="full"
+        group_cmds,
+        cwd,
+        tooling=f"group:{group_name}",
+        scope="full",
+        fingerprint=fingerprint,
     )
 
 
@@ -5124,6 +5165,7 @@ def _run_resolved_suite(
     commands: list[str],
     scope: str = "changed",
     base_ref: str | None = None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run a resolved full-suite command list, honouring changed scope.
 
@@ -5134,7 +5176,9 @@ def _run_resolved_suite(
     run never silently skips testing.
     """
     if scope == "changed":
-        group_result = _run_group_from_changed_files(cwd, base_ref=base_ref)
+        group_result = _run_group_from_changed_files(
+            cwd, base_ref=base_ref, fingerprint=fingerprint
+        )
         if group_result is not None:
             LOG.info(
                 "Implement run_tests: selected group '%s' from changed files in %s",
@@ -5142,7 +5186,9 @@ def _run_resolved_suite(
                 cwd,
             )
             return group_result
-        scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
+        scoped = _run_changed_scope_pytest(
+            cwd, base_ref=base_ref, fingerprint=fingerprint
+        )
         if scoped is not None:
             return scoped
         LOG.warning(
@@ -5151,11 +5197,14 @@ def _run_resolved_suite(
             "or node-only selection) — falling back to full scope.",
             cwd,
         )
-    return _run_commands(commands, cwd, tooling="suite", scope="full")
+    return _run_commands(
+        commands, cwd, tooling="suite", scope="full", fingerprint=fingerprint
+    )
 
 
 def run_tests(cwd: str, scope: str = "changed",
-              base_ref: str | None = None) -> dict[str, Any]:
+              base_ref: str | None = None,
+              fingerprint: str | None = None) -> dict[str, Any]:
     """Run the project test suite, routed through the per-repo run cache.
 
     *scope* selects the execution scope (SA-0MT6CENPW004V2JN):
@@ -5214,6 +5263,13 @@ def run_tests(cwd: str, scope: str = "changed",
         scope: Execution scope (``changed`` — default — or ``full``).
         base_ref: Base ref for changed-file detection when *scope* is
             ``changed`` (default ``origin/dev``).
+        fingerprint: Explicit expected fingerprint for the run cache — the
+            finish gate passes the would-be-commit tree SHA
+            (``git write-tree`` of its temporary index). When supplied, the
+            cache key and verdict acceptance are bound to that tree instead of
+            the loose working-tree state, so a verdict recorded for another
+            tree (or a legacy entry without provenance) misses and the suite
+            re-runs (SA-0MVQHVHXI007PQAB). Omitted → historical behaviour.
 
     Returns:
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
@@ -5238,6 +5294,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 timeout=_resolve_test_timeout(cwd),
                 runner=_shell_command_runner,
                 scope="full",
+                fingerprint=fingerprint,
             ),
             tooling="override",
             scope="full",
@@ -5260,7 +5317,11 @@ def run_tests(cwd: str, scope: str = "changed",
                 tooling=None,
             )
         return _run_resolved_suite(
-            cwd, resolved_suite, scope=scope, base_ref=base_ref
+            cwd,
+            resolved_suite,
+            scope=scope,
+            base_ref=base_ref,
+            fingerprint=fingerprint,
         )
 
     # 3. Legacy convention detection (test skill unavailable or no suite
@@ -5273,7 +5334,9 @@ def run_tests(cwd: str, scope: str = "changed",
         if scope == "changed":
             # Try named group selection first (SA-0MUJKF2HP001BR51):
             # map changed files to the smallest sufficient group.
-            group_result = _run_group_from_changed_files(cwd, base_ref=base_ref)
+            group_result = _run_group_from_changed_files(
+                cwd, base_ref=base_ref, fingerprint=fingerprint
+            )
             if group_result is not None:
                 LOG.info(
                     "Implement run_tests: selected group '%s' from changed files in %s",
@@ -5282,7 +5345,9 @@ def run_tests(cwd: str, scope: str = "changed",
                 )
                 return group_result
             # Fall through to the existing changed-file → test-file selector.
-            scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
+            scoped = _run_changed_scope_pytest(
+                cwd, base_ref=base_ref, fingerprint=fingerprint
+            )
             if scoped is not None:
                 return scoped
             LOG.warning(
@@ -5300,6 +5365,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 keep_git_index=True,
             ),
             scope="full",
+            fingerprint=fingerprint,
         )
         result = pytest_run
         final_tooling = "pytest"
@@ -5314,6 +5380,7 @@ def run_tests(cwd: str, scope: str = "changed",
                     keep_git_index=True,
                 ),
                 scope="full",
+                fingerprint=fingerprint,
             )
             if npm_run["exit_code"] == 0:
                 return _finalize_test_result(
@@ -5342,6 +5409,7 @@ def run_tests(cwd: str, scope: str = "changed",
                     keep_git_index=True,
                 ),
                 scope="full",
+                fingerprint=fingerprint,
             ),
             tooling="npm",
             scope="full",
@@ -5380,6 +5448,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 timeout=_resolve_test_timeout(cwd),
                 runner=_shell_command_runner,
                 scope="full",
+                fingerprint=fingerprint,
             ),
             tooling="repo-script",
             scope="full",
@@ -6681,9 +6750,11 @@ def phase_finish(
     # main-checkout `.worklog/cache` that post-push verification and the
     # audit skill consume read-only. Running the full suite here instead
     # would (a) burn a slot for the whole suite duration per work item,
-    # (b) cache the result under a pre-commit dirty git-state fingerprint
-    # that no later consumer ever looks up, and (c) duplicate the push
-    # gate.
+    # (b) record a verdict no later consumer could safely reuse — before the
+    # gate was tree-bound it was cached under a pre-commit dirty git-state
+    # fingerprint (the verdict is now keyed by the would-be-commit tree SHA,
+    # SA-0MVQHVHXI007PQAB, but the dev-push gate still runs the full suite on
+    # the pushed commit), and (c) duplicate the push gate.
     LOG.info("Changed-scope validation passed — full suite deferred to the dev-push gate")
 
     # ── Step 3c: Single-owner main-checkout lock (WL-0MVPADZ1Z000FOSG AC5) ─

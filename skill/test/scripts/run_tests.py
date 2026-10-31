@@ -1642,6 +1642,7 @@ def run_suite(
     base_ref: str = "origin/dev",
     test_type: str = DEFAULT_TEST_TYPE,
     group: str | None = None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run a single named suite and return structured results.
 
@@ -1798,6 +1799,7 @@ def run_suite(
                     runner=_cached_runner,
                     scope=resolvable_scope,
                     test_type=test_type,
+                    fingerprint=fingerprint,
                 )
                 proc = SimpleNamespace(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
@@ -1910,6 +1912,7 @@ def run_all(
     commands: list[str] | None = None,
     test_type: str = DEFAULT_TEST_TYPE,
     group: str | None = None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run the selected suites and aggregate failures.
 
@@ -1952,6 +1955,7 @@ def run_all(
                     base_ref=base_ref,
                     test_type=test_type,
                     group=group,
+                    fingerprint=fingerprint,
                 )
             results[name] = result
             resolved_scopes.append(result["scope"])
@@ -2282,6 +2286,7 @@ def guarded_run_all(
     commands: list[str] | None = None,
     test_type: str = DEFAULT_TEST_TYPE,
     group: str | None = None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run the selected suites under the canonical live-repo guard ownership.
 
@@ -2318,6 +2323,8 @@ def guarded_run_all(
         commands: Explicit command override (resolved type/group profile).
         test_type: Command profile name (``full`` default).
         group: Named test group from ``.pi/test-config.json``.
+        fingerprint: Explicit expected fingerprint (a would-be-commit tree
+            SHA) forwarded to the cache; omitted keeps loose-worktree keys.
 
     Returns:
         The :func:`run_all` result dict, with ``success=False`` and
@@ -2349,6 +2356,7 @@ def guarded_run_all(
             commands=commands,
             test_type=test_type,
             group=group,
+            fingerprint=fingerprint,
         )
     finally:
         # Only clear the marker we set — a nested call must not clear an

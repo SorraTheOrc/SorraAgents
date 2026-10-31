@@ -17,12 +17,14 @@ from types import SimpleNamespace
 import pytest
 import test_cache
 from shared import git_sandbox as gs
+from shared.git_sandbox import fixture_git_env
 from test_cache import (
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
     _default_runner,
     cache_dir,
     compute_git_state,
+    compute_tree_state,
     lookup,
     normalize_test_command,
     query_cached,
@@ -70,6 +72,8 @@ def git(repo: Path, *args: str) -> None:
     index exported, and these fixtures must operate on their own repository
     (``tests/conftest.py`` drops the ambient ``GIT_INDEX_FILE``; the shared
     helper also scrubs repository overrides and pins a fixture identity).
+    ``fixture_git_env`` is used where a test wants the raw child env; both
+    drop the inherited index (SA-0MVQHVHXI007PQAB).
     """
     gs.run_git(repo, args, check=True)
 
@@ -672,6 +676,7 @@ def test_cache_entries_are_written_atomically_and_gitignored(
         capture_output=True,
         text=True,
         check=False,
+        env=fixture_git_env(),
     ).stdout
     assert "test-cache" not in status
     assert ".worklog" not in status
@@ -925,14 +930,6 @@ def _write_legacy_entry(
     return entry_dir
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F8 / SA-0MVQHVBHXI007PQAB not landed): run_cached "
-        "has no explicit fingerprint override, so a gate cannot key a verdict "
-        "by the would-be-commit tree. Remove this marker when F8 lands."
-    ),
-)
 def test_explicit_fingerprint_mismatch_misses_and_reruns(git_repo: Path) -> None:
     """A stored verdict for another tree is a miss: the command re-runs."""
     calls: list[str] = []
@@ -949,14 +946,6 @@ def test_explicit_fingerprint_mismatch_misses_and_reruns(git_repo: Path) -> None
     assert len(calls) == 2, "the command must re-run for a foreign fingerprint"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F8 / SA-0MVQHVBHXI007PQAB not landed): run_cached "
-        "has no explicit fingerprint override, so a matching-tree verdict "
-        "cannot be requested. Remove this marker when F8 lands."
-    ),
-)
 def test_explicit_fingerprint_match_within_ttl_is_a_hit(git_repo: Path) -> None:
     """An identical fingerprint inside the TTL reuses the entry — no spawn."""
     calls: list[str] = []
@@ -972,14 +961,6 @@ def test_explicit_fingerprint_match_within_ttl_is_a_hit(git_repo: Path) -> None:
     assert len(calls) == 1, "a matching fingerprint must not re-execute"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F8 / SA-0MVQHVBHXI007PQAB not landed): run_cached "
-        "has no explicit fingerprint override, so a stale tree-bound verdict "
-        "cannot be requested. Remove this marker when F8 lands."
-    ),
-)
 def test_identical_fingerprint_outside_ttl_misses_and_reruns(
     git_repo: Path,
 ) -> None:
@@ -1006,15 +987,6 @@ def test_identical_fingerprint_outside_ttl_misses_and_reruns(
     assert len(calls) == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-fix baseline (F8 / SA-0MVQHVBHXI007PQAB not landed): entries "
-        "record no fingerprint provenance, so a legacy entry keyed by the "
-        "same string would be served for a tree-fingerprint request. Remove "
-        "this marker when F8 lands."
-    ),
-)
 def test_legacy_entry_without_provenance_misses_for_a_tree_fingerprint(
     git_repo: Path,
 ) -> None:
@@ -1060,3 +1032,158 @@ def test_default_request_keeps_loose_worktree_fingerprint_semantics(
     assert legacy["cached"] is True
     assert legacy["stdout"] == "legacy\n"
     assert len(calls) == 1, "a legacy entry must still be served by default"
+
+
+# ---------------------------------------------------------------------------
+# Tree-state fingerprint: ``git write-tree`` on an explicit index (F8)
+#
+# The finish gate stages the change set into a temporary index, so the tree the
+# commit will produce is ``git write-tree`` of that index — a value no loose
+# working-tree fingerprint can express (generated, gitignored metadata moves the
+# on-disk tree without moving the loose state; see
+# ``test_generated_metadata_is_invisible_to_the_git_state_fingerprint``).
+# ``compute_tree_state`` is that fingerprint, and ``run_cached`` binds verdict
+# acceptance to it.
+# ---------------------------------------------------------------------------
+
+
+def _git_with_index(repo: Path, index_file: Path, *args: str) -> str:
+    """Run ``git <args>`` in *repo* against *index_file*, returning stdout."""
+    env = fixture_git_env()
+    env["GIT_INDEX_FILE"] = str(index_file)
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return proc.stdout
+
+
+def _temp_index(repo: Path, *, stage_change: bool = True) -> Path:
+    """A temporary index seeded from HEAD, optionally with the change set applied.
+
+    Mirrors what the finish gate builds (``read-tree HEAD`` then ``git add -A``)
+    without touching the repository's real index.
+    """
+    index_path = repo.parent / f"probe-{os.getpid()}-{time.time_ns()}.index"
+    _git_with_index(repo, index_path, "read-tree", "HEAD")
+    if stage_change:
+        _git_with_index(repo, index_path, "add", "-A")
+    return index_path
+
+
+def _head_tree(repo: Path) -> str:
+    """The tree SHA of HEAD's commit."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=fixture_git_env(),
+    )
+    return proc.stdout.strip()
+
+
+def test_compute_tree_state_returns_the_staged_index_tree_sha(
+    git_repo: Path,
+) -> None:
+    """The fingerprint is exactly what ``git write-tree`` reports for that index."""
+    (git_repo / "tracked.txt").write_text("two\n", encoding="utf-8")
+    (git_repo / "added.txt").write_text("brand new\n", encoding="utf-8")
+    index_path = _temp_index(git_repo)
+
+    tree = compute_tree_state(index_path, cwd=git_repo)
+
+    assert tree == _git_with_index(git_repo, index_path, "write-tree").strip()
+    assert len(tree) == 40, tree
+    assert tree != _head_tree(git_repo), "the staged change set must be visible"
+    # The real index was never touched: it still produces HEAD's tree.
+    assert _git_with_index(git_repo, git_repo / ".git" / "index", "write-tree").strip() == _head_tree(
+        git_repo
+    )
+
+
+def test_compute_tree_state_reads_the_index_not_the_working_tree(
+    git_repo: Path,
+) -> None:
+    """An unstaged edit is invisible: the tree is the index's, not the worktree's."""
+    (git_repo / "tracked.txt").write_text("dirty but unstaged\n", encoding="utf-8")
+    index_path = _temp_index(git_repo, stage_change=False)
+
+    assert compute_tree_state(index_path, cwd=git_repo) == _head_tree(git_repo)
+
+
+def test_compute_tree_state_raises_for_an_unusable_index(git_repo: Path) -> None:
+    """An unreadable index fails loudly instead of yielding a phantom tree."""
+    index_path = git_repo.parent / "not-an-index"
+    index_path.write_text("this is not a git index\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        compute_tree_state(index_path, cwd=git_repo)
+
+    assert str(index_path) in str(excinfo.value), excinfo.value
+
+
+def test_tree_fingerprint_binding_ignores_loose_worktree_churn(
+    git_repo: Path,
+) -> None:
+    """A tree-bound verdict is keyed by the staged tree, not the loose state.
+
+    The gate hands ``run_cached`` the would-be-commit tree SHA. Churn the
+    commit cannot see — untracked files, unstaged edits — moves the loose
+    fingerprint but not the tree, so it must not evict a verdict recorded for
+    that tree, and a default request must still miss it.
+    """
+    (git_repo / "tracked.txt").write_text("staged\n", encoding="utf-8")
+    index_path = _temp_index(git_repo)
+    tree = compute_tree_state(index_path, cwd=git_repo)
+    calls: list[str] = []
+    runner = make_runner(calls)
+    first = run_cached("pytest", cwd=str(git_repo), fingerprint=tree, runner=runner)
+    assert first["cached"] is False
+    assert first["git_state"] == tree
+    assert first["fingerprint_kind"] == "tree"
+    loose_before = compute_git_state(str(git_repo))
+
+    (git_repo / "untracked.txt").write_text("loose churn\n", encoding="utf-8")
+    assert compute_git_state(str(git_repo)) != loose_before
+
+    second = run_cached("pytest", cwd=str(git_repo), fingerprint=tree, runner=runner)
+    assert second["cached"] is True
+    assert second["completed_at"] == first["completed_at"]
+    assert len(calls) == 1, "tree-bound state did not change, so nothing re-ran"
+
+    # The loose-state key is genuinely different: a default request misses.
+    default = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert default["cached"] is False
+    assert default["fingerprint_kind"] == "worktree"
+    assert len(calls) == 2
+
+
+def test_tree_bound_entry_never_satisfies_a_loose_request(git_repo: Path) -> None:
+    """Provenance is symmetric: a tree-keyed verdict is not loose-state evidence.
+
+    The two fingerprints live in different namespaces even when their strings
+    collide, so an entry recorded for a tree can never be served to a consumer
+    that asked about the loose working tree (and vice versa: see
+    ``test_legacy_entry_without_provenance_misses_for_a_tree_fingerprint``).
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+    loose_state = compute_git_state(str(git_repo))
+    # Force a collision: the tree request uses the loose fingerprint's string.
+    primed = run_cached("pytest", cwd=str(git_repo), fingerprint=loose_state, runner=runner)
+    assert primed["cached"] is False
+    assert primed["fingerprint_kind"] == "tree"
+
+    assert lookup("pytest", loose_state, cwd=str(git_repo)) is None, (
+        "a tree verdict must never be served as loose-state evidence"
+    )
+    tree_hit = lookup(
+        "pytest", loose_state, cwd=str(git_repo), fingerprint_kind="tree"
+    )
+    assert tree_hit is not None and tree_hit["cached"] is True
