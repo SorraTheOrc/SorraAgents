@@ -87,6 +87,7 @@ from typing import Any
 
 #: Repository-overriding git environment variables. Git honours these over
 #: ``cwd``; a leaked value makes an isolated fixture mutate the named repo.
+ENV_GIT_INDEX_FILE = "GIT_INDEX_FILE"
 REPOSITORY_OVERRIDE_ENV_VARS: tuple[str, ...] = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -268,6 +269,75 @@ def fixture_git_env(
     env = scrub_repository_overrides(base)
     env.pop("GIT_INDEX_FILE", None)
     return env
+
+
+def git_env_for_repo(repo: str | os.PathLike[str]) -> dict[str, str]:
+    """Environment for a git command that **inspects** *repo*.
+
+    Repository overrides are scrubbed exactly as :func:`sanitized_git_env`
+    does. An ambient ``GIT_INDEX_FILE`` is kept **only when it belongs to
+    *repo*** — i.e. the index lives inside *repo*'s git directory — and
+    dropped otherwise.
+
+    Why (SA-0MVTET8KQ0031R6Z): the finish gate exports a temporary
+    would-be-commit index for the suite it runs (SA-0MVQHVGFR006W8LG), so the
+    repository under test must be inspected through that index. Every other
+    repository — a test fixture — must not inherit it: git applies an
+    inherited index to whatever repository ``cwd`` names, so a fixture would
+    report another repository's staged files as its own changes, and any
+    command that refreshes the index would write into the gate's index and
+    invalidate the gate's evidence for the tree it tested.
+
+    Ownership is decided by the index path lying inside ``git rev-parse
+    --absolute-git-dir`` for *repo* (works for linked worktrees, whose git dir
+    is ``<main>/.git/worktrees/<name>``). Any uncertainty — git unavailable,
+    a non-repository *repo*, a relative override — drops the variable, the
+    hermetic default.
+
+    Args:
+        repo: The repository the git command operates on.
+
+    Returns:
+        A child environment mapping for the git subprocess.
+    """
+    env = sanitized_git_env()
+    index_file = env.get(ENV_GIT_INDEX_FILE)
+    if not index_file:
+        return env
+    git_dir = _absolute_git_dir(repo)
+    if git_dir is None:
+        env.pop(ENV_GIT_INDEX_FILE, None)
+        return env
+    try:
+        index_path = Path(index_file).expanduser().resolve()
+    except (OSError, RuntimeError):
+        env.pop(ENV_GIT_INDEX_FILE, None)
+        return env
+    if not index_path.is_relative_to(git_dir):
+        env.pop(ENV_GIT_INDEX_FILE, None)
+    return env
+
+
+def _absolute_git_dir(repo: str | os.PathLike[str]) -> Path | None:
+    """Return *repo*'s absolute git directory, or ``None`` when undeterminable."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"],
+            cwd=str(repo),
+            env=sanitized_git_env(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return Path(proc.stdout.strip()).resolve()
+    except (OSError, RuntimeError):
+        return None
 
 
 def run_git(

@@ -31,6 +31,7 @@ from run_tests import (
     NOTICE_COMMAND_NOT_FOUND,
     NOTICE_SLOT_BUSY,
     NOTICE_SUITE_TIMEOUT,
+    NOTICE_UNPARSED_FAILURE,
     SLOT_BUSY_NOTICE_PREFIX,
     run_all,
     run_suite,
@@ -60,7 +61,9 @@ def _fake_run(stdout: str = "", stderr: str = "", returncode: int = 1):
 
 
 class TestRunSuiteDiagnostics:
-    def test_carries_bounded_output_and_no_notice(self, tmp_path) -> None:
+    def test_carries_bounded_output_and_classifies_unparsed_exit(
+        self, tmp_path
+    ) -> None:
         with mock.patch.object(
             run_tests, "_run_cmd", return_value=_fake_run(stdout=_NOISE, stderr=_NOISE)
         ), mock.patch.object(run_tests, "_test_concurrency_slot"):
@@ -73,8 +76,10 @@ class TestRunSuiteDiagnostics:
         assert len(result["stderr"]) < len(_NOISE)
         assert "stderr-line-1999" in result["stdout"]
         assert len(result["stdout"]) < len(_NOISE)
-        assert result["notice"] == ""
-        assert result["notice_code"] == ""
+        # A non-zero exit with no parsable failure is classified rather than
+        # left as an unexplained non-zero result (SA-0MVU8XRBQ000DG9D).
+        assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
+        assert "no parsable failures" in result["notice"]
 
     def test_command_not_found_is_classified(self, tmp_path) -> None:
         def raise_not_found(*args, **kwargs):

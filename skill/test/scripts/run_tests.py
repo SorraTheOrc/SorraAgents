@@ -112,6 +112,7 @@ from shared.git_sandbox import (
     describe_guarded_diff,
     diff_guarded_roots,
     excluded_churn_notes,
+    git_env_for_repo,
     snapshot_guarded_roots,
 )
 from shared.process_semaphore import Semaphore, nested_semaphore_dir  # noqa: F401
@@ -329,6 +330,28 @@ _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
 TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts")
 
 
+def _git_inspection_env(root: Path) -> dict[str, str]:
+    """Environment for a git command that *inspects* ``root``.
+
+    Delegates to :func:`shared.git_sandbox.git_env_for_repo`: repository
+    overrides are scrubbed (F2, SA-0MUIA3OE40001QJX) and an ambient
+    ``GIT_INDEX_FILE`` is honoured only when it belongs to *root*'s own
+    repository. The finish gate exports a temporary would-be-commit index for
+    the suite it runs (SA-0MVQHVGFR006W8LG), so the repository under test is
+    measured against that staged tree, while a fixture repository never reads
+    — or refreshes, which writes — another repository's index. Inheriting it
+    made a fixture report every tracked file as changed and invalidated the
+    gate's evidence for the tested tree (SA-0MVTET8KQ0031R6Z).
+
+    Args:
+        root: The repository the git command operates on.
+
+    Returns:
+        A child environment mapping for the git subprocess.
+    """
+    return git_env_for_repo(root)
+
+
 def compute_changed_files(
     project_root: Path | None = None,
     base_ref: str = "origin/dev",
@@ -369,6 +392,7 @@ def compute_changed_files(
         text=True,
         timeout=30,
         check=False,
+        env=_git_inspection_env(root),
     )
     if proc.returncode != 0:
         return set()
@@ -395,6 +419,7 @@ def _resolve_merge_base(root: Path, base_ref: str) -> str | None:
                 text=True,
                 timeout=30,
                 check=False,
+                env=_git_inspection_env(root),
             )
         except (OSError, subprocess.TimeoutExpired):
             # Missing cwd / git unavailable → no diff base → caller falls

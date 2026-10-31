@@ -113,13 +113,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from shared.git_sandbox import git_env_for_repo
 from test_runner import (
     executable_test_command,
     is_pytest_command,
     log_repository_override_scrub,
     normalize_test_command,
     resolve_pytest_executable,
-    scrub_repository_overrides,
     subprocess_env_with_scrubbed_overrides,
 )
 
@@ -173,12 +173,18 @@ Runner = Callable[[str, str, int], Any]
 def _run_git(cwd: str, *args: str) -> str | None:
     """Run a git command in *cwd*, returning stdout or None on failure.
 
-    The environment is the shared repository-override scrub
-    (SA-0MUIA3OE40001QJX): git honours ``GIT_DIR``/``GIT_WORK_TREE``/
-    ``GIT_CONFIG*`` over ``cwd``, so a leaked value made the fingerprint
-    describe a *different* repository — one constant key for every state of
-    the tree being tested, i.e. stale results for the whole TTL
-    (WL-0MVPO9P610055UQ3). The fingerprint always describes the repository
+    The environment is :func:`shared.git_sandbox.git_env_for_repo` for *cwd*.
+    Repository overrides are scrubbed (SA-0MUIA3OE40001QJX): git honours
+    ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_CONFIG*`` over ``cwd``, so a leaked
+    value made the fingerprint describe a *different* repository — one
+    constant key for every state of the tree being tested, i.e. stale results
+    for the whole TTL (WL-0MVPO9P610055UQ3). An ambient ``GIT_INDEX_FILE`` is
+    honoured only when it belongs to *cwd*'s own repository: the finish gate
+    exports a temporary would-be-commit index for the suite it runs
+    (SA-0MVQHVGFR006W8LG), so the repository under test must be fingerprinted
+    through it, while a fixture repository that inherited it would see a
+    foreign index with no dirty paths and fingerprint every edit identically
+    (SA-0MVTET8KQ0031R6Z). The fingerprint always describes the repository
     containing ``cwd``.
     """
     log_repository_override_scrub()
@@ -190,7 +196,7 @@ def _run_git(cwd: str, *args: str) -> str | None:
             text=True,
             timeout=30,
             check=False,
-            env=scrub_repository_overrides(),
+            env=git_env_for_repo(cwd),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

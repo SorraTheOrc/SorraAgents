@@ -112,6 +112,26 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _staged_foreign_index(tmp_path: Path) -> Path:
+    """An index belonging to a *different* repository with a staged change.
+
+    Mirrors what the finish gate hands the suite it runs: a temporary index
+    that names another repository's files (SA-0MVQHVGFR006W8LG).
+    """
+    gate_repo = init_repo(tmp_path / "gate_repo", default_branch="dev")
+    (gate_repo / "gate_only.py").write_text("x = 1\n")
+    commit_all(gate_repo, "initial")
+    (gate_repo / "gate_only.py").write_text("x = 2\n")
+    index = tmp_path / "gate.index"
+    run_git(
+        gate_repo,
+        ["add", "-A"],
+        env={"GIT_INDEX_FILE": str(index)},
+        check=True,
+    )
+    return index
+
+
 def _init_repo_with_dev(repo: Path, *, message: str = "initial") -> Path:
     """Create a hermetic repo at *repo* on branch ``dev`` with one commit.
 
@@ -220,6 +240,33 @@ class TestComputeChangedFiles:
         result = compute_changed_files(repo, base_ref="dev")
         assert "src/untracked.py" not in result
         assert "src/utils.py" in result
+
+    def test_fixture_repo_ignores_an_inherited_index_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A foreign ``GIT_INDEX_FILE`` never leaks into a fixture repo's diff.
+
+        The finish gate exports a temporary would-be-commit index for the
+        suite it runs (SA-0MVQHVGFR006W8LG). A fixture repository that
+        inherits it reports every tracked file as changed (the foreign index
+        has no stat entries for its paths) and lets git refresh — write — an
+        index that is not its own, which invalidates the gate's evidence for
+        the tree it tested (SA-0MVTET8KQ0031R6Z).
+        """
+        foreign_index = _staged_foreign_index(tmp_path)
+        before = foreign_index.read_bytes()
+        repo = _make_repo(tmp_path)
+        monkeypatch.setenv("GIT_INDEX_FILE", str(foreign_index))
+
+        result = compute_changed_files(repo, base_ref="dev")
+
+        assert result == set(), (
+            "the foreign gate index leaked into the fixture's changed-file set: "
+            f"{sorted(result)}"
+        )
+        assert foreign_index.read_bytes() == before, (
+            "compute_changed_files refreshed (wrote) the inherited gate index"
+        )
 
 
 # ---------------------------------------------------------------------------

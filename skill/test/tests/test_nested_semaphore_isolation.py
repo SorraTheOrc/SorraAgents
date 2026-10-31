@@ -37,7 +37,7 @@ for _path in (str(REPO_ROOT), str(_SKILLS_ROOT), str(_RUNNER_DIR)):
         sys.path.insert(0, _path)
 
 from run_tests import nested_semaphore_dir
-from shared.git_sandbox import fixture_git_env
+from shared.git_sandbox import fixture_git_env, run_git
 from shared.process_semaphore import Semaphore
 
 RUN_TESTS_PY = _RUNNER_DIR / "run_tests.py"
@@ -87,7 +87,15 @@ print(json.dumps(result))
 
 
 def _make_noop_project(tmp_path: Path, name: str = "nested-repo") -> Path:
-    """A committed repo whose whole suite is ``bash noop.sh`` (no real tests)."""
+    """A committed repo whose whole suite is ``bash noop.sh`` (no real tests).
+
+    Every git command runs with :func:`shared.git_sandbox.fixture_git_env`,
+    which drops an ambient ``GIT_INDEX_FILE``. The finish gate exports a
+    temporary index for the suite it runs, so a raw ``git add`` here would
+    stage into the *gate's* index and invalidate the gate's evidence for the
+    would-be-commit tree (the ``index_unchanged`` check,
+    SA-0MVTET8KQ0031R6Z).
+    """
     repo = tmp_path / name
     repo.mkdir()
     for args in (
@@ -118,6 +126,28 @@ def _make_noop_project(tmp_path: Path, name: str = "nested-repo") -> Path:
         env=fixture_git_env(),
     )
     return repo
+
+
+def test_fixture_repo_never_writes_to_an_inherited_index(tmp_path, monkeypatch):
+    """The fixture stays hermetic when the gate exports a temporary index.
+
+    Regression pin: the finish gate runs this suite with ``GIT_INDEX_FILE``
+    pointing at its would-be-commit index so tests can observe the staged
+    tree. A fixture repo that inherits that variable stages its own files
+    into the gate's index, which the gate reports as invalid evidence and
+    refuses to attribute to the tree under test.
+    """
+    inherited_index = tmp_path / "gate-index"
+    monkeypatch.setenv("GIT_INDEX_FILE", str(inherited_index))
+
+    repo = _make_noop_project(tmp_path)
+
+    assert not inherited_index.exists(), (
+        "the fixture staged into the gate's inherited GIT_INDEX_FILE"
+    )
+    assert run_git(repo, ["ls-files"], check=True).stdout.split(), (
+        "the fixture repo did not commit its own files"
+    )
 
 
 def _run_nested(repo: Path, env_overrides: dict[str, str], timeout: int = 30):

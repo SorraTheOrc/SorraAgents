@@ -484,6 +484,73 @@ class TestScrubRepositoryOverrides:
         assert "GIT_DIR" not in gs.sanitized_git_env()
 
 
+class TestGitEnvForRepo:
+    """SA-0MVTET8KQ0031R6Z: an ambient index only reaches its own repository.
+
+    The finish gate exports a temporary would-be-commit index for the suite it
+    runs. The repository under test must be inspected through it, while a
+    fixture repository must never read — or refresh, which writes — another
+    repository's index.
+    """
+
+    def test_keeps_an_index_that_belongs_to_the_repo(self, tmp_path, monkeypatch):
+        repo = _seeded_repo(tmp_path)
+        index = _staged_index(repo, "own.index")
+        monkeypatch.setenv("GIT_INDEX_FILE", str(index))
+
+        env = gs.git_env_for_repo(repo)
+
+        assert env["GIT_INDEX_FILE"] == str(index)
+
+    def test_drops_an_index_owned_by_another_repo(self, tmp_path, monkeypatch):
+        gate_repo = _seeded_repo(tmp_path, "gate")
+        fixture_repo = _seeded_repo(tmp_path, "fixture")
+        gate_index = _staged_index(gate_repo, "gate.index")
+        monkeypatch.setenv("GIT_INDEX_FILE", str(gate_index))
+
+        env = gs.git_env_for_repo(fixture_repo)
+
+        assert "GIT_INDEX_FILE" not in env, (
+            "a fixture repository inherited the gate's index"
+        )
+
+    def test_no_index_in_the_environment_is_a_no_op(self, tmp_path, monkeypatch):
+        repo = _seeded_repo(tmp_path)
+        monkeypatch.delenv("GIT_INDEX_FILE", raising=False)
+
+        assert "GIT_INDEX_FILE" not in gs.git_env_for_repo(repo)
+
+    def test_repository_overrides_are_still_scrubbed(self, tmp_path, monkeypatch):
+        repo = _seeded_repo(tmp_path)
+        monkeypatch.setenv("GIT_DIR", "/tmp/leaked")
+
+        assert "GIT_DIR" not in gs.git_env_for_repo(repo)
+
+    def test_non_repository_drops_the_index(self, tmp_path, monkeypatch):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "some.index"))
+
+        assert "GIT_INDEX_FILE" not in gs.git_env_for_repo(plain)
+
+
+def _staged_index(repo: Path, name: str) -> Path:
+    """Stage *repo*'s tree into ``<repo git dir>/<name>`` and return the path.
+
+    The gate's temporary index lives inside the repository's git directory
+    (``<git-dir>/implement-gate-*.index``), which is what makes it that
+    repository's index rather than a foreign one.
+    """
+    index = repo / ".git" / name
+    gs.run_git(
+        repo,
+        ["add", "-A"],
+        env={"GIT_INDEX_FILE": str(index)},
+        check=True,
+    )
+    return index
+
+
 class TestRepositoryOverrideVarsPresent:
     """F2: the detection helper used by diagnostics and the release gate."""
 
