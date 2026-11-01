@@ -572,8 +572,9 @@ configured runner):
   (SA-0MUY6U05F008RG86 — see
   [test-skill-reference.md](test-skill-reference.md#06-nested-run-isolation-sa-0muy6u05f008rg86)).
 
-**Gate-failure diagnostics (WL-0MVGUT787000LNDG):** a failed changed-scope
-run is never reported as an empty `Failures:` block. `_adapt_guarded_result`
+#### Gate-failure diagnostics (WL-0MVGUT787000LNDG)
+
+A failed changed-scope run is never reported as an empty `Failures:` block. `_adapt_guarded_result`
 carries the guarded run's `notices`/`notice_codes` (slot contention,
 command-not-found, suite timeout) and bounded `stdout`/`stderr` tails into
 `phase_finish`'s message builder, which renders:
