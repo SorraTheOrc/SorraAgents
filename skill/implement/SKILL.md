@@ -302,7 +302,7 @@ The same vocabulary is documented for the runner's notice codes in
 [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md#notice-codes-stable-strings)
 and for the gate's classification rules in
 [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#gate-failure-diagnostics-wl-0mvgut787000lndg);
-a docs-vs-source consistency test (`skill/implement/tests/test_gate_classification_docs.py`)
+a docs-vs-source consistency test (`$(skill_path implement)/tests/test_gate_classification_docs.py`)
 fails if a documented reason, notice code or fact field no longer exists in the
 code — or if a new one is left undocumented.
 
