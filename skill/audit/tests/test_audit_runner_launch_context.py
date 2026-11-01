@@ -45,6 +45,7 @@ from shared.git_sandbox import (
     GitSandboxError,
     add_worktree,
     commit_all,
+    fixture_git_env,
     init_repo,
     run_git,
 )
@@ -120,9 +121,12 @@ def _make_minimal_runner(recorded: list[list[str]] | None = None,
         cmd_str = " ".join(cmd)
 
         if git_cwd is not None and cmd and cmd[0] == "git":
+            # Hermetic env: the finish gate exports a temporary GIT_INDEX_FILE
+            # for the suite it runs, and a fixture command that inherited it
+            # would stage into the gate's index (SA-0MVWS6G0Z0050PD2).
             proc = subprocess.run(
                 list(cmd), cwd=str(git_cwd), check=False,
-                capture_output=True, text=True,
+                capture_output=True, text=True, env=fixture_git_env(),
             )
             return SimpleNamespace(
                 returncode=proc.returncode,
@@ -576,12 +580,17 @@ class TestRootFileOnlyRepoManifest:
 
     @staticmethod
     def _git_runner(repo: Path):
-        """Runner resolving git commands against the fixture repo."""
+        """Runner resolving git commands against the fixture repo.
+
+        Hermetic environment (``fixture_git_env``): the finish gate exports a
+        temporary ``GIT_INDEX_FILE`` that a fixture command must never inherit
+        (SA-0MVWS6G0Z0050PD2).
+        """
         def runner(cmd):
             if cmd and cmd[0] == "git":
                 cmd = ["git", "-C", str(repo)] + list(cmd[1:])
             return subprocess.run(cmd, capture_output=True, text=True,
-                                  check=False)
+                                  check=False, env=fixture_git_env())
         return runner
 
     def test_repo_index_exposes_root_file_names(self, tmp_path):

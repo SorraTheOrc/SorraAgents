@@ -50,7 +50,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from audit.scripts import audit_runner, verify_context_reduction
 from intake.scripts import intake
-from shared import status_lifecycle
+from refactor.scripts import refactor
+from shared import status_lifecycle, tree_coverage
 
 from skill.implement.scripts import implement
 
@@ -59,10 +60,13 @@ _WORK_ITEM_ID_RE = re.compile(r"^[A-Z][A-Z0-9]*-[A-Z0-9-]+$")
 _SKILL_ROOT = REPO_ROOT / "skill"
 
 
-def _load_agent_log_review():
-    """Load the hyphenated ``agent-log-review`` skill script as a module."""
-    path = _SKILL_ROOT / "agent-log-review" / "scripts" / "agent_log_review.py"
-    name = "_matrix_agent_log_review"
+def _load_hyphenated_skill_module(source: str, name: str):
+    """Load a script from a hyphenated skill directory as a module.
+
+    Skill directories such as ``find-related`` and ``agent-log-review`` are
+    not importable package names, so the module is loaded from its file path.
+    """
+    path = _SKILL_ROOT / source
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -72,7 +76,15 @@ def _load_agent_log_review():
     return module
 
 
-agent_log_review = _load_agent_log_review()
+agent_log_review = _load_hyphenated_skill_module(
+    "agent-log-review/scripts/agent_log_review.py", "_matrix_agent_log_review"
+)
+find_related = _load_hyphenated_skill_module(
+    "find-related/scripts/find_related.py", "_matrix_find_related"
+)
+effort_and_risk_run_skill = _load_hyphenated_skill_module(
+    "effort-and-risk/scripts/run_skill.py", "_matrix_effort_and_risk_run_skill"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +402,22 @@ class ReleaseExercise:
     entry_points: tuple[str, ...]
     exercise: Callable[[FakeWorklogStore], None] = field(compare=False)
     classification: str = "must-release-on-terminal"
+
+
+@dataclass(frozen=True)
+class ReadOnlyCaller:
+    """A reviewed read-only caller that must never establish a claim.
+
+    ``exercise`` runs the production entry point against the in-memory store
+    seeded with a pre-existing producer ``Map`` hold. A read-only caller must
+    write no ``--assignee`` at all: it cannot leave a hold behind, and the
+    release-by-default must not wrongly clear a hold it never held.
+    """
+
+    name: str
+    source: str
+    exercise: Callable[[FakeWorklogStore, Path], None] = field(compare=False)
+    classification: str = "must-not-acquire-assignee"
 
 
 # ---------------------------------------------------------------------------
@@ -1159,6 +1187,114 @@ def test_intentional_holds_are_preserved(hold: PinnedHold, tmp_path: Path) -> No
     """Intentional holds must survive the release-by-default behaviour."""
     assert hold.classification == "intentional-hold"
     hold.exercise(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Read-only callers: they must never establish a claim in the first place
+# ---------------------------------------------------------------------------
+
+
+def _exercise_find_related(store: FakeWorklogStore, tmp_path: Path) -> None:
+    """Run find-related's read-only lifecycle (its work fetch fails fast)."""
+    with (
+        patch.object(find_related, "_default_repo_path", return_value="."),
+        patch.object(find_related, "_wl_flags_for", return_value=[]),
+        patch.object(find_related, "fetch_with_probe", return_value=(None, None)),
+        patch.object(
+            sys, "argv", ["find_related.py", "--work-item-id", "SA-MATRIXRO"]
+        ),
+        _inject_store_runner(store),
+        pytest.raises(SystemExit),
+    ):
+        find_related._main()
+
+
+def _exercise_refactor(store: FakeWorklogStore, tmp_path: Path) -> None:
+    """Run refactor's read-only lifecycle wrapper (pipeline stubbed out)."""
+    args = SimpleNamespace(
+        work_item_id="SA-MATRIXRO",
+        dry_run=False,
+        config=None,
+        parent_branch="dev",
+        no_linter=True,
+        no_llm=True,
+    )
+    with (
+        patch.object(refactor, "refactor_pipeline", return_value={"success": True}),
+        _inject_store_runner(store),
+    ):
+        refactor._build_pipeline_runner(args)()
+
+
+def _exercise_effort_and_risk(store: FakeWorklogStore, tmp_path: Path) -> None:
+    """Run the effort/risk wrapper (orchestrator subprocess stubbed out)."""
+    proc = SimpleNamespace(returncode=0, stdout="{}", stderr="")
+    with (
+        patch.object(
+            effort_and_risk_run_skill,
+            "wl_show",
+            return_value={"workItem": {"status": "open"}},
+        ),
+        patch.object(effort_and_risk_run_skill.subprocess, "run", return_value=proc),
+        patch.object(sys, "argv", ["run_skill.py", "--issue", "SA-MATRIXRO"]),
+        _inject_store_runner(store),
+    ):
+        effort_and_risk_run_skill.main()
+
+
+def _exercise_tree_coverage(store: FakeWorklogStore, tmp_path: Path) -> None:
+    """Advance the stage through tree coverage's shared lifecycle helper."""
+    tree_coverage._advance_stage("SA-MATRIXRO", "plan_complete", runner=store.runner)
+
+
+READ_ONLY_CALLERS: tuple[ReadOnlyCaller, ...] = (
+    ReadOnlyCaller(
+        name="find-related read-only analysis",
+        source="find-related/scripts/find_related.py",
+        exercise=_exercise_find_related,
+    ),
+    ReadOnlyCaller(
+        name="refactor read-only analysis",
+        source="refactor/scripts/refactor.py",
+        exercise=_exercise_refactor,
+    ),
+    ReadOnlyCaller(
+        name="effort-and-risk estimate wrapper",
+        source="effort-and-risk/scripts/run_skill.py",
+        exercise=_exercise_effort_and_risk,
+    ),
+    ReadOnlyCaller(
+        name="tree-coverage stage advance",
+        source="shared/tree_coverage.py",
+        exercise=_exercise_tree_coverage,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "case", READ_ONLY_CALLERS, ids=[case.name for case in READ_ONLY_CALLERS]
+)
+def test_read_only_callers_never_touch_an_assignee(
+    case: ReadOnlyCaller, tmp_path: Path
+) -> None:
+    """A read-only caller writes no assignee and preserves a producer hold."""
+    assert case.classification == "must-not-acquire-assignee"
+    store = FakeWorklogStore.with_item(
+        "SA-MATRIXRO", status="open", stage="plan_complete", assignee="Map"
+    )
+    assert store.assignee("SA-MATRIXRO") == "Map"
+
+    case.exercise(store, tmp_path)
+
+    assert store.update_commands, "the read-only caller issued no wl update at all"
+    offending = [cmd for cmd in store.update_commands if "--assignee" in cmd]
+    assert not offending, (
+        f"{case.name}: a read-only caller wrote an assignee ({offending[0]}); it "
+        "must neither claim nor release a hold"
+    )
+    assert store.assignee("SA-MATRIXRO") == "Map", (
+        f"{case.name}: the read-only caller wrongly cleared the producer hold"
+    )
 
 
 # ---------------------------------------------------------------------------

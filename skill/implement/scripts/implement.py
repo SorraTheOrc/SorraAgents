@@ -749,6 +749,9 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
     wi = data.get("workItem", {})
     current = wi.get("status", "")
     if current in ("in-progress", "in_progress"):
+        # Durable-write reset: this safety path runs outside any StatusLifecycle
+        # context (signal/error unwinding), so the helper's release-by-default
+        # exit hook does not apply — the claim is released explicitly here.
         StatusLifecycle.update_status(work_item_id, "open", assignee="")
         LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
     else:
@@ -6523,6 +6526,11 @@ def _phase_start_locked(
     LOG.info("Claiming work item %s...", work_item_id)
     try:
         StatusLifecycle.update_status(work_item_id, "in_progress")
+        # Status-only claim: no assignee is set, so there is no scheduling hold
+        # to release while the run is in flight (AGENTS_GLOBAL.md claim
+        # pattern). Terminal outcomes below still write ``assignee=""``
+        # explicitly, including on paths that never reach a StatusLifecycle
+        # exit (SA-0MVVF6Y38004T5OZ).
     except RuntimeError as exc:
         msg = f"Failed to claim work item {work_item_id}: {exc}"
         report["success"] = False
@@ -8513,6 +8521,10 @@ def phase_parent(
     already_terminal = _is_terminal_status(parent_status)
     if not already_terminal:
         try:
+            # Direct terminal durable write (phase_parent is not wrapped in a
+            # StatusLifecycle context manager): the release must stay explicit
+            # so the epic is never left on an agent hold (assignee-hold
+            # convention).
             StatusLifecycle.update_status(
                 work_item_id, "completed", stage="in_review", assignee=""
             )
@@ -9675,6 +9687,8 @@ def _finalise_stranded_child(
 
     commit = str(evidence.get("commit", ""))
     try:
+        # Direct terminal durable write — the finaliser is not a StatusLifecycle
+        # exit, so the stranded child's hold is released explicitly.
         StatusLifecycle.update_status(
             child_id, "completed", stage="in_review", assignee=""
         )
@@ -10186,6 +10200,8 @@ def phase_drive(
                     ),
                 )
                 try:
+                    # Durable-write reset after a failed finish: release the
+                    # child's claim so a fresh drive session can re-dispatch it.
                     StatusLifecycle.update_status(
                         failed_cid, "open", assignee="",
                     )
