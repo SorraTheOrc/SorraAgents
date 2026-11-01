@@ -591,8 +591,47 @@ Genuine structured failures always win the classification, so a real test
 failure is never misreported as (or retried as) an infrastructure
 condition. The classification uses the stable notice codes exported by
 `run_tests.py` (`NOTICE_SLOT_BUSY`, `NOTICE_COMMAND_NOT_FOUND`,
-`NOTICE_SUITE_TIMEOUT`), never string matching on the human-readable notice
-text.
+`NOTICE_SUITE_TIMEOUT`, `NOTICE_KILLED`, `NOTICE_UNPARSED_FAILURE`), never
+string matching on the human-readable notice text.
+
+**Timeout, kill and unparsed reasons (SA-0MVTET8KQ0031R6Z).** A red gate has
+to answer one question before an operator (or an agent) acts: fix the code,
+raise the timeout, treat the host as the problem, or read the output. The gate
+therefore publishes one reason per condition, mapped from the runner's stable
+codes:
+
+| `reason` | Runner code | Meaning | Next action |
+|----------|-------------|---------|-------------|
+| `test_failure` | structured `failures` | Real failing tests. | Fix the code. Never treated as infrastructure. |
+| `timeout` | `suite_timeout` | The suite exceeded `timeoutPerCommand` and was stopped. | Raise `timeoutPerCommand` in `.pi/test-config.json` with headroom over a green run's elapsed time, then re-run. |
+| `killed` | `killed` (suite `returncode < 0`) | The child was signal-terminated (OOM kill, worker/supervisor crash) with no test result. | Treat as host/infrastructure: read the output tail, re-run; do not "fix" a test. |
+| `unparsed` | `unparsed_failure` | The suite exited non-zero and no test failure could be parsed (bad flag, unloadable config, missing wrapper). | Read the command and output tail; the command or its configuration is the problem. |
+| `slot_contention` | `slot_busy` | No host test slot within the bounded wait. | Wait a staggered delay, or raise `TEST_LOCK_TIMEOUT`. The queue wait is reported separately from suite execution. |
+| `infrastructure` | any other notice, or a live-repo mutation | Unattributable to a test, but explained by a notice. | Read the notices; the repo may have been mutated by a concurrent session. |
+| `unknown` | — | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. It is unreachable for a timed-out, killed or non-zero run. |
+
+The deciding **fact fields** travel with the verdict — on `test_phase` in the
+finish report and in the operator message under `Gate facts:` — so nothing has
+to be re-derived from prose:
+
+- `configured_timeout` — the `timeoutPerCommand` that was applied (seconds).
+- `elapsed_seconds` — wall time of the command execution only; `null` (never
+  `0`) when nothing ran (fully cached, or a slot wait expired before the
+  spawn).
+- `slot_wait_seconds` — the host test-slot queue wait, measured once by the
+  pacer and **never** folded into `elapsed_seconds`; on a slot-busy result it
+  is the elapsed bounded wait.
+- `command` — the suite command that was run.
+- `exit_code` / `signal` — the process exit code, with the terminating signal
+  when the child was killed. An exit code is reported only when a suite
+  actually reported one; the report-shape fallback is never presented as a
+  fact.
+
+Where a runner predates the `killed`/`unparsed_failure` codes the gate
+classifies the *shape*: a negative per-suite `returncode` is `killed`, and a
+positive one with no parsable failure is `unparsed`. The test skill's
+failure-notice contract (fields, units and codes) is documented in
+[test-skill-reference.md](test-skill-reference.md#notice-codes-stable-strings).
 
 The returned dict includes `skipped` (bool) and `tooling` (str | None) in
 addition to `success`/`stdout`/`stderr`/`exit_code`/`failures` — and, for a

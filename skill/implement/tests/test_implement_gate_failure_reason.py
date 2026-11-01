@@ -250,16 +250,6 @@ class TestGateFailureMessage:
 # precedence/regression tests that pass today are unmarked on purpose.
 # ---------------------------------------------------------------------------
 
-_GATE_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Contract pinned test-first by SA-0MVU8XQTU006DP37; the finish-gate "
-        "slice SA-0MVU8XRTE008VDO2 adds the timeout/killed/unparsed reasons "
-        "and the fact fields. Remove this marker in that slice (strict xfail "
-        "fails on XPASS)."
-    ),
-)
-
 #: Fact fields a classified runner emits (see
 #: ``gate_failure_fixtures.FACT_FIELDS`` for the units).
 _TIMEOUT_FACTS = {
@@ -339,7 +329,6 @@ def _slot_busy_shape() -> dict:
 class TestGateReasonVocabulary:
     """The reasons are published, machine-readable strings."""
 
-    @_GATE_XFAIL
     def test_reason_strings_are_named_and_stable(self) -> None:
         assert implement.GATE_FAILURE_TIMEOUT == fx.REASON_TIMEOUT
         assert implement.GATE_FAILURE_KILLED == fx.REASON_KILLED
@@ -349,25 +338,21 @@ class TestGateReasonVocabulary:
 class TestGateReasonClassification:
     """Each infrastructure condition maps to its own reason."""
 
-    @_GATE_XFAIL
     def test_timeout_code_is_timeout(self) -> None:
         assert implement._gate_failure_kind(_timeout_shape()) == (
             implement.GATE_FAILURE_TIMEOUT
         )
 
-    @_GATE_XFAIL
     def test_killed_code_is_killed(self) -> None:
         assert implement._gate_failure_kind(_killed_shape()) == (
             implement.GATE_FAILURE_KILLED
         )
 
-    @_GATE_XFAIL
     def test_unparsed_failure_code_is_unparsed(self) -> None:
         assert implement._gate_failure_kind(_unparsed_shape()) == (
             implement.GATE_FAILURE_UNPARSED
         )
 
-    @_GATE_XFAIL
     def test_negative_exit_code_without_a_notice_is_still_killed(self) -> None:
         """The gate classifies the shape itself, not only a runner code."""
         adapted = _adapt(
@@ -379,7 +364,6 @@ class TestGateReasonClassification:
             implement.GATE_FAILURE_KILLED
         )
 
-    @_GATE_XFAIL
     def test_non_zero_exit_without_a_notice_is_still_unparsed(self) -> None:
         adapted = _adapt(
             success=False,
@@ -419,7 +403,6 @@ class TestNoInfrastructureConditionFallsBackToUnknown:
                 "a classified failure must carry a non-empty detail"
             )
 
-    @_GATE_XFAIL
     def test_kill_and_unparsed_output_are_never_unknown(self) -> None:
         for shape in (
             _killed_shape(),
@@ -440,7 +423,6 @@ class TestNoInfrastructureConditionFallsBackToUnknown:
 class TestGateFactFieldsAreCarried:
     """The implement.py boundary must not drop the facts it was handed."""
 
-    @_GATE_XFAIL
     def test_timeout_facts_survive_adaptation(self) -> None:
         adapted = _timeout_shape()
 
@@ -448,7 +430,6 @@ class TestGateFactFieldsAreCarried:
         assert adapted["elapsed_seconds"] == pytest.approx(300.5)
         assert adapted["slot_wait_seconds"] == pytest.approx(42.0)
 
-    @_GATE_XFAIL
     def test_killed_facts_survive_adaptation(self) -> None:
         adapted = _killed_shape()
 
@@ -456,7 +437,6 @@ class TestGateFactFieldsAreCarried:
         assert adapted["exit_code"] == -9
         assert adapted["command"] == fx.FIXTURE_COMMAND
 
-    @_GATE_XFAIL
     def test_unparsed_facts_survive_adaptation(self) -> None:
         adapted = _unparsed_shape()
 
@@ -467,7 +447,6 @@ class TestGateFactFieldsAreCarried:
 class TestGateFailureMessageRendersFacts:
     """The message must state the facts that decide the remedy."""
 
-    @_GATE_XFAIL
     def test_timeout_message_names_configured_timeout_and_elapsed(self) -> None:
         message = _message(_timeout_shape())
 
@@ -477,7 +456,6 @@ class TestGateFailureMessageRendersFacts:
         assert "300" in message, "and how long the suite had been running"
         assert "not a code failure" in message
 
-    @_GATE_XFAIL
     def test_killed_message_reports_command_signal_and_output_tail(self) -> None:
         message = _message(_killed_shape())
 
@@ -486,7 +464,6 @@ class TestGateFailureMessageRendersFacts:
         assert "9" in message
         assert _TAIL_MARKER in message
 
-    @_GATE_XFAIL
     def test_unparsed_message_reports_command_exit_code_and_output_tail(self) -> None:
         message = _message(_unparsed_shape())
 

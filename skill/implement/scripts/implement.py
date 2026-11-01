@@ -155,7 +155,16 @@ try:
     # separately so an older test skill without the constants degrades to
     # the literal fallbacks instead of breaking the whole delegation import.
     from test.scripts.run_tests import (
+        NOTICE_KILLED as _NOTICE_KILLED,
+    )
+    from test.scripts.run_tests import (
         NOTICE_SLOT_BUSY as _NOTICE_SLOT_BUSY,
+    )
+    from test.scripts.run_tests import (
+        NOTICE_SUITE_TIMEOUT as _NOTICE_SUITE_TIMEOUT,
+    )
+    from test.scripts.run_tests import (
+        NOTICE_UNPARSED_FAILURE as _NOTICE_UNPARSED_FAILURE,
     )
     from test.scripts.run_tests import (
         SLOT_BUSY_NOTICE_PREFIX as _SLOT_BUSY_NOTICE_PREFIX,
@@ -164,6 +173,9 @@ except ImportError:
     # Older test skill without the notice-code contract — degrade to the
     # literal fallbacks (never break the delegation import chain).
     _NOTICE_SLOT_BUSY = "slot_busy"  # type: ignore[assignment]
+    _NOTICE_SUITE_TIMEOUT = "suite_timeout"  # type: ignore[assignment]
+    _NOTICE_KILLED = "killed"  # type: ignore[assignment]
+    _NOTICE_UNPARSED_FAILURE = "unparsed_failure"  # type: ignore[assignment]
     _SLOT_BUSY_NOTICE_PREFIX = (  # type: ignore[assignment]
         "test concurrency slot busy:"
     )
@@ -2372,7 +2384,7 @@ def _remove_gate_index(index_path: str | None) -> None:
             os.unlink(candidate)
         except FileNotFoundError:
             continue
-        except OSError as exc:  # noqa: BLE001 - cleanup is best-effort
+        except OSError as exc:
             LOG.warning(
                 "Could not remove the finish gate's temporary index %s: %s",
                 candidate,
@@ -4895,6 +4907,79 @@ def _guarded_output(guarded: dict[str, Any], key: str) -> str:
     return "\n".join(parts)
 
 
+def _gate_facts(
+    guarded: dict[str, Any], exit_code: int
+) -> dict[str, Any]:
+    """The infrastructure facts a ``guarded_run_all`` result carries.
+
+    Read from the aggregate when the runner reports them there and otherwise
+    from the first suite that has them, so a partial or older result still
+    contributes whatever it measured. ``signal`` is derived from a negative
+    exit code when the runner did not state it (a signal-terminated child is
+    ``returncode < 0`` — SA-0MVU8XRBQ000DG9D).
+
+    Args:
+        guarded: The ``guarded_run_all`` result.
+        exit_code: The resolved aggregate exit code.
+
+    Returns:
+        A mapping of the fact fields that are known (never ``None`` values, so
+        an unknown fact is absent rather than misleading).
+    """
+    facts: dict[str, Any] = {}
+    suites = guarded.get("suites") or {}
+    suite_results = (
+        [s for s in suites.values() if isinstance(s, dict)]
+        if isinstance(suites, dict)
+        else []
+    )
+
+    def _from_suites(field: str) -> Any:
+        for suite in suite_results:
+            value = suite.get(field)
+            if value is not None:
+                return value
+        return None
+
+    configured_timeout = guarded.get("configured_timeout")
+    if configured_timeout is None:
+        configured_timeout = _from_suites("configured_timeout")
+    if configured_timeout is not None:
+        facts["configured_timeout"] = configured_timeout
+
+    elapsed = guarded.get("elapsed_seconds")
+    if elapsed is None:
+        elapsed = guarded.get("elapsed_seconds_total")
+    if elapsed is None:
+        elapsed = _from_suites("elapsed_seconds")
+    if elapsed is not None:
+        facts["elapsed_seconds"] = elapsed
+
+    slot_wait = guarded.get("slot_wait_seconds")
+    if slot_wait is None:
+        slot_wait = _from_suites("slot_wait_seconds")
+    if slot_wait is not None:
+        facts["slot_wait_seconds"] = slot_wait
+
+    command = guarded.get("command") or _from_suites("command")
+    if command:
+        facts["command"] = command
+
+    signal_number = guarded.get("signal")
+    if signal_number is None:
+        signal_number = _from_suites("signal")
+    if signal_number is None and exit_code < 0:
+        signal_number = abs(exit_code)
+    if signal_number is not None:
+        facts["signal"] = signal_number
+
+    # Only a suite that actually reported a non-zero code states an exit code:
+    # the report-shape fallback of ``1`` must never be presented as one.
+    if _reported_exit_code(guarded) is not None or exit_code < 0:
+        facts["exit_code"] = exit_code
+    return facts
+
+
 def _adapt_guarded_result(
     guarded: dict[str, Any], tooling: str | None, scope: str
 ) -> dict[str, Any]:
@@ -4939,6 +5024,9 @@ def _adapt_guarded_result(
         "stdout": _tail_text(_guarded_output(guarded, "stdout")),
         "stderr": _tail_text(_guarded_output(guarded, "stderr")),
         "exit_code": exit_code,
+        # Whether the runner *reported* an exit code (as opposed to the
+        # report-shape fallback) so the gate never presents a fabricated one.
+        "exit_code_reported": _explicit_suite_exit_code(guarded) is not None,
         "failures": failures,
         "notices": notices,
         "notice_codes": notice_codes,
@@ -4957,6 +5045,12 @@ def _adapt_guarded_result(
     ]
     if excluded:
         result["live_repo_excluded"] = excluded
+    # Infrastructure facts (SA-0MVTET8KQ0031R6Z): the runner states what
+    # happened — configured timeout, execution time, queue wait, command, exit
+    # code and signal — and the gate must not drop a single one, because they
+    # are what decides the remedy. Additive only: absent keys stay absent.
+    for field, value in _gate_facts(guarded, exit_code).items():
+        result[field] = value
     # Verdict provenance (SA-0MVQHVJEX0071R7G): carry the cache flag and the
     # served entry's metadata through from the guarded run so the finish
     # report can attribute the verdict (fresh run vs. which cached entry).
@@ -4970,10 +5064,70 @@ def _adapt_guarded_result(
 #: Classification of a test-gate failure (WL-0MVGUT787000LNDG). ``phase_finish``
 #: must distinguish a retryable infrastructure condition (no free test slot)
 #: from a genuine code failure so the operator does not burn a blind retry.
+#:
+#: The three infrastructure kinds below answer the only question an operator
+#: woken by a red gate has to settle before acting
+#: (SA-0MVTET8KQ0031R6Z): fix code (``test_failure``), raise
+#: ``timeoutPerCommand`` (``timeout``), treat the host as the problem
+#: (``killed`` / ``slot_contention``), or read the output because the suite
+#: said something the parser could not parse (``unparsed``).
 GATE_FAILURE_SLOT_CONTENTION = "slot_contention"
 GATE_FAILURE_INFRASTRUCTURE = "infrastructure"
 GATE_FAILURE_TESTS = "test_failure"
+GATE_FAILURE_TIMEOUT = "timeout"
+GATE_FAILURE_KILLED = "killed"
+GATE_FAILURE_UNPARSED = "unparsed"
 GATE_FAILURE_UNKNOWN = "unknown"
+
+#: Fact fields carried from the runner into the gate report and message. Every
+#: one is additive: a consumer reading an older result simply finds no key.
+GATE_FACT_FIELDS: tuple[str, ...] = (
+    "configured_timeout",
+    "elapsed_seconds",
+    "slot_wait_seconds",
+    "command",
+    "exit_code",
+    "signal",
+)
+
+
+def _explicit_suite_exit_code(test_result: dict[str, Any]) -> int | None:
+    """The run's exit code from an *explicit* per-suite ``returncode``.
+
+    Returns ``None`` when no suite reported one, so the classification can tell
+    "a suite exited non-zero" apart from "the runner never ran a command" —
+    the fallback ``1`` used for the report shape must never be read as a
+    genuine non-zero exit.
+    """
+    suites = test_result.get("suites") or {}
+    if not isinstance(suites, dict):
+        return None
+    for suite in suites.values():
+        if not isinstance(suite, dict):
+            continue
+        returncode = suite.get("returncode")
+        if isinstance(returncode, int) and returncode != 0:
+            return returncode
+    return None
+
+
+def _reported_exit_code(test_result: dict[str, Any]) -> int | None:
+    """The run's exit code as *reported*, from either result shape.
+
+    A raw ``guarded_run_all`` result carries per-suite ``returncode``s; an
+    adapted result carries the resolved ``exit_code`` plus
+    ``exit_code_reported``. Both are read so the classification works on either
+    side of the boundary, and a report-shape fallback is never mistaken for a
+    genuine non-zero exit.
+    """
+    explicit = _explicit_suite_exit_code(test_result)
+    if explicit is not None:
+        return explicit
+    if test_result.get("exit_code_reported"):
+        exit_code = test_result.get("exit_code")
+        if isinstance(exit_code, int) and exit_code != 0:
+            return exit_code
+    return None
 
 
 def _gate_failure_kind(test_result: dict[str, Any]) -> str:
@@ -4981,10 +5135,17 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
 
     Genuine structured failures always win: a real test failure must never be
     reported as (or fixed by retrying instead of fixing) an infrastructure
-    condition. Slot contention is identified by the stable ``notice_code``
-    first, with a narrow legacy fallback on the slot-busy notice prefix (only
-    used when there are no structured failures), matching the constraint in
-    WL-0MVGUT787000LNDG — never a generic substring match.
+    condition. Classification then proceeds on stable machine-readable codes
+    (never on notice wording), with a narrow legacy fallback on the slot-busy
+    notice prefix for a result produced by an older test skill (WL-0MVGUT787000LNDG).
+
+    A timeout, a signal kill and an unparsable non-zero exit each get their own
+    reason (SA-0MVTET8KQ0031R6Z). When the runner predates the ``killed`` /
+    ``unparsed_failure`` codes the *shape* decides instead: a negative suite
+    exit code is a signal termination and a positive one with no parsable
+    failure is unparsed output. ``unknown`` therefore survives only for a
+    failure with no structured failure, no notice and no executed command —
+    never for a timed-out, killed or non-zero run.
     """
     if test_result.get("failures"):
         return GATE_FAILURE_TESTS
@@ -4996,6 +5157,17 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
             return GATE_FAILURE_SLOT_CONTENTION
     if test_result.get("live_repo_mutation"):
         return GATE_FAILURE_INFRASTRUCTURE
+    if _NOTICE_SUITE_TIMEOUT in notice_codes:
+        return GATE_FAILURE_TIMEOUT
+    if _NOTICE_KILLED in notice_codes:
+        return GATE_FAILURE_KILLED
+    if _NOTICE_UNPARSED_FAILURE in notice_codes:
+        return GATE_FAILURE_UNPARSED
+    exit_code = _reported_exit_code(test_result)
+    if exit_code is not None:
+        if exit_code < 0:
+            return GATE_FAILURE_KILLED
+        return GATE_FAILURE_UNPARSED
     if notice_codes or test_result.get("notices"):
         return GATE_FAILURE_INFRASTRUCTURE
     return GATE_FAILURE_UNKNOWN
@@ -5027,6 +5199,9 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
         sections.append(
             "Live-repo mutation detected:\n" + _tail_text(str(mutation))
         )
+    facts = _render_gate_facts(_gate_facts(test_result, _gate_exit_code(test_result)))
+    if facts:
+        sections.append("Gate facts:\n" + facts)
     output_tail = _tail_text(test_result.get("stderr")) or _tail_text(
         test_result.get("stdout")
     )
@@ -5038,6 +5213,55 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
             "notices or command output. Check the test-runner logs."
         )
     return "No structured test failures were parsed.\n\n" + "\n\n".join(sections)
+
+
+def _gate_exit_code(test_result: dict[str, Any]) -> int:
+    """The gate result's exit code, negative when signal-terminated."""
+    exit_code = test_result.get("exit_code")
+    if isinstance(exit_code, int):
+        return exit_code
+    reported = _reported_exit_code(test_result)
+    return reported if reported is not None else 0
+
+
+def _render_seconds(value: Any) -> str:
+    """Render a measured duration, naming an unmeasured one."""
+    if isinstance(value, (int, float)):
+        return f"{float(value):.1f}s"
+    return "unknown"
+
+
+def _render_gate_facts(facts: dict[str, Any]) -> str:
+    """One line per known infrastructure fact, in a fixed readable order.
+
+    The units are stated so a report is readable without the source: seconds
+    for the durations, the command as it was run, and the exit code with the
+    signal that terminated it when the child was killed
+    (SA-0MVTET8KQ0031R6Z).
+    """
+    lines: list[str] = []
+    if "configured_timeout" in facts:
+        lines.append(
+            "configured timeout (timeoutPerCommand): "
+            f"{facts['configured_timeout']}s"
+        )
+    if "elapsed_seconds" in facts:
+        lines.append(
+            "suite elapsed (command execution only): "
+            f"{_render_seconds(facts['elapsed_seconds'])}"
+        )
+    if "slot_wait_seconds" in facts:
+        lines.append(
+            "test-slot queue wait (separate from elapsed): "
+            f"{_render_seconds(facts['slot_wait_seconds'])}"
+        )
+    if "command" in facts:
+        lines.append(f"command: {facts['command']}")
+    if "exit_code" in facts:
+        lines.append(f"exit code: {facts['exit_code']}")
+    if "signal" in facts:
+        lines.append(f"signal: {facts['signal']} (child killed)")
+    return "\n".join(lines)
 
 
 def _gate_failure_message(
@@ -5054,17 +5278,73 @@ def _gate_failure_message(
     """
     kind = _gate_failure_kind(test_result)
     detail = _gate_failure_detail(test_result)
+    facts = _gate_facts(test_result, _gate_exit_code(test_result))
     if kind == GATE_FAILURE_SLOT_CONTENTION:
+        waited = (
+            f" after waiting {_render_seconds(facts['slot_wait_seconds'])} "
+            "for one"
+            if "slot_wait_seconds" in facts
+            else ""
+        )
         headline = (
             f"Test run {attempt}/{max_retry} could not start: no free test "
-            "slot (infrastructure condition, not a code failure). Wait for a "
-            "slot to free up, then retry — or raise TEST_LOCK_TIMEOUT "
+            f"slot{waited} (infrastructure condition, not a code failure). "
+            "The queue wait is reported separately from the suite's "
+            "execution time. Wait a staggered delay before retrying (do not "
+            "re-run immediately; concurrent waiters re-enter the pool in "
+            "lockstep otherwise), or raise TEST_LOCK_TIMEOUT "
             "(e.g. TEST_LOCK_TIMEOUT=1800) to wait longer."
+        )
+    elif kind == GATE_FAILURE_TIMEOUT:
+        configured = facts.get("configured_timeout")
+        budget = (
+            f" The gate allows {configured}s per command (timeoutPerCommand)."
+            if configured is not None
+            else ""
+        )
+        headline = (
+            f"Test run {attempt}/{max_retry} timed out: the suite exceeded "
+            f"the configured per-command timeout and was stopped after "
+            f"{_render_seconds(facts.get('elapsed_seconds'))} of execution "
+            f"(infrastructure condition, not a code failure).{budget} Raise "
+            "timeoutPerCommand in .pi/test-config.json with headroom over a "
+            "green run's elapsed time (a queue wait for a test slot is "
+            "reported separately and is not part of that budget), then "
+            "re-run."
+        )
+    elif kind == GATE_FAILURE_KILLED:
+        signal_number = facts.get("signal")
+        headline = (
+            f"Test run {attempt}/{max_retry} was killed"
+            + (f" by signal {signal_number}" if signal_number is not None else "")
+            + " (infrastructure condition, not a code failure): the child was "
+            "terminated without reporting a test result — an OOM kill or a "
+            "worker/supervisor crash. Inspect the output tail below; do not "
+            "treat this as a failing test."
+        )
+    elif kind == GATE_FAILURE_UNPARSED:
+        exit_code = facts.get("exit_code")
+        headline = (
+            f"Test run {attempt}/{max_retry} exited "
+            + (f"with code {exit_code} " if exit_code is not None else "non-zero ")
+            + "and produced no parsable test failures (infrastructure "
+            "condition, not a code failure): the suite command failed before "
+            "any test result was reported. Read the command and output tail "
+            "below — the command or its configuration is the problem, not a "
+            "test."
         )
     elif kind == GATE_FAILURE_INFRASTRUCTURE:
         headline = (
             f"Test run {attempt}/{max_retry} failed for an infrastructure "
             "reason (not a code failure)."
+        )
+    elif kind == GATE_FAILURE_UNKNOWN:
+        headline = (
+            f"Test run {attempt}/{max_retry} failed for an unclassified "
+            "reason: the runner reported no structured failure, no notice and "
+            "no executed command, so no view of this run can be attributed. "
+            "Re-run the suite directly with the test skill to obtain "
+            "diagnostics."
         )
     else:
         headline = f"Test run {attempt}/{max_retry} failed."
@@ -6932,12 +7212,19 @@ def phase_finish(
             # Report current state and let the agent loop externally
             report["success"] = False
             report["message"] = msg
+            # The report states the classification *and* the facts that
+            # decided it (SA-0MVTET8KQ0031R6Z): a consumer never has to
+            # re-derive the configured timeout, the execution time, the
+            # separate queue wait, the command or the exit code/signal from
+            # prose. Additive keys only — an older consumer ignores them.
             report["test_phase"] = {
                 "attempt": test_attempts,
                 "max_retry": max_retry,
                 "failures": failures,
                 "notices": list(test_result.get("notices") or []),
+                "notice_codes": list(test_result.get("notice_codes") or []),
                 "reason": failure_reason,
+                **_gate_facts(test_result, _gate_exit_code(test_result)),
             }
             print(format_json_output(report))
             return report
