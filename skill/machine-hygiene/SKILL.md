@@ -37,19 +37,60 @@ the evaluate script and displays the output in the chat window.
 Collects and renders a **before table** with the following metrics, each
 classified as **low** (green), **warning** (amber), or **critical** (red):
 
-| Metric | Source | Classification basis |
-|---|---|---|
-| Load average | `/proc/loadavg` vs. core count | Configurable multiplier |
-| CPU pressure | `/proc/pressure/cpu` | Percentage thresholds |
-| Memory pressure | `/proc/pressure/memory` | Percentage thresholds |
-| I/O pressure | `/proc/pressure/io` | Percentage thresholds |
-| Free memory | `/proc/meminfo` | Percentage thresholds |
-| Swap usage | `/proc/meminfo` | Percentage thresholds |
-| Process count | `/proc` scan | Core-count multiplier |
-| Thread count | `/proc` scan | Core-count multiplier |
-| Per-command RSS (top 10) | `/proc/[pid]/status` | Absolute RSS bytes |
-| Runnable processes | `/proc` state scan | Core-count multiplier |
-| Stale devices | Zombie + lock detection | Absolute count |
+| Metric | Source | PSI line (basis) | Classification basis |
+|---|---|---|---|
+| Load average | `/proc/loadavg` vs. core count | — | Configurable multiplier |
+| CPU pressure | `/proc/pressure/cpu` | `some` avg10 (% of time *any* task stalled on CPU) | Percentage thresholds (`cpu_pressure`) |
+| Memory pressure | `/proc/pressure/memory` | `full` avg10 (% of time *all* tasks stalled on memory) | Percentage thresholds (`memory_pressure`) |
+| I/O pressure | `/proc/pressure/io` | `full` avg10 (% of time *all* tasks stalled on I/O) | Percentage thresholds (`io_pressure`) |
+| Free memory | `/proc/meminfo` | — | Percentage thresholds (`memory_usage`) |
+| Swap usage | `/proc/meminfo` | — | Percentage thresholds (`swap_usage`) |
+| Process count | `/proc` scan | — | Core-count multiplier |
+| Thread count | `/proc` scan | — | Core-count multiplier |
+| Per-command RSS (top 10) | `/proc/[pid]/status` | — | Absolute RSS bytes |
+| Runnable processes | `/proc` state scan | — | Core-count multiplier |
+| Stale devices | Zombie + lock detection | — | Absolute count |
+
+### Pressure stall (PSI) semantics
+
+`/proc/pressure/*` files expose up to two lines per resource:
+
+- **`some`** — the percentage of the last 10 s during which *at least one*
+task was stalled on the resource. It fires long before capacity is
+exhausted and is the only line the CPU file provides (a CPU is never
+stalled for every task at once).
+- **`full`** — the percentage of the last 10 s during which *all* runnable
+tasks were stalled. This is the "nothing made progress" signal and is what
+makes memory and I/O pressure actionable.
+
+Line selection is deliberate and explicit in `metrics.py`
+(`_read_proc_pressure(key, which)`): **cpu → `some`, memory → `full`,
+io → `full`**. Each metric's `description` in the rendered table names the
+selected line and its basis, so a row is self-documenting.
+
+**No fallback.** If the kernel does not expose the requested line (e.g. a
+pre-4.20 PSI backport that only ships `some` for memory), the metric
+degrades to `n/a` with a description naming the line that was requested —
+never a silent fallback to the other line, because mixing `some` and `full`
+would misstate severity. The same `n/a` degradation applies on non-Linux
+hosts and to kernels without pressure-stall info; the workflow continues and
+no metric crashes.
+
+**Stall percentage is not usage percentage.** `memory_usage` (from
+`/proc/meminfo`) is a *capacity* figure, so it is calibrated at 80/95 %.
+`memory_pressure` (the `full` PSI line) is a *stall* figure: a host can sit
+at 50 % RAM and still stall 20 % of wall time under reclaim churn, while 95 %
+RAM used with no stalls is not a memory stall problem at all. The two are not
+comparable, which is why `memory_pressure` has its own block
+(`warning: 5`, `critical: 20`) rather than borrowing the memory-usage
+thresholds — the latter would leave the metric permanently green and throw
+away the signal.
+
+**Threshold provenance.** `cpu_pressure` (70/85) and `io_pressure` (50/80)
+are inherited from the pre-parser-fix configuration and have not yet been
+validated against real stall data; `memory_pressure` (5/20) is a starting
+calibration for `full`-line semantics. Tune them in `config.yaml` from
+observed runs.
 
 ### Step 2 — Pressure Analysis
 
@@ -108,6 +149,12 @@ residual/legitimate load (e.g. active test suites, ongoing sessions).
 Thresholds are configurable via `config.yaml` in the skill directory
 (`~/.pi/agent/skills/machine-hygiene/config.yaml`). See the config file
 for documented defaults and descriptions.
+
+Each pressure metric has its own block: `cpu_pressure`, `memory_pressure`
+and `io_pressure` apply to the `avg10` value of the PSI line named in the
+metric table above; `memory_usage` and `swap_usage` are `/proc/meminfo`
+percentages. Threshold provenance and the `some` vs `full` rationale are
+documented both above and in `config.yaml`.
 
 ## Exit Codes
 

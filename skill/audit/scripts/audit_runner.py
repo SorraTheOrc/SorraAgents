@@ -1668,6 +1668,8 @@ def _restore_work_item_status(issue_id: str, original_status: str,
         original_status, original_stage,
     )
     try:
+        # Signal-path durable write: the StatusLifecycle exit hook never runs on
+        # SIGTERM/SIGINT, so the audit claim is released explicitly here.
         cmd = [
             "wl", "update", issue_id,
             "--status", safe_status,
@@ -10445,6 +10447,12 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # terminal item fail before the pipeline started. There is nothing to
     # claim for a done item, so skip the claim and let the verdict-driven
     # terminal lifecycle keep/restore `done` (SA-0MUWKGW9W004QXQZ).
+    #
+    # The claim is status-only and sets no assignee, so it never establishes a
+    # scheduling hold and never overwrites a pre-existing producer hold (the
+    # status-neutral claim convention documented in AGENTS_GLOBAL.md). The
+    # release of the audit agent's own claim happens on the terminal-write path
+    # below (SA-0MVVF6Y38004T5OZ).
     if original_stage != "done":
         _run_wl(runner,
                 ["wl", "update", issue_id, "--status", "in_progress", "--json"],
@@ -13331,6 +13339,8 @@ def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
     safe_status, safe_stage = _coerce_valid_status_stage(
         ctx.original_status, ctx.original_stage,
     )
+    # Raw ``wl update`` durable write: there is no StatusLifecycle exit here to
+    # inherit the release-by-default, so the audit claim is released explicitly.
     cmd = [
         "wl", "update", ctx.issue_id,
         "--status", safe_status,
@@ -13581,6 +13591,12 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         # variance note) leaves the overall 'Ready to close: Yes' verdict
         # trustworthy, so the item still moves to the review queue.
         fallback_tainted = ctx.ac_fallback_used.is_set()
+        # Every terminal write below is a raw ``wl update`` — this phase does
+        # not use ``StatusLifecycle`` — so the helper's release-by-default exit
+        # hook cannot clear the audit claim. The ``--assignee ""`` on each
+        # command is therefore required and must not be dropped as redundant
+        # (assignee-hold convention; pinned by
+        # ``tests/test_assignee_release_all_skills.py``).
         if ctx.audit_verdict == "no" and not fallback_tainted:
             # Evidence-marker backstop: if any AC evidence carries a known
             # infra-failure diagnostic, treat the "No" as fallback-tainted

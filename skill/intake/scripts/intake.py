@@ -22,6 +22,14 @@ Assignee release: ``start`` sets the assignee (a claim/hold marker); every
 terminal command (``finish``, ``auto-complete``, ``abort``) and every
 failure reset clears it, so a completed or released item is never left on
 a scheduling hold (non-empty assignee = hold; clear to release).
+
+Every release here is an explicit ``assignee=""`` and must stay explicit:
+these are direct ``StatusLifecycle.update_status`` durable writes, not
+``StatusLifecycle`` context-manager exits, so the helper's
+release-by-default (which applies on ``__exit__``) does not cover them.
+Dropping the keyword would silently reintroduce the hold for any item
+claimed with ``--assignee`` (pinned by
+``tests/test_assignee_release_all_skills.py``).
 """
 
 from __future__ import annotations
@@ -97,13 +105,18 @@ def cmd_finish(item_id: str, description_file: str | None = None) -> dict:
         except RuntimeError:
             # The item was claimed (in_progress) by `start`; reset to open so
             # it is never left stuck in in_progress on failure, and release
-            # the assignee hold.
+            # the assignee hold. The explicit ``assignee=""`` is required:
+            # this is a direct durable write, not a context-manager exit, so
+            # the helper's release-by-default does not run here.
             try:
                 StatusLifecycle.update_status(item_id, "open", assignee="")
             except RuntimeError:
                 LOG.error("Failed to reset work item %s status to open", item_id)
             raise
 
+    # Direct durable write (not a StatusLifecycle exit): the assignee must be
+    # released explicitly, because the helper's release-by-default only runs
+    # on context-manager exit (assignee-hold convention).
     StatusLifecycle.update_status(
         item_id, "open", stage="intake_complete", assignee=""
     )
@@ -126,12 +139,14 @@ def cmd_auto_complete(item_id: str) -> dict:
     """
     StatusLifecycle.update_status(item_id, "in_progress")
     try:
+        # Direct durable write: see the module docstring — the explicit
+        # ``assignee=""`` cannot be dropped as redundant.
         StatusLifecycle.update_status(
             item_id, "open", stage="intake_complete", assignee=""
         )
     except RuntimeError:
         # Reset back to open so the item is never left stuck in in_progress
-        # (and release the assignee hold).
+        # (and release the assignee hold; direct durable write again).
         try:
             StatusLifecycle.update_status(item_id, "open", assignee="")
         except RuntimeError:
@@ -153,6 +168,9 @@ def cmd_abort(item_id: str) -> dict:
     Returns:
         A dict with action and item_id keys.
     """
+    # Direct durable write: the abort path never enters a StatusLifecycle
+    # context manager, so the release-by-default exit hook cannot clear the
+    # claim — keep the explicit release (assignee-hold convention).
     StatusLifecycle.update_status(item_id, "open", assignee="")
     _mark_pane_aborted()
     LOG.info("Intake aborted for %s", item_id)

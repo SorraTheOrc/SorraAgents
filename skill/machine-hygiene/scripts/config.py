@@ -31,6 +31,11 @@ _DEFAULTS: dict[str, Any] = {
         "warning": 80,
         "critical": 95,
     },
+    "memory_pressure": {
+        "low": 0,
+        "warning": 5,
+        "critical": 20,
+    },
     "io_pressure": {
         "low": 0,
         "warning": 50,
