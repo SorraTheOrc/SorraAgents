@@ -1041,6 +1041,78 @@ def repo_has_pytest_suite(project_root: Path | None = None) -> bool:
     )
 
 
+#: Project-local skill tests live under ``.pi/skills/<name>/`` in one of these
+#: two conventional directories (SA-0MVQJSGLY0098DVB D1).
+_HIDDEN_SKILL_TEST_DIRNAMES = ("tests", "test")
+#: Only this hidden root is scanned — ``.claude/``, ``.git/`` and ``.worklog/``
+#: are never traversed (D1).
+_HIDDEN_SKILL_TEST_ROOT = (".pi", "skills")
+
+
+def hidden_skill_test_dirs(project_root: Path | None = None) -> list[str]:
+    """Return project-local hidden skill test directories, sorted.
+
+    **Why this exists.** pytest's default ``norecursedirs`` includes ``.*``,
+    so a recursive ``pytest`` run from the repository root never traverses
+    ``.pi/``: the tests a project ships with its *project-local* skills
+    (``<root>/.pi/skills/<name>/tests``) are silently absent from the
+    "full" suite (measured on the llm repo: 5 264 collected recursively vs
+    529 in the skill's own test directory — SA-0MVOBJGB4001TQ8X). pytest's
+    ``pytest_ignore_collect`` hook only affects *explicit* initial paths, so
+    naming the directory on the command line collects it while the default
+    recursive run stays unchanged.
+
+    A candidate is ``<root>/.pi/skills/<name>/tests`` or ``.../test`` that
+    exists and contains at least one ``*.py`` (recursive, mirroring
+    :func:`repo_has_pytest_suite`). Only those two literal path levels are
+    probed per skill: no repository-wide scan, and no other hidden root
+    (``.claude/``, ``.git/``, ``.worklog/``) is ever traversed.
+
+    Returns:
+        Sorted, de-duplicated repo-relative POSIX directory paths. Empty when
+        the project has no project-local skill tests.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    skills_root = root.joinpath(*_HIDDEN_SKILL_TEST_ROOT)
+    if not skills_root.is_dir():
+        return []
+    try:
+        skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
+    except OSError:
+        return []
+
+    candidates: set[str] = set()
+    for skill_dir in skill_dirs:
+        for dirname in _HIDDEN_SKILL_TEST_DIRNAMES:
+            candidate = skill_dir / dirname
+            if not candidate.is_dir():
+                continue
+            try:
+                if not any(candidate.rglob("*.py")):
+                    continue
+            except OSError:
+                continue
+            candidates.add(candidate.relative_to(root).as_posix())
+    return sorted(candidates)
+
+
+def hidden_skill_test_command(dirs: list[str]) -> str:
+    """One quiet pytest command listing every hidden skill test directory.
+
+    Deliberately a **single** command rather than one per directory (D2): the
+    runner acquires one host-wide concurrency slot per suite execution, and a
+    single command keeps one cache entry and one timeout budget.
+
+    Args:
+        dirs: Repo-relative directory paths, already sorted by
+            :func:`hidden_skill_test_dirs`. Paths are shell-quoted, so a
+            directory containing spaces is passed intact.
+    """
+    return canonicalize_quiet_test_command(
+        "pytest " + " ".join(shlex.quote(d) for d in dirs)
+    )
+
+
 def _read_test_config(project_root: Path) -> dict | None:
     """Read ``.pi/test-config.json`` under *project_root* (None when absent
     or unreadable — a corrupt file is treated as absent, never an error)."""
@@ -1326,9 +1398,16 @@ def full_suite_commands(project_root: Path | None = None) -> list[str]:
        ``suiteCommands`` — when present, convention detection is skipped.
     2. **pytest** only when the repo declares a pytest suite
        (``repo_has_pytest_suite`` — never a phantom pytest command, F2 AC3).
-    3. **node** — one command per existing ``tests/{unit,node,cli}`` dir
+    3. **project-local hidden skill tests** (SA-0MVQJSGLY0098DVB D2): one
+       extra quiet pytest command naming every ``.pi/skills/<name>/tests``
+       directory the default recursive run cannot reach (pytest's default
+       ``norecursedirs`` prunes ``.*``). Emitted immediately after the
+       canonical pytest command and before any node command, so the ordering
+       is stable. Emission does NOT require ``repo_has_pytest_suite``: a
+       project shipping only skill tests still gets the command.
+    4. **node** — one command per existing ``tests/{unit,node,cli}`` dir
        (SA-0MSJELL44009XYIL).
-    4. **npm-test convention** (F2 AC2): when neither pytest nor any node
+    5. **npm-test convention** (F2 AC2): when neither pytest nor any node
        suite dir applies and ``package.json`` declares a ``test`` script,
        emit ``npm --silent test`` (the TCE fix — a vitest/npm repo's real
        suite becomes cacheable/verifiable instead of the phantom pytest).
@@ -1348,6 +1427,11 @@ def full_suite_commands(project_root: Path | None = None) -> list[str]:
     commands: list[str] = []
     if repo_has_pytest_suite(root):
         commands.append(pytest_command())
+    hidden_skill_dirs = hidden_skill_test_dirs(root)
+    if hidden_skill_dirs:
+        # Straight after the canonical pytest command, before any node
+        # command: a stable position for every consumer (D2).
+        commands.append(hidden_skill_test_command(hidden_skill_dirs))
     commands.extend(node_suite_commands(root))
 
     if not commands:
