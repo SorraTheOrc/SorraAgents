@@ -487,21 +487,129 @@ runner's auto-execution path, and its read-only cache classification):
    Use it for bespoke suites (e.g. a monorepo package command) that
    conventions would miss. `timeoutPerCommand` overrides the audit runner's
    default per-command timeout (600s, `AUDIT_TEST_SKILL_RUN_TIMEOUT` code
-   constant — not an env var).
-2. **npm-test convention** — `npm --silent test` for repos whose
-   `package.json` declares a `test` script (TCE-like layouts).
-3. **pytest** — `pytest -q -r a --disable-warnings` ONLY when the repo
+   constant — not an env var). A pinned `suiteCommands` list is returned
+   **verbatim** — the hidden skill-test command is never appended to it; when
+   the pin leaves project-local hidden skill test directories uncovered, a
+   machine-readable, non-fatal notice reports the gap (D3, see *Hidden
+   project-local skill tests* below).
+2. **pytest** — `pytest -q -r a --disable-warnings` ONLY when the repo
    declares a pytest suite (`pytest.ini` / `[tool.pytest.ini_options]` /
    pytest-style `tests/**/test_*.py` files) — no phantom pytest for
    no-pytest repos (SA-0MSQ72BVV0011SRU AC3, `repo_has_pytest_suite`).
+3. **Project-local hidden skill tests** — exactly **one** extra quiet pytest
+   command scoped to all `.pi/skills/<name>/tests` (or `test`) candidates
+   when any exist (SA-0MVQJSGLY0098DVB). pytest's default `norecursedirs`
+   includes `.*` → `.pi/` is pruned from a recursive root run, so the
+   canonical pytest command silently misses a project's skill tests; this
+   command names every candidate directory **explicitly**, which pytest
+   collects even though the default recursive pass prunes them. Emitted
+   immediately after the canonical pytest command and before any node
+   command. See *Hidden project-local skill tests* below for the rule, the
+   D3 precedence matrix, the notice and the no-double-execution skip.
 4. **Node suite dirs** — `node --test "tests/node/**/*.mjs"
    "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per
    suite dir); only dirs that exist under the target repo are included.
+5. **npm-test convention** — `npm --silent test`, emitted **only** when
+   nothing above resolved (no pinned list, no pytest suite, no hidden
+   skill-test candidates, no node suite dirs) and `package.json` declares a
+   `test` script (TCE-like layouts).
 
-An empty resolved set (no extension file, no npm test script, no pytest
-suite, no node dirs) is NOT an error: `run_tests.py` reports zero commands
-and the audit skill treats the repo as execution-impossible — fail-open
-partial, never blocks (F4 AC2).
+An empty resolved set (no extension file, no pytest suite, no hidden skill
+tests, no node dirs, no npm test script) is NOT an error: `run_tests.py`
+reports zero commands and the audit skill treats the repo as
+execution-impossible — fail-open partial, never blocks (F4 AC2).
+
+### 1.1. Hidden project-local skill tests (SA-0MVQJSGLY0098DVB)
+
+**Why this exists (the `norecursedirs` gap).** Pytest's default
+`norecursedirs` includes `.*` — every dot-directory is pruned — so a
+recursive `pytest` run from the repository root never traverses `.pi/`:
+the tests a project ships with its *project-local* skills
+(`<root>/.pi/skills/<name>/tests`) are silently absent from the "full"
+suite. Measured on the llm repo: 5 264 collected recursively vs 529 in the
+skill's own test directory (SA-0MVOBJGB4001TQ8X). Pytest's
+`pytest_ignore_collect` hook only affects *explicit* initial paths, so
+naming a directory on the command line collects it while the default
+recursive run stays unchanged — that is the mechanism this rule
+compensates for.
+
+**Detection (D1).** A candidate is `<root>/.pi/skills/<name>/tests` or
+`<root>/.pi/skills/<name>/test` that exists and contains at least one
+`*.py` (recursive, mirroring `repo_has_pytest_suite()`).
+`hidden_skill_test_dirs()` probes only those two literal path levels per
+skill name — sorted and de-duplicated for deterministic command strings —
+and never scans any other hidden root (`.claude/`, `.git/`, `.worklog/`).
+
+**Emission (D2).** When at least one candidate exists,
+`full_suite_commands()` returns **exactly one** additional command in the
+canonical quiet pytest form listing every candidate, e.g.:
+
+```
+pytest -q -r a --disable-warnings .pi/skills/proxy-usage-analysis/tests
+```
+
+One command (not one per directory) keeps a single cache entry, a single
+timeout budget and preserves the existing semaphore accounting
+(`run_tests.py` acquires one host-wide slot per suite execution). Paths are
+`shlex`-quoted. The command is emitted **immediately after the repo's
+canonical pytest command and before any node command**, so the ordering is
+stable. Emission is independent of `repo_has_pytest_suite()`: a project
+with skill tests but no root `tests/` directory still gets the command. No
+candidates → no extra command (byte-identical resolution to today).
+
+**D3 — project-local configuration stays authoritative** (the framework
+contract this must not weaken — SA-0MVO0EB1U007L7DS,
+SA-0MV5SQZ0T004R8UG):
+
+| Project-local input | Required behaviour |
+| --- | --- |
+| `.pi/test-config.json` `suiteCommands` (pinned list) | Returned **verbatim** — no appended command. The resolver records a machine-readable, non-fatal **notice** naming the hidden skill test dirs that the pinned list does not cover, so the gap is visible rather than silent. |
+| `.pi/test-config.json` `timeoutPerCommand`, absent `suiteCommands` | Unchanged; convention detection (incl. the new rule) applies. |
+| `.pi/test-config.json` `groups` | Group `commands` are project-owned and unchanged; the `full` group resolves through `full_suite_commands()` and therefore gains the extra command unless `suiteCommands` pins the list. `paths` matching unchanged. |
+| `.pi/skills_extensions/test/extension.json` `types` | Type→command maps unchanged; the default/full type inherits the extra command through `full_suite_commands()`. |
+| Project pytest configuration (`pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`) already listing a candidate in `testpaths` or `addopts` | That candidate is **skipped** (already collected by the canonical command) — no double execution. |
+
+**No double execution (D3 coverage rule).**
+`uncovered_hidden_skill_test_dirs()` drops any candidate the project's own
+pytest `testpaths`/`addopts` already collects — read from the INI forms
+`pytest.ini`/`setup.cfg`/`tox.ini` (sections `[pytest]`/`[tool:pytest]`)
+and the `pyproject.toml` `[tool.pytest.ini_options]` form — from the extra
+command, so those tests run exactly once. Coverage requires a token that
+resolves to `.pi` itself or a strict descendant of `.pi`: a root-level
+token (`.`, `tests`, `skill`) does **not** count, because the default
+`norecursedirs` (`.*`) still prunes `.pi/` from those roots. Unreadable or
+malformed pytest configuration is treated as absent (never an error) — the
+coverage rule may only ever *add* the hidden skill-test command.
+
+**Machine-readable notice (AC3).** When `suiteCommands` is pinned
+(`extension_suite_commands()` returns a list) and that list does not cover
+every candidate, `full_suite_notices()` — the single place consumers read
+resolution notices from — carries a non-fatal notice:
+
+```json
+{"code": "hidden_skill_tests_uncovered", "source": ".pi/test-config.json",
+ "directories": [".pi/skills/alpha/tests"], "message": "Pinned ..."}
+```
+
+with the stable `NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED` code, the uncovered
+`directories` and a human-readable `message`. The runner prints
+`run_tests: notice [hidden_skill_tests_uncovered] …` on stderr. A notice
+**never** changes the resolved command set or the exit status: the pinned
+list stays authoritative and the gap is merely surfaced (a notice is never
+a failure).
+
+**Full scope only (D5/AC3 — changed scope untouched).** The extra command
+belongs to `full_suite_commands()` — the `full` scope, the `full` group
+and the default `full` type — and is **never** part of a changed-scope
+subset: `changed_scope_commands()` continues to emit explicit-file subset
+commands exactly as before, byte-identical whether or not the repo ships
+candidates (regression-pinned by
+`test_changed_scope_is_identical_with_and_without_candidates`). Hidden
+skill tests are therefore enforced at **full scope only** — the dev-push
+pre-push gate, the ship release gate and the audit's full-suite
+verification. A changed `*.py` under `.pi/skills/<name>/tests` is still
+selected individually by changed scope like any other test file, for fast
+feedback (`test_hidden_skill_test_file_change_selects_that_file`).
 
 **Project-specific note (SorraAgents):** this repo declares
 `.pi/test-config.json` with `{"timeoutPerCommand": 1500}` (added under
