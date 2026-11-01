@@ -2377,6 +2377,75 @@ def git_worktree_add(
     return result.returncode == 0
 
 
+# A parent branch whose ``remote`` key must never change: a worktree
+# registration writes ``.`` into ``branch.<new-wl-branch>.remote`` only; the
+# parent's key is guarded by :func:`assert_parent_tracking_untouched`.
+
+
+def _git_config_get(cwd: str, key: str) -> str | None:
+    """Read a single ``git config --get`` value, or ``None`` when unset."""
+    result = run_cmd(
+        ["git", "config", "--get", key],
+        cwd=cwd,
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def assert_parent_tracking_untouched(
+    repo_root: str,
+    parent_branch: str,
+    before: tuple[str | None, str | None],
+) -> None:
+    """Fail loudly when a worktree registration poisoned the parent's upstream.
+
+    ``git worktree add --track -b wl-* <path> <parent>`` writes
+    ``branch.<wl-*>.remote = "."`` for the new branch and leaves the parent's
+    key alone — the *designed* shape (SA-0MVX1M6HH004YPX2, pinned by
+    ``skill/shared/tests/test_self_referential_upstream.py``).
+    ``branch.<name>.remote`` is one key per **branch name** in the shared
+    config, so if the registration ever wrote ``.`` onto the parent branch
+    name, every ``git pull`` on that machine would silently stop fetching
+    from ``origin``.
+
+    This guard runs immediately after a fresh worktree registration and fails
+    closed: a parent that now tracks ``.`` while it did not before is a hard
+    error, not a warning, because the write path is the framework's own
+    (SA-0MVX35ABT000I1PD AC1).
+
+    Args:
+        repo_root: Repository root whose config to read (the common config
+            every worktree shares).
+        parent_branch: The long-lived parent branch name that must stay
+            unaffected.
+        before: The ``(remote, merge)`` tracking pair captured *before* the
+            registration. None-values are indistinguishable from "not set".
+
+    Raises:
+        RuntimeError: when *parent_branch* now has ``remote = "."`` while it
+            did not before — i.e. this registration wrote the self-upstream.
+    """
+    after_remote = _git_config_get(repo_root, f"branch.{parent_branch}.remote")
+    after_merge = _git_config_get(repo_root, f"branch.{parent_branch}.merge")
+    before_remote = before[0]
+    before_merge = before[1]
+    if after_remote == "." and before_remote != ".":
+        raise RuntimeError(
+            f"Worktree registration wrote a self-referential upstream onto "
+            f"parent branch {parent_branch!r}: branch.{parent_branch}.remote "
+            f"changed from {before_remote!r} to '.' (merge="
+            f"{after_merge!r}, was {before_merge!r}). This makes `git pull` on "
+            f"{parent_branch} a silent no-op (SA-0MVX1M6HH004YPX2). Refusing "
+            "to continue; the defect must be repaired with "
+            f"`git branch --set-upstream-to=origin/{parent_branch} "
+            f"{parent_branch}` before any worktree is created."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Temp-index staging: test the tree the commit will produce
 # (SA-0MVQHVGFR006W8LG, F6 of SA-0MVL2NH1G0094FA2)
@@ -2935,6 +3004,40 @@ def _kill_process_group(pid: int) -> None:
         pass
 
 
+#: The remote every framework push resolves through (SA-0MVX35ABT000I1PD AC1).
+#:
+#: Framework pushes ALWAYS use the configured remote **name** — never a path
+#: or ``.`` form — so ``git push -u`` can never record a self-referential
+#: upstream (``branch.<name>.remote = "."``) onto a long-lived branch and
+#: silently disable ``git pull`` on a worktree machine (SA-0MVX1M6HH004YPX2).
+PUSH_REMOTE_NAME = "origin"
+
+
+def _assert_remote_name_only(remote: str) -> None:
+    """Refuse a push remote that is not a plain remote name.
+
+    The write path that records the self-referential upstream defect is a
+    push whose remote is the **local path form** (``.`` — also reached via a
+    path or ``file://`` URL). A framework push must therefore never accept
+    anything except a plain configured remote name.
+
+    Args:
+        remote: The remote argument a framework push is about to use.
+
+    Raises:
+        RuntimeError: when *remote* is ``.``, a path or a URL — the shapes
+            that would make ``git push -u`` write ``branch.<name>.remote = .``.
+    """
+    if remote == "." or "/" in remote or ":" in remote or "://" in remote:
+        raise RuntimeError(
+            f"Refusing a framework push to non-remote-name {remote!r}: use the "
+            f"configured remote name {PUSH_REMOTE_NAME!r}. A path or '.' "
+            "remote would make `git push -u` record a self-referential "
+            "upstream (branch.<name>.remote = '.'), silently breaking "
+            "`git pull` — see SA-0MVX1M6HH004YPX2."
+        )
+
+
 def git_push_to_dev(
     cwd: str, branch: str, commit_hash: str | None = None, timeout: int | None = None,
 ) -> bool:
@@ -2963,11 +3066,19 @@ def git_push_to_dev(
     if timeout is None:
         timeout = _resolve_test_timeout(cwd)
 
+    # Remote-name-only rule (SA-0MVX35ABT000I1PD AC1): the push must always
+    # resolve through the configured remote name, never a path/'.' form —
+    # otherwise `git push -u` at a call site could record
+    # branch.<name>.remote = '.' and silently disable `git pull` on a
+    # worktree machine (SA-0MVX1M6HH004YPX2). The guard runs on every push;
+    # the constant pins the name that carries dev-push integration.
+    _assert_remote_name_only(PUSH_REMOTE_NAME)
+
     # Spawn the push in its own process group so that a timeout kills the
     # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
     try:
         proc = subprocess.Popen(
-            ["git", "push", "origin", f"{branch}:refs/heads/dev"],
+            ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -6823,9 +6934,38 @@ def _phase_start_locked(
         )
     else:
         LOG.info("Creating worktree at %s from branch %s...", wt_path, parent_branch)
+        # Snapshot the parent's tracking config BEFORE the registration so the
+        # post-add guard can distinguish "this registration poisoned the
+        # parent" (a hard failure) from a pre-existing defect (detection's
+        # job, never prevention's). The shared common config is read through
+        # the main checkout (SA-0MVX35ABT000I1PD AC1).
+        parent_tracking_before = (
+            _git_config_get(repo_root, f"branch.{parent_branch}.remote"),
+            _git_config_get(repo_root, f"branch.{parent_branch}.merge"),
+        )
         if not git_worktree_add(branch, wt_path, parent_branch):
             msg = f"Failed to create worktree at {wt_path} from {parent_branch}"
             LOG.error(msg)
+            report["success"] = False
+            report["message"] = msg
+            try:
+                StatusLifecycle.update_status(work_item_id, "open", assignee="")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", work_item_id)
+            if json_output:
+                print(format_json_output(report))
+            return report
+        # Assert afterwards that the registration left the parent's tracking
+        # config untouched: ``git worktree add --track`` must write ``.`` only
+        # for the new wl-* branch, never onto a long-lived branch name
+        # (SA-0MVX35ABT000I1PD AC1 — fail closed, loudly).
+        try:
+            assert_parent_tracking_untouched(
+                repo_root, parent_branch, parent_tracking_before
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            LOG.error("%s", msg)
             report["success"] = False
             report["message"] = msg
             try:
