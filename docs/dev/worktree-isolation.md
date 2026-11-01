@@ -176,7 +176,14 @@ reported, never half-removed: `phase_start` resumes onto the retained
 worktree instead of failing on `git worktree add`, and the driver's
 start-of-run sweep (terminal children only) plus its `retained_worktrees`
 report (each with a `git worktree remove … && git worktree prune` remedy) keep
-a deferred tree from leaking. Full contract:
+a deferred tree from leaking. A plain leaf session that deferred its own
+removal finishes the job with
+`python3 skill/implement/scripts/implement.py cleanup <work-item-id>` as its
+**last** bash command — the command `finish` names in its completion comment,
+human output and JSON report (`steps.worktree_cleanup.command`). The action
+shares the driver's single removal path, refuses a non-terminal item and a
+dirty tree, and is an idempotent reported no-op for an already-absent tree.
+Full contract:
 [implement-skill-reference.md](implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr).
 
 **The session-side removal is `implement.py cleanup <id>`**, not a raw `git

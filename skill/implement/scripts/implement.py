@@ -3417,6 +3417,28 @@ def _should_defer_worktree_removal(
     return False, ""
 
 
+def _worktree_cleanup_command(work_item_id: str) -> str:
+    """The exact follow-up command that removes a retained worktree.
+
+    One source of truth for the deferred-removal surface (completion comment,
+    JSON report and human output) of a **plain leaf** session that opted in
+    with ``finish --keep-worktree`` / ``IMPLEMENT_KEEP_WORKTREE=1``
+    (SA-0MVTHJ3PJ000IVSK AC2). The command is the reviewed ``cleanup`` action
+    — never a raw ``git worktree remove`` — so the retained tree is removed
+    behind the shared safety gates (terminal item, clean tree, worktree not
+    main checkout), and re-running it is a reported no-op.
+
+    Args:
+        work_item_id: The work item that owns the retained worktree.
+
+    Returns:
+        A copy-pasteable command string.
+    """
+    return (
+        f"python3 skill/implement/scripts/implement.py cleanup {work_item_id}"
+    )
+
+
 def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
     """Remove a worktree directory gracefully.
 
@@ -7608,6 +7630,20 @@ def phase_finish(
                 "reason": defer_reason,
                 "worktree_path": worktree_path,
             }
+            # The follow-up surface for a retained tree (SA-0MVTHJ3PJ000IVSK
+            # AC2): the report names the path, the reason and the exact
+            # reviewed cleanup action. Empty on the default (non-deferred)
+            # path, where finish has already removed the tree itself.
+            report["steps"]["worktree_cleanup"] = {
+                "deferred": defer_removal,
+                "path": worktree_path,
+                "reason": defer_reason,
+                "command": (
+                    _worktree_cleanup_command(work_item_id)
+                    if defer_removal
+                    else ""
+                ),
+            }
 
             if defer_removal:
                 # Keep the tree, its branch and .implement_state.json: the
@@ -7763,8 +7799,11 @@ def phase_finish(
             f"{removal_step.get('reason', 'unknown')}).\n"
             f"  A driven child session's worktree is removed by "
             f"`implement.py drive` once the session exits. Otherwise remove "
-            f"it when this session no longer needs its cwd:\n"
-            f"  git worktree remove {worktree_path} && git worktree prune"
+            f"it as the LAST command, once this session no longer needs its "
+            f"cwd:\n"
+            f"  {_worktree_cleanup_command(work_item_id)}\n"
+            f"  manual fallback: git worktree remove {worktree_path} && "
+            f"git worktree prune"
         )
     wl_add_comment(work_item_id, completion_comment)
 
@@ -7782,6 +7821,22 @@ def phase_finish(
         print(f"  Commit: {commit_hash}")
         print(f"  Branch: {branch}")
         print("  Status: in_review")
+        if removal_step.get("deferred"):
+            # A retained tree is an outstanding action, never a silent one
+            # (SA-0MVTHJ3PJ000IVSK AC2): name the path, the reason and the
+            # exact command that finishes the job.
+            print(
+                "  Worktree retained: "
+                f"{removal_step.get('worktree_path', worktree_path)}"
+            )
+            print(
+                "  Deferred removal: "
+                f"{removal_step.get('reason', 'unknown')}"
+            )
+            print(
+                "  Remove it as your LAST command: "
+                f"{_worktree_cleanup_command(work_item_id)}"
+            )
         print()
 
     # Surface the project-local prose hook after the final step.

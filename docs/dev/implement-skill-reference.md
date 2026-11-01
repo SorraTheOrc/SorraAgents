@@ -302,13 +302,19 @@ Deferral is never silent — the `finish` report carries
 ```json
 "steps": {
   "worktree_removal": {"deferred": true, "reason": "driven-session", "worktree_path": "…"},
+  "worktree_cleanup": {"deferred": true, "path": "…", "reason": "driven-session", "command": "python3 skill/implement/scripts/implement.py cleanup <id>"},
   "worktree_removed": false
 }
 ```
 
-and the completion comment names the retained path with the exact remedy.
-When removal is **not** deferred the report carries `deferred: false` and
-`worktree_removed: true` on success (`false` when the removal failed).
+and the completion comment and the human (non-JSON) output name the retained
+path with the exact remedy. `worktree_cleanup.command` is the reviewed
+`cleanup` action (`_worktree_cleanup_command`) rather than a raw `git worktree
+remove`, so the follow-up runs behind the same safety gates (terminal item,
+clean tree, never the main checkout) and is an idempotent no-op when the tree
+is already gone. When removal is **not** deferred the report carries
+`deferred: false`, `command: ""` and `worktree_removed: true` on success
+(`false` when the removal failed).
 
 ### What is skipped when removal is deferred
 
