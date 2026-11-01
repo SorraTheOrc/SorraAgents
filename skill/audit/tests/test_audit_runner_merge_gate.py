@@ -26,8 +26,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from audit.scripts import audit_runner
 from audit.tests.wl_helpers import make_stateful_runner
-from shared.git_sandbox import commit_all, init_bare_remote, init_repo, run_git
-from shared.git_sandbox import fixture_git_env
+from shared.git_sandbox import (
+    commit_all,
+    fixture_git_env,
+    init_bare_remote,
+    init_repo,
+    run_git,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
