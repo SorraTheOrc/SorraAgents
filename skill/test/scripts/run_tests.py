@@ -993,6 +993,14 @@ def changed_scope_commands(
     TypeScript/vitest ``*.test.ts``/``*.spec.ts`` files, and is NOT disabled
     by ``suiteCommands`` (which describes the full suite only).
 
+    **Hidden project-local skill tests are enforced at full scope only**
+    (SA-0MVQJSGLY0098DVB D5): ``changed_scope_commands`` never emits the
+    extra hidden-skill-test command. A changed test file under
+    ``.pi/skills/<name>/tests`` is selected individually like any other
+    changed test file, but the directory-wide extra command is resolved only
+    through :func:`full_suite_commands` (the ``full`` scope / ``full`` group
+    / default type). This keeps changed-scope runs fast and regression-safe.
+
     Returns None (meaning "fall back to the full suite") when no changed
     files exist, only non-source changes were made, no group matches, no
     test file maps to the change, or the selected tests have no runnable

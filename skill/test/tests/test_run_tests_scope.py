@@ -533,6 +533,51 @@ class TestChangedScopeCommands:
             "pytest -q -r a --disable-warnings .pi/skills/demo/tests/test_demo.py"
         ]
 
+    # -- AC7 regression (SA-0MVQQ9QJI002K7DY) ------------------------------
+    # D5: changed-scope selection is untouched by the hidden skill-test rule
+    # (SA-0MVQJSGLY0098DVB) — the extra command is enforced at FULL scope
+    # only, never added to a changed-scope subset.
+
+    def test_changed_scope_is_identical_with_and_without_candidates(
+        self, tmp_path: Path,
+    ) -> None:
+        """A representative change resolves to the same subset command whether
+        or not the repo ships hidden skill-test candidates — the extra
+        command belongs to the full suite only (AC7)."""
+        def _build(hidden: bool) -> Path:
+            repo = tmp_path / ("with_candidates" if hidden else "no_candidates")
+            repo.mkdir()
+            (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+            (repo / "tests").mkdir()
+            (repo / "src").mkdir()
+            (repo / "tests" / "test_utils.py").write_text(
+                "def test_utils() -> None:\n    assert True\n", encoding="utf-8",
+            )
+            (repo / "src" / "utils.py").write_text("x = 1\n", encoding="utf-8")
+            if hidden:
+                hidden_tests = repo / ".pi" / "skills" / "alpha" / "tests"
+                hidden_tests.mkdir(parents=True)
+                (hidden_tests / "test_alpha.py").write_text(
+                    "def test_alpha() -> None:\n    assert True\n",
+                    encoding="utf-8",
+                )
+            _init_repo_with_dev(repo)
+            return repo
+
+        # Representative change: a source file whose convention test exists.
+        with_repo = _build(hidden=True)
+        without_repo = _build(hidden=False)
+        changed = {"src/utils.py"}
+
+        with_cmds = changed_scope_commands(with_repo, changed_files=changed)
+        without_cmds = changed_scope_commands(without_repo, changed_files=changed)
+
+        # Identical subset commands: the candidate dirs never leak in.
+        assert with_cmds == without_cmds
+        assert with_cmds == [
+            "pytest -q -r a --disable-warnings tests/test_utils.py"
+        ]
+
 
 # ---------------------------------------------------------------------------
 # TypeScript/vitest changed-scope selection (SA-0MVL7YOMJ006UMDO)

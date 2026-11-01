@@ -12,6 +12,13 @@ under ``.pi/skills/<name>/tests``, where pytest's default ``norecursedirs``
 
 Precedence rules (pinned ``suiteCommands``, no-double-execution) belong to
 SA-0MVQQ9NV4005UKYZ (F2) and are tested there.
+
+Consumer parity (D4/D5 of SA-0MVQJSGLY0098DVB, SA-0MVQQ9QJI002K7DY): the
+resolved command set is identical across ``full_suite_commands()``, the
+runner's per-suite execution (the aggregated result's reported command list)
+and the audit skill's F3 cache lookup — with no consumer-side code change —
+and the new command gets a per-command cache key distinct from the canonical
+pytest command (no collision). Tested here.
 """
 
 from __future__ import annotations
@@ -26,12 +33,15 @@ import json
 # subset that contains only this file (the gate collects explicit paths).
 import sys as _sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"  # <skills>/test/scripts
 if str(_RUNNER_DIR) not in _sys.path:
     _sys.path.insert(0, str(_RUNNER_DIR))
 
+import run_tests
 from run_tests import (
     NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED,
     full_suite_commands,
@@ -39,6 +49,7 @@ from run_tests import (
     hidden_skill_test_command,
     hidden_skill_test_dirs,
     hidden_skill_test_notice,
+    run_all,
 )
 
 PYTEST_CMD = "pytest -q -r a --disable-warnings"
@@ -347,3 +358,128 @@ class TestNoticeIsNonFatal:
         assert set(notice) == {"code", "source", "directories", "message"}
         assert isinstance(notice["directories"], list)
         assert notice["message"]
+
+
+# ---------------------------------------------------------------------------
+# AC6 — consumer parity (SA-0MVQQ9QJI002K7DY, D4 of SA-0MVQJSGLY0098DVB)
+# ---------------------------------------------------------------------------
+
+
+class TestConsumerParity:
+    """For a repo with candidates, the resolved command set is identical
+    across :func:`full_suite_commands`, the runner's per-suite execution
+    (the aggregated result's reported command list) and the audit skill's F3
+    cache lookup — with **no consumer-side code change**.
+    """
+
+    def test_full_suite_commands_is_the_resolution_source(self, tmp_path: Path) -> None:
+        """Precondition: with candidates, the resolver emits the extra command."""
+        _write_pytest_ini(tmp_path)
+        _skill_test_dir(tmp_path, "alpha")
+
+        resolved = full_suite_commands(tmp_path)
+        assert len(resolved) == 2
+        assert resolved[1] == f"{PYTEST_CMD} .pi/skills/alpha/tests"
+
+    def test_runner_reports_the_extra_command_in_its_command_list(
+        self, tmp_path: Path,
+    ) -> None:
+        """The runner's per-suite execution reports the same resolved command
+        list — including the extra command — with no consumer-side change:
+        ``run_all`` resolves ``name == "all"`` through
+        ``full_suite_commands()`` (F2 AC4) and reports the joined list."""
+        _write_pytest_ini(tmp_path)
+        _skill_test_dir(tmp_path, "alpha")
+        resolved = full_suite_commands(tmp_path)
+        extra = resolved[1]
+
+        captured: list[str] = []
+
+        def fake_run_cached(command: str, **kwargs):
+            captured.append(command)
+            return {
+                "stdout": "1 passed\n",
+                "stderr": "",
+                "exit_code": 0,
+                "completed_at": 0.0,
+                "command": command,
+                "git_state": "test",
+                "scope": kwargs.get("scope", "full"),
+                "test_type": kwargs.get("test_type", "full"),
+                "cached": False,
+                "interpreter": "",
+            }
+
+        # The cache runner is stubbed so no command actually executes (and no
+        # host-wide test slot is contended); resolution is what is asserted.
+        with mock.patch.object(run_tests, "run_cached", side_effect=fake_run_cached):
+            result = run_all(("all",), cwd=tmp_path)
+
+        suite = result["suites"]["all"]
+        # The aggregated result's reported command list carries the extra cmd.
+        command_list = suite["command"]
+        assert extra in command_list
+        # And the runner executed exactly the resolved set, nothing more.
+        assert captured == resolved
+        assert suite["scope"] == "full"
+
+    def test_audit_f3_cache_lookup_resolves_the_same_command_set(
+        self, tmp_path: Path,
+    ) -> None:
+        """The audit skill's F3 cache lookup (read-only) queries exactly the
+        commands ``full_suite_commands()`` resolves — the extra command
+        included — and classifies them green when cached, with *zero*
+        consumer-side code change. This exercises the real
+        ``_classify_full_suite_cache`` imported from the audit runner."""
+        # ``audit.scripts.audit_runner`` self-bootstraps the skills root onto
+        # ``sys.path`` (and ``import run_tests`` above already put it there),
+        # so no manual path juggling is needed.
+        from audit.scripts import audit_runner
+        from test_cache import run_cached as _run_cached
+
+        _write_pytest_ini(tmp_path)
+        _skill_test_dir(tmp_path, "alpha")
+        resolved = full_suite_commands(tmp_path)
+
+        def fake_cache_runner(command: str, cwd: str, timeout: int) -> SimpleNamespace:
+            return SimpleNamespace(stdout="1 passed\n", stderr="", returncode=0)
+
+        # Populate the per-repo cache per command — the same entries the
+        # dev-push pre-push hook writes on a real full run.
+        for cmd in resolved:
+            _run_cached(cmd, cwd=str(tmp_path), runner=fake_cache_runner)
+
+        # A runner answering ``git rev-parse HEAD`` for the F3 head lookup.
+        git_runner = mock.Mock()
+        git_runner.side_effect = lambda args: SimpleNamespace(
+            returncode=0, stdout="a1b2c3d4e5f67890abcdef1234567890abcdef12\n", stderr="",
+        )
+
+        with mock.patch.object(
+            audit_runner, "query_cached", wraps=audit_runner.query_cached
+        ) as spy_query:
+            status, head_sha, problems = audit_runner._classify_full_suite_cache(
+                git_runner, cwd=str(tmp_path),
+            )
+
+        assert status == "green"
+        assert head_sha == "a1b2c3d4e5f67890abcdef1234567890abcdef12"
+        assert problems == []
+        # The F3 lookup queried each resolved command by its own cache key,
+        # the extra command included.
+        queried = [call.args[0] for call in spy_query.call_args_list]
+        assert queried == resolved
+
+    def test_extra_command_has_an_independent_cache_key(self) -> None:
+        """AC7b: per-command cache entries give the new command a key distinct
+        from the canonical pytest command — no collision."""
+        from test_cache import cache_key, normalize_test_command
+
+        extra = hidden_skill_test_command([".pi/skills/alpha/tests"])
+        canonical_key = cache_key(normalize_test_command(PYTEST_CMD), "state-1")
+        extra_key = cache_key(normalize_test_command(extra), "state-1")
+
+        assert canonical_key != extra_key
+        # Distinct commands stay distinct across states too.
+        assert extra_key != cache_key(normalize_test_command(PYTEST_CMD), "state-2")
+

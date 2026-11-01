@@ -381,3 +381,96 @@ class TestGroupCommands:
         }
         repo = _make_project(tmp_path, groups=groups)
         assert group_scope_commands("test", repo) == group_commands("test", repo)
+
+
+# ---------------------------------------------------------------------------
+# AC5: hidden-skill-test rule leaves groups unaffected (SA-0MVQQ9QJI002K7DY)
+# ---------------------------------------------------------------------------
+
+
+def _add_hidden_skill_tests(repo: Path) -> None:
+    """Plant a candidate hidden skill-test dir under ``.pi/skills``."""
+    hidden = repo / ".pi" / "skills" / "alpha" / "tests"
+    hidden.mkdir(parents=True, exist_ok=True)
+    (hidden / "test_alpha.py").write_text(
+        "def test_alpha() -> None:\n    assert True\n", encoding="utf-8",
+    )
+
+
+class TestHiddenSkillGroupParity:
+    """AC5 (SA-0MVQQ9QJI002K7DY): the ``full`` group gains the extra command
+    through ``full_suite_commands()`` while named-group ``commands`` are
+    returned byte-for-byte unchanged.
+    """
+
+    def test_named_group_commands_are_unchanged(self, tmp_path: Path) -> None:
+        """A named group returns exactly its declared commands, even when the
+        project also ships hidden skill-test dirs (whose command belongs to
+        the implicit ``full`` group only).
+        """
+        groups = {
+            "audit": {
+                "commands": ["pytest skill/audit/tests/"],
+                "paths": ["skill/audit/**"],
+            },
+        }
+        repo = _make_project(tmp_path, groups=groups)
+        _add_hidden_skill_tests(repo)
+
+        assert group_commands("audit", repo) == ["pytest skill/audit/tests/"]
+
+    def test_full_group_includes_the_extra_command(self, tmp_path: Path) -> None:
+        """The implicit ``full`` group resolves through
+        ``full_suite_commands()`` (D4), so it inherits the extra hidden
+        skill-test command while named groups stay untouched.
+        """
+        groups = {
+            "audit": {
+                "commands": ["pytest skill/audit/tests/"],
+                "paths": ["skill/audit/**"],
+            },
+        }
+        repo = _make_project(tmp_path, groups=groups)
+        _add_hidden_skill_tests(repo)
+        (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+        full = group_commands("full", repo)
+        assert full == run_tests.full_suite_commands(repo)
+        assert full == [
+            "pytest -q -r a --disable-warnings",
+            "pytest -q -r a --disable-warnings .pi/skills/alpha/tests",
+        ]
+
+    def test_full_group_without_candidates_is_unchanged(self, tmp_path: Path) -> None:
+        """No candidates → the ``full`` group resolves exactly as before the
+        rule (F0 baseline, no hidden command).
+        """
+        groups = {
+            "audit": {
+                "commands": ["pytest skill/audit/tests/"],
+                "paths": ["skill/audit/**"],
+            },
+        }
+        repo = _make_project(tmp_path, groups=groups)
+        (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+        assert group_commands("full", repo) == ["pytest -q -r a --disable-warnings"]
+        assert all(".pi/skills" not in c for c in group_commands("full", repo))
+
+    def test_read_groups_with_full_still_injects_placeholder(self, tmp_path: Path) -> None:
+        """The placeholder injection (empty commands, ``**`` paths) survives
+        the rule — named-group parsing behaviour is unchanged.
+        """
+        groups = {
+            "audit": {
+                "commands": ["pytest skill/audit/tests/"],
+                "paths": ["skill/audit/**"],
+            },
+        }
+        repo = _make_project(tmp_path, groups=groups)
+        _add_hidden_skill_tests(repo)
+
+        result = _read_groups_with_full(repo)
+        assert result is not None
+        assert result["full"] == {"commands": [], "paths": ["**"]}
+        assert result["audit"]["commands"] == ["pytest skill/audit/tests/"]
