@@ -94,6 +94,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import configparser
 import contextvars
 import json
 import os
@@ -107,6 +108,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
+
+import tomllib
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2]
 _SKILLS_ROOT_STR = str(_SKILLS_ROOT)
@@ -207,6 +210,13 @@ TEST_LOCK_JITTER_DEFAULT = 0.1
 NOTICE_SLOT_BUSY = "slot_busy"
 NOTICE_COMMAND_NOT_FOUND = "command_not_found"
 NOTICE_SUITE_TIMEOUT = "suite_timeout"
+
+#: Stable code for the **non-fatal** resolution notice that a pinned
+#: ``.pi/test-config.json`` ``suiteCommands`` list does not cover some of the
+#: project's hidden skill test directories (SA-0MVQQ9NV4005UKYZ AC3). It is a
+#: notice, never a failure: the pinned list is still returned verbatim and the
+#: exit status is unchanged.
+NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED = "hidden_skill_tests_uncovered"
 #: The child was terminated by a signal (``returncode < 0``): an OOM kill or a
 #: worker/supervisor crash. No failure is parsable from a killed child, so
 #: without this code the run reads as an unexplained non-zero exit
@@ -1113,6 +1123,195 @@ def hidden_skill_test_command(dirs: list[str]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Pinned-suite precedence and no-double-execution (SA-0MVQQ9NV4005UKYZ)
+# ---------------------------------------------------------------------------
+
+#: Project pytest configuration files whose ``testpaths``/``addopts`` can
+#: already collect a hidden skill test directory (D3 coverage rule).
+_PYTEST_INI_FILES = ("pytest.ini", "setup.cfg", "tox.ini")
+#: INI sections pytest reads options from.
+_PYTEST_INI_SECTIONS = ("pytest", "tool:pytest")
+#: The only hidden root whose tokens count as coverage (D-A2): a token at or
+#: above the repo root never reaches ``.pi/`` because pytest's default
+#: ``norecursedirs`` contains ``.*``.
+_HIDDEN_ROOT_PREFIX = ".pi"
+
+
+def _resolve_repo_relative(root: Path, token: str) -> str | None:
+    """Normalise a config token to a repo-relative POSIX path.
+
+    Returns ``None`` for tokens that are not paths (option flags such as
+    ``-ra``), or that resolve outside *root*. ``"."`` is returned for the
+    repository root itself.
+    """
+    candidate = token.strip()
+    if not candidate or candidate.startswith("-"):
+        return None
+    path = Path(candidate)
+    try:
+        if path.is_absolute():
+            rel = path.resolve().relative_to(root)
+        else:
+            normalised = os.path.normpath(candidate)
+            if normalised == ".":
+                return "."
+            if normalised == ".." or normalised.startswith(".." + os.sep):
+                return None
+            rel = Path(normalised)
+    except (OSError, ValueError):
+        return None
+    return rel.as_posix()
+
+
+def _pytest_config_path_tokens(project_root: Path) -> list[str]:
+    """Path tokens from the project's pytest ``testpaths``/``addopts``.
+
+    Reads the INI forms (``pytest.ini``/``setup.cfg``/``tox.ini``) and the
+    ``pyproject.toml`` ``[tool.pytest.ini_options]`` form. Unreadable or
+    malformed configuration is treated as absent (never an error) — the
+    coverage rule may only ever *add* the hidden skill-test command.
+    """
+    root = Path(project_root)
+    tokens: list[str] = []
+
+    for name in _PYTEST_INI_FILES:
+        path = root / name
+        if not path.is_file():
+            continue
+        parser = configparser.ConfigParser(
+            inline_comment_prefixes=("#", ";"), strict=False
+        )
+        try:
+            parser.read(path, encoding="utf-8")
+        except (configparser.Error, OSError, UnicodeDecodeError):
+            continue
+        for section in _PYTEST_INI_SECTIONS:
+            if not parser.has_section(section):
+                continue
+            for option in ("testpaths", "addopts"):
+                value = parser.get(section, option, fallback="")
+                tokens.extend(str(value).split())
+
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            data = None
+        options = ((data or {}).get("tool") or {}).get("pytest") or {}
+        ini_options = (options.get("ini_options") or {}) if isinstance(options, dict) else {}
+        if isinstance(ini_options, dict):
+            for key in ("testpaths", "addopts"):
+                value = ini_options.get(key)
+                if isinstance(value, str):
+                    tokens.extend(value.split())
+                elif isinstance(value, list):
+                    tokens.extend(str(item) for item in value)
+    return tokens
+
+
+def _token_covers_candidate(root: Path, token: str, candidate: str) -> bool:
+    """Whether *token* already collects *candidate* (D3/D-A2 rule).
+
+    The token must resolve to ``.pi`` or a strict descendant of ``.pi`` — a
+    token at or above the repo root (``.``, ``tests``, ``skill``) does not
+    count, because the default ``norecursedirs`` (``.*``) still prunes
+    ``.pi`` from those roots. The candidate must then be the token itself or
+    live underneath it.
+    """
+    rel = _resolve_repo_relative(root, token)
+    if rel is None or rel == ".":
+        return False
+    if rel != _HIDDEN_ROOT_PREFIX and not rel.startswith(_HIDDEN_ROOT_PREFIX + "/"):
+        return False
+    return candidate == rel or candidate.startswith(rel.rstrip("/") + "/")
+
+
+def uncovered_hidden_skill_test_dirs(
+    project_root: Path | None = None,
+) -> list[str]:
+    """Hidden skill test dirs the canonical pytest command does NOT collect.
+
+    Applies the no-double-execution rule (D3/AC4): a candidate already
+    reached through the project's pytest ``testpaths``/``addopts`` is dropped
+    from the emitted command, so the tests run exactly once.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    tokens = _pytest_config_path_tokens(root)
+    return [
+        candidate
+        for candidate in hidden_skill_test_dirs(root)
+        if not any(_token_covers_candidate(root, token, candidate) for token in tokens)
+    ]
+
+
+def _pinned_commands_cover(root: Path, candidate: str, commands: list[str]) -> bool:
+    """Whether any pinned ``suiteCommands`` entry already names *candidate*."""
+    for command in commands:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        if any(_token_covers_candidate(root, token, candidate) for token in tokens):
+            return True
+    return False
+
+
+def hidden_skill_test_notice(
+    project_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Machine-readable, **non-fatal** notice for a pinned ``suiteCommands``.
+
+    A project's pinned list is authoritative and is returned verbatim (D3) —
+    the framework never appends a command to it. When that list does not
+    name some of the project's hidden skill test directories, the gap is
+    surfaced here instead of staying silent: consumers report the notice and
+    leave the resolution and the exit status untouched (AC3/AC4b).
+
+    Returns:
+        ``None`` when the list is not pinned or it covers every candidate;
+        otherwise a dict with the stable ``code``, the uncovered
+        ``directories`` and a human-readable ``message``.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    pinned = extension_suite_commands(root)
+    if pinned is None:
+        return None
+    uncovered = [
+        candidate
+        for candidate in hidden_skill_test_dirs(root)
+        if not _pinned_commands_cover(root, candidate, pinned)
+    ]
+    if not uncovered:
+        return None
+    listed = ", ".join(uncovered)
+    return {
+        "code": NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED,
+        "source": TEST_CONFIG_FILE,
+        "directories": uncovered,
+        "message": (
+            f"Pinned {TEST_CONFIG_FILE} suiteCommands do not cover the hidden "
+            f"skill test dir(s) {listed}; they are not run by the pinned "
+            "list (add them to suiteCommands to collect them)."
+        ),
+    }
+
+
+def full_suite_notices(project_root: Path | None = None) -> list[dict[str, Any]]:
+    """Every non-fatal resolution notice for the full suite (ordered).
+
+    The single place consumers read notices from; new notices are appended
+    here without changing :func:`full_suite_commands`'s ``list[str]``
+    signature (D4).
+    """
+    notices: list[dict[str, Any]] = []
+    hidden_notice = hidden_skill_test_notice(project_root)
+    if hidden_notice is not None:
+        notices.append(hidden_notice)
+    return notices
+
+
 def _read_test_config(project_root: Path) -> dict | None:
     """Read ``.pi/test-config.json`` under *project_root* (None when absent
     or unreadable — a corrupt file is treated as absent, never an error)."""
@@ -1427,7 +1626,9 @@ def full_suite_commands(project_root: Path | None = None) -> list[str]:
     commands: list[str] = []
     if repo_has_pytest_suite(root):
         commands.append(pytest_command())
-    hidden_skill_dirs = hidden_skill_test_dirs(root)
+    # No-double-execution (SA-0MVQQ9NV4005UKYZ AC4): a directory the project's
+    # own pytest ``testpaths``/``addopts`` already collects is not repeated.
+    hidden_skill_dirs = uncovered_hidden_skill_test_dirs(root)
     if hidden_skill_dirs:
         # Straight after the canonical pytest command, before any node
         # command: a stable position for every consumer (D2).
@@ -2601,6 +2802,12 @@ def run_all(
     elapsed_total = 0.0
     elapsed_measured = False
     slot_wait_total = 0.0
+    # Non-fatal resolution notices (SA-0MVQQ9NV4005UKYZ AC3/AC4b): reported for
+    # visibility only — they never change the resolved command set or the exit
+    # status. Computed once, from the suite's project root.
+    resolution_notices = full_suite_notices(Path(cwd or REPO_ROOT).resolve())
+    for notice in resolution_notices:
+        print(f"run_tests: notice [{notice['code']}] {notice['message']}", file=sys.stderr)
     with Timer("run_all") as _all_timer:
         for name in suites:
             with Timer(f"suite:{name}"):
@@ -2641,6 +2848,11 @@ def run_all(
         "failures": all_failures,
         "notices": notices,
         "notice_codes": notice_codes,
+        # Resolution notices are informational and carry a stable machine-
+        # readable shape (code/directories/source); they are deliberately kept
+        # out of ``notices``/``notice_codes`` so a consumer classifying a
+        # FAILED run is never confused by a non-fatal notice.
+        "resolution_notices": resolution_notices,
         "stdout": "\n".join(stdout_parts),
         "stderr": "\n".join(stderr_parts),
         "scope": scope,
