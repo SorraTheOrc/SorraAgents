@@ -616,6 +616,35 @@ class TestRootFileOnlyRepoManifest:
             f"expected only root-file markers to be distinctive: {distinctive}"
         )
 
+    def test_foreign_gate_index_does_not_replace_the_repo_index(
+        self, tmp_path, monkeypatch
+    ):
+        """An inherited foreign ``GIT_INDEX_FILE`` must not mask the markers.
+
+        ``implement.py finish`` exports a temporary would-be-commit index for
+        the suite it runs (SA-0MVQHVGFR006W8LG), and ``git ls-files`` applies
+        an inherited index to whatever repository ``cwd`` names. Without a
+        per-repository scrub ``_project_top_levels`` reported the *gate's*
+        top-level paths for every repository, so the distinctive markers
+        collapsed to ``[]`` and the scope validation silently validated a
+        manifest against the wrong tree — the two root-file-marker tests then
+        failed only inside the finish gate (SA-0MVWJ6U3J003TLRZ).
+        """
+        repo = self._init_repo(tmp_path)
+        foreign = init_repo(tmp_path / "foreign-repo")
+        (foreign / "skill").mkdir()
+        (foreign / "skill" / "unrelated.py").write_text("x\n", encoding="utf-8")
+        commit_all(foreign, "foreign")
+
+        monkeypatch.setenv("GIT_INDEX_FILE", str(foreign / ".git" / "index"))
+
+        assert audit_runner._project_top_levels(repo) == sorted(
+            self.ROOT_FILES + [self.SHARED_SUBDIR]
+        ), "the inspected repo's own index must decide its top-level paths"
+        assert set(audit_runner._distinctive_project_top_levels(repo)) == set(
+            self.ROOT_FILES
+        )
+
     def test_manifest_with_root_file_markers_passes_validation(self, tmp_path):
         """AC1: a manifest for a root-file-only-marker repo whose changes touch
         only a framework-shared subdir does NOT abort with a scope error.

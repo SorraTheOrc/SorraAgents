@@ -1256,6 +1256,13 @@ session's `finish` removed the worktree under the other
 - **Path:** `<worklog>/locks/child-<work-item-id>.lock` — under the worklog
   **store**, never inside a worktree (a worktree can be removed mid-flight,
   while its lock must outlive it).
+- **Store override:** `IMPLEMENT_CHILD_LOCK_DIR` replaces the resolved
+  worklog store. It exists for **test isolation**: `phase_start` takes the
+  real `flock` before its test-mocked steps and synthetic test ids share the
+  repository's own prefix, so an un-isolated suite wrote — and raced — real
+  lock files in the developer's `.worklog/locks`. The suites set it per test
+  to a throwaway directory; it is unset in every production invocation (see
+  [test isolation §9.8](test-isolation.md#98-per-work-item-lock-store-isolation-sa-0mvwj6u3j003tlrz)).
 - **Mechanism:** a non-blocking exclusive advisory `fcntl.flock`
   (`LOCK_EX | LOCK_NB`) held for the holder's lifetime. There is no polling,
   no wall-clock TTL that can expire under a long legitimate session, and no
@@ -1399,4 +1406,6 @@ from `assignee`.
   (`phase_start` ordering/refusal/signal/token propagation, `skipped-held`
   reports) and `skill/implement/tests/test_drive_child_lock.py` (two concurrent
   subprocesses: exactly one acquires, the loser writes nothing and the winner's
-  files are not diverged).
+  files are not diverged). Lock-store isolation is pinned by
+  `skill/implement/tests/test_phase_start_claim.py::test_child_lock_lives_in_the_isolated_store_not_the_real_one`
+  and `tests/test_implement_child_lock_isolation.py`.

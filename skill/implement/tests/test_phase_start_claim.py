@@ -222,3 +222,33 @@ def test_claim_failure_is_reported_and_logged_at_error(caplog):
     ]
     assert any("Failed to claim" in msg for msg in error_messages)
     assert any("wl exploded" in msg for msg in error_messages)
+
+
+def test_child_lock_lives_in_the_isolated_store_not_the_real_one(
+    isolated_implement_child_lock_store,
+):
+    """The per-child flock is taken in the isolated store, never the repo's.
+
+    ``phase_start`` acquires the real per-work-item ``flock`` before any of
+    its mocked steps. Synthetic ids share the repository's ``SA`` prefix, so
+    an un-isolated run wrote ``<repo>/.worklog/locks/child-<id>.lock`` into
+    the developer's live store; two concurrent pytest processes then raced
+    the same lock and one failed with "Work item SA-TEST is held by …"
+    (SA-0MVWJ6U3J003TLRZ).
+    """
+    item_id = "SA-LOCKISOLATION"
+    with _mocked_phase_start(update_status=MagicMock()):
+        report = implement.phase_start(item_id, json_output=True)
+
+    assert report["success"] is True, report
+
+    lock_name = f"child-{item_id}.lock"
+    isolated_lock = isolated_implement_child_lock_store / "locks" / lock_name
+    real_lock = REPO_ROOT / ".worklog" / "locks" / lock_name
+    assert isolated_lock.is_file(), (
+        "phase_start must take its lock in the isolated store "
+        f"({isolated_lock})"
+    )
+    assert not real_lock.exists(), (
+        f"phase_start leaked a lock into the live worklog store ({real_lock})"
+    )
