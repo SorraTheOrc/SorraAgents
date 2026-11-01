@@ -7040,7 +7040,8 @@ def phase_finish(
         ``IMPLEMENT_KEEP_WORKTREE=1``. Deferral keeps the tree, its branch
         and ``.implement_state.json`` so the session that owns the tree as
         its cwd keeps working after finish returns; the driver (or the
-        caller) removes it afterwards. Recorded in
+        caller, via ``implement.py cleanup <id>`` as its **last** bash
+        command, SA-0MVTHJ7QX005PXRG) removes it afterwards. Recorded in
         ``report["steps"]["worktree_removal"]`` (SA-0MVTE8XAJ002IUDR)
     11. Sync local parent branch (post-push, AC1/AC2)
     12. Mark in_review

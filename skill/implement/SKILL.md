@@ -932,6 +932,24 @@ See ``../refactor/SKILL.md``.
 
 9. Commit, Push to dev and mark in_review
 
+- **Plain leaf flow — run the finish with the deferral flag:**
+
+  ```bash
+  python3 $(skill_path implement)/scripts/implement.py finish <work-item-id> --keep-worktree
+  ```
+
+  `--keep-worktree` (or `IMPLEMENT_KEEP_WORKTREE=1`) defers `finish`'s own
+  worktree removal, so the worktree — this session's cwd — survives for the
+  worklog comment, the end-of-session report and the post-push verification.
+  The session then removes it itself with `implement.py cleanup <work-item-id>`
+  as its **last** bash command (see
+  [Worktree removal ownership](#worktree-removal-ownership-sa-0mvte8xaj002iudr)
+  below and the [final cleanup step](#final-cleanup-step-remove-the-retained-worktree-plain-leaf-sessions)
+  at the end of this file). Driven child sessions never pass the flag:
+  `IMPLEMENT_DRIVE_ACTIVE=1` defers automatically and `implement.py drive`
+  removes the tree after the session exits. `finish` itself builds, tests,
+  commits, pushes to `dev` and marks the item `in_review`; the manual steps
+  below are the reference for what it does.
 - Follow the mandatory build → test → commit order before committing.
 - **Do NOT create a Pull Request to `main`** — work is integrated into `dev`; the `dev`→`main` promotion is handled by the release process.
 - Push the feature branch into `dev` via the ship skill (`pushToDev()` from `$(skill_path ship)/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
@@ -968,48 +986,44 @@ See ``../refactor/SKILL.md``.
   see [Finish lock, verified sync and refusal
   recovery](#finish-lock-verified-sync-and-refusal-recovery) for the state
   left behind and the exact recovery commands.
-- After pushing, clean up the worktree — **but only if this session owns it**:
+- **Worktree removal ownership (SA-0MVTE8XAJ002IUDR).** After pushing, the
+  worktree removal is owned by exactly one actor, decided by context — **no
+  instruction ever tells a session to remove the worktree it is standing
+  in**. Who removes the tree, by flow:
+
+  - **Plain leaf flow** — the session removes its own tree with
+    `implement.py cleanup <work-item-id>` as its **last** bash command (see
+    the [final cleanup step](#final-cleanup-step-remove-the-retained-worktree-plain-leaf-sessions)
+    below), after the worklog comment, the end-of-session report and the
+    post-push verification. After that command no bash works in the session
+    (the cwd is gone by design).
+  - **Driven child session** (`IMPLEMENT_DRIVE_ACTIVE=1`) — **do not remove
+    your own worktree:** `implement.py drive` removes it once this session
+    has exited (terminal child, clean tree only, SA-0MVTE8XAJ002IUDR).
+  - **Parent/parent-phase flow** — `phase_parent` finishes each child in its
+    own subprocess and removes that child's worktree there; no session-level
+    cleanup applies and the parent's session never holds a child's cwd.
+  - **Plain leaf without the flag (default)** — `finish` removes the tree
+    immediately after a successful dev push (unchanged).
+
+  **Use `implement.py cleanup <id>`, not a raw `git worktree remove`**
+  (SA-0MVTHIZE0007EAKZ). The action is the reviewed removal path: it refuses
+  the main checkout and any directory that is not a linked worktree, retains
+  a dirty tree (uncommitted work is never discarded), refuses a
+  non-terminal item, and reports `removed` / `already_absent` /
+  `retained_*` in JSON (`--json`) or human lines. Re-running it is
+  harmless (an already-absent tree is a reported no-op success).
 
   ```bash
-  git worktree remove .worklog/worktrees/wl-<WIP-id>-<short-slug>
-  git worktree prune
-  git checkout dev && git pull origin dev
-  npm run build 2>/dev/null || echo "No build script, skipping rebuild"
+  python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --json
   ```
 
-  > **Worktree removal ownership (SA-0MVTE8XAJ002IUDR).** `finish` removes
-  > the worktree itself by default, and the first command above is then a
-  > harmless no-op. Two cases are different, and in both the worktree still
-  > exists after `finish` returns:
-  >
-  > - **Driven child session** (`IMPLEMENT_DRIVE_ACTIVE=1`): `finish` **defers**
-  >   removal, because the worktree is this session's own cwd — deleting it
-  >   makes every later bash call fail with `Working directory does not exist`.
-  >   **Do not remove your own worktree:** `implement.py drive` removes it once
-  >   this session has exited. Never run `git worktree remove` on it.
-  > - **Plain leaf session that opted in** with `finish <id> --keep-worktree`
-  >   (or `IMPLEMENT_KEEP_WORKTREE=1`): removal is deferred so this session
-  >   keeps its cwd for the completion comment, the report and the post-push
-  >   verification. Remove the tree with `implement.py cleanup <id>` as the
-  >   **last** bash command of the session — after which no bash works in it.
-  >
-  > **Use `implement.py cleanup <id>`, not a raw `git worktree remove`**
-  > (SA-0MVTHIZE0007EAKZ). The action is the reviewed removal path: it refuses
-  > the main checkout and any directory that is not a linked worktree, retains
-  > a dirty tree (uncommitted work is never discarded), refuses a
-  > non-terminal item, and reports `removed` / `already_absent` /
-  > `retained_*` in JSON (`--json`) or human lines. Re-running it is
-  > harmless (an already-absent tree is a reported no-op success).
-  >
-  > ```bash
-  > python3 $(skill_path implement)/scripts/implement.py cleanup <id> --json
-  > ```
-  >
-  > `finish` records the deferral in `report["steps"]["worktree_removal"]`
-  > (`deferred`, `reason`, `worktree_path`) and names the retained path in its
-  > completion comment. See
-  > [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr)
-  > and [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md#worktree-removal-ownership).
+  `finish` records the deferral in `report["steps"]["worktree_removal"]`
+  (`deferred`, `reason`, `worktree_path`) and names the retained path and
+  the exact cleanup follow-up (`steps.worktree_cleanup.command`) in its
+  completion comment. See
+  [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr)
+  and [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md#worktree-removal-ownership).
 
   > **Why rebuild?** `dist/` is gitignored; `git pull` does not update it. See [[concepts/git-worktree-best-practices-for-agent-workflows]].
 - Add a work-item comment with the commit hash: `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
@@ -1317,7 +1331,49 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   [--next-action <review|plan|implement|...>]
 ```
 
+For plain leaf sessions the report render is followed by the
+[final cleanup step](#final-cleanup-step-remove-the-retained-worktree-plain-leaf-sessions) — the session's **last** bash command (see Step 9).
+
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the
 tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
 re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.
+
+## Final cleanup step: remove the retained worktree (plain leaf sessions)
+
+A plain leaf session that ran `implement.py finish <work-item-id> --keep-worktree`
+(or exported `IMPLEMENT_KEEP_WORKTREE=1`) owns the removal of its own
+worktree — no one else will do it. Run it after the worklog comment, the
+end-of-session report above and the post-push verification, as the session's
+**very last** bash command:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --json
+```
+
+This must be the session's **last** bash command: `cleanup` deletes the tree
+this session stands in (its cwd), so every later bash call would fail with
+`Working directory does not exist` — which is why the comment, the report and
+the verification all come **first**. After `cleanup` returns you may still
+render the final response text (that is not a bash command), but you cannot
+run another command.
+
+**When `cleanup` reports `retained_dirty` or `retained_non_terminal`:** the
+tree was kept on purpose — never force it (the action has no force switch).
+Record the retention in a work-item comment (state the `reason` and `remedy`
+from the report) and stop; a dirty or non-terminal tree is retained as a
+reported outcome, and re-running `cleanup` later is safe after the tree is
+clean and the item is terminal (`already_absent` is a reported no-op
+success).
+
+- **Driven child sessions** (`IMPLEMENT_DRIVE_ACTIVE=1`) — do **not** run
+  `cleanup` here: `implement.py drive` removes the worktree after this
+  session has exited (terminal child, clean tree only, SA-0MVTE8XAJ002IUDR).
+- **Parent/parent-phase flows** — do **not** run `cleanup` here:
+  `phase_parent` finishes each child in its own subprocess and removes that
+  child's worktree there.
+
+See [Worktree removal
+ownership](#worktree-removal-ownership-sa-0mvte8xaj002iudr) in Step 9 and
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#the-session-side-removal-action-implementpy-cleanup-id)
+for the full contract.

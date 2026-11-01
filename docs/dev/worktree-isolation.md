@@ -161,6 +161,7 @@ worktree, decided by context:
 | Driven child session (`IMPLEMENT_DRIVE_ACTIVE=1`) | `implement.py drive` | After the child's session exits; terminal child, clean tree only |
 | Opted-in plain leaf (`finish --keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session itself (or an operator) | The session's **last** bash command, after the comment, report and post-push verification |
 | Plain leaf (default) | `finish` | Immediately after a successful dev push |
+| Parent/parent-phase flow | `phase_parent` (its own `finish` subprocess per child) | Each child is finished in its own subprocess and its worktree removed there — no session-level cleanup instruction applies |
 | Aborted item | `abort` | Unconditionally |
 
 `_should_defer_worktree_removal()` is the single deferral predicate

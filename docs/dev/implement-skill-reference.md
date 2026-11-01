@@ -277,6 +277,7 @@ and verify the pushed commit (evidence: driven child sessions
 | Driven child session (`IMPLEMENT_DRIVE_ACTIVE=1`) | `implement.py drive` | After that child's session has exited, and only when the child is terminal and the tree is clean |
 | Plain leaf session that opted in (`--keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session (or an operator) | After the completion comment, the report and the post-push verification — as the session's **last** bash command |
 | Plain leaf session (default) | `finish` | Immediately after a successful dev push (unchanged) |
+| Parent/parent-phase flow | `phase_parent` (its own `finish` subprocess per child) | Each child is finished in its own subprocess and its worktree removed there — no session-level cleanup instruction applies |
 | Aborted item | `abort` | Unconditionally — an aborted item is abandoned, not resumed |
 
 ### One predicate, two removal sites
@@ -387,6 +388,13 @@ session's **last** bash command. Removal deletes the tree the session stands
 in, so nothing that needs the worktree cwd may follow — every later command
 would fail with a deleted cwd. The comment, the report and any post-push
 verification come first.
+
+A session whose final `cleanup` reports `retained_dirty` or
+`retained_non_terminal` records the retention in a work-item comment (with
+the reported `reason`/`remedy`) and stops — it never forces the removal (the
+action has no force switch). The retention is a reported outcome, and
+re-running `cleanup` later is safe once the tree is clean and the item
+terminal (`already_absent` is then a no-op success).
 
 Gates, in order — a failure at any of them **retains** the tree and is
 reported (never forced past, never silent), so a retained tree is a reported

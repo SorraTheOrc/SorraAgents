@@ -185,9 +185,10 @@ class TestWorktreeRemovalOwnership:
 
     def _skill_finish_block(self) -> str:
         content = _read(_SKILL_MD)
-        start = content.find("After pushing, clean up the worktree")
+        start = content.find("- **Plain leaf flow — run the finish with the deferral flag:**")
         assert start != -1, (
-            "SKILL.md must keep a finish-step worktree-cleanup instruction"
+            "SKILL.md must open the finish step with the plain-flow "
+            "deferral-flag instruction"
         )
         end = content.find("**Why rebuild?**", start)
         assert end != -1 and end > start, "the cleanup block must precede the rebuild note"
@@ -266,3 +267,70 @@ class TestWorktreeRemovalOwnership:
         block = self._skill_finish_block()
         assert "ownership" in block.lower()
         assert "defer" in block.lower()
+
+    def test_skill_finish_runs_plain_flow_with_deferral_flag(self) -> None:
+        """SA-0MVTHJ7QX005PXRG AC2: the SKILL finish step runs
+        `implement.py finish <id> --keep-worktree` so the tree survives the
+        run, and names the `cleanup` follow-up as the session's last command.
+        """
+        content = _read(_SKILL_MD)
+        finish_cmd = "implement.py finish <work-item-id> --keep-worktree"
+        assert finish_cmd in content, (
+            f"SKILL.md Step 9 must run the finish with the deferral flag: {finish_cmd!r}"
+        )
+        assert "IMPLEMENT_KEEP_WORKTREE" in content
+        block = self._skill_finish_block()
+        assert "implement.py cleanup <work-item-id>" in block
+        assert "last" in block.lower()
+
+    def test_skill_documents_the_cleanup_final_step(self) -> None:
+        """SA-0MVTHJ7QX005PXRG AC2: a new final step — explicitly the
+        session's last bash command — runs `implement.py cleanup <id>` after
+        the worklog comment, the end-of-session report and the post-push
+        verification, including what to do on `retained_dirty` /
+        `retained_non_terminal` (record in a comment; never force).
+        """
+        content = _read(_SKILL_MD)
+        start = content.find("## Final cleanup step: remove the retained worktree")
+        assert start != -1, "SKILL.md must end with the final cleanup step"
+        step = " ".join(content[start:].split())
+        assert "implement.py cleanup <work-item-id>" in step
+        assert "last" in step.lower()
+        assert "worklog comment" in step
+        assert "end-of-session report" in step
+        assert "post-push verification" in step
+        # The retained-outcome handling: record in a comment, never force.
+        assert "retained_dirty" in step
+        assert "retained_non_terminal" in step
+        assert "never force" in step.lower() or "no force switch" in step.lower()
+
+    def test_skill_documents_parent_phase_flow(self) -> None:
+        """SA-0MVTHJ7QX005PXRG AC5: the ownership rule names the parent /
+        parent-phase flow (phase_parent finishes children in its own
+        subprocess and removes their worktrees) alongside the plain leaf and
+        driven child flows — in all three documented places.
+        """
+        for section in (
+            self._skill_finish_block(),
+            self._reference_section(),
+            self._isolation_section(),
+        ):
+            assert "parent-phase" in section or "parent/parent-phase" in section, (
+                "ownership rule must name the parent/parent-phase flow"
+            )
+            assert "phase_parent" in section
+
+    def test_old_competing_removal_instruction_must_not_return(self) -> None:
+        """SA-0MVTHJ7QX005PXRG AC3: the old competing manual block —
+        `git worktree remove .worklog/worktrees/… && git worktree prune &&
+        git checkout dev && git pull origin dev` as a finish-step instruction
+        — must not return. The only removal the finish step may instruct is
+        `implement.py cleanup <id>` (or, for a driven child, `implement.py
+        drive`/`phase_parent` doing it after the session exits).
+        """
+        block = self._skill_finish_block()
+        assert "git worktree remove" not in block.replace(
+            "not a raw `git worktree remove`", ""
+        )
+        assert "git checkout dev" not in block
+        assert "git pull origin dev" not in block
