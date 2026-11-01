@@ -33,9 +33,12 @@ if str(_RUNNER_DIR) not in _sys.path:
     _sys.path.insert(0, str(_RUNNER_DIR))
 
 from run_tests import (
+    NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED,
     full_suite_commands,
+    full_suite_notices,
     hidden_skill_test_command,
     hidden_skill_test_dirs,
+    hidden_skill_test_notice,
 )
 
 PYTEST_CMD = "pytest -q -r a --disable-warnings"
@@ -195,3 +198,152 @@ class TestFullSuiteCommandsWithHiddenSkillTests:
             PYTEST_CMD,
             "npm --silent test -- tests/unit",
         ]
+
+
+# ---------------------------------------------------------------------------
+# AC3/AC4 — pinned precedence + no double execution
+# (SA-0MVQQ9NV4005UKYZ, elaborating the parent's D3)
+# ---------------------------------------------------------------------------
+
+
+def _write_test_config(root: Path, suite_commands: list[str]) -> None:
+    (root / ".pi").mkdir(parents=True, exist_ok=True)
+    (root / ".pi" / "test-config.json").write_text(
+        json.dumps({"suiteCommands": suite_commands}), encoding="utf-8",
+    )
+
+
+class TestPinnedSuiteCommandsPrecedence:
+    """AC3: a pinned list is authoritative; the gap is reported, not patched."""
+
+    def test_pinned_list_is_returned_verbatim(self, tmp_path: Path) -> None:
+        pinned = ["pytest -q tests", "npm --silent run lint"]
+        _write_pytest_ini(tmp_path)
+        _write_test_config(tmp_path, pinned)
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert full_suite_commands(tmp_path) == pinned
+
+    def test_notice_names_uncovered_hidden_dirs(self, tmp_path: Path) -> None:
+        _write_test_config(tmp_path, ["pytest -q tests"])
+        _skill_test_dir(tmp_path, "alpha")
+        _skill_test_dir(tmp_path, "beta", "test")
+
+        notice = hidden_skill_test_notice(tmp_path)
+
+        assert notice is not None
+        assert notice["code"] == NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED
+        assert notice["directories"] == [
+            ".pi/skills/alpha/tests",
+            ".pi/skills/beta/test",
+        ]
+        assert notice["source"] == ".pi/test-config.json"
+
+    def test_no_notice_when_the_pin_covers_every_candidate(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pin that names the skill test dir leaves nothing to report."""
+        _write_test_config(tmp_path, ["pytest -q .pi/skills/alpha/tests"])
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert hidden_skill_test_notice(tmp_path) is None
+        assert full_suite_notices(tmp_path) == []
+
+    def test_empty_pinned_list_is_verbatim_with_a_notice(self, tmp_path: Path) -> None:
+        """An explicitly-empty pin means "no runnable suite" and is honoured."""
+        _write_test_config(tmp_path, [])
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert full_suite_commands(tmp_path) == []
+        notice = hidden_skill_test_notice(tmp_path)
+        assert notice is not None
+        assert notice["directories"] == [".pi/skills/alpha/tests"]
+
+    def test_no_notice_without_a_pinned_list(self, tmp_path: Path) -> None:
+        _write_pytest_ini(tmp_path)
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert hidden_skill_test_notice(tmp_path) is None
+        assert full_suite_notices(tmp_path) == []
+
+
+class TestNoDoubleExecution:
+    """AC4: a candidate the project's pytest config already collects is skipped."""
+
+    def test_ini_testpaths_cover_of_the_candidate_skips_it(self, tmp_path: Path) -> None:
+        (tmp_path / "pytest.ini").write_text(
+            "[pytest]\ntestpaths = .pi/skills/alpha/tests\n", encoding="utf-8",
+        )
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert full_suite_commands(tmp_path) == [PYTEST_CMD]
+
+    def test_ini_addopts_path_covers_the_candidate(self, tmp_path: Path) -> None:
+        (tmp_path / "pytest.ini").write_text(
+            "[pytest]\naddopts = -ra .pi/skills\n", encoding="utf-8",
+        )
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert full_suite_commands(tmp_path) == [PYTEST_CMD]
+
+    def test_pyproject_testpaths_cover_skips_the_candidate(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text(
+            "[tool.pytest.ini_options]\n"
+            'testpaths = [".pi/skills/alpha/tests"]\n',
+            encoding="utf-8",
+        )
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert full_suite_commands(tmp_path) == [PYTEST_CMD]
+
+    def test_root_level_token_does_not_count_as_coverage(self, tmp_path: Path) -> None:
+        """``testpaths = .``/``tests`` never reach ``.pi`` (default
+        ``norecursedirs`` prunes ``.*``), so the command is still emitted."""
+        (tmp_path / "pytest.ini").write_text(
+            "[pytest]\ntestpaths = . tests\n", encoding="utf-8",
+        )
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_root.py").write_text("def test_x():\n    pass\n")
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert full_suite_commands(tmp_path) == [
+            PYTEST_CMD,
+            f"{PYTEST_CMD} .pi/skills/alpha/tests",
+        ]
+
+    def test_uncovered_candidate_is_still_emitted(self, tmp_path: Path) -> None:
+        (tmp_path / "pytest.ini").write_text(
+            "[pytest]\ntestpaths = .pi/skills/beta/tests\n", encoding="utf-8",
+        )
+        _skill_test_dir(tmp_path, "alpha")
+        _skill_test_dir(tmp_path, "beta")
+
+        assert full_suite_commands(tmp_path) == [
+            PYTEST_CMD,
+            f"{PYTEST_CMD} .pi/skills/alpha/tests",
+        ]
+
+
+class TestNoticeIsNonFatal:
+    """AC4b: a notice never changes resolution or the exit status."""
+
+    def test_resolution_is_identical_with_and_without_a_notice(
+        self, tmp_path: Path,
+    ) -> None:
+        pinned = ["pytest -q tests"]
+        _write_test_config(tmp_path, pinned)
+        _skill_test_dir(tmp_path, "alpha")
+
+        assert hidden_skill_test_notice(tmp_path) is not None
+        assert full_suite_commands(tmp_path) == pinned
+
+    def test_notice_carries_a_stable_machine_readable_shape(
+        self, tmp_path: Path,
+    ) -> None:
+        _write_test_config(tmp_path, ["pytest -q tests"])
+        _skill_test_dir(tmp_path, "alpha")
+
+        notice = hidden_skill_test_notice(tmp_path)
+        assert set(notice) == {"code", "source", "directories", "message"}
+        assert isinstance(notice["directories"], list)
+        assert notice["message"]
