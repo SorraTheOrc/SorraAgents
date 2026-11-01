@@ -260,6 +260,73 @@ fake, injected commit-evidence provider, recording mutation fake).
 - No fetch/network in the evidence path; a stale `origin/dev` ref is accepted
   evidence on the failure path.
 
+## Assignee release when a kill cannot run an exit hook (SA-0MVVF75ZA007XNKB)
+
+A non-empty `assignee` is a **scheduling hold**: `wl next` skips a held item,
+so an item left on a lingering agent claim is invisible to dispatch. The shared
+`StatusLifecycle` releases the assignee on every exit path it controls, but
+three outcomes never reach a normal exit and need an explicit durable write:
+
+| Outcome | Who does not get to write | Who persists the release |
+|---|---|---|
+| SIGTERM / SIGINT | the interrupted phase | `_signal_handler` → `_handle_signal_cleanup` → `_safety_reset_if_in_progress` (status `open` **and** `assignee=""`) |
+| Per-child session timeout (`drive --child-timeout`) | the killed child session — `subprocess.run(timeout=…)` is a `SIGKILL`, so no Python exit hook runs | the **surviving** driver: `_release_orphaned_child_claim` in `phase_drive`'s spawn-failure path |
+| `finish` subprocess overruns its bound inside `phase_parent` | the killed `finish` — `_invoke_implement` now maps `subprocess.TimeoutExpired` to `None` instead of propagating | `phase_parent::_run_finish` failure path → `_release_orphaned_child_claim` |
+| Unclassified exception in `phase_start` / `phase_finish` | the crashing phase (Python exits without a classified branch) | the new `except Exception` guard in each phase → `_safety_reset_if_in_progress` |
+
+### `_release_orphaned_child_claim` semantics
+
+The timeout counterpart of the signal-path safety reset. It releases **only an
+`in-progress` child**, and it **keeps the status**: the existing recovery paths
+depend on it — `phase_parent` re-finishes a child whose worktree still holds
+the work, and `drive --finalise-stranded` requires `in-progress` plus an
+assignee that is either empty or the driver's own. Clearing the assignee first
+is what lets that finaliser run at all (it refuses a child "claimed by"
+someone else).
+
+Every other state is untouched, so a producer `Map` hold and a terminal item
+are never disturbed. The helper is idempotent: a child whose own failure path
+already reset it holds no assignee and produces no write. The release never
+masks the original failure — the chain still stops with `failed_child` and the
+report carries the release under `claim_release` / `orphaned_claim_release`.
+
+### Residual window
+
+A process killed by `SIGKILL` with **no surviving supervisor** cannot write
+anything, so its claim survives until an operator (or the proposed TTL
+stale-hold reaper, precedent SA-0MVKWV2V2006JC8E) clears it. Every in-tree
+kill path now has a surviving writer — the signal handler, or `drive` /
+`phase_parent` — so the remaining case is exception-only and stays inside the
+"killed with no exit hook" scope recorded as out of scope on
+SA-0MVVEDK2Q008NDUH.
+
+### Tests
+
+The release is proved **across a real process boundary**, not by inspection:
+
+```bash
+pytest -q tests/test_implement_signal_safety.py
+```
+
+- `test_signal_kill_releases_the_assignee[SIGTERM|SIGINT]` — a real
+  `implement.py start` subprocess is held open by a `git` shim on
+  `git worktree add` (after the claim, before the worktree), sent a real
+  signal, and the persisted `status`/`assignee` are read back from a real `wl`
+  store: `open` / `""`, exit code 2.
+- `test_timeout_killed_child_releases_the_assignee` — `phase_drive` with a
+  fake `pi` that never exits and `child_timeout=1`: the real timeout kill
+  happens, the child stays `in-progress`, and the persisted assignee is `""`.
+- `test_phase_start_unexpected_exception_releases_the_claim` and
+  `test_phase_finish_unexpected_exception_releases_the_assignee` — the
+  unclassified-crash guards.
+- `test_phase_parent_releases_a_child_claim_after_a_finish_timeout` and
+  `test_invoke_implement_timeout_returns_none` — the `phase_parent` timeout
+  path.
+
+The matrix in `tests/test_assignee_release_all_skills.py` additionally
+exercises `_release_orphaned_child_claim` as a release-only entry point, and
+the discovery guard keeps any future assignee-mutating entry point classified.
+
 ## Worktree removal ownership (SA-0MVTE8XAJ002IUDR)
 
 Exactly one owner removes a worktree, decided by context. `finish` used to

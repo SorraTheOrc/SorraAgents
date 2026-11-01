@@ -402,6 +402,7 @@ class ReleaseExercise:
     entry_points: tuple[str, ...]
     exercise: Callable[[FakeWorklogStore], None] = field(compare=False)
     classification: str = "must-release-on-terminal"
+    target_id: str = "SA-MATRIXAUDIT"
 
 
 @dataclass(frozen=True)
@@ -995,7 +996,11 @@ RELEASE_ROWS: tuple[ReleaseRow, ...] = (
         skill="implement",
         entry_point="phase_drive / _finalise_stranded_child",
         source="implement/scripts/implement.py",
-        entry_points=("phase_drive", "_finalise_stranded_child"),
+        entry_points=(
+            "phase_drive",
+            "_finalise_stranded_child",
+            "_release_orphaned_child_claim",
+        ),
         success=Invocation(
             label="finalise-stranded-child",
             target_id="SA-MATRIXCHILD",
@@ -1313,12 +1318,37 @@ def _exercise_audit_pre_audit_restore(store: FakeWorklogStore) -> None:
     audit_runner._restore_pre_audit_state_on_failure(ctx)
 
 
+def _exercise_implement_orphaned_claim_release(store: FakeWorklogStore) -> None:
+    """The timeout-kill release persists a cleared assignee (SA-0MVVF75ZA007XNKB).
+
+    Called by ``phase_drive`` and ``phase_parent`` after a kill that cannot
+    run the killed session's own exit hook (a drive/spawn timeout is a
+    ``SIGKILL``). The helper keeps the status so the finish/finalise recovery
+    still applies.
+    """
+    with (
+        patch.object(implement, "wl_show", side_effect=store.show),
+        patch.object(implement, "wl_add_comment", return_value=True),
+    ):
+        release = implement._release_orphaned_child_claim("SA-MATRIXIMPL")
+
+    assert release["released"] is True, release
+    assert store.show("SA-MATRIXIMPL")["status"] == "in-progress"
+
+
 RELEASE_EXERCISES: tuple[ReleaseExercise, ...] = (
     ReleaseExercise(
         name="audit pre-audit-state restore (failed terminal transition)",
         source="audit/scripts/audit_runner.py",
         entry_points=("_restore_pre_audit_state_on_failure",),
         exercise=_exercise_audit_pre_audit_restore,
+    ),
+    ReleaseExercise(
+        name="implement orphaned-claim release (timeout/signal kill)",
+        source="implement/scripts/implement.py",
+        entry_points=("_release_orphaned_child_claim",),
+        exercise=_exercise_implement_orphaned_claim_release,
+        target_id="SA-MATRIXIMPL",
     ),
 )
 
@@ -1329,14 +1359,14 @@ RELEASE_EXERCISES: tuple[ReleaseExercise, ...] = (
 def test_release_only_entry_point_clears_the_assignee(case: ReleaseExercise) -> None:
     """A release-only helper must genuinely persist an empty assignee."""
     assert case.classification == "must-release-on-terminal"
-    store = FakeWorklogStore.with_item("SA-MATRIXAUDIT", status="in-progress")
-    assert store.assignee("SA-MATRIXAUDIT") == _AGENT
+    store = FakeWorklogStore.with_item(case.target_id, status="in-progress")
+    assert store.assignee(case.target_id) == _AGENT
 
     case.exercise(store)
 
-    assert store.assignee("SA-MATRIXAUDIT") == ""
+    assert store.assignee(case.target_id) == ""
     assert any(
-        "SA-MATRIXAUDIT" in command for command in store.update_commands
+        case.target_id in command for command in store.update_commands
     ), "the restore never reached the item"
 
 

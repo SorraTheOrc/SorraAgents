@@ -364,9 +364,10 @@ def _handle_signal_cleanup(signum: int) -> None:
     """Deterministic cleanup body for SIGTERM/SIGINT (does not exit).
 
     Split out of :func:`_signal_handler` so the cleanup contract — release
-    the per-child lock, never leave a claimed item unexplained, remove the
-    worktree, restore repo state — is directly testable without terminating
-    the interpreting process.
+    the per-child lock, release the item's claim (status **and** assignee),
+    never leave a claimed item unexplained, remove the worktree, restore repo
+    state — is directly testable without terminating the interpreting
+    process.
 
     Args:
         signum: The signal number that triggered the cleanup.
@@ -760,6 +761,13 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
     Guards against clobbering items that already reached a valid terminal
     state (``open``/``blocked``/``completed``) when a late, unrelated error
     or signal occurs (e.g. after a successful finish phase).
+
+    The reset also **clears the assignee** (``assignee=""``): a non-empty
+    assignee is a scheduling hold, so a killed session that only reclaimed the
+    status would still leave the item invisible to ``wl next``. This is the
+    durable release for the signal path (SIGTERM/SIGINT); the killed-by-
+    timeout counterpart is :func:`_release_orphaned_child_claim`
+    (SA-0MVVF75ZA007XNKB).
 
     Args:
         work_item_id: The work item ID.
@@ -6909,6 +6917,29 @@ def phase_start(
             worktree_path_override=worktree_path_override,
             force=force,
         )
+    except Exception as exc:  # noqa: BLE001 - release the claim, then report
+        # The claim is written before this point, so an *unexpected* failure
+        # (anything the classified abort branches above did not catch) must
+        # not leave the item claimed on a scheduling hold. The conditional
+        # safety reset releases the assignee and returns an in-progress item
+        # to open; it is a no-op when the item already reached a terminal
+        # state, so a late error can never clobber one
+        # (SA-0MVVF75ZA007XNKB).
+        report["unexpected_error"] = f"{type(exc).__name__}: {exc}"
+        report["success"] = False
+        report["message"] = f"Unexpected error during start: {exc}"
+        LOG.error("Unexpected error during start of %s: %s", work_item_id, exc)
+        try:
+            _safety_reset_if_in_progress(work_item_id)
+        except RuntimeError:
+            LOG.error(
+                "Failed to release the claim on %s after an unexpected "
+                "error",
+                work_item_id,
+            )
+        if json_output:
+            print(format_json_output(report))
+        return report
     finally:
         # Normal exit, early return and exception all release the lock; the
         # signal handler releases it explicitly before ``os._exit``.
@@ -8258,6 +8289,31 @@ def phase_finish(
         else:
             LOG.error(msg)
         return report
+    except Exception as exc:
+        # An *unexpected* failure (not one of the classified RuntimeErrors
+        # above) already had its original status restored by
+        # ``StatusLifecycle.__exit__`` — but for a finishing item that
+        # original status is ``in-progress``, so the claim would survive the
+        # crash on its scheduling hold. Release it durably before reporting
+        # (SA-0MVVF75ZA007XNKB). The conditional reset never clobbers an item
+        # that already reached a terminal state.
+        report["unexpected_error"] = f"{type(exc).__name__}: {exc}"
+        report["success"] = False
+        report["message"] = f"Unexpected error during finish: {exc}"
+        LOG.exception(
+            "Unexpected error during finish of %s", work_item_id,
+        )
+        try:
+            _safety_reset_if_in_progress(work_item_id)
+        except RuntimeError:
+            LOG.error(
+                "Failed to release the claim on %s after an unexpected "
+                "error",
+                work_item_id,
+            )
+        if json_output:
+            print(format_json_output(report))
+        return report
     finally:
         # Released on EVERY exit path from the critical section (success,
         # RuntimeError, or an escaping exception): the kernel also releases
@@ -8765,14 +8821,26 @@ def _invoke_implement(
     token = _child_lock_token(env)
     if token:
         env[ENV_LOCK_TOKEN] = token
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=_resolve_test_timeout(repo_root),
-        env=env,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_resolve_test_timeout(repo_root),
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        # A finish that overruns its bound is killed (``subprocess.run``
+        # SIGKILLs the child before raising), so the killed phase never runs
+        # its own release. Report the failure as ``None`` so the caller's
+        # failure path releases the orphaned claim instead of dying with a
+        # traceback (SA-0MVVF75ZA007XNKB).
+        LOG.error(
+            "Subprocess %s %s exceeded its timeout bound and was killed",
+            action, work_item_id,
+        )
+        return None
     if result.returncode != 0:
         LOG.error(
             "Subprocess failed (rc=%d): %s\nSTDERR: %s",
@@ -9187,11 +9255,21 @@ def phase_parent(
         if finish_result is None or not finish_result.get("success", False):
             msg = f"Failed to finish child {cid}"
             LOG.error(msg)
+            # A finish subprocess killed by its timeout bound (or by a signal
+            # that never reached a Python exit hook) leaves the child
+            # in-progress with nothing to release it. The surviving parent
+            # releases that orphaned claim durably before reporting the
+            # failure (SA-0MVVF75ZA007XNKB); a child whose own failure path
+            # already reset it is left untouched by the helper.
+            release = _release_orphaned_child_claim(cid)
+            if release.get("released"):
+                msg = f"{msg} ({release['reason']})"
             report["success"] = False
             report["message"] = msg
             report["next_child"] = cid
             report["finishing_failed"] = True
             report["finish_failure"] = classify_finish_failure(finish_result)
+            report["orphaned_claim_release"] = release
             report["children_processed"] = child_results
             if json_output:
                 print(format_json_output(report))
@@ -9721,6 +9799,91 @@ def _reconcile_spawn_failure(
         "Reconciled %s after a failed child session: terminal (%s).",
         child_id,
         result["evidence"],
+    )
+    return result
+
+
+def _release_orphaned_child_claim(child_id: str) -> dict[str, Any]:
+    """Release a child claim orphaned by a killed or timed-out subprocess.
+
+    A ``finish`` subprocess (or a driven child session) that is killed by a
+    timeout bound — or by a signal that never reaches a Python exit hook —
+    cannot run its own release, so the *surviving* supervisor performs it with
+    a durable write: the assignee is cleared (assignee-hold convention: a
+    non-empty assignee is a scheduling hold, so a lingering one makes the item
+    invisible to ``wl next``). This is the timeout counterpart of
+    :func:`_safety_reset_if_in_progress`, which covers the signal path
+    (SA-0MVVF75ZA007XNKB).
+
+    Only an ``in-progress`` child is touched, and only its assignee is
+    cleared: the status is deliberately left alone so the existing recovery
+    paths still apply — ``phase_parent`` re-finishes a child whose worktree
+    holds the work, and ``drive --finalise-stranded`` still recognises the
+    child as ``in-progress``. Every other state holds no claim this workflow
+    owns, so a producer ``Map`` hold or a terminal item is never disturbed,
+    and a child whose own failure path already reset it is left alone — the
+    helper is therefore idempotent and never masks the original failure (the
+    caller keeps reporting it).
+
+    Args:
+        child_id: The child work item whose claim may be orphaned.
+
+    Returns:
+        ``{"released": bool, "status": str, "previous_status": str,
+        "previous_assignee": str, "reason": str}``. ``released`` is ``False``
+        when there was nothing to release or the release write failed.
+    """
+    result: dict[str, Any] = {
+        "released": False,
+        "status": "",
+        "previous_status": "",
+        "previous_assignee": "",
+        "reason": "",
+    }
+    child = wl_show(child_id)
+    if not child:
+        result["reason"] = "could not re-fetch the child work item"
+        return result
+
+    status = str(child.get("status", "") or "")
+    assignee = str(child.get("assignee", "") or "")
+    result["previous_status"] = status
+    result["previous_assignee"] = assignee
+    result["status"] = status
+    if status not in ("in-progress", "in_progress"):
+        result["reason"] = (
+            f"child is not in-progress (status={status!r}); no claim to release"
+        )
+        return result
+    if not assignee:
+        result["reason"] = "child holds no assignee; nothing to release"
+        return result
+
+    # ``wl`` spells the status ``in-progress``; the read-back can carry the
+    # underscore form, so normalise before writing it back unchanged.
+    kept_status = "in-progress" if status == "in_progress" else status
+    try:
+        StatusLifecycle.update_status(child_id, kept_status, assignee="")
+    except (RuntimeError, ValueError) as exc:
+        result["reason"] = f"release write failed: {exc}"
+        return result
+
+    result["released"] = True
+    result["reason"] = (
+        "assignee released after its session was killed (item stays "
+        "in-progress, so the existing finish/finalise recovery still applies)"
+    )
+    wl_add_comment(
+        child_id,
+        f"Claim released: the session working on this item was killed "
+        f"(timeout or signal) before it could release its own claim, so the "
+        f"assignee ({assignee!r}) was cleared by the surviving supervisor. "
+        f"The item stays `in-progress` so it can still be finished or "
+        f"finalised; any uncommitted work in its worktree is untouched.",
+    )
+    LOG.info(
+        "Released orphaned claim on %s (was status=%s, assignee=%r)",
+        child_id, status, assignee,
     )
     return result
 
@@ -11913,11 +12076,29 @@ def phase_drive(
                 )
                 continue
 
-            # Not terminal: the hard failure stands. Before stopping the
-            # chain, check whether the child is *stranded* — its work is
-            # already on the parent branch but the item never reached a
-            # terminal state (SA-0MVLJWRVO000QQNP). Read-only: report + one
-            # parent comment, no status mutation.
+            # Not terminal: the hard failure stands. The killed session could
+            # not release the claim it held (a timeout kill is a SIGKILL, so
+            # no exit hook runs), so the surviving driver releases it with a
+            # durable write before any further diagnosis: an in-progress
+            # child would otherwise stay on a scheduling hold and be
+            # invisible to ``wl next`` (SA-0MVVF75ZA007XNKB). This also lets
+            # the evidence-gated finaliser below run — it refuses a child
+            # still carrying someone's assignee. The release never masks the
+            # failure: the chain still stops with ``failed_child``.
+            claim_release = _release_orphaned_child_claim(child_id)
+            entry["claim_release"] = claim_release
+            report["claim_release"] = claim_release
+            if claim_release.get("released"):
+                LOG.info(
+                    "Released the orphaned claim on %s after its child "
+                    "session failed: %s",
+                    child_id, claim_release["reason"],
+                )
+
+            # Before stopping the chain, check whether the child is
+            # *stranded* — its work is already on the parent branch but the
+            # item never reached a terminal state (SA-0MVLJWRVO000QQNP).
+            # Read-only: report + one parent comment, no status mutation.
             stranded = _detect_stranded_child(
                 child_id, worktree_path, parent_branch,
                 commit_evidence=commit_evidence,
