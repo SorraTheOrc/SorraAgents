@@ -270,6 +270,42 @@ Recovery: push manually from the main checkout:
 git push origin <branch>:refs/heads/dev
 ```
 
+### Reading a gate failure: `reason` and its facts (SA-0MVTET8KQ0031R6Z)
+
+A red finish gate reports a machine-readable `reason` plus the facts that
+decided it, on `test_phase` in the `--json` report and in the operator message.
+Read `reason` **first** — it answers the only question that matters before you
+act, and every reason never lands on `unknown` with an empty `failures` list.
+
+| `reason` | What happened | What to do |
+|----------|---------------|------------|
+| `test_failure` | Real, parsable failing tests. | Fix the code. Structured failures always win: a genuine failure is never reported as infrastructure. |
+| `timeout` | The suite exceeded `timeoutPerCommand` and was stopped. | Raise `timeoutPerCommand` in `.pi/test-config.json` with headroom over a green run's `elapsed_seconds`, then re-run. |
+| `killed` | The child was signal-terminated (OOM kill, worker/supervisor crash) with no test result. | Treat as host/infrastructure: read the output tail, re-run. Do **not** "fix" a test. |
+| `unparsed` | The suite exited non-zero and no test failure could be parsed (bad flag, unloadable config, missing wrapper). | Read `command` and the output tail: the command or its configuration is wrong, not a test. |
+| `slot_contention` | No host test slot within the bounded wait (`slot_busy`). | Wait a staggered delay, or raise `TEST_LOCK_TIMEOUT`. The wait is reported separately from execution. |
+| `infrastructure` | Explained by a runner notice but not attributable to a test (includes a live-repo mutation). | Read the notices; the checkout may have been mutated by a concurrent session. |
+| `unknown` | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. |
+
+The deciding **fact fields** accompany every classified failure:
+
+| Field | Unit / meaning |
+|-------|----------------|
+| `configured_timeout` | Seconds — the `timeoutPerCommand` that was applied. |
+| `elapsed_seconds` | Seconds — wall time of the command execution **only**. `null` (never `0`) when nothing executed (fully cached, or the slot wait expired before the spawn). |
+| `slot_wait_seconds` | Seconds — host test-slot queue wait, measured once by the pacer and **never** folded into `elapsed_seconds`. On a slot-busy result it is the elapsed bounded wait. |
+| `command` | The suite command that was run. |
+| `exit_code` | The process exit code, reported only when a suite actually reported one (negative means signal-terminated). |
+| `signal` | The terminating signal number when the child was killed. |
+
+The same vocabulary is documented for the runner's notice codes in
+[docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md#notice-codes-stable-strings)
+and for the gate's classification rules in
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#gate-failure-diagnostics-wl-0mvgut787000lndg);
+a docs-vs-source consistency test (`skill/implement/tests/test_gate_classification_docs.py`)
+fails if a documented reason, notice code or fact field no longer exists in the
+code — or if a new one is left undocumented.
+
 ## Status Safety & Abort Handling
 
 ### Critical Rule: Always Reset Status on Abort

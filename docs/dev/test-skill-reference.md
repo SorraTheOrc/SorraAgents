@@ -315,6 +315,15 @@ silently reclassify a genuine test failure as infrastructure contention.
 The slot-busy notice text itself is anchored to the exported
 `SLOT_BUSY_NOTICE_PREFIX` constant.
 
+**From codes to remedies.** The finish gate maps these codes onto the reasons it
+reports (`timeout`, `killed`, `unparsed`, `slot_contention`, `test_failure`,
+`infrastructure`) and attaches the deciding facts (`configured_timeout`,
+`elapsed_seconds`, `slot_wait_seconds`, `command`, `exit_code`, `signal`). Read
+the mapping — and the action per reason — in
+[implement-skill-reference.md](implement-skill-reference.md#gate-failure-diagnostics-wl-0mvgut787000lndg)
+and in `skill/implement/SKILL.md` (“Reading a gate failure”); a docs-vs-source
+consistency test keeps the three documents and the producing constants in step.
+
 #### Notice codes (stable strings)
 
 | Code | Meaning |
