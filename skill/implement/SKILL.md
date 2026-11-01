@@ -990,8 +990,20 @@ See ``../refactor/SKILL.md``.
   > - **Plain leaf session that opted in** with `finish <id> --keep-worktree`
   >   (or `IMPLEMENT_KEEP_WORKTREE=1`): removal is deferred so this session
   >   keeps its cwd for the completion comment, the report and the post-push
-  >   verification. Remove the tree as the **last** bash command of the
-  >   session — after which no bash works in it.
+  >   verification. Remove the tree with `implement.py cleanup <id>` as the
+  >   **last** bash command of the session — after which no bash works in it.
+  >
+  > **Use `implement.py cleanup <id>`, not a raw `git worktree remove`**
+  > (SA-0MVTHIZE0007EAKZ). The action is the reviewed removal path: it refuses
+  > the main checkout and any directory that is not a linked worktree, retains
+  > a dirty tree (uncommitted work is never discarded), refuses a
+  > non-terminal item, and reports `removed` / `already_absent` /
+  > `retained_*` in JSON (`--json`) or human lines. Re-running it is
+  > harmless (an already-absent tree is a reported no-op success).
+  >
+  > ```bash
+  > python3 $(skill_path implement)/scripts/implement.py cleanup <id> --json
+  > ```
   >
   > `finish` records the deferral in `report["steps"]["worktree_removal"]`
   > (`deferred`, `reason`, `worktree_path`) and names the retained path in its

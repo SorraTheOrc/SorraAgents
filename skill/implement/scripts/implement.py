@@ -27,6 +27,7 @@ Usage:
   implement.py start <work-item-id>          # Phase 1: setup
   implement.py finish <work-item-id>         # Phase 2: build, test, commit, push, cleanup
   implement.py abort <work-item-id>          # Abort and cleanup
+  implement.py cleanup <work-item-id>        # Remove a finished item's worktree (run LAST)
   implement.py parent <parent-id>            # Recurse into children (epic/parent items)
   implement.py drive <parent-id>             # Drive ALL children to completion, one fresh session each
 
@@ -7873,6 +7874,293 @@ def phase_abort(
     return report
 
 
+#: Statuses that permit :func:`phase_cleanup` to remove a worktree.
+#:
+#: Deliberately narrower than :data:`TERMINAL_STATUSES`: the post-finish
+#: cleanup contract is "the item has finished" (``completed`` /
+#: ``in_review``), not "the item is terminal for parent advancement" (which
+#: also covers ``done`` and soft-``deleted`` items whose trees nobody asked
+#: this action to remove).
+CLEANUP_REMOVABLE_STATUSES = frozenset({"completed", "in_review"})
+
+
+def _resolve_cleanup_worktree(
+    work_item_id: str, worktree_path: str | None = None
+) -> str | None:
+    """Resolve the worktree :func:`phase_cleanup` should act on.
+
+    Resolution order (the work item's contract):
+
+    1. **``.implement_state.json``** — the state file next to the candidate
+       path (``--worktree-path``) or in the current directory, provided it
+       records *this* work item. The state file is the authoritative record
+       of which tree belongs to which item, so it wins over a bare override.
+    2. **``--worktree-path``** — the operator's explicit override.
+    3. **:func:`_discover_worktree`** — the usual scan of
+       ``.worklog/worktrees/wl-<id>-*``.
+
+    Args:
+        work_item_id: The work item that owns the tree.
+        worktree_path: The ``--worktree-path`` override, if any.
+
+    Returns:
+        Absolute worktree path, or None when none can be resolved.
+    """
+    candidates: list[str] = []
+    if worktree_path:
+        candidates.append(str(Path(worktree_path).expanduser().resolve()))
+    try:
+        cwd = str(Path.cwd().resolve())
+    except OSError:  # pragma: no cover - cwd already gone
+        cwd = ""
+    if cwd and cwd not in candidates:
+        candidates.append(cwd)
+
+    for candidate in candidates:
+        if not (Path(candidate) / STATE_FILE_NAME).exists():
+            continue
+        # A state file records which item owns the tree: a candidate whose
+        # state belongs to a *different* item is not this item's worktree.
+        candidate_state = read_state(candidate)
+        if candidate_state is None or candidate_state.work_item_id == work_item_id:
+            return candidate
+    if worktree_path:
+        # No state file anywhere: the explicit override is the best
+        # information available (an already-absent tree still needs clearing).
+        return str(Path(worktree_path).expanduser().resolve())
+    return _discover_worktree(work_item_id)
+
+
+def phase_cleanup(
+    work_item_id: str,
+    json_output: bool = False,
+    verbose: bool = False,
+    worktree_path: str | None = None,
+) -> dict[str, Any]:
+    """Remove a finished item's worktree — the session's final bash command.
+
+    **Ordering contract: run this as the session's LAST bash command.**
+    Removal deletes the tree the invoking session stands in (the plain leaf
+    flow's cwd *is* the worktree), so nothing that needs the worktree cwd may
+    follow it: every later command would fail with a deleted cwd. Write the
+    worklog comment, render the report and run any post-push verification
+    first, then call this action last.
+
+    Gates, in order — a failure at any of them **retains** the tree and is
+    reported (never forced past, never silent):
+
+    1. resolve the worktree (:func:`_resolve_cleanup_worktree`); none found →
+       ``retained_no_worktree``,
+    2. the work item must be ``completed`` / ``in_review``
+       (:data:`CLEANUP_REMOVABLE_STATUSES`) → otherwise
+       ``retained_non_terminal``,
+    3. the resolved path must not be the main checkout → otherwise
+       ``retained_main_checkout``,
+    4. an existing path must actually be a git worktree (``.git`` is a
+       *file*), so an arbitrary directory is never handed to a removal
+       mechanism → otherwise ``retained_no_worktree``,
+    5. the tree must hold no uncommitted work → otherwise
+       ``retained_dirty``.
+
+    Removal itself is :func:`_remove_finished_worktree` — the single removal
+    path shared with the driver (``cleanup_worktree_processes`` →
+    ``_remove_worktree`` → ``remove_state``), so this action adds **no** new
+    deletion mechanism and never passes ``--force`` past a gate.
+
+    Idempotent by construction: an already-absent tree is a reported no-op
+    success (``already_absent``) that still clears a stale state file, so an
+    interrupted workflow can simply be re-run.
+
+    Args:
+        work_item_id: The work item that owns the worktree.
+        json_output: Emit JSON instead of human-readable lines.
+        verbose: Unused; kept for CLI symmetry.
+        worktree_path: Optional ``--worktree-path`` override.
+
+    Returns:
+        A report dict with ``removed``, ``path``, ``already_absent``,
+        ``retained_dirty``, ``retained_non_terminal``,
+        ``retained_no_worktree``, ``retained_main_checkout``,
+        ``removed_state``, ``reason``, ``remedy`` and ``message``. Retained is
+        a reported outcome (``success`` stays true); only an unexpected
+        removal failure reports ``success: false``. ``removed_state`` means
+        "no ``.implement_state.json`` remains at ``path``" — true for a
+        successful removal *and* for an already-absent tree (the stale state
+        file, if any, is cleared either way).
+    """
+    report: dict[str, Any] = {
+        "phase": "cleanup",
+        "work_item_id": work_item_id,
+        "success": True,
+        "path": "",
+        "removed": False,
+        "already_absent": False,
+        "retained_dirty": False,
+        "retained_non_terminal": False,
+        "retained_no_worktree": False,
+        "retained_main_checkout": False,
+        "retained_other_item": False,
+        "removed_state": False,
+        "reason": "",
+        "remedy": "",
+        "message": "",
+    }
+
+    # ── Step 1: Resolve the worktree ───────────────────────────────
+    path = _resolve_cleanup_worktree(work_item_id, worktree_path)
+    report["path"] = path or ""
+    if not path:
+        report["retained_no_worktree"] = True
+        report["message"] = (
+            f"No worktree found for {work_item_id}; nothing to clean up."
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\nℹ️  No worktree found for {work_item_id}; nothing to clean up.\n"
+        )
+        return report
+
+    # ── Step 2: Terminal gate ──────────────────────────────────────
+    item = wl_show(work_item_id)
+    status = str((item or {}).get("status", "") or "")
+    if status not in CLEANUP_REMOVABLE_STATUSES:
+        report["retained_non_terminal"] = True
+        report["reason"] = f"work item status is '{status or 'unknown'}'"
+        report["message"] = (
+            f"Worktree at {path} retained: work item {work_item_id} is "
+            f"'{status or 'unknown'}', not completed/in_review.\n"
+            f"  Re-run once the item is finished: "
+            f"python3 skill/implement/scripts/implement.py cleanup "
+            f"{work_item_id}"
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\n⚠️  {report['message']}\n"
+        )
+        return report
+
+    # ── Step 2b: The tree must belong to this work item ────────────
+    # A state file written for a different item (e.g. the session's own
+    # worktree while ``--worktree-path`` names another) must never authorise
+    # deleting someone else's work.
+    state = read_state(path) if Path(path).exists() else None
+    if state is not None and state.work_item_id and state.work_item_id != work_item_id:
+        report["retained_other_item"] = True
+        report["reason"] = f"worktree belongs to {state.work_item_id}"
+        report["remedy"] = (
+            f"run cleanup for {state.work_item_id}, or pass "
+            f"--worktree-path pointing at {work_item_id}'s own worktree"
+        )
+        report["message"] = (
+            f"Refusing to remove {path}: its {STATE_FILE_NAME} belongs to "
+            f"{state.work_item_id}, not {work_item_id}.\n  {report['remedy']}"
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\n⚠️  {report['message']}\n"
+        )
+        return report
+
+    # ── Step 3: Never treat the main checkout as a worktree ────────
+    repo_root = _resolve_main_repo_root(path, state)
+    report["repo_root"] = repo_root
+    if repo_root and Path(path).resolve() == Path(repo_root).resolve():
+        report["retained_main_checkout"] = True
+        report["reason"] = "resolved path is the main checkout"
+        report["remedy"] = (
+            "inspect .implement_state.json — a state file in the repository "
+            "root is a stale artifact, not a worktree"
+        )
+        report["message"] = (
+            f"Refusing to remove {path}: it resolves to the main checkout "
+            f"({repo_root}), not a worktree.\n  {report['remedy']}"
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\n⚠️  {report['message']}\n"
+        )
+        return report
+
+    # ── Step 3b: An existing path must really be a worktree ────────
+    # ``_remove_worktree`` falls back to a manual ``shutil.rmtree`` when
+    # ``git worktree remove`` fails and the target has no ``.git/``
+    # directory, so an arbitrary directory (or a tree whose registration was
+    # already pruned) must never reach it: ``.git`` is a *file* in a linked
+    # worktree and a *directory* in the main checkout.
+    if Path(path).is_dir() and not _is_worktree(Path(path)):
+        report["retained_no_worktree"] = True
+        report["reason"] = "path is not a git worktree"
+        report["remedy"] = (
+            f"inspect {path} (ls -la {path}/.git) — only a linked worktree "
+            f"may be removed automatically"
+        )
+        report["message"] = (
+            f"Refusing to remove {path}: it is not a git worktree "
+            f"(.git is a directory or absent).\n  {report['remedy']}"
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\n⚠️  {report['message']}\n"
+        )
+        return report
+
+    # ── Step 4: Remove behind the shared gates ─────────────────────
+    LOG.info("Cleaning up worktree %s for %s...", path, work_item_id)
+    outcome = _remove_finished_worktree(work_item_id, path, repo_root)
+    report["removed"] = bool(outcome.get("removed"))
+    report["already_absent"] = bool(outcome.get("already_absent"))
+    report["retained_dirty"] = bool(outcome.get("retained_dirty"))
+    # "No state file remains at the path" — true after a removal and for an
+    # already-absent tree (``_remove_finished_worktree`` clears the stale file
+    # in both cases, so a repeat run can never resume a dead tree).
+    report["removed_state"] = not (Path(path) / STATE_FILE_NAME).exists()
+    report["reason"] = str(outcome.get("reason", ""))
+    if outcome.get("remedy"):
+        report["remedy"] = str(outcome["remedy"])
+
+    if report["removed"]:
+        report["message"] = f"Removed worktree at {path}."
+    elif report["already_absent"]:
+        report["message"] = (
+            f"Worktree at {path} was already absent; nothing to do."
+        )
+    elif report["retained_dirty"]:
+        # Actionable remedy: the exact inspection and removal commands.
+        report["remedy"] = (
+            f"git -C {path} status  # commit or discard the changes\n"
+            f"  git worktree remove {path} && git worktree prune"
+        )
+        report["message"] = (
+            f"Worktree at {path} retained: it has uncommitted changes "
+            f"(never discarded).\n  {report['remedy']}"
+        )
+    else:
+        if not outcome.get("refused"):
+            # ``refused`` is already a reported (safe) outcome; anything else
+            # that removed nothing is an unexpected failure.
+            report["success"] = False
+        report["remedy"] = report["remedy"] or (
+            f"git worktree remove {path} && git worktree prune"
+        )
+        report["message"] = (
+            f"Worktree at {path} was not removed ({report['reason'] or 'unknown'}).\n"
+            f"  {report['remedy']}"
+        )
+
+    if json_output:
+        print(format_json_output(report))
+    else:
+        print(
+            f"\n{'✅' if report['removed'] else 'ℹ️ '} {report['message']}\n"
+        )
+    return report
+
+
 def _build_implement_cmd(
     action: str,
     work_item_id: str,
@@ -10754,8 +11042,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "action",
-        choices=["start", "finish", "abort", "parent", "drive"],
-        help="Workflow phase to execute",
+        choices=["start", "finish", "abort", "parent", "drive", "cleanup"],
+        help=(
+            "Workflow phase to execute ('cleanup' removes a finished item's "
+            "worktree; run it as the session's last bash command)"
+        ),
     )
     parser.add_argument(
         "work_item_id",
@@ -10929,6 +11220,15 @@ def _main(argv: list[str] | None = None) -> int:
                 work_item_id=args.work_item_id,
                 json_output=args.json,
                 verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
+    elif args.action == "cleanup":
+        with Timer("implement") as _root_timer, Timer("phase_cleanup"):
+            result = phase_cleanup(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                verbose=args.verbose,
+                worktree_path=args.worktree_path,
             )
             _emit_timing(_root_timer)
     elif args.action == "parent":

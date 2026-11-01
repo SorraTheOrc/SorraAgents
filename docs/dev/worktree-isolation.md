@@ -179,6 +179,15 @@ report (each with a `git worktree remove … && git worktree prune` remedy) keep
 a deferred tree from leaking. Full contract:
 [implement-skill-reference.md](implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr).
 
+**The session-side removal is `implement.py cleanup <id>`**, not a raw `git
+worktree remove` (SA-0MVTHIZE0007EAKZ): it routes through the same
+`cleanup_worktree_processes` → `_remove_worktree` → `remove_state` path, so it
+inherits the dirty-tree, repo-root and not-a-worktree refusals, and it refuses
+to touch a non-terminal item. It must be the session's **last** bash command,
+and re-running it is a reported no-op (`already_absent`) — see
+[session-side removal
+action](implement-skill-reference.md#the-session-side-removal-action-implementpy-cleanup-id).
+
 ## The placement guard
 
 `phase_parent`/`phase_drive` fail closed when a **non-terminal** child's

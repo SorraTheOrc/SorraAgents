@@ -329,7 +329,8 @@ leaves the tree in place. `phase_abort` is deliberately **not** deferral-aware
 ### Driver-side removal
 
 `_remove_finished_worktree(work_item_id, worktree_path, repo_root)` is the one
-removal path used by the driver (and by any other deferred caller):
+removal path used by the driver and by the session-side `cleanup` action (see
+below) — every deferred caller:
 
 1. the path is known and exists — an absent tree is a reported no-op
    (`already_absent: true`, `removed: false`), so a repeat run is idempotent;
@@ -363,6 +364,52 @@ never fatal. Note that `scripts/hygiene_check.sh` reports orphaned worktrees
 only when their branch was deleted, so a deferred tree is otherwise invisible
 to it.
 
+### The session-side removal action: `implement.py cleanup <id>`
+
+The opted-in plain leaf flow has no driver to remove its tree, and a raw
+`git worktree remove` would bypass every gate above (dirty trees, process
+cleanup, the repo-root refusal). `implement.py cleanup <work-item-id>
+[--json] [--worktree-path <path>]` is the reviewed final step
+(SA-0MVTHIZE0007EAKZ):
+
+```bash
+python3 skill/implement/scripts/implement.py cleanup <work-item-id> --json
+```
+
+**Ordering contract (stated in the function's docstring):** run it as the
+session's **last** bash command. Removal deletes the tree the session stands
+in, so nothing that needs the worktree cwd may follow — every later command
+would fail with a deleted cwd. The comment, the report and any post-push
+verification come first.
+
+Gates, in order — a failure at any of them **retains** the tree and is
+reported (never forced past, never silent), so a retained tree is a reported
+outcome rather than a crash:
+
+| Gate | Report field | Remedy printed |
+|---|---|---|
+| No worktree can be resolved | `retained_no_worktree` | Create/point at a tree (`--worktree-path`) |
+| Status is not `completed`/`in_review` (`CLEANUP_REMOVABLE_STATUSES`) | `retained_non_terminal` | Re-run once the item is finished |
+| Path resolves to the main checkout | `retained_main_checkout` | Inspect `.implement_state.json` (stale artifact) |
+| Path exists but is not a linked worktree (`.git` is not a file) | `retained_no_worktree` | `ls -la <path>/.git` |
+| State file belongs to a different item | `retained_other_item` | Run cleanup for that item |
+| `_worktree_has_uncommitted_changes` is true | `retained_dirty` | `git -C <path> status`, then commit/discard |
+
+Resolution order: a candidate (the `--worktree-path` override, then the
+current directory) whose `.implement_state.json` records *this* item, then
+the override as given, then `_discover_worktree(<id>)`. Removal itself is
+`_remove_finished_worktree` — `cleanup_worktree_processes` →
+`_remove_worktree(repo_root=…)` → `remove_state` — the same single path the
+driver uses, so the action adds **no** deletion mechanism of its own.
+
+**Idempotent.** An already-absent tree is a reported no-op success
+(`already_absent: true`, `removed: false`, exit 0) that still calls
+`remove_state`, so an interrupted workflow can simply be re-run and never
+resumes a dead tree. The report carries `removed`, `path`, `already_absent`,
+`retained_dirty`, `retained_non_terminal`, `retained_no_worktree`,
+`retained_main_checkout`, `retained_other_item`, `removed_state` ("no state
+file remains at the path"), `reason`, `remedy` and `message`.
+
 ### Tests
 
 - `skill/implement/tests/test_finish_deferred_worktree_removal.py` — driven /
@@ -371,6 +418,10 @@ to it.
 - `tests/test_implement_drive_worktree_cleanup.py` — driver removal after
   session exit (both terminal paths), dirty/non-terminal retention,
   already-absent no-op, failing removal, sweep.
+- `skill/implement/tests/test_cleanup_worktree_action.py` — the `cleanup`
+  action: deterministic removal through the shared boundaries, every
+  retention gate, already-absent idempotence, refused removal reported,
+  CLI surface and the ordering-contract docstring.
 
 ## Drive failure recovery: bounded finish attempts, reconciliation and reset
 
