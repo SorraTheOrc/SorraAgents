@@ -10,6 +10,7 @@ aggregates both so ``guarded_run_all`` consumers see them at the top level.
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -436,3 +437,99 @@ def test_run_all_aggregates_elapsed_and_slot_wait_separately(monkeypatch) -> Non
         "queue wait is aggregated separately and never folded into elapsed"
     )
     assert result["notice_codes"] == [fx.NOTICE_KILLED]
+
+
+# ---------------------------------------------------------------------------
+# Queue wait vs the per-command timeout budget (SA-0MVU8XSGI003DBWR)
+#
+# Parent AC4: time spent queued for a host test slot is neither charged to a
+# suite's per-command timeout nor hidden inside its elapsed time. The slot
+# acquisition is stubbed (no host semaphore is touched) and the command is a
+# real subprocess, so the timeout under test is the production one.
+# ---------------------------------------------------------------------------
+
+
+class TestQueueWaitIsOutsideTheTimeoutBudget:
+    """A blocking slot wait never consumes the suite's timeout budget."""
+
+    #: Runtime of the suite command the timeout below must cover.
+    COMMAND_SECONDS = 0.4
+
+    #: Queue wait that would blow the timeout if it were charged to it.
+    SLOT_WAIT_SECONDS = 1.2
+
+    #: Per-command timeout: above ``COMMAND_SECONDS``, well below
+    #: ``COMMAND_SECONDS + SLOT_WAIT_SECONDS``.
+    TIMEOUT_SECONDS = 1
+
+    def _repo_with_sleeping_suite(self, tmp_path: Path) -> Path:
+        """A repo whose suite command really runs, for ``COMMAND_SECONDS``."""
+        repo = tmp_path / "sleepy-repo"
+        repo.mkdir()
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": [f"bash -c 'sleep {self.COMMAND_SECONDS}'"]}),
+            encoding="utf-8",
+        )
+        return repo
+
+    def test_blocking_slot_wait_does_not_consume_the_timeout_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """The command still succeeds although wait + runtime exceeds it.
+
+        If the queue wait were inside the timed region, the 0.4 s command would
+        be killed at the 1.0 s timeout after waiting 1.2 s for the slot.
+        """
+        waits: list[float] = []
+        with mock.patch.object(
+            run_tests,
+            "_test_concurrency_slot",
+            lambda: fx.slot_acquisition(wait=self.SLOT_WAIT_SECONDS, waits=waits),
+        ):
+            result = run_suite(
+                "all",
+                cwd=self._repo_with_sleeping_suite(tmp_path),
+                use_cache=False,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+
+        assert waits == [self.SLOT_WAIT_SECONDS], (
+            "the stubbed slot supplied the delay — no host semaphore was touched"
+        )
+        assert result["success"] is True, (
+            "the queue wait must not count against the suite's timeout budget "
+            f"(notice={result['notice']!r}, stderr={result['stderr']!r})"
+        )
+        assert result["configured_timeout"] == self.TIMEOUT_SECONDS, (
+            "the report must still name the timeout that applied to the command"
+        )
+
+    def test_wait_is_reported_separately_from_the_measured_elapsed_time(
+        self, tmp_path: Path
+    ) -> None:
+        """``slot_wait_seconds`` and ``elapsed_seconds`` measure different spans."""
+        with mock.patch.object(
+            run_tests,
+            "_test_concurrency_slot",
+            lambda: fx.slot_acquisition(wait=self.SLOT_WAIT_SECONDS),
+        ):
+            result = run_suite(
+                "all",
+                cwd=self._repo_with_sleeping_suite(tmp_path),
+                use_cache=False,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+
+        assert result["slot_wait_seconds"] >= self.SLOT_WAIT_SECONDS * 0.8, (
+            f"the wait must be reported (got {result['slot_wait_seconds']!r})"
+        )
+        assert result["elapsed_seconds"] < self.TIMEOUT_SECONDS, (
+            "elapsed_seconds must stay within the command's own timeout, i.e. "
+            f"exclude the wait (got {result['elapsed_seconds']!r})"
+        )
+        assert result["elapsed_seconds"] < result["slot_wait_seconds"], (
+            "the two durations must be distinguishable, never the same span "
+            f"(elapsed={result['elapsed_seconds']!r}, "
+            f"slot_wait={result['slot_wait_seconds']!r})"
+        )

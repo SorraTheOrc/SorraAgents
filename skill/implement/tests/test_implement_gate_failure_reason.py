@@ -470,3 +470,77 @@ class TestGateFailureMessageRendersFacts:
         assert fx.FIXTURE_COMMAND in message
         assert "3" in message
         assert _TAIL_MARKER in message
+
+
+# ---------------------------------------------------------------------------
+# Queue wait at the gate boundary (SA-0MVU8XSGI003DBWR)
+#
+# Parent AC4: the finish gate reports the test-slot queue wait as its own
+# duration, never added to the suite's elapsed time, and a bounded wait that
+# expired is distinguishable from a command that ran and failed.
+# ---------------------------------------------------------------------------
+
+
+class TestQueueWaitAtTheGateBoundary:
+    """``elapsed_seconds`` and ``slot_wait_seconds`` stay separate facts."""
+
+    def test_suite_elapsed_and_queue_wait_are_reported_as_distinct_values(
+        self,
+    ) -> None:
+        adapted = _adapt(
+            success=False,
+            notice_codes=[fx.NOTICE_UNPARSED_FAILURE],
+            notices=["suite exited 3 with no parsable failures: all"],
+            suites={"all": {"returncode": 3, "failures": []}},
+            extra={
+                "command": fx.FIXTURE_COMMAND,
+                "configured_timeout": fx.FIXTURE_TIMEOUT,
+                "elapsed_seconds": 12.0,
+                "slot_wait_seconds": 240.0,
+            },
+        )
+
+        message = _message(adapted)
+
+        assert "12.0s" in message, (
+            "the suite's own execution time must be reported"
+        )
+        assert "240.0s" in message, (
+            "the queue wait must be reported as its own duration"
+        )
+        assert "queue wait" in message and "elapsed" in message, (
+            "the two durations must be labelled so they cannot be confused"
+        )
+
+    def test_expired_bounded_wait_is_slot_contention_with_its_wait(self) -> None:
+        """\"Waited then gave up\" is distinguishable from \"ran and failed\"."""
+        adapted = _slot_busy_shape()
+
+        assert implement._gate_failure_kind(adapted) == (
+            implement.GATE_FAILURE_SLOT_CONTENTION
+        )
+        message = _message(adapted)
+
+        assert "no free test slot" in message
+        assert "240.0s" in message, (
+            "the bounded wait that expired must be named"
+        )
+        assert "TEST_LOCK_TIMEOUT" in message, (
+            "the operator needs the remedy for a queue wait"
+        )
+
+    def test_wait_is_never_presented_as_suite_execution_time(self) -> None:
+        """The gate's fact fields carry the two spans independently."""
+        adapted = _adapt(
+            success=False,
+            notice_codes=[implement._NOTICE_SLOT_BUSY],
+            notices=[SLOT_NOTICE],
+            extra={"slot_wait_seconds": 240.0, "elapsed_seconds": None},
+        )
+
+        assert adapted["slot_wait_seconds"] == pytest.approx(240.0)
+        assert adapted.get("elapsed_seconds") is None, (
+            "nothing executed before the bounded wait expired, so there is no "
+            "execution time to report — a missing fact must stay missing "
+            "(never 0, never the wait)"
+        )
