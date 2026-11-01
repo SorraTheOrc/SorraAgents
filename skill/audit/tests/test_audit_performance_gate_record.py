@@ -226,6 +226,32 @@ def test_documented_total_matches_harness():
     }
 
 
+def test_documented_end_to_end_is_secondary_and_metric_flagged_for_producer():
+    """End-to-end stays secondary context and the gate metric is producer-flagged.
+
+    The regression gate's headline definition is "end to end"
+    (docs/dev/audit-performance-baseline.md § Regression gate) while the
+    measured gate (AC1 wording) is total LLM wall clock. The record must
+    explicitly flag that divergence for producer confirmation rather than
+    silently redefining the metric (parent SA-0MVKXNWRS005EKBM child AC4).
+    """
+    text = BASELINE_DOC.read_text()
+
+    # End-to-end wall clock is recorded as secondary context, never the gate.
+    assert re.search(
+        r"End-to-end wall clock \(secondary context[^)]*\):\s*\*\*236 s\*\*",
+        text,
+    ), "end-to-end wall clock must be recorded as secondary context"
+
+    # The gate-metric divergence is explicitly flagged for the producer.
+    assert "gate metric" in text.lower(), (
+        "the record must name the gate-metric question"
+    )
+    assert "producer" in text.lower(), (
+        "the record must flag the gate-metric question for the producer"
+    )
+
+
 def test_documented_verdict_is_derived_from_the_gate_and_the_total():
     """The documented verdict is ``total <= 600 s``, not a hand-written claim."""
     report = _harness_report()

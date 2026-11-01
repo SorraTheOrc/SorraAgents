@@ -437,6 +437,15 @@ Gate verdict: **MET** — total 227.66 s vs the unchanged 600 s gate.
 
 End-to-end wall clock (secondary context, not the gate): **236 s**.
 
+> **Gate metric — producer confirmation.** The regression gate's headline
+> definition (§ Regression gate) reads "end to end", while this item's gate
+> (AC1 wording) measures **total LLM wall clock**. The verdict above (gate
+> MET at 227.66 s) uses total LLM wall clock — the measure the parent epic's
+> AC6 gate enforces — with end-to-end recorded solely as secondary context.
+> This divergence is an OPEN QUESTION flagged here for the producer to
+> confirm or override at review; the gate metric is recorded, never silently
+> redefined (parent SA-0MVKXNWRS005EKBM, lane-A child AC4).
+
 ### Why this run made two calls, not three
 
 The single-item profile is `false-positive-screen` → `parent` → `phase2_deep`.

@@ -397,6 +397,39 @@ class TestSkillMdDocumentsBatchAndConcurrencyFlags:
         assert "--max-concurrency" in usage_line
 
 
+class TestSkillMdPhase1ModelSurface:
+    """SKILL.md documents the implemented --phase1-model/AUDIT_PHASE1_MODEL surface.
+
+    SA-0MVI6VRJT005M650 added the CLI/env surface to the runner; the Tiered
+    Phase 1 model section must not claim there is no CLI flag for it (audit
+    gap SA-0MVKXNWRS005EKBM AC6).
+    """
+
+    def test_skill_md_documents_phase1_model_cli_flag(self) -> None:
+        """--phase1-model and AUDIT_PHASE1_MODEL appear in SKILL.md."""
+        text = SKILL_MD.read_text()
+        assert "--phase1-model" in text
+        assert "AUDIT_PHASE1_MODEL" in text
+
+    def test_skill_md_never_claims_no_cli_flag_for_phase1_model(self) -> None:
+        """SKILL.md must not assert there is no CLI flag for the phase-1 model.
+
+        The stale "There is no config-file or CLI flag for this" phrasing in
+        the Tiered Phase 1 model section directly contradicted the implemented
+        --phase1-model CLI (audit_runner.py) and SKILL.md's own levers
+        section (SA-0MVKXNWRS005EKBM AC6).
+        """
+        text = SKILL_MD.read_text()
+        assert "There is no config-file or CLI flag" not in text
+
+    def test_skill_md_tiered_section_mentions_the_cli_path(self) -> None:
+        """The Tiered Phase 1 model section names the CLI/env surface."""
+        text = SKILL_MD.read_text()
+        tiered = text.split("### Tiered Phase 1 model", 1)[1]
+        assert "--phase1-model" in tiered
+        assert "AUDIT_PHASE1_MODEL" in tiered
+
+
 class TestSkillMdReadOnlyException:
     """SKILL.md + reference doc document the justified READ-ONLY exception
     (SA-0MST01Q4W005G495 AC1-AC3)."""
