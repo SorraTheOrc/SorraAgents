@@ -132,3 +132,27 @@ def _no_ambient_git_index_file_for_the_session():
 def _no_ambient_git_index_file(monkeypatch):
     """Remove an ambient ``GIT_INDEX_FILE`` for the duration of each test."""
     monkeypatch.delenv("GIT_INDEX_FILE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolated_implement_child_lock_store(tmp_path, monkeypatch):
+    """Point ``implement.py``'s per-work-item lock store at a throwaway dir.
+
+    ``phase_start`` takes a **real** per-work-item ``flock`` before any of
+    its mocked steps, under ``<worklog>/locks/child-<id>.lock``. Root-level
+    tests that drive it use synthetic ids (``SA-TEST``, ``SA-TEST123``, …)
+    whose prefix resolves to this repository's own worklog store, so an
+    un-isolated suite wrote real lock files into the developer's
+    ``.worklog/locks`` and two concurrent pytest processes raced them
+    (SA-0MVWJ6U3J003TLRZ).
+
+    ``IMPLEMENT_CHILD_LOCK_DIR`` is read per call, so this covers modules
+    that import ``implement.py`` **and** those that load it by file path.
+
+    Returns:
+        The isolated worklog store directory for the current test.
+    """
+    store = tmp_path / "isolated-worklog"
+    (store / "locks").mkdir(parents=True)
+    monkeypatch.setenv("IMPLEMENT_CHILD_LOCK_DIR", str(store))
+    return store

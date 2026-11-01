@@ -773,8 +773,15 @@ def _child_lock_dir(work_item_id: str) -> Path | None:
 
     Single, patchable resolution point: the lock must live under
     ``<worklog>/locks/`` (never inside a worktree, which can be removed
-    mid-flight), and tests isolate it to a throwaway store by patching this
-    helper.
+    mid-flight).
+
+    ``IMPLEMENT_CHILD_LOCK_DIR`` overrides the store explicitly. It exists
+    for **test isolation**: ``phase_start`` takes a real ``flock`` before any
+    of its test-mocked steps, and synthetic test ids share the repository's
+    own id prefix, so an un-isolated suite would write (and race) real lock
+    files inside the developer's ``.worklog/locks`` (SA-0MVWJ6U3J003TLRZ).
+    The suites set it to a per-test throwaway directory; it is unset in every
+    production invocation, where the worklog store is authoritative.
 
     Args:
         work_item_id: The work item whose lock directory is resolved.
@@ -782,6 +789,9 @@ def _child_lock_dir(work_item_id: str) -> Path | None:
     Returns:
         The worklog store path, or ``None`` when it cannot be resolved.
     """
+    override = os.environ.get(ENV_CHILD_LOCK_DIR)
+    if override:
+        return Path(override).expanduser()
     try:
         return resolve_worklog_dir(work_item_id)
     except RuntimeError:
@@ -2261,6 +2271,14 @@ DEFAULT_START_LOCK_TIMEOUT = 30.0
 
 ENV_FINISH_LOCK_TIMEOUT = "IMPLEMENT_FINISH_LOCK_TIMEOUT"
 ENV_START_LOCK_TIMEOUT = "IMPLEMENT_START_LOCK_TIMEOUT"
+
+#: Override for the per-work-item child-lock store (test isolation).
+#: Unset in production; the worklog store resolved from the item id is used.
+#: ``phase_start`` acquires a real ``flock`` before its mocked steps, so an
+#: un-isolated suite would race real lock files for synthetic test ids
+#: (SA-0MVWJ6U3J003TLRZ). Values are read per call, so a fixture that sets it
+#: also isolates tests that load this module by file path.
+ENV_CHILD_LOCK_DIR = "IMPLEMENT_CHILD_LOCK_DIR"
 
 
 def _resolve_lock_timeout(env_var: str, default: float) -> float:

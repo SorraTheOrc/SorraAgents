@@ -288,6 +288,11 @@ def _child_env(
     env = fixture_git_env()
     env.pop(ENV_LOCK_TOKEN, None)
     env.pop("IMPLEMENT_DRIVE_ACTIVE", None)
+    # The package conftest isolates *in-process* `phase_start` runs to a
+    # throwaway lock store (`IMPLEMENT_CHILD_LOCK_DIR`). A contender
+    # subprocess must resolve its own fixture project's lock store instead,
+    # which is exactly what the assertions below read back.
+    env.pop("IMPLEMENT_CHILD_LOCK_DIR", None)
     # Keep the contender faithful to a production invocation: the fixture's
     # pytest context must not leak into it.
     env.pop("PYTEST_CURRENT_TEST", None)

@@ -121,7 +121,7 @@ from scripts.failure_notice import FailureNotice
 from scripts.pi_utils import extract_pi_text, extract_pi_text_with_fallback
 
 try:
-    from shared.git_sandbox import scrub_repository_overrides
+    from shared.git_sandbox import git_env_for_repo, scrub_repository_overrides
     from shared.process_semaphore import (
         DEFAULT_MAX_WORKERS,
         ENV_MAX_WORKERS,
@@ -1906,11 +1906,22 @@ def _project_top_levels(project_root: Path) -> list[str]:
     Falls back to a directory listing when git is unavailable. Returns an
     empty list on any failure (callers fail open). Dot-entries are excluded
     (they are never manifest markers).
+
+    The command runs with :func:`shared.git_sandbox.git_env_for_repo`, so an
+    inherited ``GIT_INDEX_FILE`` is honoured **only** when it belongs to
+    *project_root*. ``implement.py finish`` exports a temporary
+    would-be-commit index for the suite it runs, and ``git ls-files`` applies
+    an inherited index to whatever repository ``cwd`` names: without the
+    scrub, every repository under test reported the **gate's** tree instead
+    of its own, so ``_distinctive_project_top_levels`` returned ``[]`` and
+    the root-file-marker scope tests failed only under the gate
+    (SA-0MVWJ6U3J003TLRZ).
     """
     try:
         proc = subprocess.run(
             ["git", "-C", str(project_root), "ls-files"],
             capture_output=True, text=True, check=False, timeout=30,
+            env=git_env_for_repo(project_root),
         )
         if proc.returncode == 0 and proc.stdout:
             tops: set[str] = set()

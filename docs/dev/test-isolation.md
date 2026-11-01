@@ -749,6 +749,15 @@ commit_all(repo, "init")
 - The variables that must stay inherited (`GIT_INDEX_FILE`, and by design every
   other non-override variable) are pinned by
   `tests/test_git_index_file_env.py`.
+- **Production paths that inspect a named repository scrub it themselves.**
+  `git ls-files` applies an inherited index to whatever repository `cwd`
+  names, so an inspection helper must run through
+  `git_env_for_repo(<repo>)` (which keeps `GIT_INDEX_FILE` only when it lies
+  inside that repository's git dir). `audit_runner._project_top_levels` now
+  does: without it, every repository under the gate reported the *gate's* tree
+  as its own, so the root-file-marker scope tests failed only inside
+  `implement.py finish` (SA-0MVWJ6U3J003TLRZ). Regression coverage:
+  `skill/audit/tests/test_audit_runner_launch_context.py::TestRootFileOnlyRepoManifest::test_foreign_gate_index_does_not_replace_the_repo_index`.
 
 #### The guard
 
@@ -818,6 +827,62 @@ layer, not a substitute for the rule above:
   defers worktree removal by design, so without it the test fails inside any
   driven session's own `finish` gate run — an environment-dependent failure of
   the same family as the ones this item fixes.
+
+### 9.8 Per-work-item lock store isolation (SA-0MVWJ6U3J003TLRZ)
+
+`implement.py phase_start` takes a **real** per-work-item `flock` at
+`<worklog>/locks/child-<id>.lock` **before** any of the steps a test mocks
+(claim, dirty-tree gate, worktree creation) — see [the implement
+reference](implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb).
+Synthetic ids used by the implement tests (`SA-TEST`, `SA-TEST123`, …) share
+the repository's own `SA` prefix, so `resolve_worklog_dir()` returned the
+**live** store and every run wrote a real lock file into the developer's
+`.worklog/locks`. Two concurrent pytest processes then raced the same id:
+the loser's `phase_start` refused with
+`Work item SA-TEST is held by implement@pid <n> (session <id>)` and the
+choosing tests failed for reasons unrelated to the code under test (a
+shared-state failure family, alongside the slot-contention reporting from
+SA-0MVW1MJL6003767Q).
+
+#### The rule
+
+`phase_start` resolves its lock store through `_child_lock_dir()`, which
+honours the **`IMPLEMENT_CHILD_LOCK_DIR`** override (unset in production, so
+the worklog store resolved from the item id is authoritative). The value is
+read per call, not at import time, so the override also isolates tests that
+load `implement.py` **by file path** instead of importing it — the reason a
+module-level `patch.object` on `_child_lock_dir` is not sufficient.
+
+Every test boundary that drives `phase_start` sets it to its own throwaway
+directory:
+
+```python
+@pytest.fixture(autouse=True)
+def isolated_implement_child_lock_store(tmp_path, monkeypatch):
+    store = tmp_path / ".worklog"
+    (store / "locks").mkdir(parents=True)
+    monkeypatch.setenv("IMPLEMENT_CHILD_LOCK_DIR", str(store))
+    return store
+```
+
+- `tests/conftest.py` and `skill/implement/tests/conftest.py` each define this
+autouse fixture, so every test in either package — including the root-level
+`test_implement_*.py` modules that load `implement.py` by path — gets a
+per-test store of its own.
+- A test that asserts the lock **path** (e.g.
+`skill/implement/tests/test_phase_start_child_lock.py`) patches
+`_child_lock_dir` directly; its throwaway store still wins, because the inner
+patch replaces the env-derived default for that test.
+- Names are unique per test process (`tmp_path`), so two suites running
+concurrently never contend for the same synthetic id anymore.
+
+#### Regression coverage
+
+- `skill/implement/tests/test_phase_start_claim.py::test_child_lock_lives_in_the_isolated_store_not_the_real_one`
+— drives the real `phase_start` and asserts the lock file was created in the
+isolated store and **not** in the live worklog store.
+- `tests/test_implement_child_lock_isolation.py` — asserts the store resolves
+to the isolated directory and that a real acquisition writes only there.
 
 ## 10. Tests never emit real release notifications (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL)
 
