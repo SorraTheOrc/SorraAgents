@@ -38,9 +38,11 @@ without touching production code from this item.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -49,6 +51,13 @@ from shared.git_sandbox import run_git
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+_IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
+
+#: Lazily-loaded production implement module used to compute the
+#: ``finish_failure`` payload with the *production* classifier (see
+#: :func:`_production_implement_mod`).
+_PRODUCTION_IMPLEMENT_MOD: Any = None
 
 # Reuse the existing drive-loop harness pattern verbatim: the scripted parent
 # runner, the recording session spawner, the child-report helper and the
@@ -92,7 +101,38 @@ def _child(cid: str, **overrides) -> dict:
     return child
 
 
-def finishing_failed_report(child_id: str, message: str | None = None) -> dict:
+def _production_implement_mod() -> Any:
+    """Load (once) the production implement module for the classifier.
+
+    The harness scripts parent reports carrying the exact ``finish_failure``
+    payload ``phase_parent._run_finish`` emits — which is
+    ``classify_finish_failure(parsed)`` over the child's failing ``finish``
+    subprocess report (LP-0MVWEP1MM0097RAT). The payload must therefore be
+    produced by the *production* classifier, loaded by file path under its
+    own module name. The ``sys.modules`` registration happens before
+    ``exec_module`` — required by the module's dataclass forward references,
+    mirroring the ``implement_mod`` fixture in ``tests/test_implement_drive.py``.
+    """
+    global _PRODUCTION_IMPLEMENT_MOD
+    if _PRODUCTION_IMPLEMENT_MOD is None:
+        spec = importlib.util.spec_from_file_location(
+            "implement_under_test_recovery", _IMPLEMENT_PY
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        _PRODUCTION_IMPLEMENT_MOD = mod
+    return _PRODUCTION_IMPLEMENT_MOD
+
+
+def finishing_failed_report(
+    child_id: str,
+    message: str | None = None,
+    *,
+    step: str | None = None,
+    reason: str | None = None,
+    kind: str | None = None,
+) -> dict:
     """Script the exact ``phase_parent`` report shape ``_run_finish`` emits.
 
     When ``implement.py finish <child>`` fails inside ``phase_parent``,
@@ -101,14 +141,36 @@ def finishing_failed_report(child_id: str, message: str | None = None) -> dict:
     the livelock entry point: today ``phase_drive`` breaks the chain on any
     ``success: False`` report without accounting for or recovering from it.
 
+    When *step* is given the report additionally carries ``finish_failure`` —
+    byte-for-byte the payload ``_run_finish`` would emit, i.e. produced by
+    the production :func:`classify_finish_failure` over a failing ``finish``
+    report scripted by :func:`failing_finish_report`. *kind*, when given,
+    must match the classifier's derived kind for the scripted pair, so a
+    scripted report can never silently claim the wrong failure class (a
+    mismatch raises).
+
     Args:
         child_id: The child whose finish supposedly failed.
         message: Optional failure message; defaults to the production text.
+        step: Optional failing ``finish`` step to script (e.g.
+            ``"push"``); when given, ``finish_failure`` is added to the
+            report. Both *reason* and *kind* are only meaningful with it.
+        reason: Optional reason code for the step (e.g. ``"timeout"``).
+        kind: Optional expected failure kind; must equal the production
+            classifier's derivation for ``(step, reason)``.
 
     Returns:
-        A report dict accepted by :class:`ScriptedParent`.
+        A report dict accepted by :class:`ScriptedParent`. Called with no
+        extra arguments the returned dict has byte-identical keys to the
+        pre-extension helper (AC1 — backwards compatible, existing callers
+        unchanged).
     """
-    return {
+    if kind is not None and step is None:
+        raise ValueError(
+            "finishing_failed_report: kind requires a scripted step/reason "
+            "to derive the payload"
+        )
+    report = {
         "phase": "parent",
         "work_item_id": PARENT,
         "success": False,
@@ -117,6 +179,18 @@ def finishing_failed_report(child_id: str, message: str | None = None) -> dict:
         "finishing_failed": True,
         "children_processed": [],
     }
+    if step is not None:
+        finish_report = failing_finish_report(step, reason)
+        payload = _production_implement_mod().classify_finish_failure(finish_report)
+        if kind is not None and payload["kind"] != kind:
+            raise AssertionError(
+                "finishing_failed_report: production classifier derived "
+                f"kind {payload['kind']!r} for (step={step!r}, "
+                f"reason={reason!r}); expected {kind!r} — the failure "
+                "vocabulary or the scripted pair drifted"
+            )
+        report["finish_failure"] = payload
+    return report
 
 
 class RecordingParent(ScriptedParent):
@@ -348,6 +422,68 @@ def failing_finish_report(step: str, reason: str | None = None,
         entry["reason"] = reason or "generic"
     report["steps"] = {step: entry}
     return report
+
+
+# ---------------------------------------------------------------------------
+# AC1: finishing_failed_report scripts the finish_failure payload
+# (LP-0MVWEP1XV003TGD2)
+# ---------------------------------------------------------------------------
+
+
+class TestFinishingFailedReportHarness:
+    """The extended report helper scripts the classifier payload (AC1)."""
+
+    def test_default_shape_is_byte_identical_to_today(self):
+        """No extra arguments: exactly today's keys, no ``finish_failure``."""
+        report = finishing_failed_report("SA-C1")
+        assert report == {
+            "phase": "parent",
+            "work_item_id": PARENT,
+            "success": False,
+            "message": "Failed to finish child SA-C1",
+            "next_child": "SA-C1",
+            "finishing_failed": True,
+            "children_processed": [],
+        }
+        assert "finish_failure" not in report
+
+    def test_step_reason_script_produces_classifier_payload(
+        self, implement_mod,  # noqa: F811 — fixture param
+    ):
+        """(step, reason) adds the payload the production classifier
+        produces for a scripted failing finish report."""
+        report = finishing_failed_report(
+            "SA-C1", step="push", reason="timeout",
+        )
+        parsed = failing_finish_report("push", "timeout")
+        assert report["finish_failure"] == (
+            implement_mod.classify_finish_failure(parsed)
+        )
+        assert report["finish_failure"] == {
+            "kind": "infrastructure",
+            "step": "push",
+            "reason": "timeout",
+            "message": "Finishing failed",
+        }
+
+    def test_kind_argument_pins_the_expected_class(self):
+        """kind names the classifier's derived kind; a mismatch raises so a
+        script can never silently claim the wrong failure class."""
+        report = finishing_failed_report(
+            "SA-C1", step="build", kind="gate",
+        )
+        assert report["finish_failure"]["kind"] == "gate"
+
+        with pytest.raises(AssertionError, match="expected 'gate'"):
+            finishing_failed_report(
+                "SA-C1", step="push", reason="timeout", kind="gate",
+            )
+
+    def test_kind_without_step_is_rejected(self):
+        """A kind without a scripted step/reason is a script bug, not a
+        silent no-op."""
+        with pytest.raises(ValueError, match="requires a scripted step"):
+            finishing_failed_report("SA-C1", kind="infrastructure")
 
 
 # ---------------------------------------------------------------------------
@@ -1212,6 +1348,261 @@ class TestNonTerminalResetForRetry:
         # then the next failure stops the chain without a second reset.
         assert len(harness.runner.returned) == 4
         assert report["children_driven"][0]["result"] == "reset-for-retry"
+
+
+# ---------------------------------------------------------------------------
+# AC2/AC3: commit-carrying worktree fixture + recording reset helper
+# (LP-0MVWEP1XV003TGD2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def commit_carrying_worktree(tmp_path):
+    """A real repo whose linked worktree is one commit ahead of ``dev``.
+
+    Mirrors the state a committed-child preservation gate must protect: the
+    child's slice is a *committed* change on its own branch that the parent
+    branch does not contain, so a destructive reset (``git reset --hard
+    dev`` / ``git clean -fd``) would discard real work. The fixture asserts
+    the ahead-of-parent relationship itself (AC2) so a later preservation
+    test can never pass vacuously.
+
+    The uncommitted-only variant — abandoned WIP in the worktree, nothing
+    committed — is the existing :func:`child_worktree` fixture.
+    """
+    repo = tmp_path / "main_repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    _git("config", "user.email", "test@test.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("# Test\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "Initial commit", cwd=repo)
+    _git("branch", "dev", cwd=repo)
+
+    worktree = (tmp_path / "wt-child").resolve()
+    _git(
+        "worktree", "add", "--track", "-b", "wl-SA-C1-test",
+        str(worktree), "dev", cwd=repo,
+    )
+
+    # The child's committed slice work, ahead of dev.
+    (worktree / "feature.txt").write_text("committed slice work\n")
+    _git("add", "-A", cwd=worktree)
+    _git("commit", "-q", "-m", "Child slice commit", cwd=worktree)
+
+    # Explicit setup assertions (AC2): HEAD is exactly one commit ahead of
+    # dev and that commit is reachable from HEAD (not dangling).
+    dev_rev = _git("rev-parse", "dev", cwd=repo).stdout.strip()
+    head_rev = _git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
+    ahead = _git(
+        "rev-list", "--count", f"{dev_rev}..HEAD", cwd=worktree,
+    ).stdout.strip()
+    assert ahead == "1", (
+        f"setup failure: expected HEAD to be 1 commit ahead of dev, "
+        f"got {ahead}"
+    )
+    assert head_rev != dev_rev, "setup failure: HEAD equals dev"
+    assert _git("merge-base", "dev", "HEAD", cwd=worktree).stdout.strip() == (
+        dev_rev
+    ), "setup failure: dev is not an ancestor of HEAD"
+
+    return {
+        "repo": repo,
+        "worktree": worktree,
+        "dev_rev": dev_rev,
+        "head_rev": head_rev,
+    }
+
+
+class TestCommitCarryingWorktree:
+    """Meta-tests pinning the preservation-gate fixture's setup (AC2/AC3)."""
+
+    def test_fixture_head_is_ahead_of_dev_with_reachable_commit(
+        self, commit_carrying_worktree,
+    ):
+        """The ahead-of-parent relationship holds and the commit is
+        reachable from HEAD (AC2)."""
+        fxt = commit_carrying_worktree
+        head_rev = _git(
+            "rev-parse", "HEAD", cwd=fxt["worktree"],
+        ).stdout.strip()
+        dev_rev = _git(
+            "rev-parse", "dev", cwd=fxt["worktree"],
+        ).stdout.strip()
+        assert head_rev == fxt["head_rev"]
+        assert dev_rev == fxt["dev_rev"]
+        # Exactly the initial commit plus the one slice commit is reachable
+        # from HEAD — the slice commit is real, not dangling.
+        assert _git(
+            "rev-list", "--count", "HEAD", cwd=fxt["worktree"],
+        ).stdout.strip() == "2"
+
+    def test_commit_carrying_worktree_is_detected_as_having_changes(
+        self, implement_mod, commit_carrying_worktree,  # noqa: F811
+    ):
+        """The fixture's worktree registers "has changes" — the same check
+        the production drive paths use to hand a child to ``finish`` (AC3)."""
+        assert implement_mod._has_worktree_changes(
+            str(commit_carrying_worktree["worktree"]), "dev"
+        ) is True
+
+    def test_clean_worktree_at_dev_is_not_detected_as_having_changes(
+        self, implement_mod, tmp_path,  # noqa: F811
+    ):
+        """A clean worktree sitting at ``dev`` has no changes — so the
+        positive detection above cannot pass vacuously (AC3)."""
+        repo = tmp_path / "clean_repo"
+        repo.mkdir()
+        _git("init", "-q", cwd=repo)
+        _git("config", "user.email", "test@test.com", cwd=repo)
+        _git("config", "user.name", "Test", cwd=repo)
+        (repo / "README.md").write_text("# Test\n")
+        _git("add", "-A", cwd=repo)
+        _git("commit", "-q", "-m", "Initial commit", cwd=repo)
+        _git("branch", "dev", cwd=repo)
+
+        worktree = (tmp_path / "wt-clean").resolve()
+        _git(
+            "worktree", "add", "--track", "-b", "wl-SA-C1-clean",
+            str(worktree), "dev", cwd=repo,
+        )
+        assert implement_mod._has_worktree_changes(str(worktree), "dev") is False
+
+
+class RecordingReset:
+    """Wrap ``_reset_child_worktree`` recording every call and git command.
+
+    Records each invocation (positional/keyword args) and every ``git``
+    command the wrapped implementation executed (via the module's
+    ``run_cmd``), so a test can assert *both* directions:
+
+    * that a reset ran — :attr:`calls` non-empty and :meth:`destructive`
+      non-empty for the worktree;
+    * the preservation-gate guarantee — that **no** ``git reset --hard`` or
+      ``git clean -fd`` ran against a given worktree path
+      (:meth:`destructive` empty), without mocking the reset out of
+      existence: the wrapper runs the real implementation underneath
+      recording (AC4).
+    """
+
+    def __init__(self, mod):
+        self.mod = mod
+        self.calls: list[tuple[tuple, dict]] = []
+        self.commands: list[list[str]] = []
+
+    def __call__(self, worktree_path: str, parent_branch: str = "dev", **kwargs):
+        """Invoke the real ``_reset_child_worktree`` under command recording.
+
+        Returns the reset result; the invocation and every git command it
+        ran are recorded on this instance.
+        """
+        self.calls.append(((worktree_path, parent_branch), kwargs))
+        original = self.mod.run_cmd
+
+        def _recorded(cmd, **kw):
+            self.commands.append(list(cmd))
+            return original(cmd, **kw)
+
+        with mock.patch.object(self.mod, "run_cmd", side_effect=_recorded):
+            return self.mod._reset_child_worktree(
+                worktree_path, parent_branch, **kwargs
+            )
+
+    def destructive(self, worktree_path: str | None = None) -> list[list[str]]:
+        """Recorded commands that discard committed work, per worktree.
+
+        The exact pair ``_reset_child_worktree`` runs: ``git reset --hard``
+        and ``git clean -fd`` (both in the ``git -C <path>`` form). When
+        *worktree_path* is given only commands targeting that path are
+        returned, so "nothing destructive ran **against this worktree**" is
+        asserted precisely.
+        """
+        return [
+            list(cmd)
+            for cmd in self.commands
+            if _is_destructive_git_command(cmd, worktree_path)
+        ]
+
+
+def _is_destructive_git_command(
+    cmd: list[str], worktree_path: str | None,
+) -> bool:
+    """True when *cmd* is a destructive reset/clean invocation."""
+    tokens = set(cmd)
+    is_destructive = ({"reset", "--hard"} <= tokens) or (
+        {"clean", "-fd"} <= tokens
+    )
+    if not is_destructive:
+        return False
+    if worktree_path is None:
+        return True
+    return worktree_path in cmd  # the ``-C <path>`` argument
+
+
+@pytest.fixture
+def recording_reset(implement_mod):  # noqa: F811 — fixture param
+    """Factory returning a :class:`RecordingReset` bound to the module."""
+    def _make() -> RecordingReset:
+        return RecordingReset(implement_mod)
+
+    return _make
+
+
+class TestRecordingResetHelper:
+    """The recording reset proves *presence* and *absence* of destructive
+    commands (AC4)."""
+
+    def test_recording_reset_observes_the_destructive_commands(
+        self, recording_reset, child_worktree,
+    ):
+        """When a reset actually runs, the recorder sees it — so an empty
+        ``destructive()`` result is evidence, not a blind pass."""
+        recorder = recording_reset()
+        result = recorder(child_worktree["worktree"], "dev")
+
+        assert result["success"] is True
+        assert len(recorder.calls) == 1
+        destructive = recorder.destructive(str(child_worktree["worktree"]))
+        assert ["git", "-C", str(child_worktree["worktree"]),
+                "reset", "--hard", "dev"] in destructive
+        assert ["git", "-C", str(child_worktree["worktree"]),
+                "clean", "-fd"] in destructive
+
+    def test_recording_reset_proves_nothing_destructive_ran(
+        self, recording_reset, commit_carrying_worktree,
+    ):
+        """A path that never invokes the reset records no call and no
+        destructive command against the worktree (AC4 negative proof)."""
+        recorder = recording_reset()
+
+        assert recorder.calls == []
+        assert recorder.destructive(
+            str(commit_carrying_worktree["worktree"])
+        ) == []
+
+    def test_recording_reset_refusal_is_seen_without_destructives(
+        self, recording_reset, child_worktree,
+    ):
+        """A refused reset (main checkout) records the call but no
+        destructive command against the refused path."""
+        recorder = recording_reset()
+        result = recorder(child_worktree["repo"], "dev")
+
+        assert result["success"] is False
+        assert result["reset"] is False
+        assert len(recorder.calls) == 1
+        assert recorder.destructive(str(child_worktree["repo"])) == []
+
+    def test_recording_reset_filters_to_the_given_worktree(
+        self, recording_reset, child_worktree,
+    ):
+        """Destructive commands are attributable to a specific path."""
+        recorder = recording_reset()
+        recorder(child_worktree["worktree"], "dev")
+
+        other = str(child_worktree["worktree"]) + "2"
+        assert recorder.destructive(other) == []
 
 
 # ---------------------------------------------------------------------------
