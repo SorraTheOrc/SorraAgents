@@ -1,4 +1,10 @@
 
+# <!-- REFACTOR-SA-0MVYYNOK4008GKAL
+# smell: ruff_specific
+# severity: medium
+# description: Prefer `next(...)` over single element slice
+# -->
+
 """Drive-recovery test harness + terminal-child regression
 (SA-0MVLJXKB60088SND, parent SA-0MVLIZ33M009C5QY).
 
@@ -2826,3 +2832,222 @@ class TestDriveVerdictEvidence:
         harness.run(delay=lambda _s: None)
         out = capsys.readouterr().out
         assert "local_dev_fast_forward: local_dev_diverged" in out
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVWEP3J3005Q4X6: gate-failure regression and termination proof
+# (parent AC6 — a genuine gate failure still stops the chain at the
+# finish-attempt bound with no infrastructure retry, a commit-carrying
+# worktree is never reset, and drive always terminates)
+# ---------------------------------------------------------------------------
+#
+# The refusal-aware drive (LP-0MVWEP292000ODBS) retries *infrastructure*
+# refusals on a separate bounded budget. These tests pin the other side:
+# a *genuine* gate failure (``tests: tests_failed``, the worktree-placement
+# violation, or an unlisted ``unknown`` pair) is never retried as
+# infrastructure — it consumes exactly the existing finish-attempt bound,
+# leaves ``infra_retries`` empty, never resets a commit-carrying worktree,
+# and the drive loop itself always terminates within its combined bound.
+#
+
+
+class TestGateFailureRegression:
+    """A genuine gate failure still stops the chain at the finish-attempt
+    bound with **no** infrastructure retry (parent AC6).
+
+    AC1: a ``tests: tests_failed`` finish failure at the *default*
+    ``--finish-attempt-limit`` yields exactly one finished attempt, an empty
+    ``infra_retries``, no reset of a commit-carrying worktree, and a stop
+    message naming ``tests: tests_failed``. AC2: a worktree-placement-owner
+    finish failure likewise stops with no infrastructure retry and a stop
+    message naming the failing step. AC3: an unlisted ``(step, reason)`` pair
+    (``unknown``) counts against the gate bound — ``finish_attempts``
+    increments and ``infra_retries`` stays empty.
+    """
+
+    def test_gate_failure_at_default_budget_names_step_and_preserves(
+        self, drive_harness, commit_carrying_worktree, recording_reset,
+    ):
+        """AC1: one gate failure at the default bound — a single finish
+        attempt, empty ``infra_retries``, the commit-carrying worktree never
+        reset, and the stop message naming ``tests: tests_failed``."""
+        worktree = commit_carrying_worktree["worktree"]
+        fixture_tip = commit_carrying_worktree["head_rev"]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(gate_failure_report("SA-C1") for _ in range(5)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path=str(worktree),
+        )
+        recorder = recording_reset()
+        harness.patch("_reset_child_worktree", side_effect=recorder)
+
+        report = harness.run()  # default limits, no explicit bounds
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        # The default finish-attempt bound is the session cap: exactly one
+        # `parent` invocation consumed, one finish execution observed.
+        assert report["finish_attempt_limit"] == 1
+        assert report["finish_attempts"] == {"SA-C1": 1}
+        assert len(harness.runner.returned) == 1
+        # A gate failure never touches the infrastructure budget.
+        assert report["infra_retries"] == {}
+        assert report["infra_retry_limit"] == 5
+        # The stop message names the real failing step and reason.
+        assert "tests: tests_failed" in report["message"]
+        assert harness.spawner.calls == []
+        # The commit-carrying worktree was never reset: the preservation
+        # gate ran the real helper (recording it), parked the tip on the wip
+        # ref, and no destructive git command executed against the worktree.
+        assert [e["id"] for e in report["preserved_refs"]] == ["SA-C1"]
+        assert report["preserved_refs"][0]["commit"] == fixture_tip
+        assert len(recorder.calls) == 1
+        assert recorder.destructive(str(worktree)) == []
+        assert _git("rev-parse", "HEAD", cwd=worktree
+                    ).stdout.strip() == fixture_tip
+        assert (worktree / "feature.txt").read_text() == "committed slice work\n"
+
+    def test_worktree_placement_failure_stops_without_infra_retry(
+        self, drive_harness,
+    ):
+        """AC2: a worktree-placement-violation gate failure stops with no
+        infrastructure retry and names the failing step in the message."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report(
+                    "SA-C1", step="worktree_placement",
+                    reason="placement_violation", kind="gate",
+                ) for _ in range(5)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+        )
+
+        report = harness.run()  # default limits
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["finish_attempts"] == {"SA-C1": 1}
+        assert report["infra_retries"] == {}
+        assert "worktree_placement: placement_violation" in report["message"]
+        assert harness.spawner.calls == []
+        assert len(harness.runner.returned) == 1
+
+    def test_unknown_pair_counts_against_the_gate_bound(
+        self, drive_harness,
+    ):
+        """AC3: an unlisted ``(step, reason)`` pair — ``unknown``, never
+        ``infrastructure`` — consumes the finish-attempt budget: repeated
+        ``unknown`` failures are retried up to ``finish_attempt_limit`` and
+        ``infra_retries`` stays empty."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report(
+                    "SA-C1", step="push", reason="push_failed",
+                ) for _ in range(5)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+        )
+
+        report = harness.run(finish_attempt_limit=2)
+
+        # The classifier resolves the unlisted pair as ``unknown``.
+        assert report["children_driven"] == []  # no infra-retry entries
+        assert report["finish_attempts"] == {"SA-C1": 2}
+        assert report["infra_retries"] == {}
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        # Both unknown failures were counted as real finish executions.
+        assert len(harness.runner.returned) == 2
+        assert harness.spawner.calls == []
+        assert "push: push_failed" in report["message"]
+
+
+class TestDriveTermination:
+    """The drive loop always terminates within its combined bound (parent
+    AC6).
+
+    AC4: an always-infrastructure-refusing harness with ``--infra-retry-
+    limit 5`` and ``--finish-attempt-limit 1`` terminates after exactly
+    ``infra_retry_limit + finish_attempt_limit`` parent invocations (plus the
+    terminal classification re-fetch of the child), with ``success: False``,
+    ``failed_child`` set and no session spawned. AC5: alternating gate and
+    infrastructure failures also terminate within the combined bound.
+    """
+
+    def test_always_infra_refusing_harness_terminates(
+        self, drive_harness,
+    ):
+        """AC4: the infra budget is spent, then the single finish-attempt
+        bound — 6 parent invocations in total, no session ever spawned, and
+        the reconciliation still re-fetched the child (the terminal
+        classification pass)."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(infra_refusal_report("SA-C1") for _ in range(10)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+        )
+
+        report = harness.run(
+            infra_retry_limit=5, finish_attempt_limit=1,
+            delay=lambda _s: None,
+        )
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        # 5 infra retries on the separate budget, then 1 finish attempt on the
+        # gate bound: exactly infra_retry_limit + finish_attempt_limit parent
+        # invocations — the loop terminated, it never exceeded the iteration
+        # bound or ran out of scripted reports.
+        assert len(harness.runner.returned) == 6
+        assert "exceeded its iteration bound" not in report["message"]
+        assert report["infra_retries"] == {"SA-C1": 5}
+        assert report["finish_attempts"] == {"SA-C1": 1}
+        # No session was spawned for the never-finishing child.
+        assert report["sessions_spawned"] == 0
+        assert harness.spawner.calls == []
+        # The terminal classification pass re-fetched the child after the
+        # bound was exhausted (parent fetch + one reconcile fetch).
+        assert report["_show_calls"] == [PARENT, "SA-C1"]
+        # The stopping verdict still names the real failing step/reason.
+        assert "local_dev_fast_forward: local_dev_diverged" in report["message"]
+
+    def test_mixed_failure_kinds_terminate_within_the_combined_bound(
+        self, drive_harness,
+    ):
+        """AC5: alternating gate and infrastructure failures terminate within
+        the combined bound (infra budget + finish-attempt bound) and the
+        final verdict names the step that exhausted the last bound."""
+        alternating = [
+            infra_refusal_report("SA-C1") if i % 2 == 0
+            else gate_failure_report("SA-C1")
+            for i in range(10)
+        ]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent(alternating),
+            child_states={"SA-C1": _child("SA-C1")},
+        )
+
+        report = harness.run(
+            infra_retry_limit=2, finish_attempt_limit=2,
+            delay=lambda _s: None,
+        )
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        # infra, gate, infra, gate → both budgets spent: 4 parent invocations
+        # total, alternation never confused the two budgets.
+        assert len(harness.runner.returned) == 4
+        assert report["infra_retries"] == {"SA-C1": 2}
+        assert report["finish_attempts"] == {"SA-C1": 2}
+        assert report["sessions_spawned"] == 0
+        assert harness.spawner.calls == []
+        assert "tests: tests_failed" in report["message"]
+        assert "exceeded its iteration bound" not in report["message"]

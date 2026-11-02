@@ -1260,3 +1260,34 @@ class TestInfraRetryLoopBound:
         assert len(runner.calls) == 7
         assert report["infra_retries"] == {"SA-C1": 5}
         assert "exceeded its iteration bound" not in report["message"]
+
+    def test_loop_bound_never_masks_a_never_finishing_harness(
+        self, implement_mod,
+    ):
+        """The loop bound is a termination guarantee for the *stopping*
+        path too: an always-infrastructure-refusing harness with the default
+        flags terminates after exactly infra + finish attempts — it is never
+        reported as "exceeded its iteration bound" (parent AC6,
+        LP-0MVWEP3J3005Q4X6 AC4)."""
+        m = implement_mod
+        runner = ScriptedParent([
+            *(_infra_refusal_report("SA-C1") for _ in range(10)),
+        ])
+
+        report = _run(
+            m, runner, RecordingSpawner(), [{"id": "SA-C1"}],
+            child_states={"SA-C1": {"id": "SA-C1", "status": "open"}},
+            infra_retry_limit=5, finish_attempt_limit=1,
+            delay=lambda _s: None,
+        )
+
+        # The refusal never self-clears: 5 infra retries + 1 finish attempt
+        # were observed, then the chain stopped with the child named — the
+        # iteration formula counted the budgets without tripping.
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert len(runner.calls) == 6
+        assert report["infra_retries"] == {"SA-C1": 5}
+        assert report["finish_attempts"] == {"SA-C1": 1}
+        assert report["sessions_spawned"] == 0
+        assert "exceeded its iteration bound" not in report["message"]
