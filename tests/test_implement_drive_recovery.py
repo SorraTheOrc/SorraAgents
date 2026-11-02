@@ -698,6 +698,14 @@ class TestFinishFailureClassifier:
             "step": "local_dev_fast_forward",
             "reason": "local_dev_diverged",
             "message": "Build failed (exit code 1)",
+            # LP-0MVWEP37K000JU0O: the payload carries the raw ``steps`` so
+            # the verdict messages can surface the lock/guard evidence.
+            "steps": {
+                "local_dev_fast_forward": {
+                    "method": "refused",
+                    "reason": "local_dev_diverged",
+                },
+            },
         }
         # Prose-only report (no structured steps) is unknown, never gate.
         prose_only = {
