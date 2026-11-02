@@ -116,12 +116,21 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 11053,
+  "global_agents": 14186,
   "project_agents": 3285,
-  "skills_prose": 1968,
-  "total": 16306
+  "skills_prose": 2339,
+  "total": 19810
 }
 ```
+
+> **Assignee-release invariant section (2026-11-02, SA-0MVVF7CZ6002UDKU):**
+> the canonical **Assignee release invariant** section (plus the claim-step
+> link) added ~1,170 B to `AGENTS_GLOBAL.md` (`global_agents 13016` →
+> `14186`; `total 18640` → `19810`; `project_agents` and `skills_prose`
+> unchanged). The addition is the single canonical statement of the
+> release-by-default invariant that every skill doc now cross-references, so
+> the thresholds were regenerated to the accepted surface rather than
+> compacting the rule.
 
 > **Recovery section (CG-0MUFIBB2X008A136 / SA-0MUN83EAF000G903):**
 > thresholds raised to accommodate the "Recovering from a wiped/corrupt

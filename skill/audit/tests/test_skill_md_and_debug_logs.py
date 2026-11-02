@@ -154,6 +154,10 @@ class TestSkillMdPathResolvability:
         """Resolve a token to a repo path, or None when out of scope."""
         if token.startswith(("~", "/", "<")):
             return None  # home / absolute / placeholder
+        # Markdown fragment links (`path.md#section`) must still point at a
+        # real file — strip the anchor before resolving (fragments are in
+        # scope for ./ ../ evidence/ skill/ docs/ tests/ prefixes).
+        token = token.split("#", 1)[0]
         if token.startswith(("./", "../", "evidence/")):
             return self.SKILL_DIR / token
         if token.startswith(("skill/", "docs/", "tests/")):
