@@ -1484,6 +1484,12 @@ class TestNonTerminalResetForRetry:
         assert reset_entry["finish_attempts"] == 3
         assert reset_entry["status"] == "open"
         assert "reset to dev" in reset_entry["reason"]
+        # The evidence is on the entry: the discarded uncommitted files are
+        # reported (never a commit), so the reset-for-retry record is
+        # auditable from the drive report alone (LP-0MVWEP2VQ001NPRK AC2/AC3).
+        assert reset_entry["discarded_paths"] == [
+            "README.md", "tests/test_wip.py", "wip.txt",
+        ]
         # Status reset through the shared lifecycle path, then a fresh session.
         assert {"id": "SA-C1", "status": "open", "assignee": ""} in (
             harness.status_updates
