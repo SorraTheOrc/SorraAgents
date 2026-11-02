@@ -196,6 +196,95 @@ and re-running it is a reported no-op (`already_absent`) — see
 [session-side removal
 action](implement-skill-reference.md#the-session-side-removal-action-implementpy-cleanup-id).
 
+## A branch upstream that points at itself breaks `git pull`
+
+A linked worktree and the main checkout **share** `.git/config`, so the
+branch-level tracking keys are **one per branch name**, not one per checkout:
+`branch.<name>.remote` and `branch.<name>.merge` written from any worktree
+are the same keys every other checkout (and every future `git pull`) reads.
+
+`.` is the legitimate **worktree-ownership signal**. `git worktree add --track
+-b wl-<id>-<slug> <path> dev` records `branch.wl-<id>-<slug>.remote = "."`, and
+that value deliberately **survives `git worktree remove`** — sandbox cleanup
+relies on it. For a `wl-*` branch it is correct and expected.
+
+On a **long-lived** branch (`dev`, `main`, and any branch named in the
+repository's release config) the identical value is a defect: `git pull`
+resolves the upstream to the *same repository*, prints `From .` /
+`Already up to date`, exits 0, and no remote data ever arrives. The failure is
+silent, so agents keep running stale skills and a stale worklog view while
+believing they are up to date (SA-0MVX1M6HH004YPX2).
+
+Two supported operations write the key:
+
+```bash
+# 1. Worktree registration tracking a LOCAL base branch (implement.py start)
+#    — correct: only the NEW wl-* branch gets "."; dev/main keep origin.
+git worktree add --track -b wl-<id>-<slug> <path> dev
+
+# 2. A push whose remote is the local path form — DEFECT on a long-lived branch:
+git push -u . dev:dev      # → branch.dev.remote = "."
+```
+
+### Detect
+
+| Surface | Behaviour |
+|---|---|
+| `scripts/hygiene_check.sh` (check 6) | reports every self-referential long-lived branch as a **warning** (exit 1); `--json` line `{"check":"self_referential_upstream","status":"warning","defects":[…]}` |
+| `implement.py start` | emits the same finding as a **warning** at the start of every run (`steps.self_referential_upstream` in the JSON report) |
+
+The detection module is `skill/shared/self_referential_upstream.py`
+(`detect_self_referential_upstreams(repo)`; findings carry `branch`, `type`
+(`defect`/`expected`), `remote`, `merge`, `message`). `wl-*` branches are
+classified `expected` and are never defects. Directly:
+
+```bash
+python3 skill/shared/self_referential_upstream.py --json   # exit 1 if defects
+```
+
+Both integrations are **fail-open**: they never block a work item, never
+rewrite configuration, and degrade to a skip when the module or the
+repository is unavailable.
+
+### Repair
+
+Repair is an explicit operator action — nothing rewrites the config
+implicitly:
+
+```bash
+# Preview first (writes nothing):
+python3 skill/shared/self_referential_upstream.py --fix --dry-run --json
+# Repair: only when "origin" is a configured remote AND it has the branch
+python3 skill/shared/self_referential_upstream.py --fix --json
+# Equivalent manual repair for one branch:
+git branch --set-upstream-to=origin/dev dev
+```
+
+`--fix` writes only `branch.<name>.remote = origin` and
+`branch.<name>.merge = refs/heads/<name>`; it refuses when `origin` is missing
+or does not advertise the branch, never touches a `wl-*` branch, and never
+checks out or modifies a working tree. Exit codes: `0` no defects left, `1`
+defects remain, `2` environment error (no repository / no `origin` remote).
+
+### Verify
+
+```bash
+git config --get branch.dev.remote        # must print: origin (never ".")
+git pull                                  # must show "From github.com:…", not "From ."
+git log origin/dev..dev                   # must be empty after the pull
+```
+
+### Prevention
+
+No framework code path can produce the defect any more
+(SA-0MVX35ABT000I1PD): `implement.py start` keeps `--track` for the `wl-*`
+branch (the ownership signal stays) but **asserts** — after registering the
+worktree, and again on every run — that the **parent** branch's tracking
+config is untouched, failing loudly if a registration ever writes `remote=.
+` onto the parent branch name; and every framework `git push` uses the
+configured remote **name** (`origin`), never a path or `.` form, so `-u` can
+never record a self-upstream.
+
 ## The placement guard
 
 `phase_parent`/`phase_drive` fail closed when a **non-terminal** child's
