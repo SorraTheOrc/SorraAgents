@@ -701,10 +701,10 @@ sentinel is preserved: a failure (parsed report or not) still returns
 `None` from `_run_finish`. The classifier resolves the failing
 `(step, reason)` from the report's structured `steps` payload (precedence:
 `main_checkout_lock` → `main_checkout_guard` → `local_dev_fast_forward` →
-`push` → `build` → `tests` → `ancestry_assertion` → `worktree_placement` →
-`diff`), never from `report["message"]` prose — every `finish` failure exit
-records a structured `steps` entry for this purpose. `kind` is one of
-`infrastructure`, `gate`, `unknown`:
+`push` → `build` → `build_churn` → `tests` → `ancestry_assertion` →
+`worktree_placement` → `diff`), never from `report["message"]` prose — every
+`finish` failure exit records a structured `steps` entry for this purpose.
+`kind` is one of `infrastructure`, `gate`, `unknown`:
 
 | `(step, reason)` | kind |
 |---|---|
@@ -715,6 +715,7 @@ records a structured `steps` entry for this purpose. `kind` is one of
 | `ancestry_assertion` + `ancestry_failed` | `infrastructure` |
 | `tests` + `tests_failed` | `gate` |
 | `build` + `build_failed` | `gate` |
+| `build_churn` + any reason | `gate` |
 | `worktree_placement` + any reason | `gate` |
 | `diff` + `no_changes` | `gate` |
 | anything else | `unknown` (never `infrastructure`) |
@@ -980,6 +981,7 @@ Every finish-gate verdict is self-describing. Each entry of
 | `git_fingerprint` | The **would-be-commit tree** SHA (`git write-tree` of the staged temporary index) the verdict is bound to — not the loose working-tree state. `null` outside a git work tree. |
 | `cached` | `true` only when the whole verdict was served from the per-repo test cache. |
 | `cache_entry` | Present only for a cache-served verdict: the served entry's `command`, `completed_at` (epoch float), `scope` and `fingerprint_kind`. |
+| `composed_engine` | The composition the suite ran against: per submodule the resolved checkout commit, the gitlink the would-be-commit tree records (`source`), and whether they match (SA-0MVZE164P0048306 AC4). `null` outside a git work tree. |
 
 A cached green is accepted only when its fingerprint is the would-be-commit
 tree's fingerprint: `run_gate_suite()` passes the temporary index's tree SHA
@@ -1102,6 +1104,95 @@ Harnesses that run **fixture** git commands must pass
 (`tests/test_implement_finish_local_parent_branch.py`). The gate's staging
 behaviour itself is covered by `skill/implement/tests/test_finish_gate_*.py`,
 so the harness stubs do not duplicate core coverage.
+
+### Build-originated composition churn (SA-0MVZE164P0048306)
+
+A build may legitimately change the engine composition it is built against.
+In a game repo `npm run build` starts with `npm run engine:sync`, which — when
+the tracked engine branch tip has advanced past the worktree's pin — runs
+`git submodule update --remote core`, rewrites `configs/engine-pin.json` and
+stages the pin **plus** the `core` gitlink. Left alone, `git_commit`'s blanket
+`git add -A` then commits that engine bump: an engine change the item never
+originated, sitting in a commit whose subject describes unrelated work.
+
+The finish gate therefore runs a **churn stage between the build and the
+gate** (`_exclude_build_originated_churn`, reported under
+`steps.build_churn`):
+
+1. **Baseline before the build.** `_build_churn_baseline()` snapshots the
+tracked dirty set (a per-path state token: the blob hash of a regular file,
+the checked-out commit of a submodule) and `HEAD`'s gitlinks immediately
+before `run_build`. Refactor edits are already in that snapshot, so they count
+as the item's own change.
+2. **Restore what the build produced.** After the build, a path that was
+**clean before the build** and is dirty after it is build-originated. It is
+restored to the pre-build `HEAD` state: files with
+`git checkout HEAD -- <path>`, gitlinks with `git reset HEAD -- <path>` **and**
+a submodule `checkout --detach <recorded gitlink>` — the second half is what
+makes the *tested* composition equal the *committed* one rather than leaving
+the suite on the advanced engine.
+3. **The exclusion is conditional on origin, never an ignore list.** A
+pin/gitlink that is already part of the item's change set before the build is
+preserved untouched, and a path the item had already modified that the build
+rewrote further is reported as `item_modified_during_build` and **never**
+restored — rolling it back would discard the item's own work.
+4. **Unrestorable churn fails closed.** A gitlink that cannot be restored (for
+example a submodule whose worktree carries local modifications: the checkout
+refuses instead of discarding them) leaves `restore_failed` non-empty, so
+finish refuses with an actionable message, resets the item to `open` and
+creates no commit. Churn is never force-discarded and never silently
+committed.
+
+Report shape (`report["steps"]["build_churn"]`):
+
+| Key | Meaning |
+| --- | --- |
+| `baseline_dirty_paths` | The item's own change set, as snapshotted before the build. |
+| `build_originated` | Paths clean before the build and dirty after it. |
+| `item_modified_during_build` | Paths the item had already modified **and** the build touched further — always kept. |
+| `restored` | `[{path, kind, restored, commit?}]` — the churn actually undone (`kind` is `file` or `submodule`). |
+| `excluded_from_commit` | Paths restored, therefore absent from the item's commit. |
+| `left_in_place` | Build-originated paths that have no `HEAD` state to restore (e.g. a gitlink the build added). |
+| `restore_failed` | Paths that could not be restored — non-empty means finish refuses (`reason: "restore_failed"`, classified as a `gate` failure). |
+| `composed_engine` | The resolved composition after the stage, compared against `HEAD` (`source: "HEAD"`). |
+
+Two path families are outside this stage by design: untracked build output
+(`git diff HEAD` sees tracked state only) and the finish run's own bookkeeping
+surface (`.worklog/` — `wl` comments, status and cache writes are never
+composition, so a concurrent bookkeeping write is never mistaken for build
+churn and restored).
+
+#### The composed engine SHA in every verdict (SA-0MVZE164P0048306 AC4)
+
+`_composed_engine_state()` resolves, for every gitlink recorded by the tree
+under test, the commit the submodule **checkout** is actually at — the
+composed engine the suite ran against — and compares it with the gitlink that
+tree records. Each gate attempt (`report["steps"]["tests"][*]`) therefore
+carries `composed_engine`, alongside `tree` and `git_fingerprint`:
+
+```json
+{"composition": "submodules",
+ "submodules": [{"submodule": "core", "commit": "c86808c6…",
+                 "recorded_gitlink": "c86808c6…",
+                 "source": "would-be-commit tree",
+                 "matches_recorded": true}]}
+```
+
+`source` is `would-be-commit tree` for a gate attempt (the gitlinks of the
+temporary index's `git write-tree`, so `matches_recorded` is exactly the
+"tested composition equals committed composition" check) and `HEAD` for the
+pre-gate churn stage. `report["steps"]["would_be_commit"]` carries the same
+block, and the completion comment gains a
+`- Composed engine: core@<sha> (recorded gitlink <sha> in <source>, match: <bool>)`
+line (or `none` when the tree records no submodule composition), so the green
+is attributable to a specific engine composition from the work item alone.
+
+The cache key is **not** touched: `compute_git_state` still fingerprints the
+pin/gitlink content, so a green entry recorded against a different engine is
+never served (the rejected remedy B). `engine:sync` keeps running on dev
+builds and the release path keeps using `engine:verify` (the rejected remedy
+C); the pin/gitlink pair restored here is the pre-build pair, which was
+coherent, so the pair stays coherent either way.
 
 ## Push timeout (SA-0MUH9R74O002MQDU)
 

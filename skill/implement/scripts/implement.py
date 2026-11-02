@@ -2634,6 +2634,447 @@ def _is_git_worktree(cwd: str) -> bool:
     return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
+# ---------------------------------------------------------------------------
+# Build-originated composition churn (SA-0MVZE164P0048306)
+# ---------------------------------------------------------------------------
+#: Git mode of a submodule entry (a "gitlink") in a tree or an index.
+GITLINK_MODE = "160000"
+
+#: Path prefix of the finish run's own bookkeeping surface. A tracked change
+#: there (``wl`` comments, status and cache writes) is never build composition
+#: churn and is never restored by the build-churn stage.
+CHURN_EXEMPT_PREFIX = ".worklog/"
+
+
+def _parse_gitlink_entries(output: str, sha_field: int = 2) -> dict[str, str]:
+    """Parse NUL-separated ``ls-tree``/``ls-files --stage`` output into a map.
+
+    Both plumbing commands emit ``<mode> SP <field> SP <field> TAB <path>`` but
+    with the SHA in a different position: ``ls-tree`` is ``<mode> <type>
+    <sha>`` (the SHA is the third field), ``ls-files --stage`` is ``<mode>
+    <sha> <stage>`` (the SHA is the second). Only ``160000`` (gitlink) entries
+    are kept — they are the submodule pointers, i.e. the engine pin a commit
+    records.
+
+    Args:
+        output: Raw NUL-terminated output of ``git ls-tree -r -z`` (default
+            ``sha_field``) or ``git ls-files --stage -z`` (``sha_field=1``).
+        sha_field: Zero-based index of the field holding the recorded commit.
+
+    Returns:
+        Mapping of submodule path to the commit SHA it records.
+    """
+    gitlinks: dict[str, str] = {}
+    for entry in output.split("\0"):
+        if not entry.strip():
+            continue
+        meta, _, path = entry.partition("\t")
+        fields = meta.split()
+        if len(fields) > sha_field and fields[0] == GITLINK_MODE and path:
+            gitlinks[path] = fields[sha_field]
+    return gitlinks
+
+
+def _head_gitlinks(cwd: str) -> dict[str, str]:
+    """Map every gitlink path recorded in ``HEAD`` to its commit.
+
+    This is the *committed* composition — for the game repos that compose the
+    Tableau Card Engine at ``core`` it is the engine pin the commit records.
+    Empty when ``HEAD`` is unborn or unreadable: there is then no recorded
+    composition to restore.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        Mapping of submodule path to the commit ``HEAD`` records.
+    """
+    proc = _run_git_plumbing(cwd, ["ls-tree", "-r", "-z", "HEAD"])
+    if proc.returncode != 0:
+        return {}
+    return _parse_gitlink_entries(proc.stdout)
+
+
+def _index_gitlinks(cwd: str) -> dict[str, str]:
+    """Map every gitlink path currently staged in the real index to its commit.
+
+    A build (``engine:sync``) stages the gitlink it advanced, so the index is
+    part of the pre/post-build state comparison.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        Mapping of submodule path to the commit the index stages.
+    """
+    proc = _run_git_plumbing(cwd, ["ls-files", "--stage", "-z"])
+    if proc.returncode != 0:
+        return {}
+    return _parse_gitlink_entries(proc.stdout, sha_field=1)
+
+
+def _tracked_dirty_paths(cwd: str) -> set[str]:
+    """Tracked paths whose state differs from ``HEAD``, staged or not.
+
+    Uses ``git diff HEAD`` (index *and* working tree against the commit), so a
+    build that stages its own output is visible here just like one that only
+    rewrites the working tree. Untracked files are deliberately excluded: a
+    build output the project does not track is not a composition path.
+
+    The finish run's own bookkeeping surface (``.worklog/`` — ``wl`` comments,
+    status and cache writes) is excluded: it is never composition, and a
+    concurrent bookkeeping write must never be mistaken for build churn and
+    restored.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        Set of repository-relative paths (empty when the query fails).
+    """
+    proc = _run_git_plumbing(
+        cwd, ["diff", "--name-only", "--no-renames", "-z", "HEAD"]
+    )
+    if proc.returncode != 0:
+        return set()
+    return {
+        path
+        for path in proc.stdout.split("\0")
+        if path and not path.startswith(CHURN_EXEMPT_PREFIX)
+    }
+
+
+def _path_state_token(
+    cwd: str, path: str, gitlinks: dict[str, str]
+) -> str:
+    """A token that changes only when a dirty path's content really changes.
+
+    Distinguishes a path the item modified before the build (dirty in the
+    baseline) from one that changed *during* the build: for a submodule the
+    token is its checked-out commit, for a regular path the hash of its working
+    content. A path the build changed *and* the item had already modified is
+    therefore detectable, so it is never mistaken for pure build output.
+
+    Args:
+        cwd: Worktree root.
+        path: Repository-relative path to fingerprint.
+        gitlinks: Known submodule paths for this checkout.
+
+    Returns:
+        An opaque state token string.
+    """
+    if path in gitlinks:
+        proc = _run_git_plumbing(str(Path(cwd) / path), ["rev-parse", "HEAD"])
+        if proc.returncode == 0 and proc.stdout.strip():
+            return f"gitlink:{proc.stdout.strip()}"
+        return "gitlink:unresolved"
+    if not (Path(cwd) / path).exists():
+        return "absent"
+    proc = _run_git_plumbing(cwd, ["hash-object", "--", path])
+    if proc.returncode == 0 and proc.stdout.strip():
+        return f"blob:{proc.stdout.strip()}"
+    return "unhashed"
+
+
+def _build_churn_baseline(cwd: str) -> dict[str, Any]:
+    """Snapshot the item's own change set immediately before the build runs.
+
+    Whatever differs from this snapshot after the build was produced *by the
+    build*, not by the item — the distinction AC1/AC2 of SA-0MVZE164P0048306
+    turn on. Taken after the (optional) refactor step and before ``run_build``,
+    so refactor edits count as the item's own change.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        ``{taken_at, gitlinks, dirty_paths}`` where ``dirty_paths`` maps every
+        tracked dirty path to its :func:`_path_state_token` and ``gitlinks``
+        is ``HEAD``'s recorded composition. Outside a git work tree both are
+        empty (the churn stage is then a no-op).
+    """
+    gitlinks = _head_gitlinks(cwd)
+    dirty = sorted(_tracked_dirty_paths(cwd))
+    known = {**_index_gitlinks(cwd), **gitlinks}
+    return {
+        "taken_at": datetime.now(timezone.utc).isoformat(),
+        "gitlinks": gitlinks,
+        "dirty_paths": {
+            path: _path_state_token(cwd, path, known) for path in dirty
+        },
+    }
+
+
+def _composed_engine_state(
+    cwd: str, commit_tree: str | None = None
+) -> dict[str, Any]:
+    """Record the composition a gate verdict's suite ran against.
+
+    For every recorded gitlink this resolves the commit the submodule
+    **checkout** is actually at — the composed engine the suite saw — and
+    compares it with the gitlink the *commit* records. That pair is the
+    provenance AC4 of SA-0MVZE164P0048306 requires alongside the
+    would-be-commit tree: a verdict now states which engine SHA it tested, not
+    merely which tree.
+
+    Args:
+        cwd: Worktree root.
+        commit_tree: The would-be-commit tree whose gitlinks are authoritative
+            (``git write-tree`` of the staged change set, AC3). ``None``
+            compares against ``HEAD`` — the committed composition, used by the
+            build-churn step which runs before the gate stages anything.
+
+    Returns:
+        ``{"submodules": [{"submodule", "commit", "recorded_gitlink",
+        "source", "matches_recorded"}], "composition": "none"|"submodules"}``.
+        An unresolved checkout is reported with ``commit: None`` rather than
+        omitted, so a broken composition is visible in the verdict.
+    """
+    if commit_tree:
+        proc = _run_git_plumbing(cwd, ["ls-tree", "-r", "-z", commit_tree])
+        recorded_map = (
+            _parse_gitlink_entries(proc.stdout) if proc.returncode == 0 else {}
+        )
+        source = "would-be-commit tree"
+    else:
+        recorded_map = _head_gitlinks(cwd)
+        source = "HEAD"
+    entries: list[dict[str, Any]] = []
+    for path, recorded in sorted(recorded_map.items()):
+        proc = _run_git_plumbing(str(Path(cwd) / path), ["rev-parse", "HEAD"])
+        resolved = proc.stdout.strip() if proc.returncode == 0 else ""
+        entries.append(
+            {
+                "submodule": path,
+                "commit": resolved or None,
+                "recorded_gitlink": recorded,
+                "source": source,
+                "matches_recorded": bool(resolved) and resolved == recorded,
+            }
+        )
+    return {
+        "submodules": entries,
+        "composition": "submodules" if entries else "none",
+    }
+
+
+def _restore_build_churn_path(
+    cwd: str, path: str, gitlinks: dict[str, str], known: dict[str, str]
+) -> dict[str, Any]:
+    """Restore one build-originated path to the state ``HEAD`` records.
+
+    A regular path is restored from ``HEAD`` (``git checkout HEAD -- <path>``
+    restores the index entry and the working file). A gitlink needs both
+    halves: ``git reset HEAD -- <path>`` restores the recorded pointer in the
+    index and the submodule checkout is moved back to that commit, which is
+    what makes the *tested* composition equal the *committed* one (AC3 of
+    SA-0MVZE164P0048306) instead of leaving the suite on the advanced engine.
+
+    Nothing is ever discarded by force: a submodule with local modifications
+    fails the checkout and is reported as unrestorable rather than cleaned —
+    the local work may be the item's own.
+
+    Args:
+        cwd: Worktree root.
+        path: Repository-relative path to restore.
+        gitlinks: ``HEAD``'s recorded composition.
+        known: Every known submodule path (HEAD plus the current index).
+
+    Returns:
+        ``{path, kind, restored}`` plus ``commit`` when restored, or
+        ``error``/``reason`` when it was not.
+    """
+    recorded = gitlinks.get(path)
+    if recorded is not None:
+        failures: list[str] = []
+        reset = _run_git_plumbing(cwd, ["reset", "-q", "HEAD", "--", path])
+        if reset.returncode != 0:
+            failures.append(
+                f"git reset HEAD -- {path}: "
+                f"{reset.stderr.strip() or 'failed'}"
+            )
+        checkout = _run_git_plumbing(
+            str(Path(cwd) / path), ["checkout", "-q", "--detach", recorded]
+        )
+        if checkout.returncode != 0:
+            failures.append(
+                f"git -C {path} checkout --detach {recorded}: "
+                f"{checkout.stderr.strip() or 'failed'}"
+            )
+            sync = _run_git_plumbing(
+                cwd, ["submodule", "update", "--init", "--checkout", "--", path]
+            )
+            if sync.returncode != 0:
+                failures.append(
+                    f"git submodule update --init --checkout {path}: "
+                    f"{sync.stderr.strip() or 'failed'}"
+                )
+            elif path not in _tracked_dirty_paths(cwd):
+                failures.clear()
+        if not failures and path in _tracked_dirty_paths(cwd):
+            failures.append(
+                f"{path} is still recorded as modified after the restore "
+                "(the submodule checkout does not match the gitlink HEAD "
+                "records)"
+            )
+        if failures:
+            return {
+                "path": path,
+                "kind": "submodule",
+                "restored": False,
+                "error": "; ".join(failures),
+            }
+        return {
+            "path": path,
+            "kind": "submodule",
+            "restored": True,
+            "commit": recorded,
+        }
+
+    checkout = _run_git_plumbing(cwd, ["checkout", "HEAD", "--", path])
+    if checkout.returncode == 0:
+        return {"path": path, "kind": "file", "restored": True}
+    if path in known:
+        # A gitlink the build staged but HEAD does not record: there is no
+        # committed state to restore it to, so it can only be left in place.
+        return {
+            "path": path,
+            "kind": "submodule",
+            "restored": False,
+            "reason": "not_in_head",
+            "error": checkout.stderr.strip(),
+        }
+    head_blob = _run_git_plumbing(cwd, ["cat-file", "-e", f"HEAD:{path}"])
+    if head_blob.returncode != 0:
+        return {
+            "path": path,
+            "kind": "file",
+            "restored": False,
+            "reason": "not_in_head",
+            "error": checkout.stderr.strip(),
+        }
+    return {
+        "path": path,
+        "kind": "file",
+        "restored": False,
+        "error": checkout.stderr.strip() or "git checkout HEAD failed",
+    }
+
+
+def _exclude_build_originated_churn(
+    cwd: str, baseline: dict[str, Any]
+) -> dict[str, Any]:
+    """Undo the tracked churn the build produced, keeping the item's own work.
+
+    A build such as this repo's ``npm run build`` (``engine:sync`` first) can
+    advance the engine submodule and rewrite the pin when the tracked engine
+    branch tip has moved, staging both. Left alone, finish's ``git add -A``
+    commits that bump — an engine change the item never originated — and the
+    gate tests a composition the commit does not record (SA-0MVZE164P0048306).
+
+    The rule is *conditional on origin*, never an unconditional ignore list:
+    a path restored here must have been **clean before the build** and dirty
+    after it. A path the item already had dirty is part of the item's own
+    change set and is preserved — even when the build also touched it
+    (``item_modified_during_build``), because restoring it would discard the
+    item's work.
+
+    Args:
+        cwd: Worktree root.
+        baseline: The :func:`_build_churn_baseline` taken before the build.
+
+    Returns:
+        A report dict: ``baseline_dirty_paths``, ``build_originated``,
+        ``item_modified_during_build``, ``restored``, ``excluded_from_commit``,
+        ``left_in_place``, ``restore_failed``, ``success``/``reason`` and
+        ``composed_engine``. ``restore_failed`` non-empty means finish must
+        refuse: the commit would otherwise record a composition the item did
+        not originate (or, for a file, a state that could not be restored).
+    """
+    before = baseline.get("dirty_paths") or {}
+    gitlinks = dict(baseline.get("gitlinks") or {})
+    known = {**_index_gitlinks(cwd), **gitlinks}
+
+    originated: list[str] = []
+    item_modified: list[str] = []
+    for path in sorted(_tracked_dirty_paths(cwd)):
+        if path not in before:
+            originated.append(path)
+        elif before[path] != _path_state_token(cwd, path, known):
+            item_modified.append(path)
+
+    restored: list[dict[str, Any]] = []
+    left_in_place: list[dict[str, Any]] = []
+    restore_failed: list[dict[str, Any]] = []
+    for path in originated:
+        outcome = _restore_build_churn_path(cwd, path, gitlinks, known)
+        if outcome.get("restored"):
+            restored.append(outcome)
+        elif outcome.get("reason") == "not_in_head":
+            left_in_place.append(outcome)
+        else:
+            restore_failed.append(outcome)
+
+    for entry in restored:
+        LOG.info(
+            "Finish gate: excluded build-originated churn %s (%s)",
+            entry["path"],
+            entry["kind"],
+        )
+    for entry in item_modified:
+        LOG.info(
+            "Finish gate: kept %s (modified by the item and touched by the "
+            "build; never restored)",
+            entry,
+        )
+
+    report: dict[str, Any] = {
+        "baseline_dirty_paths": sorted(before),
+        "build_originated": originated,
+        "item_modified_during_build": item_modified,
+        "restored": restored,
+        "excluded_from_commit": [entry["path"] for entry in restored],
+        "left_in_place": left_in_place,
+        "restore_failed": restore_failed,
+        "success": not restore_failed,
+        "composed_engine": _composed_engine_state(cwd),
+    }
+    if restore_failed:
+        report["reason"] = "restore_failed"
+    return report
+
+
+def _build_churn_refusal_message(churn: dict[str, Any]) -> str:
+    """Actionable refusal for build churn that could not be excluded.
+
+    Never silent and never forced: the offending paths, the git error and the
+    two remedies (clean the submodule, or make the change part of the item's
+    own change set before the build) are all named.
+
+    Args:
+        churn: The :func:`_exclude_build_originated_churn` report.
+
+    Returns:
+        The message recorded on the work item and returned to the caller.
+    """
+    details = "\n".join(
+        f"  - {entry['path']} ({entry['kind']}): {entry.get('error', 'failed')}"
+        for entry in churn.get("restore_failed") or []
+    )
+    return (
+        "Finish refused: build-originated churn could not be excluded from "
+        "the item's commit.\n"
+        f"{details}\n"
+        "The build produced these tracked changes, so committing them would "
+        "record a pin/gitlink bump this item did not originate, and the "
+        "suite would not run against the composition the commit records.\n"
+        "Resolve the reported git error (for a submodule: clean or restore "
+        "its checkout) and re-run `implement.py finish`. If the change is "
+        "genuinely this item's, make it part of the change set *before* the "
+        "build (stage or modify it yourself) so it is preserved."
+    )
+
+
 @dataclass
 class WouldBeCommitIndex:
     """The temporary index the finish gate tests the would-be-commit tree in.
@@ -2791,8 +3232,14 @@ def run_gate_suite(
     carries ``tree`` (the absolute worktree path the suite ran in) and
     ``git_fingerprint`` (the would-be-commit tree SHA the verdict is bound to),
     alongside the ``cached``/``cache_entry`` provenance the suite run reported.
-    Every verdict therefore states both *which tree* it belongs to and whether
-    it was produced or served.
+    Every verdict therefore states both *which tree* it belongs to, whether it
+    was produced or served, and (SA-0MVZE164P0048306 AC4) which composed
+    engine SHA it ran against (``composed_engine`` — the resolved submodule
+    checkout commit vs the gitlink ``HEAD`` records).
+
+    Returns:
+        Tuple of ``(test_result, summary)``; both carry ``composed_engine``
+        when the composition is resolvable, ``None`` outside a git work tree.
     """
     tested_tree = str(Path(cwd).resolve())
     if not _is_git_worktree(cwd):
@@ -2808,11 +3255,13 @@ def run_gate_suite(
         # would-be-commit tree to fingerprint outside a work tree.
         result["tree"] = tested_tree
         result["git_fingerprint"] = None
+        result["composed_engine"] = None
         return result, {
             "available": False,
             "reason": "not_a_git_worktree",
             "notice": notice,
             "staged_paths": [],
+            "composed_engine": None,
         }
 
     with would_be_commit_index(cwd) as gate_index:
@@ -2820,6 +3269,7 @@ def run_gate_suite(
         # is the tree SHA, so a verdict recorded for any other tree (or a
         # legacy entry without provenance) misses and the suite really runs
         # (SA-0MVQHVHXI007PQAB).
+        composed_engine = _composed_engine_state(cwd, gate_index.tree)
         result = run_tests(
             cwd, scope=scope, base_ref=base_ref, fingerprint=gate_index.tree
         )
@@ -2827,12 +3277,16 @@ def run_gate_suite(
         summary = gate_index.summary()
 
     summary["index_unchanged"] = integrity["unchanged"]
+    summary["composed_engine"] = composed_engine
     # Attribute the verdict to the tree it was bound to: the absolute worktree
     # the suite ran in and the would-be-commit tree SHA its cache key used
     # (SA-0MVQHVJEX0071R7G). Recorded on the run result in place so callers
-    # keep the result object the suite returned.
+    # keep the result object the suite returned. The composed engine SHA is
+    # the composition the suite actually ran against (SA-0MVZE164P0048306
+    # AC4).
     result["tree"] = tested_tree
     result["git_fingerprint"] = gate_index.tree
+    result["composed_engine"] = composed_engine
     if integrity["unchanged"]:
         return result, summary
 
@@ -2862,12 +3316,13 @@ def _gate_attempt_record(
     """One finish-gate test attempt, with the provenance of its verdict.
 
     Every attempt records the tree the suite ran against (``tree``), the
-    would-be-commit tree SHA the verdict is bound to (``git_fingerprint``) and
+    would-be-commit tree SHA the verdict is bound to (``git_fingerprint``),
     whether the verdict was served from the cache (``cached``, plus
-    ``cache_entry`` metadata — command / completed_at / scope — when it was).
-    A green verdict is therefore self-describing: it names the state whose
-    suite ran, so a stale or foreign cached green cannot be mistaken for it
-    (SA-0MVQHVJEX0071R7G).
+    ``cache_entry`` metadata — command / completed_at / scope — when it was)
+    and the composed engine SHA the suite ran against (``composed_engine``,
+    SA-0MVZE164P0048306 AC4). A green verdict is therefore self-describing: it
+    names the state whose suite ran, so a stale or foreign cached green cannot
+    be mistaken for it (SA-0MVQHVJEX0071R7G).
     """
     record: dict[str, Any] = {
         "attempt": attempt,
@@ -2879,6 +3334,7 @@ def _gate_attempt_record(
         "tree": test_result.get("tree"),
         "git_fingerprint": test_result.get("git_fingerprint"),
         "cached": bool(test_result.get("cached", False)),
+        "composed_engine": test_result.get("composed_engine"),
     }
     entry = test_result.get("cache_entry")
     if record["cached"] and entry:
@@ -2911,6 +3367,27 @@ def _verdict_provenance_lines(report: dict[str, Any]) -> list[str]:
             f"completed_at {entry.get('completed_at')}, "
             f"scope {entry.get('scope')}, "
             f"fingerprint_kind {entry.get('fingerprint_kind')}"
+        )
+    # The composed engine SHA the accepted verdict's suite ran against
+    # (SA-0MVZE164P0048306 AC4): the resolved submodule checkout commit vs the
+    # gitlink ``HEAD`` records, so the green is attributable to a specific
+    # engine composition, not merely a tree.
+    composed = final.get("composed_engine") or {}
+    submodules = list(composed.get("submodules") or [])
+    if submodules:
+        for sub in submodules:
+            lines.append(
+                f"  - Composed engine: {sub.get('submodule')}@"
+                f"{sub.get('commit')} (recorded gitlink "
+                f"{sub.get('recorded_gitlink')} in "
+                f"{sub.get('source')}, "
+                "match: "
+                f"{'true' if sub.get('matches_recorded') else 'false'})"
+            )
+    else:
+        lines.append(
+            "  - Composed engine: none (the recorded tree has no submodule "
+            "composition)"
         )
     if len(attempts) > 1:
         lines.append(f"  - Attempts: {len(attempts)}")
@@ -4072,6 +4549,7 @@ FINISH_INFRA_REFUSALS: frozenset[tuple[str, str]] = frozenset({
 FINISH_GATE_REFUSALS: frozenset[tuple[str, str]] = frozenset({
     ("tests", "tests_failed"),
     ("build", "build_failed"),
+    ("build_churn", FINISH_REASON_WILDCARD),
     ("worktree_placement", FINISH_REASON_WILDCARD),
     ("diff", "no_changes"),
 })
@@ -4087,6 +4565,7 @@ FINISH_STEP_PRECEDENCE: tuple[str, ...] = (
     "local_dev_fast_forward",
     "push",
     "build",
+    "build_churn",
     "tests",
     "ancestry_assertion",
     "worktree_placement",
@@ -7697,6 +8176,12 @@ def phase_finish(
         LOG.info("Refactor step skipped (--no-refactor)")
 
     # ── Step 2: Build ──────────────────────────────────────────────
+    # The item's own change set is snapshotted before the build: whatever the
+    # build changes on top of it is build-originated churn, not the item's
+    # change (SA-0MVZE164P0048306 AC1/AC3). A build such as ``npm run build``
+    # here runs ``engine:sync`` first, which can advance the engine submodule
+    # and stage the pin plus the gitlink.
+    build_churn_baseline = _build_churn_baseline(worktree_path)
     LOG.info("Running build...")
     build_result = run_build(worktree_path)
     report["steps"]["build"] = build_result
@@ -7711,6 +8196,32 @@ def phase_finish(
             work_item_id,
             f"Build failed during finish phase.\n```\n{build_result['stderr'][:500]}\n```",
         )
+        try:
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        return report
+
+    # ── Step 2b: Exclude build-originated composition churn ────────
+    # Build output the item did not originate must never reach the commit
+    # (AC1) and must not be what the suite runs against (AC3): both are
+    # restored to the pre-build ``HEAD`` state while the gate is still ahead
+    # of it, so the tested tree is exactly the committed tree and the composed
+    # engine SHA is the committed one. The exclusion is conditional on origin
+    # (AC2): a pin/gitlink that was already part of the item's change set is
+    # preserved untouched.
+    build_churn = _exclude_build_originated_churn(
+        worktree_path, build_churn_baseline
+    )
+    report["steps"]["build_churn"] = build_churn
+    if build_churn.get("restore_failed"):
+        msg = _build_churn_refusal_message(build_churn)
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        wl_add_comment(work_item_id, msg)
         try:
             StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
