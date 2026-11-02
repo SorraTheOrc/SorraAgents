@@ -380,6 +380,102 @@ check_tracked_deletions() {
     fi
 }
 
+# ── Check 6: Self-referential branch upstreams ─────────────────────────
+# `branch.<name>.remote = "."` on a long-lived branch (dev/main) makes a
+# plain `git pull` a silent no-op: it fetches from the same repository and
+# changes nothing, leaving the machine on stale skills and stale worklog data
+# (SA-0MVX1M6HH004YPX2). The detection module is consumed from this
+# framework's own skill tree (not the checked repo's), so `--repo-root` can
+# point at any project. FAIL-OPEN by design (AC3): a missing module, a
+# non-repo target or a git failure is reported as `skipped`, never as an
+# error, and nothing is ever rewritten — repair stays an explicit operator
+# action (`--fix`).
+
+check_self_referential_upstream() {
+    local detection
+    detection="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)/skill/shared/self_referential_upstream.py"
+    if [[ ! -f "$detection" ]]; then
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"check":"self_referential_upstream","status":"skipped","reason":"detection module not present"}'
+        else
+            echo "– Self-referential-upstream check skipped (detection module not present)."
+        fi
+        return 0
+    fi
+
+    local json_flag=false
+    [[ "$JSON_OUTPUT" == "true" ]] && json_flag=true
+
+    # The inline python both detects and formats the finding, so the JSON
+    # shape lives in one place. Exit 0 = no defect / skipped, 1 = defect.
+    if python3 - "$detection" "$REPO_ROOT" "$json_flag" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+detection_path, repo_root, json_flag = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3] == "true",
+)
+CHECK = "self_referential_upstream"
+
+
+def report(status, **fields):
+    if json_flag:
+        payload = {"check": CHECK, "status": status, **fields}
+        print(json.dumps(payload))
+    elif status == "skipped":
+        print(f"– {CHECK.replace('_', ' ')}: skipped ({fields.get('reason', '')})")
+    elif status == "ok":
+        print("✓ No self-referential upstreams on long-lived branches.")
+    else:
+        defects = fields.get("defects", [])
+        print(
+            f"⚠ {len(defects)} long-lived branch(es) track themselves — "
+            "`git pull` is a silent no-op:"
+        )
+        for finding in defects:
+            print(f"  - {finding['branch']}: {finding['message']}")
+        print(
+            "  Repair (explicit, never automatic): "
+            "python3 skill/shared/self_referential_upstream.py --fix"
+        )
+
+
+sys.path.insert(0, str(Path(detection_path).resolve().parents[1]))
+try:
+    from shared.self_referential_upstream import (
+        detect_self_referential_upstreams as _detect,
+    )
+except Exception as exc:  # fail-open: an unavailable checker is a skip
+    report("skipped", reason=f"detection unavailable: {exc}")
+    raise SystemExit(0)
+
+try:
+    # Worktree branches are reported as ``expected``; only ``defect`` findings
+    # are the machine-wide breakage this check warns about.
+    found = [
+        finding
+        for finding in _detect(repo_root)
+        if finding.get("type") == "defect"
+    ]
+except Exception as exc:  # fail-open: git/repo errors never fail hygiene
+    report("skipped", reason=f"detection unavailable: {exc}")
+    raise SystemExit(0)
+
+if found:
+    report("warning", defect_count=len(found), defects=found)
+    raise SystemExit(1)
+report("ok")
+raise SystemExit(0)
+PY
+    then
+        return 0
+    fi
+    return 1
+}
+
 # ── Main ──────────────────────────────────────────────────────────
 
 cd "$REPO_ROOT"
@@ -397,6 +493,7 @@ check_dirty_checkout || overall_exit=1
 check_orphaned_worktrees || overall_exit=1
 check_main_checkout_lock || overall_exit=1
 check_tracked_deletions || overall_exit=1
+check_self_referential_upstream || overall_exit=1
 
 if [[ "$overall_exit" -ne 0 ]]; then
     if [[ "$JSON_OUTPUT" == "true" ]]; then

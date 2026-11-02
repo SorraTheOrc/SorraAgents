@@ -116,6 +116,18 @@ try:
     )
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
+
+try:
+    # Fail-open self-referential-upstream warning (SA-0MVX35AUC003CNUD AC2/
+    # AC3). Deliberately OUTSIDE the hard-fail shared block above: the
+    # detection module is optional, so a partial skill install or a repo
+    # without it degrades to a logged skip instead of blocking the start.
+    from shared.self_referential_upstream import (
+        detect_self_referential_upstreams as _detect_self_referential_upstreams,
+    )
+except Exception:  # pragma: no cover - only partial installs hit this
+    _detect_self_referential_upstreams = None
+
 try:
     # The shared changed-file → test selector (SA-0MT6CENPW004V2JN). Kept
     # optional: partial skill installs (staged layouts without the test
@@ -2394,6 +2406,62 @@ def _git_config_get(cwd: str, key: str) -> str | None:
         return None
     value = result.stdout.strip()
     return value or None
+
+
+def warn_self_referential_upstream(repo_root: str) -> dict[str, Any]:
+    """Fail-open warning: long-lived branches whose upstream is themselves.
+
+    ``branch.<name>.remote = "."`` on ``dev``/``main`` makes a plain
+    ``git pull`` a silent no-op (SA-0MVX1M6HH004YPX2): the machine keeps
+    running stale skills and stale worklog data while every tool reports
+    "up to date".
+
+    ``implement.py start`` surfaces that as a **warning only**
+    (SA-0MVX35AUC003CNUD AC2/AC3): a work item is never blocked and no config
+    is ever rewritten — detection is read-only, and repair stays an explicit
+    operator action (``git branch --set-upstream-to=origin/<branch> <branch>``
+    or the detection module's ``--fix``). A missing detection module, a
+    non-repository target or a git failure degrades to a skip.
+
+    Args:
+        repo_root: The main checkout root to inspect.
+
+    Returns:
+        A verdict mapping with ``status`` (``ok``/``warning``/``skipped``),
+        plus ``defect_count`` and ``defects`` when defects were found.
+    """
+    if _detect_self_referential_upstreams is None:
+        LOG.warning(
+            "Self-referential-upstream check skipped: detection module not "
+            "available"
+        )
+        return {"status": "skipped", "reason": "detection module not available"}
+    try:
+        # Worktree branches are reported as ``expected``; only ``defect``
+        # findings are the machine-wide breakage worth warning about.
+        defects = [
+            finding
+            for finding in _detect_self_referential_upstreams(repo_root)
+            if finding.get("type") == "defect"
+        ]
+    except Exception as exc:  # fail-open: never block a work item
+        LOG.warning("Self-referential-upstream check skipped: %s", exc)
+        return {"status": "skipped", "reason": str(exc)}
+    if not defects:
+        return {"status": "ok", "defect_count": 0}
+    branches = ", ".join(str(defect.get("branch")) for defect in defects)
+    LOG.warning(
+        "Long-lived branch(es) track themselves (%s): `git pull` fetches from "
+        "this repository and silently changes nothing. Repair explicitly: "
+        "git branch --set-upstream-to=origin/<branch> <branch> (or "
+        "python3 skill/shared/self_referential_upstream.py --fix).",
+        branches,
+    )
+    return {
+        "status": "warning",
+        "defect_count": len(defects),
+        "defects": defects,
+    }
 
 
 def assert_parent_tracking_untouched(
@@ -6908,6 +6976,17 @@ def _phase_start_locked(
     # (SA-0MVPZG3IQ009IJMO) — bounded, fail-open: a held lock skips the
     # refresh rather than blocking or failing the start.
     repo_root = _get_repo_root() or str(Path.cwd().resolve())
+
+    # ── Step 6.6: Fail-open self-referential-upstream warning (AC2/AC3) ─
+    # A long-lived branch tracking itself makes `git pull` a silent no-op
+    # (stale skills/worklog). Surfaced as a WARNING only: it never blocks a
+    # work item and never rewrites config — repair is an explicit operator
+    # action (SA-0MVX35AUC003CNUD, parent SA-0MVX1M6HH004YPX2).
+    report["steps"] = report.get("steps", {})
+    report["steps"]["self_referential_upstream"] = (
+        warn_self_referential_upstream(repo_root)
+    )
+
     LOG.info("Refreshing parent branch %s from origin...", parent_branch)
     refresh_result = _sync_parent_branch_locked(
         repo_root, parent_branch, work_item_id
