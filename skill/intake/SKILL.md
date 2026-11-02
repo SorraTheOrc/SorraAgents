@@ -69,7 +69,9 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 `--assignee "<AGENT>"` hold; every terminal outcome — `finish`,
 `auto-complete`, `abort`, or a failure reset — clears the assignee
 (`assignee=""`), so a finished or released item is never left on a
-scheduling hold (non-empty assignee = hold; clear to release).
+scheduling hold — per the [assignee-release
+invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant) (canonical
+wording; cross-referenced here rather than restated).
 
 **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No `wl` mutation (description/comment/child creation) while `status: open`. Guard with `StatusLifecycle.require_claimed(<id>)` before any mutation; on in-session resume after producer approval, re-claim first via `StatusLifecycle.ensure_claimed(<id>)` (idempotent). Release to `open` only at true handoff (open-ended wait with no in-session resume), completion, or error/abort.
 

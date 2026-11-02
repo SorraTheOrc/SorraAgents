@@ -1,7 +1,16 @@
+
+# <!-- REFACTOR-SA-0MVYZJMK2001KFM6
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 """Table-driven assignee-release regression matrix for every skill terminal entry point.
 
-A non-empty ``assignee`` is a scheduling hold (AGENTS_GLOBAL.md: "non-empty
-assignee = scheduling hold (producer `Map`; clear to release)"). ``wl next``
+A non-empty ``assignee`` is a scheduling hold; the canonical statement in
+``AGENTS_GLOBAL.md`` (Assignee release invariant) is: "any code path that
+claims an ``assignee`` must release it on every terminal outcome; a persistent
+hold is represented by the producer assignee (``Map``) or
+``needsProducerReview``, never by a lingering agent assignee.". ``wl next``
 skips a held item, so an item left on a lingering *agent* assignee after a
 terminal outcome is invisible to dispatch and blocks re-work.
 

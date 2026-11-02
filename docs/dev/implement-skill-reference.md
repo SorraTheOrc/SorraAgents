@@ -262,10 +262,13 @@ fake, injected commit-evidence provider, recording mutation fake).
 
 ## Assignee release when a kill cannot run an exit hook (SA-0MVVF75ZA007XNKB)
 
-A non-empty `assignee` is a **scheduling hold**: `wl next` skips a held item,
-so an item left on a lingering agent claim is invisible to dispatch. The shared
-`StatusLifecycle` releases the assignee on every exit path it controls, but
-three outcomes never reach a normal exit and need an explicit durable write:
+A non-empty `assignee` is a **scheduling hold** (see the
+[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
+— canonical wording, cross-referenced rather than restated): `wl next` skips
+a held item, so an item left on a lingering agent claim is invisible to
+dispatch. The shared `StatusLifecycle` releases the assignee on every exit
+path it controls, but three outcomes never reach a normal exit and need an
+explicit durable write:
 
 | Outcome | Who does not get to write | Who persists the release |
 |---|---|---|

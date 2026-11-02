@@ -18,7 +18,7 @@ Core principles for AI Agents working with work-items tracked in Worklog (wl) an
 If you already have a current work-item id, continue using it; otherwise ask the operator to create one or get permission to create one.
 
 1. **Claim** — `wl update <id> --status in_progress --assignee <agent>`.
-   Audit tier claims status-neutrally (assignee-CAS `--if-assignee ""`; stays completed/in_review); non-empty assignee = scheduling hold (producer `Map`; clear to release).
+   Audit tier claims status-neutrally (assignee-CAS `--if-assignee ""`; stays completed/in_review); non-empty assignee = scheduling hold — see the [Assignee release invariant](#assignee-release-invariant).
 2. **Define** — `wl show <id> --children --json`; verify clear goal + testable ACs; advance stage `intake_complete`.
 3. **Plan** — break into sub-tasks; `wl create --parent <id> --issue-type <type> --priority <level> --json`; advance stage `plan_complete`.
 4. **Decide** — `wl next --json`; recurse into children until reaching a leaf item; if none remain, go to End session. (`/skill:implement <parent>` recurses automatically.)
@@ -105,6 +105,14 @@ A project may augment a global skill from its repo via
 `extension.json` (machine-readable script data). Absence is a no-op;
 extensions are additive and cannot weaken safety/gating steps — see
 [docs/dev/skill-extensions.md](docs/dev/skill-extensions.md).
+
+## Assignee release invariant
+
+A non-empty `assignee` is a **scheduling hold** (`wl next` skips a held item), so a claim left behind after a run ends makes the item invisible to dispatch. The canonical statement — skill docs and lifecycle references cross-reference this wording rather than restating their own copies:
+
+> any code path that claims an `assignee` must release it on every terminal outcome; a persistent hold is represented by the producer assignee (`Map`) or `needsProducerReview`, never by a lingering agent assignee.
+
+The shared `StatusLifecycle` helper (`skill/shared/status_lifecycle.py`) releases the claim it holds on **every** exit path by default — the successful `completed` transition, the exception/rollback path and the `restore_on_exit` path alike — clearing only the assignee it set on entry (a producer `Map` hold it never claimed is left untouched). The one documented opt-out is `preserve_assignee_on_exit=True`, whose legitimate uses are a deliberate producer/scheduling hold and the `verify_context_reduction` assignee restore; a call site that passes it must explain why in an inline comment.
 
 ## Stage vs Status distinction
 

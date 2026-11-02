@@ -61,14 +61,16 @@ use: `StatusLifecycle.update_status()` or the context-manager pattern in
 `../shared/status_lifecycle.py`.
 
 **Assignee release on every terminal outcome.** Each implement run releases
-the assignee when it ends, regardless of how it ends (assignee-hold
-convention: non-empty assignee = scheduling hold; clear to release):
+the assignee when it ends, regardless of how it ends, per the
+[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
+(canonical wording; cross-referenced here rather than restated):
 
 - successful `finish` clears the assignee together with the
   `completed`/`in_review` transition: the context manager is built with the
   agent's `assignee=`, and `StatusLifecycle` releases the claim it holds on
-  every exit path by default (`preserve_assignee_on_exit=True` is the only,
-  documented, opt-out)
+  every exit path by default (`preserve_assignee_on_exit=True` is the only
+  documented opt-out — its legitimate uses and the inline-comment
+  requirement are documented with the invariant)
 - every failure/abort reset to `open` (`phase_start`, `phase_finish`,
   `phase_abort`, the signal/KeyboardInterrupt safety reset) also passes
   `assignee=""`
