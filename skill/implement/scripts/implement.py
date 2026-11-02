@@ -4186,14 +4186,18 @@ def classify_finish_failure(
             ``None`` when no report could be parsed.
 
     Returns:
-        ``{"kind", "step", "reason", "message"}`` where ``step``/``reason``
-        are ``None`` when no structured failing step resolves.
+        ``{"kind", "step", "reason", "message", "steps"}`` where
+        ``step``/``reason`` are ``None`` when no structured failing step
+        resolves and ``steps`` is the failing report's raw ``steps`` payload
+        (so a consumer can surface the main-checkout lock holder and guard
+        evidence — LP-0MVWEP37K000JU0O AC2).
     """
     fail_safe: dict[str, Any] = {
         "kind": "unknown",
         "step": None,
         "reason": None,
         "message": None,
+        "steps": None,
     }
     if not isinstance(finish_report, dict):
         return dict(fail_safe)
@@ -4207,6 +4211,7 @@ def classify_finish_failure(
         "step": step,
         "reason": reason,
         "message": message,
+        "steps": finish_report.get("steps"),
     }
 
 
@@ -10178,6 +10183,9 @@ def _reset_for_retry_comment(
             f"- Failing `finish` step: `{failure.get('step')}` "
             f"(reason: `{failure.get('reason') or 'unspecified'}`)"
         )
+        desc = _describe_finish_failure(failure)
+        if desc:
+            lines.append(f"- Finish evidence: {desc}")
     lines.extend([
         (
             f"- Worktree reset to: `{ref}` "
@@ -10244,20 +10252,30 @@ def _reset_for_retry_violation(reset_result: dict[str, Any]) -> str:
     return ""
 
 
-def _step_reason_suffix(finish_failure: dict[str, Any]) -> str:
-    """Render the failing ``finish`` step/reason as a message suffix.
+def _describe_finish_failure(finish_failure: dict[str, Any]) -> str:
+    """Render the failing ``finish`` step/reason plus report evidence.
 
-    Naming the real step and reason in the chain-stop message keeps the
-    stopping verdict actionable (LP-0MVWEP292000ODBS AC5 semantics): a
-    producer can tell a genuine gate failure from a transient refusal without
-    reading the child's log. Empty when the failure could not be classified
-    into a structured step.
+    The single message-shape formatter for drive verdicts
+    (LP-0MVWEP37K000JU0O, parent AC5): returns ``"<step>: <reason>"`` — e.g.
+    ``local_dev_fast_forward: local_dev_diverged`` — and appends the
+    main-checkout evidence the failing ``finish`` report carries:
+
+    - ``"; lock held by <holder>"`` from ``steps.main_checkout_lock.holder``;
+    - ``"; offending paths: <paths>; competing work item <id> (pid <n>)"``
+      from the guard's offending paths and concurrent-actor evidence
+      (``steps.main_checkout_guard.verifies[-1]``).
+
+    Every field comes from the structured ``finish_failure`` payload, never
+    from ``report["message"]`` prose. Empty when the failure was not
+    classified into a structured step — the callers then leave their message
+    unchanged (fail-safe).
 
     Args:
         finish_failure: The classified ``finish_failure`` payload, if any.
 
     Returns:
-        ``"; failing finish step: <step> (<reason>)"``, or ``""``.
+        ``"<step>: <reason>"`` plus the evidence suffixes when the report
+        carries them, else ``""``.
     """
     if not isinstance(finish_failure, dict):
         return ""
@@ -10265,7 +10283,61 @@ def _step_reason_suffix(finish_failure: dict[str, Any]) -> str:
     if not step:
         return ""
     reason = finish_failure.get("reason")
-    return f"; failing finish step: {step} ({reason or 'unspecified'})"
+    parts = [f"{step}: {reason or 'unspecified'}"]
+    steps = finish_failure.get("steps")
+    if isinstance(steps, dict):
+        lock = steps.get("main_checkout_lock")
+        holder = lock.get("holder") if isinstance(lock, dict) else None
+        if holder:
+            parts.append(f"lock held by {holder}")
+        guard = steps.get("main_checkout_guard")
+        if isinstance(guard, dict):
+            verifies = guard.get("verifies") or []
+            last = verifies[-1] if verifies else None
+            if isinstance(last, dict):
+                offending = last.get("offending") or []
+                if offending:
+                    paths = ", ".join(str(p) for p in offending)
+                    parts.append(f"offending paths: {paths}")
+                actor = _competing_actor_suffix(
+                    last.get("actor_evidence") or ""
+                )
+                if actor:
+                    parts.append(actor)
+    return "; ".join(parts)
+
+
+def _competing_actor_suffix(actor_evidence: str) -> str:
+    """Render the guard's concurrent-actor evidence, ``""`` when absent.
+
+    The evidence string names the competing work item and pid in the shape
+    ``work item <id> (…); pid <n> with cwd in the main checkout``
+    (:func:`_main_checkout_actor_evidence`); those two fields are surfaced
+    as ``competing work item <id> (pid <n>)``. Any other evidence shape is
+    passed through verbatim so the message never loses information, and
+    ``"unknown"`` yields nothing.
+    """
+    if not actor_evidence or actor_evidence == "unknown":
+        return ""
+    item = re.search(r"work item (\S+)", actor_evidence)
+    pid = re.search(r"pid (\d+)", actor_evidence)
+    if item and pid:
+        wid = item.group(1).rstrip(".,;:")
+        return f"competing work item {wid} (pid {pid.group(1)})"
+    return f"competing actor: {actor_evidence}"
+
+
+def _finish_evidence_suffix(finish_failure: dict[str, Any]) -> str:
+    """Render the failing-``finish`` evidence as a message suffix.
+
+    The chain-stop messages append this inside their trailing parentheses so
+    the stopping verdict names the real failing ``finish`` step and reason —
+    never the generic ``Failed to finish child <id>`` alone
+    (LP-0MVWEP37K000JU0O AC1/AC3, parent AC5). Empty when the failure was
+    not classified.
+    """
+    desc = _describe_finish_failure(finish_failure)
+    return f"; failing finish step/reason: {desc}" if desc else ""
 
 
 def _preserved_ref_comment(
@@ -10294,6 +10366,12 @@ def _preserved_ref_comment(
     failure = finish_failure if isinstance(finish_failure, dict) else {}
     step = failure.get("step") or "unknown"
     reason = failure.get("reason") or "unknown"
+    desc = _describe_finish_failure(failure)
+    step_line = (
+        f"- Failing `finish` step/reason: {desc}"
+        if desc else
+        f"- Failing `finish` step: `{step}` (reason: `{reason}`)"
+    )
     lines = [
         f"Drive refused to reset this child's worktree (`{child_id}`) "
         "because it carries commits.",
@@ -10301,7 +10379,7 @@ def _preserved_ref_comment(
         f"- Worktree tip preserved at: `{preserved.get('ref')}`",
         f"- Preserved commit: `{preserved.get('commit')}`",
         f"- Child state: {reconciliation.get('evidence') or 'unknown'}",
-        f"- Failing `finish` step: `{step}` (reason: `{reason}`)",
+        step_line,
         "",
         "No `git reset --hard` or `git clean -fd` was run, so no committed "
         "work was discarded. Recover the slice from the preserved ref "
@@ -10359,6 +10437,10 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         evidence = _format_timeout_evidence(entry)
         if evidence:
             print(f"     {evidence}")
+        if entry.get("message"):
+            # The verdict's finish-evidence line (``<step>: <reason>`` plus
+            # lock/guard evidence) — LP-0MVWEP37K000JU0O AC5.
+            print(f"     {entry['message']}")
         if entry.get("reason"):
             print(f"     {entry['reason']}")
     print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
@@ -11412,6 +11494,9 @@ def phase_drive(
                         "step": finish_failure.get("step"),
                         "reason": finish_failure.get("reason"),
                         "attempt": attempt,
+                        "message": _describe_finish_failure(
+                            finish_failure
+                        ),
                     })
                     backoff = _drive_infra_backoff_delay(attempt)
                     LOG.warning(
@@ -11425,6 +11510,21 @@ def phase_drive(
                         attempt,
                         infra_retry_limit,
                         backoff,
+                    )
+                    # The retry verdict is durable on the child: the comment
+                    # names the real failing step/reason so a producer can
+                    # tell an infrastructure refusal from a gate failure
+                    # without reading the child's log (parent AC5,
+                    # LP-0MVWEP37K000JU0O AC4).
+                    desc = _describe_finish_failure(finish_failure)
+                    wl_add_comment(
+                        failed_cid,
+                        "Drive retried this child's `finish` after a "
+                        "transient infrastructure refusal"
+                        + (f" ({desc})" if desc else "")
+                        + f". Infra-retry {attempt}/{infra_retry_limit} in "
+                        f"{backoff}s; no session was spawned — the loop "
+                        "re-runs `parent` to retry `finish`.",
                     )
                     sleeper(backoff)
                     continue
@@ -11490,16 +11590,24 @@ def phase_drive(
                         "finish_attempts": finish_attempts[failed_cid],
                         "evidence": reconciliation["evidence"],
                         "reason": reconciliation["reason"],
+                        "message": _describe_finish_failure(
+                            finish_failure
+                        ),
                     })
                     report["terminal_reconciled"] = (
                         report.get("terminal_reconciled", 0) + 1
+                    )
+                    desc = _describe_finish_failure(finish_failure)
+                    suffix = (
+                        f" Finish evidence: {desc}." if desc else ""
                     )
                     wl_add_comment(
                         failed_cid,
                         "Drive reconciled this child after its `finish` "
                         f"failed {finish_attempts[failed_cid]} time(s): "
-                        f"{reconciliation['evidence']}. Recorded as done "
-                        "(`terminal-reconciled`); no reset was performed.",
+                        f"{reconciliation['evidence']}.{suffix} Recorded as "
+                        "done (`terminal-reconciled`); no reset was "
+                        "performed.",
                     )
                     LOG.info(
                         "Reconciled %s after a failed finish: terminal "
@@ -11526,7 +11634,8 @@ def phase_drive(
                         f"(finish-attempt bound {finish_attempt_limit} "
                         f"exhausted again after a reset; child is still "
                         f"non-terminal: "
-                        f"{reconciliation['evidence'] or 'state unreadable'})."
+                        f"{reconciliation['evidence'] or 'state unreadable'}"
+                        f"{_finish_evidence_suffix(finish_failure)})."
                     )
                     report["failed_child"] = failed_cid
                     break
@@ -11576,7 +11685,8 @@ def phase_drive(
                         f"reset refused because the worktree carries "
                         f"commits — tip preserved at "
                         f"{preserved_entry['ref']} "
-                        f"({preserved_entry['commit']}){_step_reason_suffix(finish_failure)})."
+                        f"({preserved_entry['commit']})"
+                        f"{_finish_evidence_suffix(finish_failure)})."
                     )
                     report["failed_child"] = failed_cid
                     break
@@ -11590,7 +11700,8 @@ def phase_drive(
                         f"(finish-attempt bound {finish_attempt_limit} "
                         f"exhausted; child is still non-terminal: "
                         f"{reconciliation['evidence'] or 'state unreadable'}; "
-                        f"recovery reset refused: {reset_result['reason']})."
+                        f"recovery reset refused: {reset_result['reason']}"
+                        f"{_finish_evidence_suffix(finish_failure)})."
                     )
                     report["failed_child"] = failed_cid
                     break
@@ -11613,7 +11724,8 @@ def phase_drive(
                         f"(finish-attempt bound {finish_attempt_limit} "
                         f"exhausted; child is still non-terminal: "
                         f"{reconciliation['evidence'] or 'state unreadable'}; "
-                        f"reset-for-retry refused: {violation})."
+                        f"reset-for-retry refused: {violation}"
+                        f"{_finish_evidence_suffix(finish_failure)})."
                     )
                     report["failed_child"] = failed_cid
                     break
@@ -11645,7 +11757,8 @@ def phase_drive(
                     report["message"] = (
                         f"Child {failed_cid} worktree was reset to "
                         f"{reset_result['ref']} but its status could not be "
-                        f"set to open ({exc}); stopping the drive chain."
+                        f"set to open ({exc}); stopping the drive chain"
+                        f"{_finish_evidence_suffix(finish_failure)}."
                     )
                     report["failed_child"] = failed_cid
                     break
@@ -11660,6 +11773,7 @@ def phase_drive(
                         reset_result.get("discarded_paths") or []
                     ),
                     "evidence": reconciliation["evidence"],
+                    "message": _describe_finish_failure(finish_failure),
                     "reason": (
                         f"finish failed {finish_attempts[failed_cid]} "
                         f"time(s); worktree reset to {reset_result['ref']} "

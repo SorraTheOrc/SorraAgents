@@ -133,6 +133,8 @@ def finishing_failed_report(
     step: str | None = None,
     reason: str | None = None,
     kind: str | None = None,
+    lock_holder: str | None = None,
+    guard_verifies: list | None = None,
 ) -> dict:
     """Script the exact ``phase_parent`` report shape ``_run_finish`` emits.
 
@@ -181,7 +183,10 @@ def finishing_failed_report(
         "children_processed": [],
     }
     if step is not None:
-        finish_report = failing_finish_report(step, reason)
+        finish_report = failing_finish_report(
+            step, reason, lock_holder=lock_holder,
+            guard_verifies=guard_verifies,
+        )
         payload = _production_implement_mod().classify_finish_failure(finish_report)
         if kind is not None and payload["kind"] != kind:
             raise AssertionError(
@@ -385,7 +390,10 @@ def finishing_failed_parent_runner():
 
 
 def failing_finish_report(step: str, reason: str | None = None,
-                          message: str = "Finishing failed") -> dict:
+                          message: str = "Finishing failed",
+                          *,
+                          lock_holder: str | None = None,
+                          guard_verifies: list | None = None) -> dict:
     """Script a ``finish`` subprocess failure report for one structured step.
 
     Mirrors the ``phase_finish`` failure exits: each exit records its
@@ -401,9 +409,9 @@ def failing_finish_report(step: str, reason: str | None = None,
     }
     entry: dict = {"success": False}
     if step == "main_checkout_lock":
-        entry = {"acquired": False, "holder": None}
+        entry = {"acquired": False, "holder": lock_holder}
     elif step == "main_checkout_guard":
-        entry = {"verdict": "fail", "verifies": []}
+        entry = {"verdict": "fail", "verifies": guard_verifies or []}
     elif step == "local_dev_fast_forward":
         entry = {"method": "refused", "reason": reason or "local_dev_diverged"}
     elif step == "push":
@@ -465,6 +473,9 @@ class TestFinishingFailedReportHarness:
             "step": "push",
             "reason": "timeout",
             "message": "Finishing failed",
+            # LP-0MVWEP37K000JU0O: the payload carries the raw ``steps`` so
+            # the verdict messages can surface the lock/guard evidence.
+            "steps": {"push": {"success": False, "reason": "timeout"}},
         }
 
     def test_kind_argument_pins_the_expected_class(self):
@@ -801,6 +812,12 @@ class TestRunFinishFailureThreading:
             "step": "local_dev_fast_forward",
             "reason": "local_dev_diverged",
             "message": "Finishing failed",
+            "steps": {
+                "local_dev_fast_forward": {
+                    "method": "refused",
+                    "reason": "local_dev_diverged",
+                },
+            },
         }
 
     def test_run_finish_keeps_none_sentinel_for_unparseable_failure(
@@ -2476,3 +2493,328 @@ class TestUncommittedOnlyResetScope:
         assert _git("rev-parse", "HEAD", cwd=worktree
                     ).stdout.strip() == fixture["head_rev"]
         assert (worktree / "feature.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVWEP37K000JU0O: drive verdicts surface the real failing finish
+# step/reason and the report evidence (parent AC5)
+# ---------------------------------------------------------------------------
+#
+# Every drive verdict — ``infra-retry``, ``reset-for-retry``,
+# ``terminal-reconciled`` and the chain-stop messages — must name the real
+# failing ``finish`` step and reason (``"<step>: <reason>"``), plus the
+# main-checkout lock holder and/or the guard's offending paths and competing
+# work item when the failing finish report carries them, instead of the
+# generic ``Failed to finish child <id>`` (parent AC5).
+#
+
+
+class TestDescribeFinishFailure:
+    """AC1/AC2: the shared ``_describe_finish_failure`` formatter.
+
+    Returns ``"<step>: <reason>"`` (e.g. ``local_dev_fast_forward:
+    local_dev_diverged``) and appends ``"; lock held by <holder>"`` and
+    ``"; offending paths: <paths>; competing work item <id> (pid <n>)"``
+    when the classified ``finish_failure`` payload's ``steps`` carry them.
+    """
+
+    def test_step_and_reason_only(self, implement_mod):  # noqa: F811
+        m = implement_mod
+        assert m._describe_finish_failure({
+            "kind": "gate", "step": "tests", "reason": "tests_failed",
+        }) == "tests: tests_failed"
+
+    def test_unspecified_reason_defaults_to_unspecified(
+        self, implement_mod,  # noqa: F811
+    ):
+        m = implement_mod
+        assert m._describe_finish_failure({
+            "kind": "gate", "step": "tests", "reason": None,
+        }) == "tests: unspecified"
+
+    def test_empty_when_not_classified(self, implement_mod):  # noqa: F811
+        m = implement_mod
+        assert m._describe_finish_failure(None) == ""
+        assert m._describe_finish_failure({}) == ""
+        assert m._describe_finish_failure({
+            "kind": "unknown", "step": None, "reason": None,
+        }) == ""
+
+    def test_lock_holder_named_from_steps(self, implement_mod):  # noqa: F811
+        """AC2: ``steps.main_checkout_lock.holder`` names the lock holder."""
+        m = implement_mod
+        holder = (
+            "Main-checkout lock at /repo/.worklog/locks/main-checkout.lock "
+            "(holder: work item SA-XYZ, pid 123, started "
+            "2026-11-02T06:00:00Z)"
+        )
+        failure = m.classify_finish_failure(failing_finish_report(
+            "main_checkout_lock", "lock_held", lock_holder=holder,
+        ))
+        desc = m._describe_finish_failure(failure)
+        assert desc.startswith("main_checkout_lock: lock_held")
+        assert f"lock held by {holder}" in desc
+
+    def test_offending_paths_and_competing_actor(self, implement_mod):  # noqa: F811
+        """AC2: ``steps.main_checkout_guard`` offending paths and actor
+        evidence name the offending paths and the competing work item/pid."""
+        m = implement_mod
+        failure = m.classify_finish_failure(failing_finish_report(
+            "main_checkout_guard", "fail",
+            guard_verifies=[{
+                "stage": "pre_push",
+                "at": "2026-11-02T06:00:00Z",
+                "verdict": "fail",
+                "offending": ["src/a.py", "src/b.py"],
+                "actor_evidence": (
+                    "work item SA-123 (worktree /wt/wl-SA-123, started "
+                    "2026-11-02T06:00:00Z); pid 456 with cwd in the main "
+                    "checkout"
+                ),
+            }],
+        ))
+        desc = m._describe_finish_failure(failure)
+        assert "main_checkout_guard: fail" in desc
+        assert "offending paths: src/a.py, src/b.py" in desc
+        assert "competing work item SA-123 (pid 456)" in desc
+
+    def test_guard_without_evidence_omits_suffixes(
+        self, implement_mod,  # noqa: F811
+    ):
+        m = implement_mod
+        failure = m.classify_finish_failure(
+            failing_finish_report("main_checkout_guard", "fail"),
+        )
+        assert m._describe_finish_failure(failure) == "main_checkout_guard: fail"
+
+    def test_malformed_steps_are_graceful(self, implement_mod):  # noqa: F811
+        m = implement_mod
+        assert m._describe_finish_failure({
+            "kind": "infrastructure", "step": "push", "reason": "timeout",
+            "steps": "not-a-dict",
+        }) == "push: timeout"
+        assert m._describe_finish_failure({
+            "kind": "infrastructure", "step": "push", "reason": "timeout",
+            "steps": {"main_checkout_lock": None},
+        }) == "push: timeout"
+        assert m._describe_finish_failure({
+            "kind": "infrastructure", "step": "push", "reason": "timeout",
+            "steps": {
+                "main_checkout_guard": {
+                    "verdict": "fail", "verifies": [],
+                },
+            },
+        }) == "push: timeout"
+
+
+class TestDriveVerdictEvidence:
+    """AC1/AC3/AC4: the four drive verdicts name the real failing step and
+    reason in their messages and child comments (parent AC5)."""
+
+    def test_infra_retry_entries_and_comments_name_step_reason(
+        self, drive_harness,
+    ):
+        """AC1/AC4: each infra-retry entry and its child comment carry
+        ``<step>: <reason>`` (and spawn no session)."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(infra_refusal_report("SA-C1") for _ in range(2)),
+                {"success": True, "next_child": "SA-C1",
+                 "worktree_path": "/wt/SA-C1"},
+                {"success": True, "parent_advanced": True},
+            ]),
+        )
+
+        report = harness.run(delay=lambda _s: None)
+
+        retries = [
+            e for e in report["children_driven"]
+            if e["result"] == "infra-retry"
+        ]
+        assert len(retries) == 2
+        for entry in retries:
+            assert (
+                "local_dev_fast_forward: local_dev_diverged"
+                in entry["message"]
+            )
+        comments = [
+            text for wid, text in harness.comments if wid == "SA-C1"
+        ]
+        assert len(comments) == 2
+        for text in comments:
+            assert (
+                "local_dev_fast_forward: local_dev_diverged" in text
+            )
+        # Finish-only retries never spawn a session.
+        assert harness.spawn_calls == ["SA-C1"]
+
+    def test_reset_for_retry_entry_and_comment_name_step_reason(
+        self, drive_harness, child_worktree,
+    ):
+        """AC1/AC4: the reset-for-retry entry and its discard comment carry
+        the failing step/reason."""
+        worktree = child_worktree["worktree"]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report(
+                    "SA-C1", step="tests", kind="gate",
+                ) for _ in range(3)),
+                {"success": True, "next_child": "SA-C1",
+                 "worktree_path": str(worktree)},
+                {"success": True, "parent_advanced": True},
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path=str(worktree),
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        reset = [
+            e for e in report["children_driven"]
+            if e["result"] == "reset-for-retry"
+        ][0]
+        assert "tests: tests_failed" in reset["message"]
+        comments = [
+            text for wid, text in harness.comments if wid == "SA-C1"
+        ]
+        assert len(comments) == 1
+        assert "tests: tests_failed" in comments[0]
+
+    def test_terminal_reconciled_entry_and_comment_name_step_reason(
+        self, drive_harness,
+    ):
+        """AC1/AC4: the terminal-reconciled entry and its child comment
+        carry the failing step/reason."""
+        child = _child("SA-C1", status="completed", stage="in_review")
+        harness = drive_harness(
+            children=[child],
+            runner=RecordingParent([
+                *(finishing_failed_report(
+                    "SA-C1", step="tests", kind="gate",
+                ) for _ in range(3)),
+                {"success": True, "parent_advanced": True,
+                 "message": "all children terminal"},
+            ]),
+            child_states={"SA-C1": child},
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        entry = report["children_driven"][0]
+        assert entry["result"] == "terminal-reconciled"
+        assert "tests: tests_failed" in entry["message"]
+        comments = [
+            text for wid, text in harness.comments if wid == "SA-C1"
+        ]
+        assert len(comments) == 1
+        assert "tests: tests_failed" in comments[0]
+
+    def test_chain_stop_message_names_step_reason_never_generic_alone(
+        self, drive_harness,
+    ):
+        """AC1/AC3: the chain-stop message names the failing step/reason and
+        the generic ``Failed to finish child <id>`` never appears alone when
+        a classified ``finish_failure`` is available."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report(
+                    "SA-C1", step="tests", kind="gate",
+                ) for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path="",  # no resettable worktree → reset-refused stop
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert "tests: tests_failed" in report["message"]
+        assert (
+            "Failed to finish child SA-C1" not in report["message"]
+            or "tests: tests_failed" in report["message"]
+        )
+
+    def test_chain_stop_names_lock_holder_and_offending_actor(
+        self, drive_harness,
+    ):
+        """AC2: when the failing finish report carries the lock holder /
+        guard offending paths + actor evidence, the chain-stop message names
+        them (never parsed from prose)."""
+        holder = (
+            "Main-checkout lock at /repo/.worklog/locks/main-checkout.lock "
+            "(holder: work item SA-LOCKED, pid 2345, started "
+            "2026-11-02T06:00:00Z)"
+        )
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report(
+                    "SA-C1", step="main_checkout_lock", reason="lock_held",
+                    kind="infrastructure", lock_holder=holder,
+                ) for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+        )
+
+        report = harness.run(
+            infra_retry_limit=1, finish_attempt_limit=1,
+            delay=lambda _s: None,
+        )
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert f"lock held by {holder}" in report["message"]
+        assert "main_checkout_lock: lock_held" in report["message"]
+
+        harness2 = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report(
+                    "SA-C1", step="main_checkout_guard", reason="fail",
+                    kind="infrastructure",
+                    guard_verifies=[{
+                        "stage": "pre_push",
+                        "verdict": "fail",
+                        "offending": ["src/x.py"],
+                        "actor_evidence": (
+                            "work item SA-CLASH (worktree /wt/wt-clash, "
+                            "started 2026-11-02T06:00:00Z); pid 99 with "
+                            "cwd in the main checkout"
+                        ),
+                    }],
+                ) for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+        )
+
+        report2 = harness2.run(
+            infra_retry_limit=1, finish_attempt_limit=1,
+            delay=lambda _s: None,
+        )
+
+        assert report2["success"] is False
+        assert "main_checkout_guard: fail" in report2["message"]
+        assert "offending paths: src/x.py" in report2["message"]
+        assert "competing work item SA-CLASH (pid 99)" in report2["message"]
+
+    def test_emit_phase_report_prints_failing_child_evidence(
+        self, drive_harness, capsys,
+    ):
+        """AC5: the human drive summary prints the failing child's evidence
+        lines (the per-entry message) and the chain-stop message."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(infra_refusal_report("SA-C1") for _ in range(2)),
+                {"success": True, "next_child": "SA-C1",
+                 "worktree_path": "/wt/SA-C1"},
+                {"success": True, "parent_advanced": True},
+            ]),
+        )
+        harness.run(delay=lambda _s: None)
+        out = capsys.readouterr().out
+        assert "local_dev_fast_forward: local_dev_diverged" in out

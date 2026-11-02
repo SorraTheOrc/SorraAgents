@@ -708,7 +708,14 @@ reset and the discarded file list (never a commit hash — `reset-for-retry`
 is limited to uncommitted WIP; a commit-carrying worktree is preserved on
 `refs/wip/<id>` instead), then continues with a fresh session
 (`reset-for-retry`, at most once
-per child per invocation). `parent_advanced: false` therefore always means
+per child per invocation). Every verdict — `infra-retry`,
+`reset-for-retry`, `terminal-reconciled` and the chain-stop messages —
+names the real failing `finish` step and reason (`"<step>: <reason>"`, e.g.
+`local_dev_fast_forward: local_dev_diverged`), plus the main-checkout lock
+holder and/or the guard's offending paths and competing work item when the
+failing `finish` report carries them, instead of a bare
+`Failed to finish child <id>` (LP-0MVWEP37K000JU0O, parent AC5).
+`parent_advanced: false` therefore always means
 real non-terminal or blocked work remains. Full contract:
 [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#drive-failure-recovery-bounded-finish-attempts-reconciliation-and-reset).
 
