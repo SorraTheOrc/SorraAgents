@@ -124,7 +124,36 @@ The regression guard fails the suite if a test mutates the live checkout:
 see the [test skill](../test/SKILL.md#live-repo-mutation-guard-detect-only)
 and [`tests/test_live_repo_mutation_guard.py`](../../tests/test_live_repo_mutation_guard.py).
 
-### 8. Unmocked Audit / Suite Subprocess Spawns
+### 9. Leaking Temp Artefacts
+
+**What it looks like:** A node test harness creates a sandbox tree via
+`mkdtempSync(join(tmpdir(), …))` (a fake skill layout, git fixture, webhook
+config tree) and never removes it — no `after` hook, no `rmSync`.
+
+**Why it's bad:** `/tmp` here is a tmpfs with a per-user quota. Every
+full-suite run leaves thousands of unremoved directories behind; the
+accumulation eventually exhausts the quota and a later run fails with an
+opaque `Unknown system error -122` (EDQUOT) on whichever test happens to write
+next (2026-10-29, SA-0MVTSV5SO008625I and SA-0MVTSV8GO005KZ5V). One exhaustion
+typically fails several unrelated node tests in the same run — e.g.
+`run-release: --help is side-effect free` and
+`run-release: post-release gated on a newly created tag` — because each
+failing harness is simply the next one to write.
+
+**Fix:** Route temp-dir creation through the shared helper
+[`tests/helpers/temp-dir.mjs`](../../tests/helpers/temp-dir.mjs) —
+`makeTempDir(prefix)` registers the directory for removal on process exit and
+wraps quota/space failures in an actionable diagnostic. Alternatively, remove
+the directory in an `after()` hook:
+
+```js
+import { after } from 'node:test';
+
+const dir = mkdtempSync(join(tmpdir(), 'my-harness-'));
+after(() => rmSync(dir, { recursive: true, force: true }));
+```
+
+### 10. Unmocked Audit / Suite Subprocess Spawns
 
 **What it looks like:** A test exercises the audit's child-audit cascade
 (`--audit-children`) or any other path that calls `subprocess.run` to spawn a
@@ -178,8 +207,19 @@ with mock.patch.object(audit_runner.subprocess, "run",
    `tmp_path` path with only `cwd=` for isolation. The guard in
    [`skill/shared/live_repo_guard.py`](../shared/live_repo_guard.py) (armed by
    the repo-root [`conftest.py`](../../conftest.py)) fails the session if a test
-   mutates the checkout.
+   mutates the checkout. The same `conftest.py` arms
+   [`skill/shared/inherited_index_guard.py`](../shared/inherited_index_guard.py),
+   which fails the test that stages into an inherited `GIT_INDEX_FILE` — the
+   finish gate exports its temporary would-be-commit index, so a raw `git add`
+   in a fixture repository would corrupt the gate's evidence
+   (SA-0MVWQ4FZ4003S0GE; see
+   [docs/dev/test-isolation.md](../../docs/dev/test-isolation.md#97-inherited-git_index_file-fixture-rule-and-per-test-guard-sa-0mvwq4fz4003s0ge)).
 8. **Tests that reach the audit child-cascade / suite subprocess must mock
-   `audit_runner.subprocess.run`** (see anti-pattern 8) so no real
+   `audit_runner.subprocess.run`** (see anti-pattern 10) so no real
    `audit_runner.py issue` child is spawned; assert the mocked invocation
    instead.
+9. **Harness sandboxes are removed when the test finishes.** Prefer
+   [`tests/helpers/temp-dir.mjs`](../../tests/helpers/temp-dir.mjs)
+   (`makeTempDir`) so exit-time cleanup is automatic; at minimum delete the
+   directory in an `after()` hook. Never leave `mkdtempSync` trees behind
+   (anti-pattern 9).

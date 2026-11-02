@@ -11,9 +11,10 @@ exits with a configurable code.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
+
+from shared.git_sandbox import fixture_git_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for candidate in (REPO_ROOT, Path(__file__).resolve().parents[2]):
@@ -53,16 +54,23 @@ def _run_hook(
     git_hooks = repo / ".git" / "hooks"
     if with_git_repo:
         subprocess.run(
-            ["git", "init", "-q", str(repo)], check=True, capture_output=True
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            capture_output=True,
+            env=fixture_git_env(),
         )
         git_hooks = repo / ".git" / "hooks"
         subprocess.run(
             ["git", "-C", str(repo), "config", "user.email", "t@t"],
-            check=True, capture_output=True,
+            check=True,
+            capture_output=True,
+            env=fixture_git_env(),
         )
         subprocess.run(
             ["git", "-C", str(repo), "config", "user.name", "t"],
-            check=True, capture_output=True,
+            check=True,
+            capture_output=True,
+            env=fixture_git_env(),
         )
     else:
         git_hooks.mkdir(parents=True, exist_ok=True)
@@ -76,7 +84,7 @@ def _run_hook(
     runner.write_text(_FAKE_RUNNER, encoding="utf-8")
 
     env = {
-        **os.environ,
+        **fixture_git_env(),
         "CONTEXT_BUDGET_SKIP": "1",
         "WORKLOG_SKIP_PRE_PUSH": "1",
         "BRANCH_POLICY_SKIP": "1",
@@ -178,8 +186,12 @@ class TestBypassAndFailClosed:
         """A dev push without run_tests.py must fail closed, not silently pass."""
         repo = tmp_path / "repo"
         repo.mkdir()
-        subprocess.run(["git", "init", "-q", str(repo)], check=True,
-                       capture_output=True)
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            capture_output=True,
+            env=fixture_git_env(),
+        )
         git_hooks = repo / ".git" / "hooks"
         hook_dst = git_hooks / "pre-push"
         hook_dst.write_text(HOOK_PATH.read_text(encoding="utf-8"), encoding="utf-8")
@@ -187,7 +199,7 @@ class TestBypassAndFailClosed:
         # NOTE: no skill/test/scripts/run_tests.py in this repo.
 
         env = {
-            **os.environ,
+            **fixture_git_env(),
             "CONTEXT_BUDGET_SKIP": "1",
             "WORKLOG_SKIP_PRE_PUSH": "1",
             "BRANCH_POLICY_SKIP": "1",

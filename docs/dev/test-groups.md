@@ -90,10 +90,18 @@ order:
    `paths` spec.  The **smallest** (fewest commands) matching group is
    selected.  The `full` group is excluded from selection — it is the
    implicit fallback.
-2. **Changed-file → test-file selector** — the existing convention mapping
-   (source file → test file) is tried.
+2. **Changed-file → test-file selector** — the convention mapping
+   (source file → test file) is tried.  It understands pytest
+   (`test_*.py`), node (`*.test.mjs`) and vitest/TypeScript
+   (`*.test.ts` / `*.spec.ts`) files, and includes new (untracked) files.
 3. **Full suite fallback** — when neither group nor file-level selection
-   produces a subset, the full suite runs.
+   produces a subset, the full suite runs, and the warning names the
+   specific reason.
+
+`suiteCommands` **does not disable** this selection: it defines the full
+suite only.  A repo may therefore declare both `suiteCommands` and `groups`
+and still get a `scope: changed` run when a group's `paths` match the
+change (SA-0MVL7YOMJ006UMDO).
 
 ### Examples
 

@@ -410,3 +410,70 @@ class TestTypeAwareCache:
         summary = run_summary(("all",), cwd=tmp_path, commands=["echo unit-summary"])
         assert summary["success"] is False
         assert "all" in summary["missing"]
+
+
+# ---------------------------------------------------------------------------
+# AC5: hidden-skill-test rule leaves types unaffected (SA-0MVQQ9QJI002K7DY)
+# ---------------------------------------------------------------------------
+
+
+def _add_hidden_skill_test_dir(repo: Path) -> None:
+    """Plant one candidate hidden skill-test dir under ``.pi/skills``."""
+    hidden = repo / ".pi" / "skills" / "alpha" / "tests"
+    hidden.mkdir(parents=True, exist_ok=True)
+    (hidden / "test_alpha.py").write_text(
+        "def test_alpha() -> None:\n    assert True\n", encoding="utf-8",
+    )
+
+
+class TestHiddenSkillTypeParity:
+    """AC5 (SA-0MVQQ9QJI002K7DY): local ``types`` maps still resolve exactly
+    as before, while the ``full``/default type inherits the extra command
+    through :func:`full_suite_commands` (D4).
+    """
+
+    def test_local_type_mapping_is_unchanged(self, tmp_path: Path) -> None:
+        """A locally-defined type returns its own commands verbatim, even when
+        the project ships hidden skill-test dirs — the extra command belongs
+        to ``full`` only.
+        """
+        repo = _make_project(tmp_path)
+        _write_types(repo, {"dev": ["echo dev-profile"]})
+        _add_hidden_skill_test_dir(repo)
+
+        assert resolve_type_commands(repo, "dev") == ["echo dev-profile"]
+
+    def test_full_type_inherits_the_extra_command(self, tmp_path: Path) -> None:
+        """The default/``full`` type resolves through ``full_suite_commands()``
+        (D4), so the extra command appears in its resolved set when candidates
+        exist — no change to the local extension needed.
+        """
+        repo = _make_project(tmp_path)
+        _write_types(repo, {"dev": ["echo dev-profile"]})
+        _add_hidden_skill_test_dir(repo)
+
+        full = resolve_type_commands(repo, "full")
+        assert full == run_tests.full_suite_commands(repo)
+        # The extra hidden-skill command is present alongside the pytest.
+        assert any(".pi/skills/alpha/tests" in c for c in full)
+
+    def test_default_type_without_extension_inherits_it(self, tmp_path: Path) -> None:
+        """No local extension at all: the bare invocation (default type) still
+        yields the extra command through the full suite (AC5 third row).
+        """
+        repo = _make_project(tmp_path)
+        _add_hidden_skill_test_dir(repo)
+
+        assert resolve_type_commands(repo, "full") == run_tests.full_suite_commands(repo)
+        assert any(".pi/skills/alpha/tests" in c for c in resolve_type_commands(repo, "full"))
+
+    def test_local_types_resolve_without_hidden_dir(self, tmp_path: Path) -> None:
+        """Regression: with no candidates the local mapping and the fallback
+        behave exactly as before (F0 baseline).
+        """
+        repo = _make_project(tmp_path)
+        _write_types(repo, {"dev": ["echo dev-profile"]})
+
+        assert resolve_type_commands(repo, "dev") == ["echo dev-profile"]
+        assert resolve_type_commands(repo, "full") == run_tests.full_suite_commands(repo)
+        assert not any(".pi/skills" in c for c in resolve_type_commands(repo, "full"))

@@ -28,6 +28,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+from shared.git_sandbox import init_repo, run_git
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 _SKILL_MD = _REPO_ROOT / "skill" / "implement" / "SKILL.md"
@@ -46,18 +48,13 @@ def _make_repo(tmp_path: Path, with_submodules: bool = False) -> tuple[Path, Pat
     Returns:
         (repo_root, worktree_dir) — worktree_dir does not exist yet.
     """
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    subprocess.run(["git", "init"], cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    repo_root = init_repo(
+        tmp_path / "repo", default_branch="master", sandbox_root=tmp_path
+    )
     (repo_root / "README.md").write_text("# Test")
-    subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "Initial commit"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "branch", "dev"], cwd=str(repo_root), check=True, capture_output=True)
+    run_git(repo_root, ["add", "-A"], check=True)
+    run_git(repo_root, ["commit", "-q", "-m", "Initial commit"], check=True)
+    run_git(repo_root, ["branch", "dev"], check=True)
 
     if with_submodules:
         # Create a .gitmodules file (simulating a repo that declares submodules)
@@ -74,10 +71,11 @@ def _make_repo(tmp_path: Path, with_submodules: bool = False) -> tuple[Path, Pat
 
 def _git_worktree_add(repo_root: Path, worktree_dir: Path) -> None:
     """Create a real git worktree inside the test repo."""
-    subprocess.run(
-        ["git", "worktree", "add", "--track", "-b", "wl-test",
+    run_git(
+        repo_root,
+        ["worktree", "add", "--track", "-b", "wl-test",
          str(worktree_dir), "dev"],
-        cwd=str(repo_root), check=True, capture_output=True,
+        check=True,
     )
 
 

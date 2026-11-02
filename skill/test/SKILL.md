@@ -54,12 +54,31 @@ python3 $(skill_path test)/scripts/run_tests.py --json
 
 **Suite-command resolution order (F2, SA-0MSTMYE79006NA61):** the full suite is `full_suite_commands(project_root)`, resolved in this order:
 
-1. **`.pi/test-config.json` extension file** (repo root) — overrides convention detection entirely: `{"suiteCommands": ["pytest ...", "node --test ..."], "timeoutPerCommand": 600}`. Use it for bespoke suites (e.g. a monorepo package command) that conventions would miss.
-2. **npm-test convention** — `npm --silent test` for repos whose `package.json` declares a `test` script (TCE-like layouts).
-3. **pytest** — `pytest -q -r a --disable-warnings` (canonicalized via `canonicalize_quiet_test_command` from `../test_runner.py`) ONLY when the repo declares a pytest suite (`pytest.ini` / `[tool.pytest.ini_options]` / pytest-style `tests/**/test_*.py` files).
+1. **`.pi/test-config.json` extension file** (repo root) — overrides convention detection entirely: `{"suiteCommands": ["pytest ...", "node --test ..."], "timeoutPerCommand": 600}`. A pinned `suiteCommands` list is returned **verbatim** — the resolver never appends the hidden skill-test command to it, and records a non-fatal notice when the pin leaves hidden skill test directories uncovered (D3). Use it for bespoke suites (e.g. a monorepo package command) that conventions would miss.
+2. **pytest** — `pytest -q -r a --disable-warnings` (canonicalised via `canonicalize_quiet_test_command` from `../test_runner.py`) ONLY when the repo declares a pytest suite (`pytest.ini` / `[tool.pytest.ini_options]` / pytest-style `tests/**/test_*.py` files).
+3. **Project-local hidden skill tests** — exactly **one** extra quiet pytest command scoped to every `.pi/skills/<name>/tests` (or `test`) candidate that exists and holds a `*.py`, e.g. `pytest -q -r a --disable-warnings .pi/skills/proxy-usage-analysis/tests`. pytest's default `norecursedirs` includes `.*`, so the canonical recursive run never traverses `.pi/`; naming the directories **explicitly** collects them while the default pass prunes them. Full scope only — see *Hidden project-local skill tests* below.
 4. **Node suite dirs** — `node --test "tests/node/**/*.mjs" "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per suite dir). Glob patterns required — node v22.22.1 rejects a bare dir (SA-0MSF8KNE3003JDVD). Only suite dirs that **exist** under the target repo are included — missing dirs are skipped (SA-0MSJELL44009XYIL), so a repo without `tests/node` never gets a guaranteed-failing phantom command.
+5. **npm-test convention** — `npm --silent test` for repos whose `package.json` declares a `test` script (TCE-like layouts), emitted ONLY when nothing above resolved (no pinned list, no pytest suite, no hidden skill-test candidates, no node suite dirs).
 
-An empty resolved set (no extension file, no npm test script, no pytest suite, no node dirs) is NOT an error — the runner reports zero commands and the audit skill treats the repo as execution-impossible (fail-open partial, never blocks — F4 AC2).
+An empty resolved set (no extension file, no pytest suite, no hidden skill tests, no node dirs, no npm test script) is NOT an error — the runner reports zero commands and the audit skill treats the repo as execution-impossible (fail-open partial, never blocks — F4 AC2).
+
+**Hidden project-local skill tests (SA-0MVQJSGLY0098DVB).** Pytest's default `norecursedirs` includes `.*`, so a recursive `pytest` run from the repository root never traverses `.pi/` — the tests a project ships with its *project-local* skills (`<root>/.pi/skills/<name>/tests` or `.../test`) are silently absent from the "full" suite (measured on the llm repo: 5 264 collected recursively vs 529 in the skill's own test directory — SA-0MVOBJGB4001TQ8X). pytest's `pytest_ignore_collect` hook only affects *explicit* initial paths, so naming a directory on the command line collects it even though the default recursive run prunes it. The resolver scans exactly that hidden root — a candidate is a directory that exists and contains at least one `*.py` (recursive); candidates are sorted, de-duplicated and `shlex`-quoted for deterministic command strings; no other hidden root (`.claude/`, `.git/`, `.worklog/`) is ever scanned. When at least one candidate exists the resolver emits **exactly one** additional quiet pytest command listing every candidate, immediately after the canonical pytest command and before any node command. One command (not one per directory) keeps a single cache entry, a single timeout budget and the existing semaphore accounting. Emission is independent of `repo_has_pytest_suite()` — a project shipping only skill tests still gets the command; no candidates → the command is not emitted and resolution is byte-identical to today.
+
+**D3 — project-local configuration stays authoritative** (the framework contract this must not weaken — SA-0MVO0EB1U007L7DS, SA-0MV5SQZ0T004R8UG):
+
+| Project-local input | Required behaviour |
+|---|---|
+| `.pi/test-config.json` `suiteCommands` (pinned list) | Returned **verbatim** — no appended command. The resolver records a machine-readable, non-fatal **notice** naming the hidden skill test dirs that the pinned list does not cover, so the gap is visible rather than silent. |
+| `.pi/test-config.json` `timeoutPerCommand`, absent `suiteCommands` | Unchanged; convention detection (incl. the new rule) applies. |
+| `.pi/test-config.json` `groups` | Group `commands` are project-owned and unchanged; the `full` group resolves through `full_suite_commands()` and therefore gains the extra command unless `suiteCommands` pins the list. `paths` matching unchanged. |
+| `.pi/skills_extensions/test/extension.json` `types` | Type→command maps unchanged; the default/full type inherits the extra command through `full_suite_commands()`. |
+| Project pytest configuration (`pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`) already listing a candidate in `testpaths` or `addopts` | That candidate is **skipped** (already collected by the canonical command) — no double execution. |
+
+**Machine-readable notice.** When `suiteCommands` is pinned and does not cover every candidate, the resolver reports a non-fatal notice with the stable code `hidden_skill_tests_uncovered` (`NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED`), `source` (`.pi/test-config.json`), the uncovered `directories` and a human-readable `message` — surfaced as `run_tests: notice [hidden_skill_tests_uncovered] …` on stderr. A notice **never** changes the resolved command set or the exit status: the pinned list stays authoritative and the gap is merely surfaced. `full_suite_notices()` is the single place consumers read resolution notices from.
+
+**No double execution.** A candidate that the project's *own* pytest configuration already collects — via `testpaths` or `addopts` in `pytest.ini`/`setup.cfg`/`tox.ini` or `[tool.pytest.ini_options]` in `pyproject.toml` — is dropped from the extra command, so its tests run exactly once. A token at or above the repo root (`.`, `tests`) does NOT count as coverage: the default `norecursedirs` (`.*`) still prunes `.pi/` from those roots. Unreadable or malformed pytest configuration is treated as absent (never an error) — the rule may only ever *add* the command.
+
+**Full scope only (changed scope unaffected).** `changed_scope_commands()` is untouched by this rule: it never emits the extra command, so hidden skill tests are enforced at **full scope only** — the dev-push pre-push gate, the ship release gate and the audit's full-suite verification. A changed `*.py` under `.pi/skills/<name>/tests` is still selected individually by changed scope like any other test file, for fast feedback. Deep implementation detail: [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md#1-suite-command-resolution-order-f2-sa-0mstmye79006na61).
 
 Output: JSON with per-suite results and a flat `failures` array (`test_name`, `stdout_excerpt`, `stack_trace`).
 
@@ -118,6 +137,23 @@ python3 $(skill_path test)/scripts/run_tests.py --type full --json   # release e
 the same git state within the **2-hour TTL** is served from cache. Details:
 [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
 
+### 0.1 Concurrency lanes (SA-0MVWZQ269009SJXV)
+
+Actual executions are bounded host-wide in **two independent semaphore lanes**
+so a short partial run never queues behind a long full suite:
+
+| Lane | Used by | Namespace | Ceiling (default) |
+|---|---|---|---|
+| `full` | whole-suite runs (`--scope full`, `--type full`) | `test` | `TEST_MAX_CONCURRENCY` (`6`) |
+| `fast` | partial runs (`--scope changed`, `--type unit`/`smoke`/`group:*`, per-test reruns) | `test-fast` | `TEST_MAX_CONCURRENCY_FAST` (`4`) |
+
+Cache hits acquire nothing. Both lanes use `TEST_LOCK_TIMEOUT` (default
+`600` s) as their bounded wait. Every result reports `slot_lane` plus
+`slot_wait_seconds` (queue time) **separately** from `elapsed_seconds`
+(execution time), so a queue-delayed run can never be mistaken for a slow
+suite; the aggregate adds `slot_lanes`. The ceilings are calibrated, not
+guessed: [docs/dev/test-ceiling-validation.json](../../docs/dev/test-ceiling-validation.json).
+
 Query a cached run without executing:
 
 ```bash
@@ -132,16 +168,40 @@ execution-dependent ACs (SA-0MSIU5HFI0024D7W). Failed (non-zero-exit) runs use
 a short 5-minute TTL so transient infra failures are not re-served as current
 results (SA-0MSJELL44009XYIL).
 
+**Evidence runs must bypass the cache (`--no-cache`).** A cache hit is a
+*reused* verdict: nothing executed for the tree in front of you. Any run whose
+result is consumed as evidence — proving a RED witness fails before the fix and
+passes after it, or supplying the green full-suite run an audit, the implement
+finish gate or the pre-push gate relies on — must execute fresh:
+
+```bash
+python3 $(skill_path test)/scripts/run_tests.py --scope changed --no-cache --json
+python3 $(skill_path test)/scripts/run_tests.py --scope full --no-cache --json
+```
+
+The cache is defensive: it never serves a verdict for a git state it could not
+fingerprint (a failing/locked index, a leaked `GIT_DIR`, an unreadable dirty
+path) and it keys each entry on the state the run *left behind*, so a completed
+run is always queryable afterwards. It cannot know whether **you** need fresh
+evidence, though — that is what `--no-cache` is for. Cache-served runs are
+marked `[cached]` in non-JSON output and carry `cached: true` per suite in JSON
+(SA-0MSGN5OJ4002OZKY).
+
 **Scope-aware execution (SA-0MT6BYQHB008DOGC):** `run_tests.py --scope full|changed`
 — the FULL suite by default, or only the tests affected by changes since
-`--target-branch` (default `origin/dev`) via convention mapping + AST
+`--target-branch` (default `origin/dev`) via named test groups, convention
+mapping (pytest, node and vitest/TypeScript `*.test.ts`/`*.spec.ts`) and AST
 import-graph expansion. `full` is the only scope accepted as full-suite
 evidence: changed-scope runs get independent cache keys, record `scope:
 changed` in their metadata, and NEVER populate the full-suite cache entry —
 the audit's read-only full-suite query rejects `changed` entries, so a
-partial run can never satisfy a "full test suite passes" AC. When no subset
-can be selected (no diff base, only non-test changes, custom
-`suiteCommands`), changed scope falls back to the full suite with a warning.
+partial run can never satisfy a "full test suite passes" AC. `suiteCommands`
+describes the **full** suite only and no longer disables changed-scope
+selection (SA-0MVL7YOMJ006UMDO); a declared `groups` entry whose `paths` match
+the change is preferred, then file-level mapping. When no subset can be
+selected the fallback names the **specific** reason (no changed files, no
+changed source/test files, no matching group, no convention-matched tests, or
+no runnable tooling for the selection) instead of a generic list.
 **Deleted/non-existent paths are never selected (LP-0MTZYRTNF0092JKW):**
 `map_changed_to_tests()` excludes any changed path absent from the worktree
 (a deleted or renamed-away test file still appears in `git diff`), and
@@ -185,6 +245,18 @@ non-ignored paths). Non-git project roots are a no-op.
   fails the run;
 - the `refs/worklog/` data namespace (churned by `wl` during a run).
 
+**Working-tree attribution** (SA-0MUIJAHXS003M7BG): a path that was **already
+dirty at run start** and is clean at run end was *resolved* during the run — a
+sibling session committing work it had itself dirtied in the shared checkout —
+so it is churn, not a mutation. It never fails the run; it is reported as an
+informational note instead (`excluded: concurrently resolved working-tree
+change in <checkout>: <path> [<code>]`), carried under `live_repo_excluded` in
+the JSON result and printed as `note:` lines in text output. Every other
+working-tree difference is still a mutation: a path that was clean at run start
+and is modified, deleted or newly created, and a path that stays dirty with a
+different status code. Rules and pinned blind spots:
+[docs/dev/test-isolation.md](../../docs/dev/test-isolation.md) §8.5.
+
 **Reading a failure:** the diff lists every added/deleted/moved ref, added/
 removed/changed config key and added/removed/changed path, e.g.
 
@@ -196,13 +268,15 @@ live-repo mutation detected: the test suite changed the checkout at <root>.
 ```
 
 JSON runs carry the same text under `live_repo_mutation` and set
-`success: false`.
+`success: false`; `live_repo_excluded` (when present) lists the excluded churn.
 
 **Direct `pytest` runs** are covered by a second, reusable guard:
 [`live_repo_guard.py`](../shared/live_repo_guard.py), armed by the
 repo-root [`conftest.py`](../../conftest.py). It compares a cheap refs+config
 fingerprint at each test's teardown and **names the offending test**
-(`pytest.fail`), then compares the full surface at session end. It is a no-op
+(`pytest.fail`), then compares the full surface at session end. Excluded
+working-tree churn from a concurrent session is printed there as a `note:`
+line, never as a failure. It is a no-op
 under `--collect-only`, under xdist workers and for non-git roots. A
 **recursion marker** (`LIVE_REPO_GUARD_ACTIVE`) is exported when a guard arms:
 subprocesses inherit it, so a nested `pytest`/`run_tests.py` invocation stands
@@ -296,7 +370,7 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \
   --ac "<...>|<...>|unmet" \
-  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```

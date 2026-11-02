@@ -20,7 +20,9 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from test.scripts.run_tests import (
+    REPO_ROOT,
     build_parser,
     full_suite_commands,
     node_suite_commands,
@@ -28,6 +30,11 @@ from test.scripts.run_tests import (
 )
 
 PYTEST_CMD = "pytest -q -r a --disable-warnings"
+
+# Prefix of the hidden project-local skill-test surface. Repos in the F0
+# baseline below never ship it, so no resolved command may reference it
+# (SA-0MVQQ9HXV000V6Z4 AC1/AC2).
+HIDDEN_SKILL_TESTS_PREFIX = ".pi/skills"
 
 
 def _write_package_json(root: Path, scripts: dict[str, str] | None = None) -> None:
@@ -179,6 +186,122 @@ class TestBackwardCompatibility:
         (tmp_path / "tests" / "unit").mkdir(parents=True)
         cmds = node_suite_commands(tmp_path)
         assert cmds == ["npm --silent test -- tests/unit"]
+
+
+# ---------------------------------------------------------------------------
+# F0 baseline: today's suite resolution must stay byte-identical
+# (SA-0MVQQ9HXV000V6Z4 AC1/AC2)
+#
+# SA-0MVQJSGLY0098DVB adds a rule that emits one extra pytest command for
+# project-local hidden skill tests under ``.pi/skills/*/tests``, while
+# guaranteeing that a repo with *zero* candidates resolves byte-identically to
+# today (that item's D2). The only way to make that guarantee durable — rather
+# than an inspection claim — is to pin the current resolved sets here, green,
+# before the resolver changes land. These tests must keep passing unchanged
+# after F1–F3.
+# ---------------------------------------------------------------------------
+
+
+def _build_pytest_only_repo(root: Path) -> None:
+    """A pytest-only repo: pytest config marker, no node/package.json."""
+    _write_pytest_ini(root)
+    (root / "tests").mkdir()
+
+
+def _build_pytest_and_node_repo(root: Path) -> None:
+    """A mixed repo: pytest config + an npm test script + a node suite dir."""
+    _write_pytest_ini(root)
+    _write_package_json(root)
+    (root / "tests" / "unit").mkdir(parents=True)
+
+
+def _build_npm_only_repo(root: Path) -> None:
+    """An npm-only repo: package.json test script, no pytest, no node dirs."""
+    _write_package_json(root)
+
+
+def _build_pinned_suite_commands_repo(root: Path) -> None:
+    """A repo pinning its command list via ``.pi/test-config.json``."""
+    _write_pytest_ini(root)
+    _write_test_config(root, ["pytest -q tests", "npm --silent run lint"])
+
+
+BASELINE_REPOS = [
+    pytest.param(_build_pytest_only_repo, [PYTEST_CMD], id="pytest-only"),
+    pytest.param(
+        _build_pytest_and_node_repo,
+        [PYTEST_CMD, "npm --silent test -- tests/unit"],
+        id="pytest-and-node",
+    ),
+    pytest.param(_build_npm_only_repo, ["npm --silent test"], id="npm-only"),
+    pytest.param(
+        _build_pinned_suite_commands_repo,
+        ["pytest -q tests", "npm --silent run lint"],
+        id="pinned-suite-commands",
+    ),
+]
+
+
+@pytest.mark.parametrize("build_repo,expected", BASELINE_REPOS)
+def test_full_suite_resolution_byte_identical_baseline(
+    tmp_path: Path, build_repo, expected: list[str],
+) -> None:
+    """AC1: the resolved set for a repo without hidden skill tests is pinned.
+
+    None of these repos ships ``.pi/skills/*/tests``, so the hidden
+    skill-test rule must emit no extra command for any of them.
+    """
+    build_repo(tmp_path)
+    commands = full_suite_commands(tmp_path)
+    assert commands == expected
+    assert not any(HIDDEN_SKILL_TESTS_PREFIX in c for c in commands), (
+        f"unexpected hidden skill-test command in {commands!r}"
+    )
+
+
+class TestNoHiddenSkillTestsByteIdentity:
+    """AC2: a repo with no ``.pi/skills/*/tests`` resolves exactly as today."""
+
+    def test_framework_layout_without_hidden_skill_tests_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        """The framework layout — pytest config, all three node suite dirs and
+        skill code under ``skill/<name>/tests`` (NOT ``.pi/skills/<name>/tests``)
+        — resolves to exactly the command set it resolves to today."""
+        _write_pytest_ini(tmp_path)
+        for node_dir in ("tests/node", "tests/cli", "tests/unit"):
+            (tmp_path / node_dir).mkdir(parents=True)
+        skill_tests = tmp_path / "skill" / "demo-skill" / "tests"
+        skill_tests.mkdir(parents=True)
+        (skill_tests / "test_demo.py").write_text(
+            "def test_demo() -> None:\n    assert True\n", encoding="utf-8",
+        )
+
+        assert full_suite_commands(tmp_path) == [
+            PYTEST_CMD,
+            'node --test "tests/node/**/*.mjs"',
+            'node --test "tests/cli/**/*.mjs"',
+            'node --test "tests/unit/**/*.mjs"',
+        ]
+
+    def test_sorraagents_checkout_resolution_unchanged(self) -> None:
+        """The SorraAgents checkout itself ships no ``.pi/skills/*/tests``, so
+        its own resolved set stays byte-identical after the rule lands.
+
+        This is the general case named by AC2 (and the parent's D-A3): the
+        framework repo has no hidden skill tests, therefore its full-suite
+        resolution must not gain, lose or reorder a command.
+        """
+        commands = full_suite_commands(REPO_ROOT)
+        assert commands == [
+            PYTEST_CMD,
+            'node --test "tests/node/**/*.mjs"',
+            'node --test "tests/cli/**/*.mjs"',
+            'node --test "tests/unit/**/*.mjs"',
+        ]
+        assert not any(HIDDEN_SKILL_TESTS_PREFIX in c for c in commands), (
+            f"unexpected hidden skill-test command in {commands!r}"
+        )
 
 
 class TestTimeoutResolution:

@@ -82,6 +82,16 @@ hit the same entries because both resolve the same project root.
   the pytest interpreter used (`[pytest interpreter: <path>]`). The concrete
   interpreter/executable is also stored in `metadata.json` (`interpreter`)
   — see *pytest interpreter resolution* below (SA-0MVK154IE007OS3D).
+- **Verdict provenance in results (SA-0MVQHVJEX0071R7G)**: a run result
+  states whether it was served from the cache and, when it was, which entry
+  was reused. `run_suite()` returns `cached` (True only when every command of
+  the suite was served) plus `cache_entries` — one mapping per cache-served
+  command carrying the entry's `command`, `completed_at` (epoch float),
+  `scope` and `fingerprint_kind` (`worktree` or `tree`). `run_all()` /
+  `guarded_run_all()` aggregate the same two keys (`cached` is True only when
+  every selected suite was cached). Consumers such as the implement finish
+  gate therefore record *what* a green verdict is based on rather than only
+  that something passed.
 - **PATH augmentation for user-installed executables (SA-0MSUZAJPC003BS66)**: the
   default runner (`_default_runner` in `test_cache.py`) prepends
   `~/.local/bin` to the subprocess `PATH` when it is not already present, so
@@ -90,6 +100,94 @@ hit the same entries because both resolve the same project root.
   audit runner whose PATH lacks the user-local bin directory). The path stays
   clean for callers that already have the directory configured (no duplicate
   entry).
+
+#### Cache fingerprint contract (SA-0MVQHVHXI007PQAB, SA-0MVQHVKUH009VQMD)
+
+The cache key is `command + fingerprint (+ test_type)`, and the fingerprint's
+*provenance* is part of the entry, not just its value. Two kinds exist, and a
+consumer can never be served one kind's verdict for a request expecting the
+other.
+
+**Worktree fingerprint (the default).** `compute_git_state(cwd, *, strict=False)`
+combines the HEAD SHA with the **content** of every path `git status` reports
+as dirty (tracked, staged, deleted, untracked), so a second edit to an
+already-dirty file is a different state (AH-0MVFGIV6700329SZ). It reflects the
+worktree containing `cwd`; an ambient `GIT_INDEX_FILE` is honoured only when
+it belongs to `cwd`'s own repository (`git_env_for_repo`), never one inherited
+from a foreign fixture repository (SA-0MVTET8KQ0031R6Z). With `strict=True`,
+an unreadable work tree, HEAD, index or dirty path raises
+`GitStateUnavailable` instead of degrading — a degraded fingerprint would make
+every dirty tree share one key (WL-0MVPO9P610055UQ3).
+
+**Tree fingerprint (would-be-commit).** `compute_tree_state(index_file, *,
+cwd=None)` returns the SHA `git write-tree` reports for **`index_file`**,
+run in `cwd` with the shared scrubbed environment plus an explicit
+`GIT_INDEX_FILE`. That SHA is exactly the tree a commit built from that index
+will contain: unlike the worktree fingerprint it sees generated, gitignored
+metadata that is present on disk but untracked, so it binds a verdict to the
+file set the suite actually validated
+(SA-0MVL2NH1G0094FA2 AC4). It is **fail-closed**: a missing repository or an
+unreadable index raises `RuntimeError` rather than falling back to the loose
+worktree fingerprint (that fallback would reintroduce the unattributable
+verdict it exists to prevent). The implement finish gate calls it through its
+temporary index and passes the SHA in as the verdict's fingerprint.
+
+**Provenance kinds.** `FINGERPRINT_KIND_WORKTREE` (`"worktree"`) and
+`FINGERPRINT_KIND_TREE` (`"tree"`) are recorded as `fingerprint_kind` in each
+entry's `metadata.json`. Entries predating the field read as `"worktree"` —
+the historical default — so existing consumers keep their historical hits.
+
+**Explicit-fingerprint override.** `run_cached(..., fingerprint=<sha>)` binds
+a run to a caller-supplied fingerprint (normally a would-be-commit tree SHA):
+
+- the value keys **both** the lookup and the stored entry, and the entry is
+  recorded with `fingerprint_kind="tree"`;
+- the loose `compute_git_state` value is **not computed at all**, so the run's
+  cost and its key cannot drift with unrelated working-tree churn;
+- the supplied value is stored **as-is** after the run — it describes the tree
+  the caller named and cannot be recomputed from a possibly-churned worktree;
+- callers that pass nothing keep the historical worktree keys byte for byte
+  (test-skill CLI, audit, pre-push).
+
+`lookup(..., fingerprint_kind=...)` and `store(..., fingerprint_kind=...)`
+expose the same distinction to callers that manage execution themselves.
+`run_suite()` / `run_all()` / `guarded_run_all()` thread an optional
+`fingerprint` through to the cache, so the finish gate reaches it through the
+same canonical runner as every other consumer.
+
+**Legacy and foreign entries miss (fail closed).** A cache hit requires the
+command, `test_type`, `fingerprint_kind` and fingerprint to match, plus the
+TTL (and, for exactness, the recorded `scope`). Therefore:
+
+- an entry with **no** `fingerprint_kind` (a legacy entry) is read as
+  `"worktree"`, so a **tree request always misses it** and the suite runs;
+- an entry recorded for a **different kind** or a **different tree** is a
+  miss;
+- a corrupt or unreadable entry is a miss and never raises into the caller;
+- `query_cached()` remains a read-only **worktree** query: the finish gate's
+tree-bound entry is intentionally not visible to it (the audit's full-suite
+evidence is recorded at the pushed commit's loose state, not at a
+pre-commit staged tree).
+
+Consequence for the finish gate: no green verdict can be served for a tree
+whose suite never ran. A tree-keyed green exists only where the suite executed
+against that exact tree, and a served green is reported as cached together
+with the reused entry's metadata (see the
+[implement finish-gate contract](implement-skill-reference.md#finish-gate-testing-the-tree-the-commit-produces-sa-0mvl2nh1g0094fa2)).
+
+**`GIT_INDEX_FILE` pass-through (SA-0MVQHV9Y3001RNNW).** The finish gate's
+tree binding depends on the suite inheriting its temporary index, so
+`GIT_INDEX_FILE` must survive the runner's repository-override scrub —
+`scrub_repository_overrides()` and `subprocess_env_with_scrubbed_overrides()`
+preserve a set `GIT_INDEX_FILE` (name and value) while still stripping genuine
+overrides such as `GIT_DIR`. It is deliberately **not** in
+`REPOSITORY_OVERRIDE_ENV_VARS` (`skill/shared/git_sandbox.py`);
+`tests/test_git_index_file_env.py` pins both halves (a scrubbed child
+`git ls-files` sees the temporary index's file set, and a guard test fails if
+`GIT_INDEX_FILE` is ever added to the scrub list). Fixture git commands must
+use a hermetic environment (`shared.git_sandbox.fixture_git_env()`) so they do
+not stage into an inherited index — see
+[test-isolation.md](test-isolation.md#92-prevention-layers-defence-in-depth).
 
 Query a cached run without executing anything:
 
@@ -134,14 +232,45 @@ never blocks a test run and vice-versa. Each workload has its own ceiling.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TEST_MAX_CONCURRENCY` | `2` | Maximum concurrent test-suite executions |
-| `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot |
+| `TEST_MAX_CONCURRENCY` | `6` | Maximum concurrent **full-suite** executions (calibrated — see *Concurrency lanes*) |
+| `TEST_MAX_CONCURRENCY_FAST` | `4` | Maximum concurrent **partial** runs (`--scope changed`, non-`full` types) |
+| `TEST_LOCK_TIMEOUT` | `600` | Max seconds to wait for a free slot in either lane |
 | `TEST_LOCK_JITTER` | `0.1` | Per-waiter stagger fraction of the bounded wait (`0` = off) — see *Staggered-wait contract* below |
 | `VITEST_MAX_WORKERS` | `4` | Maximum workers in a single vitest suite (per-suite fan-out bound) — resolved value is **exported** to every suite command; see *Per-suite vitest worker bound* below |
 
 The numeric env vars are validated at runtime: invalid values produce a stderr
 warning and fall back to the documented default (never breaking the test run).
 Values below 1 are clamped to 1.
+
+### Concurrency lanes (SA-0MVWZQ269009SJXV)
+
+Executions are bounded in two **independent** semaphore namespaces so a short
+partial run can never queue behind a long full suite:
+
+| Lane | Selection | Namespace | Ceiling |
+|---|---|---|---|
+| `full` | `--scope full` **and** `--type full` | `test` | `TEST_MAX_CONCURRENCY` (default 6) |
+| `fast` | `--scope changed`, **or** any `--type` other than `full` (`unit`, `smoke`, `group:<name>`), or a per-test rerun | `test-fast` | `TEST_MAX_CONCURRENCY_FAST` (default 4) |
+
+- The lane is derived from the **resolved** scope: a `--scope changed` run that
+  falls back to the full suite reports — and contends in — the `full` lane.
+- Cache hits never acquire a slot in either lane
+  (SA-0MTG5U75A001F1RG AC4).
+- `TEST_LOCK_TIMEOUT` bounds both lanes; the slot-busy notice names the lane
+  and the ceiling env var that produced it.
+- Every suite result carries `slot_lane` and `slot_wait_seconds` (queue time),
+  kept separate from `elapsed_seconds` (execution time,
+  SA-0MVU8XRBQ000DG9D); the aggregate adds `slot_lanes` and the summed
+  `slot_wait_seconds`. Text output prints a `queued N s for a <lane>-lane test
+  slot` line whenever the wait reaches 1 s.
+
+**Why the ceilings are 6 and 4 (not 2).** The previous default of 2 was an
+uncalibrated first cut. The 2026-10-31 production measurement
+([test-ceiling-validation.json](test-ceiling-validation.json)) found 41 full
+suites at 382–465 s (median 441 s) regardless of whether one or two ran
+concurrently, each suite using < 1 core, the host 92 % CPU idle while this pool
+sat at 100 % capacity, and 7.5–18.2 min slot waits for partial runs whose pytest
+body took 0.65–2.88 s. Queue depth, not compute, was the binding constraint.
 
 **Per-suite vitest worker bound (SA-0MVE98T1M006A17T):** the host-wide
 `TEST_MAX_CONCURRENCY` ceiling bounds how many *suites* run at once, but a
@@ -171,11 +300,13 @@ immediately or crashing. This means multiple agents running tests concurrently
 will serialize gracefully — each waits its turn and succeeds once a slot
 becomes free.
 
-**Failure-notice contract (WL-0MVGUT787000LNDG):** a suite that fails
-WITHOUT structured test failures reports a stable machine-readable
-`notice_code` alongside the human-readable `notice` — `slot_busy`
-(`NOTICE_SLOT_BUSY`), `command_not_found` (`NOTICE_COMMAND_NOT_FOUND`) or
-`suite_timeout` (`NOTICE_SUITE_TIMEOUT`). `run_suite` also carries bounded
+**Failure-notice contract (WL-0MVGUT787000LNDG, SA-0MVU8XRBQ000DG9D):** a
+suite that fails WITHOUT structured test failures reports a stable
+machine-readable `notice_code` alongside the human-readable `notice` —
+`slot_busy` (`NOTICE_SLOT_BUSY`), `command_not_found`
+(`NOTICE_COMMAND_NOT_FOUND`), `suite_timeout` (`NOTICE_SUITE_TIMEOUT`),
+`killed` (`NOTICE_KILLED`) or `unparsed_failure`
+(`NOTICE_UNPARSED_FAILURE`). `run_suite` also carries bounded
 `stdout`/`stderr` tails (`_output_tail`, 4000 chars) and `run_all`
 aggregates them into top-level `notice_codes`/`stdout`/`stderr`. Consumers
 (e.g. `implement.py`'s finish gate) classify failures on the codes — never
@@ -183,6 +314,53 @@ by string-matching the notice text — so rewording a notice can never
 silently reclassify a genuine test failure as infrastructure contention.
 The slot-busy notice text itself is anchored to the exported
 `SLOT_BUSY_NOTICE_PREFIX` constant.
+
+**From codes to remedies.** The finish gate maps these codes onto the reasons it
+reports (`timeout`, `killed`, `unparsed`, `slot_contention`, `test_failure`,
+`infrastructure`) and attaches the deciding facts (`configured_timeout`,
+`elapsed_seconds`, `slot_wait_seconds`, `command`, `exit_code`, `signal`). Read
+the mapping — and the action per reason — in
+[implement-skill-reference.md](implement-skill-reference.md#gate-failure-diagnostics-wl-0mvgut787000lndg)
+and in `skill/implement/SKILL.md` (“Reading a gate failure”); a docs-vs-source
+consistency test keeps the three documents and the producing constants in step.
+
+#### Notice codes (stable strings)
+
+| Code | Meaning |
+| --- | --- |
+| `slot_busy` | No host test slot freed within `TEST_LOCK_TIMEOUT`; no command ran. |
+| `command_not_found` | The suite binary/executable could not be spawned. |
+| `suite_timeout` | The command exceeded `timeoutPerCommand` (`TimeoutExpired`). |
+| `killed` | The child was terminated by a signal (`returncode < 0`, e.g. an OOM kill or a worker crash) and produced no parsable failure. |
+| `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). |
+
+**Precedence.** Structured (parsable) test failures always win: `killed` and
+`unparsed_failure` are set only when `failures` is empty, so a genuine code
+failure is never reclassified as an infrastructure condition. A non-zero
+result served **from cache** is classified too — its stored exit code and
+output are enough, and its elapsed time is reported as `null` (see below).
+
+#### Diagnostic fact fields
+
+Every `run_suite` result (and therefore every `run_all` per-suite entry)
+carries these fields, on green and non-green runs alike, so no consumer has
+to infer what happened from prose:
+
+| Field | Unit / semantics |
+| --- | --- |
+| `configured_timeout` | Seconds (int) — the per-command `timeoutPerCommand` that was applied. |
+| `elapsed_seconds` | Seconds (float) — wall time of the **command executions only**, queue wait excluded. `null` (never `0`) when nothing executed: a fully cache-served suite, or a slot wait that expired before spawning. On a `suite_timeout` result it is how long the command had been running when it was cut off. |
+| `slot_wait_seconds` | Seconds (float) — time spent queued for a host test slot, measured **once** by the pacer's `on_wait` callback (`paced_runner`) and never folded into `elapsed_seconds`. On a `slot_busy` result it is the elapsed bounded wait (nothing executed, so the whole window was queue wait). `0` when no wait occurred. |
+| `exit_code` | The command's process exit code (int), `null` when no child ran (timeout/slot busy/command not found). Negative means signal-terminated. |
+| `signal` | The terminating signal number when `exit_code < 0`, otherwise `null`. |
+
+**Aggregates (`run_all`).** Alongside the untouched per-suite detail under
+`suites`, the aggregate carries `notice_codes`, `elapsed_seconds_total` (sum
+of the measured command executions; `null` when no suite executed anything)
+and `slot_wait_seconds` (sum of queue waits). Execution time and queue wait
+are summed **separately**, so a queued run can never look like a slow suite
+(or vice versa). The CLI's non-green output prints the same facts on a
+`facts:` line.
 
 **Staggered-wait contract (SA-0MVEDOF7A004TSWD):** under a saturated pool,
 \*concurrent* waiters all enqueue with the same `TEST_LOCK_TIMEOUT` bound and,
@@ -309,21 +487,129 @@ runner's auto-execution path, and its read-only cache classification):
    Use it for bespoke suites (e.g. a monorepo package command) that
    conventions would miss. `timeoutPerCommand` overrides the audit runner's
    default per-command timeout (600s, `AUDIT_TEST_SKILL_RUN_TIMEOUT` code
-   constant — not an env var).
-2. **npm-test convention** — `npm --silent test` for repos whose
-   `package.json` declares a `test` script (TCE-like layouts).
-3. **pytest** — `pytest -q -r a --disable-warnings` ONLY when the repo
+   constant — not an env var). A pinned `suiteCommands` list is returned
+   **verbatim** — the hidden skill-test command is never appended to it; when
+   the pin leaves project-local hidden skill test directories uncovered, a
+   machine-readable, non-fatal notice reports the gap (D3, see *Hidden
+   project-local skill tests* below).
+2. **pytest** — `pytest -q -r a --disable-warnings` ONLY when the repo
    declares a pytest suite (`pytest.ini` / `[tool.pytest.ini_options]` /
    pytest-style `tests/**/test_*.py` files) — no phantom pytest for
    no-pytest repos (SA-0MSQ72BVV0011SRU AC3, `repo_has_pytest_suite`).
+3. **Project-local hidden skill tests** — exactly **one** extra quiet pytest
+   command scoped to all `.pi/skills/<name>/tests` (or `test`) candidates
+   when any exist (SA-0MVQJSGLY0098DVB). pytest's default `norecursedirs`
+   includes `.*` → `.pi/` is pruned from a recursive root run, so the
+   canonical pytest command silently misses a project's skill tests; this
+   command names every candidate directory **explicitly**, which pytest
+   collects even though the default recursive pass prunes them. Emitted
+   immediately after the canonical pytest command and before any node
+   command. See *Hidden project-local skill tests* below for the rule, the
+   D3 precedence matrix, the notice and the no-double-execution skip.
 4. **Node suite dirs** — `node --test "tests/node/**/*.mjs"
    "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per
    suite dir); only dirs that exist under the target repo are included.
+5. **npm-test convention** — `npm --silent test`, emitted **only** when
+   nothing above resolved (no pinned list, no pytest suite, no hidden
+   skill-test candidates, no node suite dirs) and `package.json` declares a
+   `test` script (TCE-like layouts).
 
-An empty resolved set (no extension file, no npm test script, no pytest
-suite, no node dirs) is NOT an error: `run_tests.py` reports zero commands
-and the audit skill treats the repo as execution-impossible — fail-open
-partial, never blocks (F4 AC2).
+An empty resolved set (no extension file, no pytest suite, no hidden skill
+tests, no node dirs, no npm test script) is NOT an error: `run_tests.py`
+reports zero commands and the audit skill treats the repo as
+execution-impossible — fail-open partial, never blocks (F4 AC2).
+
+### 1.1. Hidden project-local skill tests (SA-0MVQJSGLY0098DVB)
+
+**Why this exists (the `norecursedirs` gap).** Pytest's default
+`norecursedirs` includes `.*` — every dot-directory is pruned — so a
+recursive `pytest` run from the repository root never traverses `.pi/`:
+the tests a project ships with its *project-local* skills
+(`<root>/.pi/skills/<name>/tests`) are silently absent from the "full"
+suite. Measured on the llm repo: 5 264 collected recursively vs 529 in the
+skill's own test directory (SA-0MVOBJGB4001TQ8X). Pytest's
+`pytest_ignore_collect` hook only affects *explicit* initial paths, so
+naming a directory on the command line collects it while the default
+recursive run stays unchanged — that is the mechanism this rule
+compensates for.
+
+**Detection (D1).** A candidate is `<root>/.pi/skills/<name>/tests` or
+`<root>/.pi/skills/<name>/test` that exists and contains at least one
+`*.py` (recursive, mirroring `repo_has_pytest_suite()`).
+`hidden_skill_test_dirs()` probes only those two literal path levels per
+skill name — sorted and de-duplicated for deterministic command strings —
+and never scans any other hidden root (`.claude/`, `.git/`, `.worklog/`).
+
+**Emission (D2).** When at least one candidate exists,
+`full_suite_commands()` returns **exactly one** additional command in the
+canonical quiet pytest form listing every candidate, e.g.:
+
+```
+pytest -q -r a --disable-warnings .pi/skills/proxy-usage-analysis/tests
+```
+
+One command (not one per directory) keeps a single cache entry, a single
+timeout budget and preserves the existing semaphore accounting
+(`run_tests.py` acquires one host-wide slot per suite execution). Paths are
+`shlex`-quoted. The command is emitted **immediately after the repo's
+canonical pytest command and before any node command**, so the ordering is
+stable. Emission is independent of `repo_has_pytest_suite()`: a project
+with skill tests but no root `tests/` directory still gets the command. No
+candidates → no extra command (byte-identical resolution to today).
+
+**D3 — project-local configuration stays authoritative** (the framework
+contract this must not weaken — SA-0MVO0EB1U007L7DS,
+SA-0MV5SQZ0T004R8UG):
+
+| Project-local input | Required behaviour |
+| --- | --- |
+| `.pi/test-config.json` `suiteCommands` (pinned list) | Returned **verbatim** — no appended command. The resolver records a machine-readable, non-fatal **notice** naming the hidden skill test dirs that the pinned list does not cover, so the gap is visible rather than silent. |
+| `.pi/test-config.json` `timeoutPerCommand`, absent `suiteCommands` | Unchanged; convention detection (incl. the new rule) applies. |
+| `.pi/test-config.json` `groups` | Group `commands` are project-owned and unchanged; the `full` group resolves through `full_suite_commands()` and therefore gains the extra command unless `suiteCommands` pins the list. `paths` matching unchanged. |
+| `.pi/skills_extensions/test/extension.json` `types` | Type→command maps unchanged; the default/full type inherits the extra command through `full_suite_commands()`. |
+| Project pytest configuration (`pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`) already listing a candidate in `testpaths` or `addopts` | That candidate is **skipped** (already collected by the canonical command) — no double execution. |
+
+**No double execution (D3 coverage rule).**
+`uncovered_hidden_skill_test_dirs()` drops any candidate the project's own
+pytest `testpaths`/`addopts` already collects — read from the INI forms
+`pytest.ini`/`setup.cfg`/`tox.ini` (sections `[pytest]`/`[tool:pytest]`)
+and the `pyproject.toml` `[tool.pytest.ini_options]` form — from the extra
+command, so those tests run exactly once. Coverage requires a token that
+resolves to `.pi` itself or a strict descendant of `.pi`: a root-level
+token (`.`, `tests`, `skill`) does **not** count, because the default
+`norecursedirs` (`.*`) still prunes `.pi/` from those roots. Unreadable or
+malformed pytest configuration is treated as absent (never an error) — the
+coverage rule may only ever *add* the hidden skill-test command.
+
+**Machine-readable notice (AC3).** When `suiteCommands` is pinned
+(`extension_suite_commands()` returns a list) and that list does not cover
+every candidate, `full_suite_notices()` — the single place consumers read
+resolution notices from — carries a non-fatal notice:
+
+```json
+{"code": "hidden_skill_tests_uncovered", "source": ".pi/test-config.json",
+ "directories": [".pi/skills/alpha/tests"], "message": "Pinned ..."}
+```
+
+with the stable `NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED` code, the uncovered
+`directories` and a human-readable `message`. The runner prints
+`run_tests: notice [hidden_skill_tests_uncovered] …` on stderr. A notice
+**never** changes the resolved command set or the exit status: the pinned
+list stays authoritative and the gap is merely surfaced (a notice is never
+a failure).
+
+**Full scope only (D5/AC3 — changed scope untouched).** The extra command
+belongs to `full_suite_commands()` — the `full` scope, the `full` group
+and the default `full` type — and is **never** part of a changed-scope
+subset: `changed_scope_commands()` continues to emit explicit-file subset
+commands exactly as before, byte-identical whether or not the repo ships
+candidates (regression-pinned by
+`test_changed_scope_is_identical_with_and_without_candidates`). Hidden
+skill tests are therefore enforced at **full scope only** — the dev-push
+pre-push gate, the ship release gate and the audit's full-suite
+verification. A changed `*.py` under `.pi/skills/<name>/tests` is still
+selected individually by changed scope like any other test file, for fast
+feedback (`test_hidden_skill_test_file_change_selects_that_file`).
 
 **Project-specific note (SorraAgents):** this repo declares
 `.pi/test-config.json` with `{"timeoutPerCommand": 1500}` (added under
@@ -360,7 +646,10 @@ foreign-interpreter candidate is never selected while a working one exists:
    probe.
 5. **`~/.local/bin/pytest`** — retained user-install fallback
    (SA-0MSQ012QG005N22S; user-site bin dirs are absent from non-login
-   shells).
+   shells). It sits between the PATH `pytest` and the final `python3`
+   candidate: a concrete, probed, user-site install that carries the user's
+   dependency set is preferred over the possibly-foreign PATH `python3`
+   interpreter, while still never winning over the runner's interpreter.
 6. **`python3 -m pytest`** — last resort when the runner's interpreter cannot
    run pytest but PATH `python3` can.
 
@@ -381,6 +670,83 @@ remains visible and auditable. Direct `run_cached()` consumers — the audit
 F3 auto-run and the implement finish gate — get the same behaviour through
 `test_cache._default_runner`, which rewrites the executable prefix via
 `executable_test_command()` exactly like `_cached_runner` does.
+
+#### Field verification (AC4, SA-0MVK154IE007OS3D)
+
+**Observed failure (host `RossGameDev`, repo ContentCreator, 2026-10-22, from
+the origin report):** with the old bare-`pytest`-first resolution, a PATH
+`~/.local/bin/pytest` carrying a system-Python shebang (`#!/usr/bin/python3`;
+PEP 668 externally managed, no project dependencies) shadowed the runner's
+interpreter. `python3 <skill>/test/scripts/run_tests.py --type full` then
+exited 2 with 13 collection errors — the first
+`ModuleNotFoundError: No module named 'numpy'` came from
+`.pi/skills/wiki-tts-generate/scripts/tts_generate.py`, plus
+`tests/test_podcast_parts_layout.py` and `tests/test_rss_process_notes.py` —
+while the same tree was green under the repository's canonical runner
+`./scripts/run_tests.sh` (2588 passed, 16 skipped). The red result was cached
+by git state + scope, so one such run poisoned the audit-accepted full-suite
+entry for that commit until a `--force` run replaced it.
+
+**Post-fix behaviour:** the same command now resolves `sys.executable -m
+pytest` (the interpreter carrying the project's dependencies, which precedes
+a PATH `pytest` that fails its probe), executes the same tests the canonical
+runner would, prints `[pytest interpreter: <path>]`, and records the choice
+in the cache entry's `metadata.json` — so the green result matches
+`./scripts/run_tests.sh` and is auditable. The resolution is executed by the
+interpreter the agent started the runner with, which is the repository's
+canonical interpreter (`python3 …/run_tests.py`).
+
+**Measured parity (real ContentCreator checkout, 2026-10-29).** Verified on
+host `rgardler-AI-Laptop` against ContentCreator `main` (`bf46a75`, the
+`packages/ContextHub` submodule initialised, and the vendored
+`.pi/packages/pi-llm-wiki-manual` dependencies installed with `npm ci` —
+without them the repository's own runner fails three
+`tests/test_rebuild_wiki_meta.py` cases on a fresh clone):
+
+| Runner | Command | Result |
+|--------|---------|--------|
+| Canonical | `./scripts/run_tests.sh` | exit 0 — **3286 passed, 2 skipped** across the 7 suites |
+| Test skill | `run_tests.py --type full --force --json` | success — **3286 passed, 2 skipped**, interpreter `/usr/bin/python3` |
+
+Both runners therefore report the same green result, and the skill run names
+the interpreter it used. In this repository the executed pytest command comes
+from the repo-level pin (`.pi/test-config.json` → `suiteCommands` =
+`python3 -m pytest -q -r a --disable-warnings`, tracked separately in
+OSL-0MVJOKJXK009J8ZA), which agrees with the framework resolution. Per
+producer decision 2026-10-29 (AC4), host-independent parity of this kind
+satisfies the field verification; the literal `RossGameDev` host is not
+required.
+
+**Failure condition reproduced end to end (2026-10-29).** With a `pytest`
+first on `PATH` whose `--version` succeeds but whose interpreter cannot
+import the project's dependencies (the `RossGameDev` shape), the pre-fix
+selection — a bare `pytest -q -r a --disable-warnings` — reproduces the field
+failure exactly (`ModuleNotFoundError: No module named 'numpy'`, exit 2),
+while the fixed resolver, run in the same checkout with the same poisoned
+`PATH`, selects the runner's interpreter:
+
+```text
+which(pytest)               = <foreign-pytest-dir>/pytest
+resolve_pytest_command()    = /usr/bin/python3 -m pytest
+executable_test_command("pytest -q -r a --disable-warnings")
+                            = /usr/bin/python3 -m pytest -q -r a --disable-warnings
+```
+
+**Repeatable verification (any host — no `RossGameDev` checkout required):**
+
+```bash
+# The green full-suite run names the interpreter actually used:
+python3 <skill>/test/scripts/run_tests.py --type full --force --json \
+  | jq -r '.suites | to_entries | map(.value.interpreter) | unique[]'
+```
+
+The configuration-independent regression
+`tests/test_pytest_path_resolution.py::test_foreign_pytest_on_path_is_skipped_end_to_end`
+reproduces the shadowing end to end (a temp repo whose PATH holds a
+`pytest` bound to an interpreter that cannot run pytest), asserting that the
+suite executes green under `sys.executable -m pytest`, that the JSON result
+and output name that interpreter, and that the foreign shim never executes
+the suite.
 
 ### 1a. Test types (`--type`) and the local extension contract (SA-0MTJQB2MA008HMO6)
 
@@ -462,15 +828,37 @@ evidence.
 
 **Changed-file → test selection** combines:
 
-1. **Convention mapping** — a changed file maps to its own tests:
+1. **Named test groups** — the smallest group in `.pi/test-config.json`
+   whose `paths` match a changed file wins and its `commands` run
+   (SA-0MUJKF2HP001BR51). `suiteCommands` no longer disables selection: it
+   defines the full suite only, never the changed-scope subset
+   (SA-0MVL7YOMJ006UMDO).
+2. **Convention mapping** — a changed file maps to its own tests:
    `src/foo.py` → `tests/test_foo.py`, a changed `tests/test_x.py` → itself,
-   etc.
-2. **AST import-graph expansion** — the mapping adds test files that import
-the changed module (deterministic, no heuristic coverage tools).
+   a changed `src/utils.ts` → `tests/unit/utils.test.ts`, a changed vitest
+   `*.test.ts` / `*.spec.ts` (and the `.js`/`.tsx` variants) → itself. New
+   (untracked) files are part of the change set so a test created before the
+   first commit is selectable.
+3. **AST import-graph expansion** (Python) — the mapping adds test files
+   that import the changed module (deterministic, no heuristic coverage
+   tools).
 
-Selected test files are passed explicitly (`pytest tests/test_foo.py ...`),
-so a scoped run is deterministic and cache-keyed distinctly from the full
-suite.
+**TypeScript import-graph expansion is deliberately descoped
+(SA-0MVL7YOMJ006UMDO, OPEN QUESTION 1 default).** The TypeScript side uses
+only the conservative stem convention (`src/foo.ts` → `foo.test.ts` /
+`foo.spec.ts` anywhere in the repo), plus a declared `groups` entry. A
+trustworthy TS import graph needs a resolver for `tsconfig` paths and
+package aliases; a wrong graph narrows the run and hides breakage, whereas
+the stem convention can only ever *under*-match (and then fall back to the
+full suite). The full-suite gate at the dev push still covers whatever a
+narrowed selection misses, so under-matching costs time, not correctness.
+Consequence: a changed `src/foo.ts` whose tests are named differently (e.g.
+`tests/cli/commands.test.ts` importing it) falls back to the full suite
+unless a `groups` entry matches the path.
+
+Selected test files are passed explicitly (`pytest tests/test_foo.py ...`,
+`node --test ...`, or `vitest run tests/unit/foo.test.ts`), so a scoped run
+is deterministic and cache-keyed distinctly from the full suite.
 
 **Deleted / non-existent paths (LP-0MTZYRTNF0092JKW).** A deleted or
 renamed-away test file still appears in `git diff` even though it is absent
@@ -486,11 +874,20 @@ this: a scoped pytest exit 4 is treated as "selection unavailable" →
 full-scope fallback, while a genuine failure (exit 1) still blocks.
 
 **Fallback to full scope** (with a logged warning) happens when no subset
-can be selected: no diff base / no changed files, all changed files are
-non-test/unmapped, the selection references only deleted/non-existent paths,
-the repo declares custom `suiteCommands` in `.pi/test-config.json` (not
-introspectable), or the repo has no subsettable tooling. A scoped run never
-silently skips testing.
+can be selected, and the warning names the **specific** reason rather than a
+generic list (SA-0MVL7YOMJ006UMDO):
+
+| Reason | Meaning |
+|---|---|
+| `no changed files` | No diff against the base (and no untracked files). |
+| `no changed source or test files` | Only docs/config changed. |
+| `no matching group and no convention-matched test files` | Groups are declared but none match, and no test maps to the change. |
+| `no convention-matched test files` | No group matched and no test maps to the change. |
+| `selected test files have no runnable suite tooling` | A test is selected (e.g. a `.test.ts`) but no pytest/node/vitest runner is declared. |
+
+A scoped run never silently skips testing. `changed_scope_selection()`
+returns the reason alongside the commands (`None` commands = fallback);
+`changed_scope_commands()` is the thin commands-only wrapper.
 
 **The fallback honours pinned suite commands
 (OSL-0MVNWYRQB0095WXQ).** When the fallback fires, the full-scope command set
@@ -500,11 +897,15 @@ of truth (section 1) — filtered by the requested suite name via
 `node` → commands containing `node`, `all` → every command).
 
 - A repo that pins `suiteCommands` (`{"suiteCommands": ["python3 -m pytest -q"]}`)
-therefore runs the **pinned** command — and the pinned interpreter — for
-`--suite pytest --scope changed`, exactly as `--suite all` does. The legacy
-bare `pytest` token is never substituted on the fallback path, so a scoped run
-can no longer silently re-resolve `pytest` to a different interpreter and
-report false collection errors.
+therefore runs the **pinned** command for `--suite pytest --scope changed`,
+exactly as `--suite all` does. The legacy bare `pytest` token is never
+substituted on the fallback path, so a scoped run can no longer silently
+re-resolve `pytest` to a different interpreter and report false collection
+errors. Selection honours the pin *verbatim* (that is what
+`run_suite`'s `command` result field reports); execution-time
+`executable_test_command()` resolution (SA-0MVK154IE007OS3D) still normalises
+only the pytest interpreter prefix, so `--scope changed` and `--scope full`
+spawn byte-identical commands for the same suite.
 - A **multi-command pin** (mixed pytest + node entries) maps each command to
 its own suite name; `--suite pytest` runs the pytest entries only.
 - When the filtered set is **empty** (e.g. a node-only pin queried as
@@ -513,6 +914,11 @@ its own suite name; `--suite pytest` runs the pytest entries only.
 matching command`) instead of silently running nothing and reporting success.
 - The reporting contract is unchanged: a fallback still records
 `scope: "full"`.
+- Regression coverage: `skill/test/tests/test_run_tests_scope.py` →
+`TestExplicitSuiteFallbackHonoursPins`. Because the execution-time
+interpreter rewrite makes the legacy token and a `python3 -m pytest` pin look
+alike in the spawned argv, the tests assert the selected command source
+(`result["command"]`), which is the pin verbatim on the fixed path.
 
 Direct full-scope runs (`--scope full`) keep the legacy name-based resolution
 for `pytest`/`node` (section 1), and tool-less repos keep their legacy

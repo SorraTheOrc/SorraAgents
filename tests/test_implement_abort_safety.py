@@ -21,6 +21,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import init_repo, run_git
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -129,32 +130,24 @@ def isolated_git_repo(tmp_path):
         - state_path: Path to .implement_state.json in repo_root
     """
     repo_root = tmp_path / "main_repo"
-    repo_root.mkdir()
-    subprocess.run(["git", "init"], cwd=str(repo_root), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    repo_root = init_repo(repo_root, default_branch="master", sandbox_root=tmp_path)
 
     # Create an initial commit
     (repo_root / "README.md").write_text("# Test")
-    subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "commit", "-m", "Initial commit"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    run_git(repo_root, ["add", "-A"], check=True)
+    run_git(repo_root, ["commit", "-q", "-m", "Initial commit"], check=True)
 
     # Create dev branch
-    subprocess.run(["git", "branch", "dev"], cwd=str(repo_root), check=True,
-                   capture_output=True)
+    run_git(repo_root, ["branch", "dev"], check=True)
 
     # Create a worktree
     worktree_dir = tmp_path / "test_worktree"
     worktree_dir = worktree_dir.resolve()
-    subprocess.run(
-        ["git", "worktree", "add", "--track", "-b",
-         "wl-test-branch", str(worktree_dir), "dev"],
-        cwd=str(repo_root), check=True, capture_output=True,
+    run_git(
+        repo_root,
+        ["worktree", "add", "--track", "-b", "wl-test-branch",
+         str(worktree_dir), "dev"],
+        check=True,
     )
 
     # Place .implement_state.json in the repo root as a potential trap

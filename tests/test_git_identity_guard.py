@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import fixture_git_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUARD = REPO_ROOT / "scripts" / "check_git_identity.py"
@@ -50,19 +51,6 @@ _guard = _load_guard_module()
 IdentityState = _guard.IdentityState
 evaluate_identity = _guard.evaluate_identity
 
-#: Repository-override variables that would redirect git away from the
-#: fixture repo (the 2026-09-26 incident mechanism). Strip them so the tests
-#: can never touch the live checkout.
-_OVERRIDE_VARS = (
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-)
-
 #: Every bypass switch ``.githooks/pre-push`` reads. An ambient value leaks
 #: into the hook subprocess and short-circuits a stage the wiring tests must
 #: exercise — e.g. an operator's ``WORKLOG_SKIP_PRE_PUSH=1`` (documented for
@@ -78,8 +66,13 @@ _HOOK_BYPASS_VARS = (
 
 
 def _env(home: Path) -> dict[str, str]:
-    stripped = _OVERRIDE_VARS + _HOOK_BYPASS_VARS
-    env = {k: v for k, v in os.environ.items() if k not in stripped}
+    # Hermetic base (SA-0MVWQ4FZ4003S0GE): every repository-override variable
+    # *and* an inherited GIT_INDEX_FILE are dropped, so a fixture repo can
+    # never redirect git at the live checkout or stage into the finish gate's
+    # temporary index.
+    env = fixture_git_env()
+    for name in _HOOK_BYPASS_VARS:
+        env.pop(name, None)
     env["HOME"] = str(home)
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env.pop("WORKLOG_EXPECTED_EMAIL", None)

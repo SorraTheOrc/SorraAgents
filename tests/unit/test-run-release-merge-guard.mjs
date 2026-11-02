@@ -20,9 +20,9 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
@@ -68,7 +68,7 @@ const LLM_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'llm.js');
  * @returns {{ res: import('node:child_process').SpawnSyncReturns<string>, closeLog: string, notifyLog: string, tmpDir: string }}
  */
 function runReleaseWithMocks(gitMode = 'success') {
-  const tmpDir = mkdtempSync(join(tmpdir(), 'run-release-guard-test-'));
+  const tmpDir = makeTempDir('run-release-guard-test-');
   const skillScriptDir = join(tmpDir, 'skill', 'ship', 'scripts');
   mkdirSync(skillScriptDir, { recursive: true });
 

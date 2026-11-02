@@ -61,6 +61,8 @@ except ModuleNotFoundError as _missing_shared:
 REPO_ROOT = _SKILLS_ROOT.parent
 from code_review.scripts.linter_runner import probe_linter
 from refactor.comment_injection import inject_refactor_comment
+from refactor.path_filters import filter_scannable_paths
+from refactor.scripts.config import DEFAULT_CONFIG_PATH
 from refactor.session_boundary import (
     get_all_source_files,
     get_changed_files,
@@ -281,6 +283,8 @@ def auto_fix_files(
 def detect_session_files(
     parent_branch: str,
     full_project: bool = False,
+    config: Any = None,
+    repo_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Detect files to analyse in the current run.
 
@@ -291,12 +295,26 @@ def detect_session_files(
             of only session changes.  In this mode ``changed`` and
             ``untracked`` are empty and ``all_files`` contains every
             source file found by :func:`get_all_source_files`.
+        config: Optional configuration supplying ``exclude``/``include``
+            path filters (``.refactor.json``).
+        repo_root: Repository root used for ``.gitignore`` resolution.
+            Defaults to the project root of this checkout.
 
     Returns:
         A dict with ``changed``, ``untracked``, and ``all_files`` lists.
+        External paths (defaults, config excludes, gitignored) are removed
+        from all three, so downstream counts and work items never include
+        code that does not belong to the project.
     """
+    root = repo_root if repo_root is not None else REPO_ROOT
+
     if full_project:
-        all_files = get_all_source_files()
+        all_files = filter_scannable_paths(
+            get_all_source_files(),
+            repo_root=root,
+            config=config,
+            require_source_extension=True,
+        )
         return {
             "changed": [],
             "untracked": [],
@@ -305,8 +323,23 @@ def detect_session_files(
 
     changed = get_changed_files(parent_branch=parent_branch)
     untracked = get_untracked_files()
-    all_files: list[str] = []
 
+    # Apply the same scan-scope filter to session paths so external code is
+    # never analysed (and never produces work items or REFACTOR comments).
+    # Non-source changes are kept: session scans report every touched file.
+    # One filter call keeps the gitignore check a single batched git call.
+    kept = set(
+        filter_scannable_paths(
+            [entry["file"] for entry in changed] + list(untracked),
+            repo_root=root,
+            config=config,
+            require_source_extension=False,
+        )
+    )
+    changed = [entry for entry in changed if entry["file"] in kept]
+    untracked = [path for path in untracked if path in kept]
+
+    all_files: list[str] = []
     for entry in changed:
         all_files.append(entry["file"])
     all_files.extend(untracked)
@@ -482,7 +515,9 @@ def refactor_pipeline(
         # Step 1: Detect files (session changes or full project)
         with Timer("step_1_detect_session_files"):
             session = detect_session_files(
-                parent_branch, full_project=full_project,
+                parent_branch,
+                full_project=full_project,
+                config=config,
             )
         report["session_files"] = session
 
@@ -729,23 +764,27 @@ def _run_with_sync(
 
 
 def _load_config(config_path: str | None) -> dict[str, Any] | None:
-    """Load a JSON config file if specified.
+    """Load the refactor configuration.
+
+    When *config_path* is omitted, ``.refactor.json`` in the project root is
+    used if it exists, so a project's declared ``exclude``/``include`` path
+    filters apply without passing ``--config`` explicitly.  The file is
+    deep-merged with the default smell rules, which keeps the detection
+    configuration identical to a run without a config file.
 
     Args:
         config_path: Optional path to a .refactor.json config file.
 
     Returns:
-        The parsed config dict, or None if no path given or load fails.
+        The merged config dict, or None if no config file was found.
     """
-    if not config_path:
-        return None
-    path = Path(config_path)
+    path = Path(config_path) if config_path else REPO_ROOT / DEFAULT_CONFIG_PATH
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text())
+        return load_rules(str(path))
     except (json.JSONDecodeError, OSError) as exc:
-        LOG.warning("Failed to load config %s: %s", config_path, exc)
+        LOG.warning("Failed to load config %s: %s", path, exc)
         return None
 
 

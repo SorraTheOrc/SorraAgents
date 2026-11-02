@@ -8,8 +8,13 @@ set -euo pipefail
 #
 # Version numbering:
 #   Before merging dev into main, this script automatically increments the
-#   version in package.json, commits the change, and creates an annotated git
-#   tag (v<semver>) on the merge commit. The tag is pushed to origin.
+#   version, commits the change, and creates an annotated git tag (v<semver>)
+#   on the merge commit. The tag is pushed to origin.
+#
+#   Version source (by convention, SA-0MVN2B0DJ00135W0): `package.json` when
+#   present, else `pyproject.toml`'s `[project].version` — so Python-only repos
+#   (no package.json) can be released through this pipeline too. The bumped
+#   file is detected the same way and staged generically (VERSION_FILE).
 #
 # Derived version files:
 #   After the dev merge, when package.json declares a `build` script, the
@@ -28,7 +33,8 @@ Options:
   --force         Merge the PR immediately without waiting for status checks
   --work-item-id  Worklog item id to record in logs (optional)
   --bump <type>   Version bump type: patch, minor, or major (default: patch).
-                  The version in package.json is incremented before the merge.
+                  The version in package.json (or pyproject.toml for
+                  Python-only repos) is incremented before the merge.
   -h, --help      Show this help message
 EOF
 }
@@ -153,14 +159,33 @@ git checkout -b "$BRANCH" origin/main
 # ── Version bump (only on actual release, not dry-run) ──────────────
 if [[ "$DRY_RUN" != "true" ]]; then
   BUMPS_SCRIPT="${SCRIPT_DIR}/bump-version.js"
+  # Version-source convention (SA-0MVN2B0DJ00135W0): package.json when present,
+  # else pyproject.toml's [project].version. The bump script resolves the same
+  # way, so staging VERSION_FILE keeps the two in lockstep.
+  VERSION_FILE=""
+  if [[ -f package.json ]]; then
+    VERSION_FILE="package.json"
+  elif [[ -f pyproject.toml ]]; then
+    VERSION_FILE="pyproject.toml"
+  fi
   if [[ -f "$BUMPS_SCRIPT" ]]; then
-    NEW_VERSION=$(node "$BUMPS_SCRIPT" --bump "$BUMP" 2>/dev/null) || {
-      echo "Version bump failed. Check that package.json has a valid version field and node is available." >&2
+    if [[ -z "$VERSION_FILE" ]]; then
+      echo "Version bump failed. Neither package.json nor pyproject.toml was found at the repository root, so the release cannot determine a version source." >&2
+      exit 1
+    fi
+    # Surface the bump script's own diagnostics instead of swallowing them, so
+    # an unresolvable version source says exactly what to fix.
+    BUMP_ERROR_LOG="$(mktemp)"
+    NEW_VERSION=$(node "$BUMPS_SCRIPT" --bump "$BUMP" 2>"$BUMP_ERROR_LOG") || {
+      echo "Version bump failed. Check that package.json or pyproject.toml declares a version (details below) and node is available." >&2
+      sed 's/^/  /' "$BUMP_ERROR_LOG" >&2 || true
+      rm -f "$BUMP_ERROR_LOG"
       exit 1
     }
-    git add package.json
+    rm -f "$BUMP_ERROR_LOG"
+    git add "$VERSION_FILE"
     git commit -m "Bump version to v${NEW_VERSION}"
-    echo "Version bumped to v${NEW_VERSION}"
+    echo "Version bumped to v${NEW_VERSION} ($VERSION_FILE)"
   else
     echo "Warning: bump-version.js not found at $BUMPS_SCRIPT; skipping version bump." >&2
   fi
@@ -197,12 +222,13 @@ else
     git checkout --theirs CHANGELOG.md
     git add CHANGELOG.md
   fi
-  # Auto-resolve package.json conflicts: keep the bumped release version
-  # (the release branch bumped it before the merge; dev may be behind).
-  if git ls-files -u | grep -q 'package.json'; then
-    echo "Resolving package.json merge conflict (keeping bumped version)" >&2
-    git checkout --ours package.json
-    git add package.json
+  # Auto-resolve version-file conflicts: keep the bumped release version
+  # (the release branch bumped it before the merge; dev may be behind). Covers
+  # both version sources — package.json and pyproject.toml (Python-only repos).
+  if [[ -n "${VERSION_FILE:-}" ]] && git ls-files -u | grep -qF "$VERSION_FILE"; then
+    echo "Resolving $VERSION_FILE merge conflict (keeping bumped version)" >&2
+    git checkout --ours "$VERSION_FILE"
+    git add "$VERSION_FILE"
   fi
   if git ls-files -u | grep -q .; then
     echo "Merge failed; please resolve conflicts manually." >&2

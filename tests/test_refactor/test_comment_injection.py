@@ -746,6 +746,164 @@ class TestLinePlacement:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Shebang Preservation
+# ---------------------------------------------------------------------------
+
+
+class TestShebangPreservation:
+    """An injected comment never displaces a leading shebang line.
+
+    A shebang is only honoured as the first line of a file, so prepending the
+    REFACTOR marker block above it silently breaks direct script execution
+    (SA-0MVPUVM8F006270F).
+    """
+
+    def test_shebang_stays_on_first_line(
+        self,
+        temp_dir: Path,
+        sample_smell: dict[str, Any],
+        mock_work_item_id: str,
+    ):
+        """A Python script keeps its shebang on line 1 after injection."""
+        comment_mod = _import_comment_injection()
+
+        file_path = temp_dir / "scripts" / "run.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(
+            "#!/usr/bin/env python3\n"
+            '"""Docstring."""\n'
+            "\n"
+            "print('hello')\n"
+        )
+
+        result = comment_mod.inject_refactor_comment(
+            str(file_path), sample_smell, mock_work_item_id
+        )
+
+        assert result is True
+        content = file_path.read_text()
+        assert content.splitlines()[0] == "#!/usr/bin/env python3", (
+            "the shebang must remain the first line of the file"
+        )
+        # The marker block now follows the shebang, before the docstring.
+        assert "REFACTOR" in content
+        assert content.index("REFACTOR") < content.index('"""Docstring."""')
+        # The original body is untouched.
+        assert "print('hello')" in content
+
+    def test_marker_block_immediately_follows_shebang(
+        self,
+        temp_dir: Path,
+        sample_smell: dict[str, Any],
+        mock_work_item_id: str,
+    ):
+        """No blank line separates the shebang from the marker block."""
+        comment_mod = _import_comment_injection()
+
+        file_path = temp_dir / "scripts" / "tool.sh"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("#!/bin/sh\necho hi\n")
+
+        comment_mod.inject_refactor_comment(
+            str(file_path), sample_smell, mock_work_item_id
+        )
+
+        lines = file_path.read_text().splitlines()
+        assert lines[0] == "#!/bin/sh"
+        assert "REFACTOR" in lines[1], f"expected marker on line 2, got {lines[1]!r}"
+
+    def test_shebang_only_file_is_preserved(
+        self,
+        temp_dir: Path,
+        sample_smell: dict[str, Any],
+        mock_work_item_id: str,
+    ):
+        """A file consisting solely of a shebang keeps it and gains the marker."""
+        comment_mod = _import_comment_injection()
+
+        file_path = temp_dir / "scripts" / "bare.sh"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("#!/bin/bash")
+
+        comment_mod.inject_refactor_comment(
+            str(file_path), sample_smell, mock_work_item_id
+        )
+
+        content = file_path.read_text()
+        assert content.startswith("#!/bin/bash\n"), (
+            f"shebang must be intact and newline-terminated, got {content[:40]!r}"
+        )
+        assert "REFACTOR" in content
+
+    def test_duplicate_detection_works_below_a_shebang(
+        self,
+        temp_dir: Path,
+        sample_smell: dict[str, Any],
+        mock_work_item_id: str,
+    ):
+        """A marker placed below a shebang is still detected, so re-injection
+        stays idempotent (SA-0MVPUVM8F006270F AC4).
+        """
+        comment_mod = _import_comment_injection()
+
+        file_path = temp_dir / "scripts" / "idempotent.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("#!/usr/bin/env python3\nimport os\n")
+
+        assert comment_mod.has_existing_comment(
+            str(file_path), sample_smell["smell_type"]
+        ) is False
+
+        assert comment_mod.inject_refactor_comment(
+            str(file_path), sample_smell, mock_work_item_id
+        ) is True
+
+        # Detected even though the marker now sits below the shebang.
+        assert comment_mod.has_existing_comment(
+            str(file_path), sample_smell["smell_type"]
+        ) is True
+
+        # A second injection is a no-op and the shebang is still line 1.
+        assert comment_mod.inject_refactor_comment(
+            str(file_path), sample_smell, mock_work_item_id
+        ) is False
+        content = file_path.read_text()
+        assert content.splitlines()[0] == "#!/usr/bin/env python3"
+        assert content.count("REFACTOR") == 1, (
+            f"expected exactly one marker block, got {content.count('REFACTOR')}"
+        )
+
+    def test_run_tests_script_keeps_its_shebang_first(self):
+        """The finish-time injection must not leave a marker above the shebang.
+
+        Data-fix pin for the file the refactor step damaged: the module-level
+        shebang invariant and the preserved marker are the only observable
+        properties here (executing the script would run the whole test suite).
+        """
+        script = REPO_ROOT / "skill" / "test" / "scripts" / "run_tests.py"
+        if not script.exists():
+            pytest.skip(f"Script not present: {script}")
+
+        lines = script.read_text().splitlines()
+        assert lines[0] == "#!/usr/bin/env python3", (
+            f"run_tests.py must start with its shebang, got {lines[0]!r}"
+        )
+
+        # AC3: the pre-existing marker is preserved and still precedes the
+        # first line of code, so smell tracking is not dropped.
+        marker_idx = next(
+            (i for i, line in enumerate(lines) if "REFACTOR-SA-0MVPTU74Y005WAY0" in line),
+            None,
+        )
+        assert marker_idx is not None, (
+            "run_tests.py lost its REFACTOR-SA-0MVPTU74Y005WAY0 marker"
+        )
+        assert marker_idx < 5, (
+            f"marker must stay immediately below the shebang, found at line {marker_idx + 1}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests: Error Handling
 # ---------------------------------------------------------------------------
 

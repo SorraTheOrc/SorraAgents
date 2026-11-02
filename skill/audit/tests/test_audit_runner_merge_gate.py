@@ -26,7 +26,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from audit.scripts import audit_runner
 from audit.tests.wl_helpers import make_stateful_runner
-from shared.git_sandbox import commit_all, init_bare_remote, init_repo, run_git
+from shared.git_sandbox import (
+    commit_all,
+    fixture_git_env,
+    init_bare_remote,
+    init_repo,
+    run_git,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -59,10 +65,17 @@ def _git_proc(rc: int, stdout: str = "", stderr: str = "") -> SimpleNamespace:
 
 
 def _git_runner(cwd: Path):
-    """Real-git runner executing every command inside *cwd*."""
+    """Real-git runner executing every command inside *cwd*.
+
+    The environment is hermetic (``fixture_git_env``): the finish gate exports
+    a temporary ``GIT_INDEX_FILE`` for the suite it runs, and a fixture command
+    that inherited it would stage into the gate's index — invalidating the gate
+    evidence for the tree it tested (SA-0MVWS6G0Z0050PD2).
+    """
     def _run(cmd):
         return subprocess.run(list(cmd), cwd=str(cwd), check=False,
-                              text=True, capture_output=True)
+                              text=True, capture_output=True,
+                              env=fixture_git_env())
     return _run
 
 

@@ -18,7 +18,14 @@ in place (audit semaphore, vitest pool caps, wl sync lock).
 - Sampled per-type process counts, load average, and swap every 250 ms
   during the run (`skill/shared/measure_fanout.py`).
 - Harness: `skill/shared/validate_fanout.py`; raw data:
-  `docs/dev/fanout-batch-validation.json`.
+  `docs/dev/fanout-batch-validation.json`. The harness lifts the host-wide
+  `issue` ingress cap (`AUDIT_MAX_HOST_AUDITS`) to the batch size so the
+  `AUDIT_MAX_CONCURRENCY` pi ceiling is the only binding constraint it
+  measures (capacity runs used `AUDIT_MAX_HOST_AUDITS=32` for the same
+  reason), and it removes its throwaway worklog tree when the run ends. Do
+  not set that cap low in the ambient environment when reproducing these
+  numbers: with it below the batch size, audits queue at ingress and can exit
+  non-zero under host load (SA-0MVTV8WQ00014DSK).
 
 ## Results
 

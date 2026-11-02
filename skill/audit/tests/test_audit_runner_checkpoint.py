@@ -550,6 +550,7 @@ class TestBudgetExceededReaudit:
                              "evidence": "done"}]},
         ]
         ctx = _make_ctx(checkpoint=store)
+        ctx.green_run_block = "GREEN-RUN ATTESTATION — test block\n\n"
         ctx.children = [
             {"id": "CHILD-1", "title": "C1",
              "description": "## Acceptance Criteria\n- AC1: c1"},
@@ -568,6 +569,9 @@ class TestBudgetExceededReaudit:
 
         assert rc is None
         review.assert_called_once()
+        # LP-0MVO35BF90021QY6: the budget-exceeded re-audit path forwards the
+        # resolved green-run evidence block to the child screen.
+        assert review.call_args.kwargs["green_run_block"] == ctx.green_run_block
         # The full child dict (with description) was passed, not the
         # description-less restored result.
         assert "AC1: c1" in review.call_args.args[1]["description"]

@@ -1,4 +1,13 @@
 {
+  "_notes": [
+    "Scan scope: vendored code and npm-installed packages are excluded from refactor scans by default, at any depth:",
+    "  node_modules/, vendor/, third_party/, third-party/, site-packages/, bower_components/, jspm_packages/, packages/",
+    "  plus .git/, __pycache__/, build/, dist/, .venv/, venv/, .tox/, .eggs/, *.egg-info/, .worklog/",
+    "The project's .gitignore rules are honoured too, even for tracked files (single batched git check-ignore --no-index call).",
+    "Includes win: \"include\" entries override the defaults, \"exclude\", and .gitignore for the matched paths.",
+    "\"packages/\" is excluded by default (npm-installed); re-include it below if your monorepo keeps its own source there.",
+    "Both path keys are optional: omit them to keep the default behaviour."
+  ],
   "enabled": true,
   "linter": {
     "enabled": true,
@@ -30,5 +39,12 @@
     "feature_envy",
     "inappropriate_intimacy",
     "shotgun_surgery"
+  ],
+  "exclude": [
+    "src/generated",
+    "*.min.js"
+  ],
+  "include": [
+    "packages/my-app-package"
   ]
 }

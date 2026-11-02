@@ -468,7 +468,15 @@ def _fetch_item_state(item_id: str) -> AuditItem:
 
 
 def _restore_item_state(item: AuditItem) -> None:
-    """Restore the pre-audit status/stage (re-audits must not demote items)."""
+    """Restore the pre-audit status/stage (re-audits must not demote items).
+
+    Intentional preserve/restore opt-out (assignee-hold convention): this
+    read-only analysis captured the item's pre-audit assignee and must put it
+    back exactly as it was, including a producer ``Map`` hold. It uses raw
+    ``wl update`` calls rather than ``StatusLifecycle`` precisely so the
+    helper's release-by-default exit can never wipe a hold it did not
+    establish. Pinned by ``tests/test_assignee_release_all_skills.py``.
+    """
     if item.pre_status and item.pre_stage:
         try:
             _wl(["wl", "update", item.item_id,

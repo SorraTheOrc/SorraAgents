@@ -4,14 +4,14 @@
       "id": "/skill:refactor",
       "prompt": "/skill:refactor",
       "intervalDays": 3,
-      "lastTriggeredAt": "2026-10-25T03:04:13.135Z"
+      "lastTriggeredAt": "2026-10-31T07:15:11.398Z"
     },
     {
       "id": "/skill:standup",
       "prompt": "/skill:standup",
       "intervalDays": 1,
       "time": "06:05",
-      "lastTriggeredAt": "2026-10-19T14:45:52.449Z"
+      "lastTriggeredAt": "2026-11-01T06:11:52.948Z"
     }
   ]
 }

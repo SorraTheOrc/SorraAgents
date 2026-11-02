@@ -21,6 +21,23 @@ The helper is idempotent — safe to call when the work item is already in the
 target state. It logs all transitions and raises exceptions on ``wl`` command
 failures so callers can handle them explicitly.
 
+Assignee release (release by default)
+-------------------------------------
+
+A non-empty ``assignee`` is a scheduling hold (``wl next`` skips a held item),
+so leaving an agent's claim behind after a run blocks re-dispatch. The helper
+therefore **releases the assignee on every exit path by default** — the
+successful (``completed``) exit, the exception/rollback exit and the
+``restore_on_exit`` exit — clearing only the assignee *it holds* (the
+``assignee=`` it set on entry). A hold the helper never established (a
+producer's ``Map`` hold on an item it merely transitions) is never wiped.
+
+A caller that legitimately needs the hold to survive passes
+``preserve_assignee_on_exit=True`` and says why in a comment. The legacy
+``clear_assignee_on_exit`` flag is deprecated: it still parses, emits a
+``DeprecationWarning`` and has no behavioural effect (release is already the
+default), so two flags can never contradict each other.
+
 For testing or custom runners, an injectable ``runner`` callable can be passed::
 
     def my_runner(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -59,6 +76,7 @@ import json
 import logging
 import re
 import subprocess
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 
@@ -533,6 +551,23 @@ class StatusLifecycle:
 
     - **Normal exit:** transitions to ``completed`` (optionally advancing stage)
     - **Exception exit:** restores original status (rollback)
+    - **Assignee release (default):** any assignee the context manager holds
+      — the ``assignee=`` it set on entry — is cleared on **every** exit path:
+      the successful (``completed``) exit, the exception/rollback exit and the
+      ``restore_on_exit`` exit. This releases the scheduling hold (non-empty
+      assignee = hold; clear to release) so an item is never left on a
+      lingering agent claim that blocks re-dispatch. Only an assignee the
+      context manager itself holds is cleared: a pre-existing hold on an item
+      it merely transitions (e.g. the producer's ``Map``) is left untouched.
+    - **preserve_assignee_on_exit=True:** the documented opt-out — the
+      assignee is never touched on any exit path. Legitimate uses: a caller
+      that is deliberately keeping the item on a producer/scheduling hold, and
+      a read-only analysis that must restore a pre-existing assignee it
+      captured.
+    - **clear_assignee_on_exit (deprecated):** accepted for backwards
+      compatibility only. It emits a ``DeprecationWarning`` and has **no**
+      behavioural effect (release is already the default), so it can never
+      contradict ``preserve_assignee_on_exit``; remove it from call sites.
     - **restore_on_exit=True:** restores the original status on success too —
       for read-only analysis skills (find-related, refactor, effort-and-risk)
       that must NOT advance the workflow stage. This avoids setting
@@ -543,9 +578,19 @@ class StatusLifecycle:
 
     Args:
         work_item_id: The work item ID (e.g. ``SA-XXXX``).
-        assignee: Optional assignee name. Set on entry; cleared on failure exit.
+        assignee: Optional assignee name. Set on entry; this is the claim the
+            context manager holds, so it is also the value released on every
+            exit path (unless the caller opts out with
+            ``preserve_assignee_on_exit``).
         target_stage: Optional stage value (e.g. ``in_review``) to set
             on successful exit.
+        clear_assignee_on_exit: **Deprecated, no behavioural effect.** Accepted
+            for backwards compatibility; emits a ``DeprecationWarning`` when
+            passed at all. Release is the default — remove the argument.
+        preserve_assignee_on_exit: Opt out of the default release: keep the
+            assignee (and any pre-existing hold) exactly as it is on every
+            exit path. Pass it only when the hold is deliberate, with an
+            inline comment explaining why.
         restore_on_exit: If True, restore the original status on successful
             exit instead of advancing to ``completed``.
         runner: Optional injectable command runner for testing.
@@ -566,6 +611,11 @@ class StatusLifecycle:
 
         # Status is now ``completed``, stage is ``in_review``
 
+        with StatusLifecycle("SA-0ABC123", assignee="agent", target_stage="in_review"):
+            implement()
+
+        # Status is ``completed`` and the agent's claim is released
+
         with StatusLifecycle("SA-0ABC123", restore_on_exit=True):
             find_related_work()
 
@@ -579,12 +629,24 @@ class StatusLifecycle:
         assignee: str | None = None,
         target_stage: str | None = None,
         restore_on_exit: bool = False,
+        clear_assignee_on_exit: bool | None = None,
+        preserve_assignee_on_exit: bool = False,
         runner: Runner | None = None,
     ) -> None:
+        if clear_assignee_on_exit is not None:
+            warnings.warn(
+                "StatusLifecycle(clear_assignee_on_exit=...) is deprecated and "
+                "has no effect: assignee release is now the default. Remove "
+                "the argument; a caller that must keep the hold passes "
+                "preserve_assignee_on_exit=True instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._work_item_id = work_item_id
         self._assignee = assignee
         self._target_stage = target_stage
         self._restore_on_exit = restore_on_exit
+        self._preserve_assignee_on_exit = preserve_assignee_on_exit
         self._runner = runner or _default_runner
         self._original_status: str = "open"  # safe default
         self._did_set_in_progress: bool = False
@@ -821,7 +883,7 @@ class StatusLifecycle:
         """
         if exc_type is not None:
             # Exception path — restore original status
-            self._restore_original()
+            self._restore_original(reason="failure")
             # Do NOT suppress the exception
             return None
 
@@ -829,7 +891,7 @@ class StatusLifecycle:
             # Read-only mode — restore the original status on success too so
             # the item is never advanced to ``completed`` (which the wl CLI
             # rejects for idea/intake_complete/plan_complete stages).
-            self._restore_original()
+            self._restore_original(reason="restore_on_exit")
             LOG.info(
                 "Restored original status=%s for %s (restore_on_exit)",
                 self._original_status,
@@ -842,6 +904,13 @@ class StatusLifecycle:
             kwargs: dict = {"status": "completed", "runner": self._runner}
             if self._target_stage is not None:
                 kwargs["stage"] = self._target_stage
+            if self._should_release_assignee():
+                # Release the scheduling hold together with the completed
+                # transition (assignee-hold convention: non-empty assignee =
+                # hold; clear to release). Release is the default — only the
+                # documented ``preserve_assignee_on_exit`` opt-out suppresses
+                # it — so a completed item is never left on an agent claim.
+                kwargs["assignee"] = ""
             self.update_status(self._work_item_id, **kwargs)
             LOG.info(
                 "Set status=completed for %s (stage=%s)",
@@ -861,22 +930,46 @@ class StatusLifecycle:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _restore_original(self) -> None:
-        """Restore the original status (and clear assignee on failure)."""
+    def _should_release_assignee(self) -> bool:
+        """Whether the exit path clears the assignee (release-by-default).
+
+        Release is the default on **every** exit path (success, rollback and
+        ``restore_on_exit``), so a caller cannot reintroduce a scheduling hold
+        by omission. It stays deliberately narrow: only an assignee this
+        context manager holds — the ``assignee=`` it set on entry — is ever
+        cleared. A hold it never established (a producer's ``Map`` hold on an
+        item it merely transitions) is left untouched, so the release can
+        never silently widen to someone else's hold.
+
+        Returns:
+            ``True`` when the exit path should write ``--assignee ""``.
+        """
+        if self._preserve_assignee_on_exit:
+            # Documented opt-out: the caller owns the hold (producer hold, or a
+            # pre-existing assignee it restores itself).
+            return False
+        return self._assignee is not None
+
+    def _restore_original(self, *, reason: str = "failure") -> None:
+        """Restore the original status (releasing a held assignee)."""
         if not self._did_set_in_progress:
             return  # Nothing was changed, nothing to restore
 
         try:
             kwargs: dict = {"status": self._original_status, "runner": self._runner}
-            # Clear assignee on failure to release the item
-            if self._assignee is not None:
+            release = self._should_release_assignee()
+            if release:
+                # Release the scheduling hold on the way out (default on every
+                # exit path) so an aborted/read-only run never leaves the item
+                # on an agent claim.
                 kwargs["assignee"] = ""
             self.update_status(self._work_item_id, **kwargs)
-            extra = ", assignee cleared" if self._assignee is not None else ""
+            extra = ", assignee cleared" if release else ""
             LOG.info(
-                "Restored status=%s for %s (failure exit%s)",
+                "Restored status=%s for %s (%s exit%s)",
                 self._original_status,
                 self._work_item_id,
+                reason,
                 extra,
             )
         except RuntimeError:

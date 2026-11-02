@@ -564,21 +564,22 @@ class TestLiveOutput:
             log = Path(td) / "buffered.log"
             log.write_text("")
             # Default (block-buffered) stdout: nothing reaches the file for a while.
-            job = subprocess.Popen(
-                [sys.executable, "-c",
-                 "import time\nfor i in range(5):\n    print('buffered line')\n    time.sleep(1)"],
-                stdout=open(log, "w"),
-                stderr=subprocess.STDOUT,
-            )
-            try:
-                result = _run(
-                    ["--pid", str(job.pid), "--timeout", "3", "--interval", "1"]
+            with open(log, "w") as log_fh:
+                job = subprocess.Popen(
+                    [sys.executable, "-c",
+                     "import time\nfor i in range(5):\n    print('buffered line')\n    time.sleep(1)"],
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
                 )
-                assert "block-buffering" in result.stdout, result.stdout
-                assert "python3 -u" in result.stdout or "stdbuf" in result.stdout
-            finally:
-                job.kill()
-                job.wait(timeout=20)
+                try:
+                    result = _run(
+                        ["--pid", str(job.pid), "--timeout", "3", "--interval", "1"]
+                    )
+                    assert "block-buffering" in result.stdout, result.stdout
+                    assert "python3 -u" in result.stdout or "stdbuf" in result.stdout
+                finally:
+                    job.kill()
+                    job.wait(timeout=20)
 
     def test_progress_line_reports_process_vitals(self):
         """AC9: each poll emits a compact progress line with state/cpu/rss/threads/elapsed."""

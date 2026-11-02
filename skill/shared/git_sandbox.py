@@ -19,6 +19,14 @@ SA-0MUG30IIR00978CW):
    reports additions, removals and moves. The regression guards (F4/F5) use
    these to fail a run that mutated its own checkout.
 
+   ``snapshot_guarded_roots`` / ``diff_guarded_roots`` extend that pair to
+   **every checkout a guarded run can reach**: the guarded root itself plus,
+   when the guarded root is a linked worktree, its **main checkout**
+   (WL-0MVPE2BY9001CR9O). A worktree-scoped run shares one object store and a
+   symlinked ``node_modules`` with the main checkout, so a run started in
+   ``<main>/.worklog/worktrees/<wl-…>`` can unlink tracked files in ``<main>``
+   while a root-only snapshot pair reports a clean run.
+
 Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
 
 - **stdlib-only** — no ``shared.*`` or ``test.*`` imports, so the repo-root
@@ -47,6 +55,26 @@ Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
   non-excluded key, working-tree contamination, and moves of non-excluded
   refs (SA-0MUIA3OE40001QJX); a ``refs/heads/dev``-only ref move is no longer
   a standalone incident signal (see ``docs/dev/test-isolation.md`` §8.4).
+
+**Working-tree attribution rule (SA-0MUIJAHXS003M7BG).** The working-tree
+surface is attributed by *start-of-run provenance*, derived only from git
+plumbing — the two ``git status --porcelain=v1 -uall`` snapshots: a status
+entry that **disappeared** was non-clean at snapshot start and is clean at
+snapshot end, i.e. the path was **resolved inside the guard window**. A
+hermetic suite never commits, checks out or reverts, so such a resolution is
+concurrent churn (a sibling session committing work it had already dirtied in
+the shared checkout) and is excluded from the verdict, reported instead as an
+informational note (``EXCLUDED_CHURN_NOTE_PREFIX``, AC1/AC3). Everything else
+stays a mutation (AC2): a path that was **clean at snapshot start** and is
+modified, deleted or created at snapshot end, and a path that is *still* dirty
+with a different status code. Derivations are status codes and snapshot
+provenance only — never a ``wl-*`` or path-name pattern (AC4).
+
+Pinned blind spots (AC4, ``TestWorkingTreeAttributionBoundaries``): a suite
+that reverts or deletes another session's *uncommitted* work is masked (the
+path was pre-dirty, so its resolution is attributed), the clean→dirty
+false-positive direction is deliberately retained, and a content-only change
+to an already-dirty path is invisible to a status-code surface.
 """
 
 from __future__ import annotations
@@ -59,6 +87,7 @@ from typing import Any
 
 #: Repository-overriding git environment variables. Git honours these over
 #: ``cwd``; a leaked value makes an isolated fixture mutate the named repo.
+ENV_GIT_INDEX_FILE = "GIT_INDEX_FILE"
 REPOSITORY_OVERRIDE_ENV_VARS: tuple[str, ...] = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -96,6 +125,12 @@ CONCURRENCY_EXCLUDED_REF_EXACT = "refs/heads/dev"
 #: plumbing namespaces (never a ``wl-*`` name pattern) so the incident's own
 #: fixture branches remain detectable.
 CONCURRENCY_EXCLUDED_REF_NAMESPACES: tuple[str, ...] = ("refs/remotes/origin/",)
+
+#: Prefix of the informational note emitted when a working-tree difference is
+#: attributed to concurrent churn and therefore excluded from the verdict
+#: (SA-0MUIJAHXS003M7BG AC3). Emitted — never silent — so a reviewer can tell
+#: an excluded foreign change from a clean run.
+EXCLUDED_CHURN_NOTE_PREFIX = "excluded: concurrently resolved working-tree change"
 
 
 def _is_concurrency_excluded_ref(ref: str) -> bool:
@@ -214,6 +249,97 @@ def sanitized_git_env() -> dict[str, str]:
     return scrub_repository_overrides(os.environ)
 
 
+def fixture_git_env(
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Environment for **fixture** git commands: hermetic, own index.
+
+    In addition to the repository-override scrub, an ambient
+    ``GIT_INDEX_FILE`` is removed. The finish gate exports a temporary index
+    for the suite it runs (SA-0MVQHVGFR006W8LG) and ``GIT_INDEX_FILE``
+    deliberately survives ``scrub_repository_overrides`` so tests can observe
+    that staged tree (F3, SA-0MVQHV9Y3001RNNW). A hermetic fixture must
+    therefore drop it explicitly, or its ``git init``/``add``/``commit``
+    would write into the *gate's* index instead of the fixture's own — which
+    is exactly what happens when the suite itself runs under the gate.
+
+    Callers that intentionally target a specific index pass it explicitly
+    (``run_git(..., env={"GIT_INDEX_FILE": path})``); the explicit value wins.
+    """
+    env = scrub_repository_overrides(base)
+    env.pop("GIT_INDEX_FILE", None)
+    return env
+
+
+def git_env_for_repo(repo: str | os.PathLike[str]) -> dict[str, str]:
+    """Environment for a git command that **inspects** *repo*.
+
+    Repository overrides are scrubbed exactly as :func:`sanitized_git_env`
+    does. An ambient ``GIT_INDEX_FILE`` is kept **only when it belongs to
+    *repo*** — i.e. the index lives inside *repo*'s git directory — and
+    dropped otherwise.
+
+    Why (SA-0MVTET8KQ0031R6Z): the finish gate exports a temporary
+    would-be-commit index for the suite it runs (SA-0MVQHVGFR006W8LG), so the
+    repository under test must be inspected through that index. Every other
+    repository — a test fixture — must not inherit it: git applies an
+    inherited index to whatever repository ``cwd`` names, so a fixture would
+    report another repository's staged files as its own changes, and any
+    command that refreshes the index would write into the gate's index and
+    invalidate the gate's evidence for the tree it tested.
+
+    Ownership is decided by the index path lying inside ``git rev-parse
+    --absolute-git-dir`` for *repo* (works for linked worktrees, whose git dir
+    is ``<main>/.git/worktrees/<name>``). Any uncertainty — git unavailable,
+    a non-repository *repo*, a relative override — drops the variable, the
+    hermetic default.
+
+    Args:
+        repo: The repository the git command operates on.
+
+    Returns:
+        A child environment mapping for the git subprocess.
+    """
+    env = sanitized_git_env()
+    index_file = env.get(ENV_GIT_INDEX_FILE)
+    if not index_file:
+        return env
+    git_dir = _absolute_git_dir(repo)
+    if git_dir is None:
+        env.pop(ENV_GIT_INDEX_FILE, None)
+        return env
+    try:
+        index_path = Path(index_file).expanduser().resolve()
+    except (OSError, RuntimeError):
+        env.pop(ENV_GIT_INDEX_FILE, None)
+        return env
+    if not index_path.is_relative_to(git_dir):
+        env.pop(ENV_GIT_INDEX_FILE, None)
+    return env
+
+
+def _absolute_git_dir(repo: str | os.PathLike[str]) -> Path | None:
+    """Return *repo*'s absolute git directory, or ``None`` when undeterminable."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"],
+            cwd=str(repo),
+            env=sanitized_git_env(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return Path(proc.stdout.strip()).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
 def run_git(
     cwd: str | os.PathLike[str],
     args: list[str] | tuple[str, ...],
@@ -229,7 +355,7 @@ def run_git(
     Raises:
         GitSandboxError: when *check* is true and git exits non-zero.
     """
-    base_env = sanitized_git_env()
+    base_env = fixture_git_env()
     if env:
         base_env.update(env)
     cmd = [
@@ -561,6 +687,152 @@ def main_checkout_root(
     return None
 
 
+#: Role label for the checkout a guarded run was started in.
+GUARDED_ROOT_ROLE = "guarded"
+
+#: Role label for the main checkout of a guarded root that is a linked worktree.
+MAIN_CHECKOUT_ROLE = "main_checkout"
+
+
+def guarded_roots(root: str | os.PathLike[str]) -> tuple[Path, ...]:
+    """The checkouts a guarded run started at *root* must watch.
+
+    The result is ``(<guarded toplevel>,)`` for an ordinary checkout, and
+    ``(<guarded toplevel>, <main checkout>)`` when *root* is a **linked
+    worktree** (WL-0MVPE2BY9001CR9O). The main checkout is resolved from git
+    plumbing via :func:`main_checkout_root` — never from a ``wl-*`` directory
+    name — so any registered worktree, wherever it lives, gets the same
+    coverage.
+
+    A non-git path (or a path git cannot resolve) yields just the resolved
+    *root*, so the helper is a no-op for non-repository callers.
+    """
+    resolved = Path(root).resolve()
+    top = git_toplevel(resolved)
+    if top is None:
+        return (resolved,)
+    top_path = Path(top).resolve()
+    main = main_checkout_root(resolved, top=top)
+    if main is None:
+        return (top_path,)
+    main_path = Path(main).resolve()
+    if main_path == top_path:
+        return (top_path,)
+    return (top_path, main_path)
+
+
+def snapshot_guarded_roots(
+    root: str | os.PathLike[str],
+    *,
+    include_status: bool = True,
+) -> dict[str, Any]:
+    """Snapshot every checkout a guarded run started at *root* can reach.
+
+    Each entry carries the root's ``role`` (:data:`GUARDED_ROOT_ROLE` or
+    :data:`MAIN_CHECKOUT_ROLE`), its ``path`` and the per-root
+    :func:`snapshot_repo_state` result. The per-root exclusions (ownership-based
+    worktree refs, retained ``branch.<name>.*`` config, ``refs/heads/dev`` and
+    ``refs/remotes/origin/*``) therefore apply to **each** root independently,
+    so concurrent `dev`/`origin/*` movement or a worktree registered/removed
+    mid-run stays invisible on both sides.
+
+    Cost is git plumbing only (one plumbing snapshot per checkout, no per-test
+    work); ``include_status=False`` keeps the cheap refs+config fingerprint
+    shape for the per-test guard.
+
+    Returns ``{"root": <guarded root>, "roots": [entry, ...]}``.
+    """
+    entries: list[dict[str, Any]] = []
+    paths = guarded_roots(root)
+    main_path = paths[1] if len(paths) > 1 else None
+    for path in paths:
+        role = GUARDED_ROOT_ROLE
+        if main_path is not None and path == main_path:
+            role = MAIN_CHECKOUT_ROLE
+        entries.append(
+            {
+                "role": role,
+                "path": str(path),
+                "snapshot": snapshot_repo_state(path, include_status=include_status),
+            }
+        )
+    return {"root": str(Path(root).resolve()), "roots": entries}
+
+
+def fingerprint_guarded_roots(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    """A cheap, hashable fingerprint of every root in a guarded snapshot.
+
+    Used by the per-test guard as a short-circuit trigger only: because each
+    entry's :func:`fingerprint` already ignores the ownership-based exclusions,
+    registering or removing an agent worktree mid-run cannot move it. Inclusion
+    of ``role``/``path`` keeps the two roots distinct even when their refs and
+    config are identical.
+    """
+    return tuple(
+        (entry.get("role", ""), entry.get("path", ""), fingerprint(entry["snapshot"]))
+        for entry in snapshot.get("roots", ())
+    )
+
+
+def diff_guarded_roots(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Diff two :func:`snapshot_guarded_roots` results, root by root.
+
+    Returns ``{"changed": bool, "roots": [{"role", "path", "diff"}, ...]}``
+    where each ``diff`` is the :func:`diff_snapshots` result for that root, so a
+    caller can report **which** checkout was mutated. ``changed`` is the
+    disjunction over all roots; a root present in only one snapshot (no change
+    of roots within a run is expected, but a worktree registered mid-run must
+    never fail the run) is treated as unchanged. Each root's ``diff`` carries
+    its own attribution, so pass the whole result to
+    :func:`excluded_churn_notes` to render the informational note (AC3).
+    """
+    roots: list[dict[str, Any]] = []
+    before_roots = before.get("roots", ())
+    after_roots = after.get("roots", ())
+    changed = False
+    for before_entry, after_entry in zip(before_roots, after_roots):
+        diff = diff_snapshots(before_entry["snapshot"], after_entry["snapshot"])
+        changed = changed or diff["changed"]
+        roots.append(
+            {
+                "role": before_entry.get("role", ""),
+                "path": before_entry.get("path", ""),
+                "diff": diff,
+            }
+        )
+    return {"changed": changed, "roots": roots}
+
+
+def describe_guarded_diff(diff: dict[str, Any]) -> str:
+    """Render every mutated path of a :func:`diff_guarded_roots` result.
+
+    With a single root this is exactly :func:`describe_diff` (no extra noise for
+    the common, worktree-free case). With a guarded root plus its main checkout
+    each changed checkout is announced by path, so the failure message names
+    *every* mutated main-checkout path instead of hiding it behind one generic
+    heading.
+    """
+    roots = diff.get("roots", ())
+    changed_roots = [entry for entry in roots if entry["diff"]["changed"]]
+    if not changed_roots:
+        return "  (no differences)"
+    if len(roots) == 1:
+        return describe_diff(changed_roots[0]["diff"])
+    lines: list[str] = []
+    for entry in changed_roots:
+        label = (
+            "main checkout"
+            if entry.get("role") == MAIN_CHECKOUT_ROLE
+            else "guarded checkout"
+        )
+        lines.append(f"  in {label} {entry.get('path', '')}:")
+        lines.extend(describe_diff(entry["diff"]).splitlines())
+    return "\n".join(lines)
+
+
 def snapshot_repo_state(
     root: str | os.PathLike[str],
     *,
@@ -579,6 +851,11 @@ def snapshot_repo_state(
     Returns a dict with ``root``, ``git``, ``refs``, ``config``, ``status``,
     ``worktrees`` and ``excluded_refs``. A non-git root yields empty surfaces
     (the guard is a no-op there).
+
+    The ``status`` map itself is the **start-of-run provenance**
+    :func:`diff_snapshots` uses to attribute concurrent churn
+    (SA-0MUIJAHXS003M7BG): a path present here was already dirty, so its
+    disappearance later in the run is a resolution, not suite damage.
     """
     resolved = Path(root).resolve()
     top = git_toplevel(resolved)
@@ -712,12 +989,28 @@ def diff_snapshots(
     Refs checked out in registered agent worktrees (``excluded_refs``) and the
     ``branch.<name>.*`` config those worktrees own are ignored, using the
     union of both snapshots' excluded sets so a worktree appearing or
-    disappearing mid-run is invisible on either side. Returns
-    ``{"changed": bool, "refs": ..., "config": ..., "status": ...}`` where
-    each category lists added/removed/changed entries.
+    disappearing mid-run is invisible on either side.
+
+    Working-tree differences are additionally **attributed** by start-of-run
+    provenance (SA-0MUIJAHXS003M7BG): a status entry present in ``before`` and
+    absent from ``after`` was resolved during the run (concurrent churn) and is
+    reported under ``excluded.status.removed`` instead of failing the diff —
+    see :func:`excluded_churn_notes`. ``changed`` is the attributed verdict, so
+    it is ``False`` when the only difference is such a resolution.
+
+    Returns ``{"changed": bool, "refs": ..., "config": ..., "status": ...,
+    "excluded": ...}`` where ``status`` lists the verdict-bearing
+    (``added``/``changed``) working-tree entries and each other category lists
+    ``added``/``removed``/``changed`` entries.
     """
     if not before.get("git", True) or not after.get("git", True):
-        return {"changed": False, "refs": {}, "config": {}, "status": {}}
+        return {
+            "changed": False,
+            "refs": {},
+            "config": {},
+            "status": {},
+            "excluded": {"status": {"removed": {}}},
+        }
 
     excluded = set(before.get("excluded_refs", set())) | set(
         after.get("excluded_refs", set())
@@ -754,15 +1047,34 @@ def diff_snapshots(
         if k in after_config and before_config[k] != after_config[k]
     }
 
-    status_added = {k: v for k, v in after["status"].items() if k not in before["status"]}
-    status_removed = {
-        k: v for k, v in before["status"].items() if k not in after["status"]
+    before_status = before["status"]
+    after_status = after["status"]
+    status_added = {k: v for k, v in after_status.items() if k not in before_status}
+    resolved_status = {
+        k: v for k, v in before_status.items() if k not in after_status
     }
     status_changed = {
-        k: (before["status"][k], after["status"][k])
-        for k in before["status"]
-        if k in after["status"] and before["status"][k] != after["status"][k]
+        k: (before_status[k], after_status[k])
+        for k in before_status
+        if k in after_status and before_status[k] != after_status[k]
     }
+
+    # Working-tree attribution (SA-0MUIJAHXS003M7BG, rule (a)). A status entry
+    # that disappeared was already non-clean at snapshot start and is clean at
+    # snapshot end: the path was resolved *inside* the guard window. A hermetic
+    # suite never commits/checks out/reverts, so only a concurrent session (a
+    # sibling committing work it had itself dirtied in the shared checkout) can
+    # have resolved it — that is churn, not damage, and it is excluded from the
+    # verdict but reported as a note (`excluded_churn_notes`).
+    #
+    # Deliberately retained as incidents (AC2):
+    #   * a path added to the status surface — clean at snapshot start, now
+    #     modified / deleted / newly created (the clean→dirty direction);
+    #   * a path that is still dirty with a different code — no resolution is
+    #     observable, so no attribution is provable.
+    # Provenance is the start snapshot's own status codes (git plumbing), never
+    # a path-name or `wl-*` pattern (AC4).
+    excluded_status = {"removed": resolved_status}
 
     changed = bool(
         refs_added
@@ -772,7 +1084,6 @@ def diff_snapshots(
         or config_removed
         or config_changed
         or status_added
-        or status_removed
         or status_changed
     )
     return {
@@ -789,14 +1100,56 @@ def diff_snapshots(
         },
         "status": {
             "added": status_added,
-            "removed": status_removed,
             "changed": status_changed,
         },
+        "excluded": {"status": excluded_status},
     }
 
 
+def excluded_working_tree_churn(diff: dict[str, Any]) -> dict[str, str]:
+    """``path -> status code`` of working-tree differences excluded by attribution.
+
+    These entries were non-clean at snapshot start and clean at snapshot end,
+    so the path was resolved during the run — concurrent churn that must not
+    fail the run (SA-0MUIJAHXS003M7BG AC1). They never appear in
+    ``diff["status"]`` and therefore never set ``diff["changed"]``, but they
+    are never silent either: :func:`excluded_churn_notes` renders them (AC3).
+    """
+    return dict(diff.get("excluded", {}).get("status", {}).get("removed", {}))
+
+
+def excluded_churn_notes(diff: dict[str, Any]) -> list[str]:
+    """Informational notes for working-tree churn excluded from the verdict.
+
+    Accepts either a :func:`diff_guarded_roots` result (``{"roots": [...]}``)
+    or a bare :func:`diff_snapshots` result, so both guards — and the outer
+    ``guarded_run_all`` consumer — share one renderer. Each note names the
+    checkout and every excluded path with its status code, prefixed by
+    :data:`EXCLUDED_CHURN_NOTE_PREFIX` (AC3). Empty list = nothing excluded.
+    """
+    entries: list[tuple[str, dict[str, Any]]] = []
+    if "roots" in diff:
+        for entry in diff.get("roots", ()):
+            entries.append((str(entry.get("path", "")), entry.get("diff") or {}))
+    else:
+        entries.append(("", diff))
+
+    notes: list[str] = []
+    for checkout, root_diff in entries:
+        where = f" in {checkout}" if checkout else ""
+        for path, code in sorted(excluded_working_tree_churn(root_diff).items()):
+            notes.append(f"{EXCLUDED_CHURN_NOTE_PREFIX}{where}: {path} [{code}]")
+    return notes
+
+
 def describe_diff(diff: dict[str, Any]) -> str:
-    """Render a human-readable, actionable summary of a snapshot diff."""
+    """Render a human-readable, actionable summary of a snapshot diff.
+
+    Renders the **verdict-bearing** differences only: working-tree churn
+    excluded by attribution (SA-0MUIJAHXS003M7BG) is intentionally absent here
+    because this renderer produces failure messages — the excluded paths are
+    announced by :func:`excluded_churn_notes` instead.
+    """
     lines: list[str] = []
     refs = diff.get("refs", {})
     for ref, sha in sorted(refs.get("added", {}).items()):

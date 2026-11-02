@@ -15,12 +15,12 @@ concurrency primitive):
 - AC5: concurrent test-style runs are bounded cross-process (real
   subprocesses through the real `_test_concurrency_slot` context manager).
 
-Also pins the *calibrated default* (SA-0MVE995PV0077QB5.3): the resolved
-ceiling is 3 with no env override, its rationale cites the calibration
-artifact, and an un-overridden cross-process batch never exceeds 3 active
-slots. The pinning test stays inert until the constant raise lands
-(SA-0MVF796SL006XV80), then activates permanently so a silent reversion to 2
-fails.
+Also pins the *calibrated default* (SA-0MVWZQ269009SJXV AC2, superseding the
+deleted SA-0MVE995PV0077QB5 slice): the resolved ceiling is 6 with no env
+override, its rationale cites the calibration artifact and the work item, and
+an un-overridden cross-process batch never exceeds 6 active slots. The
+pinning test stays inert until the constant raise lands, then activates
+permanently so a silent reversion to 2 fails.
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def _run_workers(n, hold=0.3, timeout=30, *, use_default_ceiling=False):
     ``TEST_MAX_CONCURRENCY`` is inherited from the test environment; with
     *use_default_ceiling* the variable is removed from the child environment
     so the calibrated default is resolved with no override
-    (SA-0MVE995PV0077QB5.3).
+    (SA-0MVWZQ269009SJXV AC2).
     """
     procs = []
     for _ in range(n):
@@ -393,7 +393,7 @@ def test_single_ceiling_serializes_cross_process(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Calibrated default ceiling (SA-0MVE995PV0077QB5.3)
+# Calibrated default ceiling (SA-0MVWZQ269009SJXV AC2)
 # ---------------------------------------------------------------------------
 
 #: Calibration artifact cited by the raised constant's rationale. Its citation
@@ -403,7 +403,7 @@ def test_single_ceiling_serializes_cross_process(monkeypatch):
 #: to 2 fails instead of silently skipping.
 CALIBRATION_ARTIFACT = "docs/dev/test-ceiling-validation.json"
 CALIBRATION_ARTIFACT_NAME = CALIBRATION_ARTIFACT.rsplit("/", 1)[-1]
-CALIBRATED_WORK_ITEM = "SA-0MVE995PV0077QB5"
+CALIBRATED_WORK_ITEM = "SA-0MVWZQ269009SJXV"
 RUNNER_SOURCE_PATH = _RUNNER_DIR / "run_tests.py"
 
 
@@ -450,32 +450,33 @@ def _adjacent_constant_comment(source: str, name: str) -> str:
     ),
 )
 def test_default_is_calibrated_ceiling():
-    """Without TEST_MAX_CONCURRENCY the resolved ceiling is the calibrated 3.
+    """Without TEST_MAX_CONCURRENCY the resolved ceiling is the calibrated 6.
 
     The rationale (constant's adjacent comment) must cite the parent work item
     and the calibration artifact, so the value stays evidence-backed. Reverting
     the constant to 2 while keeping the citation fails here.
     """
     source = _runner_source_text()
-    assert _test_semaphore_max_workers() == 3
-    assert TEST_MAX_CONCURRENCY_DEFAULT == 3
+    assert _test_semaphore_max_workers() == 6
+    assert TEST_MAX_CONCURRENCY_DEFAULT == 6
     rationale = _adjacent_constant_comment(source, "TEST_MAX_CONCURRENCY_DEFAULT")
     assert CALIBRATED_WORK_ITEM in rationale, rationale
     assert CALIBRATION_ARTIFACT_NAME in rationale, rationale
 
 
 def test_default_ceiling_bounded_cross_process():
-    """The un-overridden default bounds concurrency to at most 3 slots.
+    """The un-overridden default bounds concurrency to at most 6 slots.
 
     Mirrors ``test_concurrent_runs_bounded_cross_process`` but never sets
-    ``TEST_MAX_CONCURRENCY``: six real subprocess workers resolve the default,
-    so the ceiling is exercised rather than incidental.
+    ``TEST_MAX_CONCURRENCY``: nine real subprocess workers resolve the default
+    (more workers than the ceiling, so the bound is actually exercised),
+    so the bound is exercised rather than incidental.
     """
     assert TEST_MAX_CONCURRENCY_ENV not in os.environ
-    results = _run_workers(6, hold=0.3, timeout=30, use_default_ceiling=True)
+    results = _run_workers(9, hold=0.3, timeout=60, use_default_ceiling=True)
     acquired = [r for r in results if r.get("acquired") is not None]
-    assert len(acquired) == 6, f"not all workers acquired: {results}"
-    assert _max_concurrent(results) <= 3, f"default ceiling exceeded: {results}"
+    assert len(acquired) == 9, f"not all workers acquired: {results}"
+    assert _max_concurrent(results) <= 6, f"default ceiling exceeded: {results}"
     assert all(r.get("error") is None for r in results), results
 
 
@@ -505,9 +506,11 @@ class TestPacedRunner:
     def test_invocation_holds_slot_around_runner(self):
         """The wrapped runner runs inside the ``_test_concurrency_slot``."""
         order: list[str] = []
+        lanes: list[str] = []
 
         @contextlib.contextmanager
-        def _fake_slot():
+        def _fake_slot(lane="full"):
+            lanes.append(lane)
             order.append("acquire")
             try:
                 yield
@@ -522,12 +525,39 @@ class TestPacedRunner:
             result = paced_runner(_runner)("pytest", "/tmp", 10)
 
         assert result.stdout == "ok"
+        assert lanes == ["full"], lanes
         assert order == ["acquire", "execute", "release"]
+
+    def test_lane_is_forwarded_to_the_slot(self):
+        """The pacer publishes its lane so partial runs use the fast pool.
+
+        The lane travels as ambient state (:func:`run_tests._slot_lane`), so the
+        slot context manager itself stays zero-argument for callers and test
+        doubles; the acquisition must observe the fast lane here.
+        """
+        import run_tests as run_tests_module
+
+        lanes: list[str] = []
+
+        @contextlib.contextmanager
+        def _fake_slot():
+            lanes.append(run_tests_module._SLOT_LANE.get())
+            yield
+
+        with mock.patch("run_tests._test_concurrency_slot", _fake_slot):
+            paced_runner(
+                lambda cmd, cwd, t: SimpleNamespace(), lane="fast"
+            )("pytest", "/tmp", 10)
+
+        assert lanes == ["fast"], lanes
+        # The ambient lane is restored afterwards — a fast partial run can never
+        # leak its lane into the caller's next (full) execution.
+        assert run_tests_module._SLOT_LANE.get() == "full"
 
     def test_timeout_propagates_as_test_concurrency_timeout(self):
         """A saturated slot surfaces as ``TestConcurrencyTimeout``."""
         @contextlib.contextmanager
-        def _busy_slot():
+        def _busy_slot(lane="full"):
             raise TestConcurrencyTimeout("busy")
             yield  # pragma: no cover
 
@@ -548,7 +578,7 @@ class TestPacedRunnerTelemetry:
         waits: list[tuple[float, float]] = []
 
         @contextlib.contextmanager
-        def _fake_slot():
+        def _fake_slot(lane="full"):
             order.append("acquire")
             try:
                 yield

@@ -38,6 +38,10 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from shared.git_sandbox import fixture_git_env as _shared_fixture_git_env  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -58,14 +62,27 @@ def implement_mod():
 # ---------------------------------------------------------------------------
 
 
+def _fixture_git_env() -> dict[str, str]:
+    """Hermetic environment for fixture git commands (own index, no overrides)."""
+    return _shared_fixture_git_env()
+
+
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    """Run a git command, raising on failure."""
+    """Run a git command, raising on failure.
+
+    Uses the shared hermetic fixture environment
+    (:func:`shared.git_sandbox.fixture_git_env`): an ambient
+    ``GIT_INDEX_FILE`` — exported by the finish gate for the suite it runs
+    (SA-0MVQHVGFR006W8LG) — would otherwise redirect these fixture ``git``
+    commands into the *gate's* index and invalidate its verdict.
+    """
     proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         capture_output=True,
         text=True,
         check=False,
+        env=_fixture_git_env(),
     )
     assert proc.returncode == 0, (
         f"git {' '.join(args)} failed in {cwd}\n"
@@ -457,6 +474,35 @@ def test_phase_finish_syncs_parent_branch_after_push(implement_mod, tmp_path):
                 "scope": "full",
             },
         ),
+        # ``phase_finish`` runs its gate against the would-be-commit tree
+        # (``run_gate_suite``, SA-0MVQHVGFR006W8LG) and stages the change set
+        # in the real index through ``stage_tested_tree`` once green. Both act
+        # on a real git repository; this harness uses placeholder directories,
+        # so both seams are mocked green (the gate itself is covered by
+        # ``skill/implement/tests/test_finish_gate_*.py``).
+        mock.patch.object(
+            implement_mod,
+            "run_gate_suite",
+            return_value=(
+                {
+                    "success": True,
+                    "failures": [],
+                    "skipped": False,
+                    "tooling": "pytest",
+                    "scope": "changed",
+                },
+                {"tree": "abc1234", "scope": "changed", "index_unchanged": True},
+            ),
+        ),
+        mock.patch.object(
+            implement_mod,
+            "stage_tested_tree",
+            return_value={
+                "success": True,
+                "tree": "abc1234",
+                "expected": "abc1234",
+            },
+        ),
         mock.patch.object(implement_mod, "git_commit", return_value=True),
         mock.patch.object(
             implement_mod, "git_get_commit_hash", return_value="abc1234"
@@ -466,6 +512,15 @@ def test_phase_finish_syncs_parent_branch_after_push(implement_mod, tmp_path):
         ),
         mock.patch.object(implement_mod, "remove_state"),
         mock.patch.object(implement_mod, "_remove_worktree", return_value=True),
+        # The post-push ancestry assertion runs against the *main checkout*
+        # (real git); this harness uses placeholder directories, so the
+        # verification seam is mocked exactly like the push itself
+        # (SA-0MVPZG7A0000N66U AC2).
+        mock.patch.object(
+            implement_mod,
+            "_assert_commit_on_origin_dev",
+            return_value={"verified": True, "target": "refs/remotes/origin/dev"},
+        ),
         mock.patch.object(
             implement_mod, "git_push_to_dev", side_effect=_record_push
         ),

@@ -6,13 +6,17 @@ Tests cover:
 - `map_changed_to_tests()` import-graph expansion
 - `changed_scope_commands()` integration with full_suite_commands
 - Scope carried in run_suite/run_all results
-- Custom suiteCommands fallback to full scope
+- Custom suiteCommands no longer disable changed-scope selection
+- TypeScript/vitest .test.ts / .spec.ts convention mapping
+- Named test groups honoured by the changed-file selector
+- Specific (not generic) fallback reasons
 - CLI flag parsing
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 
 # Resolve the module under test — same pattern as run_tests.py itself.
 # The runner lives at <skills>/test/scripts/run_tests.py; inserting that
@@ -30,10 +34,18 @@ _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"  # <skills>/test/scripts
 if str(_RUNNER_DIR) not in _sys.path:
     _sys.path.insert(0, str(_RUNNER_DIR))
 
+# Repository root of the checkout under test (…/skill/test/tests → root).
+_REPO_ROOT = _SCRIPT_DIR.parents[2]
+
 import run_tests
 from run_tests import (
+    CHANGED_SCOPE_NO_CHANGES,
+    CHANGED_SCOPE_NO_GROUP,
+    CHANGED_SCOPE_NO_SOURCE,
+    CHANGED_SCOPE_NO_TOOLING,
     build_parser,
     changed_scope_commands,
+    changed_scope_selection,
     compute_changed_files,
     map_changed_to_tests,
     run_all,
@@ -46,6 +58,37 @@ from shared.git_sandbox import commit_all, init_repo, run_git
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
+
+def _hermetic_git_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop an inherited ``GIT_INDEX_FILE`` for a fixture-repo test.
+
+    The finish gate exports a *temporary* index for the whole suite
+    (SA-0MVQHVGFR006W8LG): every ``git`` command the suite spawns then reads
+    that index, which is how ``git ls-files`` guards observe the
+    would-be-commit tree. ``GIT_INDEX_FILE`` deliberately survives the test
+    skill's repository-override scrub for exactly that reason
+    (SA-0MVQHV9Y3001RNNW).
+
+    A test that builds its **own** repository must therefore neutralise it
+    (``shared.git_sandbox.fixture_git_env()`` documents the rule). Here it is
+    not only the fixture's own ``git`` calls that matter: the production
+    helpers under test (``compute_changed_files``, ``changed_scope_commands``,
+    ``run_suite``) spawn ``git`` themselves and inherit the ambient
+    environment. With a foreign index in ``GIT_INDEX_FILE`` — an index from
+    the gate's repository, which lists none of the fixture's paths —
+    ``git diff <base>`` reports **every** file in the fixture as changed, so
+    the baseline assertions below fail only when the suite runs under the
+    gate.
+    """
+    monkeypatch.delenv("GIT_INDEX_FILE", raising=False)
+
+
+# ``monkeypatch.delenv`` is undone by pytest at test teardown, so the
+# neutralisation never leaks into another test.
+@pytest.fixture(autouse=True)
+def _gate_index_neutralised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test in this module hermetic under the finish gate."""
+    _hermetic_git_index(monkeypatch)
 
 def _make_repo(tmp_path: Path) -> Path:
     """Create a minimal git repo with test and source files."""
@@ -76,6 +119,26 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _staged_foreign_index(tmp_path: Path) -> Path:
+    """An index belonging to a *different* repository with a staged change.
+
+    Mirrors what the finish gate hands the suite it runs: a temporary index
+    that names another repository's files (SA-0MVQHVGFR006W8LG).
+    """
+    gate_repo = init_repo(tmp_path / "gate_repo", default_branch="dev")
+    (gate_repo / "gate_only.py").write_text("x = 1\n")
+    commit_all(gate_repo, "initial")
+    (gate_repo / "gate_only.py").write_text("x = 2\n")
+    index = tmp_path / "gate.index"
+    run_git(
+        gate_repo,
+        ["add", "-A"],
+        env={"GIT_INDEX_FILE": str(index)},
+        check=True,
+    )
+    return index
+
+
 def _init_repo_with_dev(repo: Path, *, message: str = "initial") -> Path:
     """Create a hermetic repo at *repo* on branch ``dev`` with one commit.
 
@@ -86,6 +149,46 @@ def _init_repo_with_dev(repo: Path, *, message: str = "initial") -> Path:
     """
     init_repo(repo, default_branch="dev")
     commit_all(repo, message)
+    return repo
+
+
+def _make_vitest_repo(tmp_path: Path, config: dict | None = None) -> Path:
+    """Create a hermetic vitest/TypeScript repo on branch ``dev``.
+
+    Carries ``tests/{cli,unit}/*.test.ts`` files, a co-located
+    ``tests/unit/utils.test.ts`` for ``src/utils.ts`` and a package.json that
+    declares vitest. An optional ``.pi/test-config.json`` *config* is written
+    before the initial commit so it is part of the repo baseline.
+    """
+    repo = tmp_path / "vitest_repo"
+    (repo / "tests" / "cli").mkdir(parents=True)
+    (repo / "tests" / "unit").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {"test": "vitest run"},
+                "devDependencies": {"vitest": "^1.0.0"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (repo / "src" / "utils.ts").write_text("export const x = 1;\n")
+    (repo / "tests" / "unit" / "utils.test.ts").write_text(
+        "import { test } from 'vitest';\n"
+    )
+    (repo / "tests" / "cli" / "foo.test.ts").write_text(
+        "import { test } from 'vitest';\n"
+    )
+    (repo / "tests" / "cli" / "foo.spec.ts").write_text(
+        "import { test } from 'vitest';\n"
+    )
+    if config is not None:
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+    _init_repo_with_dev(repo)
     return repo
 
 
@@ -150,15 +253,72 @@ class TestComputeChangedFiles:
         result = compute_changed_files(repo, base_ref="dev")
         assert result == set()
 
-    def test_ignores_untracked_files(self, tmp_path: Path) -> None:
-        """Untracked files are not included in changed files."""
+    def test_changed_files_are_hermetic_under_the_finish_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A foreign ``GIT_INDEX_FILE`` (the finish gate's staged index) must
+        not turn a fixture repo's own clean history into "everything changed".
+
+        The gate exports its temporary index for the whole suite, so the
+        ambient ``GIT_INDEX_FILE`` points at a file listing none of this
+        fixture's paths. Changed-file detection must still read the fixture's
+        own working tree: the only change is the one this test makes.
+        """
+        repo = _make_repo(tmp_path)
+        (repo / "src" / "utils.py").write_text("# utils — modified\n")
+
+        foreign_index = tmp_path / "gate.index"
+        shutil.copyfile(repo / ".git" / "index", foreign_index)
+        monkeypatch.setenv("GIT_INDEX_FILE", str(foreign_index))
+        # The module-level hermetic fixture is what neutralises the gate's
+        # exported index before any production helper spawns git.
+        _hermetic_git_index(monkeypatch)
+
+        assert compute_changed_files(repo, base_ref="origin/dev") == {
+            "src/utils.py"
+        }
+
+    def test_includes_untracked_files(self, tmp_path: Path) -> None:
+        """New (untracked) files are part of the working-tree change set.
+
+        During the implement flow tests run before the first commit, so a
+        newly created test file has no diff entry — it must still be
+        selectable (SA-0MVL7YOMJ006UMDO).
+        """
         repo = _make_repo(tmp_path)
         (repo / "src" / "utils.py").write_text("# utils — modified\n")
         (repo / "src" / "untracked.py").write_text("# new file\n")
 
         result = compute_changed_files(repo, base_ref="dev")
-        assert "src/untracked.py" not in result
+        assert "src/untracked.py" in result
         assert "src/utils.py" in result
+
+    def test_fixture_repo_ignores_an_inherited_index_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A foreign ``GIT_INDEX_FILE`` never leaks into a fixture repo's diff.
+
+        The finish gate exports a temporary would-be-commit index for the
+        suite it runs (SA-0MVQHVGFR006W8LG). A fixture repository that
+        inherits it reports every tracked file as changed (the foreign index
+        has no stat entries for its paths) and lets git refresh — write — an
+        index that is not its own, which invalidates the gate's evidence for
+        the tree it tested (SA-0MVTET8KQ0031R6Z).
+        """
+        foreign_index = _staged_foreign_index(tmp_path)
+        before = foreign_index.read_bytes()
+        repo = _make_repo(tmp_path)
+        monkeypatch.setenv("GIT_INDEX_FILE", str(foreign_index))
+
+        result = compute_changed_files(repo, base_ref="dev")
+
+        assert result == set(), (
+            "the foreign gate index leaked into the fixture's changed-file set: "
+            f"{sorted(result)}"
+        )
+        assert foreign_index.read_bytes() == before, (
+            "compute_changed_files refreshed (wrote) the inherited gate index"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +433,9 @@ class TestChangedScopeCommands:
         assert "pytest" in cmd.lower()
         assert "tests/test_utils.py" in cmd
 
-    def test_falls_back_to_full_for_custom_suite_commands(self, tmp_path: Path) -> None:
-        """When .pi/test-config.json has suiteCommands, changed scope returns None."""
+    def test_suite_commands_do_not_disable_file_selection(self, tmp_path: Path) -> None:
+        """Declared suiteCommands define the full suite only — changed scope
+        still selects the affected test file (SA-0MVL7YOMJ006UMDO)."""
         repo = _make_repo(tmp_path)
         (repo / ".pi").mkdir()
         (repo / ".pi" / "test-config.json").write_text(
@@ -284,7 +445,8 @@ class TestChangedScopeCommands:
         (repo / "src" / "utils.py").write_text("# modified\n")
 
         cmds = changed_scope_commands(repo, base_ref="dev")
-        assert cmds is None  # custom commands → fall back to full scope
+        assert cmds is not None
+        assert "tests/test_utils.py" in cmds[0]
 
     def test_returns_none_for_no_pytest_repo(self, tmp_path: Path) -> None:
         """A repo with no pytest config returns None (full scope fallback)."""
@@ -314,6 +476,280 @@ class TestChangedScopeCommands:
         # Only the affected node test is selected
         assert any("utils.test.mjs" in c for c in cmds)
         assert all("other.test.mjs" not in c for c in cmds)
+
+    # -- F0 baseline (SA-0MVQQ9HXV000V6Z4 AC3) -----------------------------
+    # Pins today's changed-scope selection before the hidden skill-test rule
+    # (SA-0MVQJSGLY0098DVB) lands. That item's D5 keeps changed-scope
+    # selection untouched: hidden project-local skill tests are enforced at
+    # full scope only. These assertions must stay green after F1–F3.
+
+    def test_skill_test_file_change_selects_the_test_group(self) -> None:
+        """A changed *test* file under ``skill/test/`` matches this repo's
+        declared ``test`` group, so the group's command is selected.
+
+        Declared ``groups`` take precedence over file-level convention
+        mapping for a repo that declares them (SA-0MVL7YOMJ006UMDO), so the
+        selection is the group command rather than a single-file command.
+        """
+        cmds = changed_scope_commands(
+            _REPO_ROOT,
+            changed_files={"skill/test/tests/test_suite_resolution.py"},
+        )
+        assert cmds == ["pytest -q -r a --disable-warnings skill/test/tests/"]
+
+    def test_skill_script_change_selects_the_test_group(self) -> None:
+        """A non-test change under ``skill/test/`` matches the declared
+        ``test`` group's ``paths``, so the group command runs instead of the
+        full suite (SA-0MVL7YOMJ006UMDO).
+
+        Before group honouring this change set selected nothing (skill
+        sources are not test files) and fell back to the full suite.
+        """
+        cmds = changed_scope_commands(
+            _REPO_ROOT,
+            changed_files={"skill/test/scripts/run_tests.py"},
+        )
+        assert cmds == ["pytest -q -r a --disable-warnings skill/test/tests/"]
+
+    def test_hidden_skill_test_file_change_selects_that_file(
+        self, tmp_path: Path,
+    ) -> None:
+        """A changed test file under ``.pi/skills/<name>/tests`` is selected
+        by changed scope today (it is itself a test file). The new full-suite
+        rule adds a command at full scope only and must not alter this."""
+        repo = tmp_path / "hidden_skill_repo"
+        repo.mkdir()
+        (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        hidden_tests = repo / ".pi" / "skills" / "demo" / "tests"
+        hidden_tests.mkdir(parents=True)
+        (hidden_tests / "test_demo.py").write_text(
+            "def test_demo() -> None:\n    assert True\n", encoding="utf-8",
+        )
+
+        cmds = changed_scope_commands(
+            repo, changed_files={".pi/skills/demo/tests/test_demo.py"},
+        )
+        assert cmds == [
+            "pytest -q -r a --disable-warnings .pi/skills/demo/tests/test_demo.py"
+        ]
+
+    # -- AC7 regression (SA-0MVQQ9QJI002K7DY) ------------------------------
+    # D5: changed-scope selection is untouched by the hidden skill-test rule
+    # (SA-0MVQJSGLY0098DVB) — the extra command is enforced at FULL scope
+    # only, never added to a changed-scope subset.
+
+    def test_changed_scope_is_identical_with_and_without_candidates(
+        self, tmp_path: Path,
+    ) -> None:
+        """A representative change resolves to the same subset command whether
+        or not the repo ships hidden skill-test candidates — the extra
+        command belongs to the full suite only (AC7)."""
+        def _build(hidden: bool) -> Path:
+            repo = tmp_path / ("with_candidates" if hidden else "no_candidates")
+            repo.mkdir()
+            (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+            (repo / "tests").mkdir()
+            (repo / "src").mkdir()
+            (repo / "tests" / "test_utils.py").write_text(
+                "def test_utils() -> None:\n    assert True\n", encoding="utf-8",
+            )
+            (repo / "src" / "utils.py").write_text("x = 1\n", encoding="utf-8")
+            if hidden:
+                hidden_tests = repo / ".pi" / "skills" / "alpha" / "tests"
+                hidden_tests.mkdir(parents=True)
+                (hidden_tests / "test_alpha.py").write_text(
+                    "def test_alpha() -> None:\n    assert True\n",
+                    encoding="utf-8",
+                )
+            _init_repo_with_dev(repo)
+            return repo
+
+        # Representative change: a source file whose convention test exists.
+        with_repo = _build(hidden=True)
+        without_repo = _build(hidden=False)
+        changed = {"src/utils.py"}
+
+        with_cmds = changed_scope_commands(with_repo, changed_files=changed)
+        without_cmds = changed_scope_commands(without_repo, changed_files=changed)
+
+        # Identical subset commands: the candidate dirs never leak in.
+        assert with_cmds == without_cmds
+        assert with_cmds == [
+            "pytest -q -r a --disable-warnings tests/test_utils.py"
+        ]
+
+
+# ---------------------------------------------------------------------------
+# TypeScript/vitest changed-scope selection (SA-0MVL7YOMJ006UMDO)
+# ---------------------------------------------------------------------------
+
+
+class TestTypeScriptChangedScope:
+    """Vitest ``*.test.ts`` / ``*.spec.ts`` files are selectable."""
+
+    def test_changed_test_ts_selected(self, tmp_path: Path) -> None:
+        """A changed vitest .test.ts file is selected and runs via vitest."""
+        repo = _make_vitest_repo(tmp_path)
+
+        cmds = changed_scope_commands(
+            repo, base_ref="dev", changed_files={"tests/cli/foo.test.ts"}
+        )
+
+        assert cmds is not None
+        assert len(cmds) == 1
+        assert "vitest run" in cmds[0]
+        assert "tests/cli/foo.test.ts" in cmds[0]
+
+    def test_changed_spec_ts_selected(self, tmp_path: Path) -> None:
+        """A changed vitest .spec.ts file is selected conservatively too."""
+        repo = _make_vitest_repo(tmp_path)
+
+        cmds = changed_scope_commands(
+            repo, base_ref="dev", changed_files={"tests/cli/foo.spec.ts"}
+        )
+
+        assert cmds is not None
+        assert "vitest run" in cmds[0]
+        assert "tests/cli/foo.spec.ts" in cmds[0]
+
+    def test_changed_source_ts_selects_stem_test(self, tmp_path: Path) -> None:
+        """src/utils.ts maps to tests/unit/utils.test.ts by stem convention."""
+        repo = _make_vitest_repo(tmp_path)
+
+        cmds = changed_scope_commands(
+            repo, base_ref="dev", changed_files={"src/utils.ts"}
+        )
+
+        assert cmds is not None
+        assert "vitest run" in cmds[0]
+        assert "tests/unit/utils.test.ts" in cmds[0]
+
+    def test_new_untracked_test_ts_is_computed(self, tmp_path: Path) -> None:
+        """A newly created (untracked) test file is part of the change set."""
+        repo = _make_vitest_repo(tmp_path)
+        (repo / "tests" / "cli" / "new.test.ts").write_text(
+            "import { test } from 'vitest';\n"
+        )
+
+        assert "tests/cli/new.test.ts" in compute_changed_files(repo, base_ref="dev")
+
+        cmds = changed_scope_commands(repo, base_ref="dev")
+        assert cmds is not None
+        assert "tests/cli/new.test.ts" in cmds[0]
+
+    def test_ts_without_vitest_reports_no_tooling(self, tmp_path: Path) -> None:
+        """Without a known vitest runner the fallback names the reason."""
+        repo = tmp_path / "plain_ts_repo"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "tests" / "foo.test.ts").write_text("// test\n")
+        _init_repo_with_dev(repo)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"tests/foo.test.ts"}
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_NO_TOOLING
+
+
+# ---------------------------------------------------------------------------
+# Named groups in changed-scope selection (SA-0MVL7YOMJ006UMDO)
+# ---------------------------------------------------------------------------
+
+_GROUP_CONFIG = {
+    "suiteCommands": ["npm --silent test"],
+    "groups": {
+        "cli": {
+            "commands": ["npm --silent test -- tests/cli"],
+            "paths": ["tests/cli/**"],
+        },
+        "unit": {
+            "commands": ["npm --silent test -- tests/unit"],
+            "paths": ["tests/unit/**"],
+        },
+    },
+}
+
+
+class TestChangedScopeGroups:
+    """Declared groups are honoured even when suiteCommands is present."""
+
+    def test_suite_commands_present_with_matching_group(self, tmp_path: Path) -> None:
+        """A matching group's commands are selected despite suiteCommands."""
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"tests/cli/foo.test.ts"}
+        )
+
+        assert selection.commands == ["npm --silent test -- tests/cli"]
+        assert selection.group == "cli"
+        assert "cli" in selection.reason
+
+    def test_suite_commands_present_no_group_reports_group_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """No group and no convention match → the named group fallback reason."""
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"src/unrelated.ts"}
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_NO_GROUP
+
+    def test_docs_only_change_reports_no_source_reason(self, tmp_path: Path) -> None:
+        """A docs-only change names the no-source reason, not a generic list."""
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"docs/guide.md"}
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_NO_SOURCE
+
+    def test_no_changed_files_reports_no_changes_reason(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files=set()
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_NO_CHANGES
+
+    def test_run_suite_reports_changed_scope_for_group(self, tmp_path: Path) -> None:
+        """run_suite reports scope 'changed' with the selected group commands."""
+        from types import SimpleNamespace
+
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+        (repo / "tests" / "cli" / "foo.test.ts").write_text(
+            "import { test } from 'vitest';\n// changed\n"
+        )
+
+        captured: list[str] = []
+
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "all",
+                cwd=repo,
+                scope="changed",
+                base_ref="dev",
+                use_cache=False,
+                force=True,
+            )
+
+        assert result["scope"] == "changed"
+        assert captured == ["npm --silent test -- tests/cli"], captured
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +869,10 @@ _PINNED_PYTEST_COMMANDS: list[str] = [
 ]
 # The pinned flags, without the interpreter prefix: ``_run_cmd`` receives argv
 # after ``executable_test_command()`` resolves the pytest executable prefix to
-# an absolute interpreter path (SA-0MVK154IE007OS3D), so tests compare the flag
-# suffix — the part that distinguishes the pin (``-m pytest``) from the legacy
-# bare ``pytest`` token.
+# an absolute interpreter path (SA-0MVK154IE007OS3D), so execution-level
+# assertions compare the flag suffix. The *command source* discrimination
+# (pin vs legacy token) is asserted separately via ``result["command"]`` —
+# see ``_assert_command_source``.
 _PINNED_PYTEST_FLAGS = "-m pytest -q -r a --disable-warnings"
 
 
@@ -445,6 +882,26 @@ def _assert_pinned_pytest_only(captured: list[str]) -> None:
     assert captured[0].endswith(_PINNED_PYTEST_FLAGS), captured
     # Never the legacy bare ``pytest`` token (the bug being fixed).
     assert not captured[0].startswith("pytest "), captured
+
+
+def _assert_command_source(result: dict, expected: str) -> None:
+    """Assert the *selected* command, before execution-time resolution.
+
+    ``run_suite`` returns ``command`` as the raw selected command (the pin
+    verbatim), while ``_run_cmd`` receives argv after
+    ``executable_test_command()`` rewrites the pytest prefix to the probed
+    interpreter (SA-0MVK154IE007OS3D). Because that rewrite makes the legacy
+    bare ``pytest`` token and a ``python3 -m pytest`` pin look identical at
+    execution time, the executed argv alone cannot prove *which* command
+    source won. ``command`` is therefore the discriminating assertion: it is
+    the pinned string when the fallback resolves through
+    ``full_suite_commands()``, and the legacy ``pytest`` token when it does
+    not.
+    """
+    assert result["command"] == expected, (
+        f"expected the pinned command source {expected!r}, "
+        f"got {result['command']!r}"
+    )
 
 
 class TestExplicitSuiteFallbackHonoursPins:
@@ -473,7 +930,10 @@ class TestExplicitSuiteFallbackHonoursPins:
         (repo / "pytest.ini").write_text("[pytest]\n")
         (repo / "tests" / "test_foo.py").write_text("def test_foo(): pass\n")
         _init_repo_with_dev(repo, message="init")
-        (repo / "src" / "foo.py").write_text("CHANGED\n")
+        # A docs-only change maps to no test, so changed scope must fall back
+        # to the full suite — the fallback whose pinned-command handling these
+        # tests cover. (Source changes are now selectable, SA-0MVL7YOMJ006UMDO.)
+        (repo / "README.md").write_text("# changed\n")
         return repo
 
     def test_changed_scope_fallback_pytest_uses_pinned_command(self, tmp_path: Path) -> None:
@@ -497,6 +957,9 @@ class TestExplicitSuiteFallbackHonoursPins:
 
         # Fallback reports full scope, as before.
         assert result["scope"] == "full"
+        # The pinned command is the selected source (AC1/AC2) — the legacy
+        # bare ``pytest`` token is never substituted.
+        _assert_command_source(result, _PINNED_PYTEST_COMMANDS[0])
         # The pinned form runs — never the legacy bare ``pytest`` token.
         _assert_pinned_pytest_only(captured)
 
@@ -523,7 +986,8 @@ class TestExplicitSuiteFallbackHonoursPins:
         (repo / "tests" / "node").mkdir()
         (repo / "tests" / "node" / "utils.test.mjs").write_text("import test from \"node:test\";\n")
         _init_repo_with_dev(repo, message="init")
-        (repo / "src" / "foo.py").write_text("CHANGED\n")
+        # Docs-only change → nothing selectable → the full-suite fallback.
+        (repo / "README.md").write_text("# changed\n")
 
         captured: list[str] = []
 
@@ -544,6 +1008,10 @@ class TestExplicitSuiteFallbackHonoursPins:
 
         assert pytest_result["scope"] == "full"
         assert node_result["scope"] == "full"
+        # Each suite name is mapped to its own pinned command (AC5): the
+        # selected command source is the pin entry, verbatim.
+        _assert_command_source(pytest_result, pin[0])
+        _assert_command_source(node_result, pin[1])
         # Each suite name is mapped to its own pinned command. The node pin is
         # compared on its parts (shlex re-joins argv, dropping the quotes).
         _assert_pinned_pytest_only(pytest_captured)
@@ -575,6 +1043,8 @@ class TestExplicitSuiteFallbackHonoursPins:
             )
 
         assert result["scope"] == "full"
+        # ``--suite all`` keeps resolving the full pinned set (AC4/AC5).
+        _assert_command_source(result, _PINNED_PYTEST_COMMANDS[0])
         _assert_pinned_pytest_only(captured)
 
     def test_changed_scope_fallback_empty_filtered_pin_raises(

@@ -45,6 +45,7 @@ from shared.git_sandbox import (
     GitSandboxError,
     add_worktree,
     commit_all,
+    fixture_git_env,
     init_repo,
     run_git,
 )
@@ -120,9 +121,12 @@ def _make_minimal_runner(recorded: list[list[str]] | None = None,
         cmd_str = " ".join(cmd)
 
         if git_cwd is not None and cmd and cmd[0] == "git":
+            # Hermetic env: the finish gate exports a temporary GIT_INDEX_FILE
+            # for the suite it runs, and a fixture command that inherited it
+            # would stage into the gate's index (SA-0MVWS6G0Z0050PD2).
             proc = subprocess.run(
                 list(cmd), cwd=str(git_cwd), check=False,
-                capture_output=True, text=True,
+                capture_output=True, text=True, env=fixture_git_env(),
             )
             return SimpleNamespace(
                 returncode=proc.returncode,
@@ -576,12 +580,17 @@ class TestRootFileOnlyRepoManifest:
 
     @staticmethod
     def _git_runner(repo: Path):
-        """Runner resolving git commands against the fixture repo."""
+        """Runner resolving git commands against the fixture repo.
+
+        Hermetic environment (``fixture_git_env``): the finish gate exports a
+        temporary ``GIT_INDEX_FILE`` that a fixture command must never inherit
+        (SA-0MVWS6G0Z0050PD2).
+        """
         def runner(cmd):
             if cmd and cmd[0] == "git":
                 cmd = ["git", "-C", str(repo)] + list(cmd[1:])
             return subprocess.run(cmd, capture_output=True, text=True,
-                                  check=False)
+                                  check=False, env=fixture_git_env())
         return runner
 
     def test_repo_index_exposes_root_file_names(self, tmp_path):
@@ -605,6 +614,35 @@ class TestRootFileOnlyRepoManifest:
         distinctive = audit_runner._distinctive_project_top_levels(repo)
         assert set(distinctive) == set(self.ROOT_FILES), (
             f"expected only root-file markers to be distinctive: {distinctive}"
+        )
+
+    def test_foreign_gate_index_does_not_replace_the_repo_index(
+        self, tmp_path, monkeypatch
+    ):
+        """An inherited foreign ``GIT_INDEX_FILE`` must not mask the markers.
+
+        ``implement.py finish`` exports a temporary would-be-commit index for
+        the suite it runs (SA-0MVQHVGFR006W8LG), and ``git ls-files`` applies
+        an inherited index to whatever repository ``cwd`` names. Without a
+        per-repository scrub ``_project_top_levels`` reported the *gate's*
+        top-level paths for every repository, so the distinctive markers
+        collapsed to ``[]`` and the scope validation silently validated a
+        manifest against the wrong tree — the two root-file-marker tests then
+        failed only inside the finish gate (SA-0MVWJ6U3J003TLRZ).
+        """
+        repo = self._init_repo(tmp_path)
+        foreign = init_repo(tmp_path / "foreign-repo")
+        (foreign / "skill").mkdir()
+        (foreign / "skill" / "unrelated.py").write_text("x\n", encoding="utf-8")
+        commit_all(foreign, "foreign")
+
+        monkeypatch.setenv("GIT_INDEX_FILE", str(foreign / ".git" / "index"))
+
+        assert audit_runner._project_top_levels(repo) == sorted(
+            self.ROOT_FILES + [self.SHARED_SUBDIR]
+        ), "the inspected repo's own index must decide its top-level paths"
+        assert set(audit_runner._distinctive_project_top_levels(repo)) == set(
+            self.ROOT_FILES
         )
 
     def test_manifest_with_root_file_markers_passes_validation(self, tmp_path):

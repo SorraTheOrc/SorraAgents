@@ -21,6 +21,13 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
   (a tracer bullet, same convention as
   ``tests/test_repository_override_isolation.py``) until the implementation
   sibling SA-0MV87GC8O006RHS8 removes the markers.
+- working-tree attribution (SA-0MUIJAHXS003M7BG): a status entry that
+  disappears was non-clean at snapshot start, so its resolution is concurrent
+  churn excluded from the verdict (reported as a note), while a newly dirty
+  path — modified, deleted or created from a clean start — is still a
+  mutation. The rule's blind spots (masked revert/delete of another session's
+  uncommitted work, the retained clean→dirty direction, invisible content-only
+  changes) are pinned by characterisation tests;
 - concurrency ref-namespace exclusion (WL-0MV5MYBKJ0033P8U): moving only
   ``refs/heads/dev``, only ``refs/remotes/origin/dev`` or any
   ``refs/remotes/origin/*`` ref (a sibling ``finish`` fast-forward, a
@@ -477,6 +484,73 @@ class TestScrubRepositoryOverrides:
         assert "GIT_DIR" not in gs.sanitized_git_env()
 
 
+class TestGitEnvForRepo:
+    """SA-0MVTET8KQ0031R6Z: an ambient index only reaches its own repository.
+
+    The finish gate exports a temporary would-be-commit index for the suite it
+    runs. The repository under test must be inspected through it, while a
+    fixture repository must never read — or refresh, which writes — another
+    repository's index.
+    """
+
+    def test_keeps_an_index_that_belongs_to_the_repo(self, tmp_path, monkeypatch):
+        repo = _seeded_repo(tmp_path)
+        index = _staged_index(repo, "own.index")
+        monkeypatch.setenv("GIT_INDEX_FILE", str(index))
+
+        env = gs.git_env_for_repo(repo)
+
+        assert env["GIT_INDEX_FILE"] == str(index)
+
+    def test_drops_an_index_owned_by_another_repo(self, tmp_path, monkeypatch):
+        gate_repo = _seeded_repo(tmp_path, "gate")
+        fixture_repo = _seeded_repo(tmp_path, "fixture")
+        gate_index = _staged_index(gate_repo, "gate.index")
+        monkeypatch.setenv("GIT_INDEX_FILE", str(gate_index))
+
+        env = gs.git_env_for_repo(fixture_repo)
+
+        assert "GIT_INDEX_FILE" not in env, (
+            "a fixture repository inherited the gate's index"
+        )
+
+    def test_no_index_in_the_environment_is_a_no_op(self, tmp_path, monkeypatch):
+        repo = _seeded_repo(tmp_path)
+        monkeypatch.delenv("GIT_INDEX_FILE", raising=False)
+
+        assert "GIT_INDEX_FILE" not in gs.git_env_for_repo(repo)
+
+    def test_repository_overrides_are_still_scrubbed(self, tmp_path, monkeypatch):
+        repo = _seeded_repo(tmp_path)
+        monkeypatch.setenv("GIT_DIR", "/tmp/leaked")
+
+        assert "GIT_DIR" not in gs.git_env_for_repo(repo)
+
+    def test_non_repository_drops_the_index(self, tmp_path, monkeypatch):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "some.index"))
+
+        assert "GIT_INDEX_FILE" not in gs.git_env_for_repo(plain)
+
+
+def _staged_index(repo: Path, name: str) -> Path:
+    """Stage *repo*'s tree into ``<repo git dir>/<name>`` and return the path.
+
+    The gate's temporary index lives inside the repository's git directory
+    (``<git-dir>/implement-gate-*.index``), which is what makes it that
+    repository's index rather than a foreign one.
+    """
+    index = repo / ".git" / name
+    gs.run_git(
+        repo,
+        ["add", "-A"],
+        env={"GIT_INDEX_FILE": str(index)},
+        check=True,
+    )
+    return index
+
+
 class TestRepositoryOverrideVarsPresent:
     """F2: the detection helper used by diagnostics and the release gate."""
 
@@ -805,3 +879,446 @@ class TestConcurrencyExcludedRefs:
         diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
         assert diff["changed"]
         assert "intruder.txt" in diff["status"]["added"]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MUIJAHXS003M7BG — working-tree churn attributed to concurrent sessions
+# ---------------------------------------------------------------------------
+# On a multi-agent host a guarded full-suite run shares the main checkout with
+# sibling sessions. A sibling that commits work it had *already dirtied* makes
+# those paths leave the status surface mid-run; before this rule the guard
+# reported them as ``deleted path [ M]`` and failed a run that mutated nothing
+# (2026-10-19: 4427 passed, only two pre-dirty docs paths reported "deleted"
+# after a concurrent commit). The rule is start-of-run provenance from git
+# plumbing only: a status entry that disappeared was resolved during the run
+# (churn), everything newly dirty is a mutation.
+# ---------------------------------------------------------------------------
+
+
+class TestWorkingTreeAttribution:
+    """AC1/AC3: a concurrently resolved pre-existing dirty path is not a mutation.
+
+    The regression scenario is reproduced with a **second actor** — a separate
+    ``git`` process writing to the same hermetic checkout, exactly as a sibling
+    session does — and the excluded churn is asserted to be reported as a note
+    (never silently dropped).
+    """
+
+    @staticmethod
+    def _dirty_repo(tmp_path: Path, name: str = "main") -> Path:
+        """A ``dev`` checkout with one tracked file, dirtied after the commit."""
+        repo = gs.init_repo(tmp_path / name, default_branch="dev")
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        (repo / "seed.txt").write_text("pre-existing edit\n", encoding="utf-8")
+        return repo
+
+    def test_concurrent_commit_of_a_pre_dirty_tracked_path_is_not_a_mutation(
+        self, tmp_path
+    ):
+        """AC1: pre-dirty `` M`` path committed by a sibling mid-run → clean run."""
+        repo = self._dirty_repo(tmp_path)
+        before = gs.snapshot_guarded_roots(repo)
+        assert before["roots"][0]["snapshot"]["status"]["seed.txt"] == " M"
+
+        # Concurrent actor (a separate git process — the checkout's other
+        # writer) commits the work it had already dirtied. ``refs/heads/dev``
+        # moves with it, which the concurrency exclusion already covers.
+        gs.run_git(repo, ["commit", "-am", "sibling work"], check=True)
+
+        after = gs.snapshot_guarded_roots(repo)
+        assert "seed.txt" not in after["roots"][0]["snapshot"]["status"]
+
+        diff = gs.diff_guarded_roots(before, after)
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        # The failure renderer must not claim a difference either.
+        assert gs.describe_guarded_diff(diff) == "  (no differences)"
+        # ...and the exclusion is auditable, naming checkout, path and code.
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert gs.EXCLUDED_CHURN_NOTE_PREFIX in notes[0]
+        assert "seed.txt" in notes[0]
+        assert "[ M]" in notes[0]
+        assert str(repo.resolve()) in notes[0]
+
+    def test_concurrent_commit_of_a_pre_dirty_untracked_path_is_not_a_mutation(
+        self, tmp_path
+    ):
+        """AC1: a pre-existing ``??`` path committed by a sibling → clean run."""
+        repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        (repo / "scratch.txt").write_text("uncommitted work\n", encoding="utf-8")
+        before = gs.snapshot_guarded_roots(repo)
+        assert before["roots"][0]["snapshot"]["status"]["scratch.txt"] == "??"
+
+        gs.run_git(repo, ["add", "scratch.txt"], check=True)
+        gs.run_git(repo, ["commit", "-qm", "sibling work"], check=True)
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert "scratch.txt" in notes[0]
+        assert "[??]" in notes[0]
+
+    def test_helper_level_diff_reports_the_same_attribution(self, tmp_path):
+        """AC1: ``diff_snapshots`` (the shared rule) behaves identically."""
+        repo = self._dirty_repo(tmp_path, "solo")
+        before = gs.snapshot_repo_state(repo)
+        gs.run_git(repo, ["commit", "-am", "sibling work"], check=True)
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+        assert diff["changed"] is False
+        assert gs.excluded_working_tree_churn(diff) == {"seed.txt": " M"}
+        assert "seed.txt" not in gs.describe_diff(diff)
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1 and "seed.txt" in notes[0]
+
+
+class TestWorkingTreeAttributionIncidents:
+    """AC2: the incident direction is preserved — newly dirty is a mutation.
+
+    Every case here dirties the checkout from a *clean* start, which is what a
+    suite-caused mutation looks like; none of it may be attributed away.
+    """
+
+    @staticmethod
+    def _clean_repo(tmp_path: Path, name: str = "main") -> Path:
+        repo = gs.init_repo(tmp_path / name, default_branch="dev")
+        (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        return repo
+
+    def test_modifying_a_clean_tracked_path_is_a_mutation(self, tmp_path):
+        repo = self._clean_repo(tmp_path)
+        before = gs.snapshot_guarded_roots(repo)
+
+        (repo / "tracked.txt").write_text("suite damage\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is True
+        assert gs.excluded_churn_notes(diff) == []
+        root_diff = diff["roots"][0]["diff"]
+        assert root_diff["status"]["added"] == {"tracked.txt": " M"}
+        assert "tracked.txt" in gs.describe_guarded_diff(diff)
+
+    def test_deleting_a_clean_tracked_path_is_a_mutation(self, tmp_path):
+        repo = self._clean_repo(tmp_path)
+        before = gs.snapshot_guarded_roots(repo)
+
+        (repo / "tracked.txt").unlink()
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is True
+        assert gs.excluded_churn_notes(diff) == []
+        assert diff["roots"][0]["diff"]["status"]["added"] == {"tracked.txt": " D"}
+        assert "tracked.txt" in gs.describe_guarded_diff(diff)
+
+    def test_creating_a_new_untracked_path_is_a_mutation(self, tmp_path):
+        repo = self._clean_repo(tmp_path)
+        before = gs.snapshot_guarded_roots(repo)
+
+        (repo / "created.txt").write_text("suite artefact\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is True
+        assert gs.excluded_churn_notes(diff) == []
+        assert diff["roots"][0]["diff"]["status"]["added"] == {"created.txt": "??"}
+        assert "created.txt" in gs.describe_guarded_diff(diff)
+
+    def test_attribution_is_never_a_path_name_pattern(self, tmp_path):
+        """AC4: a ``.worklog/worktrees/wl-*`` path is still a mutation when new.
+
+        The rule derives from git status codes and snapshot provenance only —
+        were it name-based, an agent-worktree-shaped path would be excluded and
+        the incident's own fixture paths would go unguarded.
+        """
+        repo = self._clean_repo(tmp_path)
+        before = gs.snapshot_guarded_roots(repo)
+        agent_shaped = repo / ".worklog" / "worktrees" / "wl-agent" / "new.txt"
+        agent_shaped.parent.mkdir(parents=True)
+        agent_shaped.write_text("suite artefact\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is True
+        assert gs.excluded_churn_notes(diff) == []
+        assert ".worklog/worktrees/wl-agent/new.txt" in gs.describe_guarded_diff(diff)
+
+
+class TestWorkingTreeAttributionBoundaries:
+    """AC4: pinned boundaries — what the rule does *not* do.
+
+    These characterisation tests pin the chosen rule's blind spots and its
+    retained sensitivity so a later refactor cannot silently widen or narrow
+    them; they are documented in ``git_sandbox``'s module docstring and
+    ``docs/dev/test-isolation.md`` §8.5.
+    """
+
+    @staticmethod
+    def _dirty_repo(tmp_path: Path, name: str = "main") -> Path:
+        repo = gs.init_repo(tmp_path / name, default_branch="dev")
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        (repo / "seed.txt").write_text("pre-existing edit\n", encoding="utf-8")
+        return repo
+
+    def test_blind_spot_reverting_another_sessions_edit_is_masked(self, tmp_path):
+        """PINNED BLIND SPOT: a suite reverting pre-existing work is attributed.
+
+        The path was dirty at snapshot start, so its resolution is
+        indistinguishable from a sibling session's commit. The accepted
+        mitigation is the ``implement.py`` main-checkout guard
+        (WL-0MVPADZ1Z000FOSG) plus this note in the run output.
+        """
+        repo = self._dirty_repo(tmp_path)
+        before = gs.snapshot_guarded_roots(repo)
+
+        # A suite (or sibling) reverts the pre-existing edit.
+        gs.run_git(repo, ["checkout", "--", "seed.txt"], check=True)
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is False
+        assert gs.excluded_working_tree_churn(diff["roots"][0]["diff"]) == {
+            "seed.txt": " M"
+        }
+
+    def test_blind_spot_deleting_another_sessions_untracked_file_is_masked(
+        self, tmp_path
+    ):
+        """PINNED BLIND SPOT: deleting a pre-existing ``??`` path is attributed.
+
+        A pre-existing untracked file leaves the status surface whether it was
+        committed or deleted, so the rule cannot tell them apart.
+        """
+        repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        (repo / "scratch.txt").write_text("uncommitted work\n", encoding="utf-8")
+        before = gs.snapshot_guarded_roots(repo)
+
+        (repo / "scratch.txt").unlink()
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is False
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1 and "scratch.txt" in notes[0]
+
+    def test_still_dirty_with_a_different_code_stays_a_mutation(self, tmp_path):
+        """Retained sensitivity: no observable resolution ⇒ no attribution.
+
+        A pre-dirty path that stays dirty with a different code (e.g. a sibling
+        ``git add``) proves nothing about a resolution, so it keeps failing the
+        run as before — the narrowest possible removal of the false positive.
+        """
+        repo = self._dirty_repo(tmp_path)
+        before = gs.snapshot_guarded_roots(repo)
+
+        gs.run_git(repo, ["add", "seed.txt"], check=True)
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is True
+        assert diff["roots"][0]["diff"]["status"]["changed"] == {
+            "seed.txt": (" M", "M ")
+        }
+        assert gs.excluded_churn_notes(diff) == []
+
+    def test_content_only_change_to_a_pre_dirty_path_is_invisible(self, tmp_path):
+        """PINNED BLIND SPOT: status codes cannot see pre-dirty content churn.
+
+        A status-code surface never compared content, before or after this
+        rule: an already-dirty path whose content changes again keeps the same
+        code and produces no difference at all.
+        """
+        repo = self._dirty_repo(tmp_path)
+        before = gs.snapshot_guarded_roots(repo)
+
+        (repo / "seed.txt").write_text("further edit\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+        assert diff["changed"] is False
+        assert gs.excluded_churn_notes(diff) == []
+
+
+# ---------------------------------------------------------------------------
+# WL-0MVPE2B8E005O0OS — a guarded run also watches the MAIN CHECKOUT
+# ---------------------------------------------------------------------------
+# The 2026-10-26 incident: a run started in `.worklog/worktrees/<wl-…>` unlinked
+# every tracked file of `packages/shared` from the *main* checkout, and the
+# root-only snapshot pair reported a clean run. These tests pin the multi-root
+# coverage: the guarded root plus, when it is a linked worktree, its main
+# checkout.
+
+
+def _main_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """A ``dev`` checkout with one tracked file plus a linked ``wl-*`` worktree.
+
+    The worktree lives under ``<main>/.worklog/worktrees/wl-agent`` (the layout
+    the incident used) and is created from the main checkout's ``HEAD``, so both
+    checkouts start clean and share one object store.
+    """
+    main = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (main / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    (main / "tracked.txt").write_text("keep\n", encoding="utf-8")
+    gs.commit_all(main, "init")
+    worktree = gs.add_worktree(
+        main, main / ".worklog" / "worktrees" / "wl-agent", "wl-agent"
+    )
+    return main, worktree
+
+
+class TestGuardedRoots:
+    """`snapshot_guarded_roots` / `diff_guarded_roots` / `describe_guarded_diff`."""
+
+    def test_linked_worktree_guards_both_checkouts(self, tmp_path):
+        """A worktree-scoped run watches the worktree AND its main checkout."""
+        main, worktree = _main_with_worktree(tmp_path)
+
+        roots = gs.guarded_roots(worktree)
+
+        assert roots == (worktree.resolve(), main.resolve())
+        snapshot = gs.snapshot_guarded_roots(worktree)
+        assert [entry["role"] for entry in snapshot["roots"]] == [
+            gs.GUARDED_ROOT_ROLE,
+            gs.MAIN_CHECKOUT_ROLE,
+        ]
+        assert [entry["path"] for entry in snapshot["roots"]] == [
+            str(worktree.resolve()),
+            str(main.resolve()),
+        ]
+
+    def test_main_checkout_root_is_a_single_root(self, tmp_path):
+        """Run from the main checkout itself: nothing extra to watch."""
+        main, _worktree = _main_with_worktree(tmp_path)
+        assert gs.guarded_roots(main) == (main.resolve(),)
+        snapshot = gs.snapshot_guarded_roots(main)
+        assert [entry["role"] for entry in snapshot["roots"]] == [gs.GUARDED_ROOT_ROLE]
+
+    def test_non_git_path_is_a_single_root(self, tmp_path):
+        """A non-repository path stays a single (git-less) root — guard no-op."""
+        plain = tmp_path / "not-a-repo"
+        plain.mkdir()
+        assert gs.guarded_roots(plain) == (plain.resolve(),)
+        assert gs.snapshot_guarded_roots(plain)["roots"][0]["snapshot"]["git"] is False
+
+    def test_main_checkout_tracked_file_deletion_is_reported(self, tmp_path):
+        """The defect class: only the main checkout loses a tracked file."""
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        (main / "tracked.txt").unlink()
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is True
+        # The guarded root did not change; the main checkout did.
+        by_role = {entry["role"]: entry for entry in diff["roots"]}
+        assert by_role[gs.GUARDED_ROOT_ROLE]["diff"]["changed"] is False
+        assert by_role[gs.MAIN_CHECKOUT_ROLE]["diff"]["changed"] is True
+
+        text = gs.describe_guarded_diff(diff)
+        assert "tracked.txt" in text, text
+        assert str(main.resolve()) in text, text
+        assert "main checkout" in text, text
+
+    def test_guarded_root_mutation_is_still_reported(self, tmp_path):
+        """Mutations of the guarded root itself keep their previous coverage."""
+        _main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        (worktree / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is True
+        by_role = {entry["role"]: entry for entry in diff["roots"]}
+        assert by_role[gs.GUARDED_ROOT_ROLE]["diff"]["changed"] is True
+        assert by_role[gs.MAIN_CHECKOUT_ROLE]["diff"]["changed"] is False
+        assert "tracked.txt" in gs.describe_guarded_diff(diff)
+
+    def test_clean_guarded_roots_report_nothing(self, tmp_path):
+        """An unchanged run over both checkouts is clean and names no path."""
+        _main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is False
+        assert gs.describe_guarded_diff(diff) == "  (no differences)"
+        assert gs.fingerprint_guarded_roots(before) == gs.fingerprint_guarded_roots(
+            gs.snapshot_guarded_roots(worktree)
+        )
+
+    def test_guarded_fingerprint_moves_when_main_checkout_changes(self, tmp_path):
+        """The cheap per-test trigger also covers the main checkout's refs."""
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree, include_status=False)
+
+        gs.run_git(main, ["branch", "intruder"], check=True)
+
+        assert gs.fingerprint_guarded_roots(
+            before
+        ) != gs.fingerprint_guarded_roots(
+            gs.snapshot_guarded_roots(worktree, include_status=False)
+        )
+
+    def test_fast_forward_of_dev_in_main_checkout_is_not_a_mutation(self, tmp_path):
+        """finish's own Step-5 fast-forward in the main checkout is churn.
+
+        A concurrent `implement.py finish` fast-forwards the main checkout's
+        `dev` (and `origin/dev` after its fetch) while a worktree-scoped run is
+        in flight. That is expected, never a guard failure — the exclusions are
+        applied per root, so the main checkout's `dev`/`origin/*` movement stays
+        invisible.
+        """
+        main, worktree = _main_with_worktree(tmp_path)
+        origin = gs.init_bare_remote(tmp_path / "origin.git")
+        gs.add_remote(main, "origin", str(origin))
+        gs.run_git(main, ["push", "-u", "origin", "dev"], check=True)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        # A new commit lands on dev, then the main checkout fast-forwards to it
+        # (implement.py finish's post-push parent sync) and origin/dev moves.
+        (main / "shared.txt").write_text("new\n", encoding="utf-8")
+        new_sha = gs.commit_all(main, "advance dev")
+        _advance_ref(main, "refs/remotes/origin/dev")
+        assert gs.run_git(main, ["rev-parse", "HEAD"]).stdout.strip() == new_sha
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+
+    def test_worktree_registered_mid_run_in_main_checkout_is_invisible(self, tmp_path):
+        """Registering an agent worktree mid-run moves no fingerprint and no diff.
+
+        Multi-agent hosts register/remove `.worklog/worktrees/*` constantly; the
+        ownership-based exclusions are applied per root, so the main checkout's
+        view of that churn can never fail a clean run.
+        """
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+        fingerprint_before = gs.fingerprint_guarded_roots(
+            gs.snapshot_guarded_roots(worktree, include_status=False)
+        )
+
+        sibling = gs.add_worktree(
+            main, main / ".worklog" / "worktrees" / "wl-sibling", "wl-sibling"
+        )
+        (sibling / "sibling.txt").write_text("work\n", encoding="utf-8")
+        gs.commit_all(sibling, "sibling work")
+
+        after = gs.snapshot_guarded_roots(worktree)
+        diff = gs.diff_guarded_roots(before, after)
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        assert fingerprint_before == gs.fingerprint_guarded_roots(
+            gs.snapshot_guarded_roots(worktree, include_status=False)
+        )
+
+    def test_describe_guarded_diff_single_root_matches_describe_diff(self, tmp_path):
+        """A single-root guarded diff keeps the historical rendering."""
+        repo = gs.init_repo(tmp_path / "solo", default_branch="dev")
+        (repo / "tracked.txt").write_text("keep\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        before = gs.snapshot_guarded_roots(repo)
+        gs.run_git(repo, ["branch", "feature-x"], check=True)
+        guarded = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+
+        assert guarded["changed"] is True
+        assert gs.describe_guarded_diff(guarded) == gs.describe_diff(
+            guarded["roots"][0]["diff"]
+        )
+        assert "refs/heads/feature-x" in gs.describe_guarded_diff(guarded)

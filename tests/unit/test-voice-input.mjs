@@ -3,7 +3,7 @@
  *
  * Wires the *real* modules together — controller → recorder (with an injected
  * fake capture process) → persistent faster-whisper worker (real Python, stub
- * `faster_whisper` module injected via PYTHONPATH) → pi callbacks — and feeds
+ * `faster_whisper` and `numpy` modules injected via PYTHONPATH) → pi callbacks — and feeds
  * synthetic PCM directly, so the whole path from audio frames to an
  * auto-submitted user message is exercised without a microphone, GPU or model
  * download.
@@ -16,10 +16,11 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { NUMPY_STUB } from "../helpers/voice-python-stubs.mjs";
+import { makeTempDir } from "../helpers/temp-dir.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const VOICE_DIR = join(__dirname, "..", "..", "pi-client", "voice-input");
@@ -45,8 +46,9 @@ let stubDir;
 const liveChildren = new Set();
 
 before(() => {
-  stubDir = mkdtempSync(join(tmpdir(), "voice-input-e2e-"));
+  stubDir = makeTempDir("voice-input-e2e-");
   writeFileSync(join(stubDir, "faster_whisper.py"), STUB, "utf8");
+  writeFileSync(join(stubDir, "numpy.py"), NUMPY_STUB, "utf8");
 });
 
 after(() => {
