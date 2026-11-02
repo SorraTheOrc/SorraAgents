@@ -31,15 +31,15 @@ If you already have a current work-item id, continue using it; otherwise ask the
 7. **Repeat** — return to step 4.
 8. **End session** — inform operator, summarize remaining tasks, clean up worktrees.
 
-> **Push policy:** Push only to `dev` — never to `main`. [ship skill](/home/rgardler/.pi/agent/skills/ship/SKILL.md) / `skill/ship/scripts/release/merge-dev-to-main.sh` promotes `dev` to `main`; see [docs/dev/release-process.md](docs/dev/release-process.md).
+> **Push policy:** Push only to `dev` — never to `main`. [ship skill](/home/rgardler/.pi/agent/skills/ship/SKILL.md) / `skill/ship/scripts/release/merge-dev-to-main.sh` promotes `dev` to `main`; see [docs/dev/release-process.md](/home/rgardler/projects/SorraAgents/docs/dev/release-process.md).
 
 > **Do NOT close the work-item at this stage.** Closed only after the `dev`→`main` release. "Close a work item" means stage `in_review` or mark `completed` — NOT a release. Agents SHOULD NOT push directly to `main` unless explicitly authorized.
 
 ## Implement the work-item
 
-**MANDATORY — worktree requirement:** all implementation MUST happen in the worktree created by `implement.py start <WIP-id>`; `cd` into `.worklog/worktrees/wl-<WIP-id>-<slug>` and make ALL changes there — never edit, commit, or push from the main checkout; `implement.py finish` refuses if it detects changes outside the worktree. **`cwd` is not sufficient:** before the first edit, a child/driven session MUST verify its worktree root and ensure every write/edit path resolves inside it — e.g. `test "$(git rev-parse --show-toplevel)" = "$IMPLEMENT_WORKTREE_PATH"` for a driven session, or compare `git rev-parse --show-toplevel` against the `.worklog/worktrees/wl-<WIP-id>-<slug>` path; an absolute path under the main checkout writes outside the worktree even when `cwd` looks right. Never `cd` to the main checkout to edit: `wl` reads the main checkout's `.worklog`, so run it worktree-safely as `wl --worklog-dir <main-checkout>/.worklog …`. `phase_parent`/`drive` fail closed when a driven child's work lands in the main checkout. See the [implement skill](/home/rgardler/.pi/agent/skills/implement/SKILL.md) and [docs/dev/worktree-isolation.md](docs/dev/worktree-isolation.md).
+**MANDATORY — worktree requirement:** all implementation MUST happen in the worktree created by `implement.py start <WIP-id>`; `cd` into `.worklog/worktrees/wl-<WIP-id>-<slug>` and make ALL changes there — never edit, commit, or push from the main checkout; `implement.py finish` refuses if it detects changes outside the worktree. **`cwd` is not sufficient:** before the first edit, a child/driven session MUST verify its worktree root and ensure every write/edit path resolves inside it — e.g. `test "$(git rev-parse --show-toplevel)" = "$IMPLEMENT_WORKTREE_PATH"` for a driven session, or compare `git rev-parse --show-toplevel` against the `.worklog/worktrees/wl-<WIP-id>-<slug>` path; an absolute path under the main checkout writes outside the worktree even when `cwd` looks right. Never `cd` to the main checkout to edit: `wl` reads the main checkout's `.worklog`, so run it worktree-safely as `wl --worklog-dir <main-checkout>/.worklog …`. `phase_parent`/`drive` fail closed when a driven child's work lands in the main checkout. See the [implement skill](/home/rgardler/.pi/agent/skills/implement/SKILL.md) and [docs/dev/worktree-isolation.md](/home/rgardler/projects/SorraAgents/docs/dev/worktree-isolation.md).
 
-> **Worktree hygiene:** run `scripts/hygiene_check.sh` periodically to detect orphaned stashes and dirty main checkouts; when `implement.py start` warns about orphaned stashes, triage them using the [recovery playbook](skill/implement/SKILL.md#dirty-main-checkout-recovery-playbook) — never stash or delete stashes without explicit operator permission.
+> **Worktree hygiene:** run `scripts/hygiene_check.sh` periodically to detect orphaned stashes and dirty main checkouts; when `implement.py start` warns about orphaned stashes, triage them using the [recovery playbook](/home/rgardler/.pi/agent/skills/implement/SKILL.md#dirty-main-checkout-recovery-playbook) — never stash or delete stashes without explicit operator permission.
 
 ### Epic/parent items — one session per child
 
@@ -104,7 +104,7 @@ A project may augment a global skill from its repo via
 `SKILL_POSTFIX.md` (prose before the first / after the final step) and
 `extension.json` (machine-readable script data). Absence is a no-op;
 extensions are additive and cannot weaken safety/gating steps — see
-[docs/dev/skill-extensions.md](docs/dev/skill-extensions.md).
+[docs/dev/skill-extensions.md](/home/rgardler/projects/SorraAgents/docs/dev/skill-extensions.md).
 
 ## Assignee release invariant
 
@@ -146,7 +146,7 @@ Automated infrastructure gates (pre-push hook, `implement.py finish`, audit F3 c
 ## Background job etiquette
 
 Long-running background processes (audit, build, release, batch test) follow
-the shared [background-job etiquette](skill/shared/background-job-etiquette.md):
+the shared [background-job etiquette](/home/rgardler/.pi/agent/skills/shared/background-job-etiquette.md):
 launch → prepare other work → one completion-aware wait with progress via
 `skill/shared/wait_for_job.py` → collect. Fixed `sleep N` polling of background
 processes is deprecated.

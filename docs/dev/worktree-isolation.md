@@ -22,6 +22,23 @@ Related: [implement skill](../../skill/implement/SKILL.md),
 > Every deviation is either refused before it happens or aborted loudly with
 > the offending paths named — never carried silently into a commit or push.
 
+## Repo-specific pages
+
+This page is the framework-wide copy: `AGENTS_GLOBAL.md` links it by absolute
+path and the implement skill points at it. ContextHub carries its own
+[worktree-isolation page](/home/rgardler/projects/ContextHub/docs/dev/worktree-isolation.md)
+with the guards that only apply inside that repository:
+
+- **main-checkout deletions** — detecting, refusing and recovering from a run
+  that removed files from the shared checkout;
+- **repo-wide filesystem walks** racing concurrent worktree churn;
+- **module resolution in a worktree** — `@worklog/shared` resolving into the
+  main checkout's `packages/shared/dist`, and the stale-`dist` false red that
+  follows from editing `packages/shared` in a worktree.
+
+The rule in this page applies everywhere; read ContextHub's page as well when
+the work item lives there.
+
 ## Why worktrees
 
 `implement.py start` creates

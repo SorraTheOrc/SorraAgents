@@ -12,6 +12,7 @@ and ``tests/test_implement_skill_session_per_child_doc.py``.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -334,3 +335,59 @@ class TestWorktreeRemovalOwnership:
         )
         assert "git checkout dev" not in block
         assert "git pull origin dev" not in block
+
+
+_CONTEXT_HUB_DOC_SUFFIX = "ContextHub/docs/dev/worktree-isolation.md"
+_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+
+
+def _context_hub_link_targets() -> list[str]:
+    """File targets in the isolation doc that point at ContextHub's page."""
+    targets: list[str] = []
+    for match in _LINK_RE.finditer(_read(_ISOLATION_DOC)):
+        target = match.group(1).strip().split("#", 1)[0]
+        if target.endswith(_CONTEXT_HUB_DOC_SUFFIX):
+            targets.append(target)
+    return targets
+
+
+def _section_containing(needle: str) -> str:
+    """The ``## `` section of the isolation doc that contains ``needle``."""
+    content = _read(_ISOLATION_DOC)
+    index = content.find(needle)
+    assert index != -1, f"{_ISOLATION_DOC.name} must mention {needle!r}"
+    start = content.rfind("\n## ", 0, index)
+    start = 0 if start == -1 else start + 1
+    end = content.find("\n## ", index)
+    section = content[start:] if end == -1 else content[start:end]
+    return " ".join(section.split())
+
+
+class TestContextHubCrossLink:
+    """SA-0MVZ4BECY002X81S AC3: this page cross-links ContextHub's copy and
+    says what that copy adds, so an agent working in ContextHub lands on the
+    repository-specific page instead of stopping at the framework rule."""
+
+    def test_links_context_hub_page_by_absolute_path(self) -> None:
+        targets = _context_hub_link_targets()
+        assert targets, (
+            "docs/dev/worktree-isolation.md must link ContextHub's page "
+            f"(a target ending in {_CONTEXT_HUB_DOC_SUFFIX!r}); found none"
+        )
+        for target in targets:
+            assert Path(target).is_absolute(), (
+                "the ContextHub page lives in a sibling checkout, so the link "
+                f"must be absolute (a relative target cannot reach it): {target!r}"
+            )
+            assert Path(target).exists(), f"cross-link target is missing: {target}"
+
+    def test_states_what_context_hub_page_adds(self) -> None:
+        section = _section_containing(_CONTEXT_HUB_DOC_SUFFIX)
+        lowered = section.lower()
+        assert "contexthub" in lowered
+        # The ContextHub-specific content this page does not carry.
+        assert "deletion" in lowered, "must name main-checkout deletion recovery"
+        assert "repo-wide" in lowered, "must name repo-wide walk races"
+        assert "packages/shared" in lowered or "module resolution" in lowered, (
+            "must name the module-resolution content carried by ContextHub's copy"
+        )
