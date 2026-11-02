@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.1.25 (2026-11-02)
+> **Release focus:** This release focuses on making test and release workflows faster and more reliable, with scoped test runs that target only changed files, quicker task release, and broader pipeline support for Python projects. It also fixes numerous reliability issues around task locking, epic retries, commit integrity, and test accuracy so results reflect exactly what was committed.
+### Features
+- Finished or cancelled tasks are now released immediately so they can be picked up again without delay. (SA-0MVR929TS000C8UM)
+- Refactor scans now skip third-party and vendored code, so reports stay focused on your own project. (SA-0MVPDVXT90067E3M)
+- Python projects can now be released through the standard pipeline, not just JavaScript ones. (SA-0MVN2B0DJ00135W0)
+- Quick test runs now start immediately instead of waiting behind long full test suites. (SA-0MVWZQ269009SJXV)
+- Test runs now target only the files you changed, so feedback arrives in minutes instead of waiting on the full suite. (SA-0MVL7YOMJ006UMDO)
+- Audits of small items now finish faster, so release checks stall less. (SA-0MVKXNWRS005EKBM)
+- Finished or cancelled tasks no longer get stuck and can always be picked up again. (SA-0MVVEDK2Q008NDUH)
+- Skill tests stored in hidden project folders now run in the full test suite, so broken skills can't slip through. (SA-0MVQJSGLY0098DVB)
+- Epic runs no longer get stuck retrying a failed child forever — they now recover and keep moving. (SA-0MVLIZ33M009C5QY)
+- Prevents two sessions from editing the same task at once, so your work is never overwritten. (SA-0MVOABYW00004978)
+- Builds no longer sneak unrelated engine updates into your commits, and test results always match exactly what was committed. (SA-0MVZE164P0048306)
+- End-of-session reports now only flag actions you truly need to take, so you can tell at a glance if you're blocking progress. (SA-0MVNQ3RLW006XEFW)
+### Bug Fixes
+- Scoped test runs now use the same interpreter as full runs, so results are trustworthy. (SA-0MVO0EB1U007L7DS)
+- Voice input now reports a clear setup error instead of failing mid-transcription. (SA-0MVRNLSQT006T5GQ)
+- Test results now reflect your project's real setup, so a passing run actually means passing. (SA-0MVK154IE007OS3D)
+- Fixed a bug where finishing a task could incorrectly fail even when everything was working correctly. (SA-0MVUTY6EN001OI44)
+- Blocked epics now wait for their dependencies instead of starting conflicting work. (SA-0MVS1QS9J009DGPT)
+- Worklog sync works again, so your locally-authored work items publish normally. (SA-0MVLJDS04002KI1W)
+- Finishing work in parallel sessions can no longer silently lose your commits. (SA-0MVNQURZM001TKJY)
+- Test reliability improved so PATH setup no longer causes false failures. (SA-0MVO2BAYE001T2NN)
+- Acceptance criteria checks now correctly ignore nested sub-bullets and stop instead of falsely passing when criteria can't be read. (SA-0MVO7R2WU0058RNJ)
+- Fixed a bug that could block saving your progress when finishing a level with no changes. (SA-0MVVKJGKP003QVNM)
+- Finish checks now test exactly what will be committed, so you won't see a green result that turns red right after. (SA-0MVL2NH1G0094FA2)
+- Driven sessions no longer lose their workspace mid-run, so post-push checks finish cleanly. (SA-0MVTE8XAJ002IUDR)
+- Fixed a test issue so new updates can be pushed to the dev branch again. (SA-0MVVX85KW001ZHE7)
+- Test failures now clearly show whether code broke, a timeout hit, or the test queue was busy. (SA-0MVTET8KQ0031R6Z)
+- Machine health checks now show real CPU, memory, and I/O pressure instead of "unavailable. (SA-0MVLJ8VD60091JLW)
+- Updates now actually download instead of silently reporting "up to date," so you always get the latest fixes. (SA-0MVX1M6HH004YPX2)
+- Test runs no longer fail just because another session changed files at the same time. (SA-0MUIJAHXS003M7BG)
+- Refactor markers no longer break scripts that start with a shebang line. (SA-0MVPUVM8F006270F)
+- Releases no longer get blocked by audits that are actually up to date. (SA-0MVTPAV4N005WPWF)
+- Children with no new work are no longer mistaken for having changes, preventing failed runs. (SA-0MVRN5Q67005H3M5)
+- Fixed broken worktree-isolation guide links so agents always reach the correct instructions. (SA-0MVZ4BECY002X81S)
+- Finishing a work item no longer breaks your session's ability to run commands, so reports and verification complete reliably. (SA-0MVTE927L0017ND5)
+- Plan reviews now correctly check numbered acceptance criteria, so coverage is verified instead of falsely passing. (SA-0MUYHHG1Y0040PPV)
+### Other
+- Internal code cleanup with no gameplay changes. (SA-0MVBQENSC001PEZ0)
+
 ## v0.1.24 (2026-10-25)
 > **Release focus:** This release focuses on making audits faster, more accurate, and less disruptive by scoping them to an item's own files, keeping results valid unless details change, and preventing them from resetting or blocking work. It also fixes worklog sync and git checkout/merge reliability, and ensures releases and task completion run cleanly without duplicate actions or false failures.
 ### Features
