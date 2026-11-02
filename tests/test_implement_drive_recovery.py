@@ -1065,6 +1065,188 @@ class TestBoundedFinishAttempts:
 
 
 # ---------------------------------------------------------------------------
+# LP-0MVWEP292000ODBS: infra-retry budget for transient finish refusals
+# ---------------------------------------------------------------------------
+
+
+def infra_refusal_report(child_id: str) -> dict:
+    """A ``finishing_failed`` parent report classified as **infrastructure**.
+
+    Scripts the incident shape (a ``local_dev_fast_forward`` refusal with
+    ``local_dev_diverged`` — a concurrent session fast-forwarded local
+    ``dev``) through the production classifier, so the payload can never
+    silently claim the wrong failure class (LP-0MVWEP292000ODBS).
+    """
+    return finishing_failed_report(
+        child_id,
+        step="local_dev_fast_forward",
+        reason="local_dev_diverged",
+        kind="infrastructure",
+    )
+
+
+def gate_failure_report(child_id: str) -> dict:
+    """A ``finishing_failed`` parent report classified as **gate**."""
+    return finishing_failed_report(
+        child_id,
+        step="tests",
+        reason="tests_failed",
+        kind="gate",
+    )
+
+
+class TestInfraRetryBudget:
+    """Transient infrastructure refusals are retried on their **own** bounded
+    budget, never consuming the finish-attempt budget
+    (LP-0MVWEP292000ODBS AC2–AC6).
+
+    AC2: an infrastructure refusal increments ``infra_retries[child]`` and
+    leaves ``finish_attempts`` without an entry for that child. AC3: a
+    scripted harness returning three infrastructure refusals then success
+    ends with ``success: True``, the child recorded as ``finished``,
+    ``infra_retries == {child: 3}`` and ``infra_retry_limit == 5``. AC4:
+    every retry emits a ``children_driven`` entry with ``result:
+    "infra-retry"`` carrying ``step``, ``reason`` and the attempt number,
+    and spawns **no** session. AC5: exhausting ``--infra-retry-limit`` falls
+    through to the existing reconcile/reset path and stops with a message
+    naming the failing step and reason. AC6: the backoff is bounded and
+    injectable.
+    """
+
+    def test_three_infra_refusals_then_success_ends_finished(
+        self, drive_harness,
+    ):
+        """AC3 (and parent AC2): the refusal clears inside the budget, the
+        same ``finish`` succeeds and the chain continues — the committed
+        slice is never discarded by an infra refusal that self-clears."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(infra_refusal_report("SA-C1") for _ in range(3)),
+                {"success": True, "next_child": "SA-C1",
+                 "worktree_path": "/wt/SA-C1"},
+                {"success": True, "parent_advanced": True},
+            ]),
+        )
+        delays: list[float] = []
+
+        report = harness.run(delay=delays.append)
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert report["infra_retry_limit"] == 5
+        # The child finished after the refusals cleared.
+        assert [e["result"] for e in report["children_driven"]] == [
+            "infra-retry", "infra-retry", "infra-retry", "finished",
+        ]
+        assert report["children_driven"][-1]["id"] == "SA-C1"
+        # AC2: the refusals were counted in infra_retries, never in
+        # finish_attempts.
+        assert report["infra_retries"] == {"SA-C1": 3}
+        assert report["finish_attempts"] == {}
+        # One real session (the final progress report), never per retry.
+        assert report["sessions_spawned"] == 1
+        assert harness.spawn_calls == ["SA-C1"]
+        # AC6: the injected backoff ran (no real sleeps).
+        assert delays == [2, 4, 8]
+
+    def test_infra_retry_entries_carry_step_reason_and_attempt(
+        self, drive_harness,
+    ):
+        """AC4: each retry entry names the failing step/reason and numbers
+        the attempt."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(infra_refusal_report("SA-C1") for _ in range(3)),
+                {"success": True, "next_child": "SA-C1",
+                 "worktree_path": "/wt/SA-C1"},
+                {"success": True, "parent_advanced": True},
+            ]),
+        )
+
+        report = harness.run(delay=lambda _s: None)
+
+        retries = [
+            e for e in report["children_driven"]
+            if e["result"] == "infra-retry"
+        ]
+        assert len(retries) == 3
+        for i, entry in enumerate(retries, start=1):
+            assert entry["id"] == "SA-C1"
+            assert entry["step"] == "local_dev_fast_forward"
+            assert entry["reason"] == "local_dev_diverged"
+            assert entry["attempt"] == i
+        # The retries themselves spawned no session: only the eventual
+        # child session counts (AC4 — ``sessions_spawned`` unchanged by
+        # the retries).
+        assert len(harness.spawner.calls) == 1
+
+    def test_exhausting_infra_budget_falls_through_and_names_step_reason(
+        self, drive_harness,
+    ):
+        """AC5: spending the infra budget is bounded — the loop falls
+        through to the existing reconcile/reset path and stops with a
+        message naming the failing step and reason."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(infra_refusal_report("SA-C1") for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+        )
+
+        report = harness.run(infra_retry_limit=2)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        # Two infra retries ran on the separate budget; the third refusal
+        # exhausted it and fell through to the finish-attempt path.
+        assert report["infra_retries"] == {"SA-C1": 2}
+        assert [e["result"] for e in report["children_driven"]] == [
+            "infra-retry", "infra-retry",
+        ]
+        assert report["finish_attempts"] == {"SA-C1": 1}
+        # The stopping verdict names the failing step and reason.
+        assert "local_dev_fast_forward" in report["message"]
+        assert "local_dev_diverged" in report["message"]
+        assert harness.spawner.calls == []
+
+    def test_gate_failures_never_touch_the_infra_budget(
+        self, drive_harness,
+    ):
+        """A genuine gate failure (tests/tests_failed) is never retried as
+        infrastructure: it consumes the existing finish-attempt path
+        unchanged and leaves ``infra_retries`` empty."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(gate_failure_report("SA-C1") for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["infra_retries"] == {}
+        assert report["children_driven"] == []
+        assert report["finish_attempts"] == {"SA-C1": 3}
+        assert harness.spawner.calls == []
+
+    def test_backoff_schedule_is_bounded(self, implement_mod):  # noqa: F811
+        """AC6: ``_drive_infra_backoff_delay`` yields [2, 4, 8, 16, 30, 30]
+        seconds for attempts 1–6 and caps at 30 s thereafter."""
+        m = implement_mod
+        assert [m._drive_infra_backoff_delay(n) for n in range(1, 7)] == [
+            2, 4, 8, 16, 30, 30,
+        ]
+        assert m._drive_infra_backoff_delay(10) == 30
+        assert m._drive_infra_backoff_delay(100) == 30
+
+
+# ---------------------------------------------------------------------------
 # Parent AC2 (SA-0MVLJXTYY005XQDV): terminal reconciliation on finish failure
 # ---------------------------------------------------------------------------
 

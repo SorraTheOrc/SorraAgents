@@ -42,6 +42,9 @@ Optional flags:
   --max-child-sessions N    Max fresh sessions per child when driving (default: 1)
   --finish-attempt-limit N  Max failing finish executions per child when driving
                             (default: the --max-child-sessions value)
+  --infra-retry-limit N     Max infrastructure-refusal retries per child when
+                            driving (default: 5; a separate budget, never
+                            consumes --finish-attempt-limit, spawns no session)
   --child-timeout N         Per-child session timeout in seconds (default: 3600)
   --finalise-stranded       Finalise evidence-gated stranded children when driving
   -v, --verbose             Verbose logging
@@ -224,6 +227,13 @@ DEFAULT_MAX_RETRY = 3
 
 #: Max fresh sessions spawned per child by ``phase_drive`` before it stops.
 DEFAULT_MAX_CHILD_SESSIONS = 1
+#: Max infrastructure-refusal retries per child in one ``phase_drive``
+#: invocation. A transient infrastructure refusal (``local_dev_diverged``,
+#: a held main-checkout lock, a dropped push transport) is retried on this
+#: **separate** bounded budget with exponential backoff — it never consumes
+#: the finish-attempt bound (``--finish-attempt-limit``) and never spawns a
+#: session (LP-0MVWEP292000ODBS).
+DEFAULT_INFRA_RETRY_LIMIT = 5
 #: Default per-child session timeout (seconds) used by ``phase_drive``.
 #: A child runs the whole implement workflow (changed-scope tests, full-suite
 #: gate, and the pre-push hook) so this is much larger than the per-command
@@ -9476,6 +9486,24 @@ def _resolve_child_session_timeout() -> int:
     return DEFAULT_CHILD_SESSION_TIMEOUT
 
 
+def _drive_infra_backoff_delay(attempt: int) -> int:
+    """Bounded exponential backoff (seconds) for infrastructure drive retries.
+
+    Yields ``min(2 * 2**(attempt-1), 30)`` — ``[2, 4, 8, 16, 30, 30, …]``
+    seconds for attempts 1, 2, 3, … — so a transient refusal that clears
+    within the infra-retry budget (``--infra-retry-limit``) is retried with
+    bounded, escalating spacing and a contended host is never hammered
+    (LP-0MVWEP292000ODBS AC6).
+
+    Args:
+        attempt: The 1-based retry attempt number.
+
+    Returns:
+        Seconds to wait before the retry, capped at 30.
+    """
+    return min(2 * 2 ** (attempt - 1), 30)
+
+
 def _resolve_pi_bin(env: dict[str, str] | None = None) -> str | None:
     """Resolve the Pi executable used to spawn child sessions.
 
@@ -9925,6 +9953,10 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             # parent-branch HEAD so a fresh session can retry it
             # (SA-0MVLJXVND0015LPW).
             icon = "♻"
+        elif result == "infra-retry":
+            # A transient infrastructure refusal retried on its own bounded
+            # budget with backoff (LP-0MVWEP292000ODBS).
+            icon = "🔁"
         else:
             icon = "❌"
         print(
@@ -9945,6 +9977,8 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         )
     if report.get("reset_for_retry"):
         print(f"  Reset for retry: {report['reset_for_retry']}")
+    if report.get("infra_retries"):
+        print(f"  Infra retries: {report.get('infra_retries')}")
     if report.get("finalised_children"):
         print(f"  Finalised stranded: {len(report['finalised_children'])}")
     if report.get("stranded_children"):
@@ -10625,6 +10659,8 @@ def phase_drive(
     max_child_sessions: int = DEFAULT_MAX_CHILD_SESSIONS,
     child_timeout: int | None = None,
     finish_attempt_limit: int | None = None,
+    infra_retry_limit: int = DEFAULT_INFRA_RETRY_LIMIT,
+    delay: Callable[[float], None] | None = None,
     spawn_session: Callable[..., dict[str, Any]] | None = None,
     parent_runner: Callable[..., dict[str, Any] | None] | None = None,
     commit_evidence: Callable[[str], str | None] | None = None,
@@ -10708,6 +10744,15 @@ def phase_drive(
         finish_attempt_limit: Max failing ``finish`` executions per child in
             one drive invocation (default: ``max_child_sessions``). A
             non-positive value is clamped to 1.
+        infra_retry_limit: Max **infrastructure**-refusal retries per child in
+            one drive invocation (default: ``DEFAULT_INFRA_RETRY_LIMIT``).
+            These run on a budget separate from ``finish_attempt_limit``,
+            with bounded exponential backoff, and never spawn a session — a
+            refusal that clears within the budget lets the same ``finish``
+            succeed and the chain continue (LP-0MVWEP292000ODBS). A
+            non-positive value is clamped to 1.
+        delay: Injectable backoff sleeper for infrastructure retries (tests
+            pass a zero-cost recorder; default ``time.sleep``).
         spawn_session: Injectable spawner (tests); defaults to
             :func:`_default_session_spawner`.
         parent_runner: Injectable ``parent`` runner (tests); defaults to
@@ -10735,7 +10780,13 @@ def phase_drive(
         its pushed-commit evidence (SA-0MVLJWRVO000QQNP). ``finish_attempts``
         maps each child whose ``finish`` failed to the number of failing
         finish executions observed, and ``finish_attempt_limit`` reports the
-        bound applied (SA-0MVLJXS7R000XIFL). ``terminal_reconciled`` counts
+        bound applied (SA-0MVLJXS7R000XIFL). ``infra_retries`` maps each
+        child whose ``finish`` was refused for an *infrastructure* reason to
+        the number of retries consumed on the separate infra budget, and
+        ``infra_retry_limit`` reports that bound (LP-0MVWEP292000ODBS); each
+        retry also appears in ``children_driven`` as ``"infra-retry"`` with
+        the failing ``step``/``reason`` and the attempt number.
+        ``terminal_reconciled`` counts
         children recorded as done after their finish failed
         (SA-0MVLJXTYY005XQDV); ``reset_for_retry`` counts non-terminal
         children whose worktree was reset for a fresh session
@@ -10762,6 +10813,8 @@ def phase_drive(
         "reset_for_retry": 0,
         "finish_attempts": {},
         "finish_attempt_limit": None,
+        "infra_retries": {},
+        "infra_retry_limit": None,
         "message": "",
     }
 
@@ -10824,9 +10877,18 @@ def phase_drive(
         else max(1, int(finish_attempt_limit))
     )
     report["finish_attempt_limit"] = finish_attempt_limit
+    # Clamped to at least 1 so a non-positive --infra-retry-limit can never
+    # open an unbounded retry loop (LP-0MVWEP292000ODBS AC1/AC5).
+    infra_retry_limit = max(1, int(infra_retry_limit))
+    report["infra_retry_limit"] = infra_retry_limit
+    # Injectable backoff sleeper: tests substitute a zero-delay recorder so
+    # the retry schedule is exercised without sleeping (LP-0MVWEP292000ODBS
+    # AC6).
+    sleeper = delay or time.sleep
 
     attempts: dict[str, int] = {}
     finish_attempts: dict[str, int] = {}
+    infra_retries: dict[str, int] = {}
     reset_cids: set[str] = set()
     # The report's own list, so entries recorded mid-loop (worktree cleanup
     # outcomes) are visible to the resolvers and to the final report.
@@ -10839,10 +10901,14 @@ def phase_drive(
     finaliser = finalise_child or _finalise_stranded_child
     # Hard bound on the loop: each child may consume at most
     # max_child_sessions spawns plus finish_attempt_limit failing finish
-    # retries plus one terminal classification, and the final iteration
-    # advances the parent.
+    # retries plus infra_retry_limit infrastructure retries plus one
+    # terminal classification, and the final iteration advances the parent.
+    # The infra budget is included so a chain that needs many infra retries
+    # before its session can never trip the bound prematurely
+    # (LP-0MVWEP292000ODBS AC7).
     max_iterations = (
-        len(children) * (max_child_sessions + finish_attempt_limit + 1)
+        len(children)
+        * (max_child_sessions + finish_attempt_limit + infra_retry_limit + 1)
     ) + 1
 
     # ── Start-of-run sweep: terminal children's leftover worktrees ──
@@ -10918,6 +10984,61 @@ def phase_drive(
         if parent_report.get("success") is False:
             failed_cid = parent_report.get("next_child")
             if parent_report.get("finishing_failed") and failed_cid:
+                # Classify the finish failure BEFORE the finish-attempt
+                # accounting: an *infrastructure* refusal (local_dev_diverged,
+                # a held main-checkout lock, a dropped push transport) is
+                # retried on its own bounded budget with backoff — it never
+                # consumes the finish-attempt budget and never spawns a
+                # session — so a refusal that clears seconds later no longer
+                # discards a committed slice (LP-0MVWEP292000ODBS, parent
+                # epic AC2).
+                finish_failure = parent_report.get("finish_failure") or {}
+                failure_kind = finish_failure.get("kind")
+                if (
+                    failure_kind == "infrastructure"
+                    and infra_retries.get(failed_cid, 0) < infra_retry_limit
+                ):
+                    infra_retries[failed_cid] = (
+                        infra_retries.get(failed_cid, 0) + 1
+                    )
+                    attempt = infra_retries[failed_cid]
+                    driven.append({
+                        "id": failed_cid,
+                        "result": "infra-retry",
+                        "step": finish_failure.get("step"),
+                        "reason": finish_failure.get("reason"),
+                        "attempt": attempt,
+                    })
+                    backoff = _drive_infra_backoff_delay(attempt)
+                    LOG.warning(
+                        "Child %s finish refused for an infrastructure "
+                        "reason (step=%r, reason=%r) — infra-retry %d/%d "
+                        "in %ss: re-running `parent` without spawning a "
+                        "session.",
+                        failed_cid,
+                        finish_failure.get("step"),
+                        finish_failure.get("reason"),
+                        attempt,
+                        infra_retry_limit,
+                        backoff,
+                    )
+                    sleeper(backoff)
+                    continue
+                if failure_kind == "infrastructure":
+                    # The infra budget is spent: annotate the parent message
+                    # so the stopping verdict names the real failing
+                    # step/reason, then fall through to the existing bounded
+                    # finish-attempt path (LP-0MVWEP292000ODBS AC5).
+                    parent_report = {
+                        **parent_report,
+                        "message": (
+                            f"{parent_report.get('message', '')} "
+                            "(infrastructure refusal at step "
+                            f"{finish_failure.get('step')!r}, reason "
+                            f"{finish_failure.get('reason')!r} exhausted "
+                            f"the infra-retry budget of {infra_retry_limit})"
+                        ),
+                    }
                 # Bound the retries of a failing `finish`: every re-run of
                 # `parent` re-executes the same finish for that child, so the
                 # count is the number of real finish executions observed
@@ -11305,6 +11426,7 @@ def phase_drive(
 
     report["children_driven"] = driven
     report["finish_attempts"] = dict(finish_attempts)
+    report["infra_retries"] = dict(infra_retries)
     # A drive that ended before the follow-up parent report resolved a child's
     # queued worktree never strands it silently (SA-0MVTE8XAJ002IUDR AC7).
     _retain_pending_worktree_cleanups(pending_cleanup, report)
@@ -11666,6 +11788,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--infra-retry-limit",
+        type=int,
+        default=DEFAULT_INFRA_RETRY_LIMIT,
+        help=(
+            "Max infrastructure-refusal retries per child in one drive "
+            "invocation. A transient infrastructure refusal (e.g. "
+            "local_dev_diverged, a held main-checkout lock, a dropped push) "
+            "is retried on this separate bounded budget with exponential "
+            "backoff — it never consumes --finish-attempt-limit and never "
+            "spawns a session. "
+            f"(default: {DEFAULT_INFRA_RETRY_LIMIT})"
+        ),
+    )
+    parser.add_argument(
         "--finalise-stranded",
         action="store_true",
         default=False,
@@ -11787,6 +11923,7 @@ def _main(argv: list[str] | None = None) -> int:
                 max_child_sessions=args.max_child_sessions,
                 child_timeout=args.child_timeout,
                 finish_attempt_limit=args.finish_attempt_limit,
+                infra_retry_limit=args.infra_retry_limit,
                 finalise_stranded=args.finalise_stranded,
             )
             _emit_timing(_root_timer)
