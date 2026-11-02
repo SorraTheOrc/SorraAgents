@@ -27,6 +27,7 @@ import { copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hermeticGitEnv } from '../helpers/hermeticGitEnv.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, '..', '..');
@@ -40,8 +41,10 @@ const JS_GATE = join(REPO_ROOT, 'skill/ship/scripts/check-worklog-refs.js');
 const DATA_FILE = '.worklog/worklog-data.jsonl';
 
 /** Deterministic git identity so scratch repos never depend on global config. */
+// Hermetic: fixture git commands must never inherit the finish gate's
+// temporary GIT_INDEX_FILE or repository-override vars (SA-0MVYS34QF000AWQX).
 const GIT_ENV = {
-  ...process.env,
+  ...hermeticGitEnv(),
   GIT_AUTHOR_NAME: 'Ref Gate Test',
   GIT_AUTHOR_EMAIL: 'ref-gate@example.invalid',
   GIT_COMMITTER_NAME: 'Ref Gate Test',

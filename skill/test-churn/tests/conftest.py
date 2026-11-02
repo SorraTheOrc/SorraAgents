@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import fixture_git_env
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 MODULE_NAME = "test_churn_analysis_under_test"
@@ -32,11 +33,22 @@ def churn():
 
 
 def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
+    """Run a fixture git command hermetically.
+
+    ``fixture_git_env`` scrubs repository overrides **and** drops an inherited
+    ``GIT_INDEX_FILE``, so this fixture repository's ``add``/``commit``/``mv``
+    can never stage into the finish gate's temporary index
+    (SA-0MVWQ4FZ4003S0GE). Caller-supplied variables (fixed commit dates) still
+    win.
+    """
+    child_env = fixture_git_env()
+    if env:
+        child_env.update(env)
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
-        env=env,
+        env=child_env,
         check=False,
     )
     assert result.returncode == 0, result.stderr
@@ -61,11 +73,7 @@ def commit(
     repo: Path, message: str, date: str = "2026-01-01T12:00:00+00:00"
 ) -> str:
     """Stage everything and create a commit with a fixed date."""
-    import os
-
-    env = dict(os.environ)
-    env["GIT_AUTHOR_DATE"] = date
-    env["GIT_COMMITTER_DATE"] = date
+    env = {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
     _git(repo, "add", "-A", env=env)
     _git(repo, "commit", "-qm", message, env=env)
     return _git(repo, "rev-parse", "HEAD").strip()

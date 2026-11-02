@@ -13,6 +13,7 @@ from unittest import mock
 
 import pytest
 from shared import status_lifecycle as status_lifecycle_module
+from shared.git_sandbox import init_repo, run_git
 from shared.status_lifecycle import StatusLifecycle
 
 # ---------------------------------------------------------------------------
@@ -156,21 +157,13 @@ def worktree_project(tmp_path):
     worktree under ``<main>/.worklog/worktrees/`` whose .worklog holds only
     the committed config.yaml (mimicking a real project worktree).
     """
-    repo_root = tmp_path / "project"
-    repo_root.mkdir()
-    subprocess.run(["git", "init"], cwd=str(repo_root), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    repo_root = init_repo(
+        tmp_path / "project", default_branch="master", sandbox_root=tmp_path
+    )
     (repo_root / "README.md").write_text("# Project")
-    subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "commit", "-m", "Initial commit"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "branch", "dev"], cwd=str(repo_root), check=True,
-                   capture_output=True)
+    run_git(repo_root, ["add", "-A"], check=True)
+    run_git(repo_root, ["commit", "-q", "-m", "Initial commit"], check=True)
+    run_git(repo_root, ["branch", "dev"], check=True)
 
     # Initialize .worklog in the MAIN checkout only
     main_worklog = repo_root / ".worklog"
@@ -182,10 +175,11 @@ def worktree_project(tmp_path):
     # `implement.py start`); its .worklog holds only config.yaml (not initialized)
     worktree_dir = (main_worklog / "worktrees" / "wl-test").resolve()
     worktree_dir.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "worktree", "add", "--track", "-b",
+    run_git(
+        repo_root,
+        ["worktree", "add", "--track", "-b",
          "wl-test", str(worktree_dir), "dev"],
-        cwd=str(repo_root), check=True, capture_output=True,
+        check=True,
     )
     wt_worklog = worktree_dir / ".worklog"
     wt_worklog.mkdir(exist_ok=True)

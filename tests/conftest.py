@@ -96,3 +96,63 @@ def _default_resolvable_ownership(tmp_path_factory):
         ),
     ):
         yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_ambient_git_index_file_for_the_session():
+    """Remove an ambient ``GIT_INDEX_FILE`` before any fixture builds a repo.
+
+    When this suite is itself run by ``implement.py finish`` the gate exports
+    ``GIT_INDEX_FILE`` pointing at *its* temporary index — the would-be-commit
+    tree it validates (SA-0MVQHVGFR006W8LG) — and ``GIT_INDEX_FILE``
+    deliberately survives the test skill's repository-override scrub
+    (SA-0MVQHV9Y3001RNNW). Root-level tests build throwaway fixture
+    repositories, so an inherited value would make their ``git add``/
+    ``commit`` write into the *gate's* index instead of their own: the gate
+    then (correctly) rejects its own verdict as unattributable, and every
+    ``test_cache`` fingerprint in the selection describes a foreign index.
+
+    Module-scoped fixtures build their repositories before any function-scoped
+    fixture has run, so this sweep is session-scoped; the per-test fixture
+    below still isolates each test, and a test that intentionally targets an
+    index sets the variable itself (the discoverable convention in
+    ``skill/implement/tests/conftest.py``).
+    """
+    import os
+
+    previous = os.environ.pop("GIT_INDEX_FILE", None)
+    try:
+        yield
+    finally:
+        if previous is not None:
+            os.environ["GIT_INDEX_FILE"] = previous
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_git_index_file(monkeypatch):
+    """Remove an ambient ``GIT_INDEX_FILE`` for the duration of each test."""
+    monkeypatch.delenv("GIT_INDEX_FILE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolated_implement_child_lock_store(tmp_path, monkeypatch):
+    """Point ``implement.py``'s per-work-item lock store at a throwaway dir.
+
+    ``phase_start`` takes a **real** per-work-item ``flock`` before any of
+    its mocked steps, under ``<worklog>/locks/child-<id>.lock``. Root-level
+    tests that drive it use synthetic ids (``SA-TEST``, ``SA-TEST123``, …)
+    whose prefix resolves to this repository's own worklog store, so an
+    un-isolated suite wrote real lock files into the developer's
+    ``.worklog/locks`` and two concurrent pytest processes raced them
+    (SA-0MVWJ6U3J003TLRZ).
+
+    ``IMPLEMENT_CHILD_LOCK_DIR`` is read per call, so this covers modules
+    that import ``implement.py`` **and** those that load it by file path.
+
+    Returns:
+        The isolated worklog store directory for the current test.
+    """
+    store = tmp_path / "isolated-worklog"
+    (store / "locks").mkdir(parents=True)
+    monkeypatch.setenv("IMPLEMENT_CHILD_LOCK_DIR", str(store))
+    return store

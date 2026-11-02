@@ -36,10 +36,10 @@ if str(_SKILLS_ROOT) not in sys.path:
 from shared.git_sandbox import (
     add_remote,
     commit_all,
+    fixture_git_env,
     init_bare_remote,
     init_repo,
     run_git,
-    sanitized_git_env,
 )
 
 _MODULE_NAME = "generate_standup_commit"
@@ -243,7 +243,10 @@ def _no_identity_runner(repo):
     """A real git runner with global/system config and HOME neutralised."""
 
     def _run(args):
-        env = sanitized_git_env()
+        # ``fixture_git_env`` also drops an inherited GIT_INDEX_FILE, so this
+        # fixture runner can never stage into the finish gate's index
+        # (SA-0MVWQ4FZ4003S0GE).
+        env = fixture_git_env()
         env["GIT_CONFIG_GLOBAL"] = os.devnull
         env["GIT_CONFIG_SYSTEM"] = os.devnull
         env["GIT_CONFIG_NOSYSTEM"] = "1"

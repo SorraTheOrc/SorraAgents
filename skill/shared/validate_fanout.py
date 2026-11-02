@@ -15,6 +15,10 @@ Design:
   bounds concurrent pi subprocesses to AUDIT_MAX_CONCURRENCY.
 - A sampler thread records per-type process counts, load average, and swap
   usage every 0.5s; peak values are reported alongside the batch result.
+- The batch is isolated from the host-wide ``issue`` ingress cap
+  (``AUDIT_MAX_HOST_AUDITS``) so the ``AUDIT_MAX_CONCURRENCY`` pi ceiling is
+  the only binding constraint the harness measures, and the throwaway worklog
+  tree it creates is removed when the run ends.
 
 Output: JSON document with before/after metrics and batch summary.
 """
@@ -24,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -154,6 +159,18 @@ def run_batch(worklog_dir: Path, ids: list[str], pi_bin: Path, max_concurrency: 
     env = dict(os.environ)
     env["AUDIT_MAX_CONCURRENCY"] = str(max_concurrency)
     env["AUDIT_LOCK_TIMEOUT"] = "120"
+    # Lift the *host-wide ingress* cap above this batch's size. It gates
+    # independently launched `audit_runner.py issue` processes and is NOT the
+    # pi fan-out ceiling this harness measures: an 8-audit batch exceeds the
+    # default cap (AUDIT_MAX_HOST_AUDITS=6), so two audits queue at ingress and
+    # — when host load stretches the bounded wait (AUDIT_HOST_LOCK_TIMEOUT,
+    # default 90s) — exit non-zero, turning batch.ok false for a reason
+    # unrelated to AUDIT_MAX_CONCURRENCY (SA-0MVTV8WQ00014DSK). The semaphore
+    # directory below is isolated per batch, so the ingress cap protects
+    # nothing real on the host here; the F7 capacity measurements used
+    # AUDIT_MAX_HOST_AUDITS=32 for the same reason. n is enough to admit the
+    # whole batch at once, leaving the pi ceiling as the only binding gate.
+    env["AUDIT_MAX_HOST_AUDITS"] = str(max(len(ids), 1))
     # Isolate the concurrency semaphore to this batch: without this, the
     # batch's audits share the host-wide "audit" semaphore (PI_SEMAPHORE_DIR)
     # with every other live audit/pi session on the machine and can queue
@@ -195,7 +212,7 @@ def run_batch(worklog_dir: Path, ids: list[str], pi_bin: Path, max_concurrency: 
     results = []
     for p in procs:
         _out, err = p.communicate(timeout=300)
-        results.append({"exit_code": p.returncode, "stderr_tail": err.strip()[-200:]})
+        results.append({"exit_code": p.returncode, "stderr_tail": err.strip()[-500:]})
     elapsed = time.monotonic() - started
 
     stop.set()
@@ -221,24 +238,31 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     worklog_dir, ids = setup_worklog()
-    if not ids:
-        print(json.dumps({"success": False, "error": "failed to create worklog items"}))
-        return 1
+    try:
+        if not ids:
+            print(json.dumps({"success": False, "error": "failed to create worklog items"}))
+            return 1
 
-    pi_bin = worklog_dir / "mockpi" / "pi"
-    pi_bin.parent.mkdir(parents=True, exist_ok=True)
-    pi_bin.write_text(MOCK_PI)
-    pi_bin.chmod(0o755)
+        pi_bin = worklog_dir / "mockpi" / "pi"
+        pi_bin.parent.mkdir(parents=True, exist_ok=True)
+        pi_bin.write_text(MOCK_PI)
+        pi_bin.chmod(0o755)
 
-    report = run_batch(worklog_dir, ids, pi_bin, args.max_concurrency)
-    report["success"] = True
-    report["config"] = {"max_concurrency": args.max_concurrency, "n_items": len(ids)}
+        report = run_batch(worklog_dir, ids, pi_bin, args.max_concurrency)
+        report["success"] = True
+        report["config"] = {"max_concurrency": args.max_concurrency, "n_items": len(ids)}
 
-    if args.out:
-        Path(args.out).write_text(json.dumps(report, indent=2))
+        if args.out:
+            Path(args.out).write_text(json.dumps(report, indent=2))
 
-    print(json.dumps(report, indent=2))
-    return 0 if report["batch"]["ok"] else 1
+        print(json.dumps(report, indent=2))
+        return 0 if report["batch"]["ok"] else 1
+    finally:
+        # The temp worklog and its mock pi binary are throwaway. Leaking them
+        # accumulated hundreds of `f7-validate-*` trees (and their inodes) in
+        # /tmp, feeding the tmpfs quota pressure behind the EDQUOT failures of
+        # SA-0MVTSV5SO008625I.
+        shutil.rmtree(worklog_dir, ignore_errors=True)
 
 
 MOCK_PI = """#!/usr/bin/env python3

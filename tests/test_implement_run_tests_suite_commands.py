@@ -193,7 +193,13 @@ class TestChangedScope:
     def test_changed_scope_with_suite_commands_warns_and_runs_full(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
     ) -> None:
-        """AC3: custom suiteCommands aren't introspectable → full fallback."""
+        """A non-git repo with no selectable changes falls back to the full
+        suite.
+
+        Declared ``suiteCommands`` is NOT the reason for the fallback any
+        more — they define the full suite only and never disable selection
+        (SA-0MVL7YOMJ006UMDO); here nothing is selectable at all.
+        """
         repo = tmp_path / "repo"
         repo.mkdir()
         _write_suite_commands(repo, [CLI_CMD, UNIT_CMD])
@@ -227,6 +233,94 @@ class TestChangedScope:
 
         assert captured == [SCOPED_CMD], f"got {captured}"
         assert result["scope"] == "changed"
+
+    def test_changed_scope_runs_non_pytest_selection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SA-0MVL7YOMJ006UMDO: a vitest/TS (or group) selection runs and is
+        reported as scope 'changed' — it is no longer dropped because it is
+        not a pytest command."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _write_suite_commands(repo, [CLI_CMD, UNIT_CMD])
+        mod = _load_implement()
+        captured = _record_runs(mod, monkeypatch)
+        vitest_cmd = "npx --no-install vitest run tests/cli/foo.test.ts"
+        monkeypatch.setattr(
+            mod, "_changed_scope_commands", lambda *a, **k: [vitest_cmd]
+        )
+
+        result = mod.run_tests(str(repo), scope="changed")
+
+        assert captured == [vitest_cmd], f"got {captured}"
+        assert result["scope"] == "changed"
+
+    def test_changed_scope_fallback_warning_names_specific_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        """The fallback warning carries the selector's specific reason."""
+        from types import SimpleNamespace
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _write_suite_commands(repo, [CLI_CMD, UNIT_CMD])
+        mod = _load_implement()
+        _record_runs(mod, monkeypatch)
+        monkeypatch.setattr(mod, "_changed_scope_commands", lambda *a, **k: None)
+        monkeypatch.setattr(
+            mod,
+            "_changed_scope_selection",
+            lambda *a, **k: SimpleNamespace(
+                reason="no matching group and no convention-matched test files"
+            ),
+        )
+
+        with caplog.at_level("WARNING"):
+            mod.run_tests(str(repo), scope="changed")
+
+        assert any(
+            "changed-scope selection unavailable" in rec.getMessage()
+            and "no matching group" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_legacy_pytest_path_fallback_warning_names_specific_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        """The legacy pytest-only fallback names the selector's specific
+        reason too, instead of the old generic list that still claimed a
+        declared ``suiteCommands`` disabled selection (which it no longer
+        does — AC B4)."""
+        from types import SimpleNamespace
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mod = _load_implement()
+        _record_runs(mod, monkeypatch)
+        # Force the legacy branch: no resolved suite, pytest tooling, no
+        # group match and no pytest-scoped selection.
+        monkeypatch.setattr(mod, "_resolve_full_suite_commands", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_detect_test_tooling", lambda *a, **k: "pytest")
+        monkeypatch.setattr(mod, "_run_group_from_changed_files", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_run_changed_scope_pytest", lambda *a, **k: None)
+        monkeypatch.setattr(
+            mod,
+            "_changed_scope_selection",
+            lambda *a, **k: SimpleNamespace(
+                reason="no changed source or test files"
+            ),
+        )
+
+        with caplog.at_level("WARNING"):
+            mod.run_tests(str(repo), scope="changed")
+
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any(
+            "changed-scope selection unavailable" in message
+            and "no changed source or test files" in message
+            for message in messages
+        ), messages
+        assert not any("custom suiteCommands" in message for message in messages)
 
 
 class TestConventionDetectionDelegation:

@@ -20,8 +20,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 // Shared no-I/O notifier stub — never copy the real discord-notify.js into a
 // release harness (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL).
 import { writeStubDiscordNotify } from '../helpers/release-notify-stub.mjs';
@@ -43,7 +43,7 @@ const DELETE_REMOTE_SCRIPT = join(REPO_ROOT, 'skill', 'cleanup', 'scripts', 'del
  * @returns {{ tmpDir: string, runReleasePath: string }}
  */
 function setupRunReleaseFixture(hasReleaseScript = false) {
-  const tmpDir = mkdtempSync(join(tmpdir(), 'run-release-cleanup-test-'));
+  const tmpDir = makeTempDir('run-release-cleanup-test-');
 
   const skillScriptDir = join(tmpDir, 'skill', 'ship', 'scripts');
   mkdirSync(skillScriptDir, { recursive: true });

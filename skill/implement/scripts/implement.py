@@ -1,10 +1,10 @@
+#!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MVN0IJ7H008OORA
 # smell: unknown
 # severity: low
 # description: Unparenthesized implicit string concatenation in collection
 # -->
-#!/usr/bin/env python3
 
 # <!-- REFACTOR-SA-0MUQ2OU12009Q8V5
 # smell: formatting
@@ -27,6 +27,7 @@ Usage:
   implement.py start <work-item-id>          # Phase 1: setup
   implement.py finish <work-item-id>         # Phase 2: build, test, commit, push, cleanup
   implement.py abort <work-item-id>          # Abort and cleanup
+  implement.py cleanup <work-item-id>        # Remove a finished item's worktree (run LAST)
   implement.py parent <parent-id>            # Recurse into children (epic/parent items)
   implement.py drive <parent-id>             # Drive ALL children to completion, one fresh session each
 
@@ -39,6 +40,11 @@ Optional flags:
   --worktree-path <path>    Override worktree path
   --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
   --max-child-sessions N    Max fresh sessions per child when driving (default: 1)
+  --finish-attempt-limit N  Max failing finish executions per child when driving
+                            (default: the --max-child-sessions value)
+  --infra-retry-limit N     Max infrastructure-refusal retries per child when
+                            driving (default: 5; a separate budget, never
+                            consumes --finish-attempt-limit, spawns no session)
   --child-timeout N         Per-child session timeout in seconds (default: 3600)
   --finalise-stranded       Finalise evidence-gated stranded children when driving
   -v, --verbose             Verbose logging
@@ -57,6 +63,8 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import logging
 import os
@@ -69,8 +77,21 @@ import sys
 import tempfile
 import time
 import traceback
+
+#: Bound at import time so a test that patches ``implement.subprocess`` with
+#: a Mock (replacing the whole module) cannot break `except` clauses that
+#: reference it — a MagicMock attribute is not an exception class and would
+#: raise ``TypeError: catching classes that do not inherit from
+#: BaseException`` (SA-0MVVF75ZA007XNKB).
+_SUBPROCESS_TIMEOUT_EXPIRED = subprocess.TimeoutExpired
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,15 +106,38 @@ from import_guard import guard_shared_import
 
 try:
     from shared.code_freeze import is_code_freeze_active
+    from shared.repo_lock import DEFAULT_LOCK_RELPATH as _REPO_LOCK_RELPATH
+    from shared.repo_lock import RepoLock, release_repo_lock
     from shared.skill_extensions import (
         SkillExtension,
         SkillExtensionError,
         load_extension,
     )
-    from shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
+    from shared.status_lifecycle import (
+        StatusLifecycle,
+        resolve_worklog_dir,
+        resolve_worklog_flags,
+    )
     from shared.timing import Timer
+    from shared.work_item_lock import (
+        ENV_LOCK_TOKEN,
+        WorkItemLock,
+        lock_file_path,
+    )
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
+
+try:
+    # Fail-open self-referential-upstream warning (SA-0MVX35AUC003CNUD AC2/
+    # AC3). Deliberately OUTSIDE the hard-fail shared block above: the
+    # detection module is optional, so a partial skill install or a repo
+    # without it degrades to a logged skip instead of blocking the start.
+    from shared.self_referential_upstream import (
+        detect_self_referential_upstreams as _detect_self_referential_upstreams,
+    )
+except Exception:  # pragma: no cover - only partial installs hit this
+    _detect_self_referential_upstreams = None
+
 try:
     # The shared changed-file → test selector (SA-0MT6CENPW004V2JN). Kept
     # optional: partial skill installs (staged layouts without the test
@@ -104,6 +148,9 @@ try:
     )
     from test.scripts.run_tests import (
         changed_scope_commands as _changed_scope_commands,
+    )
+    from test.scripts.run_tests import (
+        changed_scope_selection as _changed_scope_selection,
     )
     from test.scripts.run_tests import (
         extension_suite_commands as _extension_suite_commands,
@@ -117,6 +164,7 @@ try:
     from test.scripts.run_tests import paced_runner as _test_paced_runner
 except ModuleNotFoundError:
     _changed_scope_commands = None  # type: ignore[assignment]
+    _changed_scope_selection = None  # type: ignore[assignment]
     _extension_suite_commands = None  # type: ignore[assignment]
     _full_suite_commands = None  # type: ignore[assignment]
     _guarded_run_all = None  # type: ignore[assignment]
@@ -130,7 +178,16 @@ try:
     # separately so an older test skill without the constants degrades to
     # the literal fallbacks instead of breaking the whole delegation import.
     from test.scripts.run_tests import (
+        NOTICE_KILLED as _NOTICE_KILLED,
+    )
+    from test.scripts.run_tests import (
         NOTICE_SLOT_BUSY as _NOTICE_SLOT_BUSY,
+    )
+    from test.scripts.run_tests import (
+        NOTICE_SUITE_TIMEOUT as _NOTICE_SUITE_TIMEOUT,
+    )
+    from test.scripts.run_tests import (
+        NOTICE_UNPARSED_FAILURE as _NOTICE_UNPARSED_FAILURE,
     )
     from test.scripts.run_tests import (
         SLOT_BUSY_NOTICE_PREFIX as _SLOT_BUSY_NOTICE_PREFIX,
@@ -139,6 +196,9 @@ except ImportError:
     # Older test skill without the notice-code contract — degrade to the
     # literal fallbacks (never break the delegation import chain).
     _NOTICE_SLOT_BUSY = "slot_busy"  # type: ignore[assignment]
+    _NOTICE_SUITE_TIMEOUT = "suite_timeout"  # type: ignore[assignment]
+    _NOTICE_KILLED = "killed"  # type: ignore[assignment]
+    _NOTICE_UNPARSED_FAILURE = "unparsed_failure"  # type: ignore[assignment]
     _SLOT_BUSY_NOTICE_PREFIX = (  # type: ignore[assignment]
         "test concurrency slot busy:"
     )
@@ -174,6 +234,13 @@ DEFAULT_MAX_RETRY = 3
 
 #: Max fresh sessions spawned per child by ``phase_drive`` before it stops.
 DEFAULT_MAX_CHILD_SESSIONS = 1
+#: Max infrastructure-refusal retries per child in one ``phase_drive``
+#: invocation. A transient infrastructure refusal (``local_dev_diverged``,
+#: a held main-checkout lock, a dropped push transport) is retried on this
+#: **separate** bounded budget with exponential backoff — it never consumes
+#: the finish-attempt bound (``--finish-attempt-limit``) and never spawns a
+#: session (LP-0MVWEP292000ODBS).
+DEFAULT_INFRA_RETRY_LIMIT = 5
 #: Default per-child session timeout (seconds) used by ``phase_drive``.
 #: A child runs the whole implement workflow (changed-scope tests, full-suite
 #: gate, and the pre-push hook) so this is much larger than the per-command
@@ -181,12 +248,25 @@ DEFAULT_MAX_CHILD_SESSIONS = 1
 DEFAULT_CHILD_SESSION_TIMEOUT = 3600
 #: Environment marker set on driven child sessions. When present,
 #: ``phase_drive`` refuses to run — a driven session implements its own work
-#: item with the leaf workflow and must never re-enter the driver.
+#: item with the leaf workflow and must never re-enter the driver. It also
+#: marks "a driven child session owns this worktree", so ``finish`` defers
+#: worktree removal to the driver instead of deleting the session's cwd
+#: (SA-0MVTE8XAJ002IUDR).
 DRIVE_RECURSION_ENV = "IMPLEMENT_DRIVE_ACTIVE"
+#: Explicit opt-in that defers worktree removal in ``finish`` (and in the
+#: signal handler) for **any** session, not just a driven child — the escape
+#: hatch an operator (or a future pane transport) uses when the finishing
+#: session still needs its cwd. Same ``"1"`` convention as
+#: :data:`DRIVE_RECURSION_ENV`.
+KEEP_WORKTREE_ENV = "IMPLEMENT_KEEP_WORKTREE"
 #: Absolute path to the driven child's worktree, injected into its environment
 #: so the child can verify its worktree root before its first edit — ``cwd``
 #: alone does not confine an agent (it can ``cd`` to the main checkout).
 WORKTREE_ENV = "IMPLEMENT_WORKTREE_PATH"
+#: Report action for a child whose per-work-item lock is held by a live
+#: holder (another driver/session). The refused party performs no work and
+#: reports the holder identity instead of racing it (SA-0MVQ5AXLF002PAQ3).
+ACTION_SKIPPED_HELD = "skipped-held"
 
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
@@ -276,28 +356,30 @@ class ImplementState:
 _worktree_path_global: str | None = None
 _work_item_id_global: str | None = None
 _repo_root_global: str | None = None
+#: The per-child lock held by this process for the lifetime of ``phase_start``.
+#: Kept module-level so the signal handler can release it deterministically
+#: before exiting, and so spawned processes inherit its ownership token.
+_child_lock_global: WorkItemLock | None = None
+#: The ``--keep-worktree`` decision of the running ``finish`` phase, kept
+#: module-level so the signal handler defers removal for a session that
+#: opted out of it (SA-0MVTE8XAJ002IUDR AC4).
+_keep_worktree_global = False
 _cleanup_done = False
 
 
-def _signal_handler(signum: int, frame: Any) -> None:
-    """Global signal handler for SIGTERM/SIGINT during any phase.
+def _handle_signal_cleanup(signum: int) -> None:
+    """Deterministic cleanup body for SIGTERM/SIGINT (does not exit).
 
-    Runs deterministic cleanup: resets the work-item status (never leaves it
-    in-progress), terminates child processes, removes the worktree, and exits.
+    Split out of :func:`_signal_handler` so the cleanup contract — release
+    the per-child lock, release the item's claim (status **and** assignee),
+    never leave a claimed item unexplained, remove the worktree, restore repo
+    state — is directly testable without terminating the interpreting
+    process.
 
-    Uses ``os._exit`` (not ``sys.exit``) so the status reset is authoritative:
-    a ``sys.exit``-raised ``SystemExit`` would unwind through any active
-    ``StatusLifecycle`` context manager, which would restore the original
-    (in-progress) status and undo the reset.
+    Args:
+        signum: The signal number that triggered the cleanup.
     """
-    global _cleanup_done
-    if _cleanup_done:
-        return
-    _cleanup_done = True
-
     signame = signal.Signals(signum).name
-    LOG.warning("Received signal %s, running deterministic cleanup...", signame)
-
     try:
         wt = _worktree_path_global
         wid = _work_item_id_global
@@ -312,14 +394,77 @@ def _signal_handler(signum: int, frame: Any) -> None:
             except RuntimeError:
                 LOG.error("Failed to reset work item %s status to open", wid)
 
-        if wt and Path(wt).exists():
+            # A claim interrupted before the worktree exists must never be
+            # silent: the operator needs to know the item was released and
+            # why (SA-0MVQ5AXLF002PAQ3 AC2). The child lock is the phase
+            # marker — only ``phase_start`` holds it, so a signal during
+            # ``finish``/``abort`` never gets a misleading "start" comment.
+            if _child_lock_global is not None and not (wt and Path(wt).exists()):
+                try:
+                    wl_add_comment(
+                        wid,
+                        f"Start phase interrupted by {signame} before the "
+                        "worktree was created. The per-child lock was "
+                        "released and the work item returned to open; "
+                        f"re-run `implement.py start {wid}` to continue.",
+                    )
+                except Exception as exc:  # noqa: BLE001 - never block cleanup
+                    LOG.error(
+                        "Failed to record the %s interruption on %s: %s",
+                        signame, wid, exc,
+                    )
+
+        # A session that owns the worktree as its cwd must not lose it to an
+        # interrupt either: the same deferral predicate as ``finish`` applies
+        # (SA-0MVTE8XAJ002IUDR AC4). The item is still released above, so an
+        # interrupted run never leaves an orphaned ``in_progress`` claim.
+        deferred, defer_reason = _should_defer_worktree_removal(
+            bool(_keep_worktree_global)
+        )
+        if deferred:
+            LOG.info(
+                "Signal cleanup: worktree removal deferred (%s); the session "
+                "still owns %s.",
+                defer_reason,
+                wt,
+            )
+        elif wt and Path(wt).exists():
             cleanup_worktree_processes(wt)
             _remove_worktree(wt)
         if rr:
             _restore_repo_state(rr)
     except Exception as exc:  # noqa: BLE001
         LOG.error("Cleanup handler error: %s", exc)
+    finally:
+        # Explicit release (the kernel also releases the flock when
+        # ``os._exit`` closes the descriptor): no stale holder survives a
+        # signal, and the release is observable in tests.
+        _release_child_lock()
+        # The suite may have been running against the finish gate's temporary
+        # index; a signal must not leave that file (or its lock) behind.
+        _remove_gate_index(_gate_index_global)
 
+
+def _signal_handler(signum: int, frame: Any) -> None:
+    """Global signal handler for SIGTERM/SIGINT during any phase.
+
+    Runs deterministic cleanup: resets the work-item status (never leaves it
+    in-progress), releases the per-child lock, terminates child processes,
+    removes the worktree, and exits.
+
+    Uses ``os._exit`` (not ``sys.exit``) so the status reset is authoritative:
+    a ``sys.exit``-raised ``SystemExit`` would unwind through any active
+    ``StatusLifecycle`` context manager, which would restore the original
+    (in-progress) status and undo the reset.
+    """
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+
+    signame = signal.Signals(signum).name
+    LOG.warning("Received signal %s, running deterministic cleanup...", signame)
+    _handle_signal_cleanup(signum)
     LOG.info("Cleanup complete. Exiting due to %s.", signame)
     os._exit(2)
 
@@ -340,6 +485,12 @@ def _store_signal_globals(
     _repo_root_global = repo_root
 
 
+def _set_keep_worktree_global(enabled: bool) -> None:
+    """Record the ``--keep-worktree`` decision for the signal handler."""
+    global _keep_worktree_global
+    _keep_worktree_global = bool(enabled)
+
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -353,6 +504,7 @@ def run_cmd(
     timeout: int = 300,
     env: dict[str, str] | None = None,
     start_new_session: bool = False,
+    keep_git_index: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run a shell command and return the result.
 
@@ -367,6 +519,11 @@ def run_cmd(
             process group so process-group kills performed inside it can
             never reach the caller or its siblings
             (SA-0MVJC5KNT0044L2B).
+        keep_git_index: If True, inherit an ambient ``GIT_INDEX_FILE``. By
+            default it is dropped so the finish gate's own git commands (and
+            any non-suite command it spawns) always act on the real index
+            while the gate exports a temporary index for the suite
+            (SA-0MVQHVGFR006W8LG). Suite runners opt in explicitly.
 
     Returns:
         ``subprocess.CompletedProcess``
@@ -376,6 +533,10 @@ def run_cmd(
         ``subprocess.CalledProcessError`` if *check* is True and exit != 0.
     """
     LOG.debug("Running: %s (cwd=%s)", " ".join(cmd), cwd or os.getcwd())
+    child_env = dict(os.environ)
+    if not keep_git_index:
+        child_env.pop("GIT_INDEX_FILE", None)
+    child_env.update(env or {})
     return subprocess.run(
         cmd,
         cwd=cwd,
@@ -383,7 +544,7 @@ def run_cmd(
         text=True,
         check=check,
         timeout=timeout,
-        env={**os.environ, **(env or {})},
+        env=child_env,
         start_new_session=start_new_session,
     )
 
@@ -608,6 +769,13 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
     state (``open``/``blocked``/``completed``) when a late, unrelated error
     or signal occurs (e.g. after a successful finish phase).
 
+    The reset also **clears the assignee** (``assignee=""``): a non-empty
+    assignee is a scheduling hold, so a killed session that only reclaimed the
+    status would still leave the item invisible to ``wl next``. This is the
+    durable release for the signal path (SIGTERM/SIGINT); the killed-by-
+    timeout counterpart is :func:`_release_orphaned_child_claim`
+    (SA-0MVVF75ZA007XNKB).
+
     Args:
         work_item_id: The work item ID.
     """
@@ -619,10 +787,306 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
     wi = data.get("workItem", {})
     current = wi.get("status", "")
     if current in ("in-progress", "in_progress"):
-        StatusLifecycle.update_status(work_item_id, "open")
+        # Durable-write reset: this safety path runs outside any StatusLifecycle
+        # context (signal/error unwinding), so the helper's release-by-default
+        # exit hook does not apply — the claim is released explicitly here.
+        StatusLifecycle.update_status(work_item_id, "open", assignee="")
         LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
     else:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
+
+
+# ---------------------------------------------------------------------------
+# Per-work-item child lock (SA-0MVQ5AXLF002PAQ3)
+#
+# The flock primitive lives in ``shared.work_item_lock``; this section is the
+# implement-side integration: the choke point that owns it, the read-only
+# probe used for reporting, and the ownership token propagated to spawned
+# processes.
+# ---------------------------------------------------------------------------
+
+
+def _child_lock_dir(work_item_id: str) -> Path | None:
+    """Resolve the worklog **store** directory that owns the child lock.
+
+    Single, patchable resolution point: the lock must live under
+    ``<worklog>/locks/`` (never inside a worktree, which can be removed
+    mid-flight).
+
+    ``IMPLEMENT_CHILD_LOCK_DIR`` overrides the store explicitly. It exists
+    for **test isolation**: ``phase_start`` takes a real ``flock`` before any
+    of its test-mocked steps, and synthetic test ids share the repository's
+    own id prefix, so an un-isolated suite would write (and race) real lock
+    files inside the developer's ``.worklog/locks`` (SA-0MVWJ6U3J003TLRZ).
+    The suites set it to a per-test throwaway directory; it is unset in every
+    production invocation, where the worklog store is authoritative.
+
+    Args:
+        work_item_id: The work item whose lock directory is resolved.
+
+    Returns:
+        The worklog store path, or ``None`` when it cannot be resolved.
+    """
+    override = os.environ.get(ENV_CHILD_LOCK_DIR)
+    if override:
+        return Path(override).expanduser()
+    try:
+        return resolve_worklog_dir(work_item_id)
+    except RuntimeError:
+        return None
+
+
+def _new_child_lock(work_item_id: str) -> WorkItemLock:
+    """Build the per-work-item lock handle for *work_item_id*.
+
+    The ownership token comes from ``IMPLEMENT_CHILD_LOCK_TOKEN`` when the
+    process is part of an existing holder chain (driver → ``parent``/``start``
+    subprocesses → driven child session); otherwise the lock generates one.
+
+    Args:
+        work_item_id: The work item whose critical section is serialised.
+
+    Returns:
+        A not-yet-acquired :class:`WorkItemLock`.
+    """
+    worklog_dir = _child_lock_dir(work_item_id)
+    kwargs: dict[str, Any] = {
+        "agent": os.environ.get("IMPLEMENT_AGENT_NAME") or "implement",
+        "session_id": os.environ.get("PI_SESSION_ID") or f"pid-{os.getpid()}",
+    }
+    if worklog_dir is not None:
+        kwargs["worklog_dir"] = worklog_dir
+    return WorkItemLock(work_item_id, **kwargs)
+
+
+def _set_child_lock(lock: WorkItemLock) -> None:
+    """Register *lock* as this process's held child lock (signal-safe)."""
+    global _child_lock_global
+    _child_lock_global = lock
+
+
+def _release_child_lock() -> None:
+    """Release and forget this process's held child lock (idempotent)."""
+    global _child_lock_global
+    lock = _child_lock_global
+    _child_lock_global = None
+    if lock is not None:
+        lock.release()
+
+
+def _child_lock_token(base: dict[str, str] | None = None) -> str | None:
+    """Return the explicit lock ownership token of the current holder chain.
+
+    Prefers the token of the lock this process actually holds; falls back to
+    the inherited :data:`ENV_LOCK_TOKEN` of an enclosing holder chain. Never
+    derives ownership from a pid — pid equality alone is deliberately not an
+    ownership signal (SA-0MOABYW contract, AC4).
+
+    Args:
+        base: Environment mapping to inspect when no lock is held locally
+            (defaults to ``os.environ``).
+
+    Returns:
+        The token string, or ``None`` when this process is not part of a
+        holder chain.
+    """
+    if _child_lock_global is not None:
+        return _child_lock_global.token
+    env = base if base is not None else os.environ
+    return env.get(ENV_LOCK_TOKEN) or None
+
+
+def _read_child_lock_metadata(path: Path) -> dict[str, Any] | None:
+    """Read lock-file owner metadata (best-effort; ``None`` when unreadable)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _probe_child_lock(work_item_id: str) -> dict[str, Any] | None:
+    """Return the live holder's metadata when *work_item_id*'s lock is held.
+
+    Read-only by construction: it opens an **existing** lock file, takes a
+    non-blocking ``flock`` probe and releases it immediately. It never
+    creates, rewrites or truncates the lock file, so classifying a child has
+    no side effects (a refused contender must leave a byte-identical store
+    behind).
+
+    A holder chain that propagated its ownership token is not a *blocking*
+    holder: the probe reports self-ownership as free, exactly like the lock
+    primitive's re-entrancy rule (never a pid-equality heuristic).
+
+    Ambiguous states (held but unreadable metadata) fail closed: they report
+    a holder with an ``unknown`` identity rather than racing a live writer.
+
+    Args:
+        work_item_id: The child work item to probe.
+
+    Returns:
+        Holder metadata when a live holder exists, else ``None``.
+    """
+    if not work_item_id or fcntl is None:
+        return None
+    store = _child_lock_dir(work_item_id)
+    if store is None:
+        return None
+    path = lock_file_path(work_item_id, store)
+    if not path.is_file():
+        return None
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                return None
+            metadata = _read_child_lock_metadata(path)
+            if metadata is not None and metadata.get("token") == _child_lock_token():
+                return None  # our own holder chain: re-entrant, not blocked
+            if metadata is None:
+                return {
+                    "agent": "unknown",
+                    "pid": None,
+                    "session_id": "unknown",
+                    "started_at": "unknown",
+                }
+            return metadata
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:  # pragma: no cover - defensive
+            pass
+
+
+def _describe_child_lock_holder(holder: dict[str, Any] | None) -> str:
+    """Human-readable holder identity for a ``skipped-held`` report."""
+    if not holder:
+        return "an unknown holder (lock file unreadable)"
+    return (
+        f"{holder.get('agent', '?')}@pid {holder.get('pid', '?')} "
+        f"(session {holder.get('session_id', '?')}, "
+        f"since {holder.get('started_at', '?')})"
+    )
+
+
+#: Holder metadata keys surfaced for a reclaimed stale lock. The ownership
+#: token is deliberately excluded: it must never be copied into a report.
+RECLAIM_REPORTED_KEYS = ("agent", "pid", "session_id", "started_at")
+
+
+def _reclaim_warning(work_item_id: str, holder: dict[str, Any] | None) -> str:
+    """Human-readable warning naming the reclaimed (dead) lock holder."""
+    return (
+        f"Reclaimed a stale per-child lock for {work_item_id} from "
+        f"{_describe_child_lock_holder(holder)}; the recorded holder pid is "
+        "dead, so the lock was taken over (the previous session crashed)."
+    )
+
+
+def _record_child_lock_reclamation(
+    report: dict[str, Any],
+    work_item_id: str,
+    lock_result: Any,
+) -> str:
+    """Surface a reclaimed stale holder in *report* (never only in the log).
+
+    The parent epic ``SA-0MVOABYW00004978`` requires the reclamation warning
+    to be logged **and** surfaced in the report, so an operator (or a
+    ``--json`` consumer) can see who was reclaimed without reading stderr
+    (``SA-0MVUX6Q4S006KII3``).
+
+    Args:
+        report: The caller's report dict (mutated in place).
+        work_item_id: The work item whose lock was reclaimed.
+        lock_result: The :class:`LockResult` carrying ``reclaimed``/``path``.
+
+    Returns:
+        The warning string that was appended to ``report["warnings"]``.
+    """
+    holder = getattr(lock_result, "reclaimed", None) or {}
+    path = getattr(lock_result, "path", None)
+    report["lock_reclaimed"] = True
+    report["reclaimed_from"] = {
+        key: holder.get(key) for key in RECLAIM_REPORTED_KEYS
+    }
+    report["lock_path"] = str(path) if path is not None else ""
+    warning = _reclaim_warning(work_item_id, holder)
+    report.setdefault("warnings", []).append(warning)
+    return warning
+
+
+def _forward_child_lock_reclamation(
+    report: dict[str, Any],
+    child_id: str,
+    child_report: dict[str, Any] | None,
+) -> bool:
+    """Copy a child's reclaimed-lock evidence into a parent/drive report.
+
+    ``phase_parent``/``phase_drive`` consumers must see a reclamation that
+    happened while the child was started, so it is forwarded (with the child
+    named) instead of staying buried in the child's own report or log.
+
+    Args:
+        report: The parent/drive report (mutated in place).
+        child_id: The child the evidence belongs to (may be empty).
+        child_report: The child ``start`` report, if any.
+
+    Returns:
+        True when reclamation evidence was forwarded.
+    """
+    if not child_report or not child_report.get("lock_reclaimed"):
+        return False
+    report["lock_reclaimed"] = True
+    report["reclaimed_from"] = child_report.get("reclaimed_from")
+    report["lock_path"] = child_report.get("lock_path", "")
+    if child_id:
+        report["reclaimed_children"] = sorted(
+            set(report.get("reclaimed_children", [])) | {child_id}
+        )
+    warnings = report.setdefault("warnings", [])
+    forwarded = list(child_report.get("warnings") or [])
+    if not forwarded:
+        forwarded = [
+            f"Reclaimed a stale per-child lock for {child_id} from "
+            f"{_describe_child_lock_holder(child_report.get('reclaimed_from'))}."
+        ]
+    for warning in forwarded:
+        if warning not in warnings:
+            warnings.append(warning)
+    return True
+
+
+def _skipped_held_report(
+    report: dict[str, Any],
+    work_item_id: str,
+    holder: dict[str, Any] | None,
+    lock_path: Path | None,
+) -> dict[str, Any]:
+    """Populate *report* for a contender that could not acquire the lock.
+
+    A refused ``start`` performs **no** store write: no claim, no
+    status/assignee mutation, no comment, no worktree create/remove and no
+    lock-metadata rewrite. It reports the holder identity instead.
+    """
+    report["success"] = False
+    report["action"] = ACTION_SKIPPED_HELD
+    report["held_by"] = holder
+    report["lock_path"] = str(lock_path) if lock_path is not None else ""
+    report["message"] = (
+        f"Work item {work_item_id} is held by {_describe_child_lock_holder(holder)}. "
+        "Another implementation session owns its critical section; no "
+        "claim, worktree or file write was performed. Re-run once the holder "
+        "finishes (or reclaim a stale lock when its pid is dead)."
+    )
+    return report
 
 
 def _check_and_evaluate_risk_effort(
@@ -861,13 +1325,130 @@ def _is_terminal_child(child: dict[str, Any]) -> bool:
     return _is_terminal_status(str(child.get("status", "")))
 
 
+#: ``parent_blocked_reason`` values for the invoked item's blocked verdict.
+PARENT_BLOCKED_REASON_DEPENDENCY = "outbound-dependency"
+PARENT_BLOCKED_REASON_STATUS = "status-blocked"
+
+#: Per-child action used when the invoked parent itself is blocked.
+ACTION_BLOCKED_PARENT = "blocked-parent"
+
+
+def _work_item_prefix(work_item_id: str) -> str:
+    """Return the project prefix of a work-item id (``SA`` for ``SA-0MVS1Q``).
+
+    The prefix before the first ``-`` identifies the worklog project, so two
+    ids with different prefixes belong to different projects.
+
+    Args:
+        work_item_id: A work-item id.
+
+    Returns:
+        The upper-cased prefix (empty when the id has no ``-``).
+    """
+    return work_item_id.split("-", 1)[0].strip().upper()
+
+
+def _is_same_project(owner_id: str, other_id: str) -> bool:
+    """Whether two work-item ids belong to the same worklog project.
+
+    A dependency edge to an item with a different prefix is a cross-project
+    coordination note rather than an orchestrator gate — the documented
+    assumption introduced with parent recursion (SA-0MSQBM2FK005NW1T).
+
+    Args:
+        owner_id: The item whose edges are being evaluated.
+        other_id: The id of the item on the other end of the edge.
+
+    Returns:
+        True when both ids share a non-empty project prefix.
+    """
+    prefix = _work_item_prefix(owner_id)
+    return bool(prefix) and prefix == _work_item_prefix(other_id)
+
+
+def _blocker_payload(blocker: dict[str, Any]) -> dict[str, str]:
+    """Render a dependency edge as a compact, JSON-friendly description.
+
+    Args:
+        blocker: An outbound edge dict from ``wl dep list``.
+
+    Returns:
+        A dict with ``id``, ``status`` and ``title`` string fields.
+    """
+    return {
+        "id": str(blocker.get("id", "")),
+        "status": str(blocker.get("status", "")),
+        "title": str(blocker.get("title", "")),
+    }
+
+
+def _format_blockers(blockers: list[dict[str, str]]) -> str:
+    """Render a blocker payload list as ``id (status), …`` for messages."""
+    return ", ".join(
+        f"{b.get('id', '?')} ({b.get('status') or 'unknown'})" for b in blockers
+    )
+
+
+def _outbound_gate(
+    work_item_id: str,
+    blockers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate the invoked item's **own** outbound (depends-on) blockers.
+
+    ``phase_parent``/``phase_drive`` used to build their dependency graph
+    only from the children's edges, so a producer's sequencing hold recorded
+    on the parent itself was silently overridden and the first startable
+    child's worktree was created mid-flight (SA-0MVS1QS9J009DGPT). The same
+    gate applies to a leaf item in ``phase_start``.
+
+    Terminal blockers — ``in_review``/``completed``/``done``/``deleted``, and
+    soft-deleted items (``deletedBy`` set) — never gate, matching
+    :func:`_is_terminal_child`. Cross-project blockers (a different id prefix)
+    are reported as coordination notes and never gate
+    (SA-0MSQBM2FK005NW1T).
+
+    Args:
+        work_item_id: The invoked work item.
+        blockers: The item's outbound edges; fetched via
+            :func:`wl_dep_blockers` when omitted.
+
+    Returns:
+        ``{"blocked": bool, "blockers": [...], "coordination_blockers":
+        [...]}`` where ``blockers`` holds the unmet same-project edges that
+        gate starting and ``coordination_blockers`` the unmet cross-project
+        edges (informational only).
+    """
+    edges = wl_dep_blockers(work_item_id) if blockers is None else blockers
+    unmet = [edge for edge in edges if not _is_terminal_child(edge)]
+    blocking = [
+        edge
+        for edge in unmet
+        if _is_same_project(work_item_id, str(edge.get("id", "")))
+    ]
+    coordination = [edge for edge in unmet if edge not in blocking]
+    return {
+        "blocked": bool(blocking),
+        "blockers": [_blocker_payload(edge) for edge in blocking],
+        "coordination_blockers": [
+            _blocker_payload(edge) for edge in coordination
+        ],
+    }
+
+
 def _classify_child(child: dict[str, Any]) -> str:
     """Classify a child for the parent-recursion plan.
 
     Returns one of:
       - ``"skip-terminal"`` — already in a terminal state; never re-implemented.
+      - ``"skipped-held"`` — a live holder owns the child's per-work-item
+        lock (another driver/session); reported, never raced.
       - ``"skip-in-progress"`` — claimed by another agent; reported, not clobbered.
       - ``"implement"`` — the standard workflow should run on this child.
+
+    Precedence is deliberate: a terminal child is never re-implemented (even
+    with a stale lock file lying around), and a live holder outranks the
+    status-based ``in-progress`` guess because it is a fact about a running
+    process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3).
 
     Args:
         child: A child work-item dict from ``wl show --children``.
@@ -878,6 +1459,8 @@ def _classify_child(child: dict[str, Any]) -> str:
     status = str(child.get("status", ""))
     if _is_terminal_child(child):
         return "skip-terminal"
+    if _probe_child_lock(str(child.get("id", ""))) is not None:
+        return ACTION_SKIPPED_HELD
     if status in ("in-progress", "in_progress"):
         return "skip-in-progress"
     return "implement"
@@ -987,6 +1570,8 @@ def _next_child_to_implement(
         action = _classify_child(child)
         if action == "skip-terminal":
             continue
+        if action == ACTION_SKIPPED_HELD:
+            continue  # a live holder owns it; never a second session
         if action == "skip-in-progress":
             continue  # never clobber another agent's claim
         cid = str(child.get("id", ""))
@@ -1428,6 +2013,386 @@ def _main_checkout_offending_paths(
     return sorted(set(paths))
 
 
+def _main_checkout_status_map(repo_root: str) -> dict[str, str]:
+    """Parse ``git status --porcelain=v1`` into a ``{path: code}`` map.
+
+    Only the working-tree/status surface is captured (no refs, config or
+    worktree registrations), so finish's own fast-forward, ref movement and
+    agent-worktree register/remove do not move the map. ``.worklog/``
+    bookkeeping is filtered out here — the finish run itself writes there
+    via ``wl`` (comments, status updates, cache).
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+
+    Returns:
+        A mapping of relative path → porcelain XY code, excluding
+        ``.worklog/`` paths.
+    """
+    status_output = git_status(cwd=repo_root)
+    entries: dict[str, str] = {}
+    for line in status_output.splitlines():
+        if line.startswith("##") or not line.strip():
+            continue
+        if len(line) < 4:
+            continue
+        code = line[:2]
+        file_path = line[3:].strip()
+        if " -> " in file_path:
+            file_path = file_path.split(" -> ", 1)[1].strip()
+        if not file_path or file_path.startswith(".worklog/"):
+            continue
+        entries[file_path] = code
+    return entries
+
+
+def _snapshot_main_checkout(repo_root: str) -> dict[str, Any]:
+    """Snapshot the main checkout's status surface at a point in time.
+
+    The finish main-checkout guard (WL-0MVPADZ1Z000FOSG AC3) compares two of
+    these snapshots to detect foreign tracked-file mutations of the main
+    checkout during a worktree-scoped finish run.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+
+    Returns:
+        ``{"taken_at": <ISO timestamp>, "status": {path: code}}``.
+    """
+    return {
+        "taken_at": datetime.now(timezone.utc).isoformat(),
+        "status": _main_checkout_status_map(repo_root),
+    }
+
+
+def _main_checkout_guard_violations(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    own_churn: set[str] | frozenset[str] | tuple[str, ...] = (),
+    expected_dirty: tuple[str, ...] = (),
+) -> list[str]:
+    """Return the offending main-checkout paths between two snapshots.
+
+    A path is offending when its status entry *changed* between snapshots
+    (added, deleted or modified) and it is none of:
+
+    - under ``.worklog/`` (the finish run's own bookkeeping surface),
+    - a project-declared expected-dirty path (*expected_dirty*), nor
+    - a path in *own_churn* whose status code is not a deletion.
+
+    *own_churn* is the file list of finish's own Step-5 fast-forward of the
+    main checkout's ``dev`` branch: those working-tree changes are attributed
+    to finish and never abort. A deletion (``D`` in the code) is **never**
+    allow-listed, even when the path appears in *own_churn* — a fast-forward
+    cannot delete a file relative to the tracked tree, so a ``D`` entry is
+    foreign by construction (WL-0MVPADZ1Z000FOSG AC3).
+
+    Args:
+        baseline: The :func:`_snapshot_main_checkout` taken at run start.
+        current: The :func:`_snapshot_main_checkout` taken at a verify point.
+        own_churn: Paths changed by finish's own fast-forward.
+        expected_dirty: Project-declared dirty path prefixes to exclude.
+
+    Returns:
+        Sorted, de-duplicated list of ``"<path> [<code>]"`` entries.
+    """
+    before = baseline.get("status", {})
+    after = current.get("status", {})
+    own = set(own_churn or ())
+    offending: list[str] = []
+    for path, code in sorted(after.items()):
+        if path.startswith(".worklog/") or _path_is_expected_dirty(
+            path, expected_dirty
+        ):
+            continue
+        if path in own and "D" not in code:
+            continue  # finish's own fast-forward churn
+        if path not in before or before[path] != code:
+            offending.append(f"{path} [{code}]")
+    return offending
+
+
+def _record_finish_own_churn(
+    repo_root: str, before_head: str, after_head: str
+) -> list[str]:
+    """File list of finish's own fast-forward of the main checkout.
+
+    The diff between the main checkout's HEAD before the Step-5 fast-forward
+    and after covers every working-tree change the fast-forward itself
+    caused (branch checkout + commit merge), so those paths are attributable
+    to finish and excluded from the main-checkout guard's offending set.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        before_head: ``git rev-parse HEAD`` before the fast-forward.
+        after_head: The fast-forwarded HEAD (commit hash just merged).
+
+    Returns:
+        Sorted file list, or ``[]`` when either side is unavailable.
+    """
+    if not before_head or not after_head:
+        return []
+    result = run_cmd(
+        ["git", "diff", "--name-only", before_head, after_head],
+        cwd=repo_root,
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        return []
+    return sorted(p for p in result.stdout.splitlines() if p.strip())
+
+
+def _main_checkout_actor_evidence(
+    repo_root: str, worktree_path: str
+) -> str:
+    """Best-effort concurrent-actor evidence for the guard's abort message.
+
+    Sources, in order:
+
+    1. other worktree state files (``.implement_state.json``) under the main
+       checkout — each names its owning work item and start time,
+    2. live processes whose ``/proc/<pid>/cwd`` resolves to the main
+       checkout root (Linux only; skipped elsewhere).
+
+    Returns ``"unknown"`` when no source yields evidence (the abort message
+    still fires — evidence is informative, never gating).
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        worktree_path: This finish run's own worktree (excluded from the
+            evidence scan).
+    """
+    own = str(Path(worktree_path).resolve())
+    evidence: list[str] = []
+    worktrees_dir = Path(repo_root) / ".worklog" / "worktrees"
+    try:
+        state_files = sorted(worktrees_dir.glob("wl-*/.implement_state.json"))
+    except OSError:
+        state_files = []
+    for state_file in state_files:
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(state_file.parent.resolve()) == own:
+            continue
+        evidence.append(
+            f"work item {data.get('work_item_id', '?')} "
+            f"(worktree {state_file.parent}, started "
+            f"{data.get('started_at', '?')})"
+        )
+        if len(evidence) >= 5:
+            break
+    try:
+        root = str(Path(repo_root).resolve())
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                cwd = os.readlink(f"/proc/{entry}/cwd")
+            except OSError:
+                continue
+            if str(Path(cwd).resolve()) == root:
+                evidence.append(f"pid {entry} with cwd in the main checkout")
+                if len(evidence) >= 8:
+                    break
+    except OSError:
+        pass
+    return "; ".join(evidence) if evidence else "unknown"
+
+
+def _main_checkout_guard_message(
+    repo_root: str,
+    violations: list[str],
+    actor_evidence: str,
+    stage: str,
+) -> str:
+    """Render the loud-abort message for a main-checkout guard failure.
+
+    Names every offending path, the concurrent-actor evidence available at
+    runtime and the recovery command, so an agent hitting the abort can
+    restore the main checkout and re-run finish without spelunking.
+    """
+    listing = "\n".join(f"  - {p}" for p in violations[:20])
+    if len(violations) > 20:
+        listing += f"\n  … and {len(violations) - 20} more"
+    return (
+        f"Main-checkout mutation detected ({stage} verify): tracked-file "
+        f"changes in the main checkout at {repo_root} were NOT made by this "
+        f"finish run. Aborting instead of silently committing, fast-forwarding "
+        f"or pushing them.\n"
+        f"Offending paths:\n{listing}\n"
+        f"Concurrent actor evidence: {actor_evidence}\n"
+        f"Recovery: in the main checkout run `git checkout -- <path>` (or "
+        f"`git restore <path>`) for each path above to restore the tracked "
+        f"files from HEAD, then re-run `implement.py finish`."
+    )
+
+
+def _verify_main_checkout(
+    guard: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    repo_root: str,
+    worktree_path: str,
+    own_churn: list[str],
+    expected_dirty: tuple[str, ...],
+    stage: str,
+) -> list[str]:
+    """Re-snapshot the main checkout and record a guard verify entry.
+
+    Appends ``{"stage", "at", "verdict", "offending"?}`` to
+    ``guard["verifies"]``, updates ``guard["verdict"]`` and returns the
+    offending paths (empty list = pass), so an operator can read the guard's
+    work straight from the finish report.
+
+    Args:
+        guard: The ``report["steps"]["main_checkout_guard"]`` dict.
+        baseline: Snapshot taken at run start.
+        repo_root: Absolute path to the main checkout.
+        worktree_path: This finish run's own worktree.
+        own_churn: Paths changed by finish's own fast-forward.
+        expected_dirty: Project-declared dirty path prefixes to exclude.
+        stage: Verify stage label (``pre_push`` / ``pre_worktree_removal``).
+
+    Returns:
+        The offending paths (empty list on pass).
+    """
+    current = _snapshot_main_checkout(repo_root)
+    violations = _main_checkout_guard_violations(
+        baseline,
+        current,
+        own_churn=own_churn,
+        expected_dirty=expected_dirty,
+    )
+    entry: dict[str, Any] = {
+        "stage": stage,
+        "at": current["taken_at"],
+        "verdict": "fail" if violations else "pass",
+    }
+    if violations:
+        entry["offending"] = violations
+        entry["actor_evidence"] = _main_checkout_actor_evidence(
+            repo_root, worktree_path
+        )
+    guard["verifies"].append(entry)
+    guard["verdict"] = entry["verdict"]
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Per-checkout finish lock (WL-0MVPADZ1Z000FOSG AC5)
+# ---------------------------------------------------------------------------
+
+#: Lock-file path relative to the main checkout root. One exclusive advisory
+#: ``flock`` holder per repository — two finishes on the same main checkout
+#: can never overlap (2026-10-26 incident: two concurrent finishes plus a
+#: full-scope test run on one shared checkout). The mechanics live in the
+#: shared :mod:`shared.repo_lock` helper (SA-0MVPZG3IQ009IJMO) so the same
+#: lock also guards the adjacent parent-branch refresh window in
+#: :func:`phase_start`.
+MAIN_CHECKOUT_LOCK_RELPATH = _REPO_LOCK_RELPATH
+
+#: Bounded wait for the per-repository lock in ``finish`` (seconds). Default
+#: ``0`` = fail fast: a second finish refuses immediately with an actionable
+#: message naming the holder (AC3 allows fail-fast). Set to a positive value
+#: (env ``IMPLEMENT_FINISH_LOCK_TIMEOUT``) to wait that long for a concurrent
+#: finish instead — the wait is always bounded, never indefinite.
+DEFAULT_FINISH_LOCK_TIMEOUT = 0.0
+
+#: Bounded wait for the parent-branch refresh window in ``start`` (seconds).
+#: ``start`` must never be blocked by a concurrent finish: after this bound the
+#: refresh is skipped (fail-open) and the local branch is used as the base.
+DEFAULT_START_LOCK_TIMEOUT = 30.0
+
+ENV_FINISH_LOCK_TIMEOUT = "IMPLEMENT_FINISH_LOCK_TIMEOUT"
+ENV_START_LOCK_TIMEOUT = "IMPLEMENT_START_LOCK_TIMEOUT"
+
+#: Override for the per-work-item child-lock store (test isolation).
+#: Unset in production; the worklog store resolved from the item id is used.
+#: ``phase_start`` acquires a real ``flock`` before its mocked steps, so an
+#: un-isolated suite would race real lock files for synthetic test ids
+#: (SA-0MVWJ6U3J003TLRZ). Values are read per call, so a fixture that sets it
+#: also isolates tests that load this module by file path.
+ENV_CHILD_LOCK_DIR = "IMPLEMENT_CHILD_LOCK_DIR"
+
+
+def _resolve_lock_timeout(env_var: str, default: float) -> float:
+    """Resolve a bounded lock wait from the environment (fail-safe default)."""
+    raw = os.environ.get(env_var)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        LOG.warning(
+            "Ignoring invalid %s=%r (expected seconds); using %gs",
+            env_var, raw, default,
+        )
+        return default
+    if value < 0:
+        LOG.warning(
+            "Ignoring negative %s=%r; using %gs", env_var, raw, default,
+        )
+        return default
+    return value
+
+
+def _finish_lock_timeout() -> float:
+    """Bounded wait used by ``phase_finish`` for the main-checkout lock."""
+    return _resolve_lock_timeout(ENV_FINISH_LOCK_TIMEOUT, DEFAULT_FINISH_LOCK_TIMEOUT)
+
+
+def _start_lock_timeout() -> float:
+    """Bounded wait used by ``phase_start`` for the parent-branch refresh."""
+    return _resolve_lock_timeout(ENV_START_LOCK_TIMEOUT, DEFAULT_START_LOCK_TIMEOUT)
+
+
+def _main_checkout_lock_path(repo_root: str) -> Path:
+    """Absolute path of the main-checkout finish lock file."""
+    return RepoLock(repo_root, relpath=MAIN_CHECKOUT_LOCK_RELPATH).path
+
+
+def _release_main_checkout_lock(fd: int | None) -> None:
+    """Release the held main-checkout lock. Idempotent (None/no-op)."""
+    release_repo_lock(fd)
+
+
+def acquire_main_checkout_lock(
+    repo_root: str,
+    work_item_id: str,
+    timeout: float = 0.0,
+) -> tuple[int | None, str | None]:
+    """Take the exclusive per-checkout lock (fail fast by default).
+
+    Thin ``implement.py`` wrapper over :class:`shared.repo_lock.RepoLock`. The
+    lock is an advisory ``flock`` on
+    ``<main-checkout>/.worklog/locks/main-checkout.lock``, released by the
+    kernel when the holder dies (SIGKILL included) — no stale-lock bookkeeping
+    exists to trust (WL-0MVPADZ1Z000FOSG AC4/AC5). Holder metadata is written
+    into the lock file after acquisition for the refusal message only; it never
+    decides ownership and a metadata write failure never fails the acquisition.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        work_item_id: The work item this run belongs to (recorded in the
+            refusal message as the requester).
+        timeout: Bounded wait in seconds (``0`` = fail fast). A positive value
+            waits up to that deadline, then refuses with an actionable
+            timeout message — never an indefinite hang.
+
+    Returns:
+        ``(fd, None)`` on success (caller must release via
+        :func:`_release_main_checkout_lock`), or ``(None, message)`` with a
+        complete, actionable refusal message when the lock is held.
+    """
+    return RepoLock(repo_root, relpath=MAIN_CHECKOUT_LOCK_RELPATH).acquire(
+        work_item_id, timeout=timeout
+    )
+
+
 def git_worktree_add(
     branch: str, worktree_path: str, parent_branch: str = DEFAULT_PARENT_BRANCH
 ) -> bool:
@@ -1447,6 +2412,1042 @@ def git_worktree_add(
         timeout=120,
     )
     return result.returncode == 0
+
+
+# A parent branch whose ``remote`` key must never change: a worktree
+# registration writes ``.`` into ``branch.<new-wl-branch>.remote`` only; the
+# parent's key is guarded by :func:`assert_parent_tracking_untouched`.
+
+
+def _git_config_get(cwd: str, key: str) -> str | None:
+    """Read a single ``git config --get`` value, or ``None`` when unset."""
+    result = run_cmd(
+        ["git", "config", "--get", key],
+        cwd=cwd,
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def warn_self_referential_upstream(repo_root: str) -> dict[str, Any]:
+    """Fail-open warning: long-lived branches whose upstream is themselves.
+
+    ``branch.<name>.remote = "."`` on ``dev``/``main`` makes a plain
+    ``git pull`` a silent no-op (SA-0MVX1M6HH004YPX2): the machine keeps
+    running stale skills and stale worklog data while every tool reports
+    "up to date".
+
+    ``implement.py start`` surfaces that as a **warning only**
+    (SA-0MVX35AUC003CNUD AC2/AC3): a work item is never blocked and no config
+    is ever rewritten — detection is read-only, and repair stays an explicit
+    operator action (``git branch --set-upstream-to=origin/<branch> <branch>``
+    or the detection module's ``--fix``). A missing detection module, a
+    non-repository target or a git failure degrades to a skip.
+
+    Args:
+        repo_root: The main checkout root to inspect.
+
+    Returns:
+        A verdict mapping with ``status`` (``ok``/``warning``/``skipped``),
+        plus ``defect_count`` and ``defects`` when defects were found.
+    """
+    if _detect_self_referential_upstreams is None:
+        LOG.warning(
+            "Self-referential-upstream check skipped: detection module not "
+            "available"
+        )
+        return {"status": "skipped", "reason": "detection module not available"}
+    try:
+        # Worktree branches are reported as ``expected``; only ``defect``
+        # findings are the machine-wide breakage worth warning about.
+        defects = [
+            finding
+            for finding in _detect_self_referential_upstreams(repo_root)
+            if finding.get("type") == "defect"
+        ]
+    except Exception as exc:  # fail-open: never block a work item
+        LOG.warning("Self-referential-upstream check skipped: %s", exc)
+        return {"status": "skipped", "reason": str(exc)}
+    if not defects:
+        return {"status": "ok", "defect_count": 0}
+    branches = ", ".join(str(defect.get("branch")) for defect in defects)
+    LOG.warning(
+        "Long-lived branch(es) track themselves (%s): `git pull` fetches from "
+        "this repository and silently changes nothing. Repair explicitly: "
+        "git branch --set-upstream-to=origin/<branch> <branch> (or "
+        "python3 skill/shared/self_referential_upstream.py --fix).",
+        branches,
+    )
+    return {
+        "status": "warning",
+        "defect_count": len(defects),
+        "defects": defects,
+    }
+
+
+def assert_parent_tracking_untouched(
+    repo_root: str,
+    parent_branch: str,
+    before: tuple[str | None, str | None],
+) -> None:
+    """Fail loudly when a worktree registration poisoned the parent's upstream.
+
+    ``git worktree add --track -b wl-* <path> <parent>`` writes
+    ``branch.<wl-*>.remote = "."`` for the new branch and leaves the parent's
+    key alone — the *designed* shape (SA-0MVX1M6HH004YPX2, pinned by
+    ``skill/shared/tests/test_self_referential_upstream.py``).
+    ``branch.<name>.remote`` is one key per **branch name** in the shared
+    config, so if the registration ever wrote ``.`` onto the parent branch
+    name, every ``git pull`` on that machine would silently stop fetching
+    from ``origin``.
+
+    This guard runs immediately after a fresh worktree registration and fails
+    closed: a parent that now tracks ``.`` while it did not before is a hard
+    error, not a warning, because the write path is the framework's own
+    (SA-0MVX35ABT000I1PD AC1).
+
+    Args:
+        repo_root: Repository root whose config to read (the common config
+            every worktree shares).
+        parent_branch: The long-lived parent branch name that must stay
+            unaffected.
+        before: The ``(remote, merge)`` tracking pair captured *before* the
+            registration. None-values are indistinguishable from "not set".
+
+    Raises:
+        RuntimeError: when *parent_branch* now has ``remote = "."`` while it
+            did not before — i.e. this registration wrote the self-upstream.
+    """
+    after_remote = _git_config_get(repo_root, f"branch.{parent_branch}.remote")
+    after_merge = _git_config_get(repo_root, f"branch.{parent_branch}.merge")
+    before_remote = before[0]
+    before_merge = before[1]
+    if after_remote == "." and before_remote != ".":
+        raise RuntimeError(
+            f"Worktree registration wrote a self-referential upstream onto "
+            f"parent branch {parent_branch!r}: branch.{parent_branch}.remote "
+            f"changed from {before_remote!r} to '.' (merge="
+            f"{after_merge!r}, was {before_merge!r}). This makes `git pull` on "
+            f"{parent_branch} a silent no-op (SA-0MVX1M6HH004YPX2). Refusing "
+            "to continue; the defect must be repaired with "
+            f"`git branch --set-upstream-to=origin/{parent_branch} "
+            f"{parent_branch}` before any worktree is created."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Temp-index staging: test the tree the commit will produce
+# (SA-0MVQHVGFR006W8LG, F6 of SA-0MVL2NH1G0094FA2)
+# ---------------------------------------------------------------------------
+
+#: Temporary finish-gate index names. The prefix is also the marker the abort
+#: contract's artefact detector looks for, so it is part of the contract.
+GATE_INDEX_PREFIX = "implement-gate-"
+GATE_INDEX_SUFFIX = ".index"
+
+#: The temporary index currently exported to a running suite, or None. Kept
+#: module-level so the signal handler can remove it on SIGTERM/SIGINT.
+_gate_index_global: str | None = None
+
+
+def _remove_gate_index(index_path: str | None) -> None:
+    """Best-effort removal of a temporary finish-gate index (and its lock).
+
+    Shared by the staging context manager's ``finally`` and the signal
+    handler, so no exit path can leave an index-shaped artefact in the git
+    directory (the F5 abort contract, SA-0MVQHVCRE0070YO6).
+    """
+    if not index_path:
+        return
+    for candidate in (index_path, f"{index_path}.lock"):
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            LOG.warning(
+                "Could not remove the finish gate's temporary index %s: %s",
+                candidate,
+                exc,
+            )
+
+
+def _run_git_plumbing(
+    cwd: str,
+    args: list[str],
+    *,
+    index_file: str | None = None,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess:
+    """Run ``git <args>`` in *cwd* against an explicitly chosen index.
+
+    The finish gate's temp-index plumbing must act on the real worktree and on
+    a *specific* index file, never on whatever ``GIT_INDEX_FILE`` happens to be
+    exported into this process (the gate exports it while the suite runs).
+    ``index_file`` is therefore authoritative: a path is exported to the child,
+    and ``None`` **removes** any ambient value so the real index is used.
+
+    Deliberately not routed through :func:`run_cmd`: these are fast, local
+    plumbing calls that must reach the real repository even when a caller (or a
+    test harness) stubs the surrounding git boundary.
+    """
+    env = dict(os.environ)
+    env.pop("GIT_INDEX_FILE", None)
+    if index_file is not None:
+        env["GIT_INDEX_FILE"] = index_file
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def _git_absolute_git_dir(cwd: str) -> str:
+    """The absolute git directory of the repository/worktree at *cwd*."""
+    proc = _run_git_plumbing(cwd, ["rev-parse", "--absolute-git-dir"])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError(
+            "Cannot resolve the git directory for the finish gate's "
+            f"temporary index at {cwd}: "
+            f"{proc.stderr.strip() or 'git rev-parse failed'}"
+        )
+    return proc.stdout.strip()
+
+
+def _is_git_worktree(cwd: str) -> bool:
+    """Whether *cwd* is inside a git work tree.
+
+    The precondition of the finish gate's would-be-commit staging: a directory
+    outside a work tree has no commit tree to attribute a verdict to, so the
+    gate degrades to a plain suite run instead of refusing to run at all
+    (SA-0MVVKJGKP003QVNM).
+    """
+    proc = _run_git_plumbing(cwd, ["rev-parse", "--is-inside-work-tree"])
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+# ---------------------------------------------------------------------------
+# Build-originated composition churn (SA-0MVZE164P0048306)
+# ---------------------------------------------------------------------------
+#: Git mode of a submodule entry (a "gitlink") in a tree or an index.
+GITLINK_MODE = "160000"
+
+#: Path prefix of the finish run's own bookkeeping surface. A tracked change
+#: there (``wl`` comments, status and cache writes) is never build composition
+#: churn and is never restored by the build-churn stage.
+CHURN_EXEMPT_PREFIX = ".worklog/"
+
+
+def _parse_gitlink_entries(output: str, sha_field: int = 2) -> dict[str, str]:
+    """Parse NUL-separated ``ls-tree``/``ls-files --stage`` output into a map.
+
+    Both plumbing commands emit ``<mode> SP <field> SP <field> TAB <path>`` but
+    with the SHA in a different position: ``ls-tree`` is ``<mode> <type>
+    <sha>`` (the SHA is the third field), ``ls-files --stage`` is ``<mode>
+    <sha> <stage>`` (the SHA is the second). Only ``160000`` (gitlink) entries
+    are kept — they are the submodule pointers, i.e. the engine pin a commit
+    records.
+
+    Args:
+        output: Raw NUL-terminated output of ``git ls-tree -r -z`` (default
+            ``sha_field``) or ``git ls-files --stage -z`` (``sha_field=1``).
+        sha_field: Zero-based index of the field holding the recorded commit.
+
+    Returns:
+        Mapping of submodule path to the commit SHA it records.
+    """
+    gitlinks: dict[str, str] = {}
+    for entry in output.split("\0"):
+        if not entry.strip():
+            continue
+        meta, _, path = entry.partition("\t")
+        fields = meta.split()
+        if len(fields) > sha_field and fields[0] == GITLINK_MODE and path:
+            gitlinks[path] = fields[sha_field]
+    return gitlinks
+
+
+def _head_gitlinks(cwd: str) -> dict[str, str]:
+    """Map every gitlink path recorded in ``HEAD`` to its commit.
+
+    This is the *committed* composition — for the game repos that compose the
+    Tableau Card Engine at ``core`` it is the engine pin the commit records.
+    Empty when ``HEAD`` is unborn or unreadable: there is then no recorded
+    composition to restore.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        Mapping of submodule path to the commit ``HEAD`` records.
+    """
+    proc = _run_git_plumbing(cwd, ["ls-tree", "-r", "-z", "HEAD"])
+    if proc.returncode != 0:
+        return {}
+    return _parse_gitlink_entries(proc.stdout)
+
+
+def _index_gitlinks(cwd: str) -> dict[str, str]:
+    """Map every gitlink path currently staged in the real index to its commit.
+
+    A build (``engine:sync``) stages the gitlink it advanced, so the index is
+    part of the pre/post-build state comparison.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        Mapping of submodule path to the commit the index stages.
+    """
+    proc = _run_git_plumbing(cwd, ["ls-files", "--stage", "-z"])
+    if proc.returncode != 0:
+        return {}
+    return _parse_gitlink_entries(proc.stdout, sha_field=1)
+
+
+def _tracked_dirty_paths(cwd: str) -> set[str]:
+    """Tracked paths whose state differs from ``HEAD``, staged or not.
+
+    Uses ``git diff HEAD`` (index *and* working tree against the commit), so a
+    build that stages its own output is visible here just like one that only
+    rewrites the working tree. Untracked files are deliberately excluded: a
+    build output the project does not track is not a composition path.
+
+    The finish run's own bookkeeping surface (``.worklog/`` — ``wl`` comments,
+    status and cache writes) is excluded: it is never composition, and a
+    concurrent bookkeeping write must never be mistaken for build churn and
+    restored.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        Set of repository-relative paths (empty when the query fails).
+    """
+    proc = _run_git_plumbing(
+        cwd, ["diff", "--name-only", "--no-renames", "-z", "HEAD"]
+    )
+    if proc.returncode != 0:
+        return set()
+    return {
+        path
+        for path in proc.stdout.split("\0")
+        if path and not path.startswith(CHURN_EXEMPT_PREFIX)
+    }
+
+
+def _path_state_token(
+    cwd: str, path: str, gitlinks: dict[str, str]
+) -> str:
+    """A token that changes only when a dirty path's content really changes.
+
+    Distinguishes a path the item modified before the build (dirty in the
+    baseline) from one that changed *during* the build: for a submodule the
+    token is its checked-out commit, for a regular path the hash of its working
+    content. A path the build changed *and* the item had already modified is
+    therefore detectable, so it is never mistaken for pure build output.
+
+    Args:
+        cwd: Worktree root.
+        path: Repository-relative path to fingerprint.
+        gitlinks: Known submodule paths for this checkout.
+
+    Returns:
+        An opaque state token string.
+    """
+    if path in gitlinks:
+        proc = _run_git_plumbing(str(Path(cwd) / path), ["rev-parse", "HEAD"])
+        if proc.returncode == 0 and proc.stdout.strip():
+            return f"gitlink:{proc.stdout.strip()}"
+        return "gitlink:unresolved"
+    if not (Path(cwd) / path).exists():
+        return "absent"
+    proc = _run_git_plumbing(cwd, ["hash-object", "--", path])
+    if proc.returncode == 0 and proc.stdout.strip():
+        return f"blob:{proc.stdout.strip()}"
+    return "unhashed"
+
+
+def _build_churn_baseline(cwd: str) -> dict[str, Any]:
+    """Snapshot the item's own change set immediately before the build runs.
+
+    Whatever differs from this snapshot after the build was produced *by the
+    build*, not by the item — the distinction AC1/AC2 of SA-0MVZE164P0048306
+    turn on. Taken after the (optional) refactor step and before ``run_build``,
+    so refactor edits count as the item's own change.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        ``{taken_at, gitlinks, dirty_paths}`` where ``dirty_paths`` maps every
+        tracked dirty path to its :func:`_path_state_token` and ``gitlinks``
+        is ``HEAD``'s recorded composition. Outside a git work tree both are
+        empty (the churn stage is then a no-op).
+    """
+    gitlinks = _head_gitlinks(cwd)
+    dirty = sorted(_tracked_dirty_paths(cwd))
+    known = {**_index_gitlinks(cwd), **gitlinks}
+    return {
+        "taken_at": datetime.now(timezone.utc).isoformat(),
+        "gitlinks": gitlinks,
+        "dirty_paths": {
+            path: _path_state_token(cwd, path, known) for path in dirty
+        },
+    }
+
+
+def _composed_engine_state(
+    cwd: str, commit_tree: str | None = None
+) -> dict[str, Any]:
+    """Record the composition a gate verdict's suite ran against.
+
+    For every recorded gitlink this resolves the commit the submodule
+    **checkout** is actually at — the composed engine the suite saw — and
+    compares it with the gitlink the *commit* records. That pair is the
+    provenance AC4 of SA-0MVZE164P0048306 requires alongside the
+    would-be-commit tree: a verdict now states which engine SHA it tested, not
+    merely which tree.
+
+    Args:
+        cwd: Worktree root.
+        commit_tree: The would-be-commit tree whose gitlinks are authoritative
+            (``git write-tree`` of the staged change set, AC3). ``None``
+            compares against ``HEAD`` — the committed composition, used by the
+            build-churn step which runs before the gate stages anything.
+
+    Returns:
+        ``{"submodules": [{"submodule", "commit", "recorded_gitlink",
+        "source", "matches_recorded"}], "composition": "none"|"submodules"}``.
+        An unresolved checkout is reported with ``commit: None`` rather than
+        omitted, so a broken composition is visible in the verdict.
+    """
+    if commit_tree:
+        proc = _run_git_plumbing(cwd, ["ls-tree", "-r", "-z", commit_tree])
+        recorded_map = (
+            _parse_gitlink_entries(proc.stdout) if proc.returncode == 0 else {}
+        )
+        source = "would-be-commit tree"
+    else:
+        recorded_map = _head_gitlinks(cwd)
+        source = "HEAD"
+    entries: list[dict[str, Any]] = []
+    for path, recorded in sorted(recorded_map.items()):
+        proc = _run_git_plumbing(str(Path(cwd) / path), ["rev-parse", "HEAD"])
+        resolved = proc.stdout.strip() if proc.returncode == 0 else ""
+        entries.append(
+            {
+                "submodule": path,
+                "commit": resolved or None,
+                "recorded_gitlink": recorded,
+                "source": source,
+                "matches_recorded": bool(resolved) and resolved == recorded,
+            }
+        )
+    return {
+        "submodules": entries,
+        "composition": "submodules" if entries else "none",
+    }
+
+
+def _restore_build_churn_path(
+    cwd: str, path: str, gitlinks: dict[str, str], known: dict[str, str]
+) -> dict[str, Any]:
+    """Restore one build-originated path to the state ``HEAD`` records.
+
+    A regular path is restored from ``HEAD`` (``git checkout HEAD -- <path>``
+    restores the index entry and the working file). A gitlink needs both
+    halves: ``git reset HEAD -- <path>`` restores the recorded pointer in the
+    index and the submodule checkout is moved back to that commit, which is
+    what makes the *tested* composition equal the *committed* one (AC3 of
+    SA-0MVZE164P0048306) instead of leaving the suite on the advanced engine.
+
+    Nothing is ever discarded by force: a submodule with local modifications
+    fails the checkout and is reported as unrestorable rather than cleaned —
+    the local work may be the item's own.
+
+    Args:
+        cwd: Worktree root.
+        path: Repository-relative path to restore.
+        gitlinks: ``HEAD``'s recorded composition.
+        known: Every known submodule path (HEAD plus the current index).
+
+    Returns:
+        ``{path, kind, restored}`` plus ``commit`` when restored, or
+        ``error``/``reason`` when it was not.
+    """
+    recorded = gitlinks.get(path)
+    if recorded is not None:
+        failures: list[str] = []
+        reset = _run_git_plumbing(cwd, ["reset", "-q", "HEAD", "--", path])
+        if reset.returncode != 0:
+            failures.append(
+                f"git reset HEAD -- {path}: "
+                f"{reset.stderr.strip() or 'failed'}"
+            )
+        checkout = _run_git_plumbing(
+            str(Path(cwd) / path), ["checkout", "-q", "--detach", recorded]
+        )
+        if checkout.returncode != 0:
+            failures.append(
+                f"git -C {path} checkout --detach {recorded}: "
+                f"{checkout.stderr.strip() or 'failed'}"
+            )
+            sync = _run_git_plumbing(
+                cwd, ["submodule", "update", "--init", "--checkout", "--", path]
+            )
+            if sync.returncode != 0:
+                failures.append(
+                    f"git submodule update --init --checkout {path}: "
+                    f"{sync.stderr.strip() or 'failed'}"
+                )
+            elif path not in _tracked_dirty_paths(cwd):
+                failures.clear()
+        if not failures and path in _tracked_dirty_paths(cwd):
+            failures.append(
+                f"{path} is still recorded as modified after the restore "
+                "(the submodule checkout does not match the gitlink HEAD "
+                "records)"
+            )
+        if failures:
+            return {
+                "path": path,
+                "kind": "submodule",
+                "restored": False,
+                "error": "; ".join(failures),
+            }
+        return {
+            "path": path,
+            "kind": "submodule",
+            "restored": True,
+            "commit": recorded,
+        }
+
+    checkout = _run_git_plumbing(cwd, ["checkout", "HEAD", "--", path])
+    if checkout.returncode == 0:
+        return {"path": path, "kind": "file", "restored": True}
+    if path in known:
+        # A gitlink the build staged but HEAD does not record: there is no
+        # committed state to restore it to, so it can only be left in place.
+        return {
+            "path": path,
+            "kind": "submodule",
+            "restored": False,
+            "reason": "not_in_head",
+            "error": checkout.stderr.strip(),
+        }
+    head_blob = _run_git_plumbing(cwd, ["cat-file", "-e", f"HEAD:{path}"])
+    if head_blob.returncode != 0:
+        return {
+            "path": path,
+            "kind": "file",
+            "restored": False,
+            "reason": "not_in_head",
+            "error": checkout.stderr.strip(),
+        }
+    return {
+        "path": path,
+        "kind": "file",
+        "restored": False,
+        "error": checkout.stderr.strip() or "git checkout HEAD failed",
+    }
+
+
+def _exclude_build_originated_churn(
+    cwd: str, baseline: dict[str, Any]
+) -> dict[str, Any]:
+    """Undo the tracked churn the build produced, keeping the item's own work.
+
+    A build such as this repo's ``npm run build`` (``engine:sync`` first) can
+    advance the engine submodule and rewrite the pin when the tracked engine
+    branch tip has moved, staging both. Left alone, finish's ``git add -A``
+    commits that bump — an engine change the item never originated — and the
+    gate tests a composition the commit does not record (SA-0MVZE164P0048306).
+
+    The rule is *conditional on origin*, never an unconditional ignore list:
+    a path restored here must have been **clean before the build** and dirty
+    after it. A path the item already had dirty is part of the item's own
+    change set and is preserved — even when the build also touched it
+    (``item_modified_during_build``), because restoring it would discard the
+    item's work.
+
+    Args:
+        cwd: Worktree root.
+        baseline: The :func:`_build_churn_baseline` taken before the build.
+
+    Returns:
+        A report dict: ``baseline_dirty_paths``, ``build_originated``,
+        ``item_modified_during_build``, ``restored``, ``excluded_from_commit``,
+        ``left_in_place``, ``restore_failed``, ``success``/``reason`` and
+        ``composed_engine``. ``restore_failed`` non-empty means finish must
+        refuse: the commit would otherwise record a composition the item did
+        not originate (or, for a file, a state that could not be restored).
+    """
+    before = baseline.get("dirty_paths") or {}
+    gitlinks = dict(baseline.get("gitlinks") or {})
+    known = {**_index_gitlinks(cwd), **gitlinks}
+
+    originated: list[str] = []
+    item_modified: list[str] = []
+    for path in sorted(_tracked_dirty_paths(cwd)):
+        if path not in before:
+            originated.append(path)
+        elif before[path] != _path_state_token(cwd, path, known):
+            item_modified.append(path)
+
+    restored: list[dict[str, Any]] = []
+    left_in_place: list[dict[str, Any]] = []
+    restore_failed: list[dict[str, Any]] = []
+    for path in originated:
+        outcome = _restore_build_churn_path(cwd, path, gitlinks, known)
+        if outcome.get("restored"):
+            restored.append(outcome)
+        elif outcome.get("reason") == "not_in_head":
+            left_in_place.append(outcome)
+        else:
+            restore_failed.append(outcome)
+
+    for entry in restored:
+        LOG.info(
+            "Finish gate: excluded build-originated churn %s (%s)",
+            entry["path"],
+            entry["kind"],
+        )
+    for entry in item_modified:
+        LOG.info(
+            "Finish gate: kept %s (modified by the item and touched by the "
+            "build; never restored)",
+            entry,
+        )
+
+    report: dict[str, Any] = {
+        "baseline_dirty_paths": sorted(before),
+        "build_originated": originated,
+        "item_modified_during_build": item_modified,
+        "restored": restored,
+        "excluded_from_commit": [entry["path"] for entry in restored],
+        "left_in_place": left_in_place,
+        "restore_failed": restore_failed,
+        "success": not restore_failed,
+        "composed_engine": _composed_engine_state(cwd),
+    }
+    if restore_failed:
+        report["reason"] = "restore_failed"
+    return report
+
+
+def _build_churn_refusal_message(churn: dict[str, Any]) -> str:
+    """Actionable refusal for build churn that could not be excluded.
+
+    Never silent and never forced: the offending paths, the git error and the
+    two remedies (clean the submodule, or make the change part of the item's
+    own change set before the build) are all named.
+
+    Args:
+        churn: The :func:`_exclude_build_originated_churn` report.
+
+    Returns:
+        The message recorded on the work item and returned to the caller.
+    """
+    details = "\n".join(
+        f"  - {entry['path']} ({entry['kind']}): {entry.get('error', 'failed')}"
+        for entry in churn.get("restore_failed") or []
+    )
+    return (
+        "Finish refused: build-originated churn could not be excluded from "
+        "the item's commit.\n"
+        f"{details}\n"
+        "The build produced these tracked changes, so committing them would "
+        "record a pin/gitlink bump this item did not originate, and the "
+        "suite would not run against the composition the commit records.\n"
+        "Resolve the reported git error (for a submodule: clean or restore "
+        "its checkout) and re-run `implement.py finish`. If the change is "
+        "genuinely this item's, make it part of the change set *before* the "
+        "build (stage or modify it yourself) so it is preserved."
+    )
+
+
+@dataclass
+class WouldBeCommitIndex:
+    """The temporary index the finish gate tests the would-be-commit tree in.
+
+    ``tree`` is the ``git write-tree`` SHA of the change set staged into the
+    temporary index — the tree the suite therefore ran against. The real index
+    and the working tree are never modified while the gate runs.
+    """
+
+    worktree: str
+    index_path: str
+    real_index: str
+    tree: str
+    staged_paths: list[str]
+
+    def summary(self) -> dict[str, Any]:
+        """Report-shaped summary of the tested tree (recorded by finish)."""
+        return {
+            "tree": self.tree,
+            "index_path": self.index_path,
+            "real_index": self.real_index,
+            "staged_paths": list(self.staged_paths),
+            "staged_count": len(self.staged_paths),
+        }
+
+    def verify_unchanged(self) -> dict[str, Any]:
+        """Re-derive the temporary index's tree after the suite has run.
+
+        A fixture (or a child ``git`` invocation) that honoured the inherited
+        ``GIT_INDEX_FILE`` and staged into it would change the tree the gate
+        believes it tested. Comparing the tree before and after makes that
+        unattributable verdict detectable instead of silently accepted.
+        """
+        proc = _run_git_plumbing(
+            self.worktree, ["write-tree"], index_file=self.index_path
+        )
+        current = proc.stdout.strip()
+        return {
+            "unchanged": proc.returncode == 0 and current == self.tree,
+            "tree": current,
+            "expected": self.tree,
+        }
+
+
+@contextlib.contextmanager
+def would_be_commit_index(cwd: str) -> Iterator[WouldBeCommitIndex]:
+    """Stage the pending change set into a copy of the real index.
+
+    The finish gate must validate the exact tree the commit will produce, not
+    the loose working tree (SA-0MVL2NH1G0094FA2). Before the suite runs, the
+    real index is copied to a temporary file, the change set is applied to the
+    copy (``git add -A`` under ``GIT_INDEX_FILE``), and ``GIT_INDEX_FILE`` is
+    exported for the duration so every child ``git`` command the suite spawns
+    — including ``git ls-files`` guards inside tests — sees the staged file
+    set. ``GIT_INDEX_FILE`` survives the test skill's repository-override
+    scrub (F3, SA-0MVQHV9Y3001RNNW) for exactly that reason.
+
+    The temporary index is removed and the previous ``GIT_INDEX_FILE`` value
+    restored on **every** exit path (success, gate failure, fix-loop abort,
+    exception), and the real index is never written: a failed gate leaves no
+    residual staging (F5, SA-0MVQHVCRE0070YO6).
+
+    Raises:
+        RuntimeError: when the index cannot be prepared or the change set
+            cannot be staged — with no temporary index and no environment
+            change left behind.
+    """
+    global _gate_index_global
+
+    git_dir = Path(_git_absolute_git_dir(cwd))
+    real_index = git_dir / "index"
+    fd, index_path = tempfile.mkstemp(
+        prefix=GATE_INDEX_PREFIX, suffix=GATE_INDEX_SUFFIX, dir=str(git_dir)
+    )
+    os.close(fd)
+    _gate_index_global = index_path
+    previous_index_env = os.environ.get("GIT_INDEX_FILE")
+    try:
+        if real_index.exists():
+            shutil.copyfile(real_index, index_path)
+        else:
+            read_tree = _run_git_plumbing(
+                cwd, ["read-tree", "HEAD"], index_file=index_path
+            )
+            if read_tree.returncode != 0:
+                raise RuntimeError(
+                    "Cannot seed the finish gate's temporary index from "
+                    f"HEAD: {read_tree.stderr.strip() or 'git read-tree failed'}"
+                )
+
+        add = _run_git_plumbing(cwd, ["add", "-A"], index_file=index_path)
+        if add.returncode != 0:
+            raise RuntimeError(
+                "Cannot stage the change set in the finish gate's temporary "
+                f"index: {add.stderr.strip() or 'git add -A failed'}"
+            )
+
+        write_tree = _run_git_plumbing(cwd, ["write-tree"], index_file=index_path)
+        if write_tree.returncode != 0 or not write_tree.stdout.strip():
+            raise RuntimeError(
+                "Cannot compute the would-be-commit tree of the finish gate's "
+                f"temporary index: "
+                f"{write_tree.stderr.strip() or 'git write-tree failed'}"
+            )
+
+        staged = _run_git_plumbing(
+            cwd,
+            ["diff", "--cached", "--name-only", "HEAD"],
+            index_file=index_path,
+        )
+
+        os.environ["GIT_INDEX_FILE"] = index_path
+        LOG.info(
+            "Finish gate: testing the would-be-commit tree %s "
+            "(temporary index %s)",
+            write_tree.stdout.strip(),
+            index_path,
+        )
+
+        yield WouldBeCommitIndex(
+            worktree=cwd,
+            index_path=index_path,
+            real_index=str(real_index),
+            tree=write_tree.stdout.strip(),
+            staged_paths=[
+                line.strip() for line in staged.stdout.splitlines() if line.strip()
+            ],
+        )
+    finally:
+        if previous_index_env is None:
+            os.environ.pop("GIT_INDEX_FILE", None)
+        else:
+            os.environ["GIT_INDEX_FILE"] = previous_index_env
+        _remove_gate_index(index_path)
+        _gate_index_global = None
+
+
+def run_gate_suite(
+    cwd: str, scope: str = "changed", base_ref: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the finish gate's suite against the would-be-commit tree.
+
+    Returns ``(test_result, summary)``: the normal ``run_tests`` result and the
+    temp-index summary (recorded under ``steps.would_be_commit``). When the
+    suite mutated the temporary index the verdict is invalid — a test staged
+    into the inherited ``GIT_INDEX_FILE`` instead of its own repository's
+    index — so the result is forced red with an explanatory notice rather than
+    being attributed to a tree that was never the one tested.
+
+    *cwd* outside a git work tree has no would-be-commit tree to verify: the
+    suite runs plainly and the summary reports ``available: False`` with the
+    stable ``not_a_git_worktree`` reason (SA-0MVVKJGKP003QVNM).
+
+    Verdict provenance (SA-0MVQHVJEX0071R7G): the returned ``test_result``
+    carries ``tree`` (the absolute worktree path the suite ran in) and
+    ``git_fingerprint`` (the would-be-commit tree SHA the verdict is bound to),
+    alongside the ``cached``/``cache_entry`` provenance the suite run reported.
+    Every verdict therefore states both *which tree* it belongs to, whether it
+    was produced or served, and (SA-0MVZE164P0048306 AC4) which composed
+    engine SHA it ran against (``composed_engine`` — the resolved submodule
+    checkout commit vs the gitlink ``HEAD`` records).
+
+    Returns:
+        Tuple of ``(test_result, summary)``; both carry ``composed_engine``
+        when the composition is resolvable, ``None`` outside a git work tree.
+    """
+    tested_tree = str(Path(cwd).resolve())
+    if not _is_git_worktree(cwd):
+        notice = (
+            "finish gate tree check unavailable: "
+            f"{cwd} is not inside a git work tree, so there is no "
+            "would-be-commit tree to verify; the suite ran against the "
+            "working tree as-is."
+        )
+        LOG.warning("Finish gate: %s", notice)
+        result = run_tests(cwd, scope=scope, base_ref=base_ref)
+        # Attribute the verdict to the directory the suite ran in: there is no
+        # would-be-commit tree to fingerprint outside a work tree.
+        result["tree"] = tested_tree
+        result["git_fingerprint"] = None
+        result["composed_engine"] = None
+        return result, {
+            "available": False,
+            "reason": "not_a_git_worktree",
+            "notice": notice,
+            "staged_paths": [],
+            "composed_engine": None,
+        }
+
+    with would_be_commit_index(cwd) as gate_index:
+        # Bind verdict acceptance to the would-be-commit tree: the cache key
+        # is the tree SHA, so a verdict recorded for any other tree (or a
+        # legacy entry without provenance) misses and the suite really runs
+        # (SA-0MVQHVHXI007PQAB).
+        composed_engine = _composed_engine_state(cwd, gate_index.tree)
+        result = run_tests(
+            cwd, scope=scope, base_ref=base_ref, fingerprint=gate_index.tree
+        )
+        integrity = gate_index.verify_unchanged()
+        summary = gate_index.summary()
+
+    summary["index_unchanged"] = integrity["unchanged"]
+    summary["composed_engine"] = composed_engine
+    # Attribute the verdict to the tree it was bound to: the absolute worktree
+    # the suite ran in and the would-be-commit tree SHA its cache key used
+    # (SA-0MVQHVJEX0071R7G). Recorded on the run result in place so callers
+    # keep the result object the suite returned. The composed engine SHA is
+    # the composition the suite actually ran against (SA-0MVZE164P0048306
+    # AC4).
+    result["tree"] = tested_tree
+    result["git_fingerprint"] = gate_index.tree
+    result["composed_engine"] = composed_engine
+    if integrity["unchanged"]:
+        return result, summary
+
+    notice = (
+        "gate evidence invalid: the temporary index changed while the suite "
+        f"ran (tested tree {integrity['expected']}, index now "
+        f"{integrity['tree'] or 'unreadable'}). A test staged into the "
+        "inherited GIT_INDEX_FILE instead of its own repository's index; the "
+        "verdict cannot be attributed to the would-be-commit tree. Fixture "
+        "git commands must use a hermetic environment (for example "
+        "shared.git_sandbox.fixture_git_env())."
+    )
+    LOG.error("Finish gate: %s", notice)
+    return (
+        {
+            **result,
+            "success": False,
+            "notices": [*(result.get("notices") or []), notice],
+        },
+        summary,
+    )
+
+
+def _gate_attempt_record(
+    attempt: int, test_result: dict[str, Any]
+) -> dict[str, Any]:
+    """One finish-gate test attempt, with the provenance of its verdict.
+
+    Every attempt records the tree the suite ran against (``tree``), the
+    would-be-commit tree SHA the verdict is bound to (``git_fingerprint``),
+    whether the verdict was served from the cache (``cached``, plus
+    ``cache_entry`` metadata — command / completed_at / scope — when it was)
+    and the composed engine SHA the suite ran against (``composed_engine``,
+    SA-0MVZE164P0048306 AC4). A green verdict is therefore self-describing: it
+    names the state whose suite ran, so a stale or foreign cached green cannot
+    be mistaken for it (SA-0MVQHVJEX0071R7G).
+    """
+    record: dict[str, Any] = {
+        "attempt": attempt,
+        "success": test_result["success"],
+        "failures": test_result.get("failures", []),
+        "skipped": test_result.get("skipped", False),
+        "tooling": test_result.get("tooling"),
+        "scope": test_result.get("scope", "changed"),
+        "tree": test_result.get("tree"),
+        "git_fingerprint": test_result.get("git_fingerprint"),
+        "cached": bool(test_result.get("cached", False)),
+        "composed_engine": test_result.get("composed_engine"),
+    }
+    entry = test_result.get("cache_entry")
+    if record["cached"] and entry:
+        record["cache_entry"] = dict(entry)
+    return record
+
+
+def _verdict_provenance_lines(report: dict[str, Any]) -> list[str]:
+    """Completion-comment lines describing the finish gate's verdict provenance.
+
+    The comment on the work item must carry what the JSON report carries: the
+    tree the accepted verdict belongs to, its would-be-commit fingerprint and
+    whether the suite ran for it or the verdict was served from the cache
+    (SA-0MVQHVJEX0071R7G).
+    """
+    attempts = list((report.get("steps") or {}).get("tests") or [])
+    if not attempts:
+        return ["- Test gate verdict: not recorded (no test step ran)"]
+    final = attempts[-1]
+    lines = [
+        "- Test gate verdict:",
+        f"  - Tree: {final.get('tree')}",
+        f"  - Fingerprint: {final.get('git_fingerprint')}",
+        f"  - Cached: {'true' if final.get('cached') else 'false'}",
+    ]
+    entry = final.get("cache_entry") or {}
+    if entry:
+        lines.append(
+            f"  - Cache entry: command {entry.get('command')}, "
+            f"completed_at {entry.get('completed_at')}, "
+            f"scope {entry.get('scope')}, "
+            f"fingerprint_kind {entry.get('fingerprint_kind')}"
+        )
+    # The composed engine SHA the accepted verdict's suite ran against
+    # (SA-0MVZE164P0048306 AC4): the resolved submodule checkout commit vs the
+    # gitlink ``HEAD`` records, so the green is attributable to a specific
+    # engine composition, not merely a tree.
+    composed = final.get("composed_engine") or {}
+    submodules = list(composed.get("submodules") or [])
+    if submodules:
+        for sub in submodules:
+            lines.append(
+                f"  - Composed engine: {sub.get('submodule')}@"
+                f"{sub.get('commit')} (recorded gitlink "
+                f"{sub.get('recorded_gitlink')} in "
+                f"{sub.get('source')}, "
+                "match: "
+                f"{'true' if sub.get('matches_recorded') else 'false'})"
+            )
+    else:
+        lines.append(
+            "  - Composed engine: none (the recorded tree has no submodule "
+            "composition)"
+        )
+    if len(attempts) > 1:
+        lines.append(f"  - Attempts: {len(attempts)}")
+    return lines
+
+
+def stage_tested_tree(cwd: str, tested_tree: str | None) -> dict[str, Any]:
+    """Stage the change set in the **real** index and prove it is the tested tree.
+
+    Called only once the gate is green: the change set is staged exactly as
+    :func:`git_commit` does (``git add -A``) and ``git write-tree`` is compared
+    with the tree the suite ran against, so a commit can never be created for
+    a tree the suite did not test. On a mismatch the just-staged change set is
+    unstaged again, leaving no residual staging (the F5 abort contract).
+
+    Returns a report dict with ``success``, ``tree``, ``expected`` and, on
+    failure, an actionable ``message``.
+    """
+    add = _run_git_plumbing(cwd, ["add", "-A"])
+    if add.returncode != 0:
+        return {
+            "success": False,
+            "expected": tested_tree,
+            "message": "Could not stage the change set in the real index: "
+            f"{add.stderr.strip() or 'git add -A failed'}",
+        }
+
+    write_tree = _run_git_plumbing(cwd, ["write-tree"])
+    if write_tree.returncode != 0 or not write_tree.stdout.strip():
+        return {
+            "success": False,
+            "expected": tested_tree,
+            "message": "Could not compute the committed tree: "
+            f"{write_tree.stderr.strip() or 'git write-tree failed'}",
+        }
+
+    actual = write_tree.stdout.strip()
+    if tested_tree and actual != tested_tree:
+        # Leave no residual staging: the gate refused this tree, so the real
+        # index must be as untouched as an aborted gate leaves it.
+        _run_git_plumbing(cwd, ["reset", "--quiet"])
+        return {
+            "success": False,
+            "expected": tested_tree,
+            "tree": actual,
+            "message": (
+                "The commit's tree does not match the tree the finish gate "
+                f"tested (tested {tested_tree}, would commit {actual}). The "
+                "change set was unstaged again and no commit was created; "
+                "re-run `implement.py finish` after investigating the tree "
+                "drift (a build step or a concurrent writer changed files "
+                "after the gate ran)."
+            ),
+        }
+    return {
+        "success": True,
+        "tree": actual,
+        "expected": tested_tree,
+        "verified": bool(tested_tree) and actual == tested_tree,
+    }
 
 
 def git_commit(cwd: str, message: str) -> bool:
@@ -1519,6 +3520,43 @@ class PushNonFastForwardError(RuntimeError):
         )
 
 
+class AncestryAssertionError(RuntimeError):
+    """Raised when finish's own commit did not reach the pushed dev tip.
+
+    Carries the commit hash (full and as reported), the remote-tracking ref it
+    was asserted against, and that ref's tip so the refusal message can name
+    every hash involved (SA-0MVPZG7A0000N66U AC2). A finish that raises this
+    must not report success and must not advance the work item to
+    ``in_review``.
+    """
+
+    def __init__(
+        self,
+        commit_hash: str,
+        resolved_commit: str | None,
+        target_ref: str,
+        target_tip: str | None,
+        reason: str,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.resolved_commit = resolved_commit
+        self.target_ref = target_ref
+        self.target_tip = target_tip
+        self.reason = reason
+        named = resolved_commit or commit_hash or "unknown"
+        super().__init__(
+            f"Ancestry assertion failed: commit {named} (reported as "
+            f"{commit_hash or 'unknown'}) is not verifiably on {target_ref} "
+            f"(tip {target_tip or 'unresolved'}): {reason}. finish did not "
+            f"publish this commit to origin/dev, so it must not report "
+            f"success. The worktree and the feature branch are retained for "
+            f"recovery; the work item is not advanced to in_review. "
+            f"Recovery: git log --oneline {target_ref}; then "
+            f"git push origin HEAD:refs/heads/dev from the worktree (rebase "
+            f"onto {target_ref} first if the push is rejected)."
+        )
+
+
 def _kill_process_group(pid: int) -> None:
     """Kill the entire process group rooted at *pid* (POSIX only).
 
@@ -1534,6 +3572,40 @@ def _kill_process_group(pid: int) -> None:
     except (ProcessLookupError, PermissionError, OSError):
         # The process may have already exited — best effort.
         pass
+
+
+#: The remote every framework push resolves through (SA-0MVX35ABT000I1PD AC1).
+#:
+#: Framework pushes ALWAYS use the configured remote **name** — never a path
+#: or ``.`` form — so ``git push -u`` can never record a self-referential
+#: upstream (``branch.<name>.remote = "."``) onto a long-lived branch and
+#: silently disable ``git pull`` on a worktree machine (SA-0MVX1M6HH004YPX2).
+PUSH_REMOTE_NAME = "origin"
+
+
+def _assert_remote_name_only(remote: str) -> None:
+    """Refuse a push remote that is not a plain remote name.
+
+    The write path that records the self-referential upstream defect is a
+    push whose remote is the **local path form** (``.`` — also reached via a
+    path or ``file://`` URL). A framework push must therefore never accept
+    anything except a plain configured remote name.
+
+    Args:
+        remote: The remote argument a framework push is about to use.
+
+    Raises:
+        RuntimeError: when *remote* is ``.``, a path or a URL — the shapes
+            that would make ``git push -u`` write ``branch.<name>.remote = .``.
+    """
+    if remote == "." or "/" in remote or ":" in remote or "://" in remote:
+        raise RuntimeError(
+            f"Refusing a framework push to non-remote-name {remote!r}: use the "
+            f"configured remote name {PUSH_REMOTE_NAME!r}. A path or '.' "
+            "remote would make `git push -u` record a self-referential "
+            "upstream (branch.<name>.remote = '.'), silently breaking "
+            "`git pull` — see SA-0MVX1M6HH004YPX2."
+        )
 
 
 def git_push_to_dev(
@@ -1564,11 +3636,19 @@ def git_push_to_dev(
     if timeout is None:
         timeout = _resolve_test_timeout(cwd)
 
+    # Remote-name-only rule (SA-0MVX35ABT000I1PD AC1): the push must always
+    # resolve through the configured remote name, never a path/'.' form —
+    # otherwise `git push -u` at a call site could record
+    # branch.<name>.remote = '.' and silently disable `git pull` on a
+    # worktree machine (SA-0MVX1M6HH004YPX2). The guard runs on every push;
+    # the constant pins the name that carries dev-push integration.
+    _assert_remote_name_only(PUSH_REMOTE_NAME)
+
     # Spawn the push in its own process group so that a timeout kills the
     # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
     try:
         proc = subprocess.Popen(
-            ["git", "push", "origin", f"{branch}:refs/heads/dev"],
+            ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1690,6 +3770,60 @@ def _get_repo_root(cwd: str | None = None) -> str | None:
         if git_marker.is_dir() or git_marker.is_file():
             return main_root.as_posix()
     return toplevel.as_posix()
+
+
+def _resolve_main_repo_root(
+    worktree_path: str | None = None,
+    state: ImplementState | None = None,
+) -> str:
+    """Resolve the MAIN checkout root for a worktree-scoped phase.
+
+    The implement state file's ``repo_root`` is authoritative **except** when
+    it points at the worktree itself or somewhere inside it: that is stale
+    state written by ``phase_start`` when it resumed from inside a linked
+    worktree, and trusting it makes ``phase_finish`` refuse to remove "the
+    repository root" and ``phase_abort`` restore the wrong checkout
+    (MS-0MVM7NJF70037YU4).
+
+    A stale value is rejected with a WARNING naming both the rejected and the
+    derived value, then the main root is derived from *worktree_path* via
+    :func:`_get_repo_root` (which resolves ``--git-common-dir``'s parent),
+    falling back to discovery from the current directory.
+
+    Args:
+        worktree_path: Absolute path to the phase's worktree, if known.
+        state: The implement state read for this worktree, if available.
+
+    Returns:
+        Absolute main checkout root — never the worktree or a path inside it
+        (unless the worktree *is* the main checkout, which the callers'
+        removal safety gates then refuse on their own terms).
+    """
+    worktree = Path(worktree_path).resolve() if worktree_path else None
+
+    def _inside_worktree(candidate: str) -> bool:
+        if worktree is None:
+            return False
+        resolved = Path(candidate).resolve()
+        return resolved == worktree or worktree in resolved.parents
+
+    stated = (state.repo_root if state else "") or ""
+    if stated and not _inside_worktree(stated):
+        return str(Path(stated).resolve())
+
+    derived = (
+        (_get_repo_root(str(worktree)) if worktree else None)
+        or _get_repo_root()
+        or str(Path.cwd().resolve())
+    )
+    if stated:
+        LOG.warning(
+            "Ignoring stale state repo_root=%s (it is the worktree or inside "
+            "it); using the main checkout root %s instead.",
+            stated,
+            derived,
+        )
+    return derived
 
 
 def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> bool:
@@ -1927,6 +4061,65 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
         return False
 
 
+def _should_defer_worktree_removal(
+    keep_worktree: bool = False,
+) -> tuple[bool, str]:
+    """Whether this process must leave the worktree in place.
+
+    One predicate, one owner per worktree (SA-0MVTE8XAJ002IUDR):
+
+    - **driven child session** (``IMPLEMENT_DRIVE_ACTIVE=1``) — the worktree
+      is the session's cwd; ``implement.py drive`` removes it once that
+      session has actually exited. Reason token: ``driven-session``.
+    - **explicit opt-in** — ``IMPLEMENT_KEEP_WORKTREE=1`` or the parsed
+      ``--keep-worktree`` flag defer removal for any session; the caller (the
+      session itself, or an operator cleanup pass) owns the removal.
+      Reason tokens: ``keep-worktree-env`` / ``keep-worktree-flag``.
+    - **everything else** — ``finish``/``abort`` remove the tree exactly as
+      before (``deferred`` is ``False`` and the reason is empty).
+
+    Precedence is fixed and stable (driven > env > flag) so the reason token
+    is deterministic when switches are combined; combining them is
+    idempotent — the tree is deferred once, never twice.
+
+    Args:
+        keep_worktree: The parsed ``--keep-worktree`` flag.
+
+    Returns:
+        ``(deferred, reason)`` — ``reason`` is a stable token, empty when the
+        removal should proceed.
+    """
+    if os.environ.get(DRIVE_RECURSION_ENV) == "1":
+        return True, "driven-session"
+    if os.environ.get(KEEP_WORKTREE_ENV) == "1":
+        return True, "keep-worktree-env"
+    if keep_worktree:
+        return True, "keep-worktree-flag"
+    return False, ""
+
+
+def _worktree_cleanup_command(work_item_id: str) -> str:
+    """The exact follow-up command that removes a retained worktree.
+
+    One source of truth for the deferred-removal surface (completion comment,
+    JSON report and human output) of a **plain leaf** session that opted in
+    with ``finish --keep-worktree`` / ``IMPLEMENT_KEEP_WORKTREE=1``
+    (SA-0MVTHJ3PJ000IVSK AC2). The command is the reviewed ``cleanup`` action
+    — never a raw ``git worktree remove`` — so the retained tree is removed
+    behind the shared safety gates (terminal item, clean tree, worktree not
+    main checkout), and re-running it is a reported no-op.
+
+    Args:
+        work_item_id: The work item that owns the retained worktree.
+
+    Returns:
+        A copy-pasteable command string.
+    """
+    return (
+        f"python3 skill/implement/scripts/implement.py cleanup {work_item_id}"
+    )
+
+
 def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
     """Remove a worktree directory gracefully.
 
@@ -2023,6 +4216,12 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
 
 def _restore_repo_state(repo_root: str) -> None:
     """Restore the repo to the dev branch.
+
+    Deliberately **outside** the per-repository lock: this runs on the abort
+    path (signal handler / crash cleanup), where the process may already hold
+    the lock — a second ``flock`` on a new descriptor would fail against its
+    own hold and skip the restore. A dying process releases the lock itself
+    (kernel-guaranteed), so no other run can be interleaving at this point.
 
     Args:
         repo_root: Path to the repo root.
@@ -2182,7 +4381,738 @@ def _sync_parent_branch(
             return result
 
     result["method"] = "synced"
+    result["target"] = remote_parent_ref
     LOG.info("Synced parent branch %s to origin/%s", parent_branch, parent_branch)
+    return result
+
+
+def _sync_parent_branch_locked(
+    repo_root: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    work_item_id: str = "",
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Sync the local parent branch while holding the per-repository lock.
+
+    ``phase_start`` refreshes the parent branch before forking a worktree, and
+    that refresh fast-forwards the **shared** local parent ref — the very ref a
+    concurrent ``finish`` moves inside its locked commit → fast-forward → push
+    → sync window. Taking the same per-repository lock keeps the two windows
+    from interleaving (SA-0MVPZG3IQ009IJMO): a refresh that ran between a
+    finish's local fast-forward and its push could move the shared ref and make
+    the finish's own fast-forward fail, or leave the shared ref pointing at an
+    unpublished commit.
+
+    **Fail-open by design.** ``start`` must never be blocked or failed by a
+    concurrent finish, so a held lock is waited on only up to *timeout*
+    (default :data:`DEFAULT_START_LOCK_TIMEOUT`, env
+    ``IMPLEMENT_START_LOCK_TIMEOUT``) and then the refresh is skipped with a
+    logged warning — the local branch is still a perfectly usable base.
+
+    Args:
+        repo_root: Path to the main checkout (where the shared ref lives).
+        parent_branch: Parent branch to sync (default ``dev``).
+        work_item_id: Work item this run belongs to (named in refusal text).
+        timeout: Bounded wait for the lock; ``None`` resolves the default.
+
+    Returns:
+        The :func:`_sync_parent_branch` result, plus a ``lock`` sub-dict
+        describing the acquisition. On a held lock: ``method="skipped"``,
+        ``success=True``, ``reason="lock_held"``.
+    """
+    if timeout is None:
+        timeout = _start_lock_timeout()
+    lock_fd, refusal = acquire_main_checkout_lock(
+        repo_root, work_item_id, timeout=timeout
+    )
+    lock_report = {
+        "lock_path": str(_main_checkout_lock_path(repo_root)),
+        "acquired": lock_fd is not None,
+        "timeout_seconds": timeout,
+        "holder": refusal if lock_fd is None else None,
+    }
+    if lock_fd is None:
+        result: dict[str, Any] = {
+            "method": "skipped",
+            "success": True,
+            "reason": "lock_held",
+            "lock": lock_report,
+            "warning": (
+                f"Skipped refreshing parent branch {parent_branch}: a "
+                f"concurrent run holds the repository lock "
+                f"({lock_report['lock_path']}). {refusal}"
+            ),
+        }
+        LOG.info("%s", result["warning"])
+        return result
+    try:
+        result = _sync_parent_branch(repo_root, parent_branch)
+    finally:
+        _release_main_checkout_lock(lock_fd)
+    result["lock"] = lock_report
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Verified, reversible local-dev sync + post-push ancestry assertion
+# (SA-0MVPZG7A0000N66U, parent SA-0MVNQURZM001TKJY AC1/AC2)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_full_commit(cwd: str, rev: str) -> str | None:
+    """Full 40-character commit hash for *rev* in *cwd*, or ``None``.
+
+    Ref-membership decisions are never taken on an abbreviated hash:
+    ``git_get_commit_hash`` returns a short hash (fine to display, unsafe to
+    assert with), so every ancestry check resolves the commit to its full
+    object name first.
+    """
+    if not rev:
+        return None
+    result = run_cmd(
+        ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
+        cwd=cwd,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _resolve_origin_parent_tip(
+    repo_root: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> str | None:
+    """Full hash of ``refs/remotes/origin/<parent_branch>``, or ``None``."""
+    return _resolve_full_commit(
+        repo_root, f"refs/remotes/origin/{parent_branch}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Finish-failure classification vocabulary (LP-0MVWEP1MM0097RAT)
+# ---------------------------------------------------------------------------
+#
+# The single, table-driven classifier that turns a failing ``finish``
+# subprocess report into ``{kind, step, reason, message}`` so
+# ``phase_drive`` can tell a transient infrastructure refusal from a genuine
+# gate failure (parent epic LP-0MVVYQ1U3006GDWT AC1). The constants live
+# BESIDE the emitters (``_fast_forward_local_dev_for_push`` and
+# ``phase_finish``) intentionally:
+#
+# **Drift rule** — every ``(step, reason)`` pair the shipped ``finish`` code
+# can emit must be listed in the vocabulary below in the same commit that
+# introduces it (a new ``_refuse`` reason or failure exit that is not listed
+# silently classifies as ``unknown`` — fail-safe, never ``infrastructure``,
+# but hidden from the operator). The table test in
+# ``tests/test_implement_drive_recovery.py`` enumerates the emitted pairs
+# against this vocabulary.
+
+#: The three failure kinds :func:`classify_finish_failure` can return.
+FINISH_FAILURE_KINDS: tuple[str, ...] = (
+    "infrastructure",
+    "gate",
+    "unknown",
+)
+
+#: Wildcard reason matched against :data:`FINISH_GATE_REFUSALS`: an entry
+#: ``("step", "*")`` classifies as ``gate`` for any reason under that step
+#: (e.g. ``("worktree_placement", "*")`` — the placement violation is a
+#: gate failure regardless of the specific reason the exit records).
+FINISH_REASON_WILDCARD = "*"
+
+#: Allow-list of ``(step, reason)`` pairs classified as **infrastructure** —
+#: transient refusals that self-clear (a concurrent session's fast-forward,
+#: a held main-checkout lock, a dropped push connection, a failed ancestry
+#: assertion) and are retried by drive on a separate budget instead of
+#: consuming the finish-attempt gate bound (parent epic LP-0MVVYQ1U3006GDWT
+#: Assumptions).
+FINISH_INFRA_REFUSALS: frozenset[tuple[str, str]] = frozenset({
+    ("local_dev_fast_forward", "local_dev_diverged"),
+    ("local_dev_fast_forward", "commit_not_based_on_remote_tip"),
+    ("local_dev_fast_forward", "fetch_failed"),
+    ("local_dev_fast_forward", "checkout_failed"),
+    ("local_dev_fast_forward", "no_remote_tracking_ref"),
+    ("main_checkout_lock", "lock_held"),
+    ("main_checkout_guard", "fail"),
+    ("push", "timeout"),
+    ("push", "connection_closed"),
+    ("push", "transport"),
+    ("ancestry_assertion", "ancestry_failed"),
+})
+
+#: Explicit ``(step, reason)`` pairs classified as **gate** failures —
+#: genuine failures that consume the finish-attempt budget and are never
+#: retried as infrastructure. Recorded for documentation/consistency AND
+#: used by the classifier; anything not listed in either set is
+#: ``unknown`` (fail-safe). A ``FINISH_REASON_WILDCARD`` entry matches any
+#: reason under the step.
+FINISH_GATE_REFUSALS: frozenset[tuple[str, str]] = frozenset({
+    ("tests", "tests_failed"),
+    ("build", "build_failed"),
+    ("build_churn", FINISH_REASON_WILDCARD),
+    ("worktree_placement", FINISH_REASON_WILDCARD),
+    ("diff", "no_changes"),
+})
+
+#: Consultation order for the structured ``steps`` payload of a failing
+#: ``finish`` report. When several steps failed, the first in this order is
+#: the primary cause; the mandated prefix (``main_checkout_lock`` → … →
+#: ``ancestry_assertion``) is followed by the two vocabulary steps that
+#: return before the lock step (``worktree_placement``, ``diff``).
+FINISH_STEP_PRECEDENCE: tuple[str, ...] = (
+    "main_checkout_lock",
+    "main_checkout_guard",
+    "local_dev_fast_forward",
+    "push",
+    "build",
+    "build_churn",
+    "tests",
+    "ancestry_assertion",
+    "worktree_placement",
+    "diff",
+)
+
+
+def _failing_step_reason(step: str, entry: Any) -> Any | None:
+    """Extract the reason code of a failing *entry*, or ``None`` when pass.
+
+    Each ``finish`` step records its outcome in a different shape;
+    this maps every shape onto a stable ``(step, reason)`` pair so the
+    classifier never parses ``report["message"]`` prose
+    (LP-0MVWEP1MM0097RAT AC5).
+    """
+    if step == "tests":
+        # The tests step is a list of per-attempt gate records.
+        attempts = entry if isinstance(entry, list) else []
+        if any(
+            isinstance(a, dict) and a.get("success") is False
+            for a in attempts
+        ):
+            return "tests_failed"
+        return None
+    if not isinstance(entry, dict):
+        return None
+    if step == "main_checkout_lock":
+        return "lock_held" if entry.get("acquired") is False else None
+    if step == "main_checkout_guard":
+        return "fail" if entry.get("verdict") == "fail" else None
+    if step == "local_dev_fast_forward":
+        if entry.get("method") == "refused":
+            return entry.get("reason") or "refused"
+        return None
+    if step == "diff":
+        if entry.get("success") is False:
+            return entry.get("reason") or "no_changes"
+        return None
+    # Generic shape: build / push / ancestry_assertion / worktree_placement.
+    if entry.get("success") is False:
+        return entry.get("reason") or f"{step}_failed"
+    return None
+
+
+def _first_failing_step(steps: Any) -> tuple[str, Any] | None:
+    """Return the first failing ``(step, reason)`` in precedence order.
+
+    A step "fails" when its structured entry records a non-passing outcome
+    (``acquired: False`` for the lock, ``verdict: "fail"`` for the guard,
+    ``method: "refused"`` for the fast-forward, ``success: False`` for the
+    rest). Returns ``None`` when no precedence step fails — the report then
+    classifies as ``unknown`` (fail-safe).
+    """
+    if not isinstance(steps, dict):
+        return None
+    for step in FINISH_STEP_PRECEDENCE:
+        entry = steps.get(step)
+        if entry is None:
+            continue
+        reason = _failing_step_reason(step, entry)
+        if reason is not None:
+            return step, reason
+    return None
+
+
+def _finish_failure_kind(step: str, reason: Any) -> str:
+    """Map a resolved ``(step, reason)`` onto a failure kind.
+
+    Allow-list driven: ``infrastructure`` for an explicit infra allow-list
+    hit, ``gate`` for an explicit gate-list hit (a wildcard reason matches
+    any reason under the step), otherwise ``unknown`` — an unlisted pair is
+    never ``infrastructure`` (parent epic LP-0MVVYQ1U3006GDWT AC1).
+    """
+    pair = (step, str(reason))
+    if pair in FINISH_INFRA_REFUSALS:
+        return "infrastructure"
+    if pair in FINISH_GATE_REFUSALS or (
+        step, FINISH_REASON_WILDCARD,
+    ) in FINISH_GATE_REFUSALS:
+        return "gate"
+    return "unknown"
+
+
+def classify_finish_failure(
+    finish_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Classify a failing ``finish`` subprocess report into a failure kind.
+
+    The single, table-driven classifier for ``finish`` failures (parent epic
+    LP-0MVVYQ1U3006GDWT AC1). It turns the structured ``steps`` payload of
+    a failed ``finish`` report into ``{kind, step, reason, message}`` so
+    ``phase_drive`` can tell a transient infrastructure refusal from a
+    genuine gate failure without excavating subprocess stdout.
+
+    Resolution rules:
+
+    * ``(step, reason)`` is resolved from the report's structured ``steps``
+      entries in :data:`FINISH_STEP_PRECEDENCE` order — never from
+      ``report["message"]`` prose;
+    * ``kind == "infrastructure"`` only for an explicit allow-list hit in
+      :data:`FINISH_INFRA_REFUSALS`;
+    * ``kind == "gate"`` only for an explicit :data:`FINISH_GATE_REFUSALS`
+      hit (a ``("step", "*")`` entry is a wildcard matching any reason
+      under that step);
+    * anything else — including ``None``, ``{}`` and non-dict input — is
+      ``kind == "unknown"`` (fail-safe: ``unknown`` is never
+      ``infrastructure``, so drive can never retry a genuine gate failure
+      as infrastructure).
+
+    Args:
+        finish_report: The parsed ``finish`` subprocess JSON report, or
+            ``None`` when no report could be parsed.
+
+    Returns:
+        ``{"kind", "step", "reason", "message", "steps"}`` where
+        ``step``/``reason`` are ``None`` when no structured failing step
+        resolves and ``steps`` is the failing report's raw ``steps`` payload
+        (so a consumer can surface the main-checkout lock holder and guard
+        evidence — LP-0MVWEP37K000JU0O AC2).
+    """
+    fail_safe: dict[str, Any] = {
+        "kind": "unknown",
+        "step": None,
+        "reason": None,
+        "message": None,
+        "steps": None,
+    }
+    if not isinstance(finish_report, dict):
+        return dict(fail_safe)
+    message = finish_report.get("message")
+    resolved = _first_failing_step(finish_report.get("steps"))
+    if resolved is None:
+        return {**fail_safe, "message": message}
+    step, reason = resolved
+    return {
+        "kind": _finish_failure_kind(step, reason),
+        "step": step,
+        "reason": reason,
+        "message": message,
+        "steps": finish_report.get("steps"),
+    }
+
+
+def _fast_forward_local_dev_for_push(
+    repo_root: str,
+    commit_hash: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any]:
+    """Advance the main checkout's local parent branch to *commit_hash*.
+
+    The pre-push fast-forward exists so the dev-push integration gate measures
+    the **main checkout** with the new files already present (commits touching
+    ``AGENTS.md`` and friends would otherwise be rejected against a stale
+    checkout — SA-0MVECQUGF0064U81). The advance is therefore inherently
+    unverified: the commit is by definition not on ``origin/<parent_branch>``
+    yet. Instead of the previous silent best-effort (a broad ``except`` that
+    disabled the whole fast-forward), it is made **loud and reversible**:
+
+    * local ``dev`` is only ever advanced with ``git merge --ff-only`` — its
+      history is never rewritten;
+    * the pre-advance tip is returned as ``pre_advance_tip`` so a failed push
+      can restore local ``dev`` to ``refs/remotes/origin/<parent_branch>``
+      (:func:`_restore_local_dev_after_failed_push`);
+    * when the advance is impossible — local ``dev`` has diverged from the
+      remote tip, or the commit is not based on the current remote tip (a
+      sibling landed first) — the helper **refuses loudly**, naming the refs
+      and hashes, and leaves local ``dev`` at ``origin/<parent_branch>``;
+    * it never fails the finish: the push (with its rebase-and-retry
+      recovery) and the post-push ancestry assertion
+      (:func:`_assert_commit_on_origin_dev`) remain authoritative.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        commit_hash: The commit finish is about to push.
+        parent_branch: The shared parent branch (default: ``dev``).
+
+    Returns:
+        Dict with ``method`` (``advanced`` | ``refused``), ``success``
+        (always ``True`` — a refusal never fails a finish), ``advanced``,
+        ``advanced_to`` / ``pre_advance_tip`` when advanced, ``local_tip``,
+        ``remote_tip``, ``own_churn`` and, on refusal, ``reason`` +
+        ``warning``.
+    """
+    result: dict[str, Any] = {
+        "method": "none",
+        "success": True,
+        "advanced": False,
+        "commit": commit_hash,
+        "own_churn": [],
+    }
+    remote_ref = f"refs/remotes/origin/{parent_branch}"
+
+    def _refuse(reason: str, warning: str) -> dict[str, Any]:
+        result["method"] = "refused"
+        result["reason"] = reason
+        result["warning"] = warning
+        LOG.warning("%s", warning)
+        return result
+
+    # 0. Capture the pre-fast-forward HEAD so the main-checkout guard can
+    #    attribute the fast-forward's own file churn.
+    before_head_result = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_root)
+    before_head = (
+        before_head_result.stdout.strip()
+        if before_head_result.returncode == 0
+        else ""
+    )
+
+    # 1. Refresh the remote-tracking ref the advance is measured against.
+    #    Without it the remote tip cannot be verified, so no advance happens.
+    fetch_result = run_cmd(
+        ["git", "fetch", "origin", parent_branch],
+        cwd=repo_root,
+        check=False,
+        timeout=120,
+    )
+    if fetch_result.returncode != 0:
+        return _refuse(
+            "fetch_failed",
+            f"Refusing to advance local {parent_branch}: git fetch origin "
+            f"{parent_branch} failed, so the remote tip cannot be verified "
+            f"({fetch_result.stderr.strip()[:200]}). The push proceeds from "
+            f"the current checkout; commit {commit_hash} is verified against "
+            f"{remote_ref} after the push.",
+        )
+    remote_tip = _resolve_origin_parent_tip(repo_root, parent_branch)
+    result["remote_tip"] = remote_tip
+    if not remote_tip:
+        return _refuse(
+            "no_remote_tracking_ref",
+            f"Refusing to advance local {parent_branch}: {remote_ref} does "
+            f"not resolve after a successful fetch. The push proceeds; "
+            f"commit {commit_hash} is verified after it.",
+        )
+
+    # 2. Ensure the main checkout is on the parent branch: the pre-push gate
+    #    measures this working tree, so the new files must be checked out.
+    checkout_result = run_cmd(
+        ["git", "checkout", parent_branch], cwd=repo_root, check=False
+    )
+    if checkout_result.returncode != 0:
+        return _refuse(
+            "checkout_failed",
+            f"Refusing to advance local {parent_branch}: git checkout "
+            f"{parent_branch} failed in {repo_root} "
+            f"({checkout_result.stderr.strip()[:200]}). The push proceeds "
+            f"from the current checkout; commit {commit_hash} is verified "
+            f"after the push.",
+        )
+    local_tip = _resolve_full_commit(repo_root, f"refs/heads/{parent_branch}")
+    result["local_tip"] = local_tip
+
+    # 2b. A local branch that already carries commits origin/dev does not have
+    #     has moved since this worktree's base. Merging the remote ref into it
+    #     would be a silent no-op (the remote tip is an ancestor), leaving the
+    #     shared branch ahead of the remote and making the finish commit
+    #     impossible to fast-forward onto — so refuse loudly *before*
+    #     touching anything (AC1).
+    if local_tip and remote_tip and local_tip != remote_tip:
+        local_ahead_result = run_cmd(
+            ["git", "merge-base", "--is-ancestor", remote_tip, local_tip],
+            cwd=repo_root,
+            check=False,
+        )
+        if local_ahead_result.returncode == 0:
+            return _refuse(
+                "local_dev_diverged",
+                f"Refusing to advance local {parent_branch}: it has moved "
+                f"since the worktree base and carries commits {remote_ref} "
+                f"does not have (local={local_tip}, origin={remote_tip}). "
+                f"Local {parent_branch} is left untouched; commit "
+                f"{commit_hash} is pushed from the feature branch and "
+                f"verified against {remote_ref} after the push.",
+            )
+
+    # 3. Fast-forward local dev to origin/dev only (never rewrite history).
+    merge_origin_result = run_cmd(
+        ["git", "merge", "--ff-only", remote_ref], cwd=repo_root, check=False
+    )
+    if merge_origin_result.returncode != 0:
+        return _refuse(
+            "local_dev_diverged",
+            f"Refusing to advance local {parent_branch}: it has moved since "
+            f"the worktree base and cannot be fast-forwarded to "
+            f"{remote_ref} (local={local_tip}, origin={remote_tip}) "
+            f"({merge_origin_result.stderr.strip()[:200]}). Local "
+            f"{parent_branch} is left untouched; commit {commit_hash} is "
+            f"pushed from the feature branch and verified against "
+            f"{remote_ref} after the push.",
+        )
+
+    # 4. Fast-forward local dev onto the finish commit.
+    merge_commit_result = run_cmd(
+        ["git", "merge", "--ff-only", commit_hash],
+        cwd=repo_root,
+        check=False,
+    )
+    if merge_commit_result.returncode != 0:
+        return _refuse(
+            "commit_not_based_on_remote_tip",
+            f"Refusing to advance local {parent_branch} to {commit_hash}: the "
+            f"commit is not a descendant of {remote_ref} ({remote_tip}) — "
+            f"local {parent_branch} has moved since this worktree's base "
+            f"({merge_commit_result.stderr.strip()[:200]}). Local "
+            f"{parent_branch} stays at {remote_tip}; the push will land or "
+            f"fail non-fast-forward and be rebased, and the post-push "
+            f"ancestry assertion decides success.",
+        )
+
+    result["method"] = "advanced"
+    result["advanced"] = True
+    result["pre_advance_tip"] = local_tip
+    result["advanced_to"] = _resolve_full_commit(repo_root, commit_hash)
+    # The fast-forward's own file churn is expected — record it so the
+    # main-checkout guard never aborts on it (WL-0MVPADZ1Z000FOSG AC3/AC4).
+    result["own_churn"] = _record_finish_own_churn(
+        repo_root, before_head, commit_hash
+    )
+    LOG.info(
+        "Fast-forwarded local %s to %s (was %s)",
+        parent_branch,
+        commit_hash,
+        local_tip,
+    )
+    return result
+
+
+def _restore_local_dev_after_failed_push(
+    repo_root: str,
+    fast_forward: dict[str, Any] | None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any]:
+    """Undo finish's own pre-push fast-forward after a failed push (AC1).
+
+    Invariant: local ``dev`` must never be left pointing at an unpushed finish
+    commit after a failed push. Otherwise the next child worktree forks from a
+    base that ``origin/dev`` does not have and the commit is silently orphaned
+    (the 2026-10-25 incident). The restore is deliberately conservative:
+
+    * the target is ``refs/remotes/origin/<parent>`` — a commit known to be on
+      the remote (never a locally-created commit);
+    * only finish's **own** advance is undone: when the branch has moved since
+      (another session, or the operator) nothing is touched and the refusal is
+      reported loudly;
+    * when the branch is checked out, ``git reset --merge`` is used so
+      uncommitted work in the shared checkout survives — never
+      ``reset --hard``; if a local modification overlaps the commit being
+      undone the reset is skipped and reported loudly;
+    * when the branch is not checked out, the ref is moved with an atomic
+      compare-and-swap ``git update-ref``.
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        fast_forward: The :func:`_fast_forward_local_dev_for_push` result.
+        parent_branch: The shared parent branch (default: ``dev``).
+
+    Returns:
+        Dict recording what happened (``restored``, ``target``, ``reason``,
+        hashes and an optional loud ``warning``).
+    """
+    result: dict[str, Any] = {
+        "restored": False,
+        "success": True,
+        "target": f"refs/remotes/origin/{parent_branch}",
+    }
+    if not fast_forward or not fast_forward.get("advanced"):
+        result["reason"] = "no_advance_to_undo"
+        return result
+
+    advanced_to = _resolve_full_commit(
+        repo_root, str(fast_forward.get("advanced_to") or fast_forward.get("commit"))
+    )
+    current = _resolve_full_commit(repo_root, f"refs/heads/{parent_branch}")
+    result["advanced_to"] = advanced_to
+    result["current"] = current
+    if advanced_to and current and current != advanced_to:
+        result["reason"] = "branch_moved_since_advance"
+        result["warning"] = (
+            f"Not restoring local {parent_branch}: it moved from the tip this "
+            f"finish advanced to ({advanced_to}) to {current}, so another "
+            f"actor owns that move and the shared checkout is left untouched."
+        )
+        LOG.warning("%s", result["warning"])
+        return result
+
+    target_tip = _resolve_origin_parent_tip(repo_root, parent_branch)
+    result["target_tip"] = target_tip
+    if not target_tip:
+        result["reason"] = "no_remote_tracking_ref"
+        result["warning"] = (
+            f"Cannot restore local {parent_branch}: {result['target']} does "
+            f"not resolve. Local {parent_branch} may still point at the "
+            f"unpushed commit {current or 'unknown'} — the next finish refuses "
+            f"to advance it and reports the divergence."
+        )
+        LOG.warning("%s", result["warning"])
+        return result
+    if current == target_tip:
+        result["restored"] = True
+        result["reason"] = "already_at_remote_tip"
+        return result
+
+    head_result = run_cmd(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_root, check=False
+    )
+    on_parent_branch = (
+        head_result.returncode == 0
+        and head_result.stdout.strip() == parent_branch
+    )
+    if on_parent_branch:
+        # ``--merge`` resets the index/worktree for the files our own advance
+        # touched and keeps every other uncommitted change; it aborts rather
+        # than clobber a conflicting local modification (never ``--hard``).
+        reset_result = run_cmd(
+            ["git", "reset", "--merge", target_tip],
+            cwd=repo_root,
+            check=False,
+        )
+        if reset_result.returncode != 0:
+            result["reason"] = "reset_conflict"
+            result["warning"] = (
+                f"Cannot restore local {parent_branch} to {target_tip}: "
+                f"uncommitted changes in {repo_root} overlap the commit being "
+                f"undone ({reset_result.stderr.strip()[:200]}). Nothing was "
+                f"reset — the shared checkout keeps its uncommitted work; "
+                f"local {parent_branch} still points at {current}. Restore "
+                f"manually: git -C {repo_root} reset --merge {target_tip}"
+            )
+            LOG.warning("%s", result["warning"])
+            return result
+    else:
+        # Not checked out here: move the ref only, with an atomic
+        # compare-and-swap on the tip we created.
+        update_result = run_cmd(
+            [
+                "git",
+                "update-ref",
+                f"refs/heads/{parent_branch}",
+                target_tip,
+                current or "",
+            ],
+            cwd=repo_root,
+            check=False,
+        )
+        if update_result.returncode != 0:
+            result["reason"] = "update_ref_failed"
+            result["warning"] = (
+                f"Cannot restore local {parent_branch} to {target_tip}: "
+                f"git update-ref failed "
+                f"({update_result.stderr.strip()[:200]}). Local "
+                f"{parent_branch} still points at {current}."
+            )
+            LOG.warning("%s", result["warning"])
+            return result
+
+    result["restored"] = True
+    LOG.info(
+        "Restored local %s to %s after the failed push (was %s)",
+        parent_branch,
+        target_tip,
+        current,
+    )
+    return result
+
+
+def _assert_commit_on_origin_dev(
+    repo_root: str,
+    commit_hash: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    branch: str | None = None,
+    worktree_path: str | None = None,
+) -> dict[str, Any]:
+    """Assert finish's own commit is on the pushed ``origin/<parent>`` (AC2).
+
+    The assertion fails **closed**: ``finish`` may only report success when
+    ``git merge-base --is-ancestor <commit> refs/remotes/origin/<parent>``
+    positively holds. A commit that was not published — including a rebased
+    replacement hash produced by non-fast-forward recovery — therefore can
+    never be reported as success (the 2026-10-25 orphan's false positive).
+
+    The remote-tracking ref is refreshed first (best effort: a push already
+    updates it, a fetch just makes the verdict independent of that).
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        commit_hash: The commit finish pushed (short or full hash).
+        parent_branch: The shared parent branch (default: ``dev``).
+        branch: Feature branch, for the refusal message only.
+        worktree_path: Retained worktree, for the refusal message only.
+
+    Returns:
+        Dict with ``verified``, ``commit``, ``resolved_commit``, ``target``,
+        ``origin_tip`` and ``fetched``.
+
+    Raises:
+        AncestryAssertionError: when the commit is not an ancestor of the
+            remote-tracking parent ref, or the check cannot be performed.
+    """
+    target_ref = f"refs/remotes/origin/{parent_branch}"
+    result: dict[str, Any] = {
+        "verified": False,
+        "commit": commit_hash,
+        "target": target_ref,
+        "branch": branch,
+        "worktree_path": worktree_path,
+    }
+    fetch_result = run_cmd(
+        ["git", "fetch", "origin", parent_branch],
+        cwd=repo_root,
+        check=False,
+        timeout=120,
+    )
+    result["fetched"] = fetch_result.returncode == 0
+
+    resolved = _resolve_full_commit(repo_root, commit_hash)
+    origin_tip = _resolve_origin_parent_tip(repo_root, parent_branch)
+    result["resolved_commit"] = resolved
+    result["origin_tip"] = origin_tip
+    if not resolved or not origin_tip:
+        raise AncestryAssertionError(
+            commit_hash,
+            resolved,
+            target_ref,
+            origin_tip,
+            "the commit or the remote-tracking ref could not be resolved, so "
+            "publication cannot be verified",
+        )
+
+    ancestor_result = run_cmd(
+        ["git", "merge-base", "--is-ancestor", resolved, target_ref],
+        cwd=repo_root,
+        check=False,
+    )
+    if ancestor_result.returncode != 0:
+        raise AncestryAssertionError(
+            commit_hash,
+            resolved,
+            target_ref,
+            origin_tip,
+            "git merge-base --is-ancestor reports the commit is not on the "
+            "remote branch",
+        )
+
+    result["verified"] = True
+    LOG.info(
+        "Ancestry verified: %s is on %s (%s)", resolved, target_ref, origin_tip
+    )
     return result
 
 
@@ -2709,7 +5639,49 @@ def _skip_test_result(message: str, tooling: str | None,
         "skipped": True,
         "tooling": tooling,
         "scope": scope,
+        "cached": False,
+        "cache_entries": [],
     }
+
+
+def _cache_entry_from_run(
+    run: dict[str, Any], command: str
+) -> dict[str, Any]:
+    """Reportable metadata of the cache entry a verdict was served from.
+
+    ``run`` is a ``run_cached`` result that was a cache hit. The mapping
+    carries the entry's ``command``, ``completed_at`` (epoch float), ``scope``
+    and ``fingerprint_kind`` so the finish report and the completion comment
+    can state *what* was reused, not merely that something was
+    (SA-0MVQHVJEX0071R7G).
+    """
+    return {
+        "command": run.get("command") or command,
+        "completed_at": run.get("completed_at", 0),
+        "scope": run.get("scope", "full"),
+        "fingerprint_kind": run.get("fingerprint_kind", ""),
+    }
+
+
+def _with_cache_provenance(
+    result: dict[str, Any],
+    *,
+    cached: bool,
+    entries: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Attach verdict provenance (cache flag + entry metadata) to *result*.
+
+    ``cached`` is True only when the whole verdict was served from the cache;
+    ``cache_entry`` then identifies the entry that was served (command,
+    completion time, scope, fingerprint kind) so a partially-scoped or foreign
+    entry can never masquerade as a fresh full-tree verdict
+    (SA-0MVQHVJEX0071R7G).
+    """
+    result["cached"] = bool(cached)
+    result["cache_entries"] = list(entries or [])
+    if cached and result["cache_entries"]:
+        result["cache_entry"] = result["cache_entries"][0]
+    return result
 
 
 def _finalize_test_result(result: dict[str, Any], tooling: str | None,
@@ -2752,6 +5724,7 @@ def _shell_command_runner(
         check=False,
         timeout=timeout,
         capture=True,
+        keep_git_index=True,
     )
 
 
@@ -2880,6 +5853,79 @@ def _guarded_output(guarded: dict[str, Any], key: str) -> str:
     return "\n".join(parts)
 
 
+def _gate_facts(
+    guarded: dict[str, Any], exit_code: int
+) -> dict[str, Any]:
+    """The infrastructure facts a ``guarded_run_all`` result carries.
+
+    Read from the aggregate when the runner reports them there and otherwise
+    from the first suite that has them, so a partial or older result still
+    contributes whatever it measured. ``signal`` is derived from a negative
+    exit code when the runner did not state it (a signal-terminated child is
+    ``returncode < 0`` — SA-0MVU8XRBQ000DG9D).
+
+    Args:
+        guarded: The ``guarded_run_all`` result.
+        exit_code: The resolved aggregate exit code.
+
+    Returns:
+        A mapping of the fact fields that are known (never ``None`` values, so
+        an unknown fact is absent rather than misleading).
+    """
+    facts: dict[str, Any] = {}
+    suites = guarded.get("suites") or {}
+    suite_results = (
+        [s for s in suites.values() if isinstance(s, dict)]
+        if isinstance(suites, dict)
+        else []
+    )
+
+    def _from_suites(field: str) -> Any:
+        for suite in suite_results:
+            value = suite.get(field)
+            if value is not None:
+                return value
+        return None
+
+    configured_timeout = guarded.get("configured_timeout")
+    if configured_timeout is None:
+        configured_timeout = _from_suites("configured_timeout")
+    if configured_timeout is not None:
+        facts["configured_timeout"] = configured_timeout
+
+    elapsed = guarded.get("elapsed_seconds")
+    if elapsed is None:
+        elapsed = guarded.get("elapsed_seconds_total")
+    if elapsed is None:
+        elapsed = _from_suites("elapsed_seconds")
+    if elapsed is not None:
+        facts["elapsed_seconds"] = elapsed
+
+    slot_wait = guarded.get("slot_wait_seconds")
+    if slot_wait is None:
+        slot_wait = _from_suites("slot_wait_seconds")
+    if slot_wait is not None:
+        facts["slot_wait_seconds"] = slot_wait
+
+    command = guarded.get("command") or _from_suites("command")
+    if command:
+        facts["command"] = command
+
+    signal_number = guarded.get("signal")
+    if signal_number is None:
+        signal_number = _from_suites("signal")
+    if signal_number is None and exit_code < 0:
+        signal_number = abs(exit_code)
+    if signal_number is not None:
+        facts["signal"] = signal_number
+
+    # Only a suite that actually reported a non-zero code states an exit code:
+    # the report-shape fallback of ``1`` must never be presented as one.
+    if _reported_exit_code(guarded) is not None or exit_code < 0:
+        facts["exit_code"] = exit_code
+    return facts
+
+
 def _adapt_guarded_result(
     guarded: dict[str, Any], tooling: str | None, scope: str
 ) -> dict[str, Any]:
@@ -2896,6 +5942,11 @@ def _adapt_guarded_result(
     suite timeout) and bounded ``stdout``/``stderr`` tails, so ``phase_finish``
     can explain WHY the gate failed instead of emitting an empty ``Failures:``
     message (WL-0MVGUT787000LNDG).
+
+    ``live_repo_excluded`` is carried too: working-tree churn attributed to a
+    concurrent session never fails the gate, but it is surfaced in the finish
+    output so an excluded foreign change is distinguishable from a clean run
+    (SA-0MUIJAHXS003M7BG AC3).
     """
     failures: list[str] = []
     for failure in guarded.get("failures", []):
@@ -2919,6 +5970,9 @@ def _adapt_guarded_result(
         "stdout": _tail_text(_guarded_output(guarded, "stdout")),
         "stderr": _tail_text(_guarded_output(guarded, "stderr")),
         "exit_code": exit_code,
+        # Whether the runner *reported* an exit code (as opposed to the
+        # report-shape fallback) so the gate never presents a fabricated one.
+        "exit_code_reported": _explicit_suite_exit_code(guarded) is not None,
         "failures": failures,
         "notices": notices,
         "notice_codes": notice_codes,
@@ -2930,16 +5984,96 @@ def _adapt_guarded_result(
     if mutation:
         result["live_repo_mutation"] = mutation
         result["success"] = False
-    return result
+    excluded = [
+        str(n).strip()
+        for n in guarded.get("live_repo_excluded", [])
+        if str(n).strip()
+    ]
+    if excluded:
+        result["live_repo_excluded"] = excluded
+    # Infrastructure facts (SA-0MVTET8KQ0031R6Z): the runner states what
+    # happened — configured timeout, execution time, queue wait, command, exit
+    # code and signal — and the gate must not drop a single one, because they
+    # are what decides the remedy. Additive only: absent keys stay absent.
+    for field, value in _gate_facts(guarded, exit_code).items():
+        result[field] = value
+    # Verdict provenance (SA-0MVQHVJEX0071R7G): carry the cache flag and the
+    # served entry's metadata through from the guarded run so the finish
+    # report can attribute the verdict (fresh run vs. which cached entry).
+    return _with_cache_provenance(
+        result,
+        cached=bool(guarded.get("cached", False)),
+        entries=list(guarded.get("cache_entries") or []),
+    )
 
 
 #: Classification of a test-gate failure (WL-0MVGUT787000LNDG). ``phase_finish``
 #: must distinguish a retryable infrastructure condition (no free test slot)
 #: from a genuine code failure so the operator does not burn a blind retry.
+#:
+#: The three infrastructure kinds below answer the only question an operator
+#: woken by a red gate has to settle before acting
+#: (SA-0MVTET8KQ0031R6Z): fix code (``test_failure``), raise
+#: ``timeoutPerCommand`` (``timeout``), treat the host as the problem
+#: (``killed`` / ``slot_contention``), or read the output because the suite
+#: said something the parser could not parse (``unparsed``).
 GATE_FAILURE_SLOT_CONTENTION = "slot_contention"
 GATE_FAILURE_INFRASTRUCTURE = "infrastructure"
 GATE_FAILURE_TESTS = "test_failure"
+GATE_FAILURE_TIMEOUT = "timeout"
+GATE_FAILURE_KILLED = "killed"
+GATE_FAILURE_UNPARSED = "unparsed"
 GATE_FAILURE_UNKNOWN = "unknown"
+
+#: Fact fields carried from the runner into the gate report and message. Every
+#: one is additive: a consumer reading an older result simply finds no key.
+GATE_FACT_FIELDS: tuple[str, ...] = (
+    "configured_timeout",
+    "elapsed_seconds",
+    "slot_wait_seconds",
+    "command",
+    "exit_code",
+    "signal",
+)
+
+
+def _explicit_suite_exit_code(test_result: dict[str, Any]) -> int | None:
+    """The run's exit code from an *explicit* per-suite ``returncode``.
+
+    Returns ``None`` when no suite reported one, so the classification can tell
+    "a suite exited non-zero" apart from "the runner never ran a command" —
+    the fallback ``1`` used for the report shape must never be read as a
+    genuine non-zero exit.
+    """
+    suites = test_result.get("suites") or {}
+    if not isinstance(suites, dict):
+        return None
+    for suite in suites.values():
+        if not isinstance(suite, dict):
+            continue
+        returncode = suite.get("returncode")
+        if isinstance(returncode, int) and returncode != 0:
+            return returncode
+    return None
+
+
+def _reported_exit_code(test_result: dict[str, Any]) -> int | None:
+    """The run's exit code as *reported*, from either result shape.
+
+    A raw ``guarded_run_all`` result carries per-suite ``returncode``s; an
+    adapted result carries the resolved ``exit_code`` plus
+    ``exit_code_reported``. Both are read so the classification works on either
+    side of the boundary, and a report-shape fallback is never mistaken for a
+    genuine non-zero exit.
+    """
+    explicit = _explicit_suite_exit_code(test_result)
+    if explicit is not None:
+        return explicit
+    if test_result.get("exit_code_reported"):
+        exit_code = test_result.get("exit_code")
+        if isinstance(exit_code, int) and exit_code != 0:
+            return exit_code
+    return None
 
 
 def _gate_failure_kind(test_result: dict[str, Any]) -> str:
@@ -2947,10 +6081,17 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
 
     Genuine structured failures always win: a real test failure must never be
     reported as (or fixed by retrying instead of fixing) an infrastructure
-    condition. Slot contention is identified by the stable ``notice_code``
-    first, with a narrow legacy fallback on the slot-busy notice prefix (only
-    used when there are no structured failures), matching the constraint in
-    WL-0MVGUT787000LNDG — never a generic substring match.
+    condition. Classification then proceeds on stable machine-readable codes
+    (never on notice wording), with a narrow legacy fallback on the slot-busy
+    notice prefix for a result produced by an older test skill (WL-0MVGUT787000LNDG).
+
+    A timeout, a signal kill and an unparsable non-zero exit each get their own
+    reason (SA-0MVTET8KQ0031R6Z). When the runner predates the ``killed`` /
+    ``unparsed_failure`` codes the *shape* decides instead: a negative suite
+    exit code is a signal termination and a positive one with no parsable
+    failure is unparsed output. ``unknown`` therefore survives only for a
+    failure with no structured failure, no notice and no executed command —
+    never for a timed-out, killed or non-zero run.
     """
     if test_result.get("failures"):
         return GATE_FAILURE_TESTS
@@ -2962,6 +6103,17 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
             return GATE_FAILURE_SLOT_CONTENTION
     if test_result.get("live_repo_mutation"):
         return GATE_FAILURE_INFRASTRUCTURE
+    if _NOTICE_SUITE_TIMEOUT in notice_codes:
+        return GATE_FAILURE_TIMEOUT
+    if _NOTICE_KILLED in notice_codes:
+        return GATE_FAILURE_KILLED
+    if _NOTICE_UNPARSED_FAILURE in notice_codes:
+        return GATE_FAILURE_UNPARSED
+    exit_code = _reported_exit_code(test_result)
+    if exit_code is not None:
+        if exit_code < 0:
+            return GATE_FAILURE_KILLED
+        return GATE_FAILURE_UNPARSED
     if notice_codes or test_result.get("notices"):
         return GATE_FAILURE_INFRASTRUCTURE
     return GATE_FAILURE_UNKNOWN
@@ -2993,6 +6145,9 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
         sections.append(
             "Live-repo mutation detected:\n" + _tail_text(str(mutation))
         )
+    facts = _render_gate_facts(_gate_facts(test_result, _gate_exit_code(test_result)))
+    if facts:
+        sections.append("Gate facts:\n" + facts)
     output_tail = _tail_text(test_result.get("stderr")) or _tail_text(
         test_result.get("stdout")
     )
@@ -3004,6 +6159,55 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
             "notices or command output. Check the test-runner logs."
         )
     return "No structured test failures were parsed.\n\n" + "\n\n".join(sections)
+
+
+def _gate_exit_code(test_result: dict[str, Any]) -> int:
+    """The gate result's exit code, negative when signal-terminated."""
+    exit_code = test_result.get("exit_code")
+    if isinstance(exit_code, int):
+        return exit_code
+    reported = _reported_exit_code(test_result)
+    return reported if reported is not None else 0
+
+
+def _render_seconds(value: Any) -> str:
+    """Render a measured duration, naming an unmeasured one."""
+    if isinstance(value, (int, float)):
+        return f"{float(value):.1f}s"
+    return "unknown"
+
+
+def _render_gate_facts(facts: dict[str, Any]) -> str:
+    """One line per known infrastructure fact, in a fixed readable order.
+
+    The units are stated so a report is readable without the source: seconds
+    for the durations, the command as it was run, and the exit code with the
+    signal that terminated it when the child was killed
+    (SA-0MVTET8KQ0031R6Z).
+    """
+    lines: list[str] = []
+    if "configured_timeout" in facts:
+        lines.append(
+            "configured timeout (timeoutPerCommand): "
+            f"{facts['configured_timeout']}s"
+        )
+    if "elapsed_seconds" in facts:
+        lines.append(
+            "suite elapsed (command execution only): "
+            f"{_render_seconds(facts['elapsed_seconds'])}"
+        )
+    if "slot_wait_seconds" in facts:
+        lines.append(
+            "test-slot queue wait (separate from elapsed): "
+            f"{_render_seconds(facts['slot_wait_seconds'])}"
+        )
+    if "command" in facts:
+        lines.append(f"command: {facts['command']}")
+    if "exit_code" in facts:
+        lines.append(f"exit code: {facts['exit_code']}")
+    if "signal" in facts:
+        lines.append(f"signal: {facts['signal']} (child killed)")
+    return "\n".join(lines)
 
 
 def _gate_failure_message(
@@ -3020,17 +6224,73 @@ def _gate_failure_message(
     """
     kind = _gate_failure_kind(test_result)
     detail = _gate_failure_detail(test_result)
+    facts = _gate_facts(test_result, _gate_exit_code(test_result))
     if kind == GATE_FAILURE_SLOT_CONTENTION:
+        waited = (
+            f" after waiting {_render_seconds(facts['slot_wait_seconds'])} "
+            "for one"
+            if "slot_wait_seconds" in facts
+            else ""
+        )
         headline = (
             f"Test run {attempt}/{max_retry} could not start: no free test "
-            "slot (infrastructure condition, not a code failure). Wait for a "
-            "slot to free up, then retry — or raise TEST_LOCK_TIMEOUT "
+            f"slot{waited} (infrastructure condition, not a code failure). "
+            "The queue wait is reported separately from the suite's "
+            "execution time. Wait a staggered delay before retrying (do not "
+            "re-run immediately; concurrent waiters re-enter the pool in "
+            "lockstep otherwise), or raise TEST_LOCK_TIMEOUT "
             "(e.g. TEST_LOCK_TIMEOUT=1800) to wait longer."
+        )
+    elif kind == GATE_FAILURE_TIMEOUT:
+        configured = facts.get("configured_timeout")
+        budget = (
+            f" The gate allows {configured}s per command (timeoutPerCommand)."
+            if configured is not None
+            else ""
+        )
+        headline = (
+            f"Test run {attempt}/{max_retry} timed out: the suite exceeded "
+            f"the configured per-command timeout and was stopped after "
+            f"{_render_seconds(facts.get('elapsed_seconds'))} of execution "
+            f"(infrastructure condition, not a code failure).{budget} Raise "
+            "timeoutPerCommand in .pi/test-config.json with headroom over a "
+            "green run's elapsed time (a queue wait for a test slot is "
+            "reported separately and is not part of that budget), then "
+            "re-run."
+        )
+    elif kind == GATE_FAILURE_KILLED:
+        signal_number = facts.get("signal")
+        headline = (
+            f"Test run {attempt}/{max_retry} was killed"
+            + (f" by signal {signal_number}" if signal_number is not None else "")
+            + " (infrastructure condition, not a code failure): the child was "
+            "terminated without reporting a test result — an OOM kill or a "
+            "worker/supervisor crash. Inspect the output tail below; do not "
+            "treat this as a failing test."
+        )
+    elif kind == GATE_FAILURE_UNPARSED:
+        exit_code = facts.get("exit_code")
+        headline = (
+            f"Test run {attempt}/{max_retry} exited "
+            + (f"with code {exit_code} " if exit_code is not None else "non-zero ")
+            + "and produced no parsable test failures (infrastructure "
+            "condition, not a code failure): the suite command failed before "
+            "any test result was reported. Read the command and output tail "
+            "below — the command or its configuration is the problem, not a "
+            "test."
         )
     elif kind == GATE_FAILURE_INFRASTRUCTURE:
         headline = (
             f"Test run {attempt}/{max_retry} failed for an infrastructure "
             "reason (not a code failure)."
+        )
+    elif kind == GATE_FAILURE_UNKNOWN:
+        headline = (
+            f"Test run {attempt}/{max_retry} failed for an unclassified "
+            "reason: the runner reported no structured failure, no notice and "
+            "no executed command, so no view of this run can be attributed. "
+            "Re-run the suite directly with the test skill to obtain "
+            "diagnostics."
         )
     else:
         headline = f"Test run {attempt}/{max_retry} failed."
@@ -3047,6 +6307,7 @@ def _run_guarded_suite(
     scope: str,
     base_ref: str | None,
     tooling: str | None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Execute *commands* through the canonical guard-owning runner.
 
@@ -3057,6 +6318,10 @@ def _run_guarded_suite(
     environment (a nested run): ``guarded_run_all`` then stands down because
     the outer guard already owns the checkout.
 
+    *fingerprint* is the finish gate's would-be-commit tree SHA; it is
+    forwarded to the cache so the verdict is keyed by the tree the commit
+    produces rather than the loose working tree (SA-0MVQHVHXI007PQAB).
+
     When the test skill is unavailable (partial install), or the delegation
     raises, falls back to the direct ``_run_commands_direct`` path (the
     inner conftest guard remains armed), preserving graceful degradation.
@@ -3064,7 +6329,9 @@ def _run_guarded_suite(
     if _guarded_run_all is None or _full_suite_commands is None:
         # Partial install, or the legacy convention path: only the inner
         # conftest guard is armed, so run directly (no delegation).
-        return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+        return _run_commands_direct(
+            commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
+        )
     try:
         guarded = _guarded_run_all(
             cwd=Path(cwd),
@@ -3073,6 +6340,7 @@ def _run_guarded_suite(
             scope=scope,
             base_ref=base_ref or "origin/dev",
             use_cache=True,
+            fingerprint=fingerprint,
         )
     except Exception as exc:  # noqa: BLE001 - degrade to the direct path
         LOG.warning(
@@ -3080,11 +6348,15 @@ def _run_guarded_suite(
             "back to the direct cached runner (inner guard only).",
             exc,
         )
-        return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+        return _run_commands_direct(
+            commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
+        )
     return _adapt_guarded_result(guarded, tooling=tooling, scope=scope)
 
 
-def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
+def _run_changed_scope_pytest(
+    cwd: str, base_ref: str | None = None, fingerprint: str | None = None
+) -> dict[str, Any] | None:
     """Run only the tests affected by the worktree's changes vs *base_ref*.
 
     Reuses the shared changed-file → test selector from the test skill
@@ -3094,12 +6366,14 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     partial run is never mistaken for full-suite evidence).
 
     Returns ``None`` when no subset is possible so the caller falls back to
-    the full suite: no dev baseline/changed files, only non-test changes,
-    custom ``suiteCommands`` in ``.pi/test-config.json``, a selection
-    that resolves to node-only commands (implement's pytest channel cannot
-    run them), or a partial skill install without the test skill's
-    selector. npm / repo-script / override / unity toolings are not
-    subsettable — the caller warns and runs full scope.
+    the full suite: no dev baseline/changed files, only non-test changes, a
+    selection that resolves to non-pytest commands (this legacy channel can
+    only run pytest), or a partial skill install without the test skill's
+    selector. ``.pi/test-config.json`` ``suiteCommands`` does NOT disable
+    selection — it describes the full suite only (SA-0MVL7YOMJ006UMDO).
+    npm / repo-script / override / unity toolings are not subsettable — the
+    caller warns and runs full scope. The resolved-suite path uses
+    :func:`_run_changed_scope_selection` instead, which runs any tooling.
     """
     if _changed_scope_commands is None:
         LOG.warning(
@@ -3121,6 +6395,7 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
         scope="changed",
         base_ref=base_ref,
         tooling="pytest",
+        fingerprint=fingerprint,
     )
     # pytest exit 4 is a *usage* error: "file or directory not found" (or a
     # similar no-valid-items condition). It means the selection referenced a
@@ -3140,8 +6415,76 @@ def _run_changed_scope_pytest(cwd: str, base_ref: str | None = None) -> dict[str
     return run
 
 
+def _changed_scope_unavailable_reason(cwd: str, base_ref: str | None = None) -> str:
+    """The shared selector's specific reason for having no subset, or a
+    generic fallback when the selector itself is unavailable.
+
+    Keeping the reason in one place means every implement.py entry point
+    (the resolved-suite path and the legacy pytest-only path) reports the
+    same specific cause instead of restating a generic list of possibilities
+    (SA-0MVL7YOMJ006UMDO).
+    """
+    if _changed_scope_selection is None:
+        return "changed-scope selector unavailable"
+    return _changed_scope_selection(
+        Path(cwd), base_ref=base_ref or "origin/dev"
+    ).reason
+
+
+def _run_changed_scope_selection(
+    cwd: str, base_ref: str | None = None, fingerprint: str | None = None
+) -> tuple[dict[str, Any] | None, str]:
+    """Run the changed-file-selected commands (any tooling) via the guard.
+
+    Unlike :func:`_run_changed_scope_pytest` (the legacy pytest-only path),
+    this runs whatever the shared selector resolves — a named group's
+    commands, a vitest ``*.test.ts`` selection, pytest, or node — so a repo
+    that declares ``suiteCommands`` or ``groups`` reports ``scope: changed``
+    instead of falling back to the full suite (SA-0MVL7YOMJ006UMDO).
+
+    *fingerprint* is the finish gate's would-be-commit tree SHA, forwarded to
+    the run cache so the verdict is keyed by the tree the commit produces
+    (SA-0MVQHVHXI007PQAB).
+
+    Returns ``(result, reason)``. ``result`` is ``None`` when no subset is
+    available; ``reason`` then names the specific fallback cause so the
+    caller can log it instead of a generic list of possibilities.
+    """
+    if _changed_scope_commands is None:
+        return None, "changed-scope selector unavailable"
+    commands = _changed_scope_commands(
+        Path(cwd), base_ref=base_ref or "origin/dev"
+    )
+    if not commands:
+        return None, _changed_scope_unavailable_reason(cwd, base_ref=base_ref)
+    run = _run_guarded_suite(
+        list(commands),
+        cwd,
+        scope="changed",
+        base_ref=base_ref,
+        tooling="changed-scope",
+        fingerprint=fingerprint,
+    )
+    # pytest exit 4 is a usage error ("file or directory not found"), not a
+    # test failure. Treat it as selection unavailable so the caller falls
+    # back to the full suite (LP-0MTZYRTNF0092JKW).
+    if run.get("exit_code") == 4:
+        LOG.warning(
+            "Implement run_tests: changed-scope run exited 4 (no valid test "
+            "paths — likely a deleted/renamed test file) in %s — falling "
+            "back to full scope.",
+            cwd,
+        )
+        return None, "selection references no valid test paths (exit 4)"
+    return run, "changed-scope selection available"
+
+
 def _run_commands(
-    commands: list[str], cwd: str, tooling: str, scope: str = "full"
+    commands: list[str],
+    cwd: str,
+    tooling: str,
+    scope: str = "full",
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Execute *commands* through the canonical guard-owning runner.
 
@@ -3152,13 +6495,24 @@ def _run_commands(
     """
     if _guarded_run_all is not None and _full_suite_commands is not None:
         return _run_guarded_suite(
-            commands, cwd, scope=scope, base_ref=None, tooling=tooling
+            commands,
+            cwd,
+            scope=scope,
+            base_ref=None,
+            tooling=tooling,
+            fingerprint=fingerprint,
         )
-    return _run_commands_direct(commands, cwd, tooling=tooling, scope=scope)
+    return _run_commands_direct(
+        commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
+    )
 
 
 def _run_commands_direct(
-    commands: list[str], cwd: str, tooling: str, scope: str = "full"
+    commands: list[str],
+    cwd: str,
+    tooling: str,
+    scope: str = "full",
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run each command through the per-repo cache and combine the results.
 
@@ -3185,34 +6539,47 @@ def _run_commands_direct(
     exit_code = 0
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    cached_flags: list[bool] = []
+    cache_entries: list[dict[str, Any]] = []
     for command in commands:
         run = _run_cached_paced(
             command,
             cwd=cwd,
             timeout=_resolve_test_timeout(cwd),
             runner=lambda command, cwd_, timeout_: run_cmd(
-                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True,
+                keep_git_index=True,
             ),
             scope=scope,
+            fingerprint=fingerprint,
         )
+        cached_flags.append(bool(run.get("cached")))
+        if run.get("cached"):
+            cache_entries.append(_cache_entry_from_run(run, command))
         if run["exit_code"] != 0 and exit_code == 0:
             exit_code = run["exit_code"]
         if run.get("stdout"):
             stdout_parts.append(run["stdout"])
         if run.get("stderr"):
             stderr_parts.append(run["stderr"])
-    return _finalize_test_result(
-        {
-            "exit_code": exit_code,
-            "stdout": "\n".join(stdout_parts),
-            "stderr": "\n".join(stderr_parts),
-        },
-        tooling=tooling,
-        scope=scope,
+    return _with_cache_provenance(
+        _finalize_test_result(
+            {
+                "exit_code": exit_code,
+                "stdout": "\n".join(stdout_parts),
+                "stderr": "\n".join(stderr_parts),
+            },
+            tooling=tooling,
+            scope=scope,
+        ),
+        cached=bool(cached_flags) and all(cached_flags),
+        entries=cache_entries,
     )
 
 
-def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict[str, Any] | None:
+def _run_group_from_changed_files(
+    cwd: str, base_ref: str | None = None, fingerprint: str | None = None
+) -> dict[str, Any] | None:
     """Try to select a named test group from changed files and run it.
 
     Uses the shared :func:`select_group_from_changed_files` to map touched
@@ -3249,7 +6616,11 @@ def _run_group_from_changed_files(cwd: str, base_ref: str | None = None) -> dict
         return None
 
     return _run_commands(
-        group_cmds, cwd, tooling=f"group:{group_name}", scope="full"
+        group_cmds,
+        cwd,
+        tooling=f"group:{group_name}",
+        scope="changed",
+        fingerprint=fingerprint,
     )
 
 
@@ -3297,17 +6668,21 @@ def _run_resolved_suite(
     commands: list[str],
     scope: str = "changed",
     base_ref: str | None = None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run a resolved full-suite command list, honouring changed scope.
 
     ``scope="changed"`` first tries the test skill's changed-file selector
-    (named group, then file-level selection). When no subset is available
-    (custom ``suiteCommands``, no dev baseline, no matching tests, or a
-    node-only selection) it warns and runs the full command list so a scoped
-    run never silently skips testing.
+    (named group, then file-level selection). ``.pi/test-config.json``
+    ``suiteCommands`` never disables selection — it describes the full suite
+    only (SA-0MVL7YOMJ006UMDO). When no subset is available the selector's
+    specific reason is warned and the full command list runs, so a scoped run
+    never silently skips testing.
     """
     if scope == "changed":
-        group_result = _run_group_from_changed_files(cwd, base_ref=base_ref)
+        group_result = _run_group_from_changed_files(
+            cwd, base_ref=base_ref, fingerprint=fingerprint
+        )
         if group_result is not None:
             LOG.info(
                 "Implement run_tests: selected group '%s' from changed files in %s",
@@ -3315,20 +6690,25 @@ def _run_resolved_suite(
                 cwd,
             )
             return group_result
-        scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
+        scoped, scope_reason = _run_changed_scope_selection(
+            cwd, base_ref=base_ref, fingerprint=fingerprint
+        )
         if scoped is not None:
             return scoped
         LOG.warning(
             "Implement run_tests: changed-scope selection unavailable in "
-            "%s (no dev baseline, no changed tests, custom suiteCommands, "
-            "or node-only selection) — falling back to full scope.",
+            "%s (%s) — falling back to full scope.",
             cwd,
+            scope_reason,
         )
-    return _run_commands(commands, cwd, tooling="suite", scope="full")
+    return _run_commands(
+        commands, cwd, tooling="suite", scope="full", fingerprint=fingerprint
+    )
 
 
 def run_tests(cwd: str, scope: str = "changed",
-              base_ref: str | None = None) -> dict[str, Any]:
+              base_ref: str | None = None,
+              fingerprint: str | None = None) -> dict[str, Any]:
     """Run the project test suite, routed through the per-repo run cache.
 
     *scope* selects the execution scope (SA-0MT6CENPW004V2JN):
@@ -3387,6 +6767,13 @@ def run_tests(cwd: str, scope: str = "changed",
         scope: Execution scope (``changed`` — default — or ``full``).
         base_ref: Base ref for changed-file detection when *scope* is
             ``changed`` (default ``origin/dev``).
+        fingerprint: Explicit expected fingerprint for the run cache — the
+            finish gate passes the would-be-commit tree SHA
+            (``git write-tree`` of its temporary index). When supplied, the
+            cache key and verdict acceptance are bound to that tree instead of
+            the loose working-tree state, so a verdict recorded for another
+            tree (or a legacy entry without provenance) misses and the suite
+            re-runs (SA-0MVQHVHXI007PQAB). Omitted → historical behaviour.
 
     Returns:
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
@@ -3411,6 +6798,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 timeout=_resolve_test_timeout(cwd),
                 runner=_shell_command_runner,
                 scope="full",
+                fingerprint=fingerprint,
             ),
             tooling="override",
             scope="full",
@@ -3433,7 +6821,11 @@ def run_tests(cwd: str, scope: str = "changed",
                 tooling=None,
             )
         return _run_resolved_suite(
-            cwd, resolved_suite, scope=scope, base_ref=base_ref
+            cwd,
+            resolved_suite,
+            scope=scope,
+            base_ref=base_ref,
+            fingerprint=fingerprint,
         )
 
     # 3. Legacy convention detection (test skill unavailable or no suite
@@ -3446,7 +6838,9 @@ def run_tests(cwd: str, scope: str = "changed",
         if scope == "changed":
             # Try named group selection first (SA-0MUJKF2HP001BR51):
             # map changed files to the smallest sufficient group.
-            group_result = _run_group_from_changed_files(cwd, base_ref=base_ref)
+            group_result = _run_group_from_changed_files(
+                cwd, base_ref=base_ref, fingerprint=fingerprint
+            )
             if group_result is not None:
                 LOG.info(
                     "Implement run_tests: selected group '%s' from changed files in %s",
@@ -3455,23 +6849,27 @@ def run_tests(cwd: str, scope: str = "changed",
                 )
                 return group_result
             # Fall through to the existing changed-file → test-file selector.
-            scoped = _run_changed_scope_pytest(cwd, base_ref=base_ref)
+            scoped = _run_changed_scope_pytest(
+                cwd, base_ref=base_ref, fingerprint=fingerprint
+            )
             if scoped is not None:
                 return scoped
             LOG.warning(
                 "Implement run_tests: changed-scope selection unavailable in "
-                "%s (no dev baseline, no changed tests, no matching groups, "
-                "or custom suiteCommands) — falling back to full scope.",
+                "%s (%s) — falling back to full scope.",
                 cwd,
+                _changed_scope_unavailable_reason(cwd, base_ref=base_ref),
             )
         pytest_run = _run_cached_paced(
             PYTEST_CMD,
             cwd=cwd,
             timeout=_resolve_test_timeout(cwd),
             runner=lambda command, cwd_, timeout_: run_cmd(
-                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True,
+                keep_git_index=True,
             ),
             scope="full",
+            fingerprint=fingerprint,
         )
         result = pytest_run
         final_tooling = "pytest"
@@ -3482,9 +6880,11 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
                 runner=lambda command, cwd_, timeout_: run_cmd(
-                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True,
+                    keep_git_index=True,
                 ),
                 scope="full",
+                fingerprint=fingerprint,
             )
             if npm_run["exit_code"] == 0:
                 return _finalize_test_result(
@@ -3509,9 +6909,11 @@ def run_tests(cwd: str, scope: str = "changed",
                 cwd=cwd,
                 timeout=_resolve_test_timeout(cwd),
                 runner=lambda command, cwd_, timeout_: run_cmd(
-                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                    shlex.split(command), cwd=cwd_, check=False, timeout=timeout_, capture=True,
+                    keep_git_index=True,
                 ),
                 scope="full",
+                fingerprint=fingerprint,
             ),
             tooling="npm",
             scope="full",
@@ -3550,6 +6952,7 @@ def run_tests(cwd: str, scope: str = "changed",
                 timeout=_resolve_test_timeout(cwd),
                 runner=_shell_command_runner,
                 scope="full",
+                fingerprint=fingerprint,
             ),
             tooling="repo-script",
             scope="full",
@@ -3871,6 +7274,13 @@ def phase_start(
     Steps:
     1. Validate the work item ID
     2. Code Freeze gate: refuse when a release is in progress
+    2.5. Acquire the per-work-item child lock (before the claim and before
+        any worktree creation/resume); a held child is reported as
+        ``skipped-held`` and performs no writes (AC1)
+    2.6. Outbound (depends-on) gate: refuse when the item's own same-project
+        outbound blockers are unmet — reported as a ``blocked`` verdict with
+        the blocker list, before the claim so no claim/worktree is left
+        behind (SA-0MVS1QS9J009DGPT)
     3. Claim the work item (status → in_progress)
     4. Safety gate: check for dirty working tree
     5. Stash hygiene gate: warn on orphaned stashes (fail-open, --allow-orphaned-stashes to skip)
@@ -3879,6 +7289,11 @@ def phase_start(
     7. Create a worktree from the parent branch
     8. Register signal handlers
     9. Write persistent state
+
+    The lock is held for the whole of the phase and released on normal exit,
+    on exception/abort and on SIGINT/SIGTERM (AC2). Two concurrent
+    ``drive``/``parent``/``start`` invocations for one child can therefore
+    never both enter its critical section (SA-0MVOABYW00004978).
 
     Args:
         work_item_id: The work item ID.
@@ -3929,6 +7344,146 @@ def phase_start(
             print(f"\n⛔ {msg}\n")
         return report
 
+    # ── Step 2.5: Acquire the per-child lock (AC1) ────────────────
+    # The single choke point for ``drive``, ``parent`` and a manual ``start``.
+    # Acquired BEFORE the claim and before any worktree creation/resume so a
+    # contender can never mutate the item or its worktree. A failed acquire
+    # is fail-closed: report the holder and write nothing.
+    try:
+        lock = _new_child_lock(work_item_id)
+        lock_result = lock.acquire()
+    except (OSError, RuntimeError) as exc:
+        msg = (
+            f"Cannot acquire the per-child lock for {work_item_id}: {exc}. "
+            "Refusing to start (fail closed) because exclusive ownership "
+            "cannot be guaranteed."
+        )
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        return report
+
+    if not lock_result.acquired:
+        _skipped_held_report(
+            report, work_item_id, lock_result.held_by, lock_result.path,
+        )
+        lock.release()  # a losing handle never held the kernel lock: no-op
+        LOG.warning("%s", report["message"])
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {report['message']}\n")
+        return report
+
+    _set_child_lock(lock)
+    if lock_result.reentrant:
+        LOG.info(
+            "Re-entered the per-child lock for %s by ownership token "
+            "(holder chain); not blocked.",
+            work_item_id,
+        )
+    elif lock_result.reclaimed:
+        # Logged AND surfaced in the report (parent AC3, SA-0MVUX6Q4S006KII3).
+        LOG.warning(
+            "%s", _record_child_lock_reclamation(report, work_item_id, lock_result)
+        )
+
+    # Register the signal handler from the claim onwards: an interruption
+    # between the claim and the worktree creation must release the lock and
+    # leave an explanatory comment (AC2).
+    _register_signal_handlers()
+    try:
+        return _phase_start_locked(
+            report,
+            work_item_id,
+            json_output=json_output,
+            parent_branch=parent_branch,
+            worktree_path_override=worktree_path_override,
+            force=force,
+        )
+    except Exception as exc:  # noqa: BLE001 - release the claim, then report
+        # The claim is written before this point, so an *unexpected* failure
+        # (anything the classified abort branches above did not catch) must
+        # not leave the item claimed on a scheduling hold. The conditional
+        # safety reset releases the assignee and returns an in-progress item
+        # to open; it is a no-op when the item already reached a terminal
+        # state, so a late error can never clobber one
+        # (SA-0MVVF75ZA007XNKB).
+        report["unexpected_error"] = f"{type(exc).__name__}: {exc}"
+        report["success"] = False
+        report["message"] = f"Unexpected error during start: {exc}"
+        LOG.error("Unexpected error during start of %s: %s", work_item_id, exc)
+        try:
+            _safety_reset_if_in_progress(work_item_id)
+        except RuntimeError:
+            LOG.error(
+                "Failed to release the claim on %s after an unexpected "
+                "error",
+                work_item_id,
+            )
+        if json_output:
+            print(format_json_output(report))
+        return report
+    finally:
+        # Normal exit, early return and exception all release the lock; the
+        # signal handler releases it explicitly before ``os._exit``.
+        _release_child_lock()
+
+
+def _phase_start_locked(
+    report: dict[str, Any],
+    work_item_id: str,
+    *,
+    json_output: bool,
+    parent_branch: str,
+    worktree_path_override: str | None,
+    force: bool,
+) -> dict[str, Any]:
+    """Steps 3-9 of :func:`phase_start`, executed under the child lock.
+
+    Split out purely so the lock's acquisition/release brackets the whole
+    mutating section without re-indenting it. ``report`` is populated by the
+    caller (validation and Code Freeze gates) and returned here.
+    """
+
+    # ── Step 3.0: Outbound (depends-on) gate (SA-0MVS1QS9J009DGPT) ──
+    # The invoked item's own outbound edges are authoritative producer
+    # sequencing decisions: an unmet same-project blocker means the item must
+    # wait. The gate sits BEFORE the claim (Assumption A3) so a blocked item
+    # is never left ``in_progress`` with no worktree, and no worktree is
+    # created. It runs *under* the per-child lock: a losing contender must
+    # leave the worklog store untouched (no read/write at all), so the gate
+    # cannot run before the lock is acquired. Cross-project edges remain
+    # coordination notes and do not refuse (SA-0MSQBM2FK005NW1T).
+    outbound = _outbound_gate(work_item_id)
+    if outbound["coordination_blockers"]:
+        LOG.info(
+            "Cross-project dependency note(s) for %s: %s",
+            work_item_id,
+            _format_blockers(outbound["coordination_blockers"]),
+        )
+        report["coordination_blockers"] = outbound["coordination_blockers"]
+    if outbound["blocked"]:
+        msg = (
+            f"Work item {work_item_id} is blocked by unmet outbound "
+            f"dependency: {_format_blockers(outbound['blockers'])}. "
+            "No implementation was started (no claim, no worktree). Wait for "
+            "the blocker(s) to reach a terminal state, or remove the "
+            "dependency edge, then re-run."
+        )
+        LOG.warning(msg)
+        report["success"] = False
+        report["blocked"] = True
+        report["blocked_by"] = outbound["blockers"]
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n\u26d4 {msg}\n")
+        return report
+
     # ── Step 3: Claim the work item via shared helper ─────────────
     # Status-only claim: the workflow stage must NOT be advanced here.
     # `in_progress` is a status, not a stage; passing it as a stage made `wl`
@@ -3937,6 +7492,11 @@ def phase_start(
     LOG.info("Claiming work item %s...", work_item_id)
     try:
         StatusLifecycle.update_status(work_item_id, "in_progress")
+        # Status-only claim: no assignee is set, so there is no scheduling hold
+        # to release while the run is in flight (AGENTS_GLOBAL.md claim
+        # pattern). Terminal outcomes below still write ``assignee=""``
+        # explicitly, including on paths that never reach a StatusLifecycle
+        # exit (SA-0MVVF6Y38004T5OZ).
     except RuntimeError as exc:
         msg = f"Failed to claim work item {work_item_id}: {exc}"
         report["success"] = False
@@ -3964,7 +7524,7 @@ def phase_start(
         report["message"] = msg
         report["extension_error"] = True
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4017,7 +7577,7 @@ def phase_start(
         report["success"] = False
         report["message"] = msg
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4092,7 +7652,7 @@ def phase_start(
         report["dirty_worktree"] = True
         wl_add_comment(work_item_id, f"Start phase aborted: dirty working tree detected.\n```\n{status_output}\n```")
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4157,9 +7717,26 @@ def phase_start(
     # when another actor pushed to origin/<parent> between the last
     # finish and this start. Degrades gracefully (dirty/offline/diverged
     # → fall back to the local branch; never fails the start phase).
+    # The refresh fast-forwards the SHARED local parent ref, so it takes the
+    # same per-repository lock a concurrent ``finish`` holds
+    # (SA-0MVPZG3IQ009IJMO) — bounded, fail-open: a held lock skips the
+    # refresh rather than blocking or failing the start.
     repo_root = _get_repo_root() or str(Path.cwd().resolve())
+
+    # ── Step 6.6: Fail-open self-referential-upstream warning (AC2/AC3) ─
+    # A long-lived branch tracking itself makes `git pull` a silent no-op
+    # (stale skills/worklog). Surfaced as a WARNING only: it never blocks a
+    # work item and never rewrites config — repair is an explicit operator
+    # action (SA-0MVX35AUC003CNUD, parent SA-0MVX1M6HH004YPX2).
+    report["steps"] = report.get("steps", {})
+    report["steps"]["self_referential_upstream"] = (
+        warn_self_referential_upstream(repo_root)
+    )
+
     LOG.info("Refreshing parent branch %s from origin...", parent_branch)
-    refresh_result = _sync_parent_branch(repo_root, parent_branch)
+    refresh_result = _sync_parent_branch_locked(
+        repo_root, parent_branch, work_item_id
+    )
     report["steps"] = report.get("steps", {})
     report["steps"]["sync_parent_branch"] = refresh_result
     if refresh_result.get("warning"):
@@ -4182,13 +7759,42 @@ def phase_start(
         )
     else:
         LOG.info("Creating worktree at %s from branch %s...", wt_path, parent_branch)
+        # Snapshot the parent's tracking config BEFORE the registration so the
+        # post-add guard can distinguish "this registration poisoned the
+        # parent" (a hard failure) from a pre-existing defect (detection's
+        # job, never prevention's). The shared common config is read through
+        # the main checkout (SA-0MVX35ABT000I1PD AC1).
+        parent_tracking_before = (
+            _git_config_get(repo_root, f"branch.{parent_branch}.remote"),
+            _git_config_get(repo_root, f"branch.{parent_branch}.merge"),
+        )
         if not git_worktree_add(branch, wt_path, parent_branch):
             msg = f"Failed to create worktree at {wt_path} from {parent_branch}"
             LOG.error(msg)
             report["success"] = False
             report["message"] = msg
             try:
-                StatusLifecycle.update_status(work_item_id, "open")
+                StatusLifecycle.update_status(work_item_id, "open", assignee="")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", work_item_id)
+            if json_output:
+                print(format_json_output(report))
+            return report
+        # Assert afterwards that the registration left the parent's tracking
+        # config untouched: ``git worktree add --track`` must write ``.`` only
+        # for the new wl-* branch, never onto a long-lived branch name
+        # (SA-0MVX35ABT000I1PD AC1 — fail closed, loudly).
+        try:
+            assert_parent_tracking_untouched(
+                repo_root, parent_branch, parent_tracking_before
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            LOG.error("%s", msg)
+            report["success"] = False
+            report["message"] = msg
+            try:
+                StatusLifecycle.update_status(work_item_id, "open", assignee="")
             except RuntimeError:
                 LOG.error("Failed to reset work item %s status to open", work_item_id)
             if json_output:
@@ -4225,7 +7831,11 @@ def phase_start(
     )
 
     # ── Step 8: Register signal handlers ───────────────────────────
-    repo_root = str(Path.cwd().resolve())
+    # ``repo_root`` is the main checkout root resolved at Step 6.5. Do NOT
+    # recompute it from ``Path.cwd()``: on a resume from inside the worktree
+    # ``cwd`` IS the worktree, so the state file and the signal globals
+    # recorded the worktree — which then made finish refuse to remove "the
+    # repository root" after a successful push (MS-0MVM7NJF70037YU4).
     _store_signal_globals(abs_wt_path, work_item_id, repo_root)
     _register_signal_handlers()
 
@@ -4370,6 +7980,7 @@ def phase_finish(
     commit_msg_override: str | None = None,
     max_retry: int = DEFAULT_MAX_RETRY,
     verbose: bool = False,
+    keep_worktree: bool = False,
 ) -> dict[str, Any]:
     """Phase 2: Complete the implementation.
 
@@ -4380,14 +7991,26 @@ def phase_finish(
     3. Build
     4. Test (with fix-and-re-run loop)
     5. Commit
-    6. Fast-forward dev in the main checkout (AC1 — context-budget fix)
+    6. Verified, reversible fast-forward of dev in the main checkout
+       (context-budget fix; restored to origin/dev on push failure)
     7. Push to dev (rebase + retry on concurrent advance)
-    8. Clean up worktree processes (post-push, before removal —
+    8. Post-push ancestry assertion: the pushed commit must be an ancestor
+       of refs/remotes/origin/dev or finish fails loudly naming the hash
+       (SA-0MVPZG7A0000N66U AC2)
+    9. Clean up worktree processes (post-push, before removal —
        self-exclusion-safe, SA-0MVJC5KNT0044L2B)
-    9. Remove worktree
-    10. Sync local parent branch (post-push, AC1/AC2)
-    11. Mark in_review
-    12. Read back the terminal status from the main-checkout store and
+    10. Remove worktree — **deferred** when the finishing process belongs to
+        a driven child session (``IMPLEMENT_DRIVE_ACTIVE=1``) or when the
+        caller opted in with ``--keep-worktree`` /
+        ``IMPLEMENT_KEEP_WORKTREE=1``. Deferral keeps the tree, its branch
+        and ``.implement_state.json`` so the session that owns the tree as
+        its cwd keeps working after finish returns; the driver (or the
+        caller, via ``implement.py cleanup <id>`` as its **last** bash
+        command, SA-0MVTHJ7QX005PXRG) removes it afterwards. Recorded in
+        ``report["steps"]["worktree_removal"]`` (SA-0MVTE8XAJ002IUDR)
+    11. Sync local parent branch (post-push, AC1/AC2)
+    12. Mark in_review
+    13. Read back the terminal status from the main-checkout store and
         fail loudly if it did not stick (OSL-0MVME1PI5005WU58)
 
     All implementation work MUST be done inside the worktree created by
@@ -4401,6 +8024,8 @@ def phase_finish(
         commit_msg_override: Custom commit message.
         max_retry: Max test-fix retries.
         verbose: Enable verbose logging.
+        keep_worktree: Defer worktree removal (``--keep-worktree``); the
+            caller then owns the cleanup so the session keeps its cwd.
 
     Returns:
         Dict with result information.
@@ -4430,6 +8055,10 @@ def phase_finish(
 
     # Read state for metadata
     state = read_state(worktree_path)
+    # The shared parent branch this finish syncs and verifies against (dev).
+    # Resolved once here so the verified fast-forward (Step 5), the restore
+    # (Step 6) and the ancestry assertion (Step 6a) all use the same ref.
+    parent_branch = state.parent_branch if state else DEFAULT_PARENT_BRANCH
 
     report["worktree_path"] = worktree_path
     # Compute branch name from the worktree
@@ -4461,13 +8090,20 @@ def phase_finish(
         report["success"] = False
         report["message"] = msg
         report["worktree_enforcement"] = True
+        # AC5 (LP-0MVWEP1MM0097RAT): the placement violation records a
+        # structured step so the classifier resolves it as a gate failure
+        # without parsing prose (``worktree_placement`` + any reason).
+        report["steps"]["worktree_placement"] = {
+            "success": False,
+            "reason": "placement_violation",
+        }
         wl_add_comment(
             work_item_id,
             "Finish phase refused: implementation changes found outside the "
             f"worktree.\n```\n{msg}\n```",
         )
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4475,6 +8111,58 @@ def phase_finish(
         else:
             print(f"\n⛔ {msg}\n")
         return report
+
+    # ── Step 0.75: Main-checkout guard (WL-0MVPADZ1Z000FOSG AC3) ──
+    # A worktree-scoped finish must never silently build on, fast-forward
+    # over, or push foreign tracked-file mutations of the main checkout. All
+    # implementation work happens in the worktree, but finish itself operates
+    # on the main checkout (Step 5 fast-forward, Step 6 push, Step 7
+    # removal), so the main checkout is snapshotted now and re-verified
+    # before the push and before worktree removal. A mutation not
+    # attributable to finish's own fast-forward aborts loudly, names every
+    # offending path, and leaves the item open.
+    # ``state.repo_root`` is the main checkout root, but a state file written
+    # by an older build may carry the worktree itself (start resumed from
+    # inside it); such a stale value is rejected and the main root re-derived
+    # from the worktree (MS-0MVM7NJF70037YU4).
+    repo_root = _resolve_main_repo_root(worktree_path, state)
+    main_checkout_baseline = _snapshot_main_checkout(repo_root)
+    main_checkout_guard: dict[str, Any] = {
+        "repo_root": repo_root,
+        "snapshot_at": main_checkout_baseline["taken_at"],
+        "baseline_paths": len(main_checkout_baseline["status"]),
+        "own_churn": [],
+        "verifies": [],
+        "verdict": "pass",
+    }
+    report["steps"]["main_checkout_guard"] = main_checkout_guard
+
+    def _abort_on_main_checkout_violation(stage: str, own_churn: list[str]) -> None:
+        """Verify the main checkout; raise a loud abort when it was mutated.
+
+        Records the verdict in ``report["steps"]["main_checkout_guard"]``
+        and, on failure, comments on the work item before raising so the
+        audit trail survives the status reset in the outer handler.
+        """
+        violations = _verify_main_checkout(
+            main_checkout_guard,
+            main_checkout_baseline,
+            repo_root=repo_root,
+            worktree_path=worktree_path,
+            own_churn=own_churn,
+            expected_dirty=expected_dirty_paths(repo_root),
+            stage=stage,
+        )
+        if not violations:
+            return
+        actor = main_checkout_guard["verifies"][-1].get(
+            "actor_evidence", "unknown"
+        )
+        msg = _main_checkout_guard_message(
+            repo_root, violations, actor, stage
+        )
+        wl_add_comment(work_item_id, msg)
+        raise RuntimeError(msg)
 
     # ── Step 1: Refactor step ──────────────────────────────────────
     if not no_refactor:
@@ -4488,6 +8176,12 @@ def phase_finish(
         LOG.info("Refactor step skipped (--no-refactor)")
 
     # ── Step 2: Build ──────────────────────────────────────────────
+    # The item's own change set is snapshotted before the build: whatever the
+    # build changes on top of it is build-originated churn, not the item's
+    # change (SA-0MVZE164P0048306 AC1/AC3). A build such as ``npm run build``
+    # here runs ``engine:sync`` first, which can advance the engine submodule
+    # and stage the pin plus the gitlink.
+    build_churn_baseline = _build_churn_baseline(worktree_path)
     LOG.info("Running build...")
     build_result = run_build(worktree_path)
     report["steps"]["build"] = build_result
@@ -4503,7 +8197,33 @@ def phase_finish(
             f"Build failed during finish phase.\n```\n{build_result['stderr'][:500]}\n```",
         )
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        return report
+
+    # ── Step 2b: Exclude build-originated composition churn ────────
+    # Build output the item did not originate must never reach the commit
+    # (AC1) and must not be what the suite runs against (AC3): both are
+    # restored to the pre-build ``HEAD`` state while the gate is still ahead
+    # of it, so the tested tree is exactly the committed tree and the composed
+    # engine SHA is the committed one. The exclusion is conditional on origin
+    # (AC2): a pin/gitlink that was already part of the item's change set is
+    # preserved untouched.
+    build_churn = _exclude_build_originated_churn(
+        worktree_path, build_churn_baseline
+    )
+    report["steps"]["build_churn"] = build_churn
+    if build_churn.get("restore_failed"):
+        msg = _build_churn_refusal_message(build_churn)
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        wl_add_comment(work_item_id, msg)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4511,18 +8231,19 @@ def phase_finish(
         return report
 
     # ── Step 3: Test with fix-and-re-run loop ──────────────────────
-    LOG.info("Running test suite (changed scope)...")
+    # The suite runs against the **would-be-commit tree**: the change set is
+    # staged into a temporary copy of the index and exported as
+    # ``GIT_INDEX_FILE``, so tracked-file guards (``git ls-files``) see exactly
+    # what the commit will produce (SA-0MVQHVGFR006W8LG). The real index and
+    # the working tree are not touched until the gate is green.
+    LOG.info("Running test suite (changed scope, would-be-commit tree)...")
     test_attempts = 0
-    test_result = run_tests(worktree_path, scope="changed")
+    test_result, gate_tree = run_gate_suite(worktree_path, scope="changed")
+    report["steps"]["would_be_commit"] = gate_tree
     report["steps"]["tests"] = []
-    report["steps"]["tests"].append({
-        "attempt": test_attempts + 1,
-        "success": test_result["success"],
-        "failures": test_result.get("failures", []),
-        "skipped": test_result.get("skipped", False),
-        "tooling": test_result.get("tooling"),
-        "scope": test_result.get("scope", "changed"),
-    })
+    report["steps"]["tests"].append(
+        _gate_attempt_record(test_attempts + 1, test_result)
+    )
 
     while not test_result["success"] and test_attempts < max_retry:
         test_attempts += 1
@@ -4545,12 +8266,19 @@ def phase_finish(
             # Report current state and let the agent loop externally
             report["success"] = False
             report["message"] = msg
+            # The report states the classification *and* the facts that
+            # decided it (SA-0MVTET8KQ0031R6Z): a consumer never has to
+            # re-derive the configured timeout, the execution time, the
+            # separate queue wait, the command or the exit code/signal from
+            # prose. Additive keys only — an older consumer ignores them.
             report["test_phase"] = {
                 "attempt": test_attempts,
                 "max_retry": max_retry,
                 "failures": failures,
                 "notices": list(test_result.get("notices") or []),
+                "notice_codes": list(test_result.get("notice_codes") or []),
                 "reason": failure_reason,
+                **_gate_facts(test_result, _gate_exit_code(test_result)),
             }
             print(format_json_output(report))
             return report
@@ -4576,7 +8304,7 @@ def phase_finish(
             report["message"] = msg
             wl_add_comment(work_item_id, msg)
             try:
-                StatusLifecycle.update_status(work_item_id, "open")
+                StatusLifecycle.update_status(work_item_id, "open", assignee="")
             except RuntimeError:
                 LOG.error("Failed to reset work item %s status to open", work_item_id)
             if json_output:
@@ -4594,15 +8322,11 @@ def phase_finish(
         # Re-run tests
         LOG.info("Re-running test suite (attempt %d/%d, changed scope)...",
                  test_attempts + 1, max_retry)
-        test_result = run_tests(worktree_path, scope="changed")
-        report["steps"]["tests"].append({
-            "attempt": test_attempts + 1,
-            "success": test_result["success"],
-            "failures": test_result.get("failures", []),
-            "skipped": test_result.get("skipped", False),
-            "tooling": test_result.get("tooling"),
-            "scope": test_result.get("scope", "changed"),
-        })
+        test_result, gate_tree = run_gate_suite(worktree_path, scope="changed")
+        report["steps"]["would_be_commit"] = gate_tree
+        report["steps"]["tests"].append(
+            _gate_attempt_record(test_attempts + 1, test_result)
+        )
 
     if not test_result["success"]:
         msg = (
@@ -4614,7 +8338,7 @@ def phase_finish(
         report["message"] = msg
         wl_add_comment(work_item_id, msg)
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
@@ -4622,6 +8346,16 @@ def phase_finish(
         else:
             LOG.error(msg)
         return report
+
+    # Working-tree churn attributed to a concurrent session is excluded from
+    # the guard's verdict but is never silent: surface the note in the finish
+    # output and the JSON report so the operator can tell an excluded foreign
+    # change from a clean run (SA-0MUIJAHXS003M7BG AC3).
+    excluded_churn = list(test_result.get("live_repo_excluded") or [])
+    if excluded_churn:
+        report["live_repo_excluded"] = excluded_churn
+        for note in excluded_churn:
+            LOG.info("Live-repo guard note: %s", note)
 
     # ── Step 3b: Full-suite coverage moved to the dev-push gate ─────
     # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) No
@@ -4635,17 +8369,105 @@ def phase_finish(
     # main-checkout `.worklog/cache` that post-push verification and the
     # audit skill consume read-only. Running the full suite here instead
     # would (a) burn a slot for the whole suite duration per work item,
-    # (b) cache the result under a pre-commit dirty git-state fingerprint
-    # that no later consumer ever looks up, and (c) duplicate the push
-    # gate.
+    # (b) record a verdict no later consumer could safely reuse — before the
+    # gate was tree-bound it was cached under a pre-commit dirty git-state
+    # fingerprint (the verdict is now keyed by the would-be-commit tree SHA,
+    # SA-0MVQHVHXI007PQAB, but the dev-push gate still runs the full suite on
+    # the pushed commit), and (c) duplicate the push gate.
     LOG.info("Changed-scope validation passed — full suite deferred to the dev-push gate")
 
+    # ── Step 3c: Single-owner main-checkout lock (WL-0MVPADZ1Z000FOSG AC5) ─
+    # Everything from the commit onwards operates on the main checkout, so
+    # exactly one finish per checkout may hold this critical section at a
+    # time. The lock is an advisory flock — no measurable latency when free,
+    # kernel-released when the holder dies, and recorded in the report for
+    # observability. The wait is bounded by ``IMPLEMENT_FINISH_LOCK_TIMEOUT``
+    # (default 0 = fail fast), so a concurrent finish never hangs this one.
+    lock_timeout = _finish_lock_timeout()
+    lock_fd, lock_refusal = acquire_main_checkout_lock(
+        repo_root, work_item_id, timeout=lock_timeout
+    )
+    report["steps"]["main_checkout_lock"] = {
+        "lock_path": str(_main_checkout_lock_path(repo_root)),
+        "acquired": lock_fd is not None,
+        "acquired_at": (
+            datetime.now(timezone.utc).isoformat() if lock_fd is not None else None
+        ),
+        "timeout_seconds": lock_timeout,
+        "holder": lock_refusal if lock_fd is None else None,
+    }
+    if lock_fd is None:
+        # The helper's refusal is already actionable: it names the lock path,
+        # the holder and the recovery step, and states the bounded wait that
+        # expired when a timeout was configured.
+        msg = lock_refusal or (
+            f"Another run holds the main-checkout lock "
+            f"({report['steps']['main_checkout_lock']['lock_path']}). "
+            f"Aborting without modifying the checkout or the work item — "
+            f"re-run finish once the holder completes."
+        )
+        report["success"] = False
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            LOG.error(msg)
+        return report
+
     try:
-        with StatusLifecycle(work_item_id, target_stage="in_review"):
+        # Assignee release is the helper's default, but it only ever clears an
+        # assignee the context manager holds — so finish declares the agent
+        # claim it owns here and releases it with the terminal
+        # ``completed``/``in_review`` transition. A producer hold on the item
+        # is therefore never wiped by finishing it (SA-0MVVF6OJY000JZBL).
+        with StatusLifecycle(
+            work_item_id,
+            assignee=os.environ.get("IMPLEMENT_AGENT_NAME") or "implement",
+            target_stage="in_review",
+        ):
+            # ── Step 3d: Prove the real index matches the tested tree ─────
+            # The gate ran against a temporary index. Stage the change set in
+            # the real index exactly as ``git_commit`` does and assert its
+            # ``write-tree`` equals the tree the suite ran against, so no
+            # commit can be created for a tree that was never tested. On a
+            # mismatch ``stage_tested_tree`` unstages again and raises below,
+            # leaving the abort contract intact (SA-0MVQHVGFR006W8LG).
+            if gate_tree.get("available", True):
+                staged = stage_tested_tree(worktree_path, gate_tree.get("tree"))
+            else:
+                # No repository, no commit tree: the gate recorded why the
+                # verification was unavailable (SA-0MVVKJGKP003QVNM).
+                staged = {
+                    "success": True,
+                    "skipped": True,
+                    "verified": False,
+                    "reason": gate_tree.get("reason"),
+                    "notice": gate_tree.get("notice", ""),
+                }
+            report["steps"]["would_be_commit_assertion"] = staged
+            if not staged["success"]:
+                raise RuntimeError(staged["message"])
+            if staged.get("skipped"):
+                LOG.warning(
+                    "Finish gate tree verification skipped: %s",
+                    staged.get("notice", ""),
+                )
+            else:
+                LOG.info(
+                    "Finish gate tree verified: committing tree %s",
+                    staged["tree"],
+                )
+
             # ── Step 4: Commit ─────────────────────────────────────────────
             commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"
             LOG.info("Committing changes...")
             if not git_commit(worktree_path, commit_msg):
+                # AC5 (LP-0MVWEP1MM0097RAT): structured steps entry so the
+                # classifier never needs the ``report["message"]`` prose.
+                report["steps"]["commit"] = {
+                    "success": False,
+                    "reason": "commit_failed",
+                }
                 raise RuntimeError("git commit failed")
 
             commit_hash = git_get_commit_hash(worktree_path)
@@ -4655,66 +8477,43 @@ def phase_finish(
             }
             LOG.info("Committed at %s", commit_hash)
 
-            # ── Step 5: Fast-forward dev in the main checkout ──────────────
+            # ── Step 5: Verified, reversible local-dev fast-forward ───────
             # Before removing the worktree, bring the main checkout's local
-            # dev branch up to the new commit (AC1).  This ensures that when
-            # the pre-push hook measures the working tree (which is the main
+            # dev branch up to the new commit. This ensures that when the
+            # pre-push hook measures the working tree (which is the main
             # checkout at push time), it sees the updated files — so
             # context-budget compliant commits that modify AGENTS.md etc. no
             # longer trigger the stale-checkout failure.
-            repo_root = (
-                state.repo_root
-                if state
-                else (_get_repo_root() or str(Path.cwd().resolve()))
+            # ``repo_root`` was resolved (stale state rejected) at Step 0.75.
+            #
+            # The advance is *loud and reversible* (SA-0MVPZG7A0000N66U AC1):
+            # it is recorded in the report, undoable on push failure (restore
+            # to refs/remotes/origin/dev), and refuses loudly — naming the
+            # refs and hashes — instead of the previous silent
+            # ``except Exception`` whenever it cannot fast-forward safely.
+            # The commit is inherently unpublishable at this point, so the
+            # post-push ancestry assertion (Step 6a) is the authority on
+            # whether it actually landed.
+            LOG.info(
+                "Fast-forwarding dev in main checkout (%s) to %s ...",
+                repo_root,
+                commit_hash,
             )
-            try:
-                LOG.info(
-                    "Fast-forwarding dev in main checkout (%s) to %s ...",
-                    repo_root,
-                    commit_hash,
-                )
-                # 1. Fetch latest origin/dev so our local-tracking ref is current.
-                fetch_result = run_cmd(
-                    ["git", "fetch", "origin", "dev"], cwd=repo_root,
-                )
-                if fetch_result.returncode != 0:
-                    raise RuntimeError(
-                        f"git fetch origin dev failed: {fetch_result.stderr.strip()}"
-                    )
-                # 2. Ensure the main checkout is on dev (and clean).
-                checkout_result = run_cmd(
-                    ["git", "checkout", "dev"], cwd=repo_root,
-                )
-                if checkout_result.returncode != 0:
-                    raise RuntimeError(
-                        f"git checkout dev failed: {checkout_result.stderr.strip()}"
-                    )
-                # 3. Fast-forward origin/dev → local dev (synchronises with any
-                #    concurrent pushes before we merge our commit).
-                merge_origin_result = run_cmd(
-                    ["git", "merge", "--ff-only", "origin/dev"], cwd=repo_root,
-                )
-                if merge_origin_result.returncode != 0:
-                    raise RuntimeError(
-                        f"git merge origin/dev failed (non-fast-forward or conflict): "
-                        f"{merge_origin_result.stderr.strip()}"
-                    )
-                # 4. Fast-forward our new commit onto dev.
-                merge_commit_result = run_cmd(
-                    ["git", "merge", "--ff-only", commit_hash], cwd=repo_root,
-                )
-                if merge_commit_result.returncode != 0:
-                    raise RuntimeError(
-                        f"git merge --ff-only {commit_hash} failed: "
-                        f"{merge_commit_result.stderr.strip()}"
-                    )
-                LOG.info("Fast-forward to %s succeeded", commit_hash)
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning(
-                    "Fast-forward dev failed (%s); push will proceed from the "
-                    "stale checkout — the context-budget gate may reject the push.",
-                    exc,
-                )
+            local_dev_fast_forward = _fast_forward_local_dev_for_push(
+                repo_root, commit_hash, parent_branch
+            )
+            report["steps"]["local_dev_fast_forward"] = local_dev_fast_forward
+            main_checkout_guard["own_churn"] = list(
+                local_dev_fast_forward.get("own_churn") or []
+            )
+
+            # ── Step 5b: Main-checkout guard verify (pre-push) ───────────
+            # A foreign mutation of the main checkout must abort before the
+            # push, never be carried along by finish's own fast-forward and
+            # push.
+            _abort_on_main_checkout_violation(
+                "pre_push", main_checkout_guard["own_churn"]
+            )
 
             # ── Step 6: Push to dev ────────────────────────────────────────
             # The push runs *before* the worktree is removed: a
@@ -4729,20 +8528,46 @@ def phase_finish(
                     raise RuntimeError("git push to dev failed.")
             except PushTimeoutError as exc:
                 # AC3: recoverable state — commit is safe, branch info retained.
-                # Post a manual-push comment and re-raise so the outer handler
-                # resets status to open.
+                # Restore local dev off the unpushed commit (AC1) so the next
+                # finish/sibling does not fork from a base origin/dev lacks,
+                # post a manual-push comment, and re-raise so the outer
+                # handler resets status to open.
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": "timeout",
+                    "hash": commit_hash,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
                 wl_add_comment(
                     work_item_id,
                     f"Push to dev timed out after {exc.timeout}s (pre-push hook "
                     f"still running, likely the full test suite). Commit "
                     f"{exc.commit_hash} is local on branch {exc.branch}.\n"
+                    f"Local dev was restored to origin/dev (the commit stays "
+                    f"on its feature branch).\n"
                     f"Push manually: git push origin {exc.branch}:refs/heads/dev",
                 )
                 raise RuntimeError(f"git push to dev timed out: {exc}") from exc
             except PushNonFastForwardError as exc:
-                # AC1/AC2/AC3: dev advanced concurrently — rebase and retry
-                # inside the (still-present) worktree instead of losing the
-                # completed implementation.
+                # AC1/AC2/AC3: dev advanced concurrently — restore local dev
+                # (it must never point at the unpushed commit), then rebase
+                # and retry inside the (still-present) worktree instead of
+                # losing the completed implementation. The ancestry assertion
+                # below re-checks the rebased replacement hash.
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": "non_fast_forward",
+                    "hash": commit_hash,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
                 LOG.info(
                     "Push failed (non-fast-forward); attempting rebase and retry "
                     "...",
@@ -4757,45 +8582,147 @@ def phase_finish(
                 )
                 # The rebase rewrote HEAD; keep the reported commit in sync.
                 report["steps"]["commit"]["hash"] = commit_hash
-
-            report["steps"]["push"] = {"success": True, "hash": commit_hash}
+                report["steps"]["push"] = {
+                    "success": True,
+                    "recovered": "non_fast_forward",
+                    "hash": commit_hash,
+                }
+            except RuntimeError:
+                # A generic push failure: nothing reached origin. Undo our own
+                # fast-forward so local dev never stays on the unpushed commit
+                # (the exact orphan that made the next finish fork from a base
+                # origin/dev did not have).
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": "push_failed",
+                    "hash": commit_hash,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
+                raise
+            else:
+                report["steps"]["push"] = {
+                    "success": True,
+                    "hash": commit_hash,
+                }
             LOG.info("Push to dev succeeded")
 
-            # ── Step 6b: Clean up worktree processes ───────────────────────
-            # Runs *after* the push (historically it ran before, at Step 5b):
-            # a cleanup that misbehaves can no longer pre-empt the push,
-            # which is the failure mode that stranded commits local-only
-            # (SA-0MVJC5KNT0044L2B). The cleanup still precedes the worktree
-            # removal so stray sessions holding cwd in the tree do not block
-            # ``git worktree remove``. cleanup_worktree_processes itself is
-            # additionally self-exclusion-safe (see its docstring).
-            LOG.info("Cleaning up worktree processes...")
-            cleanup_result = cleanup_worktree_processes(worktree_path)
-            report["steps"]["cleanup"] = cleanup_result
-            if cleanup_result.get("warning"):
-                LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
+            # ── Step 6a: Post-push ancestry assertion (AC2) ───────────────
+            # The push's return value is not trusted on its own: finish may
+            # only report success when its own commit (including a rebased
+            # replacement hash) is an ancestor of the pushed origin/dev tip
+            # (SA-0MVPZG7A0000N66U AC2). The assertion fails closed — raising
+            # `AncestryAssertionError` here keeps the worktree and the feature
+            # branch, leaves the work item un-advanced, and is reported by the
+            # outer handler with the commit hash.
+            report["steps"]["ancestry_assertion"] = _assert_commit_on_origin_dev(
+                repo_root,
+                commit_hash,
+                parent_branch=parent_branch,
+                branch=branch,
+                worktree_path=worktree_path,
+            )
 
-            # ── Step 7: Remove worktree ───────────────────────────────────
+            # ── Step 6b: Worktree removal ownership ───────────────────────
+            # One owner per worktree (SA-0MVTE8XAJ002IUDR): a driven child
+            # session's worktree belongs to the driver (removed once that
+            # session has exited), and ``--keep-worktree`` /
+            # ``IMPLEMENT_KEEP_WORKTREE=1`` hands ownership to the caller.
+            # Removing it here would delete the finishing session's own cwd
+            # and leave it unable to run any later command.
+            defer_removal, defer_reason = _should_defer_worktree_removal(
+                keep_worktree
+            )
+            report["steps"]["worktree_removal"] = {
+                "deferred": defer_removal,
+                "reason": defer_reason,
+                "worktree_path": worktree_path,
+            }
+            # The follow-up surface for a retained tree (SA-0MVTHJ3PJ000IVSK
+            # AC2): the report names the path, the reason and the exact
+            # reviewed cleanup action. Empty on the default (non-deferred)
+            # path, where finish has already removed the tree itself.
+            report["steps"]["worktree_cleanup"] = {
+                "deferred": defer_removal,
+                "path": worktree_path,
+                "reason": defer_reason,
+                "command": (
+                    _worktree_cleanup_command(work_item_id)
+                    if defer_removal
+                    else ""
+                ),
+            }
+
+            if defer_removal:
+                # Keep the tree, its branch and .implement_state.json: the
+                # session keeps working and a resume can re-enter it. The
+                # deferral is never silent — the report, a log line and the
+                # completion comment all name the retained path.
+                report["steps"]["worktree_removed"] = False
+                LOG.info(
+                    "Worktree removal deferred (%s); retained at %s.\n"
+                    "  The driver removes it for a driven child session; "
+                    "otherwise remove it yourself once this session is "
+                    "finished with it:\n"
+                    "  git worktree remove %s && git worktree prune",
+                    defer_reason,
+                    worktree_path,
+                    worktree_path,
+                )
+            else:
+                # ── Step 6b: Clean up worktree processes ──────────────────
+                # Runs *after* the push (historically it ran before, at Step
+                # 5b): a cleanup that misbehaves can no longer pre-empt the
+                # push, which is the failure mode that stranded commits
+                # local-only (SA-0MVJC5KNT0044L2B). The cleanup still
+                # precedes the worktree removal so stray sessions holding cwd
+                # in the tree do not block ``git worktree remove``.
+                # cleanup_worktree_processes itself is additionally
+                # self-exclusion-safe (see its docstring).
+                LOG.info("Cleaning up worktree processes...")
+                cleanup_result = cleanup_worktree_processes(worktree_path)
+                report["steps"]["cleanup"] = cleanup_result
+                if cleanup_result.get("warning"):
+                    LOG.warning(
+                        "Process cleanup warning: %s", cleanup_result["warning"]
+                    )
+
+            # ── Step 6c: Main-checkout guard verify (pre-removal) ────────
+            # Re-verify once more before tearing the worktree down: a
+            # mutation that appeared during the push (e.g. the pre-push
+            # hook) must still abort loudly instead of being left silently
+            # in place. Runs on the deferred path too — the guard is about
+            # the main checkout, not the worktree.
+            _abort_on_main_checkout_violation(
+                "pre_worktree_removal", main_checkout_guard["own_churn"]
+            )
+
+            # ── Step 7: Remove worktree (unless deferred) ─────────────────
             # Only after a successful push — a failed push keeps the
             # worktree so the recovery rebase and manual recovery remain
             # possible (WL-0MV533YSW004D1E1).
-            LOG.info("Removing worktree...")
-            remove_state(worktree_path)
-            if not _remove_worktree(
-                worktree_path,
-                repo_root=state.repo_root if state else None,
-            ):
-                msg = f"Failed to remove worktree at {worktree_path}"
-                LOG.warning(msg)
-                report["steps"]["worktree_removed"] = False
+            if not defer_removal:
+                LOG.info("Removing worktree...")
+                remove_state(worktree_path)
+                report["steps"]["worktree_removed"] = bool(
+                    _remove_worktree(
+                        worktree_path,
+                        repo_root=repo_root,
+                    )
+                )
+                if not report["steps"]["worktree_removed"]:
+                    LOG.warning(
+                        "Failed to remove worktree at %s", worktree_path
+                    )
 
             # ── Step 8: Sync local parent branch (AC1 / AC2) ──────────────
             # After a successful push, bring the main checkout's local
             # parent branch (dev) up to date so the next child worktree
             # does not start from a stale base.
-            sync_parent_branch = (
-                state.parent_branch if state else DEFAULT_PARENT_BRANCH
-            )
+            sync_parent_branch = parent_branch
             LOG.info("Syncing local parent branch %s...", sync_parent_branch)
             sync_result = _sync_parent_branch(repo_root, sync_parent_branch)
             report["steps"]["sync_parent_branch"] = sync_result
@@ -4819,9 +8746,21 @@ def phase_finish(
         msg = str(e)
         report["success"] = False
         report["message"] = msg
+        # AC5 (LP-0MVWEP1MM0097RAT): every finish failure exit records a
+        # structured steps entry so no classification path depends on
+        # ``report["message"]`` prose. Specific steps (push, commit, ancestry,
+        # guard) already record their own entries where they are raised; a
+        # generic runtime error that escapes without one is recorded under
+        # ``finish`` and classifies as ``unknown`` (fail-safe — never
+        # ``infrastructure``).
+        report["steps"]["finish"] = {
+            "success": False,
+            "reason": "runtime_error",
+            "exception": type(e).__name__,
+        }
         # Status was restored to original by StatusLifecycle; override to open
         try:
-            StatusLifecycle.update_status(work_item_id, "open")
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if "git push to dev failed" in msg or "git push to dev timed out" in msg:
@@ -4836,17 +8775,96 @@ def phase_finish(
             )
         elif "git commit failed" in msg:
             wl_add_comment(work_item_id, "Commit failed during finish phase.")
+        elif isinstance(e, AncestryAssertionError):
+            # AC2: the push claimed success but the commit never reached
+            # origin/dev. Record the refusal (and the retained recovery
+            # state) on the work item; the status reset above keeps it open.
+            # AC5 (LP-0MVWEP1MM0097RAT): the exit that previously carried no
+            # structured steps entry now records one under
+            # ``ancestry_assertion`` (classifies as ``infrastructure``,
+            # matching the parent epic's allow-list).
+            report["steps"]["ancestry_assertion"] = {
+                "success": False,
+                "reason": "ancestry_failed",
+                "commit": e.resolved_commit or e.commit_hash,
+                "target_ref": e.target_ref,
+                "target_tip": e.target_tip,
+            }
+            wl_add_comment(
+                work_item_id,
+                "Finish refused: ancestry assertion failed.\n"
+                f"- Commit: {e.resolved_commit or e.commit_hash}\n"
+                f"- Target: {e.target_ref} (tip {e.target_tip or 'unresolved'})\n"
+                f"- Reason: {e.reason}\n"
+                f"- Branch: {branch} (retained)\n"
+                f"- Worktree: {worktree_path} (retained)\n"
+                "The work item stays open; re-run finish once the commit is "
+                "pushed (rebase onto the remote branch if the push is "
+                "rejected).",
+            )
         if json_output:
             print(format_json_output(report))
         else:
             LOG.error(msg)
         return report
+    except Exception as exc:
+        # An *unexpected* failure (not one of the classified RuntimeErrors
+        # above) already had its original status restored by
+        # ``StatusLifecycle.__exit__`` — but for a finishing item that
+        # original status is ``in-progress``, so the claim would survive the
+        # crash on its scheduling hold. Release it durably before reporting
+        # (SA-0MVVF75ZA007XNKB). The conditional reset never clobbers an item
+        # that already reached a terminal state.
+        report["unexpected_error"] = f"{type(exc).__name__}: {exc}"
+        report["success"] = False
+        report["message"] = f"Unexpected error during finish: {exc}"
+        LOG.exception(
+            "Unexpected error during finish of %s", work_item_id,
+        )
+        try:
+            _safety_reset_if_in_progress(work_item_id)
+        except RuntimeError:
+            LOG.error(
+                "Failed to release the claim on %s after an unexpected "
+                "error",
+                work_item_id,
+            )
+        if json_output:
+            print(format_json_output(report))
+        return report
+    finally:
+        # Released on EVERY exit path from the critical section (success,
+        # RuntimeError, or an escaping exception): the kernel also releases
+        # the flock if this process dies.
+        _release_main_checkout_lock(lock_fd)
 
     # ── Step 9: Add completion comment ─────────────────────────────
-    wl_add_comment(
-        work_item_id,
-        f"Implementation complete.\n- Commit: {commit_hash}\n- Branch: {branch}\n- Worktree: {worktree_path}",
+    # The comment carries the gate's verdict provenance (tree path, tree
+    # fingerprint, cache flag and, for a cache-served verdict, the entry
+    # metadata) so the accepted green is attributable from the work item alone
+    # (SA-0MVQHVJEX0071R7G).
+    verdict_lines = "\n".join(_verdict_provenance_lines(report))
+    completion_comment = (
+        f"Implementation complete.\n- Commit: {commit_hash}\n"
+        f"- Branch: {branch}\n- Worktree: {worktree_path}\n{verdict_lines}"
     )
+    removal_step = report["steps"].get("worktree_removal") or {}
+    if removal_step.get("deferred"):
+        # Never let a deferred cleanup disappear: name the retained tree, the
+        # reason and the exact remedy on the work item itself
+        # (SA-0MVTE8XAJ002IUDR AC2).
+        completion_comment += (
+            f"\n- Worktree retained (deferred removal: "
+            f"{removal_step.get('reason', 'unknown')}).\n"
+            f"  A driven child session's worktree is removed by "
+            f"`implement.py drive` once the session exits. Otherwise remove "
+            f"it as the LAST command, once this session no longer needs its "
+            f"cwd:\n"
+            f"  {_worktree_cleanup_command(work_item_id)}\n"
+            f"  manual fallback: git worktree remove {worktree_path} && "
+            f"git worktree prune"
+        )
+    wl_add_comment(work_item_id, completion_comment)
 
     report["success"] = True
     report["hash"] = commit_hash
@@ -4862,6 +8880,22 @@ def phase_finish(
         print(f"  Commit: {commit_hash}")
         print(f"  Branch: {branch}")
         print("  Status: in_review")
+        if removal_step.get("deferred"):
+            # A retained tree is an outstanding action, never a silent one
+            # (SA-0MVTHJ3PJ000IVSK AC2): name the path, the reason and the
+            # exact command that finishes the job.
+            print(
+                "  Worktree retained: "
+                f"{removal_step.get('worktree_path', worktree_path)}"
+            )
+            print(
+                "  Deferred removal: "
+                f"{removal_step.get('reason', 'unknown')}"
+            )
+            print(
+                "  Remove it as your LAST command: "
+                f"{_worktree_cleanup_command(work_item_id)}"
+            )
         print()
 
     # Surface the project-local prose hook after the final step.
@@ -4915,7 +8949,7 @@ def phase_abort(
     # ── Step 1: Reset status ───────────────────────────────────────
     LOG.info("Resetting work item %s status to open...", work_item_id)
     try:
-        StatusLifecycle.update_status(work_item_id, "open")
+        StatusLifecycle.update_status(work_item_id, "open", assignee="")
     except RuntimeError:
         LOG.error("Failed to reset work item %s status to open", work_item_id)
 
@@ -4924,6 +8958,13 @@ def phase_abort(
 
     # ── Step 2: Find and cleanup worktree ──────────────────────────
     worktree_path = _discover_worktree(work_item_id)
+    # Resolve the MAIN checkout root *before* the worktree is torn down: the
+    # stale-state rejection needs the worktree to exist, and aborting from
+    # inside the worktree must restore the main checkout, never the worktree
+    # (MS-0MVM7NJF70037YU4).
+    repo_root = _resolve_main_repo_root(
+        worktree_path, read_state(worktree_path) if worktree_path else None
+    )
     if worktree_path and Path(worktree_path).exists():
         LOG.info("Cleaning up worktree at %s...", worktree_path)
         cleanup_worktree_processes(worktree_path)
@@ -4932,7 +8973,6 @@ def phase_abort(
         report["worktree_path"] = worktree_path
 
     # ── Step 3: Restore repo state ─────────────────────────────────
-    repo_root = str(Path.cwd().resolve())
     _restore_repo_state(repo_root)
 
     # ── Step 4: Log comment ────────────────────────────────────────
@@ -4945,6 +8985,293 @@ def phase_abort(
     else:
         print(f"\n✅ Implementation aborted for {work_item_id}. Worktree cleaned up.\n")
 
+    return report
+
+
+#: Statuses that permit :func:`phase_cleanup` to remove a worktree.
+#:
+#: Deliberately narrower than :data:`TERMINAL_STATUSES`: the post-finish
+#: cleanup contract is "the item has finished" (``completed`` /
+#: ``in_review``), not "the item is terminal for parent advancement" (which
+#: also covers ``done`` and soft-``deleted`` items whose trees nobody asked
+#: this action to remove).
+CLEANUP_REMOVABLE_STATUSES = frozenset({"completed", "in_review"})
+
+
+def _resolve_cleanup_worktree(
+    work_item_id: str, worktree_path: str | None = None
+) -> str | None:
+    """Resolve the worktree :func:`phase_cleanup` should act on.
+
+    Resolution order (the work item's contract):
+
+    1. **``.implement_state.json``** — the state file next to the candidate
+       path (``--worktree-path``) or in the current directory, provided it
+       records *this* work item. The state file is the authoritative record
+       of which tree belongs to which item, so it wins over a bare override.
+    2. **``--worktree-path``** — the operator's explicit override.
+    3. **:func:`_discover_worktree`** — the usual scan of
+       ``.worklog/worktrees/wl-<id>-*``.
+
+    Args:
+        work_item_id: The work item that owns the tree.
+        worktree_path: The ``--worktree-path`` override, if any.
+
+    Returns:
+        Absolute worktree path, or None when none can be resolved.
+    """
+    candidates: list[str] = []
+    if worktree_path:
+        candidates.append(str(Path(worktree_path).expanduser().resolve()))
+    try:
+        cwd = str(Path.cwd().resolve())
+    except OSError:  # pragma: no cover - cwd already gone
+        cwd = ""
+    if cwd and cwd not in candidates:
+        candidates.append(cwd)
+
+    for candidate in candidates:
+        if not (Path(candidate) / STATE_FILE_NAME).exists():
+            continue
+        # A state file records which item owns the tree: a candidate whose
+        # state belongs to a *different* item is not this item's worktree.
+        candidate_state = read_state(candidate)
+        if candidate_state is None or candidate_state.work_item_id == work_item_id:
+            return candidate
+    if worktree_path:
+        # No state file anywhere: the explicit override is the best
+        # information available (an already-absent tree still needs clearing).
+        return str(Path(worktree_path).expanduser().resolve())
+    return _discover_worktree(work_item_id)
+
+
+def phase_cleanup(
+    work_item_id: str,
+    json_output: bool = False,
+    verbose: bool = False,
+    worktree_path: str | None = None,
+) -> dict[str, Any]:
+    """Remove a finished item's worktree — the session's final bash command.
+
+    **Ordering contract: run this as the session's LAST bash command.**
+    Removal deletes the tree the invoking session stands in (the plain leaf
+    flow's cwd *is* the worktree), so nothing that needs the worktree cwd may
+    follow it: every later command would fail with a deleted cwd. Write the
+    worklog comment, render the report and run any post-push verification
+    first, then call this action last.
+
+    Gates, in order — a failure at any of them **retains** the tree and is
+    reported (never forced past, never silent):
+
+    1. resolve the worktree (:func:`_resolve_cleanup_worktree`); none found →
+       ``retained_no_worktree``,
+    2. the work item must be ``completed`` / ``in_review``
+       (:data:`CLEANUP_REMOVABLE_STATUSES`) → otherwise
+       ``retained_non_terminal``,
+    3. the resolved path must not be the main checkout → otherwise
+       ``retained_main_checkout``,
+    4. an existing path must actually be a git worktree (``.git`` is a
+       *file*), so an arbitrary directory is never handed to a removal
+       mechanism → otherwise ``retained_no_worktree``,
+    5. the tree must hold no uncommitted work → otherwise
+       ``retained_dirty``.
+
+    Removal itself is :func:`_remove_finished_worktree` — the single removal
+    path shared with the driver (``cleanup_worktree_processes`` →
+    ``_remove_worktree`` → ``remove_state``), so this action adds **no** new
+    deletion mechanism and never passes ``--force`` past a gate.
+
+    Idempotent by construction: an already-absent tree is a reported no-op
+    success (``already_absent``) that still clears a stale state file, so an
+    interrupted workflow can simply be re-run.
+
+    Args:
+        work_item_id: The work item that owns the worktree.
+        json_output: Emit JSON instead of human-readable lines.
+        verbose: Unused; kept for CLI symmetry.
+        worktree_path: Optional ``--worktree-path`` override.
+
+    Returns:
+        A report dict with ``removed``, ``path``, ``already_absent``,
+        ``retained_dirty``, ``retained_non_terminal``,
+        ``retained_no_worktree``, ``retained_main_checkout``,
+        ``removed_state``, ``reason``, ``remedy`` and ``message``. Retained is
+        a reported outcome (``success`` stays true); only an unexpected
+        removal failure reports ``success: false``. ``removed_state`` means
+        "no ``.implement_state.json`` remains at ``path``" — true for a
+        successful removal *and* for an already-absent tree (the stale state
+        file, if any, is cleared either way).
+    """
+    report: dict[str, Any] = {
+        "phase": "cleanup",
+        "work_item_id": work_item_id,
+        "success": True,
+        "path": "",
+        "removed": False,
+        "already_absent": False,
+        "retained_dirty": False,
+        "retained_non_terminal": False,
+        "retained_no_worktree": False,
+        "retained_main_checkout": False,
+        "retained_other_item": False,
+        "removed_state": False,
+        "reason": "",
+        "remedy": "",
+        "message": "",
+    }
+
+    # ── Step 1: Resolve the worktree ───────────────────────────────
+    path = _resolve_cleanup_worktree(work_item_id, worktree_path)
+    report["path"] = path or ""
+    if not path:
+        report["retained_no_worktree"] = True
+        report["message"] = (
+            f"No worktree found for {work_item_id}; nothing to clean up."
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\nℹ️  No worktree found for {work_item_id}; nothing to clean up.\n"
+        )
+        return report
+
+    # ── Step 2: Terminal gate ──────────────────────────────────────
+    item = wl_show(work_item_id)
+    status = str((item or {}).get("status", "") or "")
+    if status not in CLEANUP_REMOVABLE_STATUSES:
+        report["retained_non_terminal"] = True
+        report["reason"] = f"work item status is '{status or 'unknown'}'"
+        report["message"] = (
+            f"Worktree at {path} retained: work item {work_item_id} is "
+            f"'{status or 'unknown'}', not completed/in_review.\n"
+            f"  Re-run once the item is finished: "
+            f"python3 skill/implement/scripts/implement.py cleanup "
+            f"{work_item_id}"
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\n⚠️  {report['message']}\n"
+        )
+        return report
+
+    # ── Step 2b: The tree must belong to this work item ────────────
+    # A state file written for a different item (e.g. the session's own
+    # worktree while ``--worktree-path`` names another) must never authorise
+    # deleting someone else's work.
+    state = read_state(path) if Path(path).exists() else None
+    if state is not None and state.work_item_id and state.work_item_id != work_item_id:
+        report["retained_other_item"] = True
+        report["reason"] = f"worktree belongs to {state.work_item_id}"
+        report["remedy"] = (
+            f"run cleanup for {state.work_item_id}, or pass "
+            f"--worktree-path pointing at {work_item_id}'s own worktree"
+        )
+        report["message"] = (
+            f"Refusing to remove {path}: its {STATE_FILE_NAME} belongs to "
+            f"{state.work_item_id}, not {work_item_id}.\n  {report['remedy']}"
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\n⚠️  {report['message']}\n"
+        )
+        return report
+
+    # ── Step 3: Never treat the main checkout as a worktree ────────
+    repo_root = _resolve_main_repo_root(path, state)
+    report["repo_root"] = repo_root
+    if repo_root and Path(path).resolve() == Path(repo_root).resolve():
+        report["retained_main_checkout"] = True
+        report["reason"] = "resolved path is the main checkout"
+        report["remedy"] = (
+            "inspect .implement_state.json — a state file in the repository "
+            "root is a stale artifact, not a worktree"
+        )
+        report["message"] = (
+            f"Refusing to remove {path}: it resolves to the main checkout "
+            f"({repo_root}), not a worktree.\n  {report['remedy']}"
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\n⚠️  {report['message']}\n"
+        )
+        return report
+
+    # ── Step 3b: An existing path must really be a worktree ────────
+    # ``_remove_worktree`` falls back to a manual ``shutil.rmtree`` when
+    # ``git worktree remove`` fails and the target has no ``.git/``
+    # directory, so an arbitrary directory (or a tree whose registration was
+    # already pruned) must never reach it: ``.git`` is a *file* in a linked
+    # worktree and a *directory* in the main checkout.
+    if Path(path).is_dir() and not _is_worktree(Path(path)):
+        report["retained_no_worktree"] = True
+        report["reason"] = "path is not a git worktree"
+        report["remedy"] = (
+            f"inspect {path} (ls -la {path}/.git) — only a linked worktree "
+            f"may be removed automatically"
+        )
+        report["message"] = (
+            f"Refusing to remove {path}: it is not a git worktree "
+            f"(.git is a directory or absent).\n  {report['remedy']}"
+        )
+        print(
+            format_json_output(report)
+            if json_output
+            else f"\n⚠️  {report['message']}\n"
+        )
+        return report
+
+    # ── Step 4: Remove behind the shared gates ─────────────────────
+    LOG.info("Cleaning up worktree %s for %s...", path, work_item_id)
+    outcome = _remove_finished_worktree(work_item_id, path, repo_root)
+    report["removed"] = bool(outcome.get("removed"))
+    report["already_absent"] = bool(outcome.get("already_absent"))
+    report["retained_dirty"] = bool(outcome.get("retained_dirty"))
+    # "No state file remains at the path" — true after a removal and for an
+    # already-absent tree (``_remove_finished_worktree`` clears the stale file
+    # in both cases, so a repeat run can never resume a dead tree).
+    report["removed_state"] = not (Path(path) / STATE_FILE_NAME).exists()
+    report["reason"] = str(outcome.get("reason", ""))
+    if outcome.get("remedy"):
+        report["remedy"] = str(outcome["remedy"])
+
+    if report["removed"]:
+        report["message"] = f"Removed worktree at {path}."
+    elif report["already_absent"]:
+        report["message"] = (
+            f"Worktree at {path} was already absent; nothing to do."
+        )
+    elif report["retained_dirty"]:
+        # Actionable remedy: the exact inspection and removal commands.
+        report["remedy"] = (
+            f"git -C {path} status  # commit or discard the changes\n"
+            f"  git worktree remove {path} && git worktree prune"
+        )
+        report["message"] = (
+            f"Worktree at {path} retained: it has uncommitted changes "
+            f"(never discarded).\n  {report['remedy']}"
+        )
+    else:
+        if not outcome.get("refused"):
+            # ``refused`` is already a reported (safe) outcome; anything else
+            # that removed nothing is an unexpected failure.
+            report["success"] = False
+        report["remedy"] = report["remedy"] or (
+            f"git worktree remove {path} && git worktree prune"
+        )
+        report["message"] = (
+            f"Worktree at {path} was not removed ({report['reason'] or 'unknown'}).\n"
+            f"  {report['remedy']}"
+        )
+
+    if json_output:
+        print(format_json_output(report))
+    else:
+        print(
+            f"\n{'✅' if report['removed'] else 'ℹ️ '} {report['message']}\n"
+        )
     return report
 
 
@@ -5004,13 +9331,34 @@ def _invoke_implement(
     cmd = _build_implement_cmd(action, work_item_id, extra_flags=flags)
     LOG.debug("Subprocess: %s", " ".join(cmd))
     repo_root = _get_repo_root() or str(Path.cwd())
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=_resolve_test_timeout(repo_root),
-    )
+    # Propagate the holder chain's ownership token explicitly (AC4) so a
+    # subprocess that runs ``phase_start`` for the held child re-enters the
+    # lock instead of being falsely refused: the driver's own ``parent`` →
+    # ``start`` chain must never block on its own lock.
+    env = dict(os.environ)
+    token = _child_lock_token(env)
+    if token:
+        env[ENV_LOCK_TOKEN] = token
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_resolve_test_timeout(repo_root),
+            env=env,
+        )
+    except _SUBPROCESS_TIMEOUT_EXPIRED:
+        # A finish that overruns its bound is killed (``subprocess.run``
+        # SIGKILLs the child before raising), so the killed phase never runs
+        # its own release. Report the failure as ``None`` so the caller's
+        # failure path releases the orphaned claim instead of dying with a
+        # traceback (SA-0MVVF75ZA007XNKB).
+        LOG.error(
+            "Subprocess %s %s exceeded its timeout bound and was killed",
+            action, work_item_id,
+        )
+        return None
     if result.returncode != 0:
         LOG.error(
             "Subprocess failed (rc=%d): %s\nSTDERR: %s",
@@ -5033,16 +9381,23 @@ def _invoke_implement(
         return None
 
 
-def _has_worktree_changes(worktree_path: str) -> bool:
+def _has_worktree_changes(
+    worktree_path: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> bool:
     """Check if the worktree has uncommitted changes or commits ahead.
+
+    A worktree that is only *behind* the parent branch has no work and is
+    reported as clean.
 
     Args:
         worktree_path: Absolute path to the worktree.
+        parent_branch: Branch the worktree forked from (default: ``dev``).
 
     Returns:
-        True if the worktree is dirty or ahead of the parent branch.
+        True if the worktree is dirty or has commits ahead of the parent
+        branch.
     """
-    return _git_path_has_changes(Path(worktree_path), DEFAULT_PARENT_BRANCH)
+    return _git_path_has_changes(Path(worktree_path), parent_branch)
 
 
 def phase_parent(
@@ -5060,17 +9415,24 @@ def phase_parent(
     invocation of this phase advances the chain by one child:
 
     1. Fetch the parent and its children (``wl show --children``).
-    2. No children → behave like a leaf (no status change; use start/finish).
-    3. Resolve the dependency graph among children (outbound
+    2. Resolve the parent's **own** outbound (``depends-on``) edges and its
+       own status: an unmet same-project blocker, or ``status: blocked``,
+       yields a dedicated soft ``blocked`` verdict (``parent_blocked_by``,
+       no ``next_child``, no worktree) — the producer's sequencing hold is
+       never overridden (SA-0MVS1QS9J009DGPT).
+    3. No children → behave like a leaf (no status change; use start/finish).
+    4. Resolve the dependency graph among children (outbound
        ``wl dep list`` edges): in-chain blockers are implemented before
        the children they block; cycles fail fast; cross-project blockers
        are reported as coordination notes.
-    4. Classify children: terminal → skip; in_progress elsewhere → skip+report;
-       blocked by a non-terminal sibling → not startable (reported);
+    5. Classify children: terminal → skip; a live lock holder →
+       ``skipped-held`` (report the holder and stop cleanly); in_progress
+       elsewhere → skip+report; blocked by a non-terminal sibling or by a
+       same-project item outside the epic → not startable (reported);
        otherwise → implementable.
-    5. All children terminal → advance the parent to ``completed``/``in_review``
+    6. All children terminal → advance the parent to ``completed``/``in_review``
        (existing Step 5.1 advancement retained) and comment a per-child summary.
-    6. Otherwise → start the next startable child (claim + worktree via
+    7. Otherwise → start the next startable child (claim + worktree via
        ``phase_start``) and report the worktree path; the caller implements
        that child with the standard workflow (``implement.py finish
        <child>``), then re-invokes this phase for the next child.
@@ -5090,7 +9452,10 @@ def phase_parent(
     Returns:
         Dict with the recursion plan: per-child classifications, the next
         child started (with its worktree), or parent advancement when all
-        children are terminal.
+        children are terminal. When the invoked item is itself blocked, the
+        report carries ``blocked: true``, ``parent_blocked_by`` (blocker ids
+        and statuses), ``parent_blocked_reason`` and no ``next_child`` /
+        ``parent_advanced`` — a soft wait, not a failure (SA-0MVS1QS9J009DGPT).
     """
     report: dict[str, Any] = {
         "phase": "parent",
@@ -5140,6 +9505,85 @@ def phase_parent(
         return report
     children = wl_show_children(work_item_id)
 
+    # ── Step 3.5: Outbound (depends-on) gate for the invoked item ──
+    # The parent's OWN outbound edges and its own ``blocked`` status are
+    # producer sequencing decisions. Both are resolved BEFORE any child is
+    # classified, so a deliberately blocked epic can never have its first
+    # startable child started — which used to create a worktree and edit files
+    # a still-pending dependency owns (SA-0MVS1QS9J009DGPT). The verdict is a
+    # dedicated soft ``blocked`` report (``blocked``/``parent_blocked_by``, no
+    # ``next_child``, no ``parent_advanced``, ``success`` true), so callers can
+    # tell a legitimate wait from a hard failure. Assumption A1: a plain
+    # ``blocked`` status with no outbound edges also waits, mirroring
+    # ``wl next``'s blocked-item semantics.
+    outbound = _outbound_gate(work_item_id)
+    parent_status = str(parent.get("status", ""))
+    status_blocked = parent_status == "blocked"
+    if outbound["coordination_blockers"]:
+        LOG.info(
+            "Cross-project dependency note(s) for %s: %s",
+            work_item_id,
+            _format_blockers(outbound["coordination_blockers"]),
+        )
+        report["coordination_blockers"] = outbound["coordination_blockers"]
+    if outbound["blocked"] or status_blocked:
+        reasons = []
+        details = []
+        if outbound["blocked"]:
+            reasons.append(PARENT_BLOCKED_REASON_DEPENDENCY)
+            details.append(
+                "unmet outbound dependency: "
+                f"{_format_blockers(outbound['blockers'])}"
+            )
+        if status_blocked:
+            reasons.append(PARENT_BLOCKED_REASON_STATUS)
+            if outbound["blockers"]:
+                details.append("parent status is 'blocked'")
+            else:
+                # ``wl dep add`` sets ``status: blocked`` automatically and
+                # nothing clears it when the dependency completes, so a
+                # status with no unmet recorded dependency may be stale —
+                # never silently override it, but name the remedy.
+                details.append(
+                    "parent status is 'blocked' (no unmet recorded "
+                    f"dependency explains it; clear it with `wl update "
+                    f"{work_item_id} --status open` if the hold no longer "
+                    "applies)"
+                )
+        msg = (
+            f"{work_item_id} is blocked — " + " and ".join(details) + ". "
+            "No child was started and no worktree was created. Resolve the "
+            "blocker(s) (or clear the blocked status) and re-run."
+        )
+        LOG.warning(msg)
+        report["success"] = True  # soft stop: a blocked wait is not a failure
+        report["blocked"] = True
+        report["parent_blocked_by"] = outbound["blockers"]
+        report["parent_blocked_reason"] = "+".join(reasons)
+        report["parent_status"] = parent_status
+        # Classifications are skipped: every child is reported as held by the
+        # parent-level block, never as startable.
+        report["children"] = [
+            {
+                "id": str(child.get("id", "")),
+                "title": child.get("title", ""),
+                "status": child.get("status", ""),
+                "action": ACTION_BLOCKED_PARENT,
+            }
+            for child in children
+        ]
+        report["children_processed"] = []
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  \u26d4 {msg}")
+            print("=" * 60)
+            print()
+        return report
+
     # ── Step 4: No children → behave like a leaf ───────────────────
     if not children:
         report["leaf"] = True
@@ -5161,6 +9605,11 @@ def phase_parent(
     # ── Step 5: Classify children ──────────────────────────────────
     classifications: list[dict[str, Any]] = []
     blockers_map: dict[str, list[dict[str, Any]]] = {}
+    # Same-project blockers OUTSIDE the children set: they cannot be ordered
+    # within the epic, but they still gate the child (consistent with the
+    # ``phase_start`` leaf gate). Cross-project edges stay coordination notes
+    # (SA-0MSQBM2FK005NW1T).
+    out_of_chain_blocked: dict[str, list[dict[str, str]]] = {}
     for child in children:
         cid = str(child.get("id", ""))
         # Outbound (depends-on) edges: what this child is blocked by.
@@ -5169,11 +9618,22 @@ def phase_parent(
         # Blockers outside the children set (e.g. cross-project) are
         # coordination notes, not in-chain edges (SA-0MSQBM2FK005NW1T).
         in_chain_ids = {str(c.get("id")) for c in children}
+        out_of_chain = [
+            b for b in child_blockers if str(b.get("id")) not in in_chain_ids
+        ]
         external = [
             str(b.get("id"))
-            for b in child_blockers
-            if str(b.get("id")) not in in_chain_ids
+            for b in out_of_chain
+            if not _is_same_project(cid, str(b.get("id", "")))
         ]
+        unmet_same_project = [
+            _blocker_payload(b)
+            for b in out_of_chain
+            if _is_same_project(cid, str(b.get("id", "")))
+            and not _is_terminal_child(b)
+        ]
+        if unmet_same_project:
+            out_of_chain_blocked[cid] = unmet_same_project
         classifications.append({
             "id": cid,
             "title": child.get("title", ""),
@@ -5181,6 +9641,13 @@ def phase_parent(
             "action": _classify_child(child),
             "external_blockers": external,
         })
+        entry = classifications[-1]
+        if unmet_same_project:
+            entry["out_of_chain_blockers"] = unmet_same_project
+        if entry["action"] == ACTION_SKIPPED_HELD:
+            # Surface the live holder's identity so the operator can diagnose
+            # who owns the child (AC3).
+            entry["held_by"] = _probe_child_lock(cid)
     report["children"] = classifications
 
     # ── Step 5.5: Resolve dependency order (blockers first) ────────
@@ -5226,13 +9693,23 @@ def phase_parent(
 
     def _report_implement_next(
         cid: str, worktree_path: str, branch: str, message: str,
+        start_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Populate and return the report for a child awaiting implementation."""
+        if _forward_child_lock_reclamation(report, cid, start_result):
+            message = (
+                f"{message} {cid} lock reclaimed from a dead holder "
+                "(see warnings)."
+            )
         report["next_child"] = cid
         report["worktree_path"] = worktree_path
         report["branch"] = branch
         report["message"] = message
         report["children_processed"] = child_results
+        if blocked_ids:
+            # Surface the children that are still waiting so the operator can
+            # see which siblings the started child is not blocked behind.
+            report["blocked_children"] = list(blocked_ids)
         if json_output:
             print(format_json_output(report))
         else:
@@ -5243,6 +9720,8 @@ def phase_parent(
             print(f"  Worktree: {worktree_path}")
             if branch:
                 print(f"  Branch:   {branch}")
+            for warning in report.get("warnings") or []:
+                print(f"  ⚠ {warning}")
             print()
             print("  Next steps:")
             print(f"  1. cd {worktree_path}")
@@ -5277,18 +9756,38 @@ def phase_parent(
         return report
 
     def _run_finish(cid: str, title: str = "") -> dict[str, Any] | None:
-        """Run the finish subprocess for *cid* (None on failure)."""
+        """Run the finish subprocess for *cid* (None on failure).
+
+        ``parse_on_failure=True`` surfaces the ``finish`` report's structured
+        ``steps`` even when the subprocess exits non-zero, so a failing
+        ``finish`` is classified into ``{kind, step, reason}`` here — the
+        parent report carries it as ``finish_failure`` for the caller
+        (``phase_drive``). The ``None`` sentinel is preserved: a failure —
+        parsed report or not — still returns ``None``.
+        """
         LOG.info("Child %s has changes — running finish subprocess...", cid)
         finish_result = _invoke_implement(
             "finish", cid, no_refactor=no_refactor, verbose=verbose,
+            parse_on_failure=True,
         )
-        if finish_result is None:
+        if finish_result is None or not finish_result.get("success", False):
             msg = f"Failed to finish child {cid}"
             LOG.error(msg)
+            # A finish subprocess killed by its timeout bound (or by a signal
+            # that never reached a Python exit hook) leaves the child
+            # in-progress with nothing to release it. The surviving parent
+            # releases that orphaned claim durably before reporting the
+            # failure (SA-0MVVF75ZA007XNKB); a child whose own failure path
+            # already reset it is left untouched by the helper.
+            release = _release_orphaned_child_claim(cid)
+            if release.get("released"):
+                msg = f"{msg} ({release['reason']})"
             report["success"] = False
             report["message"] = msg
             report["next_child"] = cid
             report["finishing_failed"] = True
+            report["finish_failure"] = classify_finish_failure(finish_result)
+            report["orphaned_claim_release"] = release
             report["children_processed"] = child_results
             if json_output:
                 print(format_json_output(report))
@@ -5316,9 +9815,38 @@ def phase_parent(
             })
             continue
 
+        if action == ACTION_SKIPPED_HELD:
+            # A live holder owns this child's critical section. Stop cleanly
+            # with the holder's identity instead of spawning a second session
+            # (AC3) — never a concurrent second writer.
+            holder = _probe_child_lock(cid)
+            child_results.append({
+                "id": cid, "title": title,
+                "action": ACTION_SKIPPED_HELD,
+                "status": child.get("status", ""),
+                "held_by": holder,
+            })
+            report["success"] = True
+            report["action"] = ACTION_SKIPPED_HELD
+            report["skipped_held"] = True
+            report["held_by"] = holder
+            report.setdefault("held_children", []).append(cid)
+            report["message"] = (
+                f"Child {cid} is held by "
+                f"{_describe_child_lock_holder(holder)}; no second session "
+                f"was started. Re-run `implement.py parent {work_item_id}` "
+                "once the holder finishes."
+            )
+            report["children_processed"] = child_results
+            if json_output:
+                print(format_json_output(report))
+            else:
+                print(f"\n\u23f3 {report['message']}\n")
+            return report
+
         worktree_path = _discover_worktree(cid)
         has_changes = bool(
-            worktree_path and _has_worktree_changes(worktree_path)
+            worktree_path and _has_worktree_changes(worktree_path, parent_branch)
         )
 
         if action == "skip-in-progress":
@@ -5348,9 +9876,23 @@ def phase_parent(
                 })
             continue
 
-        # action == "implement" (child is open). A child is startable only
-        # when every in-chain blocker is already terminal (never before its
-        # blockers — AC-2).
+        # action == "implement" (child is open). A child whose same-project
+        # blocker lies OUTSIDE the epic cannot be ordered in-chain and must
+        # wait for it (the ``phase_start`` leaf gate would refuse anyway) —
+        # report it blocked instead of attempting a start that cannot succeed.
+        if out_of_chain_blocked.get(cid):
+            pending_ids.append(cid)
+            blocked_ids.append(cid)
+            child_results.append({
+                "id": cid, "title": title,
+                "action": "blocked",
+                "status": child.get("status", ""),
+                "blocked_by": out_of_chain_blocked[cid],
+            })
+            continue
+
+        # A child is startable only when every in-chain blocker is already
+        # terminal (never before its blockers — AC-2).
         if not all(b in terminal_ids for b in _in_chain_blockers(cid)):
             pending_ids.append(cid)
             blocked_ids.append(cid)
@@ -5403,6 +9945,7 @@ def phase_parent(
             cid, wt, start_result.get("branch", ""),
             f"Started child {cid}. Implement in {wt}, then "
             f"re-run `implement.py parent {work_item_id}`.",
+            start_result=start_result,
         )
 
     # ── Step 7: Advance only when every child is terminal ──────────
@@ -5430,8 +9973,12 @@ def phase_parent(
     already_terminal = _is_terminal_status(parent_status)
     if not already_terminal:
         try:
+            # Direct terminal durable write (phase_parent is not wrapped in a
+            # StatusLifecycle context manager): the release must stay explicit
+            # so the epic is never left on an agent hold (assignee-hold
+            # convention).
             StatusLifecycle.update_status(
-                work_item_id, "completed", stage="in_review"
+                work_item_id, "completed", stage="in_review", assignee=""
             )
         except RuntimeError:
             msg = f"Failed to advance parent {work_item_id}"
@@ -5488,8 +10035,9 @@ def _child_session_env(
 
     Marks the session as driver-owned (recursion guard), removes the
     parent session's identity so the child starts its own clean session,
-    and (when *worktree_path* is given) injects ``IMPLEMENT_WORKTREE_PATH``
-    so the child can verify its worktree root before its first edit.
+    propagates the per-child lock ownership token, and (when *worktree_path*
+    is given) injects ``IMPLEMENT_WORKTREE_PATH`` so the child can verify its
+    worktree root before its first edit.
 
     Args:
         base: Base environment (defaults to ``os.environ``).
@@ -5503,6 +10051,13 @@ def _child_session_env(
     env[DRIVE_RECURSION_ENV] = "1"
     env.pop("PI_SESSION_ID", None)
     env.pop("PI_SESSION_FILE", None)
+    # Explicit ownership propagation (AC4): the driven session runs
+    # ``start``/``finish`` for the same child id, so it must re-enter the
+    # holder chain's lock by token rather than be refused by it. Never a pid
+    # heuristic — a tokenless session is a different owner.
+    token = _child_lock_token(env)
+    if token:
+        env[ENV_LOCK_TOKEN] = token
     if worktree_path:
         env[WORKTREE_ENV] = worktree_path
     return env
@@ -5530,6 +10085,24 @@ def _resolve_child_session_timeout() -> int:
                 "Ignoring invalid IMPLEMENT_DRIVE_CHILD_TIMEOUT=%r", raw,
             )
     return DEFAULT_CHILD_SESSION_TIMEOUT
+
+
+def _drive_infra_backoff_delay(attempt: int) -> int:
+    """Bounded exponential backoff (seconds) for infrastructure drive retries.
+
+    Yields ``min(2 * 2**(attempt-1), 30)`` — ``[2, 4, 8, 16, 30, 30, …]``
+    seconds for attempts 1, 2, 3, … — so a transient refusal that clears
+    within the infra-retry budget (``--infra-retry-limit``) is retried with
+    bounded, escalating spacing and a contended host is never hammered
+    (LP-0MVWEP292000ODBS AC6).
+
+    Args:
+        attempt: The 1-based retry attempt number.
+
+    Returns:
+        Seconds to wait before the retry, capped at 30.
+    """
+    return min(2 * 2 ** (attempt - 1), 30)
 
 
 def _resolve_pi_bin(env: dict[str, str] | None = None) -> str | None:
@@ -5748,6 +10321,755 @@ def _reconcile_spawn_failure(
     return result
 
 
+def _release_orphaned_child_claim(child_id: str) -> dict[str, Any]:
+    """Release a child claim orphaned by a killed or timed-out subprocess.
+
+    A ``finish`` subprocess (or a driven child session) that is killed by a
+    timeout bound — or by a signal that never reaches a Python exit hook —
+    cannot run its own release, so the *surviving* supervisor performs it with
+    a durable write: the assignee is cleared (assignee-hold convention: a
+    non-empty assignee is a scheduling hold, so a lingering one makes the item
+    invisible to ``wl next``). This is the timeout counterpart of
+    :func:`_safety_reset_if_in_progress`, which covers the signal path
+    (SA-0MVVF75ZA007XNKB).
+
+    Only an ``in-progress`` child is touched, and only its assignee is
+    cleared: the status is deliberately left alone so the existing recovery
+    paths still apply — ``phase_parent`` re-finishes a child whose worktree
+    holds the work, and ``drive --finalise-stranded`` still recognises the
+    child as ``in-progress``. Every other state holds no claim this workflow
+    owns, so a producer ``Map`` hold or a terminal item is never disturbed,
+    and a child whose own failure path already reset it is left alone — the
+    helper is therefore idempotent and never masks the original failure (the
+    caller keeps reporting it).
+
+    Args:
+        child_id: The child work item whose claim may be orphaned.
+
+    Returns:
+        ``{"released": bool, "status": str, "previous_status": str,
+        "previous_assignee": str, "reason": str}``. ``released`` is ``False``
+        when there was nothing to release or the release write failed.
+    """
+    result: dict[str, Any] = {
+        "released": False,
+        "status": "",
+        "previous_status": "",
+        "previous_assignee": "",
+        "reason": "",
+    }
+    child = wl_show(child_id)
+    if not child:
+        result["reason"] = "could not re-fetch the child work item"
+        return result
+
+    status = str(child.get("status", "") or "")
+    assignee = str(child.get("assignee", "") or "")
+    result["previous_status"] = status
+    result["previous_assignee"] = assignee
+    result["status"] = status
+    if status not in ("in-progress", "in_progress"):
+        result["reason"] = (
+            f"child is not in-progress (status={status!r}); no claim to release"
+        )
+        return result
+    if not assignee:
+        result["reason"] = "child holds no assignee; nothing to release"
+        return result
+
+    # ``wl`` spells the status ``in-progress``; the read-back can carry the
+    # underscore form, so normalise before writing it back unchanged.
+    kept_status = "in-progress" if status == "in_progress" else status
+    try:
+        StatusLifecycle.update_status(child_id, kept_status, assignee="")
+    except (RuntimeError, ValueError) as exc:
+        result["reason"] = f"release write failed: {exc}"
+        return result
+
+    result["released"] = True
+    result["reason"] = (
+        "assignee released after its session was killed (item stays "
+        "in-progress, so the existing finish/finalise recovery still applies)"
+    )
+    wl_add_comment(
+        child_id,
+        f"Claim released: the session working on this item was killed "
+        f"(timeout or signal) before it could release its own claim, so the "
+        f"assignee ({assignee!r}) was cleared by the surviving supervisor. "
+        f"The item stays `in-progress` so it can still be finished or "
+        f"finalised; any uncommitted work in its worktree is untouched.",
+    )
+    LOG.info(
+        "Released orphaned claim on %s (was status=%s, assignee=%r)",
+        child_id, status, assignee,
+    )
+    return result
+
+
+def _reconcile_finish_failure(
+    child_id: str,
+    parent_report: dict[str, Any],
+    finish_attempts: int,
+) -> dict[str, Any]:
+    """Classify a child after its failing ``finish`` exhausted the bound.
+
+    ``implement.py finish`` can fail *after* the child reached a terminal
+    state (for example the push succeeded and a later gate step failed).
+    Treating every ``finishing_failed`` as chain-fatal stalls an epic whose
+    child is genuinely done. This helper re-fetches the child (read-only
+    ``wl show``) and classifies it with :func:`_is_terminal_child`
+    (SA-0MVLJXTYY005XQDV). It is called **only** when the finish-attempt
+    bound is exhausted, so the happy path pays no extra fetch.
+
+    Args:
+        child_id: The child whose ``finish`` failed.
+        parent_report: The ``phase_parent`` report carrying the failure.
+        finish_attempts: Number of failing finish executions observed.
+
+    Returns:
+        A dict with ``terminal`` (bool), ``status``, ``stage``,
+        ``finish_attempts``, ``evidence`` (str) and ``reason`` (str).
+        ``status``/``stage`` are empty when the child could not be fetched —
+        callers must treat that as non-terminal (fail closed).
+    """
+    result: dict[str, Any] = {
+        "terminal": False,
+        "status": "",
+        "stage": "",
+        "finish_attempts": finish_attempts,
+        "evidence": "",
+        "reason": str(parent_report.get("message", "") or ""),
+    }
+
+    child = wl_show(child_id)
+    if not child:
+        LOG.warning(
+            "Could not re-fetch %s after %d failed finish attempt(s); "
+            "keeping the hard failure.",
+            child_id,
+            finish_attempts,
+        )
+        return result
+
+    status = str(child.get("status", "") or "")
+    stage = str(child.get("stage", "") or "")
+    result["status"] = status
+    result["stage"] = stage
+    result["evidence"] = f"status={status or '?'}, stage={stage or '?'}"
+    result["terminal"] = _is_terminal_child(child) or stage == "in_review"
+    if not result["terminal"]:
+        return result
+
+    result["reason"] = (
+        f"finish failed {finish_attempts} time(s) but the child reached a "
+        f"terminal state anyway ({result['evidence']})."
+    )
+    LOG.info(
+        "Reconciled %s after a failed finish: terminal (%s).",
+        child_id,
+        result["evidence"],
+    )
+    return result
+
+
+def _worktree_ahead_of_parent(
+    worktree_path: Path, parent_branch: str,
+) -> tuple[bool | None, int | None]:
+    """Whether the worktree's ``HEAD`` carries commits the parent lacks.
+
+    The preservation gate's ahead-of-parent check: a worktree whose ``HEAD``
+    carries commits the parent branch does not have would lose them to a
+    ``git reset --hard <parent_branch>``, so the reset must be refused
+    (parent AC3, LP-0MVWEP2KB002WMRY).
+
+    Primary computation: ``git rev-list --count <parent_branch>..HEAD`` — a
+    positive count means the child's own commits would be lost. Falls back to
+    ``git merge-base --is-ancestor <parent_branch> HEAD`` when the count
+    cannot be computed (e.g. an unresolvable parent ref), guarded against the
+    ``HEAD == parent`` equality case so an exactly-at-parent worktree is never
+    misclassified as ahead.
+
+    **Tri-state, fail-closed.** ``None`` means undecidable (the parent ref
+    does not resolve, or ``HEAD`` is unreadable). A destroyer must never
+    interpret "unknown" as "safe": the caller refuses the reset on ``None``
+    rather than discarding commits it could not enumerate.
+
+    Args:
+        worktree_path: The linked worktree path (git runs with ``-C``).
+        parent_branch: The parent branch to measure against (``dev``).
+
+    Returns:
+        ``(is_ahead, count)`` where ``is_ahead`` is ``True``/``False`` when
+        decided and ``None`` when undecidable; ``count`` is the number of
+        commits ahead when the primary computation succeeded, otherwise
+        ``None``.
+    """
+    count = run_cmd(
+        [
+            "git", "-C", str(worktree_path), "rev-list", "--count",
+            f"{parent_branch}..HEAD",
+        ],
+        check=False,
+    )
+    if count.returncode == 0:
+        text = count.stdout.strip()
+        if text.isdigit():
+            n = int(text)
+            return n > 0, n
+    # Fallback: is the parent branch an ancestor of HEAD? (A == B passes, so
+    # guard the equality case explicitly — an exactly-at-parent worktree is
+    # never "ahead".)
+    parent_rev = run_cmd(
+        ["git", "-C", str(worktree_path), "rev-parse", "--verify", "--quiet",
+         f"{parent_branch}^{{commit}}"],
+        check=False,
+    )
+    head_rev = run_cmd(
+        ["git", "-C", str(worktree_path), "rev-parse", "HEAD"], check=False,
+    )
+    if parent_rev.returncode != 0 or head_rev.returncode != 0:
+        return None, None
+    if parent_rev.stdout.strip() == head_rev.stdout.strip():
+        return False, None
+    ancestor = run_cmd(
+        ["git", "-C", str(worktree_path), "merge-base", "--is-ancestor",
+            parent_branch, "HEAD"],
+        check=False,
+    )
+    if ancestor.returncode == 0:
+        return False, None
+    if ancestor.returncode == 1:
+        return True, None
+    return None, None
+
+
+def _status_porcelain_paths(worktree_path: str) -> list[str]:
+    """Return the paths ``git status --porcelain=v1`` reports (read-only).
+
+    Used by :func:`_reset_child_worktree` to capture the uncommitted work a
+    reset is about to discard **before** the destructive commands run, so the
+    reset-for-retry audit comment can name the discarded files exactly
+    (parent AC4, LP-0MVWEP2VQ001NPRK). Untracked directories are expanded to
+    individual files (``--untracked-files=all``) so the list names files
+    rather than a directory that a reader cannot audit. A rename/copy entry
+    is reported by its destination path.
+
+    Args:
+        worktree_path: The worktree to read (never mutated).
+
+    Returns:
+        A sorted, de-duplicated list of repository-relative paths. An
+        unreadable worktree or a failing ``git status`` (e.g. a missing
+        path) yields ``[]`` — the caller never crashes on a diagnostic read.
+    """
+    status = run_cmd(
+        [
+            "git", "-C", str(worktree_path), "status", "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        check=False,
+    )
+    if status.returncode != 0:
+        return []
+    paths: list[str] = []
+    for line in (status.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        entry = line[3:].strip()
+        if not entry:
+            continue
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        paths.append(entry.strip('"'))
+    return sorted(set(paths))
+
+
+#: A 7–40 character hex run that a reader could mistake for a commit hash.
+_COMMIT_HASH_TOKEN_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+#: Placeholder used while protecting verbatim path tokens from redaction.
+_REDACTION_SENTINEL = "\x00{}\x00"
+
+
+def _redact_commit_hash_tokens(
+    text: str, keep: tuple[str, ...] | list[str] = (),
+) -> str:
+    """Replace commit-hash-shaped tokens in *text* with a neutral marker.
+
+    The reset-for-retry comment must never imply that a **commit** was
+    discarded: it is the record of an uncommitted-only reset, so any
+    hash-shaped token (which a reader would read as a commit) is redacted.
+    Tokens listed in *keep* (the discarded file list) are left verbatim, so
+    the evidence-based file list stays byte-accurate even when a filename
+    happens to look like a hash (parent AC2/AC3, LP-0MVWEP2VQ001NPRK).
+
+    Args:
+        text: The text to sanitise.
+        keep: Tokens to preserve verbatim (paths from the discard list).
+
+    Returns:
+        The sanitised text.
+    """
+    protected = [token for token in keep if token]
+    text = text or ""
+    for index, token in enumerate(protected):
+        text = text.replace(token, _REDACTION_SENTINEL.format(index))
+    text = _COMMIT_HASH_TOKEN_RE.sub("<hash redacted>", text or "")
+    for index, token in enumerate(protected):
+        text = text.replace(_REDACTION_SENTINEL.format(index), token)
+    return text
+
+
+def _reset_child_worktree(
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    child_id: str = "",
+) -> dict[str, Any]:
+    """Reset a child's **own** worktree to the parent-branch HEAD.
+
+    Used by the drive recovery path after a child's ``finish`` exhausted its
+    attempts: the abandoned WIP leaves a dirty worktree that makes every
+    subsequent drive re-run the identical failing ``finish`` (the livelock
+    reproduced on AH-0MV9DB68T002IROX). Resetting the worktree to the
+    parent-branch HEAD restores a clean startable state so the next loop
+    iteration can start a fresh session (SA-0MVLJXVND0015LPW).
+
+    Isolation gates — the reset only ever touches the child's own worktree:
+
+    1. the path exists and is a **linked git worktree** (``.git`` is a file);
+       a main checkout (``.git`` directory) is refused outright;
+    2. ``git rev-parse --show-toplevel`` inside the path resolves to the path
+       itself, so a nested/shared path can never be reset;
+    3. only ``git reset --hard <parent_branch>`` and ``git clean -fd`` run —
+       the clean is never run on a shared/main path.
+
+    **Preservation gate** (parent AC3, LP-0MVWEP2KB002WMRY) — runs after the
+    isolation gates and **before** any destructive command: when the worktree
+    carries commits ahead of the parent branch (``_worktree_ahead_of_parent``),
+    the tip is parked on ``refs/wip/<child-id>`` with ``git update-ref`` and
+    the reset is refused without running ``git reset --hard`` / ``git clean
+    -fd``. A commit-carrying worktree is therefore never reset, no matter how
+    many finish attempts failed — the committed slice cannot be discarded.
+
+    ``git clean -fd`` deliberately omits ``-x``: ignored files (notably the
+    ``node_modules`` symlink) survive the reset.
+
+    Args:
+        worktree_path: The child's worktree path (never the main checkout).
+        parent_branch: Ref to reset to (default: ``dev``).
+        child_id: The child work-item id; names the preservation ref
+            (``refs/wip/<child-id>``). When empty, a commit-carrying worktree
+            is still refused — fail-safe, nothing destructive runs.
+
+    Returns:
+        A dict with ``success`` (bool), ``reset`` (bool), ``ref`` (the ref
+        reset to) and ``reason`` (failure explanation, empty on success). On
+        a refused preservation the dict additionally carries ``preserved``
+        (True), ``preserved_ref`` (``refs/wip/<child-id>``) and
+        ``preserved_commit`` (the worktree tip). On a successful reset the
+        dict additionally carries ``commits_ahead`` (always 0 — the
+        uncommitted-only invariant, parent AC4 / LP-0MVWEP2VQ001NPRK) and
+        ``discarded_paths`` — the pre-reset ``git status --porcelain=v1``
+        file list (one entry per path), so the reset-for-retry audit comment
+        is evidence-based rather than inferred from ``git clean`` stdout.
+    """
+    result: dict[str, Any] = {
+        "success": False,
+        "reset": False,
+        "ref": parent_branch,
+        "reason": "",
+    }
+    if not worktree_path:
+        result["reason"] = "no worktree path available for the child"
+        return result
+
+    wt = Path(worktree_path)
+    if not wt.exists():
+        result["reason"] = f"worktree path does not exist: {worktree_path}"
+        return result
+    if not _is_worktree(wt):
+        result["reason"] = (
+            f"refusing to reset {worktree_path}: it is not a linked git "
+            "worktree (main-checkout reset is forbidden)"
+        )
+        return result
+
+    top = run_cmd(
+        ["git", "-C", str(wt), "rev-parse", "--show-toplevel"], check=False,
+    )
+    top_path = Path(top.stdout.strip()) if top.stdout.strip() else None
+    if (
+        top.returncode != 0
+        or top_path is None
+        or top_path.resolve() != wt.resolve()
+    ):
+        result["reason"] = (
+            f"refusing to reset {worktree_path}: git reports a different "
+            "worktree root"
+        )
+        return result
+
+    # Preservation gate: a worktree that carries commits ahead of the parent
+    # branch is never reset. Park the tip on refs/wip/<child-id> BEFORE any
+    # destructive command and refuse (parent AC3, LP-0MVWEP2KB002WMRY).
+    ahead, ahead_count = _worktree_ahead_of_parent(wt, parent_branch)
+    if ahead is None:
+        result["reason"] = (
+            f"refusing to reset {worktree_path}: could not determine whether "
+            f"the worktree is ahead of {parent_branch} (unresolvable ref or "
+            "unreadable HEAD); a destroyer must not assume 'safe'"
+        )
+        return result
+    if ahead:
+        tip = run_cmd(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"], check=False,
+        )
+        tip_commit = tip.stdout.strip() if tip.returncode == 0 else ""
+        if not child_id:
+            result["reason"] = (
+                f"refusing to reset {worktree_path}: the worktree is "
+                f"{ahead_count if ahead_count is not None else '1+'}"
+                f" commit(s) ahead of {parent_branch} and no child id was "
+                "given to name a preservation ref; committed work would be "
+                "discarded"
+            )
+            return result
+        if not tip_commit:
+            result["reason"] = (
+                f"refusing to reset {worktree_path}: could not resolve the "
+                "worktree HEAD; committed work would be discarded"
+            )
+            return result
+        preserved_ref = f"refs/wip/{child_id}"
+        update_ref = run_cmd(
+            ["git", "-C", str(wt), "update-ref", preserved_ref, tip_commit],
+            check=False,
+        )
+        if update_ref.returncode != 0:
+            result["reason"] = (
+                f"refusing to reset {worktree_path}: could not create "
+                f"preservation ref {preserved_ref} "
+                f"({(update_ref.stderr or '').strip()}); committed work "
+                "would be discarded"
+            )
+            return result
+        result["success"] = False
+        result["reset"] = False
+        result["preserved"] = True
+        result["preserved_ref"] = preserved_ref
+        result["preserved_commit"] = tip_commit
+        result["reason"] = (
+            f"refusing to reset {worktree_path}: the worktree is "
+            f"{ahead_count if ahead_count is not None else '1+'}"
+            f" commit(s) ahead of {parent_branch}; the tip was preserved "
+            f"at {preserved_ref} ({tip_commit}) and no destructive command "
+            "ran"
+        )
+        return result
+
+    # Pre-reset uncommitted file list: the evidence the reset-for-retry audit
+    # comment reports (parent AC4, LP-0MVWEP2VQ001NPRK). Captured here, after
+    # the preservation gate and BEFORE any destructive command, so it describes
+    # exactly what the reset is about to discard.
+    discarded_paths = _status_porcelain_paths(str(wt))
+
+    reset = run_cmd(
+        ["git", "-C", str(wt), "reset", "--hard", parent_branch],
+        check=False,
+    )
+    if reset.returncode != 0:
+        result["reason"] = (
+            f"git reset --hard {parent_branch} failed: "
+            f"{(reset.stderr or '').strip()}"
+        )
+        return result
+
+    clean = run_cmd(["git", "-C", str(wt), "clean", "-fd"], check=False)
+    if clean.returncode != 0:
+        result["reason"] = (
+            f"git clean -fd failed: {(clean.stderr or '').strip()}"
+        )
+        return result
+
+    result["success"] = True
+    result["reset"] = True
+    # Uncommitted-only invariant (parent AC4, LP-0MVWEP2VQ001NPRK): the
+    # preservation gate refused a commit-carrying worktree above, so a
+    # successful reset never discarded commits. Recorded explicitly so the
+    # drive path can fail closed if that ever stops holding.
+    result["commits_ahead"] = 0
+    # The pre-reset status --porcelain file list: exactly what the reset
+    # removed (uncommitted paths only), for the audit comment.
+    result["discarded_paths"] = discarded_paths
+    result["cleaned"] = (clean.stdout or "").strip()
+    return result
+
+
+def _reset_for_retry_comment(
+    child_id: str,
+    finish_attempts: int,
+    failure_message: str,
+    reconciliation: dict[str, Any],
+    reset_result: dict[str, Any],
+    finish_failure: dict[str, Any] | None = None,
+) -> str:
+    """Build the audit comment recording a reset-for-retry recovery.
+
+    The comment is the durable record that a child owner's **uncommitted**
+    WIP was discarded and why: the finish failure reason (with the classified
+    failing ``finish`` step/reason when available), the number of failed
+    finish attempts, the child's non-terminal state, the exact reset
+    performed, and the file list the reset discarded.
+
+    ``reset-for-retry`` is limited to a worktree that carried **no** commits
+    ahead of the parent branch (parent AC4, LP-0MVWEP2VQ001NPRK): committed
+    work is preserved by the refusal gate in :func:`_reset_child_worktree`,
+    never discarded. The comment therefore states explicitly that no commit
+    was discarded, and no hash-shaped token can survive in it — a reader can
+    never infer that a commit was thrown away. The discarded paths come from
+    the pre-reset ``git status --porcelain`` capture
+    (``reset_result["discarded_paths"]``), so the list is evidence-based
+    rather than inferred from ``git clean`` stdout.
+
+    Args:
+        child_id: The child whose worktree was reset.
+        finish_attempts: Number of failing finish executions observed.
+        failure_message: The parent report's failure message.
+        reconciliation: The non-terminal reconciliation payload.
+        reset_result: The :func:`_reset_child_worktree` result (carrying
+            ``ref``, ``discarded_paths`` and ``cleaned``).
+        finish_failure: The classified ``finish_failure`` payload, if any.
+
+    Returns:
+        The comment body.
+    """
+    discarded = list(reset_result.get("discarded_paths") or [])
+    ref = reset_result.get("ref")
+    failure = finish_failure if isinstance(finish_failure, dict) else {}
+    lines = [
+        f"Drive reset this child for a clean retry (`{child_id}`).",
+        "",
+        f"- Failed `finish` attempts: {finish_attempts}",
+        (
+            f"- Child state before reset: "
+            f"{reconciliation.get('evidence') or 'unknown'}"
+        ),
+        (
+            "- Failure reason: "
+            f"{failure_message or 'unspecified'}"
+        ),
+    ]
+    if failure.get("step"):
+        lines.append(
+            f"- Failing `finish` step: `{failure.get('step')}` "
+            f"(reason: `{failure.get('reason') or 'unspecified'}`)"
+        )
+        desc = _describe_finish_failure(failure)
+        if desc:
+            lines.append(f"- Finish evidence: {desc}")
+    lines.extend([
+        (
+            f"- Worktree reset to: `{ref}` "
+            "(`git reset --hard`, then `git clean -fd`)"
+        ),
+        (
+            "- Committed work discarded: none — no commit was discarded "
+            f"(the worktree was not ahead of `{ref}`, so there were no "
+            "commits to discard)."
+        ),
+        "",
+    ])
+    if discarded:
+        lines.append(
+            f"Discarded uncommitted paths ({len(discarded)}):"
+        )
+        lines.extend(f"  - {path}" for path in discarded)
+    else:
+        lines.append(
+            "Discarded uncommitted paths: none (the worktree was clean)."
+        )
+    lines.extend([
+        "",
+        (
+            "Uncommitted WIP in the child's worktree was discarded so the "
+            "next drive iteration can start a fresh session. Restore it from "
+            "the abandoned session's log if it is still needed."
+        ),
+    ])
+    # Redact hash-shaped tokens (paths excepted) so the discard record can
+    # never be read as "a commit was thrown away" (AC2).
+    return _redact_commit_hash_tokens("\n".join(lines), keep=discarded)
+
+
+def _reset_for_retry_violation(reset_result: dict[str, Any]) -> str:
+    """Return why a reset result may not be recorded as ``reset-for-retry``.
+
+    ``reset-for-retry`` is limited to a worktree that carried **no commits**
+    ahead of the parent branch (parent AC4, LP-0MVWEP2VQ001NPRK). Committed
+    work is preserved by the refusal gate in :func:`_reset_child_worktree`
+    (tip parked on ``refs/wip/<child-id>``) and never discarded, so a reset
+    result that carries commits — or a preservation refusal — must never be
+    turned into a ``reset-for-retry`` entry: that would imply the committed
+    slice was discarded when it was not.
+
+    Args:
+        reset_result: The :func:`_reset_child_worktree` result.
+
+    Returns:
+        An explanation when the result violates the invariant, else ``""``.
+    """
+    if reset_result.get("preserved_ref") or reset_result.get("preserved"):
+        return (
+            "the worktree carries commits and its tip was preserved at "
+            f"{reset_result.get('preserved_ref') or '(unknown ref)'}; a "
+            "commit-preserving refusal is never a reset-for-retry"
+        )
+    commits_ahead = reset_result.get("commits_ahead")
+    if commits_ahead:
+        return (
+            f"the worktree was {commits_ahead} commit(s) ahead of the parent "
+            "branch, so the reset would have discarded committed work"
+        )
+    return ""
+
+
+def _describe_finish_failure(finish_failure: dict[str, Any]) -> str:
+    """Render the failing ``finish`` step/reason plus report evidence.
+
+    The single message-shape formatter for drive verdicts
+    (LP-0MVWEP37K000JU0O, parent AC5): returns ``"<step>: <reason>"`` — e.g.
+    ``local_dev_fast_forward: local_dev_diverged`` — and appends the
+    main-checkout evidence the failing ``finish`` report carries:
+
+    - ``"; lock held by <holder>"`` from ``steps.main_checkout_lock.holder``;
+    - ``"; offending paths: <paths>; competing work item <id> (pid <n>)"``
+      from the guard's offending paths and concurrent-actor evidence
+      (``steps.main_checkout_guard.verifies[-1]``).
+
+    Every field comes from the structured ``finish_failure`` payload, never
+    from ``report["message"]`` prose. Empty when the failure was not
+    classified into a structured step — the callers then leave their message
+    unchanged (fail-safe).
+
+    Args:
+        finish_failure: The classified ``finish_failure`` payload, if any.
+
+    Returns:
+        ``"<step>: <reason>"`` plus the evidence suffixes when the report
+        carries them, else ``""``.
+    """
+    if not isinstance(finish_failure, dict):
+        return ""
+    step = finish_failure.get("step")
+    if not step:
+        return ""
+    reason = finish_failure.get("reason")
+    parts = [f"{step}: {reason or 'unspecified'}"]
+    steps = finish_failure.get("steps")
+    if isinstance(steps, dict):
+        lock = steps.get("main_checkout_lock")
+        holder = lock.get("holder") if isinstance(lock, dict) else None
+        if holder:
+            parts.append(f"lock held by {holder}")
+        guard = steps.get("main_checkout_guard")
+        if isinstance(guard, dict):
+            verifies = guard.get("verifies") or []
+            last = verifies[-1] if verifies else None
+            if isinstance(last, dict):
+                offending = last.get("offending") or []
+                if offending:
+                    paths = ", ".join(str(p) for p in offending)
+                    parts.append(f"offending paths: {paths}")
+                actor = _competing_actor_suffix(
+                    last.get("actor_evidence") or ""
+                )
+                if actor:
+                    parts.append(actor)
+    return "; ".join(parts)
+
+
+def _competing_actor_suffix(actor_evidence: str) -> str:
+    """Render the guard's concurrent-actor evidence, ``""`` when absent.
+
+    The evidence string names the competing work item and pid in the shape
+    ``work item <id> (…); pid <n> with cwd in the main checkout``
+    (:func:`_main_checkout_actor_evidence`); those two fields are surfaced
+    as ``competing work item <id> (pid <n>)``. Any other evidence shape is
+    passed through verbatim so the message never loses information, and
+    ``"unknown"`` yields nothing.
+    """
+    if not actor_evidence or actor_evidence == "unknown":
+        return ""
+    item = re.search(r"work item (\S+)", actor_evidence)
+    pid = re.search(r"pid (\d+)", actor_evidence)
+    if item and pid:
+        wid = item.group(1).rstrip(".,;:")
+        return f"competing work item {wid} (pid {pid.group(1)})"
+    return f"competing actor: {actor_evidence}"
+
+
+def _finish_evidence_suffix(finish_failure: dict[str, Any]) -> str:
+    """Render the failing-``finish`` evidence as a message suffix.
+
+    The chain-stop messages append this inside their trailing parentheses so
+    the stopping verdict names the real failing ``finish`` step and reason —
+    never the generic ``Failed to finish child <id>`` alone
+    (LP-0MVWEP37K000JU0O AC1/AC3, parent AC5). Empty when the failure was
+    not classified.
+    """
+    desc = _describe_finish_failure(finish_failure)
+    return f"; failing finish step/reason: {desc}" if desc else ""
+
+
+def _preserved_ref_comment(
+    child_id: str,
+    preserved: dict[str, Any],
+    reconciliation: dict[str, Any],
+    finish_failure: dict[str, Any] | None = None,
+) -> str:
+    """Build the durable record that a commit-carrying worktree was preserved.
+
+    A reset was *refused*, not performed: the child's committed slice is still
+    on its branch and its tip is parked on ``refs/wip/<child-id>``. The
+    comment names the ref and commit so the owner can recover the work, and
+    states explicitly that nothing was discarded (the inverse of
+    :func:`_reset_for_retry_comment`).
+
+    Args:
+        child_id: The child whose worktree was preserved.
+        preserved: The ``{id, ref, commit}`` preservation entry.
+        reconciliation: The non-terminal reconciliation payload.
+        finish_failure: The classified ``finish_failure`` payload, if any.
+
+    Returns:
+        The comment body.
+    """
+    failure = finish_failure if isinstance(finish_failure, dict) else {}
+    step = failure.get("step") or "unknown"
+    reason = failure.get("reason") or "unknown"
+    desc = _describe_finish_failure(failure)
+    step_line = (
+        f"- Failing `finish` step/reason: {desc}"
+        if desc else
+        f"- Failing `finish` step: `{step}` (reason: `{reason}`)"
+    )
+    lines = [
+        f"Drive refused to reset this child's worktree (`{child_id}`) "
+        "because it carries commits.",
+        "",
+        f"- Worktree tip preserved at: `{preserved.get('ref')}`",
+        f"- Preserved commit: `{preserved.get('commit')}`",
+        f"- Child state: {reconciliation.get('evidence') or 'unknown'}",
+        step_line,
+        "",
+        "No `git reset --hard` or `git clean -fd` was run, so no committed "
+        "work was discarded. Recover the slice from the preserved ref "
+        f"(`git branch <name> {preserved.get('ref')}`), or delete it once it "
+        f"is no longer needed (`git update-ref -d {preserved.get('ref')}`).",
+    ]
+    return "\n".join(lines)
+
+
 def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     """Emit a drive report as JSON or a concise human summary."""
     if json_output:
@@ -5762,7 +11084,7 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     print("=" * 60)
     for entry in report.get("children_driven", []):
         result = entry.get("result")
-        if result == "ok":
+        if result == "finished":
             icon = "✅"
         elif result == "completed-late":
             # The session was killed at the per-child timeout but the child
@@ -5773,6 +11095,20 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             # A stranded child was finalised through the evidence-gated
             # --finalise-stranded path (SA-0MVLJWTGP005XJPP).
             icon = "🛠"
+        elif result == "terminal-reconciled":
+            # The child's finish failed but the child had already reached a
+            # terminal state: recorded as done, never reset
+            # (SA-0MVLJXTYY005XQDV).
+            icon = "🕓"
+        elif result == "reset-for-retry":
+            # A non-terminal child's abandoned worktree was reset to the
+            # parent-branch HEAD so a fresh session can retry it
+            # (SA-0MVLJXVND0015LPW).
+            icon = "♻"
+        elif result == "infra-retry":
+            # A transient infrastructure refusal retried on its own bounded
+            # budget with backoff (LP-0MVWEP292000ODBS).
+            icon = "🔁"
         else:
             icon = "❌"
         print(
@@ -5782,11 +11118,30 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         evidence = _format_timeout_evidence(entry)
         if evidence:
             print(f"     {evidence}")
+        if entry.get("message"):
+            # The verdict's finish-evidence line (``<step>: <reason>`` plus
+            # lock/guard evidence) — LP-0MVWEP37K000JU0O AC5.
+            print(f"     {entry['message']}")
         if entry.get("reason"):
             print(f"     {entry['reason']}")
     print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
     if report.get("completed_late"):
         print(f"  Completed late: {report['completed_late']}")
+    if report.get("terminal_reconciled"):
+        print(
+            f"  Terminal-reconciled: {report['terminal_reconciled']}"
+        )
+    if report.get("reset_for_retry"):
+        print(f"  Reset for retry: {report['reset_for_retry']}")
+    if report.get("preserved_refs"):
+        print(f"  Preserved (never reset): {len(report['preserved_refs'])}")
+        for preserved in report["preserved_refs"]:
+            print(
+                f"     {preserved.get('id')}: {preserved.get('ref')} "
+                f"({preserved.get('commit')})"
+            )
+    if report.get("infra_retries"):
+        print(f"  Infra retries: {report.get('infra_retries')}")
     if report.get("finalised_children"):
         print(f"  Finalised stranded: {len(report['finalised_children'])}")
     if report.get("stranded_children"):
@@ -5965,6 +11320,349 @@ def _worktree_has_uncommitted_changes(worktree_path: str) -> bool:
     return bool(result.stdout.strip())
 
 
+def _retained_worktree_entry(
+    work_item_id: str, worktree_path: str, reason: str
+) -> dict[str, Any]:
+    """Describe a retained worktree with a copy-pasteable remedy.
+
+    Retained trees are reported (never deleted silently and never forgotten):
+    every entry names the path, why it survived and the exact commands that
+    remove it (SA-0MVTE8XAJ002IUDR AC7).
+
+    Args:
+        work_item_id: The work item that owns the tree.
+        worktree_path: Absolute path to the retained worktree.
+        reason: Why it was retained.
+
+    Returns:
+        A small report entry dict.
+    """
+    return {
+        "id": work_item_id,
+        "path": worktree_path,
+        "reason": reason,
+        "remedy": (
+            f"git worktree remove {worktree_path} && git worktree prune"
+        ),
+    }
+
+
+def _remove_finished_worktree(
+    work_item_id: str,
+    worktree_path: str,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Remove a finished item's worktree behind the existing safety gates.
+
+    The single removal path shared by the driver (after a driven child's
+    session has exited) and every other deferred-removal caller: no second
+    deletion mechanism, no ``rm -rf`` shortcut.
+
+    Gates, in order — a failure at any of them **retains** the tree and is
+    reported, never forced past:
+
+    1. the path is known and exists (an absent tree is a reported no-op
+       success: ``already_absent``),
+    2. the tree holds no uncommitted work
+       (:func:`_worktree_has_uncommitted_changes`, untracked included) —
+       uncommitted work is never discarded,
+    3. :func:`_remove_worktree`'s own gates refuse the repository root and any
+       tree with a ``.git/`` directory.
+
+    ``cleanup_worktree_processes`` runs first so a stray ``wl`` process cannot
+    block ``git worktree remove`` (its self-exclusion contract is
+    SA-0MVJC5KNT0044L2B), and ``remove_state`` runs last so no
+    ``.implement_state.json`` is left behind.
+
+    Args:
+        work_item_id: The work item that owns the tree.
+        worktree_path: Absolute path to the worktree.
+        repo_root: The main checkout root (passed to ``_remove_worktree`` so
+            its repo-root refusal is authoritative).
+
+    Returns:
+        A result dict with ``removed``, ``already_absent``,
+        ``retained_dirty``, ``refused``, ``removed_state``, ``path``,
+        ``reason`` and (when retained) ``remedy``.
+    """
+    result: dict[str, Any] = {
+        "work_item_id": work_item_id,
+        "id": work_item_id,
+        "path": worktree_path,
+        "removed": False,
+        "already_absent": False,
+        "retained_dirty": False,
+        "refused": False,
+        "removed_state": False,
+        "reason": "",
+    }
+
+    if not worktree_path or not Path(worktree_path).exists():
+        # Idempotent: an interrupted/swept run must not fail on a tree that is
+        # already gone. ``remove_state`` is a no-op when the file is absent,
+        # but it still clears a stale state file left by an odd removal.
+        result["already_absent"] = True
+        result["reason"] = "worktree already absent"
+        if worktree_path:
+            remove_state(worktree_path)
+        return result
+
+    if _worktree_has_uncommitted_changes(worktree_path):
+        result["retained_dirty"] = True
+        result["reason"] = "worktree has uncommitted changes"
+        result["remedy"] = (
+            f"git worktree remove {worktree_path} && git worktree prune"
+        )
+        return result
+
+    # ``_remove_worktree`` chdirs the calling process out of the tree when cwd
+    # is inside it; in the driver that would move the driver's own cwd, so
+    # restore it afterwards.
+    try:
+        cwd_before: str | None = os.getcwd()
+    except OSError:  # pragma: no cover - cwd already gone
+        cwd_before = None
+
+    cleanup_worktree_processes(worktree_path)
+    try:
+        removed = bool(_remove_worktree(worktree_path, repo_root=repo_root or None))
+    except RuntimeError as exc:
+        # A safety-gate refusal (repository root, .git/ directory): retain the
+        # tree and report it rather than turning the caller into a failure.
+        result["refused"] = True
+        result["reason"] = f"removal refused: {exc}"
+        result["remedy"] = (
+            f"inspect {worktree_path} and remove it manually once safe"
+        )
+        return result
+    finally:
+        if cwd_before and Path(cwd_before).exists():
+            try:
+                os.chdir(cwd_before)
+            except OSError:  # pragma: no cover - defensive
+                LOG.debug("Could not restore cwd %s", cwd_before)
+
+    result["removed"] = removed
+    if removed:
+        remove_state(worktree_path)
+        result["removed_state"] = not (
+            Path(worktree_path) / STATE_FILE_NAME
+        ).exists()
+        result["reason"] = "worktree removed"
+    else:
+        result["reason"] = "worktree removal failed"
+        result["remedy"] = (
+            f"git worktree remove {worktree_path} && git worktree prune"
+        )
+    return result
+
+
+def _maybe_remove_child_worktree(
+    child_id: str,
+    worktree_path: str,
+    entry: dict[str, Any],
+    report: dict[str, Any],
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Remove a driven child's worktree once terminality is established.
+
+    This is the removal-owner side of the driven flow
+    (SA-0MVTE8XAJ002IUDR): a driven child's ``finish`` defers worktree
+    removal so the session keeps its cwd, making the driver the owner. The
+    caller establishes that the child is **terminal** first (via the next
+    ``phase_parent`` report's ``children_processed``, or via the
+    spawn-failure reconciliation on the ``completed-late`` path); this helper
+    only applies the removal gates:
+
+    - dirty tree ⇒ retained, never discarded;
+    - already absent ⇒ reported no-op (``already_absent``);
+    - refusal/failure ⇒ retained and reported, the drive chain continues.
+
+    Every retained tree is added to ``report["retained_worktrees"]`` with a
+    copy-pasteable remedy. Never raises.
+
+    Args:
+        child_id: The child work item id.
+        worktree_path: The child's worktree path.
+        entry: The ``report["children_driven"]`` entry to record the outcome on.
+        report: The drive report (receives ``retained_worktrees``).
+        repo_root: The main checkout root (defaults to discovery).
+
+    Returns:
+        The :func:`_remove_finished_worktree` result.
+    """
+    try:
+        outcome = _remove_finished_worktree(
+            child_id, worktree_path, repo_root or _get_repo_root()
+        )
+    except Exception as exc:  # noqa: BLE001 - never break the drive chain
+        LOG.warning("Worktree cleanup for %s failed: %s", child_id, exc)
+        outcome = {
+            "id": child_id,
+            "path": worktree_path,
+            "removed": False,
+            "reason": f"cleanup failed: {exc}",
+        }
+
+    entry["worktree_removed"] = bool(outcome["removed"])
+    entry["worktree_cleanup"] = outcome
+    if outcome.get("removed"):
+        LOG.info("Driver removed %s's worktree at %s", child_id, worktree_path)
+    else:
+        entry["worktree_retained"] = worktree_path
+        report.setdefault("retained_worktrees", []).append(
+            _retained_worktree_entry(
+                child_id, worktree_path, outcome.get("reason", "retained")
+            )
+        )
+    return outcome
+
+
+def _resolve_pending_worktree_cleanups(
+    parent_report: dict[str, Any] | None,
+    pending: dict[str, str],
+    report: dict[str, Any],
+    repo_root: str | None = None,
+) -> None:
+    """Remove queued child worktrees once the parent reports their status.
+
+    The spawn-success path queues the child in *pending* instead of
+    re-fetching it (the pinned "reconciliation only on the failure path"
+    contract, risk R1 of SA-0MVHXWLPG007OQVN). Every ``phase_parent`` report
+    carries ``children_processed`` with each child's status/action, so the
+    next report after a finished session names the child — that is the
+    terminality signal. Resolving here means the hot path performs **no**
+    extra store fetch.
+
+    Args:
+        parent_report: The latest ``phase_parent`` report.
+        pending: ``{child_id: worktree_path}`` awaiting a terminal verdict.
+        report: The drive report (receives ``retained_worktrees``).
+        repo_root: The main checkout root (defaults to discovery).
+    """
+    processed: dict[str, dict[str, Any]] = {}
+    for item in (parent_report or {}).get("children_processed") or []:
+        cid = str(item.get("id") or "")
+        if cid:
+            processed[cid] = item
+
+    for child_id in list(pending):
+        info = processed.get(child_id)
+        if info is None:
+            continue  # the parent has not reported this child yet
+        status = str(info.get("status") or "")
+        action = str(info.get("action") or "")
+        worktree_path = pending.pop(child_id)
+        entry = next(
+            (e for e in report.get("children_driven", []) if e.get("id") == child_id),
+            {},
+        )
+        if not (_is_terminal_status(status) or action in ("finished", "skipped-terminal")):
+            # The parent still sees the child non-terminal: retain the tree as
+            # debug evidence and never remove it. Reported with its remedy so
+            # it is not silently stranded.
+            entry["worktree_removed"] = False
+            entry["worktree_retained"] = worktree_path
+            report.setdefault("retained_worktrees", []).append(
+                _retained_worktree_entry(
+                    child_id, worktree_path, "child is not terminal"
+                )
+            )
+            continue
+        _maybe_remove_child_worktree(
+            child_id, worktree_path, entry, report, repo_root=repo_root
+        )
+
+
+def _retain_pending_worktree_cleanups(
+    pending: dict[str, str], report: dict[str, Any]
+) -> None:
+    """Report queued worktrees the drive ended before resolving.
+
+    A drive that stops (failure, blocked parent, advanced parent) before the
+    follow-up ``parent`` report named a child leaves that child's queued
+    worktree unresolved. It is never silently stranded: it is listed in
+    ``report["retained_worktrees"]`` with its remedy, and the next drive's
+    start-of-run sweep removes it once the child is terminal.
+    """
+    for child_id, worktree_path in pending.items():
+        entry = next(
+            (e for e in report.get("children_driven", []) if e.get("id") == child_id),
+            {},
+        )
+        entry.setdefault("worktree_removed", False)
+        entry.setdefault("worktree_retained", worktree_path)
+        report.setdefault("retained_worktrees", []).append(
+            _retained_worktree_entry(
+                child_id,
+                worktree_path,
+                "drive ended before the parent reported this child's state; "
+                "the next drive sweep (or the remedy below) removes it",
+            )
+        )
+
+
+def _sweep_terminal_child_worktrees(
+    children: list[dict[str, Any]],
+    report: dict[str, Any],
+    repo_root: str | None = None,
+) -> None:
+    """Remove leftover worktrees of terminal children at the start of a drive.
+
+    A drive that was interrupted between a child session's exit and the
+    driver-side removal strands that child's tree; sweeping at the start of
+    the next drive keeps deferred worktrees from leaking (SA-0MVTE8XAJ002IUDR
+    AC7). Bounded and best-effort: terminal children only, clean trees only,
+    never fatal — the outcome is recorded in ``report["worktree_sweep"]`` and
+    retained trees are named in ``report["retained_worktrees"]``.
+
+    Args:
+        children: The parent's children (``wl_show_children`` shape).
+        report: The drive report to annotate.
+        repo_root: The main checkout root (defaults to discovery).
+    """
+    sweep: list[dict[str, Any]] = []
+    for child in children or []:
+        if not _is_terminal_child(child):
+            continue
+        child_id = str(child.get("id") or "")
+        if not child_id:
+            continue
+        try:
+            path = _discover_worktree(child_id)
+        except Exception as exc:  # noqa: BLE001 - sweep is best-effort
+            LOG.debug("Worktree discovery for %s failed: %s", child_id, exc)
+            continue
+        if not path:
+            continue
+        try:
+            outcome = _remove_finished_worktree(
+                child_id, path, repo_root or _get_repo_root()
+            )
+        except Exception as exc:  # noqa: BLE001 - sweep is best-effort
+            LOG.warning("Sweep of %s worktree failed: %s", child_id, exc)
+            sweep.append({
+                "id": child_id,
+                "path": path,
+                "removed": False,
+                "reason": f"sweep failed: {exc}",
+            })
+            continue
+        LOG.info(
+            "Worktree sweep: %s at %s (%s)",
+            "removed" if outcome["removed"] else "retained",
+            path,
+            outcome["reason"],
+        )
+        sweep.append(outcome)
+        if not outcome["removed"]:
+            report.setdefault("retained_worktrees", []).append(
+                _retained_worktree_entry(child_id, path, outcome["reason"])
+            )
+    if sweep:
+        report["worktree_sweep"] = sweep
+
+
 def _finalise_stranded_child(
     child_id: str,
     evidence: dict[str, Any],
@@ -6027,7 +11725,11 @@ def _finalise_stranded_child(
 
     commit = str(evidence.get("commit", ""))
     try:
-        StatusLifecycle.update_status(child_id, "completed", stage="in_review")
+        # Direct terminal durable write — the finaliser is not a StatusLifecycle
+        # exit, so the stranded child's hold is released explicitly.
+        StatusLifecycle.update_status(
+            child_id, "completed", stage="in_review", assignee=""
+        )
     except RuntimeError as exc:
         return {
             "finalised": False,
@@ -6069,9 +11771,11 @@ def _stranded_children_comment(
     lines: list[str] = []
     if stranded:
         lines += [
-            f"Drive detected {len(stranded)} stranded child(ren): a session "
-            f"failed after the work was pushed to `{parent_branch}`, so the "
-            "item is still non-terminal and blocks `wl next`.",
+            (
+                f"Drive detected {len(stranded)} stranded child(ren): a session "
+                f"failed after the work was pushed to `{parent_branch}`, so the "
+                "item is still non-terminal and blocks `wl next`."
+            ),
             "",
         ]
         for item in stranded:
@@ -6081,9 +11785,11 @@ def _stranded_children_comment(
             )
         lines += [
             "",
-            "Finalise the item(s) once the pushed work is verified (or re-run "
-            "drive with `--finalise-stranded` to let it finalise evidence-gated "
-            "children automatically):",
+            (
+                "Finalise the item(s) once the pushed work is verified (or re-run "
+                "drive with `--finalise-stranded` to let it finalise evidence-gated "
+                "children automatically):"
+            ),
             "",
         ]
         for item in stranded:
@@ -6115,6 +11821,9 @@ def phase_drive(
     verbose: bool = False,
     max_child_sessions: int = DEFAULT_MAX_CHILD_SESSIONS,
     child_timeout: int | None = None,
+    finish_attempt_limit: int | None = None,
+    infra_retry_limit: int = DEFAULT_INFRA_RETRY_LIMIT,
+    delay: Callable[[float], None] | None = None,
     spawn_session: Callable[..., dict[str, Any]] | None = None,
     parent_runner: Callable[..., dict[str, Any] | None] | None = None,
     commit_evidence: Callable[[str], str | None] | None = None,
@@ -6141,12 +11850,50 @@ def phase_drive(
     4. Repeat. A child is retried at most ``max_child_sessions`` times so a
        session that never reaches a terminal state cannot loop forever.
 
+    A parent report carrying the blocked verdict (``blocked: true`` /
+    ``parent_blocked_by``) stops the chain **without** spawning a session: the
+    invoked item is itself blocked by an unmet same-project outbound edge or a
+    ``blocked`` status, so starting a child would override a producer's hold
+    and edit files the pending dependency owns (SA-0MVS1QS9J009DGPT). This is
+    a soft wait — the drive report forwards ``parent_blocked_by`` /
+    ``parent_blocked_reason``, keeps ``success`` true and does **not** set
+    ``failed_child`` — distinct from a hard per-child failure.
+
     A per-child session timeout (or non-zero exit) is treated as a *bound*,
     not a verdict: after a failed spawn the child is re-fetched and classified
     with :func:`_reconcile_spawn_failure`. A child that already reached a
     terminal state (``completed``/``done``/``in_review``) is recorded as
     ``completed-late`` and the chain continues; a genuinely incomplete child
     keeps the pre-existing hard failure (SA-0MVHXWLPG007OQVN).
+
+    Failing ``finish`` executions are bounded too (SA-0MVLJXS7R000XIFL): a
+    ``finishing_failed`` parent report is counted per child in
+    ``finish_attempts`` (distinct from the session-spawn ``attempts``), and
+    the loop re-runs ``parent`` — which retries the ``finish`` — only while
+    the child's count stays below ``finish_attempt_limit``. Once the bound is
+    exhausted the chain stops and the report carries the count, so the same
+    failing ``finish`` (e.g. an abandoned dirty worktree whose build/tests
+    are red) can never be executed unboundedly. The bound defaults to
+    ``max_child_sessions``, so the default behaviour (one attempt) is
+    unchanged from before this feature.
+
+    Before the chain stops, the exhausted child is reconciled
+    (SA-0MVLJXTYY005XQDV): it is re-fetched with ``wl show`` and classified
+    with :func:`_is_terminal_child`. A child that reached a terminal state
+    despite the failed finish is recorded as ``terminal-reconciled`` and the
+    loop continues; only a genuinely non-terminal child keeps the hard
+    failure. Terminal children are never finished, reset or re-spawned.
+
+    A non-terminal child whose finish bound is exhausted is recovered instead
+    of livelocking (SA-0MVLJXVND0015LPW): its **own** worktree is reset to the
+    parent-branch HEAD (``git reset --hard <parent_branch>`` + ``git clean
+    -fd``, isolation-gated so the main checkout can never be touched) and its
+    status is set back to ``open`` through :class:`StatusLifecycle`, with an
+    audit comment recording the failure reason, the finish-attempt count and
+    the reset performed. The loop then continues, so the next iteration
+    starts a fresh session for that child. The reset runs at most once per
+    child per drive invocation: a second exhaustion after a successful reset
+    stops the chain (bounded, truthful) rather than resetting forever.
 
     Args:
         work_item_id: The parent work item ID.
@@ -6157,6 +11904,18 @@ def phase_drive(
         max_child_sessions: Max fresh sessions per child before stopping.
         child_timeout: Per-child session timeout in seconds (default from
             :func:`_resolve_child_session_timeout`).
+        finish_attempt_limit: Max failing ``finish`` executions per child in
+            one drive invocation (default: ``max_child_sessions``). A
+            non-positive value is clamped to 1.
+        infra_retry_limit: Max **infrastructure**-refusal retries per child in
+            one drive invocation (default: ``DEFAULT_INFRA_RETRY_LIMIT``).
+            These run on a budget separate from ``finish_attempt_limit``,
+            with bounded exponential backoff, and never spawn a session — a
+            refusal that clears within the budget lets the same ``finish``
+            succeed and the chain continue (LP-0MVWEP292000ODBS). A
+            non-positive value is clamped to 1.
+        delay: Injectable backoff sleeper for infrastructure retries (tests
+            pass a zero-cost recorder; default ``time.sleep``).
         spawn_session: Injectable spawner (tests); defaults to
             :func:`_default_session_spawner`.
         parent_runner: Injectable ``parent`` runner (tests); defaults to
@@ -6181,7 +11940,32 @@ def phase_drive(
         ``terminal_stage`` so the two timeout outcomes are distinguishable
         (SA-0MVLJWOJ8004ABBA). A non-terminal child whose work is already on
         the parent branch additionally appears in ``stranded_children`` with
-        its pushed-commit evidence (SA-0MVLJWRVO000QQNP).
+        its pushed-commit evidence (SA-0MVLJWRVO000QQNP). ``finish_attempts``
+        maps each child whose ``finish`` failed to the number of failing
+        finish executions observed, and ``finish_attempt_limit`` reports the
+        bound applied (SA-0MVLJXS7R000XIFL). ``infra_retries`` maps each
+        child whose ``finish`` was refused for an *infrastructure* reason to
+        the number of retries consumed on the separate infra budget, and
+        ``infra_retry_limit`` reports that bound (LP-0MVWEP292000ODBS); each
+        retry also appears in ``children_driven`` as ``"infra-retry"`` with
+        the failing ``step``/``reason`` and the attempt number.
+        ``terminal_reconciled`` counts
+        children recorded as done after their finish failed
+        (SA-0MVLJXTYY005XQDV); ``reset_for_retry`` counts non-terminal
+        children whose worktree was reset for a fresh session
+        (SA-0MVLJXVND0015LPW); ``preserved_refs`` lists the children whose
+        reset was **refused** because their worktree carries commits, each as
+        ``{id, ref, commit}`` with the tip parked on ``refs/wip/<id>``
+        (parent AC3, LP-0MVWEP2KB002WMRY). A child whose per-work-item lock is held by
+        another live session is reported with ``action: "skipped-held"``,
+        ``skipped_held: True``, ``held_by`` and ``held_children`` — and no
+        session is spawned for it (SA-0MVQ5AXLF002PAQ3). Worktree removal is
+        driver-owned: each driven child's ``finish`` defers it, so a terminal
+        child's clean tree is removed once its session exits and the entry
+        records ``worktree_removed`` plus its ``worktree_cleanup`` outcome;
+        ``retained_worktrees`` lists every tree that was kept (with a
+        remedy) and ``worktree_sweep`` records the start-of-run sweep of
+        terminal children's leftover trees (SA-0MVTE8XAJ002IUDR).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -6191,6 +11975,13 @@ def phase_drive(
         "sessions_spawned": 0,
         "children_driven": [],
         "completed_late": 0,
+        "terminal_reconciled": 0,
+        "reset_for_retry": 0,
+        "preserved_refs": [],
+        "finish_attempts": {},
+        "finish_attempt_limit": None,
+        "infra_retries": {},
+        "infra_retry_limit": None,
         "message": "",
     }
 
@@ -6248,15 +12039,53 @@ def phase_drive(
     spawner = spawn_session or _default_session_spawner
     timeout = child_timeout or _resolve_child_session_timeout()
     max_child_sessions = max(1, int(max_child_sessions))
+    finish_attempt_limit = (
+        max_child_sessions if finish_attempt_limit is None
+        else max(1, int(finish_attempt_limit))
+    )
+    report["finish_attempt_limit"] = finish_attempt_limit
+    # Clamped to at least 1 so a non-positive --infra-retry-limit can never
+    # open an unbounded retry loop (LP-0MVWEP292000ODBS AC1/AC5).
+    infra_retry_limit = max(1, int(infra_retry_limit))
+    report["infra_retry_limit"] = infra_retry_limit
+    # Injectable backoff sleeper: tests substitute a zero-delay recorder so
+    # the retry schedule is exercised without sleeping (LP-0MVWEP292000ODBS
+    # AC6).
+    sleeper = delay or time.sleep
 
     attempts: dict[str, int] = {}
-    driven: list[dict[str, Any]] = []
+    finish_attempts: dict[str, int] = {}
+    infra_retries: dict[str, int] = {}
+    reset_cids: set[str] = set()
+    # The report's own list, so entries recorded mid-loop (worktree cleanup
+    # outcomes) are visible to the resolvers and to the final report.
+    driven: list[dict[str, Any]] = report["children_driven"]
+    #: Child worktrees awaiting a terminal verdict from the next
+    #: ``phase_parent`` report (the success path performs no extra store
+    #: fetch — SA-0MVHXWLPG007OQVN risk R1).
+    pending_cleanup: dict[str, str] = {}
     stranded_comment_posted = False
     finaliser = finalise_child or _finalise_stranded_child
     # Hard bound on the loop: each child may consume at most
-    # max_child_sessions spawns plus one terminal classification, and the
-    # final iteration advances the parent.
-    max_iterations = (len(children) * (max_child_sessions + 1)) + 1
+    # max_child_sessions spawns plus finish_attempt_limit failing finish
+    # retries plus infra_retry_limit infrastructure retries plus one
+    # terminal classification, and the final iteration advances the parent.
+    # The infra budget is included so a chain that needs many infra retries
+    # before its session can never trip the bound prematurely
+    # (LP-0MVWEP292000ODBS AC7).
+    max_iterations = (
+        len(children)
+        * (max_child_sessions + finish_attempt_limit + infra_retry_limit + 1)
+    ) + 1
+
+    # ── Start-of-run sweep: terminal children's leftover worktrees ──
+    # A driven child's ``finish`` defers worktree removal (the session owns
+    # its cwd), so the driver is its owner. A drive interrupted between a
+    # session's exit and this removal would strand the tree forever; sweeping
+    # leftover trees of *terminal* children at the start keeps the deferral
+    # from leaking (SA-0MVTE8XAJ002IUDR AC7). Bounded, clean trees only,
+    # never fatal.
+    _sweep_terminal_child_worktrees(children, report)
 
     for _ in range(max_iterations):
         parent_report = runner(
@@ -6267,6 +12096,12 @@ def phase_drive(
                 f"`implement.py parent {work_item_id}` failed (see logs)."
             )
             break
+
+        # Resolve queued worktree removals from this report's per-child
+        # statuses before acting on anything else (SA-0MVTE8XAJ002IUDR AC5).
+        _resolve_pending_worktree_cleanups(
+            parent_report, pending_cleanup, report
+        )
 
         if parent_report.get("parent_advanced"):
             report["parent_advanced"] = True
@@ -6284,13 +12119,393 @@ def phase_drive(
                 )
             break
 
+        if parent_report.get("blocked"):
+            # The invoked item is blocked by its OWN outbound dependency edge
+            # and/or its own ``blocked`` status (SA-0MVS1QS9J009DGPT). This is
+            # a legitimate producer-mandated wait, not a failure: forward the
+            # verdict (with the blocker ids/statuses) and spawn NOTHING — a
+            # child session would create a worktree and edit files the
+            # still-pending dependency owns.
+            report["blocked"] = True
+            report["success"] = True
+            report["parent_advanced"] = False
+            report["parent_blocked_by"] = parent_report.get(
+                "parent_blocked_by", []
+            )
+            report["parent_blocked_reason"] = parent_report.get(
+                "parent_blocked_reason", PARENT_BLOCKED_REASON_DEPENDENCY
+            )
+            if parent_report.get("coordination_blockers"):
+                report["coordination_blockers"] = parent_report[
+                    "coordination_blockers"
+                ]
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            report["message"] = parent_report.get(
+                "message",
+                f"{work_item_id} is blocked; no child session was spawned.",
+            )
+            break
+
         if parent_report.get("success") is False:
+            failed_cid = parent_report.get("next_child")
+            if parent_report.get("finishing_failed") and failed_cid:
+                # Classify the finish failure BEFORE the finish-attempt
+                # accounting: an *infrastructure* refusal (local_dev_diverged,
+                # a held main-checkout lock, a dropped push transport) is
+                # retried on its own bounded budget with backoff — it never
+                # consumes the finish-attempt budget and never spawns a
+                # session — so a refusal that clears seconds later no longer
+                # discards a committed slice (LP-0MVWEP292000ODBS, parent
+                # epic AC2).
+                finish_failure = parent_report.get("finish_failure") or {}
+                failure_kind = finish_failure.get("kind")
+                if (
+                    failure_kind == "infrastructure"
+                    and infra_retries.get(failed_cid, 0) < infra_retry_limit
+                ):
+                    infra_retries[failed_cid] = (
+                        infra_retries.get(failed_cid, 0) + 1
+                    )
+                    attempt = infra_retries[failed_cid]
+                    driven.append({
+                        "id": failed_cid,
+                        "result": "infra-retry",
+                        "step": finish_failure.get("step"),
+                        "reason": finish_failure.get("reason"),
+                        "attempt": attempt,
+                        "message": _describe_finish_failure(
+                            finish_failure
+                        ),
+                    })
+                    backoff = _drive_infra_backoff_delay(attempt)
+                    LOG.warning(
+                        "Child %s finish refused for an infrastructure "
+                        "reason (step=%r, reason=%r) — infra-retry %d/%d "
+                        "in %ss: re-running `parent` without spawning a "
+                        "session.",
+                        failed_cid,
+                        finish_failure.get("step"),
+                        finish_failure.get("reason"),
+                        attempt,
+                        infra_retry_limit,
+                        backoff,
+                    )
+                    # The retry verdict is durable on the child: the comment
+                    # names the real failing step/reason so a producer can
+                    # tell an infrastructure refusal from a gate failure
+                    # without reading the child's log (parent AC5,
+                    # LP-0MVWEP37K000JU0O AC4).
+                    desc = _describe_finish_failure(finish_failure)
+                    wl_add_comment(
+                        failed_cid,
+                        "Drive retried this child's `finish` after a "
+                        "transient infrastructure refusal"
+                        + (f" ({desc})" if desc else "")
+                        + f". Infra-retry {attempt}/{infra_retry_limit} in "
+                        f"{backoff}s; no session was spawned — the loop "
+                        "re-runs `parent` to retry `finish`.",
+                    )
+                    sleeper(backoff)
+                    continue
+                if failure_kind == "infrastructure":
+                    # The infra budget is spent: annotate the parent message
+                    # so the stopping verdict names the real failing
+                    # step/reason, then fall through to the existing bounded
+                    # finish-attempt path (LP-0MVWEP292000ODBS AC5).
+                    parent_report = {
+                        **parent_report,
+                        "message": (
+                            f"{parent_report.get('message', '')} "
+                            "(infrastructure refusal at step "
+                            f"{finish_failure.get('step')!r}, reason "
+                            f"{finish_failure.get('reason')!r} exhausted "
+                            f"the infra-retry budget of {infra_retry_limit})"
+                        ),
+                    }
+                # Bound the retries of a failing `finish`: every re-run of
+                # `parent` re-executes the same finish for that child, so the
+                # count is the number of real finish executions observed
+                # (SA-0MVLJXS7R000XIFL).
+                finish_attempts[failed_cid] = (
+                    finish_attempts.get(failed_cid, 0) + 1
+                )
+                if finish_attempts[failed_cid] < finish_attempt_limit:
+                    LOG.warning(
+                        "Child %s finish failed (attempt %d/%d) — bounded "
+                        "retry: re-running `parent` so finish is attempted "
+                        "again.",
+                        failed_cid,
+                        finish_attempts[failed_cid],
+                        finish_attempt_limit,
+                    )
+                    continue
+                LOG.warning(
+                    "Child %s finish failed %d time(s), exhausting the "
+                    "finish-attempt bound (%d); reconciling the child's "
+                    "actual state.",
+                    failed_cid,
+                    finish_attempts[failed_cid],
+                    finish_attempt_limit,
+                )
+                # Bound exhausted: re-fetch the child and reconcile. A
+                # child whose finish failed but which nevertheless reached a
+                # terminal state (e.g. the push succeeded and a later gate
+                # step failed) is done, not failed — recording it as
+                # terminal lets the epic advance
+                # (SA-0MVLJXTYY005XQDV). This fetch runs only on the slow
+                # finish-failure path.
+                reconciliation = _reconcile_finish_failure(
+                    failed_cid,
+                    parent_report,
+                    finish_attempts[failed_cid],
+                )
+                if reconciliation["terminal"]:
+                    driven.append({
+                        "id": failed_cid,
+                        "result": "terminal-reconciled",
+                        "reconciled": True,
+                        "status": reconciliation["status"],
+                        "stage": reconciliation["stage"],
+                        "finish_attempts": finish_attempts[failed_cid],
+                        "evidence": reconciliation["evidence"],
+                        "reason": reconciliation["reason"],
+                        "message": _describe_finish_failure(
+                            finish_failure
+                        ),
+                    })
+                    report["terminal_reconciled"] = (
+                        report.get("terminal_reconciled", 0) + 1
+                    )
+                    desc = _describe_finish_failure(finish_failure)
+                    suffix = (
+                        f" Finish evidence: {desc}." if desc else ""
+                    )
+                    wl_add_comment(
+                        failed_cid,
+                        "Drive reconciled this child after its `finish` "
+                        f"failed {finish_attempts[failed_cid]} time(s): "
+                        f"{reconciliation['evidence']}.{suffix} Recorded as "
+                        "done (`terminal-reconciled`); no reset was "
+                        "performed.",
+                    )
+                    LOG.info(
+                        "Reconciled %s after a failed finish: terminal "
+                        "(%s); continuing the drive loop.",
+                        failed_cid,
+                        reconciliation["evidence"],
+                    )
+                    continue
+                # Non-terminal: break the livelock by resetting the child to a
+                # clean startable state and letting the loop continue so the
+                # next iteration starts a fresh session
+                # (SA-0MVLJXVND0015LPW). The reset is bounded to once per
+                # child per drive invocation: a second exhaustion after the
+                # reset stops the chain instead of resetting forever.
+                if failed_cid in reset_cids:
+                    LOG.error(
+                        "Child %s finish failed again after its worktree "
+                        "was already reset in this drive invocation; "
+                        "stopping the drive chain.",
+                        failed_cid,
+                    )
+                    report["message"] = (
+                        f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                        f"(finish-attempt bound {finish_attempt_limit} "
+                        f"exhausted again after a reset; child is still "
+                        f"non-terminal: "
+                        f"{reconciliation['evidence'] or 'state unreadable'}"
+                        f"{_finish_evidence_suffix(finish_failure)})."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
+                reset_worktree = (
+                    parent_report.get("worktree_path")
+                    or _discover_worktree(failed_cid)
+                    or ""
+                )
+                reset_result = _reset_child_worktree(
+                    reset_worktree, parent_branch, child_id=failed_cid,
+                )
+                if reset_result.get("preserved_ref"):
+                    # The worktree carries commits the parent branch does not
+                    # have: the reset was refused and the tip parked on
+                    # refs/wip/<child-id> BEFORE any destructive command ran
+                    # (parent AC3, LP-0MVWEP2KB002WMRY). Record the
+                    # preservation, comment it on the child and stop the
+                    # chain — spawning a session would race work that was
+                    # deliberately preserved.
+                    preserved_entry = {
+                        "id": failed_cid,
+                        "ref": reset_result["preserved_ref"],
+                        "commit": reset_result["preserved_commit"],
+                    }
+                    report.setdefault("preserved_refs", []).append(
+                        preserved_entry
+                    )
+                    wl_add_comment(
+                        failed_cid,
+                        _preserved_ref_comment(
+                            failed_cid, preserved_entry, reconciliation,
+                            finish_failure,
+                        ),
+                    )
+                    LOG.error(
+                        "Refusing to reset child %s: it carries commits. "
+                        "Tip preserved at %s (%s).",
+                        failed_cid,
+                        preserved_entry["ref"],
+                        preserved_entry["commit"],
+                    )
+                    report["message"] = (
+                        f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                        f"(finish-attempt bound {finish_attempt_limit} "
+                        f"exhausted; child is still non-terminal: "
+                        f"{reconciliation['evidence'] or 'state unreadable'}; "
+                        f"reset refused because the worktree carries "
+                        f"commits — tip preserved at "
+                        f"{preserved_entry['ref']} "
+                        f"({preserved_entry['commit']})"
+                        f"{_finish_evidence_suffix(finish_failure)})."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
+                if not reset_result["success"]:
+                    LOG.error(
+                        "Refusing to reset child %s: %s",
+                        failed_cid, reset_result["reason"],
+                    )
+                    report["message"] = (
+                        f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                        f"(finish-attempt bound {finish_attempt_limit} "
+                        f"exhausted; child is still non-terminal: "
+                        f"{reconciliation['evidence'] or 'state unreadable'}; "
+                        f"recovery reset refused: {reset_result['reason']}"
+                        f"{_finish_evidence_suffix(finish_failure)})."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
+                # Invariant guard (parent AC4, LP-0MVWEP2VQ001NPRK):
+                # reset-for-retry is only for a worktree that carried **no**
+                # commits ahead of the parent branch. The preservation gate
+                # above refuses a commit-carrying worktree, so reaching this
+                # point with commits would mean a committed slice was
+                # discarded — fail closed instead of recording a
+                # reset-for-retry that implies an uncommitted-only reset.
+                violation = _reset_for_retry_violation(reset_result)
+                if violation:
+                    LOG.error(
+                        "Refusing to record a reset-for-retry for child "
+                        "%s: %s",
+                        failed_cid, violation,
+                    )
+                    report["message"] = (
+                        f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                        f"(finish-attempt bound {finish_attempt_limit} "
+                        f"exhausted; child is still non-terminal: "
+                        f"{reconciliation['evidence'] or 'state unreadable'}; "
+                        f"reset-for-retry refused: {violation}"
+                        f"{_finish_evidence_suffix(finish_failure)})."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
+                reset_cids.add(failed_cid)
+                # Record the discard *before* changing the status, so the
+                # child owner's WIP is never discarded silently.
+                wl_add_comment(
+                    failed_cid,
+                    _reset_for_retry_comment(
+                        failed_cid,
+                        finish_attempts[failed_cid],
+                        str(parent_report.get("message", "") or ""),
+                        reconciliation,
+                        reset_result,
+                        finish_failure,
+                    ),
+                )
+                try:
+                    # Durable-write reset after a failed finish: release the
+                    # child's claim so a fresh drive session can re-dispatch it.
+                    StatusLifecycle.update_status(
+                        failed_cid, "open", assignee="",
+                    )
+                except RuntimeError as exc:
+                    LOG.error(
+                        "Failed to reset child %s to open after its "
+                        "worktree reset: %s", failed_cid, exc,
+                    )
+                    report["message"] = (
+                        f"Child {failed_cid} worktree was reset to "
+                        f"{reset_result['ref']} but its status could not be "
+                        f"set to open ({exc}); stopping the drive chain"
+                        f"{_finish_evidence_suffix(finish_failure)}."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
+                driven.append({
+                    "id": failed_cid,
+                    "result": "reset-for-retry",
+                    "reset": True,
+                    "status": "open",
+                    "stage": reconciliation["stage"],
+                    "finish_attempts": finish_attempts[failed_cid],
+                    "discarded_paths": list(
+                        reset_result.get("discarded_paths") or []
+                    ),
+                    "evidence": reconciliation["evidence"],
+                    "message": _describe_finish_failure(finish_failure),
+                    "reason": (
+                        f"finish failed {finish_attempts[failed_cid]} "
+                        f"time(s); worktree reset to {reset_result['ref']} "
+                        "and the child queued for a fresh session."
+                    ),
+                })
+                report["reset_for_retry"] = (
+                    report.get("reset_for_retry", 0) + 1
+                )
+                LOG.info(
+                    "Reset child %s worktree to %s after %d failed finish "
+                    "attempt(s); continuing the drive loop with a fresh "
+                    "session.",
+                    failed_cid,
+                    reset_result["ref"],
+                    finish_attempts[failed_cid],
+                )
+                continue
             report["message"] = parent_report.get(
                 "message",
                 f"Phase parent reported a failure for {work_item_id}.",
             )
             report["failed_child"] = parent_report.get("next_child")
             break
+
+        if parent_report.get("skipped_held"):
+            # The parent stopped cleanly because a live holder owns the next
+            # child's critical section. Surface the held classification and
+            # its holder, and spawn nothing (AC3): a second session would race
+            # the holder's worktree writes (SA-0MVOABYW00004978).
+            report["action"] = ACTION_SKIPPED_HELD
+            report["skipped_held"] = True
+            report["held_by"] = parent_report.get("held_by")
+            report["held_children"] = parent_report.get("held_children", [])
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            report["message"] = parent_report.get(
+                "message",
+                f"A child of {work_item_id} is held by another "
+                "implementation session; no session was spawned.",
+            )
+            break
+
+        # A stale-lock reclamation recorded while the parent phase started the
+        # child is forwarded into the drive report, so a ``drive --json``
+        # consumer sees it without scraping the child's log
+        # (SA-0MVUX6Q4S006KII3, parent AC3).
+        _forward_child_lock_reclamation(
+            report, str(parent_report.get("next_child") or ""), parent_report
+        )
 
         child_id = parent_report.get("next_child")
         if not child_id:
@@ -6336,10 +12551,16 @@ def phase_drive(
             "id": child_id,
             "worktree_path": worktree_path,
             "attempt": attempts[child_id],
-            "result": "ok" if spawn_result.get("success") else "failed",
+            "result": "finished" if spawn_result.get("success") else "failed",
             "reason": spawn_result.get("reason", ""),
         }
         driven.append(entry)
+
+        if spawn_result.get("success"):
+            # Queue the tree for removal: the follow-up `parent` report names
+            # the child's terminal state, which is the signal to remove it
+            # without an extra store fetch on the hot path.
+            pending_cleanup[child_id] = worktree_path
 
         if not spawn_result.get("success"):
             # A failed spawn is a bound, not a verdict: reconcile against the
@@ -6363,13 +12584,39 @@ def phase_drive(
                     "Child %s completed late (%s); continuing the drive loop.",
                     child_id, reconciliation["evidence"],
                 )
+                # This is the exact path the production incident took: the
+                # session was killed after its push, so the deferred worktree
+                # must be released here too — a hook on the success path only
+                # would leak it. The reconciliation already established
+                # terminality, so removal is immediate (no extra fetch).
+                _maybe_remove_child_worktree(
+                    child_id, worktree_path, entry, report
+                )
                 continue
 
-            # Not terminal: the hard failure stands. Before stopping the
-            # chain, check whether the child is *stranded* — its work is
-            # already on the parent branch but the item never reached a
-            # terminal state (SA-0MVLJWRVO000QQNP). Read-only: report + one
-            # parent comment, no status mutation.
+            # Not terminal: the hard failure stands. The killed session could
+            # not release the claim it held (a timeout kill is a SIGKILL, so
+            # no exit hook runs), so the surviving driver releases it with a
+            # durable write before any further diagnosis: an in-progress
+            # child would otherwise stay on a scheduling hold and be
+            # invisible to ``wl next`` (SA-0MVVF75ZA007XNKB). This also lets
+            # the evidence-gated finaliser below run — it refuses a child
+            # still carrying someone's assignee. The release never masks the
+            # failure: the chain still stops with ``failed_child``.
+            claim_release = _release_orphaned_child_claim(child_id)
+            entry["claim_release"] = claim_release
+            report["claim_release"] = claim_release
+            if claim_release.get("released"):
+                LOG.info(
+                    "Released the orphaned claim on %s after its child "
+                    "session failed: %s",
+                    child_id, claim_release["reason"],
+                )
+
+            # Before stopping the chain, check whether the child is
+            # *stranded* — its work is already on the parent branch but the
+            # item never reached a terminal state (SA-0MVLJWRVO000QQNP).
+            # Read-only: report + one parent comment, no status mutation.
             stranded = _detect_stranded_child(
                 child_id, worktree_path, parent_branch,
                 commit_evidence=commit_evidence,
@@ -6464,6 +12711,11 @@ def phase_drive(
         )
 
     report["children_driven"] = driven
+    report["finish_attempts"] = dict(finish_attempts)
+    report["infra_retries"] = dict(infra_retries)
+    # A drive that ended before the follow-up parent report resolved a child's
+    # queued worktree never strands it silently (SA-0MVTE8XAJ002IUDR AC7).
+    _retain_pending_worktree_cleanups(pending_cleanup, report)
     _emit_phase_report(report, json_output)
     return report
 
@@ -6498,8 +12750,9 @@ def _worktree_placement_violation(
 
     1. the current directory is not the worktree (or a subdirectory of it),
     2. the main checkout holds uncommitted changes outside ``.worklog/``, and
-    3. the worktree itself holds NO changes (clean and at the parent branch
-       HEAD) — i.e. the work was done in the main checkout, not the worktree.
+    3. the worktree itself holds NO changes (no dirty files and no commits
+       ahead of the parent branch) — i.e. the work was done in the main
+       checkout, not the worktree.
 
     Condition 3 keeps the gate precise: pre-existing/unrelated dirt in the
     main checkout does not block a legitimate finish when the work actually
@@ -6549,7 +12802,12 @@ def _git_path_has_changes(
 ) -> bool:
     """True when the git directory at *path* contains implementation changes.
 
-    Detects both uncommitted changes and commits ahead of *parent_branch*.
+    Detects uncommitted changes and commits **ahead of** *parent_branch*. A
+    worktree that is merely *behind* the parent branch (HEAD differs from it,
+    but zero commits ahead and no dirty files) holds no work and is reported
+    as clean, so a long-running child is never handed to ``finish`` just
+    because unrelated commits landed on the parent branch
+    (SA-0MVRN5Q67005H3M5).
 
     Args:
         path: Directory to check (e.g. the worktree root).
@@ -6557,22 +12815,25 @@ def _git_path_has_changes(
         expected_dirty: Project-declared path prefixes to exclude.
 
     Returns:
-        True if the directory is dirty or its HEAD differs from the parent
-        branch; False only when it is clean AND at the parent branch HEAD.
+        True if the directory is dirty or has commits ahead of
+        *parent_branch*; False when it is clean and has none.
     """
     if git_has_dirty_files(
         git_status(cwd=str(path)), expected_dirty=expected_dirty
     ):
         return True
-    head = run_cmd(
-        ["git", "rev-parse", "HEAD"], cwd=str(path), check=False, capture=True
+    ahead = run_cmd(
+        ["git", "rev-list", "--count", f"{parent_branch}..HEAD"],
+        cwd=str(path),
+        check=False,
+        capture=True,
     )
-    parent = run_cmd(
-        ["git", "rev-parse", parent_branch], cwd=str(path), check=False, capture=True
-    )
-    if head.returncode == 0 and parent.returncode == 0:
-        return head.stdout.strip() != parent.stdout.strip()
-    return True  # cannot compare; fail open
+    if ahead.returncode == 0:
+        try:
+            return int(ahead.stdout.strip()) > 0
+        except ValueError:
+            return True  # unparseable count; fail open
+    return True  # cannot compare (missing ref, git error); fail open
 
 
 def _child_main_checkout_violation(
@@ -6592,8 +12853,8 @@ def _child_main_checkout_violation(
 
     1. the child is non-terminal (the caller enforces this),
     2. the main checkout holds uncommitted changes outside ``.worklog/``, and
-    3. the child's worktree holds NO changes (clean and at the parent branch
-       HEAD) — so the work did not land in the worktree.
+    3. the child's worktree holds NO changes (no dirty files and no commits
+       ahead of the parent branch) — so the work did not land in the worktree.
 
     Condition 3 keeps the guard precise: pre-existing/unrelated dirt in the
     main checkout does not block a child whose work legitimately lives in its
@@ -6636,8 +12897,9 @@ def _child_main_checkout_violation(
         listing += f"\n  … and {len(offending) - 20} more"
     return (
         f"Child {child_id} produced changes in the main checkout at {root} "
-        f"instead of its worktree {wt}. The worktree has no changes (clean at "
-        f"{parent_branch} HEAD), so the child's work did not land in its own "
+        f"instead of its worktree {wt}. The worktree has no changes (no "
+        f"dirty files and no commits ahead of {parent_branch}), so the "
+        f"child's work did not land in its own "
         f"worktree — `cwd` is not sufficient. Offending main-checkout paths:\n"
         f"{listing}\n"
         f"Move these changes into {wt} (or discard them), then re-run. A "
@@ -6723,8 +12985,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "action",
-        choices=["start", "finish", "abort", "parent", "drive"],
-        help="Workflow phase to execute",
+        choices=["start", "finish", "abort", "parent", "drive", "cleanup"],
+        help=(
+            "Workflow phase to execute ('cleanup' removes a finished item's "
+            "worktree; run it as the session's last bash command)"
+        ),
     )
     parser.add_argument(
         "work_item_id",
@@ -6757,6 +13022,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Parent branch for worktree (default: {DEFAULT_PARENT_BRANCH})",
     )
     parser.add_argument(
+        "--keep-worktree",
+        action="store_true",
+        help=(
+            "finish: defer worktree removal — the caller owns the cleanup, so "
+            "the finishing session keeps its cwd. Implied for driven child "
+            f"sessions ({DRIVE_RECURSION_ENV}=1); also settable with "
+            f"{KEEP_WORKTREE_ENV}=1."
+        ),
+    )
+    parser.add_argument(
         "--worktree-path",
         default=None,
         help="Override worktree path",
@@ -6787,6 +13062,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Per-child session timeout in seconds when driving an epic "
             f"(default: {DEFAULT_CHILD_SESSION_TIMEOUT})"
+        ),
+    )
+    parser.add_argument(
+        "--finish-attempt-limit",
+        type=int,
+        default=None,
+        help=(
+            "Max failing finish executions per child in one drive invocation "
+            "(default: the --max-child-sessions value)"
+        ),
+    )
+    parser.add_argument(
+        "--infra-retry-limit",
+        type=int,
+        default=DEFAULT_INFRA_RETRY_LIMIT,
+        help=(
+            "Max infrastructure-refusal retries per child in one drive "
+            "invocation. A transient infrastructure refusal (e.g. "
+            "local_dev_diverged, a held main-checkout lock, a dropped push) "
+            "is retried on this separate bounded budget with exponential "
+            "backoff — it never consumes --finish-attempt-limit and never "
+            "spawns a session. "
+            f"(default: {DEFAULT_INFRA_RETRY_LIMIT})"
         ),
     )
     parser.add_argument(
@@ -6837,6 +13135,10 @@ def _main(argv: list[str] | None = None) -> int:
     # phase_start() later overwrites these globals with the real worktree
     # path and repo root once they are known.
     _store_signal_globals("", args.work_item_id, "")
+    # The ``--keep-worktree`` decision must survive into the signal handler so
+    # an interrupted opt-in finish keeps the session's cwd
+    # (SA-0MVTE8XAJ002IUDR AC4).
+    _set_keep_worktree_global(getattr(args, "keep_worktree", False))
     _register_signal_handlers()
 
     logging.basicConfig(
@@ -6866,6 +13168,7 @@ def _main(argv: list[str] | None = None) -> int:
                 commit_msg_override=args.commit_msg,
                 max_retry=args.max_retry,
                 verbose=args.verbose,
+                keep_worktree=args.keep_worktree,
             )
             _emit_timing(_root_timer)
     elif args.action == "abort":
@@ -6874,6 +13177,15 @@ def _main(argv: list[str] | None = None) -> int:
                 work_item_id=args.work_item_id,
                 json_output=args.json,
                 verbose=args.verbose,
+            )
+            _emit_timing(_root_timer)
+    elif args.action == "cleanup":
+        with Timer("implement") as _root_timer, Timer("phase_cleanup"):
+            result = phase_cleanup(
+                work_item_id=args.work_item_id,
+                json_output=args.json,
+                verbose=args.verbose,
+                worktree_path=args.worktree_path,
             )
             _emit_timing(_root_timer)
     elif args.action == "parent":
@@ -6896,6 +13208,8 @@ def _main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 max_child_sessions=args.max_child_sessions,
                 child_timeout=args.child_timeout,
+                finish_attempt_limit=args.finish_attempt_limit,
+                infra_retry_limit=args.infra_retry_limit,
                 finalise_stranded=args.finalise_stranded,
             )
             _emit_timing(_root_timer)

@@ -15,11 +15,11 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
@@ -58,7 +58,7 @@ const SAMPLE_CHANGELOG = `# Changelog
 
 /** Create a temp project dir with a .worklog/ folder. */
 function makeTempProject() {
-  const dir = mkdtempSync(join(tmpdir(), 'discord-notify-test-'));
+  const dir = makeTempDir('discord-notify-test-');
   mkdirSync(join(dir, '.worklog'), { recursive: true });
   return dir;
 }

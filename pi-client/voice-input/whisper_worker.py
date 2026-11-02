@@ -112,9 +112,62 @@ def load_model_for_cpu(model_size: str) -> Any:
     return load_model(model_size, "cpu", "int8")
 
 
+def load_numpy() -> Any:
+    """Import numpy lazily.
+
+    numpy is a runtime requirement of the transcription path:
+    ``pcm_to_float32()`` uses it to build the float32 array
+    ``WhisperModel.transcribe()`` expects. Imported lazily so the module (and
+    its tests / doctor checks) can be imported on an interpreter without it;
+    ``missing_dependency_message()`` reports it at ``start`` instead.
+    """
+    import numpy  # type: ignore import-not-found
+
+    return numpy
+
+
+def faster_whisper_missing_message(exc: BaseException) -> str:
+    """Actionable message for a missing/unimportable faster-whisper install."""
+    return (
+        "faster-whisper is not installed in the selected Python "
+        f"environment: {exc}. Install it with `pip install "
+        "faster-whisper` (a CUDA build also needs cuDNN/cuBLAS)."
+    )
+
+
+def numpy_missing_message(exc: BaseException) -> str:
+    """Actionable message for a missing/unimportable numpy install."""
+    return (
+        "numpy is not installed in the selected Python environment: "
+        f"{exc}. numpy is a runtime requirement of faster-whisper; install it "
+        "with `pip install numpy` (or reinstall faster-whisper, which depends "
+        "on it)."
+    )
+
+
+def missing_dependency_message() -> str | None:
+    """Return an actionable message for the first missing runtime dependency.
+
+    Both dependencies of the transcription path are checked before the model
+    is loaded so an unusable interpreter is reported at ``start``, never as a
+    mid-stream ``transcription failed: No module named 'numpy'`` (numpy is a
+    hard dependency of faster-whisper, so it is present wherever the worker
+    can transcribe).
+    """
+    try:
+        import faster_whisper  # type: ignore import-not-found  # noqa: F401
+    except ImportError as exc:
+        return faster_whisper_missing_message(exc)
+    try:
+        load_numpy()
+    except ImportError as exc:
+        return numpy_missing_message(exc)
+    return None
+
+
 def pcm_to_float32(pcm: bytes) -> Any:
     """Convert little-endian int16 mono PCM to a normalised float32 array."""
-    import numpy as np
+    np = load_numpy()
 
     samples = np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0
     return samples
@@ -261,21 +314,16 @@ def handle_command(
         model_size = str(message.get("model") or args.model)
         device = str(message.get("device") or args.device)
         compute_type = str(message.get("computeType") or args.compute_type)
+        missing = missing_dependency_message()
+        if missing is not None:
+            emit({"type": "error", "message": missing})
+            raise SystemExit(1)
         try:
             model, device, compute_type = load_model_with_fallback(
                 model_size, device, compute_type
             )
         except ImportError as exc:
-            emit(
-                {
-                    "type": "error",
-                    "message": (
-                        "faster-whisper is not installed in the selected Python "
-                        f"environment: {exc}. Install it with `pip install "
-                        "faster-whisper` (a CUDA build also needs cuDNN/cuBLAS)."
-                    ),
-                }
-            )
+            emit({"type": "error", "message": faster_whisper_missing_message(exc)})
             raise SystemExit(1)
         except Exception as exc:  # noqa: BLE001 - report any model load failure
             emit(

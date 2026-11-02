@@ -131,7 +131,7 @@ class Simulation:
     def _discover_worktree(self, child_id):
         return self.worktrees.get(child_id)
 
-    def _has_worktree_changes(self, worktree_path):
+    def _has_worktree_changes(self, worktree_path, parent_branch=None):
         # worktree_path == /wt/<cid>
         cid = worktree_path.rsplit("/", 1)[-1]
         return bool(self.changes.get(cid, False))

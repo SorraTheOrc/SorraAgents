@@ -235,7 +235,7 @@ class TestParentAdvancement:
         assert report.get("parent_advanced") is True
         # Exactly one status transition: the parent → completed/in_review.
         assert report["_calls"]["update_status"] == [
-            ("SA-PARENT001", "completed", "in_review", None)
+            ("SA-PARENT001", "completed", "in_review", "")
         ]
         # No child worktree was started.
         assert report["_calls"]["phase_start"] == []
@@ -251,7 +251,7 @@ class TestParentAdvancement:
         assert report["success"] is True
         assert report.get("parent_advanced") is True
         assert report["_calls"]["update_status"] == [
-            ("SA-PARENT001", "completed", "in_review", None)
+            ("SA-PARENT001", "completed", "in_review", "")
         ]
 
 
@@ -360,7 +360,7 @@ class TestDeletedChildren:
         assert report["success"] is True
         assert report.get("parent_advanced") is True
         assert report["_calls"]["update_status"] == [
-            ("SA-PARENT001", "completed", "in_review", None)
+            ("SA-PARENT001", "completed", "in_review", "")
         ]
         assert report["_calls"]["phase_start"] == []
 
@@ -432,7 +432,7 @@ class TestSoftDeletedChildren:
         assert report["success"] is True
         assert report.get("parent_advanced") is True
         assert report["_calls"]["update_status"] == [
-            ("SA-PARENT001", "completed", "in_review", None)
+            ("SA-PARENT001", "completed", "in_review", "")
         ]
         assert report["_calls"]["phase_start"] == []
 

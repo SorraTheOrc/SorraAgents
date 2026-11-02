@@ -11,7 +11,9 @@ outer guard owns the checkout).
 The tests patch the delegation boundary (``_guarded_run_all``) and assert the
 observable contract: the resolved commands/scope are forwarded, the adapted
 result keeps implement.py's shape, a ``live_repo_mutation`` from the owning
-guard fails the gate, and a partial install degrades to the direct path.
+guard fails the gate, ``live_repo_excluded`` churn notes are carried through
+without failing it (SA-0MUIJAHXS003M7BG AC3), and a partial install degrades to
+the direct path.
 """
 
 from __future__ import annotations
@@ -170,3 +172,48 @@ def test_partial_install_degrades_to_direct_path(monkeypatch, tmp_path):
 
     assert captured == ["pytest -q -r a --disable-warnings"]
     assert result["success"] is True
+
+
+def test_excluded_churn_note_is_carried_through_the_gate(monkeypatch, tmp_path):
+    """AC3 (SA-0MUIJAHXS003M7BG): an excluded-churn note never fails the gate.
+
+    Working-tree churn attributed to a concurrent session must reach the finish
+    output (``live_repo_excluded``) while leaving ``success`` untouched, so a
+    reviewer can tell an excluded foreign change from a clean run.
+    """
+    repo = _repo_with_suite(tmp_path, ["pytest -q -r a --disable-warnings"])
+    note = (
+        "excluded: concurrently resolved working-tree change in /repo: "
+        "docs/dev/test-isolation.md [ M]"
+    )
+
+    def fake_guarded_run_all(cwd=None, timeout=600, *, commands=None, scope="full",
+                             base_ref="origin/dev", use_cache=True, **kwargs):
+        return {
+            **_guarded_result(commands, scope=scope),
+            "live_repo_excluded": [note],
+        }
+
+    monkeypatch.setattr(implement, "_guarded_run_all", fake_guarded_run_all)
+
+    result = implement.run_tests(str(repo), scope="full")
+
+    assert result["success"] is True
+    assert "live_repo_mutation" not in result
+    assert result["live_repo_excluded"] == [note]
+
+
+def test_gate_without_excluded_churn_omits_the_key(monkeypatch, tmp_path):
+    """A clean gate stays byte-for-byte the previous shape (no empty key)."""
+    repo = _repo_with_suite(tmp_path, ["pytest -q -r a --disable-warnings"])
+
+    def fake_guarded_run_all(cwd=None, timeout=600, *, commands=None, scope="full",
+                             base_ref="origin/dev", use_cache=True, **kwargs):
+        return _guarded_result(commands, scope=scope)
+
+    monkeypatch.setattr(implement, "_guarded_run_all", fake_guarded_run_all)
+
+    result = implement.run_tests(str(repo), scope="full")
+
+    assert result["success"] is True
+    assert "live_repo_excluded" not in result

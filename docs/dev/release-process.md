@@ -373,6 +373,14 @@ Trigger and constraints:
   untracked build droppings (e.g. `dist/`) are never committed. A derived file
   that is generated fresh (untracked/gitignored) is out of scope — the fix
   targets repos that already track their derived version file.
+- **Submodule pointers excluded:** after `git add -u`, every staged gitlink
+  (index mode `160000`) is restored to its recorded commit, so a build that
+  advances a submodule checkout — e.g. main-street's `engine:sync` moving
+  `./core` — can never smuggle a pointer bump into the derived-files commit.
+  This keeps pin/pointer invariants intact (the committed pointer still equals
+  `configs/engine-pin.json`); a deliberate engine advance for a release is a
+  separate, pinned commit, never a side effect of regeneration
+  (SA-0MVO274QN006GXGQ).
 
 Implementation: `skill/ship/scripts/release/regenerate-version.js` (invoked by
 `merge-dev-to-main.sh` after the dev merge, before the tag).

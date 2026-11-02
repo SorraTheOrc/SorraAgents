@@ -16,6 +16,12 @@ githubRepo: SorraTheOrc/SorraAgents
 # empty-author-email gate is never bypassed, and incident sentinel identities
 # such as `t@t.com` stay refused. Regression coverage:
 # tests/test_author_gate_allowlist.py. See SA-0MVB57M02008QPJS.
+#
+# `sorra@thewizardscode.com` is the project's own work identity (not a
+# sentinel): inbound worklog commits authored by it blocked `wl sync` on
+# 2026-10-27 and again on 2026-10-29/10-31 (SA-0MVVX9PAT009Q45H, decision =
+# allow-list the real project identity).
 syncAllowedAuthors:
   - 250240+SorraTheOrc@users.noreply.github.com
   - pi@local
+  - sorra@thewizardscode.com

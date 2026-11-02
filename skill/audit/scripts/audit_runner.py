@@ -91,7 +91,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2]
@@ -121,7 +121,7 @@ from scripts.failure_notice import FailureNotice
 from scripts.pi_utils import extract_pi_text, extract_pi_text_with_fallback
 
 try:
-    from shared.git_sandbox import scrub_repository_overrides
+    from shared.git_sandbox import git_env_for_repo, scrub_repository_overrides
     from shared.process_semaphore import (
         DEFAULT_MAX_WORKERS,
         ENV_MAX_WORKERS,
@@ -1668,6 +1668,8 @@ def _restore_work_item_status(issue_id: str, original_status: str,
         original_status, original_stage,
     )
     try:
+        # Signal-path durable write: the StatusLifecycle exit hook never runs on
+        # SIGTERM/SIGINT, so the audit claim is released explicitly here.
         cmd = [
             "wl", "update", issue_id,
             "--status", safe_status,
@@ -1904,11 +1906,22 @@ def _project_top_levels(project_root: Path) -> list[str]:
     Falls back to a directory listing when git is unavailable. Returns an
     empty list on any failure (callers fail open). Dot-entries are excluded
     (they are never manifest markers).
+
+    The command runs with :func:`shared.git_sandbox.git_env_for_repo`, so an
+    inherited ``GIT_INDEX_FILE`` is honoured **only** when it belongs to
+    *project_root*. ``implement.py finish`` exports a temporary
+    would-be-commit index for the suite it runs, and ``git ls-files`` applies
+    an inherited index to whatever repository ``cwd`` names: without the
+    scrub, every repository under test reported the **gate's** tree instead
+    of its own, so ``_distinctive_project_top_levels`` returned ``[]`` and
+    the root-file-marker scope tests failed only under the gate
+    (SA-0MVWJ6U3J003TLRZ).
     """
     try:
         proc = subprocess.run(
             ["git", "-C", str(project_root), "ls-files"],
             capture_output=True, text=True, check=False, timeout=30,
+            env=git_env_for_repo(project_root),
         )
         if proc.returncode == 0 and proc.stdout:
             tops: set[str] = set()
@@ -2028,11 +2041,13 @@ def _parse_iso_utc(value) -> datetime | None:
     timestamp-parse implementation both callers use.
     """
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        # ``fromisoformat`` accepts the ``Z`` suffix natively on the
+        # project's 3.11 target, so no ``+00:00`` rewrite is needed.
+        parsed = datetime.fromisoformat(str(value))
     except (ValueError, TypeError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -5429,7 +5444,7 @@ _CODE_QUALITY_SCOPE_EMPTY_REASON = (
     "no in-scope files could be resolved (the git changed-file list is empty "
     "and no committed touched files or Key Files resolved to existing paths) "
     "— the whole-repository scan is deliberately not run "
-    "(SA-0MUI5ZYO6002W3KD)"
+    "(SA-0MUI5ZYO6002W3KD, SA-0MVPDTSRV0049KW2)"
 )
 """Documented skip reason for an empty code-quality scope.
 
@@ -5438,6 +5453,93 @@ lint: on the normal post-merge state (the item's work is already committed
 and the checkout is clean) that would report unrelated pre-existing findings
 against this item (SA-0MUI5ZYO6002W3KD).
 """
+
+
+def _filter_code_quality_scope(
+    paths: Sequence[str],
+    project_root: Path | None = None,
+) -> list[str]:
+    """Drop code-quality scan paths that leave the audited project.
+
+    The code-quality lint must only ever touch files this project owns
+    (SA-0MVPDTSRV0049KW2): a work item's ``Key Files``, a commit that touches
+    a git submodule, or a comment-recorded hash can otherwise drag submodule
+    files or another repository's files into the scan. ``create_quality_epics``
+    then files *critical* work items against that foreign code, blocking the
+    owning project's next release at the ship skill's critical-items gate.
+
+    Two bounds are applied, each path is resolved first (``Path.resolve()``,
+    so symlinks and ``..`` segments cannot smuggle a path outside the root):
+
+    1. **Containment** — the resolved path must lie inside *project_root*;
+    2. **Nested repositories** — no ancestor between the file and the project
+       root may carry a ``.git`` entry (file or directory), which is how git
+       marks submodules and nested checkouts.
+
+    A path that fails resolution (unresolvable symlink, NUL byte, …) is
+    dropped rather than raising, so a pathological entry can never abort the
+    audit. In-scope paths are returned **unchanged and in order**, never
+    rewritten, re-ordered or widened. When nothing survives, the empty result
+    means "lint nothing" — callers must skip the scan with
+    ``_CODE_QUALITY_SCOPE_EMPTY_REASON`` (never a whole-repository fallback).
+
+    *project_root* defaults to the cwd-derived ``TARGET_PROJECT_ROOT``,
+    matching ``_filter_existing_paths`` so the filter cannot silently widen
+    to an unrelated root.
+    """
+    root = (
+        Path(project_root).resolve() if project_root is not None
+        else Path(TARGET_PROJECT_ROOT).resolve()
+    )
+    kept: list[str] = []
+    dropped = 0
+    for path in paths:
+        try:
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError, ValueError):
+            # Unresolvable entry (dangling link, NUL byte, loop): never
+            # abort the audit on a pathological path — drop it instead.
+            dropped += 1
+            continue
+        if resolved == root or root not in resolved.parents:
+            # Outside the audited project (a sibling repository, an absolute
+            # Key File, or a ``..`` escape that resolved out of bounds).
+            dropped += 1
+            continue
+        if _inside_nested_git_repo(resolved, root):
+            dropped += 1
+            continue
+        kept.append(path)
+    if dropped:
+        print(
+            f"Warning: dropped {dropped} path(s) from the code-quality scope "
+            f"(outside project root or inside a nested git repository) — "
+            f"linting {len(kept)} in-scope file(s) only (SA-0MVPDTSRV0049KW2).",
+            file=sys.stderr,
+        )
+    return kept[:_FILE_SCOPE_MAX_FILES]
+
+
+def _inside_nested_git_repo(resolved: Path, root: Path) -> bool:
+    """True when a ``.git`` marker sits between *resolved* and *root*.
+
+    Walks the ancestors of *resolved* up to (but excluding) *root* and
+    returns True as soon as an ancestor carries a ``.git`` entry — either a
+    directory (a nested checkout) or a file (a git submodule's gitlink). The
+    root itself is never examined, so a normal clone's top-level ``.git``
+    does not mark every file nested.
+    """
+    for parent in resolved.parents:
+        if parent == root:
+            return False
+        if root not in parent.parents:
+            return False
+        if (parent / ".git").exists():
+            return True
+    return False
 
 
 def _resolve_code_quality_scope(
@@ -5471,11 +5573,15 @@ def _resolve_code_quality_scope(
     """
     changed = _git_changed_files(runner)
     if changed:
-        return changed
+        # Both scope sources are bounded to the audited project: a changed
+        # path can itself be a submodule path or escape the root via ``..``
+        # (SA-0MVPDTSRV0049KW2 AC3).
+        return _filter_code_quality_scope(changed, project_root)
     touched = _resolve_touched_files(
         runner, issue_id, work_item=work_item, comments=comments,
     ) or []
-    return _filter_existing_paths(touched, project_root)
+    existing = _filter_existing_paths(touched, project_root)
+    return _filter_code_quality_scope(existing, project_root)
 
 
 def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX,
@@ -5758,6 +5864,39 @@ def _child_has_stored_verdict(child: dict) -> bool:
     return bool(child.get("reused_from")) or child.get("child_audit_ready") is not None
 
 
+def _child_acs_assessed_in_run(child: dict) -> bool:
+    """True when *child* carries real (non-pending) acceptable verdicts.
+
+    The child-verdict reuse pre-pass runs BEFORE child screening, so a child
+    with no stored verdict is tagged ``child_audit_ready = False`` at that
+    point. The screening that follows (separate-process Phase-1, or the
+    budget-exceeded re-screen) then fills ``ac_results`` with real verdicts
+    without touching that flag — so the flag alone cannot distinguish
+    "never judged" from "judged by this run".
+
+    A child whose criteria were all judged acceptable by this run has been
+    assessed; reporting it as ``not_assessed`` misleads a reader (and an
+    orchestrator grepping reason codes) into treating a fully screened child
+    as an unjudged one (MS-0MVQO6N34007DHP8). A child whose screens are still
+    pending main-session review, whose screening was budget-exceeded, or
+    whose verdicts include anything but ``met``/``adjusted`` is NOT
+    considered assessed here, so the existing ``not_assessed`` semantics are
+    preserved for genuinely unjudged and blocking children.
+    """
+    acs = child.get("ac_results") or []
+    if not acs or child.get("budget_exceeded"):
+        return False
+    if any(
+        a.get("verdict") == VERDICT_PARTIAL
+        and MAIN_SLOT_PENDING_EVIDENCE in str(a.get("evidence", ""))
+        for a in acs
+    ):
+        return False
+    return all(
+        a.get("verdict") in (VERDICT_MET, VERDICT_ADJUSTED) for a in acs
+    )
+
+
 def _unserviced_main_slot_child_ids(
     child_results: list[dict],
     stale_pending_ids: set[str] | None,
@@ -5788,18 +5927,27 @@ def _classify_child_assessment_reason(
       carry the unserviced pending marker).  Whether the parent inherits a
       stored verdict or not is a separate concern; the reason always names the
       unserviced-in-main-slot origin.
-    * ``not_assessed`` — the child is genuinely not-ready and has no stored
-      verdict (a normal "not ready" verdict).
-    * ``None`` — the child is assessed (stored-verdict-inherited, in_review,
-      done, exempt, etc.) and does not need a diagnostic.
+    * ``not_assessed`` — the child is genuinely not-assessed: no stored
+      verdict AND no acceptable verdict from this run's screening (pending
+      screens, budget-exceeded screening, or blocking verdicts).
+    * ``None`` — the child is assessed (stored-verdict-inherited, screened to
+      an acceptable verdict by this run, in_review, done, exempt, etc.) and
+      does not need a diagnostic.
 
     The caller decides whether to surface the code in the report or JSON payload.
     """
     if _is_unserviced_main_slot_child(child, stale_pending_ids):
         return REASON_UNSERVICED_IN_MAIN_SLOT
-    # A child whose child_audit_ready is False and which is not unserviced
-    # is genuinely not-ready / not-assessed.
-    if child.get("child_audit_ready") is False:
+    # A child whose child_audit_ready is False and which is not unserviced is
+    # not-assessed ONLY when this run never judged its criteria. A child this
+    # run screened to an acceptable verdict (child_audit_ready is still False
+    # because it was set before screening) HAS been assessed — the flag means
+    # "no stored verdict at pre-pass time", not "never judged"
+    # (MS-0MVQO6N34007DHP8).
+    if (
+        child.get("child_audit_ready") is False
+        and not _child_acs_assessed_in_run(child)
+    ):
         return REASON_NOT_ASSESSED
     return None
 
@@ -7278,6 +7426,7 @@ def _phase1_review_children_batched(
     runner: Runner,
     script_failure_callback: Callable[[str, Exception], None],
     ac_fallback_used: threading.Event | None = None,
+    green_run_block: str | None = None,
 ) -> dict[int, list[dict]]:
     """Screen ALL pending children's ACs in ONE indexed Phase 1 call.
 
@@ -7292,6 +7441,15 @@ def _phase1_review_children_batched(
     parseable at all — degrades that child's ACs to the conservative
     ``partial`` verdict, exactly as a failed single-child screen does. A
     batch can therefore never turn an unexamined AC into ``met``.
+
+    *green_run_block* is the resolved GREEN-RUN evidence block (operator
+    attestation, auto-verified cached full-suite run, or executed test-skill
+    run), or ``None`` when no evidence exists at the audited HEAD
+    (LP-0MVO35BF90021QY6). It is spliced immediately after the SCANNING block
+    — exactly as the parent Phase-1 and every Phase 2 prompt already do — so
+    an absent block leaves the prompt byte-identical and an execution-
+    dependent child AC can only be marked ``met`` against real evidence. The
+    block itself forbids executing the suite; the read-only mandate stands.
 
     Returns ``{child_index: [ac_result, ...]}`` for every pending child.
     Never raises: a Pi ``RuntimeError`` records a script failure and degrades
@@ -7346,6 +7504,7 @@ def _phase1_review_children_batched(
         f"for it.\n\n"
         f"{children_block}\n\n"
         f"{_SCANNING_BLOCK}"
+        f"{green_run_block or ''}"
         f"If a criterion has acceptable variance (implementation differs from "
         f"original spec but still satisfies user story intent), use verdict "
         f"'adjusted' instead of 'unmet'. Include justification in the "
@@ -7378,33 +7537,32 @@ def _phase1_review_children_batched(
             batch = parsed if isinstance(parsed, list) else None
         except (json.JSONDecodeError, TypeError):
             batch = None
-    if not batch:
-        # AC4 safe fallback: a retry with the full model only when a distinct
-        # fast model was used. A capped batch (budget / concurrency wait) is
-        # never retried — it is quarantined as 'partial' so the run does not
-        # spend a second full-length call after the budget is already gone
-        # (SA-0MVJ3Q662006RDJR AC2/AC3).
-        if phase1_model != full_model and not _screen_call_capped(result):
-            print(
-                "Warning: fast Phase 1 model produced unparseable output — "
-                "retrying batched child review with the full audit model",
-                file=sys.stderr,
+    # AC4 safe fallback: a retry with the full model only when a distinct
+    # fast model was used. A capped batch (budget / concurrency wait) is
+    # never retried — it is quarantined as 'partial' so the run does not
+    # spend a second full-length call after the budget is already gone
+    # (SA-0MVJ3Q662006RDJR AC2/AC3).
+    if not batch and phase1_model != full_model and not _screen_call_capped(result):
+        print(
+            "Warning: fast Phase 1 model produced unparseable output — "
+            "retrying batched child review with the full audit model",
+            file=sys.stderr,
+        )
+        try:
+            result = _call_pi_and_maybe_log(
+                "", "phase1_batch", prompt,
+                model=full_model, pi_bin=pi_bin, debug_log=debug_log,
+                timeout=timeout, ac_fallback_used=ac_fallback_used,
+                json_expected=True,
             )
-            try:
-                result = _call_pi_and_maybe_log(
-                    "", "phase1_batch", prompt,
-                    model=full_model, pi_bin=pi_bin, debug_log=debug_log,
-                    timeout=timeout, ac_fallback_used=ac_fallback_used,
-                    json_expected=True,
-                )
-                raw_text = (
-                    result.get("extracted_text", "")
-                    or result.get("evidence", "")
-                    or result.get("text", "")
-                )
-                batch = _extract_json_array(raw_text)
-            except RuntimeError:
-                batch = None
+            raw_text = (
+                result.get("extracted_text", "")
+                or result.get("evidence", "")
+                or result.get("text", "")
+            )
+            batch = _extract_json_array(raw_text)
+        except RuntimeError:
+            batch = None
     # A capped child screen is quarantined, not silently treated as a model
     # judgement (SA-0MVI3608M0080QLW): the result keeps the conservative
     # `partial` verdict but its evidence names the budget and phase, and the
@@ -7460,7 +7618,8 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                              timeout: int | None, runner: Runner,
                              script_failure_callback: Callable[[str, Exception], None],
                              ac_fallback_used: threading.Event | None = None,
-                             child_in_main_slot: bool = False
+                             child_in_main_slot: bool = False,
+                             green_run_block: str | None = None,
                              ) -> tuple[int, list[dict]]:
     """Phase 1 child AC review worker (P7, parallel-safe).
 
@@ -7482,6 +7641,15 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
     instruction; the child's ACs are marked pending main-session review.
     A later parent run reuses the child's persisted audit (freshness/child
     verdict reuse) with zero pi calls.
+
+    *green_run_block* (LP-0MVO35BF90021QY6) is the resolved GREEN-RUN evidence
+    block, or ``None`` when no evidence exists at the audited HEAD. It is
+    spliced immediately after the SCANNING block so the child screen judges
+    execution-dependent ACs on the same verified evidence the parent Phase-1
+    screen receives; an absent block leaves the prompt byte-identical and
+    such ACs stay ``partial`` (never a fabricated ``met``). The block reaches
+    the in-main-slot emitted prompt too, since that is the prompt the main
+    session executes.
 
     Never raises: a Pi ``RuntimeError`` records a script failure and falls
     back to diagnostic ``partial`` verdicts (identical to the historical
@@ -7511,6 +7679,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
             f"here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
             f"{_SCANNING_BLOCK}"
+            f"{green_run_block or ''}"
             f"If a criterion has acceptable variance (implementation differs from original "
             f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
             f"Include justification in the evidence field.\n\n"
@@ -10289,6 +10458,12 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # terminal item fail before the pipeline started. There is nothing to
     # claim for a done item, so skip the claim and let the verdict-driven
     # terminal lifecycle keep/restore `done` (SA-0MUWKGW9W004QXQZ).
+    #
+    # The claim is status-only and sets no assignee, so it never establishes a
+    # scheduling hold and never overwrites a pre-existing producer hold (the
+    # status-neutral claim convention documented in AGENTS_GLOBAL.md). The
+    # release of the audit agent's own claim happens on the terminal-write path
+    # below (SA-0MVVF6Y38004T5OZ).
     if original_stage != "done":
         _run_wl(runner,
                 ["wl", "update", issue_id, "--status", "in_progress", "--json"],
@@ -11520,6 +11695,7 @@ def _reaudit_budget_exceeded_children(
             ctx.runner, ctx.record_script_failure,
             ac_fallback_used=ctx.ac_fallback_used,
             child_in_main_slot=ctx.child_in_main_slot,
+            green_run_block=ctx.green_run_block,
         )
         cr["ac_results"] = acs
         cr["child_audit_ready"] = False
@@ -12099,6 +12275,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                             pi_bin, debug_log, timeout,
                             runner, ctx.record_script_failure,
                             ac_fallback_used=ac_fallback_used,
+                            green_run_block=green_run_block,
                         )
                         for _ci, _acs in _batched.items():
                             child_results[_ci]["ac_results"] = _acs
@@ -12113,6 +12290,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     runner, ctx.record_script_failure,
                                     ac_fallback_used=ac_fallback_used,
                                     child_in_main_slot=ctx.child_in_main_slot,
+                                    green_run_block=green_run_block,
                                 )
                                 for ci, child in pending_children
                             ]
@@ -12128,6 +12306,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                                 child_in_main_slot=ctx.child_in_main_slot,
+                                green_run_block=green_run_block,
                             )
                             child_results[ci]["ac_results"] = acs
 
@@ -12643,6 +12822,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                             pi_bin, debug_log, timeout,
                             runner, ctx.record_script_failure,
                             ac_fallback_used=ac_fallback_used,
+                            green_run_block=green_run_block,
                         )
                         for _ci, _acs in _batched.items():
                             child_results[_ci]["ac_results"] = _acs
@@ -12657,6 +12837,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                     runner, ctx.record_script_failure,
                                     ac_fallback_used=ac_fallback_used,
                                     child_in_main_slot=ctx.child_in_main_slot,
+                                    green_run_block=green_run_block,
                                 )
                                 for ci, child in pending_children
                             ]
@@ -12672,6 +12853,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 runner, ctx.record_script_failure,
                                 ac_fallback_used=ac_fallback_used,
                                 child_in_main_slot=ctx.child_in_main_slot,
+                                green_run_block=green_run_block,
                             )
                             child_results[ci]["ac_results"] = acs
 
@@ -13168,6 +13350,8 @@ def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
     safe_status, safe_stage = _coerce_valid_status_stage(
         ctx.original_status, ctx.original_stage,
     )
+    # Raw ``wl update`` durable write: there is no StatusLifecycle exit here to
+    # inherit the release-by-default, so the audit claim is released explicitly.
     cmd = [
         "wl", "update", ctx.issue_id,
         "--status", safe_status,
@@ -13418,6 +13602,12 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         # variance note) leaves the overall 'Ready to close: Yes' verdict
         # trustworthy, so the item still moves to the review queue.
         fallback_tainted = ctx.ac_fallback_used.is_set()
+        # Every terminal write below is a raw ``wl update`` — this phase does
+        # not use ``StatusLifecycle`` — so the helper's release-by-default exit
+        # hook cannot clear the audit claim. The ``--assignee ""`` on each
+        # command is therefore required and must not be dropped as redundant
+        # (assignee-hold convention; pinned by
+        # ``tests/test_assignee_release_all_skills.py``).
         if ctx.audit_verdict == "no" and not fallback_tainted:
             # Evidence-marker backstop: if any AC evidence carries a known
             # infra-failure diagnostic, treat the "No" as fallback-tainted
@@ -13637,7 +13827,7 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         try:
             _cascade_descendants_terminal(
                 ctx.issue_id,
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
                 runner=ctx.runner,
                 worklog_dir=ctx.worklog_dir,
                 persist=ctx.persist,
@@ -14777,6 +14967,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_freshness.add_argument("issue_id", help="Work item id to check")
     p_freshness.add_argument("--worklog-dir", default=None,
                              help="Explicit .worklog directory to target (overrides auto-resolution)")
+    # Accepted for compatibility with the documented ship-gate invocation
+    # (``queryContentFreshness()`` in check-audit-gate.js builds
+    # ``check-freshness <id> --json``). The subcommand already prints JSON, so
+    # the flag is parsed but unused — it only keeps the CLI in sync with the
+    # callers and the docs (SA-0MVTU2268007BBYO).
+    p_freshness.add_argument("--json", action="store_true", default=False,
+                             help=("Accepted for compatibility: the probe output is "
+                                   "already a single JSON object (no-op)"))
 
     return p
 

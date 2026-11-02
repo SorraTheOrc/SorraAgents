@@ -54,11 +54,30 @@ logs or comments.
 Status transitions are managed by the shared `StatusLifecycle` context manager
 from `../shared/status_lifecycle.py`. The orchestration script (`implement.py`)
 uses it automatically: `phase_start()` claims (`in_progress`); `phase_finish()`
-wraps build/test/commit/push in `with StatusLifecycle(..., target_stage="in_review"):`
+wraps build/test/commit/push in `with StatusLifecycle(..., target_stage="in_review")`
 (success → `completed`/`in_review`; error → original status restored);
 `phase_abort()` resets to `open` (also `implement.py abort <WIP-id>`). Manual
 use: `StatusLifecycle.update_status()` or the context-manager pattern in
 `../shared/status_lifecycle.py`.
+
+**Assignee release on every terminal outcome.** Each implement run releases
+the assignee when it ends, regardless of how it ends, per the
+[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
+(canonical wording; cross-referenced here rather than restated):
+
+- successful `finish` clears the assignee together with the
+  `completed`/`in_review` transition: the context manager is built with the
+  agent's `assignee=`, and `StatusLifecycle` releases the claim it holds on
+  every exit path by default (`preserve_assignee_on_exit=True` is the only
+  documented opt-out — its legitimate uses and the inline-comment
+  requirement are documented with the invariant)
+- every failure/abort reset to `open` (`phase_start`, `phase_finish`,
+  `phase_abort`, the signal/KeyboardInterrupt safety reset) also passes
+  `assignee=""`
+- epic/parent completion and the stranded-child `drive --finalise` path
+  clear the assignee on the `completed`/`in_review` advance
+
+A finished or released item is therefore never left on a scheduling hold.
 
 **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`.** No
 `wl` mutation (description/comment/child creation) while `status: open`. Guard
@@ -252,6 +271,42 @@ Recovery: push manually from the main checkout:
 ```bash
 git push origin <branch>:refs/heads/dev
 ```
+
+### Reading a gate failure: `reason` and its facts (SA-0MVTET8KQ0031R6Z)
+
+A red finish gate reports a machine-readable `reason` plus the facts that
+decided it, on `test_phase` in the `--json` report and in the operator message.
+Read `reason` **first** — it answers the only question that matters before you
+act, and every reason never lands on `unknown` with an empty `failures` list.
+
+| `reason` | What happened | What to do |
+|----------|---------------|------------|
+| `test_failure` | Real, parsable failing tests. | Fix the code. Structured failures always win: a genuine failure is never reported as infrastructure. |
+| `timeout` | The suite exceeded `timeoutPerCommand` and was stopped. | Raise `timeoutPerCommand` in `.pi/test-config.json` with headroom over a green run's `elapsed_seconds`, then re-run. |
+| `killed` | The child was signal-terminated (OOM kill, worker/supervisor crash) with no test result. | Treat as host/infrastructure: read the output tail, re-run. Do **not** "fix" a test. |
+| `unparsed` | The suite exited non-zero and no test failure could be parsed (bad flag, unloadable config, missing wrapper). | Read `command` and the output tail: the command or its configuration is wrong, not a test. |
+| `slot_contention` | No host test slot within the bounded wait (`slot_busy`). | Wait a staggered delay, or raise `TEST_LOCK_TIMEOUT`. The wait is reported separately from execution. |
+| `infrastructure` | Explained by a runner notice but not attributable to a test (includes a live-repo mutation). | Read the notices; the checkout may have been mutated by a concurrent session. |
+| `unknown` | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. |
+
+The deciding **fact fields** accompany every classified failure:
+
+| Field | Unit / meaning |
+|-------|----------------|
+| `configured_timeout` | Seconds — the `timeoutPerCommand` that was applied. |
+| `elapsed_seconds` | Seconds — wall time of the command execution **only**. `null` (never `0`) when nothing executed (fully cached, or the slot wait expired before the spawn). |
+| `slot_wait_seconds` | Seconds — host test-slot queue wait, measured once by the pacer and **never** folded into `elapsed_seconds`. On a slot-busy result it is the elapsed bounded wait. |
+| `command` | The suite command that was run. |
+| `exit_code` | The process exit code, reported only when a suite actually reported one (negative means signal-terminated). |
+| `signal` | The terminating signal number when the child was killed. |
+
+The same vocabulary is documented for the runner's notice codes in
+[docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md#notice-codes-stable-strings)
+and for the gate's classification rules in
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#gate-failure-diagnostics-wl-0mvgut787000lndg);
+a docs-vs-source consistency test (`$(skill_path implement)/tests/test_gate_classification_docs.py`)
+fails if a documented reason, notice code or fact field no longer exists in the
+code — or if a new one is left undocumented.
 
 ## Status Safety & Abort Handling
 
@@ -596,12 +651,26 @@ that child's own worktree, waits for it to exit, then continues. A single
 `drive` call therefore completes every child and advances the parent, while
 each child keeps its own clean context window and its own worktree. Options:
 `--json` (machine-readable per-child report), `--max-child-sessions N`
-(default 1) to bound retries, `--child-timeout S` (default 3600),
+(default 1) to bound retries, `--finish-attempt-limit N` (default: the
+`--max-child-sessions` value) to bound failing `finish` retries,
+`--infra-retry-limit N` (default `5`) to bound transient
+infrastructure-refusal `finish` retries on a separate budget with backoff,
+`--child-timeout S` (default 3600),
 `--finalise-stranded` (opt-in, evidence-gated finalisation of stranded
 children — see below). When no Pi executable is available it stops with
 actionable manual instructions rather than silently skipping a child
 (`IMPLEMENT_DRIVE_PI_BIN` overrides the binary). A driven session is marked
 `IMPLEMENT_DRIVE_ACTIVE=1` and refuses to re-enter `drive`.
+
+**The driver owns the child's worktree (SA-0MVTE8XAJ002IUDR).** A driven
+child's `finish` defers worktree removal (the tree is that session's own cwd,
+so deleting it inside `finish` breaks every later command). Once the child's
+session has exited, `drive` removes the tree itself — only when the child is
+terminal **and** the tree is clean, never while a session may still be alive.
+A non-terminal or dirty tree is retained and named in
+`report["retained_worktrees"]` with the exact `git worktree remove … && git
+worktree prune` remedy, and leftover trees of terminal children are swept at
+the start of the next drive (recorded in `report["worktree_sweep"]`).
 
 **A timeout is a bound, not a verdict (SA-0MVHXWLPG007OQVN).** After a failed
 child spawn (timeout or non-zero exit) `drive` re-fetches the child and
@@ -612,8 +681,10 @@ child handling:
 
 | `result` | Meaning |
 |---|---|
-| `ok` | The child session exited successfully. |
+| `finished` | The child session exited successfully. |
 | `completed-late` | The session timed out/failed **but** the child is terminal (status `completed`/`done`/`in_review`, stage `in_review`, or soft-deleted). The chain continues. |
+| `terminal-reconciled` | The child's `finish` failed but the child was already terminal; recorded as done, the chain continues. |
+| `reset-for-retry` | The child was non-terminal after its finish-attempt bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Only reachable for **uncommitted** WIP: a worktree carrying commits is preserved on `refs/wip/<id>`, never reset. |
 | `finalised` | A stranded child was finalised via `--finalise-stranded` (verified pushed commit, still in-progress, no other agent, clean worktree). The chain continues. |
 | `failed` | The child is not terminal — the chain stops and `failed_child` is set. |
 
@@ -626,6 +697,65 @@ evidence (read-only: report plus one parent comment, no status mutation).
 `--finalise-stranded` additionally finalises such children through
 `StatusLifecycle` (`completed`/`in_review`) when every safety gate holds, and
 lists them in `report["finalised_children"]`.
+
+**A failing `finish` is bounded, reconciled, then reset
+(SA-0MVLIZ33M009C5QY).** A child whose worktree is dirty after a dead session
+makes `phase_parent` re-run the same failing `finish`, which used to livelock
+the epic. Every failing `finish` is first **classified** by the single,
+table-driven classifier `classify_finish_failure` into one of three kinds:
+
+- `infrastructure` — a transient refusal that self-clears (a concurrent
+  session's local-`dev` fast-forward, a held main-checkout lock, a dropped
+  push connection, a failed ancestry assertion);
+- `gate` — a genuine failure (red tests, a failed build, a
+  worktree-placement violation, an empty diff);
+- `unknown` — anything not listed in either vocabulary, which **fails
+  safe**: it is never `infrastructure`, so drive can never retry an
+  unclassified failure as infrastructure.
+
+`phase_drive` recovers within per-child bounds, in this order:
+
+- **1. Infrastructure retries — `--infra-retry-limit N`** (default `5`): a
+   refusal classified `infrastructure` is retried on its **own** bounded
+   budget with exponential backoff (2 s doubling to a 30 s cap) — it never
+   consumes the finish-attempt budget and **never spawns a session**: the
+   loop just re-runs `parent`. Each retry records a `children_driven` entry
+   with `result: "infra-retry"` (plus `step`/`reason`).
+- **2. Bounded finish retries — `--finish-attempt-limit N`** (default: the
+   `--max-child-sessions` value): genuine failing `finish` executions are
+   counted per child in `finish_attempts` and never exceed the bound.
+- **3. Terminal reconciliation — `terminal-reconciled`**: when the bound is
+   exhausted the child is re-fetched with `wl show`; a child that reached a
+   terminal state anyway is recorded as done — never finished, reset or
+   re-spawned.
+- **4. Reset for retry — `reset-for-retry`** (at most once per child per
+   invocation): a genuinely non-terminal child's **own** worktree is reset
+   to the parent-branch HEAD (`git reset --hard <parent_branch>` + `git
+   clean -fd`, isolation-gated) and its status set back to `open` via
+   `StatusLifecycle`, with an audit comment naming the failure (with the
+   classified failing `finish` step/reason when available), the reset and
+   the discarded file list (never a commit hash). `reset-for-retry` is
+   limited to **uncommitted** WIP: a worktree that carries commits is
+   **preserved** — the **commit-preservation gate** parks its tip on
+   `refs/wip/<id>` before any destructive command runs, refuses the reset,
+   reports the preservation in `report["preserved_refs"]`
+   (`{id, ref, commit}`) and stops the chain — a committed slice is never
+   discarded by the recovery path.
+
+Every verdict — `infra-retry`, `reset-for-retry`, `terminal-reconciled` and
+the chain-stop messages — names the real failing `finish` step and reason
+(`"<step>: <reason>"`, e.g. `local_dev_fast_forward: local_dev_diverged`),
+plus the main-checkout lock holder and/or the guard's offending paths and
+competing work item when the failing `finish` report carries them, instead of
+a bare `Failed to finish child <id>` (LP-0MVWEP37K000JU0O, parent AC5). The
+report surface grows accordingly: the failing parent report carries
+`finish_failure` (`{kind, step, reason, message, steps}`); the drive report
+adds `infra_retries` (per-child retry counts), `infra_retry_limit` (the
+applied bound) and `preserved_refs` (the preservation entries) — all
+additions are additive, existing keys keep their meaning and types.
+`parent_advanced: false` therefore always means
+real non-terminal or blocked work remains. Full contract:
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#drive-failure-recovery-bounded-finish-attempts-reconciliation-and-reset).
 
 > **Child sessions run extensions-disabled.** The spawner builds
 > `pi -p "/skill:implement <child>" --approve --no-extensions` so a globally
@@ -655,6 +785,38 @@ python3 $(skill_path implement)/scripts/implement.py parent <parent-id>
   carries `children_processed` (per-child action/status), the started child
   (`next_child` plus its `worktree_path`/`branch`), or the parent
   advancement when every child is terminal.
+- **The invoked item is itself blocked** → when the parent's **own** outbound
+  (`depends-on`) blocker is unmet, or its own `status` is `blocked`, every
+  child is reported as `blocked-parent` and **nothing** is started: no child
+  claim, no worktree, no code. The report carries `parent_blocked_by` (blocker
+  ids + statuses), `parent_blocked_reason` (`outbound-dependency`,
+  `status-blocked`, or both joined by `+`), `blocked: true`, no `next_child`
+  and no `parent_advanced`; `success` stays true because a blocked wait is not
+  a failure. `drive` forwards the same fields and spawns no session. A
+  `blocked` status with no unmet recorded dependency is still honoured (never
+  silently overridden); the message names the remedy — `wl update <id>
+  --status open` — because `wl dep add` sets `blocked` automatically and
+  nothing clears it when the dependency completes.
+
+**The invoked item's own outbound edges gate starting
+(SA-0MVS1QS9J009DGPT).** `phase_parent`/`phase_drive` and `phase_start` all
+resolve `wl_dep_blockers(<the invoked item>)` before doing any work. An unmet
+(non-terminal) blocker — `_is_terminal_child` semantics, so `in_review`,
+`completed`, `done`, `deleted` and soft-deleted items are terminal — means the
+item waits. A producer's `depends-on` edge (or a `blocked` status) is therefore
+never silently overridden: a blocked epic can no longer start editing files an
+in-progress dependency still owns. This mirrors `wl next`, which skips
+dependency-blocked items.
+
+Scope of the gate: **same-project** edges (the same id prefix, e.g. `SA-` on
+`SA-`) gate. An edge to another project (e.g. `OSL-…` on an `SA-…` item) is a
+**coordination note**, reported in `coordination_blockers` and never blocking
+— that is the SA-0MSQBM2FK005NW1T assumption, clarified here: it covers
+*cross-project* edges only, **not** same-project edges recorded on the invoked
+parent itself. A child blocked by a same-project item outside the epic is
+reported as `blocked` (in `blocked_children`) and is not started; `phase_start`
+refuses the equivalent leaf case with the blocker list, before the claim, so no
+orphaned `in_progress` item and no worktree are left behind.
 
 Then implement that child by recursing into this procedure (steps 1–8), and
 re-run `implement.py parent <parent-id>`. The parent phase **finishes the
@@ -704,6 +866,37 @@ layers on top of the subprocess-isolated orchestration above:
 - **Parent advanced last.** The parent is advanced to `completed`/`in_review`
   only after **all** child sessions have reached a terminal stage.
 
+**One child = one holder (per-child lock).** A child's critical section —
+work-item claim plus worktree creation/resume — is serialised by an exclusive
+`fcntl.flock` at `<worklog>/locks/child-<id>.lock`, acquired in `phase_start`
+before any mutation and held for the holder's lifetime. `drive`, `parent` and
+a manual `start` all share this choke point:
+
+- **A held child is never started twice.** If another live session owns the
+  lock, the child is classified `skipped-held`: the report carries
+  `action: "skipped-held"`, `skipped_held: true`, the holder identity in
+  `held_by` (`agent`, `pid`, `session_id`, `started_at`) and the child in
+  `held_children`, and **no session is spawned** for it. Nothing is written —
+  no claim, no status/assignee change, no comment, no worktree change.
+- **Ownership is a token, not a pid.** The holder exports
+  `IMPLEMENT_CHILD_LOCK_TOKEN` to its subprocesses and to the driven child
+  session, so the driver's own `parent` → `start` chain and the child session
+  re-enter the lock instead of blocking on themselves.
+- **Release is kernel-guaranteed.** Normal exit, exceptions and
+  `SIGINT`/`SIGTERM` release the lock explicitly; `SIGKILL`/crash release it
+  when the kernel closes the descriptor. A recorded holder whose pid is dead is
+  reclaimed automatically with a logged warning naming it **and surfaced in the
+  report** (`lock_reclaimed`, `reclaimed_from`, `lock_path`, `warnings`, also
+  forwarded by `parent`/`drive`).
+- **Not the same as `--assignee`.** A non-empty assignee is a human-visible
+  scheduling hold; the lock is proof of a live process. Never infer a live
+  holder from `assignee`, and never treat a live lock as an assignee.
+
+Operators diagnose a held child from the report's `held_by` (and `lock_path` in
+a `start` report) or by
+reading `<worklog>/locks/child-<id>.lock`, then check `ps -p <pid>`; see
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb).
+
 This mirrors the "Epic/parent items — one session per child" guidance in
 `AGENTS_GLOBAL.md`.
 
@@ -711,7 +904,21 @@ Guards (deterministic, in `phase_parent`):
 
 - **Dependency order** — a child `blocked` by another item is implemented
   only after its blockers; the chain is resolved dependency-order correct.
+- **The invoked item is never started while blocked** — the parent's own
+  outbound blockers and its own `blocked` status are resolved *before* any
+  child is classified; an unmet same-project outbound blocker or a `blocked`
+  status yields the dedicated `blocked` verdict (`parent_blocked_by`) and no
+  child worktree. `phase_start` applies the same outbound gate to a leaf,
+  before the claim.
+- **Cross-project edges are coordination notes** — an edge to another project
+  (different id prefix) never gates; it is reported in
+  `coordination_blockers` (parent/leaf report) or `external_blockers`
+  (per-child classification).
 - **Terminal children are never re-implemented** (skipped, reported).
+- **Held children are never raced** — a child whose per-work-item lock is held
+  by another live session is reported as `skipped-held` (with `held_by`) and no
+  second session is started; the phase stops cleanly and can be re-run once the
+  holder finishes.
 - **In-progress by another agent** (no worktree) → skipped and reported,
   never clobbered. An in-progress child *we* started (worktree exists) is
   finished when its worktree has changes, or returned to the agent for
@@ -721,7 +928,10 @@ Guards (deterministic, in `phase_parent`):
   never regressed.
 - **Cycles fail fast** with a clear error (no infinite recursion).
 - **Blocked children wait** — a child is only started once every in-chain
-  blocker is terminal; otherwise it is reported in `blocked_children`.
+  blocker is terminal; otherwise it is reported in `blocked_children`. The
+  same applies to a same-project blocker outside the epic (reported with its
+  `blocked_by` payload) — cross-project blockers stay coordination notes and
+  never gate.
 - **No premature parent advance** — if any non-terminal child remains
   (in-progress elsewhere or blocked), the parent is not advanced; the phase
   reports waiting instead.
@@ -731,10 +941,11 @@ Guards (deterministic, in `phase_parent`):
 - **No orphaned `in_progress`** — a child start failure or abort leaves no
   in-progress state behind; re-run the parent phase after resolving the
   blocker to continue the chain.
-- **Worktree placement guard** — a non-terminal child whose worktree is clean
-  at the parent-HEAD while the main checkout is dirty outside `.worklog/` has
-  written to the main checkout; the phase fails closed with the offending
-  paths (and does not advance the parent) instead of silently proceeding.
+- **Worktree placement guard** — a non-terminal child whose worktree holds no
+  work (no dirty files, no commits ahead of the parent branch) while the main
+  checkout is dirty outside `.worklog/` has written to the main checkout; the
+  phase fails closed with the offending paths (and does not advance the
+  parent) instead of silently proceeding.
 - A parent with no children or all-terminal children behaves as today.
 
 Worktree isolation per child is preserved: every child is implemented in
@@ -769,6 +980,24 @@ See ``../refactor/SKILL.md``.
 
 9. Commit, Push to dev and mark in_review
 
+- **Plain leaf flow — run the finish with the deferral flag:**
+
+  ```bash
+  python3 $(skill_path implement)/scripts/implement.py finish <work-item-id> --keep-worktree
+  ```
+
+  `--keep-worktree` (or `IMPLEMENT_KEEP_WORKTREE=1`) defers `finish`'s own
+  worktree removal, so the worktree — this session's cwd — survives for the
+  worklog comment, the end-of-session report and the post-push verification.
+  The session then removes it itself with `implement.py cleanup <work-item-id>`
+  as its **last** bash command (see
+  [Worktree removal ownership](#worktree-removal-ownership-sa-0mvte8xaj002iudr)
+  below and the [final cleanup step](#final-cleanup-step-remove-the-retained-worktree-plain-leaf-sessions)
+  at the end of this file). Driven child sessions never pass the flag:
+  `IMPLEMENT_DRIVE_ACTIVE=1` defers automatically and `implement.py drive`
+  removes the tree after the session exits. `finish` itself builds, tests,
+  commits, pushes to `dev` and marks the item `in_review`; the manual steps
+  below are the reference for what it does.
 - Follow the mandatory build → test → commit order before committing.
 - **Do NOT create a Pull Request to `main`** — work is integrated into `dev`; the `dev`→`main` promotion is handled by the release process.
 - Push the feature branch into `dev` via the ship skill (`pushToDev()` from `$(skill_path ship)/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
@@ -785,8 +1014,8 @@ See ``../refactor/SKILL.md``.
   fast-forwards the main checkout's **local parent branch** (`dev`) to the
   pushed tip *after* a successful push, so the next `implement.py parent` /
   `start` forks the following child worktree from an up-to-date base instead
-  of a stale one. The sync is **safe-skip**: it performs a `git fetch origin
-  dev` followed by a `--ff-only` merge (when `dev` is checked out) or a
+  of a stale one. The sync itself is **safe-skip**: it performs a `git fetch
+  origin dev` followed by a `--ff-only` merge (when `dev` is checked out) or a
   non-checked-out ref fetch (`git fetch origin dev:dev`) — it never
   force-updates and never loses local commits. It is skipped (with a logged
   warning, and without failing the already-successful finish) when the main
@@ -794,14 +1023,55 @@ See ``../refactor/SKILL.md``.
   diverged. `implement.py start` also refreshes the parent branch before
   `git worktree add`, so children never start from a stale base even when
   another actor pushed concurrently.
-- After pushing, clean up the worktree:
+
+  That whole window — commit → local `dev` fast-forward → push → worktree
+  removal → sync — is serialised by a **per-repository finish lock**, the
+  advance only ever moves with `git merge --ff-only` and is **restored to
+  `origin/dev` when the push fails**, and the push is followed by an
+  **ancestry assertion** that fails closed when the commit never reached
+  `origin/dev` (SA-0MVPZG3IQ009IJMO, SA-0MVPZG7A0000N66U). When any of them
+  refuses, the worktree and branch are retained and the item stays `open` —
+  see [Finish lock, verified sync and refusal
+  recovery](#finish-lock-verified-sync-and-refusal-recovery) for the state
+  left behind and the exact recovery commands.
+- **Worktree removal ownership (SA-0MVTE8XAJ002IUDR).** After pushing, the
+  worktree removal is owned by exactly one actor, decided by context — **no
+  instruction ever tells a session to remove the worktree it is standing
+  in**. Who removes the tree, by flow:
+
+  - **Plain leaf flow** — the session removes its own tree with
+    `implement.py cleanup <work-item-id>` as its **last** bash command (see
+    the [final cleanup step](#final-cleanup-step-remove-the-retained-worktree-plain-leaf-sessions)
+    below), after the worklog comment, the end-of-session report and the
+    post-push verification. After that command no bash works in the session
+    (the cwd is gone by design).
+  - **Driven child session** (`IMPLEMENT_DRIVE_ACTIVE=1`) — **do not remove
+    your own worktree:** `implement.py drive` removes it once this session
+    has exited (terminal child, clean tree only, SA-0MVTE8XAJ002IUDR).
+  - **Parent/parent-phase flow** — `phase_parent` finishes each child in its
+    own subprocess and removes that child's worktree there; no session-level
+    cleanup applies and the parent's session never holds a child's cwd.
+  - **Plain leaf without the flag (default)** — `finish` removes the tree
+    immediately after a successful dev push (unchanged).
+
+  **Use `implement.py cleanup <id>`, not a raw `git worktree remove`**
+  (SA-0MVTHIZE0007EAKZ). The action is the reviewed removal path: it refuses
+  the main checkout and any directory that is not a linked worktree, retains
+  a dirty tree (uncommitted work is never discarded), refuses a
+  non-terminal item, and reports `removed` / `already_absent` /
+  `retained_*` in JSON (`--json`) or human lines. Re-running it is
+  harmless (an already-absent tree is a reported no-op success).
 
   ```bash
-  git worktree remove .worklog/worktrees/wl-<WIP-id>-<short-slug>
-  git worktree prune
-  git checkout dev && git pull origin dev
-  npm run build 2>/dev/null || echo "No build script, skipping rebuild"
+  python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --json
   ```
+
+  `finish` records the deferral in `report["steps"]["worktree_removal"]`
+  (`deferred`, `reason`, `worktree_path`) and names the retained path and
+  the exact cleanup follow-up (`steps.worktree_cleanup.command`) in its
+  completion comment. See
+  [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr)
+  and [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md#worktree-removal-ownership).
 
   > **Why rebuild?** `dist/` is gitignored; `git pull` does not update it. See [[concepts/git-worktree-best-practices-for-agent-workflows]].
 - Add a work-item comment with the commit hash: `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
@@ -840,6 +1110,108 @@ See ``../refactor/SKILL.md``.
     child's Step 9; the parent itself is covered by the per-child test runs
     at Step 6.1.
 
+Finish lock, verified sync and refusal recovery
+-----------------------------------------------
+
+`finish`'s main-checkout critical section — commit → local `dev` fast-forward
+→ push → worktree removal → post-push parent-branch sync — is serialised by a
+**per-repository exclusive advisory lock**
+(`<main-checkout>/.worklog/locks/main-checkout.lock`,
+`$(skill_path shared)/repo_lock.py`). `start`'s pre-worktree parent-branch refresh
+takes the same lock (`_sync_parent_branch_locked`), so two runs can never
+interleave moves of the shared local `dev` ref — the 2026-10-25 shape where
+finish A's commit became reachable only from its feature branch while both
+runs reported success.
+
+- **Bounded wait, never a hang.** A second `finish` fails fast by default
+  (`IMPLEMENT_FINISH_LOCK_TIMEOUT=0`); a positive value waits at most that many
+  seconds and then refuses with the lock path, the holder (work item, pid,
+  start time, repo, host) and the recovery step. `start` waits at most
+  `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then **skips** the refresh
+  fail-open (`reason: "lock_held"`) — a start is never blocked by a finish.
+  An indefinite wait is rejected outright, so no code path blocks forever.
+- **Crash-safe.** Ownership is the kernel's `flock`, released when the holder
+  dies — `SIGKILL`, an exception or a hard crash included. The metadata in the
+  lock file is for the refusal message only and never decides ownership, so a
+  **stale lock file cannot block a later finish**.
+- **Verified fast-forward.** Local `dev` only ever advances with `git merge
+  --ff-only` (its history is never rewritten) and the pre-advance tip is
+  recorded. When local `dev` moved since the worktree base, the commit is not
+  based on the current `origin/dev`, the fetch fails or the checkout cannot
+  switch, the helper **refuses loudly** (`local_dev_diverged`,
+  `commit_not_based_on_remote_tip`, `fetch_failed`, `checkout_failed`) instead
+  of silently skipping — so an unsafe advance is never taken and the refusal
+  is reported rather than swallowed.
+- **Reversible on push failure.** A failed push restores local `dev` to
+  `refs/remotes/origin/dev`: `git reset --merge` when `dev` is checked out
+  (uncommitted work in the shared checkout survives; an overlapping local
+  modification is reported, never clobbered — `reset --hard` is never used),
+  otherwise an atomic compare-and-swap `git update-ref`. An unpushed commit is
+  therefore never left as the next worktree's base.
+- **Ancestry assertion (fails closed).** After a successful push, `finish`
+  resolves the commit to its full hash and requires `git merge-base
+  --is-ancestor <commit> refs/remotes/origin/dev`. A commit that did not land —
+  including the rebased replacement hash produced by non-fast-forward recovery
+  — raises `AncestryAssertionError`, so `finish` can never report success for
+  an orphaned commit.
+- **Observability.** `report["steps"]["main_checkout_lock"]`,
+  `["local_dev_fast_forward"]`, `["local_dev_restore"]` and
+  `["ancestry_assertion"]` record each decision. Full contract:
+  [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#verified-reversible-local-dev-sync-and-post-push-ancestry-assertion-sa-0mvpzg7a0000n66u).
+
+### When `finish` refuses
+
+**Lock refused.** Nothing changed: the checkout, the work item and the branch
+are untouched (no status write, no comment). Read the holder from the refusal
+message, `report["steps"]["main_checkout_lock"]`, or
+`<main-checkout>/.worklog/locks/main-checkout.lock`, and check it is alive
+(`ps -p <pid>`). A dead holder's lock file does not block you: re-run `finish`
+(or `start`) — there is nothing to clean up.
+
+**Ancestry assertion or non-fast-forward recovery refused.** The worktree and
+the feature branch are **retained**, the work item stays `open` (never
+`in_review`), and a comment records the commit, the target ref, the reason,
+the branch and the worktree path. The commit is complete and already
+published on its feature branch — only its arrival on `origin/dev` failed.
+Publish it, then re-run `finish`:
+
+```bash
+cd <retained worktree>
+git fetch origin dev
+git rebase origin/dev          # resolve conflicts if dev advanced
+git push origin HEAD:refs/heads/dev
+python3 $(skill_path implement)/scripts/implement.py finish <work-item-id>
+```
+
+If the push is rejected again, another commit landed in the meantime: rebase
+and retry once more. Re-running `finish` on the retained worktree is
+idempotent — it re-verifies commit → ancestry → status and marks the item
+`in_review`.
+
+**When a manual merge is needed.** Only in two cases. First, when the rebase
+conflicts: resolve them, commit, push, and re-run `finish`. Second, when the
+pre-push fast-forward reports `local_dev_diverged` because the **main
+checkout's local `dev` carries commits `origin/dev` does not have**:
+
+```bash
+git -C <main-checkout> log --oneline origin/dev..dev   # what is local-only
+```
+
+Those commits are someone's unpublished work, so `finish` neither discards nor
+merges them for you. If they are intended, publish them (push `dev`, or merge
+them into `origin/dev`) and re-run `finish`; if they are stale, restore local
+`dev` deliberately with `git -C <main-checkout> reset --merge origin/dev` —
+`--merge`, never `--hard`, because the shared checkout may hold uncommitted
+work from another session. `finish` has already restored its **own** advance
+after the failed push, so this is the residual case of a pre-existing local
+divergence.
+
+**Runtime copy.** These behaviours live in the installed skill copy
+(`~/.pi/agent/skills/`). The fix takes effect in subsequent sessions **only
+after** `scripts/install_pi.sh` has refreshed the runtime skill copy, so re-run
+it after pulling a change to the implement skill — then later sessions run the
+fixed `implement.py` and read the updated skill text.
+
 Pre-push blocking check
 -----------------------
 
@@ -865,11 +1237,35 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 | Phase | Mechanism | Status | Stage |
 |-------|-----------|--------|-------|
 | Claim (Step 1) | `update_status(id, "in_progress", assignee="<AGENT>")` / `phase_start()` (status-only; stage unchanged) | in_progress | unchanged |
-| Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review")` | completed | in_review |
-| Final (Step 9) | `with StatusLifecycle(id, target_stage="in_review"):` / `phase_finish()` | completed | in_review |
-| Abort (dirty/gate/user/error/termination) | `update_status(id, "open")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
+| Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review", assignee="")` | completed | in_review |
+| Final (Step 9) | `with StatusLifecycle(id, assignee="<AGENT>", target_stage="in_review"):` / `phase_finish()` (release is the helper's default) | completed | in_review |
+| Abort (dirty/gate/user/error/termination) | `update_status(id, "open", assignee="")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
 
-> **All abort/failure transitions reset to `open`.** Never leave a work item in `in_progress` unless actively implementing.
+> **All abort/failure transitions reset to `open` and clear the assignee.** Never leave a work item in `in_progress` unless actively implementing; never leave a completed or released item on an assignee hold.
+
+## Implement state file: `repo_root` is always the main checkout
+
+`<worktree>/.implement_state.json` carries `repo_root`, and it always means the
+**main checkout root** — never the worktree, never a path inside it. Every
+consumer acts on the main checkout: the `dev` fast-forward and push in
+`finish`, the parent-branch sync, the signal handler's `_restore_repo_state`,
+and `_remove_worktree(..., repo_root=…)`, whose safety gate refuses a path that
+resolves to `repo_root`. A worktree recorded as `repo_root` therefore makes
+`finish` raise `REFUSE to remove the repository root` *after* a successful push
+and leaves the item `open` (MS-0MVM7NJF70037YU4).
+
+- `phase_start` resolves the value with `_get_repo_root()`, which returns the
+  main checkout even when `start` is invoked (or resumed) from **inside** a
+  linked worktree. Do not derive it from `Path.cwd()`.
+- `finish` and `abort` do not blindly trust an existing value: a `repo_root`
+  that is the worktree or inside it is stale. It is rejected (WARNING logs the
+  rejected and derived values) and `_resolve_main_repo_root` re-derives the
+  main checkout, so already-stranded worktrees finish without hand-edited JSON.
+- `_remove_worktree`'s gates stay untouched — the fix supplies the correct root
+  rather than relaxing the check.
+
+Full rationale and the resume-from-worktree case:
+[docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md#the-state-file-repo_root-is-the-main-checkout).
 
 ## Scripts (canonical runner & modules)
 
@@ -978,12 +1374,54 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \
   --ac "<...>|<...>|unmet" \
-  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```
+
+For plain leaf sessions the report render is followed by the
+[final cleanup step](#final-cleanup-step-remove-the-retained-worktree-plain-leaf-sessions) — the session's **last** bash command (see Step 9).
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the
 tool call), then close with: `<work-item-id>: <one-line summary>`. Do NOT
 re-summarize the report in a different format — the report is the summary. When the session ends in a terminal state with no open questions for the operator, end your final response with `</end_session>` on its own line as the very last line after the summary; if the session ends with questions for the operator, do not emit the marker.
+
+## Final cleanup step: remove the retained worktree (plain leaf sessions)
+
+A plain leaf session that ran `implement.py finish <work-item-id> --keep-worktree`
+(or exported `IMPLEMENT_KEEP_WORKTREE=1`) owns the removal of its own
+worktree — no one else will do it. Run it after the worklog comment, the
+end-of-session report above and the post-push verification, as the session's
+**very last** bash command:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --json
+```
+
+This must be the session's **last** bash command: `cleanup` deletes the tree
+this session stands in (its cwd), so every later bash call would fail with
+`Working directory does not exist` — which is why the comment, the report and
+the verification all come **first**. After `cleanup` returns you may still
+render the final response text (that is not a bash command), but you cannot
+run another command.
+
+**When `cleanup` reports `retained_dirty` or `retained_non_terminal`:** the
+tree was kept on purpose — never force it (the action has no force switch).
+Record the retention in a work-item comment (state the `reason` and `remedy`
+from the report) and stop; a dirty or non-terminal tree is retained as a
+reported outcome, and re-running `cleanup` later is safe after the tree is
+clean and the item is terminal (`already_absent` is a reported no-op
+success).
+
+- **Driven child sessions** (`IMPLEMENT_DRIVE_ACTIVE=1`) — do **not** run
+  `cleanup` here: `implement.py drive` removes the worktree after this
+  session has exited (terminal child, clean tree only, SA-0MVTE8XAJ002IUDR).
+- **Parent/parent-phase flows** — do **not** run `cleanup` here:
+  `phase_parent` finishes each child in its own subprocess and removes that
+  child's worktree there.
+
+See [Worktree removal
+ownership](#worktree-removal-ownership-sa-0mvte8xaj002iudr) in Step 9 and
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#the-session-side-removal-action-implementpy-cleanup-id)
+for the full contract.

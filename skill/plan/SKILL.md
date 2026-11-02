@@ -51,8 +51,12 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#workflow-for-ai-agents) for the claim
 **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`; release to `open` only at true handoff.** No agent process may perform work-item mutations (create children, update description, wire deps, add completion comments) while `status: open`. Use `StatusLifecycle.require_claimed(<id>)` as a guard before any mutation, and `StatusLifecycle.ensure_claimed(<id>)` to re-claim on in-session resume.
 
 Claim with `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
-before starting, and always leave the item in a **valid terminal status**
-(`open`, `blocked`, or `completed`) when the skill ends — including on error:
+— plan claims **with no `assignee`**, so it establishes no scheduling hold
+and nothing needs releasing on exit (asserted against the
+[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant),
+cross-referenced rather than restated) — before starting, and always leave
+the item in a **valid terminal status** (`open`, `blocked`, or `completed`)
+when the skill ends — including on error:
 
 - **On completion:** `StatusLifecycle.update_status(<work-item-id>, "open", stage="plan_complete")`
 - **Pausing for producer input (handoff-only):** Release to `open` AND mark needs-producer-review **only when the session genuinely hands control back** for an open-ended wait with no in-session resume. Do **not** release when an in-session resume is expected (e.g. interactive approval pane — see Resume re-claim below). A downtime-dispatched run with no interactive approver that hits the approval gate must **hold `in_progress` or abort cleanly — never release to `open` mid-run** (the `open` window caused duplicate dispatch of AH-0MTFPDKDU006QUDC on 2026-08-30):
@@ -399,7 +403,7 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --ac "Child work items created in test-first dependency order | wl dep list | met" \
   --ac "Six automated review stages completed | stage outputs recorded | met" \
   --ac "Acceptance-criteria coverage verified | tree_coverage review | met" \
-  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```

@@ -13,10 +13,10 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makeTempDir } from "../helpers/temp-dir.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MODULE = join(__dirname, "..", "..", "pi-client", "voice-input", "config.js");
@@ -280,7 +280,7 @@ describe("config validation", () => {
 
 describe("config file loading", () => {
   test("reads .pi/voice-input.json from the project directory", () => {
-    const cwd = mkdtempSync(join(tmpdir(), "voice-config-"));
+    const cwd = makeTempDir("voice-config-");
     mkdirSync(join(cwd, ".pi"));
     writeFileSync(join(cwd, ".pi", "voice-input.json"), JSON.stringify({ model: "base" }));
 
@@ -291,7 +291,7 @@ describe("config file loading", () => {
   });
 
   test("PI_VOICE_INPUT_CONFIG takes precedence over the project file", () => {
-    const cwd = mkdtempSync(join(tmpdir(), "voice-config-"));
+    const cwd = makeTempDir("voice-config-");
     const explicit = join(cwd, "explicit.json");
     writeFileSync(explicit, JSON.stringify({ model: "tiny" }));
 
@@ -301,8 +301,8 @@ describe("config file loading", () => {
   });
 
   test("invalid JSON is ignored with a warning", () => {
-    const cwd = mkdtempSync(join(tmpdir(), "voice-config-"));
-    const home = mkdtempSync(join(tmpdir(), "voice-home-"));
+    const cwd = makeTempDir("voice-config-");
+    const home = makeTempDir("voice-home-");
     mkdirSync(join(cwd, ".pi"));
     writeFileSync(join(cwd, ".pi", "voice-input.json"), "{ not json");
 
@@ -312,8 +312,8 @@ describe("config file loading", () => {
   });
 
   test("non-object JSON is ignored with a warning", () => {
-    const cwd = mkdtempSync(join(tmpdir(), "voice-config-"));
-    const home = mkdtempSync(join(tmpdir(), "voice-home-"));
+    const cwd = makeTempDir("voice-config-");
+    const home = makeTempDir("voice-home-");
     mkdirSync(join(cwd, ".pi"));
     writeFileSync(join(cwd, ".pi", "voice-input.json"), "[1,2,3]");
     const { file, warnings } = readConfigFile({ cwd, env: {}, home });
@@ -334,7 +334,7 @@ describe("config file loading", () => {
 
   test("loadConfig/getConfig cache and combine file+env+defaults", () => {
     resetConfig();
-    const cwd = mkdtempSync(join(tmpdir(), "voice-config-"));
+    const cwd = makeTempDir("voice-config-");
     mkdirSync(join(cwd, ".pi"));
     writeFileSync(join(cwd, ".pi", "voice-input.json"), JSON.stringify({ keybinding: "ctrl+alt+v" }));
 

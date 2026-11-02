@@ -20,6 +20,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from shared.git_sandbox import fixture_git_env, run_git
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for candidate in (REPO_ROOT, Path(__file__).resolve().parents[2]):
     if (candidate / "skill" / "ship" / "scripts" / "release" / "merge-dev-to-main.sh").exists():
@@ -49,10 +51,8 @@ exit 0
 
 
 def _git(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd) if cwd else None,
-        capture_output=True, text=True, check=False,
-    )
+    """Run a git command in the fixture sandbox, hermetically."""
+    return run_git(cwd or Path.cwd(), args)
 
 
 def _build_release_fixture(
@@ -158,7 +158,7 @@ def _run_release(
     gate_copy.chmod(0o755)
 
     env = {
-        **os.environ,
+        **fixture_git_env(),
         "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
         "HOME": str(tmp_path / "home"),
         "RUNNER_MARKER": str(runner_marker),

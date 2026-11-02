@@ -31,15 +31,29 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from skill.implement.scripts import implement
 
+#: Stable full commit hash the fake git resolves every revision to.
+#: ``phase_finish`` fast-forwards local ``dev`` before the push and then
+#: asserts that the pushed commit is an ancestor of ``refs/remotes/origin/dev``
+#: (SA-0MVPZG7A0000N66U). Both paths resolve their refs with
+#: ``git rev-parse --verify``; modelling a published commit keeps those paths
+#: exercised for real instead of tripping the fail-closed assertion, whose own
+#: behaviour is covered by
+#: ``tests/test_implement_finish_local_dev_verified_sync.py``.
+_FAKE_COMMIT = "1" * 40
+
 
 def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProcess:
     """Stand-in for ``run_cmd``: every git sub-command "succeeds".
 
-    ``phase_finish`` runs a fast-forward block (fetch/checkout/merge) against
-    the main checkout; none of that must touch a real repository in tests.
+    ``phase_finish`` runs a fast-forward block (fetch/checkout/merge) and a
+    post-push ancestry assertion against the main checkout; neither must touch
+    a real repository in tests. Revision lookups resolve to
+    :data:`_FAKE_COMMIT` so both code paths succeed as they would in a healthy
+    repository.
     """
+    stdout = f"{_FAKE_COMMIT}\n" if len(cmd) > 1 and cmd[1] == "rev-parse" else ""
     return subprocess.CompletedProcess(
-        args=cmd, returncode=0, stdout="", stderr=""
+        args=cmd, returncode=0, stdout=stdout, stderr=""
     )
 
 
@@ -113,6 +127,39 @@ def _mocked_phase_finish(*, update_status=None, store_show=None, tmp_path=None):
             patch.object(implement, "_worktree_placement_violation", return_value=None)
         )
         stack.enter_context(patch.object(implement, "run_build", return_value=_build_result()))
+        # ``phase_finish`` runs its gate against the **would-be-commit tree**
+        # through ``run_gate_suite`` (temp-index staging,
+        # SA-0MVQHVGFR006W8LG) and, once green, stages the change set in the
+        # real index through ``stage_tested_tree``. Both act on a real git
+        # repository; this harness drives ``phase_finish`` from a bare temp
+        # directory, so both boundaries are stubbed green (the gate's own
+        # behaviour is covered by ``test_finish_gate_*.py``).
+        stack.enter_context(
+            patch.object(
+                implement,
+                "run_gate_suite",
+                return_value=(
+                    _tests_result(),
+                    {
+                        "tree": "abc1234",
+                        "scope": "changed",
+                        "cached": False,
+                        "index_unchanged": True,
+                    },
+                ),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                implement,
+                "stage_tested_tree",
+                return_value={
+                    "success": True,
+                    "tree": "abc1234",
+                    "expected": "abc1234",
+                },
+            )
+        )
         stack.enter_context(patch.object(implement, "run_tests", return_value=_tests_result()))
         stack.enter_context(patch.object(implement, "git_commit", return_value=True))
         stack.enter_context(
@@ -232,3 +279,33 @@ def test_finish_fails_loudly_when_terminal_status_missing_from_store(tmp_path):
     assert "does not hold the terminal transition" in report["message"]
     # The item is released to open (StatusLifecycle's reset), not left claimed.
     assert _reset_update(mocks["update_status"]) == ("OSL-TEST", "open")
+    # The reset also releases the assignee hold.
+    resets = [
+        c for c in mocks["update_status"].call_args_list
+        if len(c.args) >= 2 and c.args[1] == "open"
+    ]
+    assert resets and resets[-1].kwargs.get("assignee") == ""
+
+
+def test_finish_success_clears_assignee(tmp_path):
+    """finish releases the assignee hold with the terminal completion.
+
+    A non-empty assignee is a scheduling hold; a successful implement run
+    must clear it together with the ``completed``/``in_review`` transition so
+    the reviewed item is never left held (assignee-hold convention).
+    """
+    lifecycle = MagicMock()
+    with _mocked_phase_finish(
+        update_status=lifecycle, tmp_path=tmp_path
+    ) as mocks:
+        report = implement.phase_finish("OSL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+
+    terminal_calls = [
+        c for c in mocks["update_status"].call_args_list
+        if c.kwargs.get("status") == "completed"
+        and c.kwargs.get("stage") == "in_review"
+    ]
+    assert terminal_calls, "finish must issue the terminal transition"
+    assert terminal_calls[-1].kwargs.get("assignee") == ""

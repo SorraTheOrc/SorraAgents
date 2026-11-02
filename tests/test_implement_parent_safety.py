@@ -181,7 +181,7 @@ class TestMixedStatuses:
         assert report["success"] is True
         assert report.get("parent_advanced") is True
         assert h.calls["phase_start"] == []
-        assert h.calls["update_status"] == [("SA-PARENT001", "completed", "in_review", None)]
+        assert h.calls["update_status"] == [("SA-PARENT001", "completed", "in_review", "")]
 
     def test_no_worktree_created_for_the_parent_itself(self, implement_mod):
         """The parent action orchestrates children only — phase_start is
@@ -248,7 +248,7 @@ class TestSoftDeletedBlockerGating:
         assert report["success"] is True
         assert report.get("parent_advanced") is True
         assert h.calls["phase_start"] == []
-        assert h.calls["update_status"] == [("SA-PARENT001", "completed", "in_review", None)]
+        assert h.calls["update_status"] == [("SA-PARENT001", "completed", "in_review", "")]
 
 
 # ===========================================================================

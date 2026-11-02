@@ -436,6 +436,11 @@ export function resolveChildScope(item, { getItemByIdFn, runAuditShow }) {
  *   Runs the audit remediation (`python3 <runner> issue <id>`).
  * @param {() => string} [options.resolveAuditRunnerFn] - Resolves the audit
  *   runner script path; defaults to `resolveAuditRunner`.
+ * @param {(workItemId: string) => { fresh: boolean, reason: string, hasFingerprint: boolean, auditedAt: string|null }} [options.queryContentFreshnessFn] -
+ *   Read-only content-freshness probe; defaults to `queryContentFreshness`.
+ *   Used by the fast path and by the shared post-remediation resolution
+ *   (`attemptAuditRemediation`, SA-0MVTU22MB0057T2L). Injectable for hermetic
+ *   tests.
  * @param {(id: string) => (object|null)} [options.getItemByIdFn] - Resolves a
  *   work item by id (for parent-chain coverage); defaults to {@link getItemById}.
  * @param {(itemId: string, args: string[]) => string} [options.runCloseCommand] -
@@ -683,6 +688,10 @@ export async function checkFinalValidation(options = {}) {
             runAuditShow,
             runAuditCommand,
             resolveAuditRunnerFn,
+            // Shared post-remediation resolution (SA-0MVTU22MB0057T2L): a
+            // passing-but-time-stale audit is resolved by content freshness;
+            // the logic lives in the shared remediation path, not here.
+            queryContentFreshnessFn,
           });
           budget.record();
           if (remediation.status === 'passing') {

@@ -216,7 +216,16 @@ Every test helper that shells out to **real `git`** must:
    (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG`, `GIT_CONFIG_GLOBAL`) and set
    fixture-local identity (`user.name`/`user.email`) explicitly;
 4. avoid `git init`-on-an-existing-repo patterns that silently re-target an
-   enclosing repository.
+   enclosing repository;
+5. never inherit an ambient `GIT_INDEX_FILE` — the finish gate exports its
+   temporary would-be-commit index for the suite it runs, and a fixture that
+   inherits it stages into the *gate's* index instead of its own (see §9.7).
+
+The single way to satisfy (3) and (5) is to run fixture git commands through
+`shared.git_sandbox.run_git(...)`, or to pass
+`shared.git_sandbox.fixture_git_env()` as the subprocess `env`. A command that
+deliberately targets a specific index passes that path explicitly
+(`env={"GIT_INDEX_FILE": path}`); the explicit value wins.
 
 The shared sandbox helper and the two regression guards (a `run_tests.py`
 pre/post snapshot and a repo-root autouse `conftest` fixture) are delivered by
@@ -362,7 +371,8 @@ drift.
 
 The mutation surface is **refs + local `.git/config` + working tree**. Three
 namespaces are deliberately excluded because their movement cannot be
-distinguished from suite-caused movement:
+distinguished from suite-caused movement (working-tree churn is attributed
+separately — see §8.5):
 
 - `refs/worklog/*` — managed by the `wl` tool;
 - concurrent-infrastructure churn — every branch ref checked out in a
@@ -431,7 +441,9 @@ Genuine mutations still fail the guard and name the offending test:
   branches);
 - a rewritten local-config key outside the excluded set (e.g. `user.name`,
   `core.bare`, `branch.dev.remote`);
-- a deleted tracked file or an added untracked file;
+- a deleted tracked file or an added untracked file **that was clean at
+  snapshot start** (a path that was already dirty and is resolved later is
+  attributed to concurrent churn — see §8.5);
 - a move of a monitored own-root branch (own-root branches other than the
   concurrency-excluded `refs/heads/dev` stay monitored).
 
@@ -467,6 +479,63 @@ Regression coverage:
   `tests/test_live_repo_mutation_guard.py`;
 - outer-guard detection inherits the helper (no drift) in
   `skill/test/tests/test_guarded_run_all.py`.
+
+### 8.5 Working-tree attribution (SA-0MUIJAHXS003M7BG)
+
+The ref/config exclusions above cannot help with **working-tree** churn: on a
+multi-agent host a guarded run shares its checkout with sibling sessions, and a
+sibling that commits work it had *already dirtied* makes those paths leave the
+status surface mid-run. Before this rule the guard reported exactly that as
+``deleted path   [ M]`` and failed a run that mutated nothing (2026-10-19: 4427
+passed, only two pre-dirty docs paths reported after a concurrent commit
+``7de44be9`` landed inside the run window).
+
+**The rule (option (a), pre-existing-dirty attribution).** Start-of-run
+provenance, taken from the two ``git status --porcelain=v1 -uall`` snapshots:
+
+| Snapshot difference | Verdict |
+|---|---|
+| path **present** at snapshot start, **absent** at session end | **excluded** — resolved during the run (a sibling commit/checkout of work it had itself dirtied); reported as an informational note |
+| path **absent** at snapshot start, **present** at session end (modified, deleted or newly created) | **mutation** — clean→dirty damage is suite-caused |
+| path present at both, with a **different status code** | **mutation** — no resolution is observable, so nothing is attributable |
+
+The derivation is git plumbing only (status codes plus the start snapshot's own
+``status`` map) — never a ``wl-*`` or path-name pattern (AC4). The excluded
+paths are emitted as notes (``EXCLUDED_CHURN_NOTE_PREFIX`` in
+``skill/shared/git_sandbox.py``), never silently dropped:
+
+```text
+note: excluded: concurrently resolved working-tree change in /home/…/repo: docs/dev/test-isolation.md [ M]
+```
+
+surfaced as ``live_repo_excluded`` (a list of notes) in the ``run_tests.py``
+result JSON, as ``note:`` lines in its text output, printed by the inner plugin
+at session end, and logged by ``implement.py finish``'s test gate.
+
+**Blind spots (accepted, pinned).**
+
+1. **Masked revert/delete of another session's *uncommitted* work.** A suite
+   that reverts a sibling's pre-existing edit, or deletes its pre-existing
+   untracked file, produces the same "resolved" signal as the sibling's own
+   commit, so it is attributed away. Mitigations: the note names every
+   excluded path, and the finish main-checkout guard (WL-0MVPADZ1Z000FOSG)
+   remains a second net.
+2. **Retained clean→dirty false positive.** The exclusion deliberately does
+   not touch the incident direction: a path that becomes dirty from a clean
+   start still fails the run, even if a sibling (not the suite) created it.
+3. **Invisible content-only change to an already-dirty path.** A status-code
+   surface never compared content, before or after this rule: an already-dirty
+   path edited again keeps its code and yields no difference.
+
+Regression pins: ``TestWorkingTreeAttribution``,
+``TestWorkingTreeAttributionIncidents`` and
+``TestWorkingTreeAttributionBoundaries`` in
+``skill/shared/tests/test_git_sandbox.py`` (helper rule, the benign concurrent
+commit from a second actor, the delete/modify/create incident cases and the
+pinned boundaries), ``TestWorkingTreeAttributionNested`` in
+``tests/test_live_repo_mutation_guard.py`` (inner-plugin parity) and the
+``live_repo_excluded`` tests in
+``skill/test/tests/test_guarded_run_all.py`` (outer-guard parity, AC3 note).
 
 
 ## 9. Production test-execution scrub (2026-09-26 recurrence, SA-0MUIA3OE40001QJX)
@@ -504,6 +573,11 @@ Regression coverage: `tests/test_repository_override_isolation.py` (victim-repo
 proof for every production path, plus an assertion that `refs/heads/dev` and
 `refs/remotes/origin/dev` cannot be moved by a fixture),
 `skill/shared/tests/test_git_sandbox.py` (scrub helper contract),
+`tests/test_git_index_file_env.py` (**pass-through** contract: `GIT_INDEX_FILE`
+is deliberately *not* an override and must survive the scrub so the finish
+gate's temporary would-be-commit index reaches child `git ls-files` commands;
+the file also fails if the name is ever added to
+`REPOSITORY_OVERRIDE_ENV_VARS`, SA-0MVQHV9Y3001RNNW),
 `skill/audit/tests/test_audit_runner_concurrency.py` (host cap + orphan
 detection), `tests/test_run_tests_cache.py` (strict release gate,
 including the worktree-hook exemption and the non-worktree refusal,
@@ -632,6 +706,183 @@ rather than inheriting them. The production hook's documented
 (pollutes the parent environment, asserts `_env()` omits every bypass switch,
 and asserts the mismatched-identity case still reports `git identity mismatch`
 and skips `wl sync`).
+
+### 9.7 Inherited `GIT_INDEX_FILE`: fixture rule and per-test guard (SA-0MVWQ4FZ4003S0GE)
+
+`implement.py finish` stages the *would-be commit* into a temporary index
+inside the repository's git directory and exports `GIT_INDEX_FILE` for the
+suite it runs (SA-0MVQHVGFR006W8LG). That variable **deliberately survives**
+the repository-override scrub (§9.2) so child `git ls-files` guards see the
+staged tree (SA-0MVQHV9Y3001RNNW). The consequence for fixtures is direct:
+every `git` subprocess a test spawns inherits the gate's index, so a helper
+that runs raw `git init` / `add` / `commit` in its own throwaway repository
+stages into the **gate's** index. The gate then refuses its own verdict —
+
+```
+gate evidence invalid: the temporary index changed while the suite ran …
+Fixture git commands must use a hermetic environment
+```
+
+— and the failure is unattributable: the verdict belongs to the whole suite,
+not to the test that wrote the index.
+
+#### The rule
+
+Fixture git commands use the hermetic helpers:
+
+```python
+from shared.git_sandbox import commit_all, fixture_git_env, init_repo, run_git
+
+repo = init_repo(tmp_path / "repo", sandbox_root=tmp_path)   # own index, pinned identity
+(repo / "f.txt").write_text("x\n", encoding="utf-8")
+run_git(repo, ["add", "-A"], check=True)                     # never the inherited index
+commit_all(repo, "init")
+```
+
+- `run_git` / `fixture_git_env` scrub the repository overrides **and** drop an
+  inherited `GIT_INDEX_FILE` (`fixture_git_env`); `git_env_for_repo` — the
+  *inspection* helper used by production paths — keeps the ambient index only
+  when it belongs to the repository being inspected.
+- A test that intentionally drives a specific index passes it explicitly
+  (`run_git(repo, [...], env={"GIT_INDEX_FILE": str(index)})`); the explicit
+  value wins over the scrub.
+- The variables that must stay inherited (`GIT_INDEX_FILE`, and by design every
+  other non-override variable) are pinned by
+  `tests/test_git_index_file_env.py`.
+- **Production paths that inspect a named repository scrub it themselves.**
+  `git ls-files` applies an inherited index to whatever repository `cwd`
+  names, so an inspection helper must run through
+  `git_env_for_repo(<repo>)` (which keeps `GIT_INDEX_FILE` only when it lies
+  inside that repository's git dir). `audit_runner._project_top_levels` now
+  does: without it, every repository under the gate reported the *gate's* tree
+  as its own, so the root-file-marker scope tests failed only inside
+  `implement.py finish` (SA-0MVWJ6U3J003TLRZ). Regression coverage:
+  `skill/audit/tests/test_audit_runner_launch_context.py::TestRootFileOnlyRepoManifest::test_foreign_gate_index_does_not_replace_the_repo_index`.
+
+#### The guard
+
+The repo-root `conftest.py` arms `skill/shared/inherited_index_guard.py`
+(`IndexWatch`) at session start:
+
+- it records the **inherited** index path, its staged tree (`git write-tree`)
+  and a content digest — only when `GIT_INDEX_FILE` names an existing file, so
+  an ordinary `pytest` run is unaffected;
+- an autouse fixture polls it after **every** test and fails the offending test
+  **by name**, with the index path, the tested tree vs the index tree now, and
+  the `run_git` / `fixture_git_env` remediation;
+- the stat signature is only a *trigger*: a rewrite that stages the same
+  entries (a git stat-cache refresh) is not a violation, so there are no false
+  positives;
+- after reporting, the watch re-baselines on the current state, so only the
+  first offending test is named instead of every later test in the session;
+- it is bound to the index inherited at **session start**, so a test that
+  exports its own `GIT_INDEX_FILE` on purpose (the finish-gate tests) is not
+  affected;
+- it stands down under `--collect-only` and under xdist workers, where a write
+  cannot be attributed to the test in this process.
+
+#### Relationship to the package-level env isolation
+
+`tests/conftest.py` (session- and function-scoped), `skill/implement/tests/`
+and `skill/test/tests/` keep autouse fixtures that *delete* the inherited
+`GIT_INDEX_FILE` for their tests. Those remain deliberately, as a complementary
+layer, not a substitute for the rule above:
+
+- they cover tests that drive **production** git-inspecting code against a
+  fixture repository (e.g. `refactor.session_boundary.get_all_source_files`,
+  `generate_standup.commit_report_file`, `implement.phase_finish`). Production
+  code must honour an index that belongs to the repository it inspects, so its
+  environment cannot be scrubbed; the isolation has to happen at the test
+  boundary instead;
+- the guard therefore only ever fires where the inherited index is visible
+  (`skill/*/tests/` packages without such a fixture, or a fixture that
+  explicitly re-inherits it), and it names the test when it does;
+- where the isolation applies, the guard is inert by construction, which is why
+  the fixture-level rule (hermetic helpers) is the primary control and the
+  sweep above matters even for packages that pop the variable.
+
+#### Regression coverage
+
+- `skill/shared/tests/test_inherited_index_guard.py` — `IndexWatch` unit
+  behaviour (no inherited index → inert; hermetic fixture stays silent; raw
+  fixture staging into the inherited index is reported once and re-baselined;
+  a same-tree rewrite is not a violation) plus an end-to-end **simulated gate
+  run**: the real `conftest.py` and guard modules are copied, unchanged, into a
+  throwaway project whose suite contains one hermetic and one poisoning test.
+  The hermetic run stays green and leaves the index byte-identical; the
+  poisoning run fails and the output names the offending test and the
+  remediation.
+- `tests/test_finish_gate_temp_index.py` — the gate's own post-suite integrity
+  check (the last line of defence when a nested suite has no conftest).
+- The fixture sweep itself — `tests/` and `skill/*/tests/` helpers now route
+  their git commands through the shared hermetic helpers (the sentinel case
+  being `tests/test_test_cache.py`, whose raw `git add -A` produced the
+  measured gate index corruption on 2026-10-31). Production paths that inspect
+  a *named* repository keep an ambient index only when it belongs to that
+  repository (`git_env_for_repo`), which is why
+  `generate_standup.commit_report_file`'s default runner no longer inherits a
+  foreign index.
+- `skill/implement/tests/test_repo_root_resolution.py` clears
+  `IMPLEMENT_DRIVE_ACTIVE` for the removal assertion: a driven child session
+  defers worktree removal by design, so without it the test fails inside any
+  driven session's own `finish` gate run — an environment-dependent failure of
+  the same family as the ones this item fixes.
+
+### 9.8 Per-work-item lock store isolation (SA-0MVWJ6U3J003TLRZ)
+
+`implement.py phase_start` takes a **real** per-work-item `flock` at
+`<worklog>/locks/child-<id>.lock` **before** any of the steps a test mocks
+(claim, dirty-tree gate, worktree creation) — see [the implement
+reference](implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb).
+Synthetic ids used by the implement tests (`SA-TEST`, `SA-TEST123`, …) share
+the repository's own `SA` prefix, so `resolve_worklog_dir()` returned the
+**live** store and every run wrote a real lock file into the developer's
+`.worklog/locks`. Two concurrent pytest processes then raced the same id:
+the loser's `phase_start` refused with
+`Work item SA-TEST is held by implement@pid <n> (session <id>)` and the
+choosing tests failed for reasons unrelated to the code under test (a
+shared-state failure family, alongside the slot-contention reporting from
+SA-0MVW1MJL6003767Q).
+
+#### The rule
+
+`phase_start` resolves its lock store through `_child_lock_dir()`, which
+honours the **`IMPLEMENT_CHILD_LOCK_DIR`** override (unset in production, so
+the worklog store resolved from the item id is authoritative). The value is
+read per call, not at import time, so the override also isolates tests that
+load `implement.py` **by file path** instead of importing it — the reason a
+module-level `patch.object` on `_child_lock_dir` is not sufficient.
+
+Every test boundary that drives `phase_start` sets it to its own throwaway
+directory:
+
+```python
+@pytest.fixture(autouse=True)
+def isolated_implement_child_lock_store(tmp_path, monkeypatch):
+    store = tmp_path / ".worklog"
+    (store / "locks").mkdir(parents=True)
+    monkeypatch.setenv("IMPLEMENT_CHILD_LOCK_DIR", str(store))
+    return store
+```
+
+- `tests/conftest.py` and `skill/implement/tests/conftest.py` each define this
+autouse fixture, so every test in either package — including the root-level
+`test_implement_*.py` modules that load `implement.py` by path — gets a
+per-test store of its own.
+- A test that asserts the lock **path** (e.g.
+`skill/implement/tests/test_phase_start_child_lock.py`) patches
+`_child_lock_dir` directly; its throwaway store still wins, because the inner
+patch replaces the env-derived default for that test.
+- Names are unique per test process (`tmp_path`), so two suites running
+concurrently never contend for the same synthetic id anymore.
+
+#### Regression coverage
+
+- `skill/implement/tests/test_phase_start_claim.py::test_child_lock_lives_in_the_isolated_store_not_the_real_one`
+— drives the real `phase_start` and asserts the lock file was created in the
+isolated store and **not** in the live worklog store.
+- `tests/test_implement_child_lock_isolation.py` — asserts the store resolves
+to the isolated directory and that a real acquisition writes only there.
 
 ## 10. Tests never emit real release notifications (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL)
 

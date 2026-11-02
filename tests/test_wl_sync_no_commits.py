@@ -14,20 +14,19 @@ from __future__ import annotations
 
 import subprocess
 
+from shared.git_sandbox import fixture_git_env, init_repo, run_git
+
 
 def _run(cmd: list[str], cwd: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, check=False, timeout=120,
+        cmd, cwd=cwd, env=fixture_git_env(), capture_output=True, text=True,
+        check=False, timeout=120,
     )
 
 
 def _init_no_commit_repo(repo) -> None:
     """Create a git repo with NO commits and an initialized worklog store."""
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"],
-                   cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"],
-                   cwd=repo, check=True, capture_output=True)
+    init_repo(repo, default_branch="master", sandbox_root=repo.parent)
 
     init = _run([
         "wl", "init",
@@ -87,11 +86,8 @@ def test_wl_sync_after_initial_commit_is_unchanged(tmp_path):
     repo.mkdir()
     _init_no_commit_repo(repo)
 
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
-    commit = subprocess.run(
-        ["git", "commit", "-q", "-m", "chore: initial"],
-        cwd=repo, check=True, capture_output=True,
-    )
+    run_git(repo, ["add", "-A"], check=True)
+    commit = run_git(repo, ["commit", "-q", "-m", "chore: initial"])
     assert commit.returncode == 0
 
     sync = _run(["wl", "sync"], cwd=str(repo))

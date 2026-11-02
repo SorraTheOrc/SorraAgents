@@ -18,6 +18,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from shared.git_sandbox import init_repo, run_git
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 
@@ -38,17 +40,12 @@ def _make_repo(tmp_path: Path, marker_active: bool | None = None) -> Path:
     Returns:
         repo_root Path.
     """
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    subprocess.run(["git", "init"], cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    repo_root = init_repo(
+        tmp_path / "repo", default_branch="master", sandbox_root=tmp_path
+    )
     (repo_root / "README.md").write_text("# Test")
-    subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "Initial commit"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    run_git(repo_root, ["add", "-A"], check=True)
+    run_git(repo_root, ["commit", "-q", "-m", "Initial commit"], check=True)
 
     if marker_active is not None:
         worklog = repo_root / ".worklog"

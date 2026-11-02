@@ -113,6 +113,23 @@ parent's, so a child-level gap must never spuriously block a release.
 - **Remediation-runner failure/timeout** — treated as blocking for that item
   with the manual remediation command surfaced; never silently passed.
 
+**Content-freshness contract (SA-0MVTU2643004QTQN):** content-fresh audits are
+trusted regardless of `updatedAt` — when the stored v2 content fingerprint
+still matches the work item, the time gate never overrides that verdict, so a
+`wl sync`-moved `updatedAt` can never force a re-audit of unchanged content.
+The probe invocation is `audit_runner.py check-freshness <id> --json`; the
+runner accepts `--json` (its output is already a single JSON object), and the
+command string built by `queryContentFreshness()` is pinned to that accepted
+argument shape by tests on both sides. In-gate remediation inherits the same
+contract: when `audit_runner.py issue <id>` short-circuits on a content-fresh
+audit and leaves a passing-but-time-stale verdict, the shared
+`attemptAuditRemediation()` re-queries content freshness and reports the item
+as passing (naming the content-fresh basis) — a **passing-but-time-stale audit
+must not block** the release. Only a content-changed or unconfirmable audit
+blocks, and its reason names the real condition (`time-stale but content
+changed`) plus the `audit_runner.py issue <id> --force` remedy. No blocking
+entry is ever emitted with the reason `Ready to close`.
+
 The gate never mutates state destructively: it only invokes
 `audit_runner.py` (which persists per its own contract) and `wl audit-show`
 (read-only) — never `wl update`/`wl close` directly. Command boundaries
@@ -210,6 +227,45 @@ Steps:
    **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** before this step, `snapshotReleaseTags()` captures the pre-run tag list; `isNewlyCreatedTag(version, preRunTags)` requires `v<version>` to be absent from it. A stale tag (or an unreadable snapshot) aborts with **exit code 14** and runs no post-release step, so an old reachable tag read by `git describe` can never trigger a close.
 10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
 11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures. **Close verification (SA-0MUXA5ZNZ0019QY5):** every attempted close is re-read through the injectable `getCloseStateFn` boundary (default `getItemLifecycle`); an item is counted as closed only when the persisted lifecycle is `status: completed` **and** `stage: done`. A close that exits 0 but does not persist — the concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried exactly once and re-verified; if still not terminal (or the read throws/returns `null` — fail-safe) the item is listed in `unclosedCount`/`unclosedItems`, `success` is `false`, and the summary never claims blanket success. The step remains non-blocking.
+
+### Version source convention (SA-0MVN2B0DJ00135W0)
+
+`release/bump-version.js` resolves the version source by convention instead of
+requiring `package.json`, so a Python-only repo can be released through the same
+canonical pipeline:
+
+1. `package.json` (repository root) when it declares a string `version` field;
+2. else `pyproject.toml`'s `[project].version`.
+
+When neither declares a version the helper exits non-zero with a single
+combined, actionable message that names **both** candidate files and why each
+was rejected (missing file, no `version` field, `dynamic = ["version"]`, a
+legacy `[tool.poetry].version`, or an unparseable value).
+
+**pyproject.toml editing.** Node has no built-in TOML module, and a
+parse/serialise round-trip would rewrite the document (dropping comments,
+reordering keys), so the edit is line-based and section-aware: only the
+`version = "…"` (or single-quoted) line inside the `[project]` table is
+rewritten, preserving the quote style, any trailing comment, all other tables
+and every other byte — line endings included. `--dry-run` never writes, and the
+rewritten document is produced (and validated) before the write, so a failed
+bump leaves no partial `pyproject.toml`.
+
+**Staging.** `merge-dev-to-main.sh` resolves the same convention into
+`VERSION_FILE` and stages that file (`git add "$VERSION_FILE"`); its post-merge
+conflict auto-resolution keeps the bumped version for both `package.json` and
+`pyproject.toml`. A slight wording change accompanies it: the success line now
+reads `Version bumped to v<version> (<file>)`.
+
+**Diagnostics.** The bump failure path no longer discards the helper's stderr —
+the release log shows the actionable cause, which is what made the original
+TTS v0.1.1 release spend time on an opaque "Check that package.json has a valid
+version field" message.
+
+**Unchanged downstream steps.** Changelog generation reads commit history, and
+derived-file regeneration only runs when `package.json` declares a
+`scripts.build`; both behave exactly as before for Python-only repos (the
+derived-file step is a non-fatal no-op).
 
 ### Child producer-review override (close step)
 

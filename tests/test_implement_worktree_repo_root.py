@@ -29,6 +29,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import init_repo, run_git
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -119,28 +120,21 @@ def repo_with_worktree(tmp_path):
         - repo_root: Path to the main repo (main working tree)
         - worktree_dir: Path to the linked worktree
     """
-    repo_root = tmp_path / "main_repo"
-    repo_root.mkdir()
-    subprocess.run(["git", "init"], cwd=str(repo_root), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"],
-                   cwd=str(repo_root), check=True, capture_output=True)
+    repo_root = init_repo(
+        tmp_path / "main_repo", default_branch="master", sandbox_root=tmp_path
+    )
 
     (repo_root / "README.md").write_text("# Test")
-    subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "commit", "-m", "Initial commit"],
-                   cwd=str(repo_root), check=True, capture_output=True)
-    subprocess.run(["git", "branch", "dev"], cwd=str(repo_root), check=True,
-                   capture_output=True)
+    run_git(repo_root, ["add", "-A"], check=True)
+    run_git(repo_root, ["commit", "-q", "-m", "Initial commit"], check=True)
+    run_git(repo_root, ["branch", "dev"], check=True)
 
     worktree_dir = (tmp_path / "test_worktree").resolve()
-    subprocess.run(
-        ["git", "worktree", "add", "--track", "-b", "wl-test-branch",
+    run_git(
+        repo_root,
+        ["worktree", "add", "--track", "-b", "wl-test-branch",
          str(worktree_dir), "dev"],
-        cwd=str(repo_root), check=True, capture_output=True,
+        check=True,
     )
 
     # Preconditions: worktree has .git as a file, main repo as a directory

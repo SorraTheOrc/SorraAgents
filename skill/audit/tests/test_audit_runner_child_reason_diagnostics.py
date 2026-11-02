@@ -244,3 +244,87 @@ class TestMarkdownReportDiagnostics:
                     if ln.startswith("Child assessment reasons:"))
         assert "[unserviced_in_main_slot] CHILD-UNS" in line
         assert "[not_assessed] CHILD-NOTREADY" in line
+
+
+def screened_in_run_child(child_id="CHILD-RUN"):
+    """A child whose criteria were screened by THIS run (separate-process).
+
+    Reproduces the MS-0MVQO6N34007DHP8 audit: the child-verdict reuse
+    pre-pass runs before screening, so a child with no stored verdict gets
+    ``child_audit_ready = False``; the screening that follows then fills
+    ``ac_results`` with real (non-pending) verdicts. Four such children were
+    reported ``not_assessed`` even though every criterion was ``met`` and each
+    child audit was persisted in the same run with Ready to close: Yes.
+    """
+    return {
+        "id": child_id,
+        "title": f"Child {child_id}",
+        "status": "completed",
+        "stage": "in_review",
+        "child_audit_ready": False,
+        "ac_results": [
+            {"text": "CAC1", "verdict": "met", "evidence": "child.py:1"},
+            {"text": "CAC2", "verdict": "adjusted", "evidence": "child.py:9"},
+        ],
+    }
+
+
+def pending_main_slot_child():
+    """An in-main-slot child whose screens this run emitted but nobody ran."""
+    return {
+        "id": "CHILD-PENDING",
+        "title": "Child CHILD-PENDING",
+        "status": "in_progress",
+        "stage": "in_review",
+        "child_audit_ready": False,
+        "ac_results": [
+            {"text": "CAC1", "verdict": "partial",
+             "evidence": "verdict pending main-session review."},
+        ],
+    }
+
+
+class TestScreenedInRunChildAssessment:
+    """A child screened in this run is assessed — never ``not_assessed``.
+
+    MS-0MVQO6N34007DHP8: the diagnostic must keep meaning "never judged",
+    not "judged and not ready" (the latter is the blocking-verdict path).
+    """
+
+    def test_screened_in_run_child_has_no_reason_code(self):
+        assert ar._classify_child_assessment_reason(
+            screened_in_run_child(), None) is None
+
+    def test_four_screened_children_produce_no_json_reasons(self):
+        children = [screened_in_run_child(f"CHILD-RUN-{i}") for i in range(4)]
+        payload = ar._build_issue_json(
+            {"id": "TEST-1"}, _PARENT_ACS, children,
+        )
+        assert payload["child_reasons"] == {}
+        assert payload["not_assessed_children"] == []
+
+    def test_screened_children_produce_no_report_diagnostic_line(self):
+        children = [screened_in_run_child(f"CHILD-RUN-{i}") for i in range(4)]
+        report = ar._assemble_issue_report(
+            {"id": "TEST-1"}, _PARENT_ACS, children,
+        )
+        assert "Child assessment reasons:" not in report
+
+    def test_pending_main_slot_child_still_not_assessed(self):
+        """Unserviced screens are NOT an assessment (no stale signal needed)."""
+        assert ar._classify_child_assessment_reason(
+            pending_main_slot_child(), None) == ar.REASON_NOT_ASSESSED
+
+    def test_blocking_verdict_child_still_not_assessed(self):
+        child = screened_in_run_child("CHILD-BLOCKED")
+        child["ac_results"] = [
+            {"text": "CAC1", "verdict": "unmet", "evidence": "child.py:4"},
+        ]
+        assert ar._classify_child_assessment_reason(
+            child, None) == ar.REASON_NOT_ASSESSED
+
+    def test_budget_exceeded_child_still_not_assessed(self):
+        child = screened_in_run_child("CHILD-BUDGET")
+        child["budget_exceeded"] = True
+        assert ar._classify_child_assessment_reason(
+            child, None) == ar.REASON_NOT_ASSESSED

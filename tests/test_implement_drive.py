@@ -213,7 +213,9 @@ class TestDriveCompletion:
         ]
         # Parent was re-run after each child and once more to advance.
         assert len(runner.calls) == 3
-        assert [e["result"] for e in report["children_driven"]] == ["ok", "ok"]
+        assert [e["result"] for e in report["children_driven"]] == [
+            "finished", "finished",
+        ]
 
     def test_each_spawn_carries_a_clean_guarded_environment(
         self, implement_mod,
@@ -359,8 +361,8 @@ class TestTimeoutReconciliation:
         assert report["sessions_spawned"] == 2
         first, second = report["children_driven"]
         assert first["result"] != "failed"
-        assert first["result"] in {"ok", "completed-late"}
-        assert second["result"] == "ok"
+        assert first["result"] in {"finished", "completed-late"}
+        assert second["result"] == "finished"
         assert len(runner.calls) == 3
 
     def test_non_terminal_child_timed_out_still_fails_hard(
@@ -1159,3 +1161,133 @@ class TestHermeticAgainstDrivenAmbientGuard:
             f"module must pass under IMPLEMENT_DRIVE_ACTIVE=1\n{combined}"
         )
         assert "Refusing to drive from within a driven child" not in combined
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVWEP292000ODBS: --infra-retry-limit CLI flag and loop bound
+# ---------------------------------------------------------------------------
+
+
+def _infra_refusal_report(child_id: str) -> dict:
+    """A ``finishing_failed`` parent report classified as infrastructure.
+
+    The canonical, classifier-checked scripted helper lives in
+    ``tests/test_implement_drive_recovery.py`` (:func:`infra_refusal_report`);
+    this module only needs the drive-visible shape (``kind``/``step``/
+    ``reason``) for loop-bound and CLI accounting.
+    """
+    return {
+        "phase": "parent",
+        "work_item_id": PARENT,
+        "success": False,
+        "message": f"Failed to finish child {child_id}",
+        "next_child": child_id,
+        "finishing_failed": True,
+        "children_processed": [],
+        "finish_failure": {
+            "kind": "infrastructure",
+            "step": "local_dev_fast_forward",
+            "reason": "local_dev_diverged",
+        },
+    }
+
+
+class TestInfraRetryLimitFlag:
+    """AC1: ``--infra-retry-limit`` exists, defaults to 5 and is clamped."""
+
+    def test_usage_block_lists_the_flag(self, implement_mod):
+        assert "--infra-retry-limit" in implement_mod.__doc__
+
+    def test_default_is_five(self, implement_mod):
+        args = implement_mod.parse_args(["drive", "SA-1"])
+        assert args.infra_retry_limit == 5
+
+    def test_flag_parses(self, implement_mod):
+        args = implement_mod.parse_args(
+            ["drive", "SA-1", "--infra-retry-limit", "3"],
+        )
+        assert args.infra_retry_limit == 3
+
+    def test_help_lists_the_flag(self, implement_mod, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            implement_mod.parse_args(["drive", "SA-1", "--help"])
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "--infra-retry-limit" in out
+        assert "default: 5" in out
+
+    def test_non_positive_limit_is_clamped_to_one(self, implement_mod):
+        """A non-positive ``--infra-retry-limit`` is clamped to 1 so the
+        loop still terminates (never an unbounded retry loop)."""
+        for bad in (0, -3):
+            report = _run(
+                implement_mod,
+                ScriptedParent([
+                    _infra_refusal_report("SA-C1"),
+                    _infra_refusal_report("SA-C1"),
+                ]),
+                RecordingSpawner(),
+                [{"id": "SA-C1"}],
+                infra_retry_limit=bad,
+            )
+            assert report["infra_retry_limit"] == 1
+            assert report["infra_retries"] == {"SA-C1": 1}
+
+
+class TestInfraRetryLoopBound:
+    """AC7: ``max_iterations`` accounts for the infrastructure budget, so a
+    chain that needs several infra retries then its session then the parent
+    advance completes instead of tripping the iteration bound."""
+
+    def test_loop_bound_includes_the_infra_budget(self, implement_mod):
+        """Five infra retries + one session + the parent advance consume 7
+        parent invocations — beyond the bound that would hold without the
+        infra budget in the formula — and must still complete."""
+        m = implement_mod
+        runner = ScriptedParent([
+            *(_infra_refusal_report("SA-C1") for _ in range(5)),
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True},
+        ])
+
+        report = _run(
+            m, runner, RecordingSpawner(), [{"id": "SA-C1"}],
+            infra_retry_limit=5, delay=lambda _s: None,
+        )
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert len(runner.calls) == 7
+        assert report["infra_retries"] == {"SA-C1": 5}
+        assert "exceeded its iteration bound" not in report["message"]
+
+    def test_loop_bound_never_masks_a_never_finishing_harness(
+        self, implement_mod,
+    ):
+        """The loop bound is a termination guarantee for the *stopping*
+        path too: an always-infrastructure-refusing harness with the default
+        flags terminates after exactly infra + finish attempts — it is never
+        reported as "exceeded its iteration bound" (parent AC6,
+        LP-0MVWEP3J3005Q4X6 AC4)."""
+        m = implement_mod
+        runner = ScriptedParent([
+            *(_infra_refusal_report("SA-C1") for _ in range(10)),
+        ])
+
+        report = _run(
+            m, runner, RecordingSpawner(), [{"id": "SA-C1"}],
+            child_states={"SA-C1": {"id": "SA-C1", "status": "open"}},
+            infra_retry_limit=5, finish_attempt_limit=1,
+            delay=lambda _s: None,
+        )
+
+        # The refusal never self-clears: 5 infra retries + 1 finish attempt
+        # were observed, then the chain stopped with the child named — the
+        # iteration formula counted the budgets without tripping.
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert len(runner.calls) == 6
+        assert report["infra_retries"] == {"SA-C1": 5}
+        assert report["finish_attempts"] == {"SA-C1": 1}
+        assert report["sessions_spawned"] == 0
+        assert "exceeded its iteration bound" not in report["message"]

@@ -118,9 +118,12 @@ class TestIntakeCwdIndependence:
             cmd = m.call_args[0][0]
             assert cmd[:4] == ["wl", "--worklog-dir", "/fake/proj/.worklog", "update"]
             assert "--status" in cmd and "open" in cmd
+            # Abort releases the assignee hold too.
+            assert "--assignee" in cmd
+            assert cmd[cmd.index("--assignee") + 1] == ""
 
     def test_cmd_finish_preserves_statuses(self):
-        """finish still sets open + intake_complete (no behaviour change)."""
+        """finish still sets open + intake_complete and releases the assignee."""
         with (
             mock.patch("shared.status_lifecycle.subprocess.run") as m,
             mock.patch(
@@ -135,6 +138,65 @@ class TestIntakeCwdIndependence:
             assert cmd[:2] == ["wl", "update"]
             assert "--status" in cmd and "open" in cmd
             assert "--stage" in cmd and "intake_complete" in cmd
+            # Completion clears the assignee hold.
+            assert "--assignee" in cmd
+            assert cmd[cmd.index("--assignee") + 1] == ""
+
+    def test_cmd_auto_complete_clears_assignee(self):
+        """auto-complete's terminal transition releases the assignee hold."""
+        with (
+            mock.patch("shared.status_lifecycle.subprocess.run") as m,
+            mock.patch(
+                "shared.status_lifecycle.worklog_dir_flag",
+                return_value=[],
+            ),
+        ):
+            m.return_value = _ok_proc(["wl"])
+            result = intake.cmd_auto_complete("TEST-123")
+            assert result == {
+                "success": True,
+                "action": "auto_completed",
+                "item_id": "TEST-123",
+            }
+            # Two updates: the in-progress claim, then the terminal transition.
+            cmds = [c.args[0] for c in m.call_args_list]
+            assert len(cmds) == 2
+            final = cmds[-1]
+            assert "--status" in final and "open" in final
+            assert "--stage" in final and "intake_complete" in final
+            assert "--assignee" in final
+            assert final[final.index("--assignee") + 1] == ""
+
+    def test_cmd_finish_failure_reset_clears_assignee(self):
+        """A description-update failure resets to open AND clears the assignee.
+
+        ``start`` claimed the item with an assignee hold; if ``finish`` fails
+        before its terminal transition, the reset must release that hold so the
+        item is not left stuck on a scheduling hold.
+        """
+        with (
+            mock.patch("shared.status_lifecycle.subprocess.run") as m,
+            mock.patch(
+                "shared.status_lifecycle.worklog_dir_flag",
+                return_value=[],
+            ),
+        ):
+            m.side_effect = [
+                subprocess.CompletedProcess(
+                    ["wl"],
+                    1,
+                    stdout=json.dumps({"success": False, "error": "bad draft"}),
+                    stderr="",
+                ),
+                _ok_proc(["wl"]),  # reset
+            ]
+            with pytest.raises(RuntimeError, match="bad draft"):
+                intake.cmd_finish("TEST-123", description_file="/tmp/draft.md")
+            cmds = [c.args[0] for c in m.call_args_list]
+            reset = cmds[-1]
+            assert "--status" in reset and "open" in reset
+            assert "--assignee" in reset
+            assert reset[reset.index("--assignee") + 1] == ""
 
 
 # ===========================================================================

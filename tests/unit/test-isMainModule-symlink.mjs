@@ -13,10 +13,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import {
-  mkdtempSync,
   mkdirSync,
   writeFileSync,
   readFileSync,
@@ -24,6 +22,7 @@ import {
   realpathSync,
 } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { makeTempDir } from '../helpers/temp-dir.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(__filename), '..', '..');
@@ -53,7 +52,7 @@ function runBumpVersionViaSymlink(opts = {}) {
   // Create a temp directory with a minimal package.json and a git repo
   // (bump-version.js now uses `git rev-parse --show-toplevel` to find the
   // repository root, so the temp dir must be a valid git repository)
-  const tmpDir = mkdtempSync(join(tmpdir(), 'bump-version-symlink-test-'));
+  const tmpDir = makeTempDir('bump-version-symlink-test-');
   writeFileSync(
     join(tmpDir, 'package.json'),
     JSON.stringify({ name: 'test-pkg', version }) + '\n',
@@ -160,7 +159,7 @@ describe('isMainModule via symlink (bump-version.js)', () => {
     // Verify the real paths match — this confirms the symlink target exists
     const realScriptPath = realpathSync(BUMP_VERSION_SRC);
 
-    const tmpDir = mkdtempSync(join(tmpdir(), 'bump-version-realpath-test-'));
+    const tmpDir = makeTempDir('bump-version-realpath-test-');
     const symlinkPath = join(tmpDir, 'bump-version.js');
     symlinkSync(BUMP_VERSION_SRC, symlinkPath);
     const realSymlinkPath = realpathSync(symlinkPath);

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+
+# <!-- REFACTOR-SA-0MVPTU74Y005WAY0
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
 """Run the full project test suite in quiet mode and report every failure.
 
 Suites are resolved per-repo through ``full_suite_commands`` (the single
@@ -20,12 +26,17 @@ per-command timeout (F2 AC1).
 Results are cached per-repo (see skill/test_cache.py) by default so repeated
 verification at the same git state is served without re-executing the suite.
 
-Concurrent suite executions are bounded host-wide via the shared "test"
-semaphore (skill/shared/process_semaphore.py): TEST_MAX_CONCURRENCY (default
-2) ceilings concurrent runs, TEST_LOCK_TIMEOUT (default 600s) bounds the wait
-for a free slot. Only ACTUAL executions acquire a slot — cache hits are
-served without executing and never block on the semaphore
-(SA-0MTG5U75A001F1RG).
+Concurrent suite executions are bounded host-wide via two shared semaphore
+namespaces (skill/shared/process_semaphore.py): the "test" lane carries FULL
+suites (TEST_MAX_CONCURRENCY, default 6 — calibrated, see the constant block)
+and the "test-fast" lane carries PARTIAL runs (TEST_MAX_CONCURRENCY_FAST,
+default 4), so a 1-3 s changed-scope run never queues behind a 7-minute full
+suite (SA-0MVWZQ269009SJXV). TEST_LOCK_TIMEOUT (default 600s) bounds the wait
+for either lane's free slot. Only ACTUAL executions acquire a slot — cache
+hits are served without executing and never block on the semaphore
+(SA-0MTG5U75A001F1RG). Every result reports ``slot_wait_seconds`` (queue time)
+separately from ``elapsed_seconds`` (execution time) so a queue-delayed run
+can never read as a slow suite (SA-0MVU8XRBQ000DG9D).
 
 Per-suite worker pools are bounded independently of that suite ceiling
 (SA-0MVE98T1M006A17T): a single vitest suite otherwise sizes its tinypool to
@@ -61,7 +72,11 @@ refs + local config + working tree, with an **ownership-based exclusion**: a
 ref checked out in a registered worktree other than the guard's own root (plus
 its ``branch.<name>.*`` config, retained worktree-track config, and
 remote-tracking refs) is concurrent-infrastructure churn; the guard root's
-own branch stays monitored (SA-0MV8311B3005DNG8). See also the repo-root
+own branch stays monitored (SA-0MV8311B3005DNG8). The guard also covers the
+**main checkout** whenever the guarded root is a linked worktree — the two
+exclusions are applied per checkout, so a worktree-scoped run that unlinks a
+tracked file in the main checkout can no longer be reported green
+(WL-0MVPE2BY9001CR9O). See also the repo-root
 ``conftest.py`` / ``skill/shared/live_repo_guard.py`` inner guard, which this
 outer guard stands down (SA-0MUG30J5F001L57H, SA-0MUH1MJL6003767Q).
 
@@ -79,6 +94,8 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import configparser
+import contextvars
 import json
 import os
 import re
@@ -90,7 +107,9 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
+
+import tomllib
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2]
 _SKILLS_ROOT_STR = str(_SKILLS_ROOT)
@@ -99,9 +118,11 @@ if _SKILLS_ROOT_STR in sys.path:
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
 from shared.git_sandbox import (
-    describe_diff,
-    diff_snapshots,
-    snapshot_repo_state,
+    describe_guarded_diff,
+    diff_guarded_roots,
+    excluded_churn_notes,
+    git_env_for_repo,
+    snapshot_guarded_roots,
 )
 from shared.process_semaphore import Semaphore, nested_semaphore_dir  # noqa: F401
 from shared.skill_extensions import (
@@ -147,9 +168,30 @@ NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
 # semaphore (skill/shared/process_semaphore.py) — a separate namespace
 # from the "audit" semaphore so the two workloads have independent
 # ceilings. Cache hits never execute and never consume a slot.
+#
+# Full-suite ceiling calibration (SA-0MVWZQ269009SJXV; evidence committed to
+# docs/dev/test-ceiling-validation.json): 6, not the original uncalibrated 2.
+# Measured on the 32-thread host 2026-10-31 — 41 full suites at 382-465 s
+# (median 441 s) whether one or two ran concurrently, each suite using < 1
+# core, the host 92% CPU idle while this pool sat at 100% capacity (22 suites
+# in 83 min), and 7-18 min slot waits for partial runs whose pytest body took
+# 1-3 s. Queueing, not compute, was the binding constraint; six suites is at
+# most six cores of thirty-two.
 TEST_SEMAPHORE_NAME = "test"
 TEST_MAX_CONCURRENCY_ENV = "TEST_MAX_CONCURRENCY"
-TEST_MAX_CONCURRENCY_DEFAULT = 2
+TEST_MAX_CONCURRENCY_DEFAULT = 6
+#: Independent lane for PARTIAL runs (``--scope changed``, or a ``--type``
+#: other than ``full``): its own namespace, so partial runs neither queue
+#: behind full suites nor evict them (SA-0MVWZQ269009SJXV AC1). The ceiling is
+#: separate from the full-suite ceiling: partial runs are short, so the pool is
+#: sized for burst absorbtion rather than for suite throughput.
+TEST_FAST_SEMAPHORE_NAME = "test-fast"
+TEST_MAX_CONCURRENCY_FAST_ENV = "TEST_MAX_CONCURRENCY_FAST"
+TEST_MAX_CONCURRENCY_FAST_DEFAULT = 4
+#: Lane names carried on every suite result and used to resolve the
+#: (semaphore namespace, ceiling) pair.
+TEST_SLOT_LANE_FULL = "full"
+TEST_SLOT_LANE_FAST = "fast"
 TEST_LOCK_TIMEOUT_ENV = "TEST_LOCK_TIMEOUT"
 TEST_LOCK_TIMEOUT_DEFAULT = 600.0
 #: Per-waiter stagger fraction of the bounded wait (SA-0MVEDOF7A004TSWD):
@@ -161,13 +203,30 @@ TEST_LOCK_JITTER_DEFAULT = 0.1
 
 #: Stable, machine-readable notice codes carried on a suite result that fails
 #: WITHOUT structured test failures (WL-0MVGUT787000LNDG): no free test slot,
-#: command-not-found, suite timeout. Consumers (e.g. ``implement.py``'s finish
-#: gate) classify on the code — never on the human-readable notice text — so
-#: rewording a notice can never silently reclassify a genuine test failure as
-#: an infrastructure condition.
+#: command-not-found, suite timeout, killed child, unparsable non-zero exit.
+#: Consumers (e.g. ``implement.py``'s finish gate) classify on the code —
+#: never on the human-readable notice text — so rewording a notice can never
+#: silently reclassify a genuine test failure as an infrastructure condition.
 NOTICE_SLOT_BUSY = "slot_busy"
 NOTICE_COMMAND_NOT_FOUND = "command_not_found"
 NOTICE_SUITE_TIMEOUT = "suite_timeout"
+
+#: Stable code for the **non-fatal** resolution notice that a pinned
+#: ``.pi/test-config.json`` ``suiteCommands`` list does not cover some of the
+#: project's hidden skill test directories (SA-0MVQQ9NV4005UKYZ AC3). It is a
+#: notice, never a failure: the pinned list is still returned verbatim and the
+#: exit status is unchanged.
+NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED = "hidden_skill_tests_uncovered"
+#: The child was terminated by a signal (``returncode < 0``): an OOM kill or a
+#: worker/supervisor crash. No failure is parsable from a killed child, so
+#: without this code the run reads as an unexplained non-zero exit
+#: (SA-0MVU8XRBQ000DG9D).
+NOTICE_KILLED = "killed"
+#: The child exited non-zero and NO structured test failure could be parsed
+#: from its output (bad flag, unloadable config, missing binary wrapper, …).
+#: Structured failures always win: this code applies only when ``failures``
+#: is empty (SA-0MVU8XRBQ000DG9D).
+NOTICE_UNPARSED_FAILURE = "unparsed_failure"
 
 #: Prefix of the no-free-slot notice produced by :func:`_test_concurrency_slot`.
 #: Exposed as a stable constant so a consumer handling a legacy result that
@@ -193,6 +252,18 @@ def _output_tail(text: str | None, limit: int = NOTICE_OUTPUT_TAIL_CHARS) -> str
     if len(text) <= limit:
         return text
     return text[-limit:]
+
+
+def _measured_seconds(samples: list[float]) -> float | None:
+    """Total measured command-execution time, or ``None`` when none ran.
+
+    ``None`` (never ``0``) distinguishes an *unmeasured* execution — every
+    command was served from the cache, or a slot wait expired before the
+    command was spawned — from one that finished in under a millisecond, so
+    a consumer can never read "unavailable" as "instantaneous"
+    (SA-0MVU8XRBQ000DG9D).
+    """
+    return sum(samples) if samples else None
 
 
 #: Per-suite vitest/tinypool worker-pool bound (SA-0MVE98T1M006A17T): the
@@ -293,7 +364,65 @@ _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
 # Scope-aware test selection
 # ---------------------------------------------------------------------------
 
-TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts")
+TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts", ".tsx")
+
+#: Suffixes recognised as test files by the convention mapper. The
+#: TypeScript/JavaScript forms cover vitest (``*.test.ts`` / ``*.spec.ts``),
+#: which previously mapped to nothing and forced the full suite
+#: (SA-0MVL7YOMJ006UMDO). ``_test.mjs`` and ``*.test.mjs`` keep the node
+#: suite conventions.
+JS_TS_TEST_SUFFIXES = (
+    ".test.mjs",
+    ".spec.mjs",
+    "_test.mjs",
+    ".test.js",
+    ".spec.js",
+    ".test.ts",
+    ".spec.ts",
+    ".test.tsx",
+    ".spec.tsx",
+)
+
+#: Directories never scanned for test files (VCS metadata, dependency trees,
+#: build output, caches). Pruning them keeps the scan bounded in a monorepo
+#: and avoids selecting a vendored ``node_modules`` test.
+_TEST_SCAN_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".worklog",
+        "node_modules",
+        "dist",
+        "build",
+        "coverage",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+    }
+)
+
+
+def _git_inspection_env(root: Path) -> dict[str, str]:
+    """Environment for a git command that *inspects* ``root``.
+
+    Delegates to :func:`shared.git_sandbox.git_env_for_repo`: repository
+    overrides are scrubbed (F2, SA-0MUIA3OE40001QJX) and an ambient
+    ``GIT_INDEX_FILE`` is honoured only when it belongs to *root*'s own
+    repository. The finish gate exports a temporary would-be-commit index for
+    the suite it runs (SA-0MVQHVGFR006W8LG), so the repository under test is
+    measured against that staged tree, while a fixture repository never reads
+    — or refreshes, which writes — another repository's index. Inheriting it
+    made a fixture report every tracked file as changed and invalidated the
+    gate's evidence for the tested tree (SA-0MVTET8KQ0031R6Z).
+
+    Args:
+        root: The repository the git command operates on.
+
+    Returns:
+        A child environment mapping for the git subprocess.
+    """
+    return git_env_for_repo(root)
 
 
 def compute_changed_files(
@@ -309,11 +438,14 @@ def compute_changed_files(
     3. ``HEAD~1`` — when neither dev ref exists (fallback for repos without
        a dev branch, so the diff is against the last commit)
 
-    Untracked files are not included (they have no diff and would be
-    reported only by ``git status``, not a diff). The merge-base is used so
-    only files changed on the current branch since it forked from the base
-    are returned — files changed on the base after the fork point are not
-    attributed to this branch.
+    New (untracked, not-yet-committed) files ARE included: during the
+    implement flow the tests run before the first commit, so a newly created
+    test file has no diff entry yet and would otherwise be invisible to
+    changed-scope selection. ``git ls-files --others --exclude-standard``
+    adds them while keeping ignored build/dependency churn out. The
+    merge-base is used so only files changed on the current branch since it
+    forked from the base are returned — files changed on the base after the
+    fork point are not attributed to this branch.
 
     Args:
         project_root: Repo root (default: detected from calling repo).
@@ -336,10 +468,37 @@ def compute_changed_files(
         text=True,
         timeout=30,
         check=False,
+        env=_git_inspection_env(root),
     )
     if proc.returncode != 0:
         return set()
-    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    changed = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+    # New (untracked) files are part of the working-tree change set but have
+    # no diff entry against *base*. Include them so a newly created test file
+    # (the common implement-flow case: tests run before the first commit) is
+    # selectable. ``--exclude-standard`` keeps ignored files out. The
+    # inspection environment is the same one the diff uses, so a *foreign*
+    # gate index is never inherited — under one, every fixture file looks
+    # untracked and would both pollute the change set and invalidate the
+    # gate's evidence (SA-0MVTET8KQ0031R6Z).
+    try:
+        others = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=_git_inspection_env(root),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        others = None
+    if others is not None and others.returncode == 0:
+        changed.update(
+            line.strip() for line in others.stdout.splitlines() if line.strip()
+        )
+    return changed
 
 def _resolve_merge_base(root: Path, base_ref: str) -> str | None:
     """Find the merge-base commit for diffing, following the fallback chain.
@@ -362,6 +521,7 @@ def _resolve_merge_base(root: Path, base_ref: str) -> str | None:
                 text=True,
                 timeout=30,
                 check=False,
+                env=_git_inspection_env(root),
             )
         except (OSError, subprocess.TimeoutExpired):
             # Missing cwd / git unavailable → no diff base → caller falls
@@ -387,19 +547,22 @@ def map_changed_to_tests(
     Two mechanisms, unioned:
 
     1. **Convention mapping**: ``src/foo.py`` → ``tests/test_foo.py``;
-       ``tests/test_foo.py`` itself; any ``test_*.py`` / ``*_test.py`` in the
-       same directory tree as a non-test change whose basename matches the
-       changed file's stem.
+       ``tests/test_foo.py`` itself; any test file in the repository whose
+       basename matches the changed file's stem. Recognised test files are
+       pytest (``test_*.py`` / ``*_test.py``), node (``*.test.mjs`` /
+       ``*_test.mjs`` / ``*.spec.mjs``) and vitest/TypeScript
+       (``*.test.ts`` / ``*.spec.ts``, plus the ``.js``/``.tsx`` variants).
     2. **Import-graph expansion**: AST-scan every test file once; for each
        changed module (dotted name derived from its path relative to the
        project root), find test files whose import statements reference the
        changed module OR any module that (transitively) imports it. This
        catches indirect breakage — e.g. ``utils.py`` changed →
-       ``test_report.py`` imported via a chain.
+       ``test_report.py`` imported via a chain. (Python only; the TypeScript
+       side uses the conservative stem convention.)
 
     ``changed_files`` defaults to :func:`compute_changed_files` against the
-    calling repo. Non-Python changes (README, yaml, …) never map to tests
-    (they return an empty selection) unless they are themselves test files.
+    calling repo. Non-source changes (README, yaml, …) never map to tests
+    unless they are themselves test files.
 
     Args:
         project_root: Repo root.
@@ -414,23 +577,10 @@ def map_changed_to_tests(
     if not changed:
         return set()
 
-    # All test files under tests/test dirs (matching run_tests conventions).
-    test_dirs = [d for d in ("tests", "test") if (root / d).is_dir()]
-    all_tests: set[str] = set()
-    for d in test_dirs:
-        all_tests.update(
-            str(p.relative_to(root))
-            for p in (root / d).rglob("*.py")
-        )
-    # Node suite dirs also carry test files (tests/node|cli|unit/**/*.mjs)
-    # — included so a changed source can select its node tests by convention.
-    for d in NODE_SUITE_DIRS:
-        node_dir = root / d
-        if not node_dir.is_dir():
-            continue
-        for p in node_dir.rglob("*.mjs"):
-            if _is_test_file(Path(str(p.relative_to(root)))):
-                all_tests.add(str(p.relative_to(root)))
+    # Every recognisable test file in the repo — py, node and vitest/TS — so
+    # a changed source can select its tests by convention regardless of where
+    # the suite lives (``tests/``, ``test/`` or co-located ``src/``).
+    all_tests: set[str] = set(_iter_test_files(root))
 
     # 1. Convention mapping
     selected: set[str] = set()
@@ -447,16 +597,25 @@ def map_changed_to_tests(
         if rel.suffix not in TRACKED_SOURCE_EXTENSIONS:
             continue  # non-source change → no test selection
 
-        # Direct convention: changed_stem → test_<stem>.py in same tree
+        # Direct convention: changed_stem → the matching test file name in
+        # any test directory (pytest, node and vitest/TypeScript forms).
+        candidates = {
+            f"test_{rel.stem}.py",
+            f"{rel.stem}_test.py",
+            f"test_{rel.stem}.mjs",
+            f"{rel.stem}_test.mjs",
+            f"{rel.stem}.test.mjs",
+            f"{rel.stem}.spec.mjs",
+            f"{rel.stem}.test.js",
+            f"{rel.stem}.spec.js",
+            f"{rel.stem}.test.ts",
+            f"{rel.stem}.spec.ts",
+            f"{rel.stem}.test.tsx",
+            f"{rel.stem}.spec.tsx",
+        }
         for test in all_tests:
             test_rel = Path(test)
-            if test_rel.name in {
-                f"test_{rel.stem}.py",
-                f"{rel.stem}_test.py",
-                f"test_{rel.stem}.mjs",
-                f"{rel.stem}_test.mjs",
-                f"{rel.stem}.test.mjs",
-            }:
+            if test_rel.name in candidates:
                 selected.add(test)
             elif (
                 rel.name == "__init__.py"
@@ -478,12 +637,32 @@ def map_changed_to_tests(
 
 
 def _is_test_file(rel: Path) -> bool:
-    """True for names matching test-file conventions (test_*.py / *_test.py)."""
+    """True for names matching a recognised test-file convention.
+
+    Covers pytest (``test_*.py`` / ``*_test.py``), node
+    (``*_test.mjs`` / ``*.test.mjs`` / ``*.spec.mjs``) and vitest/TypeScript
+    (``*.test.ts`` / ``*.spec.ts`` and the ``.js``/``.tsx`` variants).
+    """
     name = rel.name
-    return (
-        name.startswith("test_")
-        or name.endswith(("_test.py", ".test.mjs", "_test.mjs"))
+    return name.startswith("test_") or name.endswith(
+        ("_test.py", *JS_TS_TEST_SUFFIXES)
     )
+
+
+def _iter_test_files(root: Path) -> Iterator[str]:
+    """Yield repo-relative paths of every recognisable test file under *root*.
+
+    The whole tree is scanned (pruning VCS, dependency, build and worklog
+    directories) so co-located vitest tests (``src/foo.test.ts``) and the
+    conventional ``tests/``/``test/`` trees are both discovered — not only
+    the Python/node suite directories the previous implementation knew about.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _TEST_SCAN_EXCLUDED_DIRS]
+        for filename in filenames:
+            rel = Path(dirpath, filename).relative_to(root)
+            if _is_test_file(rel):
+                yield rel.as_posix()
 
 
 def _has_python_changes(changed: set[str]) -> bool:
@@ -612,70 +791,112 @@ def _ast_imports(root: Path, test_file: str) -> set[str]:
     return imports
 
 
-def changed_scope_commands(
-    project_root: Path | None = None,
-    base_ref: str = "origin/dev",
-    changed_files: set[str] | None = None,
-) -> list[str] | None:
-    """Return the test commands for changed-file scope, or None for full scope.
+#: Stable reason strings returned by :func:`changed_scope_selection` when no
+#: subset is available. Consumers surface the specific cause instead of a
+#: generic list of every possible cause (SA-0MVL7YOMJ006UMDO).
+CHANGED_SCOPE_NO_CHANGES = "no changed files"
+CHANGED_SCOPE_NO_SOURCE = "no changed source or test files"
+CHANGED_SCOPE_NO_GROUP = "no matching group and no convention-matched test files"
+CHANGED_SCOPE_NO_TESTS = "no convention-matched test files"
+CHANGED_SCOPE_NO_TOOLING = "selected test files have no runnable suite tooling"
 
-    Returns None (meaning "fall back to the full suite") when:
 
-    - The repo declares custom ``suiteCommands`` in ``.pi/test-config.json``
-      (not introspectable → cannot select a subset).
-    - No changed files are found (nothing to select → full scope).
-    - The resolved changed-file selection is empty (e.g. only non-source
-      changes like README edits).
-    - The repo has no test tooling of a kind we can subset (no pytest, no
-      node suite dirs).
+class ChangedScopeSelection(NamedTuple):
+    """Result of changed-file → test-command selection.
 
-    When a selection IS possible, returns a list with, per applicable suite:
+    ``commands`` is ``None`` when no safe subset is available, in which case
+    ``reason`` names the specific cause. ``group`` records the named test
+    group that matched when selection came from ``.pi/test-config.json``.
+    """
 
-    - pytest: ``pytest <selected test files>`` (canonicalized quiet form).
-    - node: ``node --test <selected node test files>`` per node suite dir.
+    commands: list[str] | None
+    reason: str
+    group: str | None = None
 
-    The selected test files are always passed explicitly so the partial run
-    is deterministic and cache-keyed distinctly from the full suite.
 
-    *changed_files* may be passed in to avoid a second ``git diff`` when the
-    caller already computed it (single source for the fallback warning).
+def _selectable_changed(changed: set[str]) -> set[str]:
+    """Return changed paths that can drive test selection.
+
+    A path is selectable when it is itself a recognised test file or a
+    tracked source extension. Documentation/config-only change sets return
+    an empty set (nothing to map to tests).
+    """
+    return {
+        path
+        for path in changed
+        if _is_test_file(Path(path)) or Path(path).suffix in TRACKED_SOURCE_EXTENSIONS
+    }
+
+
+def repo_uses_vitest(project_root: Path | None = None) -> bool:
+    """Whether *project_root* runs its TypeScript tests with vitest.
+
+    Detected from a local ``node_modules/.bin/vitest`` binary or from
+    ``package.json`` (a ``vitest`` dependency or a script whose command
+    mentions vitest). This gates the convention-mapped ``*.test.ts`` /
+    ``*.spec.ts`` commands: without a known runner the selector reports
+    "no runnable suite tooling" instead of emitting a bogus command.
     """
     root = Path(project_root or REPO_ROOT).resolve()
+    if (root / "node_modules" / ".bin" / "vitest").exists():
+        return True
+    pkg_json = root / "package.json"
+    if not pkg_json.is_file():
+        return False
+    try:
+        data = json.loads(pkg_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    for key in ("dependencies", "devDependencies"):
+        deps = data.get(key)
+        if isinstance(deps, dict) and "vitest" in deps:
+            return True
+    scripts = data.get("scripts")
+    if isinstance(scripts, dict):
+        return any(
+            isinstance(value, str) and "vitest" in value
+            for value in scripts.values()
+        )
+    return False
 
-    # Custom suite commands are not introspectable — fall back to full scope.
-    if extension_suite_commands(root) is not None:
+
+def _vitest_test_command(root: Path, files: list[str]) -> str | None:
+    """Build a ``vitest run <files>`` command, or None when vitest is absent."""
+    if not files or not repo_uses_vitest(root):
         return None
+    local_bin = root / "node_modules" / ".bin" / "vitest"
+    if local_bin.exists():
+        executable = "node_modules/.bin/vitest"
+    else:
+        # A declared-but-not-yet-installed dependency: resolve the local
+        # package without allowing npx to fetch a different version.
+        executable = "npx --no-install vitest"
+    file_args = " ".join(shlex.quote(f) for f in files)
+    return f"{executable} run {file_args}"
 
-    changed = (
-        changed_files
-        if changed_files is not None
-        else compute_changed_files(root, base_ref=base_ref)
-    )
-    if not changed:
-        return None
 
-    selected = map_changed_to_tests(root, changed)
-    # Anything changed that is itself a test file is already in `selected`;
-    # leaf-only changes (e.g. a lone docs edit) → full scope.
-    if not selected:
-        return None
+def _commands_for_selected_tests(root: Path, selected: set[str]) -> list[str]:
+    """Build runnable commands for *selected* test files, grouped by tooling.
 
-    # Defensive existence filter: never emit a command referencing a path that
-    # is absent from the worktree (deleted/renamed away). If filtering leaves
-    # nothing selectable, fall back to full scope rather than emitting a
-    # degenerate command that would exit 4 (LP-0MTZYRTNF0092JKW).
-    selected = {f for f in selected if (root / f).exists()}
-    if not selected:
-        return None
+    - pytest for ``.py`` tests (only when the repo declares a pytest suite),
+    - ``node --test`` per node suite directory for ``.mjs`` tests,
+    - ``vitest run`` for TypeScript/JavaScript tests when vitest is declared.
 
-    pytest_files = sorted(f for f in selected if f.endswith(".py") and not f.endswith(".mjs"))
-    node_files = sorted(f for f in selected if f.endswith(".mjs"))
-
+    Files are always passed explicitly so a scoped run is deterministic and
+    cache-keyed distinctly from the full suite.
+    """
     commands: list[str] = []
+
+    pytest_files = sorted(
+        f for f in selected if f.endswith(".py") and (root / f).is_file()
+    )
     if pytest_files and repo_has_pytest_suite(root):
         file_args = " ".join(shlex.quote(f) for f in pytest_files)
         commands.append(canonicalize_quiet_test_command(f"pytest {file_args}"))
 
+    node_files = sorted(f for f in selected if f.endswith(".mjs"))
     if node_files:
         # Group by node suite dir (tests/node, tests/cli, tests/unit) so we
         # emit one node --test command per dir, mirroring full_suite_commands.
@@ -689,7 +910,108 @@ def changed_scope_commands(
             file_args = " ".join(shlex.quote(f) for f in files)
             commands.append(f"node --test {file_args}")
 
-    return commands or None
+    js_ts_files = sorted(
+        f
+        for f in selected
+        if f.endswith((".ts", ".tsx", ".js")) and not f.endswith(".mjs")
+    )
+    vitest_cmd = _vitest_test_command(root, js_ts_files)
+    if vitest_cmd is not None:
+        commands.append(vitest_cmd)
+
+    return commands
+
+
+def changed_scope_selection(
+    project_root: Path | None = None,
+    base_ref: str = "origin/dev",
+    changed_files: set[str] | None = None,
+) -> ChangedScopeSelection:
+    """Resolve the changed-file subset and the reason when none is available.
+
+    Selection order:
+
+    1. **Declared ``groups``** in ``.pi/test-config.json`` — the smallest
+       group whose ``paths`` match a changed file wins and its ``commands``
+       run. ``suiteCommands`` no longer disables selection: it defines the
+       *full* suite only, never the changed-scope subset.
+    2. **Convention mapping** — a changed test file itself, or a source whose
+       stem maps to a test file (pytest, node ``.mjs``, vitest
+       ``.test.ts``/``.spec.ts``).
+    3. **Full-scope fallback**, with a specific ``reason``.
+
+    *changed_files* may be passed in to avoid a second ``git diff`` when the
+    caller already computed it.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    changed = (
+        changed_files
+        if changed_files is not None
+        else compute_changed_files(root, base_ref=base_ref)
+    )
+    if not changed:
+        return ChangedScopeSelection(None, CHANGED_SCOPE_NO_CHANGES)
+
+    # 1. Declared named groups (coarser than file-level, but still targeted).
+    group_name = select_group_from_changed_files(changed, root)
+    if group_name is not None:
+        group_cmds = group_commands(group_name, root)
+        if group_cmds:
+            return ChangedScopeSelection(
+                list(group_cmds), f"matched group '{group_name}'", group_name
+            )
+
+    groups_declared = _read_groups(root) is not None
+    if not _selectable_changed(changed):
+        return ChangedScopeSelection(None, CHANGED_SCOPE_NO_SOURCE)
+
+    # 2. Convention mapping. The existence filter never emits a command that
+    # references a path absent from the worktree (LP-0MTZYRTNF0092JKW).
+    selected = {f for f in map_changed_to_tests(root, changed) if (root / f).exists()}
+    commands = _commands_for_selected_tests(root, selected)
+    if commands:
+        return ChangedScopeSelection(
+            commands, f"selected {len(selected)} affected test file(s)"
+        )
+
+    if selected:
+        return ChangedScopeSelection(None, CHANGED_SCOPE_NO_TOOLING)
+    if groups_declared:
+        return ChangedScopeSelection(None, CHANGED_SCOPE_NO_GROUP)
+    return ChangedScopeSelection(None, CHANGED_SCOPE_NO_TESTS)
+
+
+def changed_scope_commands(
+    project_root: Path | None = None,
+    base_ref: str = "origin/dev",
+    changed_files: set[str] | None = None,
+) -> list[str] | None:
+    """Return the test commands for changed-file scope, or None for full scope.
+
+    Thin wrapper over :func:`changed_scope_selection` for callers that only
+    need the commands. Selection now honours declared test ``groups`` and
+    TypeScript/vitest ``*.test.ts``/``*.spec.ts`` files, and is NOT disabled
+    by ``suiteCommands`` (which describes the full suite only).
+
+    **Hidden project-local skill tests are enforced at full scope only**
+    (SA-0MVQJSGLY0098DVB D5): ``changed_scope_commands`` never emits the
+    extra hidden-skill-test command. A changed test file under
+    ``.pi/skills/<name>/tests`` is selected individually like any other
+    changed test file, but the directory-wide extra command is resolved only
+    through :func:`full_suite_commands` (the ``full`` scope / ``full`` group
+    / default type). This keeps changed-scope runs fast and regression-safe.
+
+    Returns None (meaning "fall back to the full suite") when no changed
+    files exist, only non-source changes were made, no group matches, no
+    test file maps to the change, or the selected tests have no runnable
+    tooling. Call :func:`changed_scope_selection` when the specific fallback
+    reason is needed.
+    """
+    return changed_scope_selection(
+        project_root=project_root,
+        base_ref=base_ref,
+        changed_files=changed_files,
+    ).commands
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +1057,267 @@ def repo_has_pytest_suite(project_root: Path | None = None) -> bool:
     return bool(
         any(root.glob("test_*.py")) or any(root.glob("*_test.py"))
     )
+
+
+#: Project-local skill tests live under ``.pi/skills/<name>/`` in one of these
+#: two conventional directories (SA-0MVQJSGLY0098DVB D1).
+_HIDDEN_SKILL_TEST_DIRNAMES = ("tests", "test")
+#: Only this hidden root is scanned — ``.claude/``, ``.git/`` and ``.worklog/``
+#: are never traversed (D1).
+_HIDDEN_SKILL_TEST_ROOT = (".pi", "skills")
+
+
+def hidden_skill_test_dirs(project_root: Path | None = None) -> list[str]:
+    """Return project-local hidden skill test directories, sorted.
+
+    **Why this exists.** pytest's default ``norecursedirs`` includes ``.*``,
+    so a recursive ``pytest`` run from the repository root never traverses
+    ``.pi/``: the tests a project ships with its *project-local* skills
+    (``<root>/.pi/skills/<name>/tests``) are silently absent from the
+    "full" suite (measured on the llm repo: 5 264 collected recursively vs
+    529 in the skill's own test directory — SA-0MVOBJGB4001TQ8X). pytest's
+    ``pytest_ignore_collect`` hook only affects *explicit* initial paths, so
+    naming the directory on the command line collects it while the default
+    recursive run stays unchanged.
+
+    A candidate is ``<root>/.pi/skills/<name>/tests`` or ``.../test`` that
+    exists and contains at least one ``*.py`` (recursive, mirroring
+    :func:`repo_has_pytest_suite`). Only those two literal path levels are
+    probed per skill: no repository-wide scan, and no other hidden root
+    (``.claude/``, ``.git/``, ``.worklog/``) is ever traversed.
+
+    Returns:
+        Sorted, de-duplicated repo-relative POSIX directory paths. Empty when
+        the project has no project-local skill tests.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    skills_root = root.joinpath(*_HIDDEN_SKILL_TEST_ROOT)
+    if not skills_root.is_dir():
+        return []
+    try:
+        skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
+    except OSError:
+        return []
+
+    candidates: set[str] = set()
+    for skill_dir in skill_dirs:
+        for dirname in _HIDDEN_SKILL_TEST_DIRNAMES:
+            candidate = skill_dir / dirname
+            if not candidate.is_dir():
+                continue
+            try:
+                if not any(candidate.rglob("*.py")):
+                    continue
+            except OSError:
+                continue
+            candidates.add(candidate.relative_to(root).as_posix())
+    return sorted(candidates)
+
+
+def hidden_skill_test_command(dirs: list[str]) -> str:
+    """One quiet pytest command listing every hidden skill test directory.
+
+    Deliberately a **single** command rather than one per directory (D2): the
+    runner acquires one host-wide concurrency slot per suite execution, and a
+    single command keeps one cache entry and one timeout budget.
+
+    Args:
+        dirs: Repo-relative directory paths, already sorted by
+            :func:`hidden_skill_test_dirs`. Paths are shell-quoted, so a
+            directory containing spaces is passed intact.
+    """
+    return canonicalize_quiet_test_command(
+        "pytest " + " ".join(shlex.quote(d) for d in dirs)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pinned-suite precedence and no-double-execution (SA-0MVQQ9NV4005UKYZ)
+# ---------------------------------------------------------------------------
+
+#: Project pytest configuration files whose ``testpaths``/``addopts`` can
+#: already collect a hidden skill test directory (D3 coverage rule).
+_PYTEST_INI_FILES = ("pytest.ini", "setup.cfg", "tox.ini")
+#: INI sections pytest reads options from.
+_PYTEST_INI_SECTIONS = ("pytest", "tool:pytest")
+#: The only hidden root whose tokens count as coverage (D-A2): a token at or
+#: above the repo root never reaches ``.pi/`` because pytest's default
+#: ``norecursedirs`` contains ``.*``.
+_HIDDEN_ROOT_PREFIX = ".pi"
+
+
+def _resolve_repo_relative(root: Path, token: str) -> str | None:
+    """Normalise a config token to a repo-relative POSIX path.
+
+    Returns ``None`` for tokens that are not paths (option flags such as
+    ``-ra``), or that resolve outside *root*. ``"."`` is returned for the
+    repository root itself.
+    """
+    candidate = token.strip()
+    if not candidate or candidate.startswith("-"):
+        return None
+    path = Path(candidate)
+    try:
+        if path.is_absolute():
+            rel = path.resolve().relative_to(root)
+        else:
+            normalised = os.path.normpath(candidate)
+            if normalised == ".":
+                return "."
+            if normalised == ".." or normalised.startswith(".." + os.sep):
+                return None
+            rel = Path(normalised)
+    except (OSError, ValueError):
+        return None
+    return rel.as_posix()
+
+
+def _pytest_config_path_tokens(project_root: Path) -> list[str]:
+    """Path tokens from the project's pytest ``testpaths``/``addopts``.
+
+    Reads the INI forms (``pytest.ini``/``setup.cfg``/``tox.ini``) and the
+    ``pyproject.toml`` ``[tool.pytest.ini_options]`` form. Unreadable or
+    malformed configuration is treated as absent (never an error) — the
+    coverage rule may only ever *add* the hidden skill-test command.
+    """
+    root = Path(project_root)
+    tokens: list[str] = []
+
+    for name in _PYTEST_INI_FILES:
+        path = root / name
+        if not path.is_file():
+            continue
+        parser = configparser.ConfigParser(
+            inline_comment_prefixes=("#", ";"), strict=False
+        )
+        try:
+            parser.read(path, encoding="utf-8")
+        except (configparser.Error, OSError, UnicodeDecodeError):
+            continue
+        for section in _PYTEST_INI_SECTIONS:
+            if not parser.has_section(section):
+                continue
+            for option in ("testpaths", "addopts"):
+                value = parser.get(section, option, fallback="")
+                tokens.extend(str(value).split())
+
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            data = None
+        options = ((data or {}).get("tool") or {}).get("pytest") or {}
+        ini_options = (options.get("ini_options") or {}) if isinstance(options, dict) else {}
+        if isinstance(ini_options, dict):
+            for key in ("testpaths", "addopts"):
+                value = ini_options.get(key)
+                if isinstance(value, str):
+                    tokens.extend(value.split())
+                elif isinstance(value, list):
+                    tokens.extend(str(item) for item in value)
+    return tokens
+
+
+def _token_covers_candidate(root: Path, token: str, candidate: str) -> bool:
+    """Whether *token* already collects *candidate* (D3/D-A2 rule).
+
+    The token must resolve to ``.pi`` or a strict descendant of ``.pi`` — a
+    token at or above the repo root (``.``, ``tests``, ``skill``) does not
+    count, because the default ``norecursedirs`` (``.*``) still prunes
+    ``.pi`` from those roots. The candidate must then be the token itself or
+    live underneath it.
+    """
+    rel = _resolve_repo_relative(root, token)
+    if rel is None or rel == ".":
+        return False
+    if rel != _HIDDEN_ROOT_PREFIX and not rel.startswith(_HIDDEN_ROOT_PREFIX + "/"):
+        return False
+    return candidate == rel or candidate.startswith(rel.rstrip("/") + "/")
+
+
+def uncovered_hidden_skill_test_dirs(
+    project_root: Path | None = None,
+) -> list[str]:
+    """Hidden skill test dirs the canonical pytest command does NOT collect.
+
+    Applies the no-double-execution rule (D3/AC4): a candidate already
+    reached through the project's pytest ``testpaths``/``addopts`` is dropped
+    from the emitted command, so the tests run exactly once.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    tokens = _pytest_config_path_tokens(root)
+    return [
+        candidate
+        for candidate in hidden_skill_test_dirs(root)
+        if not any(_token_covers_candidate(root, token, candidate) for token in tokens)
+    ]
+
+
+def _pinned_commands_cover(root: Path, candidate: str, commands: list[str]) -> bool:
+    """Whether any pinned ``suiteCommands`` entry already names *candidate*."""
+    for command in commands:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        if any(_token_covers_candidate(root, token, candidate) for token in tokens):
+            return True
+    return False
+
+
+def hidden_skill_test_notice(
+    project_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Machine-readable, **non-fatal** notice for a pinned ``suiteCommands``.
+
+    A project's pinned list is authoritative and is returned verbatim (D3) —
+    the framework never appends a command to it. When that list does not
+    name some of the project's hidden skill test directories, the gap is
+    surfaced here instead of staying silent: consumers report the notice and
+    leave the resolution and the exit status untouched (AC3/AC4b).
+
+    Returns:
+        ``None`` when the list is not pinned or it covers every candidate;
+        otherwise a dict with the stable ``code``, the uncovered
+        ``directories`` and a human-readable ``message``.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    pinned = extension_suite_commands(root)
+    if pinned is None:
+        return None
+    uncovered = [
+        candidate
+        for candidate in hidden_skill_test_dirs(root)
+        if not _pinned_commands_cover(root, candidate, pinned)
+    ]
+    if not uncovered:
+        return None
+    listed = ", ".join(uncovered)
+    return {
+        "code": NOTICE_HIDDEN_SKILL_TESTS_UNCOVERED,
+        "source": TEST_CONFIG_FILE,
+        "directories": uncovered,
+        "message": (
+            f"Pinned {TEST_CONFIG_FILE} suiteCommands do not cover the hidden "
+            f"skill test dir(s) {listed}; they are not run by the pinned "
+            "list (add them to suiteCommands to collect them)."
+        ),
+    }
+
+
+def full_suite_notices(project_root: Path | None = None) -> list[dict[str, Any]]:
+    """Every non-fatal resolution notice for the full suite (ordered).
+
+    The single place consumers read notices from; new notices are appended
+    here without changing :func:`full_suite_commands`'s ``list[str]``
+    signature (D4).
+    """
+    notices: list[dict[str, Any]] = []
+    hidden_notice = hidden_skill_test_notice(project_root)
+    if hidden_notice is not None:
+        notices.append(hidden_notice)
+    return notices
 
 
 def _read_test_config(project_root: Path) -> dict | None:
@@ -1022,9 +1605,16 @@ def full_suite_commands(project_root: Path | None = None) -> list[str]:
        ``suiteCommands`` — when present, convention detection is skipped.
     2. **pytest** only when the repo declares a pytest suite
        (``repo_has_pytest_suite`` — never a phantom pytest command, F2 AC3).
-    3. **node** — one command per existing ``tests/{unit,node,cli}`` dir
+    3. **project-local hidden skill tests** (SA-0MVQJSGLY0098DVB D2): one
+       extra quiet pytest command naming every ``.pi/skills/<name>/tests``
+       directory the default recursive run cannot reach (pytest's default
+       ``norecursedirs`` prunes ``.*``). Emitted immediately after the
+       canonical pytest command and before any node command, so the ordering
+       is stable. Emission does NOT require ``repo_has_pytest_suite``: a
+       project shipping only skill tests still gets the command.
+    4. **node** — one command per existing ``tests/{unit,node,cli}`` dir
        (SA-0MSJELL44009XYIL).
-    4. **npm-test convention** (F2 AC2): when neither pytest nor any node
+    5. **npm-test convention** (F2 AC2): when neither pytest nor any node
        suite dir applies and ``package.json`` declares a ``test`` script,
        emit ``npm --silent test`` (the TCE fix — a vitest/npm repo's real
        suite becomes cacheable/verifiable instead of the phantom pytest).
@@ -1044,6 +1634,13 @@ def full_suite_commands(project_root: Path | None = None) -> list[str]:
     commands: list[str] = []
     if repo_has_pytest_suite(root):
         commands.append(pytest_command())
+    # No-double-execution (SA-0MVQQ9NV4005UKYZ AC4): a directory the project's
+    # own pytest ``testpaths``/``addopts`` already collects is not repeated.
+    hidden_skill_dirs = uncovered_hidden_skill_test_dirs(root)
+    if hidden_skill_dirs:
+        # Straight after the canonical pytest command, before any node
+        # command: a stable position for every consumer (D2).
+        commands.append(hidden_skill_test_command(hidden_skill_dirs))
     commands.extend(node_suite_commands(root))
 
     if not commands:
@@ -1365,26 +1962,108 @@ class TestConcurrencyTimeout(RuntimeError):
 
 
 def _test_semaphore_max_workers() -> int:
-    """Resolve the test-run concurrency ceiling.
+    """Resolve the FULL-suite concurrency ceiling.
 
-    Precedence: ``TEST_MAX_CONCURRENCY`` env var > default 2. Values below
-    1 are clamped to 1; an invalid (non-integer) value is ignored with a
-    warning so a misconfigured environment cannot break test runs. The
-    ceiling bounds concurrent suite executions host-wide via the shared
-    "test" semaphore — a separate namespace from the audit semaphore
-    (SA-0MTG5U75A001F1RG AC1/AC2/AC3).
+    Precedence: ``TEST_MAX_CONCURRENCY`` env var > calibrated default 6. Values
+    below 1 are clamped to 1; an invalid (non-integer) value is ignored with a
+    warning so a misconfigured environment cannot break test runs. The ceiling
+    bounds concurrent full-suite executions host-wide via the shared "test"
+    semaphore — a separate namespace from both the audit semaphore and the
+    partial-run "test-fast" lane (SA-0MTG5U75A001F1RG AC1/AC2/AC3,
+    SA-0MVWZQ269009SJXV AC2).
     """
-    env_value = os.environ.get(TEST_MAX_CONCURRENCY_ENV)
+    return _resolve_ceiling(TEST_MAX_CONCURRENCY_ENV, TEST_MAX_CONCURRENCY_DEFAULT)
+
+
+def _test_fast_semaphore_max_workers() -> int:
+    """Resolve the PARTIAL-run ("test-fast" lane) concurrency ceiling.
+
+    Precedence: ``TEST_MAX_CONCURRENCY_FAST`` env var > default 4, with the
+    same clamping and invalid-value handling as the full-suite ceiling
+    (:func:`_test_semaphore_max_workers`). Partial runs are short, so a modest
+    pool absorbs a burst of concurrent agents without ever waiting behind a
+    full suite (SA-0MVWZQ269009SJXV AC1).
+    """
+    return _resolve_ceiling(
+        TEST_MAX_CONCURRENCY_FAST_ENV, TEST_MAX_CONCURRENCY_FAST_DEFAULT
+    )
+
+
+def _resolve_ceiling(env_name: str, default: int) -> int:
+    """Return the env-configured ceiling, or *default* when unset/invalid.
+
+    Shared by both lanes so clamping (< 1 -> 1) and the invalid-value warning
+    are implemented exactly once.
+    """
+    env_value = os.environ.get(env_name)
     if env_value:
         try:
             return max(1, int(env_value))
         except ValueError:
             print(
-                f"Warning: invalid {TEST_MAX_CONCURRENCY_ENV} value "
+                f"Warning: invalid {env_name} value "
                 f"{env_value!r}; using default ceiling",
                 file=sys.stderr,
             )
-    return TEST_MAX_CONCURRENCY_DEFAULT
+    return default
+
+
+def slot_lane_for(scope: str, test_type: str) -> str:
+    """Return the semaphore lane a run belongs to.
+
+    A run is *partial* — and therefore belongs to the "test-fast" lane —
+    whenever it does not select the whole suite: ``scope`` other than
+    ``"full"`` (i.e. ``"changed"``) or a ``test_type`` other than ``full``
+    (``unit``, ``smoke``, ``group:<name>``). Everything else is a full suite
+    and keeps the "test" lane. Callers must pass the **resolved** scope (after
+    a changed-scope run falls back to the full suite, the lane is "full"), so
+    a lane label always matches what actually executed
+    (SA-0MVWZQ269009SJXV AC1/AC4).
+    """
+    if scope != "full" or test_type != DEFAULT_TEST_TYPE:
+        return TEST_SLOT_LANE_FAST
+    return TEST_SLOT_LANE_FULL
+
+
+#: Lane of the slot acquisitions happening in this execution context. Kept as
+#: ambient state (rather than a parameter on every call) so a caller can wrap a
+#: whole execution in :func:`_slot_lane` and every nested acquisition inherits
+#: it — and so existing zero-argument test doubles of
+#: :func:`_test_concurrency_slot` keep working.
+_SLOT_LANE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "test_slot_lane", default=TEST_SLOT_LANE_FULL
+)
+
+
+@contextmanager
+def _slot_lane(lane: str) -> Iterator[None]:
+    """Run nested slot acquisitions in *lane* (``"full"`` or ``"fast"``).
+
+    Sets the ambient lane for the duration of the block; an explicit ``lane=``
+    argument to :func:`_test_concurrency_slot` still wins, so a caller that
+    needs a one-off lane does not have to wrap the execution.
+    """
+    token = _SLOT_LANE.set(lane)
+    try:
+        yield
+    finally:
+        _SLOT_LANE.reset(token)
+
+
+def _lane_semaphore_config(lane: str) -> tuple[str, str, int]:
+    """Return ``(lane, semaphore_name, max_workers)`` for *lane*.
+
+    An unknown lane name is treated as ``"full"``: an unexpected value must
+    degrade to the conservative pool, never to an unbounded one.
+    """
+    if lane == TEST_SLOT_LANE_FAST:
+        return (
+            TEST_SLOT_LANE_FAST,
+            TEST_FAST_SEMAPHORE_NAME,
+            _test_fast_semaphore_max_workers(),
+        )
+    return TEST_SLOT_LANE_FULL, TEST_SEMAPHORE_NAME, _test_semaphore_max_workers()
+
 
 
 def _test_lock_timeout() -> float:
@@ -1468,14 +2147,24 @@ def _test_vitest_max_workers() -> int:
 
 
 @contextmanager
-def _test_concurrency_slot() -> Iterator[None]:
+def _test_concurrency_slot(lane: str | None = None) -> Iterator[None]:
     """Hold a shared test-run slot for the duration of an actual execution.
 
-    Bounds concurrent test suite executions via the shared "test"
-    semaphore (ceiling ``TEST_MAX_CONCURRENCY``, bounded wait
-    ``TEST_LOCK_TIMEOUT``). Only ACTUAL executions acquire a slot — a
-    cached result is served without executing and never blocks on the
-    semaphore, so cache behavior is unchanged (SA-0MTG5U75A001F1RG AC4).
+    Bounds concurrent test suite executions via a shared semaphore, in the
+    lane named by *lane* — or, when omitted, the ambient lane set by
+    :func:`_slot_lane` (SA-0MVWZQ269009SJXV AC1):
+
+    - ``"full"`` (default) — the ``"test"`` namespace, ceiling
+      ``TEST_MAX_CONCURRENCY``, for whole-suite executions.
+    - ``"fast"`` — the ``"test-fast"`` namespace, ceiling
+      ``TEST_MAX_CONCURRENCY_FAST``, for partial runs (``--scope changed``,
+      ``--type unit|smoke|group:*``). Independent of the full-suite pool, so a
+      1-3 s partial run never queues behind a 7-minute full suite.
+
+    Both lanes use the bounded wait ``TEST_LOCK_TIMEOUT``. Only ACTUAL
+    executions acquire a slot — a cached result is served without executing
+    and never blocks on the semaphore, so cache behavior is unchanged
+    (SA-0MTG5U75A001F1RG AC4).
 
     Nested-run isolation (SA-0MUY6U05F008RG86): fixtures that spawn a nested
     ``run_tests.py`` (or call the runner in-process) set ``PI_SEMAPHORE_DIR``
@@ -1488,10 +2177,17 @@ def _test_concurrency_slot() -> Iterator[None]:
     Raises:
         TestConcurrencyTimeout: when no slot frees within the bound.
     """
-    max_workers = _test_semaphore_max_workers()
+    lane, semaphore_name, max_workers = _lane_semaphore_config(
+        lane if lane is not None else _SLOT_LANE.get()
+    )
     lock_timeout = _test_lock_timeout()
+    ceiling_env = (
+        TEST_MAX_CONCURRENCY_FAST_ENV
+        if lane == TEST_SLOT_LANE_FAST
+        else TEST_MAX_CONCURRENCY_ENV
+    )
     sem = Semaphore(
-        TEST_SEMAPHORE_NAME,
+        semaphore_name,
         max_workers=max_workers,
         timeout=lock_timeout,
         # Per-waiter stagger within the bound so a herd of concurrent
@@ -1505,7 +2201,7 @@ def _test_concurrency_slot() -> Iterator[None]:
     except TimeoutError as exc:
         raise TestConcurrencyTimeout(
             f"{SLOT_BUSY_NOTICE_PREFIX} no free slot within "
-            f"{lock_timeout:.0f}s (TEST_MAX_CONCURRENCY={max_workers}) "
+            f"{lock_timeout:.0f}s (lane={lane}, {ceiling_env}={max_workers}) "
             f"— wait a staggered delay before retrying (do not re-run "
             f"immediately; concurrent waiters re-enter the pool in lockstep "
             f"otherwise), or raise TEST_LOCK_TIMEOUT to wait longer."
@@ -1556,8 +2252,8 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
     )
 
 
-def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
-    """Adapter exposing _run_cmd to the cache runner protocol.
+def _run_suite_command(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Spawn one suite command, with no concurrency-slot handling.
 
     Uses shlex.split (not str.split) so quoted args like
     ``node --test "tests/node/**/*.mjs"`` pass the glob without literal
@@ -1568,15 +2264,47 @@ def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.Completed
     the runner's interpreter (or the first probed candidate that can run
     pytest) instead of a PATH ``pytest`` bound to a foreign interpreter
     (SA-0MVK154IE007OS3D); the canonical command (cache key) is unchanged.
+
+    Slot acquisition is deliberately left to the caller: :func:`_cached_runner`
+    acquires it directly for legacy callers, while :func:`run_suite` routes
+    through :func:`paced_runner` so the queue wait can be reported separately
+    (SA-0MVU8XRBQ000DG9D).
     """
     executable = executable_test_command(command)
+    return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
+
+
+def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Adapter exposing slot-bounded execution to the cache runner protocol."""
     with _test_concurrency_slot():
-        return _run_cmd(shlex.split(executable), cwd=Path(cwd), timeout=timeout)
+        return _run_suite_command(command, cwd, timeout)
+
+
+def _timed_suite_runner(elapsed_samples: list[float]) -> Runner:
+    """Wrap :func:`_run_suite_command` so each execution's wall time is recorded.
+
+    The sample is appended in a ``finally`` block, so a ``TimeoutExpired``
+    still reports how long the command had been running when it stopped — the
+    fact an operator needs to tell a slow suite from an endlessly hanging one.
+    Only the command execution is timed: the queue wait for a host test slot
+    happens in the pacer *outside* this runner, so ``elapsed_seconds`` and
+    ``slot_wait_seconds`` can never double-count (SA-0MVU8XRBQ000DG9D).
+    """
+
+    def _runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+        started = time.monotonic()
+        try:
+            return _run_suite_command(command, cwd, timeout)
+        finally:
+            elapsed_samples.append(time.monotonic() - started)
+
+    return _runner
 
 
 def paced_runner(
     runner: Runner | None = None,
     on_wait: Callable[[float, float], None] | None = None,
+    lane: str = TEST_SLOT_LANE_FULL,
 ) -> Runner:
     """Wrap a cache *runner* so each real execution holds a test-run slot.
 
@@ -1597,9 +2325,15 @@ def paced_runner(
     immediately after the slot is acquired and before the command is spawned,
     so callers can emit pacing telemetry (SA-0MUA8BSAG000YZA2 AC3).
 
+    *lane* selects the semaphore namespace: ``"full"`` (default) for a whole
+    suite, ``"fast"`` for a partial run (``--scope changed``, ``--type`` other
+    than ``full``). The two pools are independent, so a partial run never
+    queues behind a full suite. An unknown lane degrades to ``"full"``
+    (SA-0MVWZQ269009SJXV AC1).
+
     This is the single pacer entry point other code paths (e.g.
     ``implement.py``'s finish-gate suites, SA-0MUKHCO02009EQFG) use to route
-    their executions through the same host-wide ``"test"`` namespace as
+    their executions through the same host-wide namespace as
     ``run_tests.py`` (SA-0MTG5U75A001F1RG). A caller that does not pace keeps
     its previous unpaced behaviour, so this is opt-in.
 
@@ -1611,12 +2345,31 @@ def paced_runner(
 
     def _paced(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
         queued_at = time.time()
-        with _test_concurrency_slot():
+        with _slot_lane(lane), _test_concurrency_slot():
             if on_wait is not None:
                 on_wait(queued_at, time.time() - queued_at)
             return runner(command, cwd, timeout)
 
     return _paced
+
+
+def _cache_entry_metadata(
+    run: dict[str, Any], command: str
+) -> dict[str, Any]:
+    """Reportable metadata of the cache entry a verdict was served from.
+
+    ``run`` is a ``run_cached`` result (a cache hit). The returned mapping
+    carries the entry's ``command``, ``completed_at`` (epoch float), ``scope``
+    and ``fingerprint_kind`` so a consumer — the finish gate's report, a
+    completion comment, an auditor — can state *what* was reused rather than
+    only that something was (SA-0MVQHVJEX0071R7G).
+    """
+    return {
+        "command": run.get("command") or command,
+        "completed_at": run.get("completed_at", 0),
+        "scope": run.get("scope", "full"),
+        "fingerprint_kind": run.get("fingerprint_kind", ""),
+    }
 
 
 def run_suite(
@@ -1631,6 +2384,7 @@ def run_suite(
     base_ref: str = "origin/dev",
     test_type: str = DEFAULT_TEST_TYPE,
     group: str | None = None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run a single named suite and return structured results.
 
@@ -1683,6 +2437,33 @@ def run_suite(
     ``cached``, ``scope``, ``type``; on a failure WITHOUT structured failures a
     ``notice`` (human-readable) plus a stable ``notice_code`` and bounded
     ``stdout``/``stderr`` tails (WL-0MVGUT787000LNDG).
+
+    Diagnostic facts (SA-0MVU8XRBQ000DG9D), present on **every** result so a
+    consumer never infers what happened:
+
+    * ``configured_timeout`` — the per-command timeout that was applied
+      (seconds).
+    * ``elapsed_seconds`` — wall time of the command executions only, queue
+      wait excluded; ``None`` (never ``0``) when nothing executed (a fully
+      cache-served suite, or a slot wait that expired before spawning).
+    * ``slot_wait_seconds`` — time spent queued for a host test slot, measured
+      once by the pacer's ``on_wait`` callback and never folded into
+      ``elapsed_seconds``; on a slot-busy result it is the elapsed bounded
+      wait.
+    * ``exit_code`` — the process exit code (``None`` when no child ran);
+      negative means signal-terminated.
+    * ``signal`` — the terminating signal number when ``exit_code < 0``, else
+      ``None``.
+
+    Non-zero results without parsable failures carry ``killed`` (signal-
+    terminated) or ``unparsed_failure`` (non-zero exit, no parsable failure)
+    as ``notice_code``; structured failures always win over those codes.
+
+    Verdict provenance (SA-0MVQHVJEX0071R7G): ``cached`` states whether every
+    command of the suite was served from the cache, and ``cache_entries``
+    carries one metadata mapping per cache-served command (``command``,
+    ``completed_at``, ``scope``, ``fingerprint_kind``) so a consumer can
+    attribute — and audit — a verdict without re-reading the cache.
     """
     cwd = cwd or REPO_ROOT
     resolvable_scope = "full"
@@ -1701,7 +2482,10 @@ def run_suite(
         if scope == "changed" and test_type == DEFAULT_TEST_TYPE:
             # Changed-file selection drives every suite name; the selection is
             # narrowed to the named suite below. Any failure to produce a
-            # subset (custom suiteCommands, no selection) falls back to full.
+            # subset (no changed/selectable files, no matching group) falls
+            # back to full. Declared ``suiteCommands`` never disable
+            # selection — they define the full suite only
+            # (SA-0MVL7YOMJ006UMDO).
             changed_files = compute_changed_files(cwd, base_ref=base_ref)
             changed_commands = changed_scope_commands(
                 cwd, base_ref=base_ref, changed_files=changed_files
@@ -1767,14 +2551,85 @@ def run_suite(
         # partial run as full-suite evidence (SA-0MUH1MJL6003767Q).
         resolvable_scope = scope if scope in ("full", "changed") else "full"
     command = " && ".join(commands)
+    # Lane selection (SA-0MVWZQ269009SJXV AC1): a partial run gets its own
+    # "test-fast" pool so it never queues behind a full suite. Derived from the
+    # RESOLVED scope, so a changed-scope run that fell back to the full suite
+    # correctly reports (and contends in) the full lane.
+    slot_lane = slot_lane_for(resolvable_scope, test_type)
 
     all_failures: list[dict[str, str]] = []
     overall_returncode = 0
     cached_flags: list[bool] = []
+    cache_entries: list[dict[str, Any]] = []
     interpreters: set[str] = set()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    #: Command-execution wall times (queue wait excluded) and queue waits, both
+    #: measured per executed command so a partially cached suite still reports
+    #: exactly what it measured (SA-0MVU8XRBQ000DG9D).
+    elapsed_samples: list[float] = []
+    slot_waits: list[float] = []
+
+    def _result(**overrides: Any) -> dict[str, Any]:
+        """Suite result carrying the shared facts and diagnostics.
+
+        Every return path — green, structured failure, timeout, kill,
+        unparsed exit, slot busy, command not found — reports the same fact
+        fields, so no consumer has to infer what happened from prose
+        (SA-0MVU8XRBQ000DG9D).
+        """
+        result: dict[str, Any] = {
+            "success": False,
+            "returncode": None,
+            "command": command,
+            "failures": [],
+            "notice": "",
+            "notice_code": "",
+            "stdout": _output_tail("\n".join(stdout_parts)),
+            "stderr": _output_tail("\n".join(stderr_parts)),
+            "scope": resolvable_scope,
+            "type": test_type,
+            "interpreter": (
+                "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
+            ),
+            "changed_files": (
+                sorted(changed_files) if resolvable_scope == "changed" else []
+            ),
+            "configured_timeout": timeout,
+            "elapsed_seconds": _measured_seconds(elapsed_samples),
+            "slot_wait_seconds": sum(slot_waits),
+            "slot_lane": slot_lane,
+            "exit_code": None,
+            "signal": None,
+            # Verdict provenance (SA-0MVQHVJEX0071R7G): every return path
+            # states whether the verdict was cache-served and, if so, which
+            # entries were reused.
+            "cached": use_cache and all(cached_flags) if cached_flags else False,
+            "cache_entries": cache_entries,
+        }
+        result.update(overrides)
+        return result
+
     for cmd in commands:
+        command_waits: list[float] = []
+        command_elapsed: list[float] = []
+
+        def _record_wait(
+            _queued_at: float,
+            wait_seconds: float,
+            _sink: list[float] = command_waits,
+        ) -> None:
+            # The pacer reports the queue wait exactly once per execution, so
+            # this is the single measurement — never a second timer, and never
+            # folded into the command's own elapsed time (SA-0MVU8XRBQ000DG9D).
+            _sink.append(wait_seconds)
+
+        paced = paced_runner(
+            runner=_timed_suite_runner(command_elapsed),
+            on_wait=_record_wait,
+            lane=slot_lane,
+        )
+        queued_at = time.monotonic()
         try:
             if use_cache:
                 run = run_cached(
@@ -1784,80 +2639,48 @@ def run_suite(
                     no_cache=no_cache,
                     ttl=CACHE_TTL_SECONDS,
                     timeout=timeout,
-                    runner=_cached_runner,
+                    runner=paced,
                     scope=resolvable_scope,
                     test_type=test_type,
+                    fingerprint=fingerprint,
                 )
                 proc = SimpleNamespace(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
                 )
                 cached_flags.append(run["cached"])
+                if run["cached"]:
+                    cache_entries.append(_cache_entry_metadata(run, cmd))
                 if run.get("interpreter"):
                     interpreters.add(run["interpreter"])
             else:
-                with _test_concurrency_slot():
-                    proc = _run_cmd(
-                        shlex.split(executable_test_command(cmd)),
-                        cwd=cwd,
-                        timeout=timeout,
-                    )
+                proc = paced(cmd, str(cwd), timeout)
                 cached_flags.append(False)
                 if is_pytest_command(cmd):
                     interpreters.add(resolve_pytest_executable())
         except FileNotFoundError as exc:
-            return {
-                "success": False,
-                "returncode": None,
-                "command": command,
-                "failures": [],
-                "notice": f"command not found: {exc.filename}",
-                "notice_code": NOTICE_COMMAND_NOT_FOUND,
-                "stdout": _output_tail("\n".join(stdout_parts)),
-                "stderr": _output_tail("\n".join(stderr_parts)),
-                "scope": resolvable_scope,
-                "type": test_type,
-                "interpreter": (
-                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
-                ),
-                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
-            }
+            slot_waits.extend(command_waits)
+            elapsed_samples.extend(command_elapsed)
+            return _result(
+                command=command,
+                notice=f"command not found: {exc.filename}",
+                notice_code=NOTICE_COMMAND_NOT_FOUND,
+            )
         except subprocess.TimeoutExpired:
-            return {
-                "success": False,
-                "returncode": None,
-                "command": command,
-                "failures": [],
-                "notice": f"suite timed out after {timeout}s: {name}",
-                "notice_code": NOTICE_SUITE_TIMEOUT,
-                "stdout": _output_tail("\n".join(stdout_parts)),
-                "stderr": _output_tail("\n".join(stderr_parts)),
-                "scope": resolvable_scope,
-                "type": test_type,
-                "interpreter": (
-                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
-                ),
-                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
-            }
+            slot_waits.extend(command_waits)
+            elapsed_samples.extend(command_elapsed)
+            return _result(
+                notice=f"suite timed out after {timeout}s: {name}",
+                notice_code=NOTICE_SUITE_TIMEOUT,
+            )
         except TestConcurrencyTimeout as exc:
             # Concurrency ceiling stayed saturated past the bounded wait:
             # report a clear failure notice (never a crash, never fail-fast
-            # before the bound) — SA-0MTG5U75A001F1RG AC1.
-            return {
-                "success": False,
-                "returncode": None,
-                "command": command,
-                "failures": [],
-                "notice": str(exc),
-                "notice_code": NOTICE_SLOT_BUSY,
-                "stdout": _output_tail("\n".join(stdout_parts)),
-                "stderr": _output_tail("\n".join(stderr_parts)),
-                "scope": resolvable_scope,
-                "type": test_type,
-                "interpreter": (
-                    "mixed" if len(interpreters) > 1 else next(iter(interpreters), "")
-                ),
-                "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
-            }
+            # before the bound) — SA-0MTG5U75A001F1RG AC1. Nothing executed,
+            # so the whole bounded window was queue wait (SA-0MVU8XRBQ000DG9D).
+            slot_waits.append(time.monotonic() - queued_at)
+            return _result(notice=str(exc), notice_code=NOTICE_SLOT_BUSY)
+        slot_waits.extend(command_waits)
+        elapsed_samples.extend(command_elapsed)
 
         output = f"{proc.stdout}\n{proc.stderr}"
         stdout_parts.append(proc.stdout or "")
@@ -1870,21 +2693,64 @@ def run_suite(
         if proc.returncode != 0:
             overall_returncode = proc.returncode
 
-    return {
-        "success": overall_returncode == 0 and not all_failures,
-        "returncode": overall_returncode,
-        "command": command,
-        "failures": all_failures,
-        "cached": use_cache and all(cached_flags) if cached_flags else False,
-        "scope": resolvable_scope,
-        "type": test_type,
-        "interpreter": "mixed" if len(interpreters) > 1 else next(iter(interpreters), ""),
-        "changed_files": sorted(changed_files) if resolvable_scope == "changed" else [],
-        "notice": "",
-        "notice_code": "",
-        "stdout": _output_tail("\n".join(stdout_parts)),
-        "stderr": _output_tail("\n".join(stderr_parts)),
-    }
+    result = _result(
+        success=overall_returncode == 0 and not all_failures,
+        returncode=overall_returncode,
+        exit_code=overall_returncode,
+        command=command,
+        failures=all_failures,
+        cached=use_cache and all(cached_flags) if cached_flags else False,
+    )
+    # Classification precedence (SA-0MVU8XRBQ000DG9D): a parsable failure is
+    # always a code failure. Only a non-zero suite with NO parsable failure is
+    # classified as an infrastructure condition, and a signal-terminated child
+    # (negative return code — OOM kill, worker crash) is distinguished from a
+    # plain non-zero exit. Cache-served non-zero results are classified from
+    # their stored exit code and output too (their elapsed time is ``None``).
+    if not all_failures and overall_returncode != 0:
+        if overall_returncode < 0:
+            signal_number = abs(overall_returncode)
+            result["signal"] = signal_number
+            result["notice_code"] = NOTICE_KILLED
+            result["notice"] = f"suite killed by signal {signal_number}: {name}"
+        else:
+            result["notice_code"] = NOTICE_UNPARSED_FAILURE
+            result["notice"] = (
+                f"suite exited {overall_returncode} with no parsable "
+                f"failures: {name}"
+            )
+    return result
+
+
+def _render_seconds(value: float | None) -> str:
+    """Render a measured duration for humans, naming an unmeasured one."""
+    return "n/a (not measured)" if value is None else f"{value:.2f}s"
+
+
+def _render_suite_facts(result: dict[str, Any]) -> str:
+    """One-line human rendering of a suite result's diagnostic facts.
+
+    Mirrors the machine-readable fields (SA-0MVU8XRBQ000DG9D) so an operator
+    reading the CLI sees the same configured timeout, elapsed time, queue
+    wait, exit code/signal and command the JSON report carries.
+    """
+    parts = [f"elapsed={_render_seconds(result.get('elapsed_seconds'))}"]
+    slot_wait = result.get("slot_wait_seconds")
+    if slot_wait:
+        parts.append(f"slot_wait={slot_wait:.2f}s")
+    if result.get("slot_lane"):
+        parts.append(f"lane={result['slot_lane']}")
+    exit_code = result.get("exit_code")
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+    signal_number = result.get("signal")
+    if signal_number is not None:
+        parts.append(f"signal={signal_number}")
+    if result.get("configured_timeout") is not None:
+        parts.append(f"configured_timeout={result['configured_timeout']}s")
+    if result.get("command"):
+        parts.append(f"command={result['command']}")
+    return ", ".join(parts)
 
 
 def run_all(
@@ -1899,6 +2765,7 @@ def run_all(
     commands: list[str] | None = None,
     test_type: str = DEFAULT_TEST_TYPE,
     group: str | None = None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run the selected suites and aggregate failures.
 
@@ -1918,6 +2785,17 @@ def run_all(
 
     *group*: when set, runs the named test group instead of suite-based
     resolution (SA-0MUJKF2HP001BR51).
+
+    In addition to the per-suite detail (kept intact under ``suites``) the
+    aggregate carries ``notice_codes``, ``elapsed_seconds_total`` (sum of
+    measured command executions, ``None`` when nothing ran) and
+    ``slot_wait_seconds`` (sum of queue waits) — the two durations are
+    aggregated separately so neither can be mistaken for the other
+    (SA-0MVU8XRBQ000DG9D).
+    Verdict provenance (SA-0MVQHVJEX0071R7G): the aggregate carries ``cached``
+    (True only when every selected suite was served from the cache) and
+    ``cache_entries`` (the metadata of every served entry, one per cached
+    command) so consumers can attribute the aggregate verdict.
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
@@ -1926,6 +2804,18 @@ def run_all(
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     resolved_scopes: list[str] = []
+    # Diagnostic aggregates (SA-0MVU8XRBQ000DG9D): execution time and queue
+    # wait are summed SEPARATELY, so a queued run can never look like a slow
+    # suite (or vice versa). Per-suite detail stays in ``suites``.
+    elapsed_total = 0.0
+    elapsed_measured = False
+    slot_wait_total = 0.0
+    # Non-fatal resolution notices (SA-0MVQQ9NV4005UKYZ AC3/AC4b): reported for
+    # visibility only — they never change the resolved command set or the exit
+    # status. Computed once, from the suite's project root.
+    resolution_notices = full_suite_notices(Path(cwd or REPO_ROOT).resolve())
+    for notice in resolution_notices:
+        print(f"run_tests: notice [{notice['code']}] {notice['message']}", file=sys.stderr)
     with Timer("run_all") as _all_timer:
         for name in suites:
             with Timer(f"suite:{name}"):
@@ -1941,9 +2831,15 @@ def run_all(
                     base_ref=base_ref,
                     test_type=test_type,
                     group=group,
+                    fingerprint=fingerprint,
                 )
             results[name] = result
             resolved_scopes.append(result["scope"])
+            suite_elapsed = result.get("elapsed_seconds")
+            if suite_elapsed is not None:
+                elapsed_total += suite_elapsed
+                elapsed_measured = True
+            slot_wait_total += result.get("slot_wait_seconds") or 0.0
             for failure in result["failures"]:
                 all_failures.append({**failure, "suite": name})
             if result.get("notice"):
@@ -1960,11 +2856,37 @@ def run_all(
         "failures": all_failures,
         "notices": notices,
         "notice_codes": notice_codes,
+        # Resolution notices are informational and carry a stable machine-
+        # readable shape (code/directories/source); they are deliberately kept
+        # out of ``notices``/``notice_codes`` so a consumer classifying a
+        # FAILED run is never confused by a non-fatal notice.
+        "resolution_notices": resolution_notices,
         "stdout": "\n".join(stdout_parts),
         "stderr": "\n".join(stderr_parts),
         "scope": scope,
         "type": test_type,
         "resolved_scopes": resolved_scopes,
+        "elapsed_seconds_total": elapsed_total if elapsed_measured else None,
+        "slot_wait_seconds": slot_wait_total,
+        # Lane provenance (SA-0MVWZQ269009SJXV AC4): which semaphore namespace(s)
+        # the selected suites contended in, so an operator can tell a slow run
+        # from a queue-delayed one without reading stderr.
+        "slot_lanes": sorted(
+            {
+                result["slot_lane"]
+                for result in results.values()
+                if result.get("slot_lane")
+            }
+        ),
+        # Verdict provenance (SA-0MVQHVJEX0071R7G): the aggregate is
+        # cache-served only when every suite was, and the entries reported are
+        # the union of the suites' served entries (one per cached command).
+        "cached": bool(results) and all(r.get("cached") for r in results.values()),
+        "cache_entries": [
+            entry
+            for result in results.values()
+            for entry in result.get("cache_entries") or []
+        ],
         "timing": _all_timer.to_dict(),
     }
 
@@ -1990,7 +2912,10 @@ def rerun_failures(
             stable.append(failure)
             continue
         try:
-            with _test_concurrency_slot():
+            # A per-test rerun is a partial run: it belongs to the fast lane so
+            # it never queues behind the full suite that just failed
+            # (SA-0MVWZQ269009SJXV AC1).
+            with _slot_lane(TEST_SLOT_LANE_FAST), _test_concurrency_slot():
                 proc = _run_cmd(
                     shlex.split(executable_test_command(cmd)),
                     cwd=cwd or REPO_ROOT,
@@ -2219,27 +3144,43 @@ def run_summary(
 def _detect_live_repo_mutation(
     project_root: Path,
     snapshot_before: dict[str, Any] | None,
-) -> str | None:
-    """Return a rendered diff when the suite mutated *project_root*, else None.
+) -> dict[str, Any]:
+    """Evaluate the guarded run's checkout delta.
 
+    Returns ``{"mutation": <rendered diff or None>, "excluded": [<note>, ...]}``.
     Detect-only: it never prevents a mutation, it stops a corrupted checkout
     from being reported as a green suite (and therefore from being pushed).
-    ``None`` for a non-git root (no-op) and when the guard was stood down by an
-    outer guard (``snapshot_before is None``).
+    ``mutation`` is ``None`` for a non-git root (no-op) and when the guard was
+    stood down by an outer guard (``snapshot_before is None``).
+
+    ``excluded`` carries the informational note for working-tree churn that was
+    attributed to a concurrent session and therefore cannot fail the run
+    (SA-0MUIJAHXS003M7BG AC1/AC3) — the paths, the checkout and the status
+    codes, so a reviewer can tell an excluded foreign change from a clean run.
+    The attribution rule itself lives in the shared ``git_sandbox`` helper, so
+    the inner ``live_repo_guard`` plugin cannot drift from it.
+
+    The surface is **every checkout the guarded run can reach**
+    (WL-0MVPE2BY9001CR9O): the guarded root plus, when the run started in a
+    linked worktree, its main checkout. A worktree-scoped run shares one object
+    store and a symlinked ``node_modules`` with the main checkout, so a
+    root-only check reported a gutted main checkout as clean (the 2026-10-26
+    `packages/shared` wipe). The message names the mutated checkout and every
+    mutated path in it.
     """
     if snapshot_before is None:
-        return None
-    snapshot_after = snapshot_repo_state(project_root)
-    if not snapshot_before.get("git", True) or not snapshot_after.get("git", True):
-        return None
-    diff = diff_snapshots(snapshot_before, snapshot_after)
+        return {"mutation": None, "excluded": []}
+    snapshot_after = snapshot_guarded_roots(project_root)
+    diff = diff_guarded_roots(snapshot_before, snapshot_after)
+    excluded = excluded_churn_notes(diff)
     if not diff["changed"]:
-        return None
-    return (
-        "live-repo mutation detected: the test suite changed the checkout at "
-        f"{project_root}. The run is failed so a corrupted checkout cannot be "
-        "pushed as green.\n" + describe_diff(diff)
+        return {"mutation": None, "excluded": excluded}
+    mutation = (
+        "live-repo mutation detected: the test suite changed a guarded "
+        f"checkout for {project_root}. The run is failed so a corrupted "
+        "checkout cannot be pushed as green.\n" + describe_guarded_diff(diff)
     )
+    return {"mutation": mutation, "excluded": excluded}
 
 
 def guarded_run_all(
@@ -2255,6 +3196,7 @@ def guarded_run_all(
     commands: list[str] | None = None,
     test_type: str = DEFAULT_TEST_TYPE,
     group: str | None = None,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Run the selected suites under the canonical live-repo guard ownership.
 
@@ -2291,16 +3233,23 @@ def guarded_run_all(
         commands: Explicit command override (resolved type/group profile).
         test_type: Command profile name (``full`` default).
         group: Named test group from ``.pi/test-config.json``.
+        fingerprint: Explicit expected fingerprint (a would-be-commit tree
+            SHA) forwarded to the cache; omitted keeps loose-worktree keys.
 
     Returns:
         The :func:`run_all` result dict, with ``success=False`` and
-        ``live_repo_mutation`` set when the owned guard detected a mutation.
+        ``live_repo_mutation`` set when the owned guard detected a mutation,
+        and ``live_repo_excluded`` (informational notes) when working-tree
+        churn was attributed to a concurrent session and excluded from the
+        verdict (SA-0MUIJAHXS003M7BG AC3).
     """
     project_root = Path(cwd or REPO_ROOT).resolve()
 
     # Stand down when an outer guard already owns the checkout (nested run).
     guard_active = not os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV)
-    snapshot_before = snapshot_repo_state(project_root) if guard_active else None
+    snapshot_before = (
+        snapshot_guarded_roots(project_root) if guard_active else None
+    )
 
     if guard_active:
         os.environ[LIVE_REPO_GUARD_ACTIVE_ENV] = "1"
@@ -2317,6 +3266,7 @@ def guarded_run_all(
             commands=commands,
             test_type=test_type,
             group=group,
+            fingerprint=fingerprint,
         )
     finally:
         # Only clear the marker we set — a nested call must not clear an
@@ -2327,10 +3277,18 @@ def guarded_run_all(
     # Detect-only: fail the run when the checkout mutated, so a corrupted
     # checkout can never be reported (or pushed) as green. Armed on
     # cache-served runs too (nothing executes, but the delta is verified).
+    # Working-tree churn attributed to a concurrent session is excluded from
+    # the verdict but reported under ``live_repo_excluded`` (AC3) — never
+    # silently, so a reviewer can tell an excluded foreign change from a
+    # clean run.
     if guard_active:
-        mutation = _detect_live_repo_mutation(project_root, snapshot_before)
+        verdict = _detect_live_repo_mutation(project_root, snapshot_before)
+        mutation = verdict.get("mutation")
+        excluded = list(verdict.get("excluded") or [])
         if mutation is not None:
             result = {**result, "success": False, "live_repo_mutation": mutation}
+        if excluded:
+            result = {**result, "live_repo_excluded": excluded}
 
     return result
 
@@ -2524,18 +3482,29 @@ def main(argv: list[str] | None = None) -> int:
                 cached = " [cached]" if suite_result.get("cached") else ""
                 scope = f" [{suite_result.get('scope', 'full')} scope]"
                 type_info = f" [type {suite_result.get('type', test_type)}]"
+                lane_info = f" [{suite_result.get('slot_lane', 'full')} lane]"
                 interpreter = suite_result.get("interpreter") or ""
                 interpreter_info = f" [pytest interpreter: {interpreter}]" if interpreter else ""
                 print(
-                    f"{name}: {status}{cached}{scope}{type_info}{interpreter_info} "
+                    f"{name}: {status}{cached}{scope}{type_info}{lane_info}{interpreter_info} "
                     f"({suite_result['command']})"
                 )
+                if (suite_result.get("slot_wait_seconds") or 0.0) >= 1.0:
+                    print(
+                        f"  queued {suite_result['slot_wait_seconds']:.1f}s for a "
+                        f"{suite_result.get('slot_lane', 'full')}-lane test slot "
+                        f"(wait, not execution — see elapsed in the facts below)"
+                    )
                 if suite_result.get("notice"):
                     print(f"  notice: {suite_result['notice']}")
+                if not suite_result["success"]:
+                    print(f"  facts: {_render_suite_facts(suite_result)}")
                 for failure in suite_result["failures"]:
                     print(f"  FAILED: {failure['test_name']}")
             for notice in result["notices"]:
                 print(f"notice: {notice}")
+            for note in result.get("live_repo_excluded") or []:
+                print(f"note: {note}")
             if result.get("live_repo_mutation"):
                 print("ERROR: " + result["live_repo_mutation"], file=sys.stderr)
             print(_root_timer.render(), file=sys.stderr)

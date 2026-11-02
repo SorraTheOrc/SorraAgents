@@ -34,6 +34,21 @@ if sys.version_info >= (3, 11):
 else:
     Self = Any  # pragma: no cover
 
+# Scan-scope primitives live in refactor.path_filters (the canonical module);
+# they are re-exported here so existing imports keep working.
+from refactor.path_filters import (
+    DEFAULT_EXCLUDED_DIRS,
+    SOURCE_EXTENSIONS,
+    has_source_extension,
+    is_excluded_path,
+)
+
+#: Source extensions scanned in full-project mode.
+_SOURCE_EXTENSIONS: tuple[str, ...] = SOURCE_EXTENSIONS
+
+#: Path components that are never source files — the shared default set,
+#: which includes the vendored/npm-installed package directories.
+_EXCLUDED_DIRS: frozenset[str] = DEFAULT_EXCLUDED_DIRS
 
 LOG = logging.getLogger("refactor.session_boundary")
 
@@ -192,16 +207,8 @@ def _run_diff(commit: str) -> list[dict[str, str]]:
 # Full-project file enumeration
 # ---------------------------------------------------------------------------
 
-# Source file extensions to include in full-project scans.
-_SOURCE_EXTENSIONS: tuple[str, ...] = (
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-)
-
-# Path components that are never source files.
-_EXCLUDED_DIRS: set[str] = {
-    ".git", "node_modules", "__pycache__", "build", "dist",
-    ".venv", "venv", ".tox", ".eggs", "*.egg-info", ".worklog",
-}
+# ``_SOURCE_EXTENSIONS`` and ``_EXCLUDED_DIRS`` are imported from
+# refactor.path_filters at the top of this module.
 
 
 def get_all_source_files() -> list[str]:
@@ -258,10 +265,11 @@ def _is_source_file(path: str) -> bool:
     """Return ``True`` if *path* is a source file worth scanning.
 
     A file is considered a source file when:
-    - Its path contains no excluded directory component.
+    - Its path contains no excluded directory component (including vendored
+      and npm-installed packages, at any depth).
     - Its extension is in :data:`_SOURCE_EXTENSIONS`.
     """
-    for part in path.split("/"):
-        if part in _EXCLUDED_DIRS:
-            return False
-    return any(path.endswith(ext) for ext in _SOURCE_EXTENSIONS)
+    if is_excluded_path(path):
+        return False
+    return has_source_extension(path)
+

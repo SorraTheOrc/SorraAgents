@@ -19,7 +19,6 @@ Related work item: SA-0MSALRZ3B006FPI5
 
 import importlib.util
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -28,6 +27,7 @@ import types
 from pathlib import Path
 
 import pytest
+from shared.git_sandbox import fixture_git_env
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
@@ -293,7 +293,9 @@ def test_start_gate_aborts_without_stashing_user_changes(tmp_path: Path) -> None
     # -- Build a fake git repo with the user's uncommitted work --
     repo = tmp_path / "repo"
     repo.mkdir()
-    env = dict(os.environ)
+    # Hermetic: the fixture repo (and the implement.py run against it) must not
+    # inherit the finish gate's temporary GIT_INDEX_FILE (SA-0MVWQ4FZ4003S0GE).
+    env = fixture_git_env()
 
     def run(cmd: list[str], cwd: Path = repo, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -491,7 +493,8 @@ def test_start_creates_clean_worktree_when_dirty_files_irrelevant(
     and the decision is recorded in a work-item comment."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    env = dict(os.environ)
+    # Hermetic: never inherit the finish gate's temporary GIT_INDEX_FILE.
+    env = fixture_git_env()
 
     def run(
         cmd: list[str], cwd: Path = repo, check: bool = True

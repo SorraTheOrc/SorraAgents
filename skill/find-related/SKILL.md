@@ -284,7 +284,7 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --headline "<1-3 sentence headline summary>" \
   --ac "<AC# description>|<verification metric>|met" \
   --ac "<...>|<...>|unmet" \
-  [--producer-actions "<actions for the producer, or omit for 'None needed'>"] \
+  [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```

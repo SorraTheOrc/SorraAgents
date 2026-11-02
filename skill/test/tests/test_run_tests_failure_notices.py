@@ -10,7 +10,9 @@ aggregates both so ``guarded_run_all`` consumers see them at the top level.
 
 from __future__ import annotations
 
+import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -21,16 +23,24 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"
 if str(_RUNNER_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNNER_DIR))
+_REPO_ROOT = _SCRIPT_DIR.parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import run_tests
 from run_tests import (
     NOTICE_COMMAND_NOT_FOUND,
     NOTICE_SLOT_BUSY,
     NOTICE_SUITE_TIMEOUT,
+    NOTICE_UNPARSED_FAILURE,
     SLOT_BUSY_NOTICE_PREFIX,
     run_all,
     run_suite,
 )
+
+# Deterministic infrastructure-failure simulations shared with the finish-gate
+# contract tests (SA-0MVU8XQTU006DP37).
+from skill.shared.tests import gate_failure_fixtures as fx
 
 _CMD = "pytest -q -r a --disable-warnings"
 
@@ -42,7 +52,7 @@ def _repo(tmp_path: Path) -> Path:
     repo.mkdir()
     (repo / ".pi").mkdir()
     (repo / ".pi" / "test-config.json").write_text(
-        '{"suiteCommands": ["%s"]}' % _CMD, encoding="utf-8"
+        f'{{"suiteCommands": ["{_CMD}"]}}', encoding="utf-8"
     )
     return repo
 
@@ -52,7 +62,9 @@ def _fake_run(stdout: str = "", stderr: str = "", returncode: int = 1):
 
 
 class TestRunSuiteDiagnostics:
-    def test_carries_bounded_output_and_no_notice(self, tmp_path) -> None:
+    def test_carries_bounded_output_and_classifies_unparsed_exit(
+        self, tmp_path
+    ) -> None:
         with mock.patch.object(
             run_tests, "_run_cmd", return_value=_fake_run(stdout=_NOISE, stderr=_NOISE)
         ), mock.patch.object(run_tests, "_test_concurrency_slot"):
@@ -65,8 +77,10 @@ class TestRunSuiteDiagnostics:
         assert len(result["stderr"]) < len(_NOISE)
         assert "stderr-line-1999" in result["stdout"]
         assert len(result["stdout"]) < len(_NOISE)
-        assert result["notice"] == ""
-        assert result["notice_code"] == ""
+        # A non-zero exit with no parsable failure is classified rather than
+        # left as an unexplained non-zero result (SA-0MVU8XRBQ000DG9D).
+        assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
+        assert "no parsable failures" in result["notice"]
 
     def test_command_not_found_is_classified(self, tmp_path) -> None:
         def raise_not_found(*args, **kwargs):
@@ -119,10 +133,12 @@ class TestRunSuiteDiagnostics:
             def __exit__(self, *a):
                 return False
 
-        with mock.patch.object(run_tests, "Semaphore", _BusySemaphore):
-            with pytest.raises(run_tests.TestConcurrencyTimeout) as exc_info:
-                with run_tests._test_concurrency_slot():
-                    pass  # pragma: no cover
+        with (
+            mock.patch.object(run_tests, "Semaphore", _BusySemaphore),
+            pytest.raises(run_tests.TestConcurrencyTimeout) as exc_info,
+            run_tests._test_concurrency_slot(),
+        ):
+            pass  # pragma: no cover
 
         assert str(exc_info.value).startswith(SLOT_BUSY_NOTICE_PREFIX)
 
@@ -169,3 +185,351 @@ class TestRunAllAggregation:
         assert result["notice_codes"] == [NOTICE_SLOT_BUSY]
         assert "tail-of-stdout" in result["stdout"]
         assert "tail-of-stderr" in result["stderr"]
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure-failure contract (SA-0MVU8XQTU006DP37, implemented by
+# SA-0MVU8XRBQ000DG9D)
+#
+# A timeout, a kill and an unparsed non-zero exit are each *provably distinct*
+# from a code failure: `run_suite` must name what happened (configured timeout
+# vs elapsed, signal vs exit code, the command, bounded tails) instead of
+# leaving a consumer to infer it. Every case below is simulated through the
+# shared fixture module, so no test sleeps for minutes, allocates gigabytes or
+# contends for a host test slot.
+# ---------------------------------------------------------------------------
+
+
+def _run_fixture_suite(
+    run_cmd,
+    tmp_path: Path,
+    *,
+    timeout: int = fx.FIXTURE_TIMEOUT,
+    slot=None,
+) -> dict:
+    """Run the fixture repo's suite with the command boundary stubbed."""
+    slot_factory = slot or (lambda: fx.slot_acquisition(wait=0))
+    with mock.patch.object(run_tests, "_run_cmd", side_effect=run_cmd), \
+         mock.patch.object(run_tests, "_test_concurrency_slot", slot_factory):
+        return run_suite(
+            "all", cwd=_repo(tmp_path), use_cache=False, timeout=timeout
+        )
+
+
+def _slow_then(result):
+    """Side effect: burn a short, real interval before returning *result*.
+
+    The interval is what ``elapsed_seconds`` must measure, so it must be real
+    (a stub clock would make the assertion test the stub).
+    """
+
+    def _run(*args, **kwargs):
+        time.sleep(fx.FIXTURE_EXECUTION_DELAY)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    return _run
+
+
+class TestRunSuiteInfrastructureFacts:
+    """Every non-green suite result states *what* happened, not just *that*."""
+
+    def test_successful_suite_reports_measured_elapsed_seconds(self, tmp_path) -> None:
+        result = _run_fixture_suite(_slow_then(fx.healthy()), tmp_path)
+
+        assert result["success"] is True
+        assert result["notice_code"] == ""
+        assert result["elapsed_seconds"] >= fx.FIXTURE_EXECUTION_DELAY * 0.8, (
+            "elapsed_seconds must measure the command execution, not be a "
+            f"placeholder (got {result['elapsed_seconds']!r})"
+        )
+
+    def test_timeout_reports_configured_timeout_and_elapsed(self, tmp_path) -> None:
+        result = _run_fixture_suite(
+            _slow_then(fx.timeout_expired(fx.FIXTURE_TIMEOUT)),
+            tmp_path,
+            timeout=fx.FIXTURE_TIMEOUT,
+        )
+
+        assert result["notice_code"] == NOTICE_SUITE_TIMEOUT
+        assert result["configured_timeout"] == fx.FIXTURE_TIMEOUT, (
+            "a timeout must name the timeoutPerCommand it exceeded"
+        )
+        assert result["elapsed_seconds"] >= fx.FIXTURE_EXECUTION_DELAY * 0.8, (
+            "a timeout must report how long the suite had been running"
+        )
+
+    def test_killed_suite_reports_signal_exit_code_and_command(self, tmp_path) -> None:
+        result = _run_fixture_suite(_slow_then(fx.killed(signal=9)), tmp_path)
+
+        assert result["notice_code"] == fx.NOTICE_KILLED
+        assert result["signal"] == 9, "the killing signal must be reported"
+        assert result["exit_code"] == -9, "a killed child's code is -signal"
+        assert fx.FIXTURE_COMMAND in result["command"]
+        assert result["failures"] == [], (
+            "a kill yields no structured failures; it must not be presented "
+            "as a code failure"
+        )
+
+    def test_killed_suite_reports_bounded_output_tails(self, tmp_path) -> None:
+        result = _run_fixture_suite(
+            _slow_then(fx.killed(stderr=fx.noisy_lines())), tmp_path
+        )
+
+        assert result["notice_code"] == fx.NOTICE_KILLED
+        assert "stderr-line-1999" in result["stderr"], (
+            "the tail of a killed run's output is the only diagnostic a "
+            "consumer gets"
+        )
+        assert "stderr-line-0" not in result["stderr"]
+        assert len(result["stderr"]) < len(fx.noisy_lines())
+
+    def test_unparsed_non_zero_exit_reports_command_exit_code_and_tails(
+        self, tmp_path
+    ) -> None:
+        result = _run_fixture_suite(
+            _slow_then(fx.unparsed(exit_code=3, stderr=fx.noisy_lines())), tmp_path
+        )
+
+        assert result["notice_code"] == fx.NOTICE_UNPARSED_FAILURE
+        assert result["exit_code"] == 3
+        assert fx.FIXTURE_COMMAND in result["command"]
+        assert result["failures"] == []
+        assert "stderr-line-1999" in result["stderr"]
+        assert len(result["stderr"]) < len(fx.noisy_lines())
+
+    def test_slot_busy_reports_the_bounded_wait_as_slot_wait_seconds(
+        self, tmp_path
+    ) -> None:
+        waits: list[float] = []
+        busy = run_tests.TestConcurrencyTimeout(
+            f"{SLOT_BUSY_NOTICE_PREFIX} no free slot within 600s"
+        )
+        result = _run_fixture_suite(
+            _slow_then(fx.healthy()),
+            tmp_path,
+            slot=lambda: fx.slot_acquisition(
+                wait=fx.FIXTURE_SLOT_WAIT, raises=busy, waits=waits
+            ),
+        )
+
+        assert result["notice_code"] == NOTICE_SLOT_BUSY
+        assert waits == [fx.FIXTURE_SLOT_WAIT], (
+            "the stubbed slot supplied the delay — no host semaphore was "
+            "touched"
+        )
+        assert result["slot_wait_seconds"] >= fx.FIXTURE_SLOT_WAIT * 0.8, (
+            "a bounded wait that expired must report the time it waited"
+        )
+
+    def test_queue_wait_is_not_folded_into_elapsed_seconds(self, tmp_path) -> None:
+        """A long queue wait must not inflate the suite's execution time.
+
+        The stub sleeps for the wait only; the command execution is the tiny
+        fixture delay. If the wait were folded in, ``elapsed_seconds`` would
+        be in the same order as the wait (parent AC3/AC4).
+        """
+        result = _run_fixture_suite(
+            _slow_then(fx.healthy()),
+            tmp_path,
+            slot=lambda: fx.slot_acquisition(wait=1.0),
+        )
+
+        assert result["slot_wait_seconds"] >= 0.8
+        assert result["elapsed_seconds"] < result["slot_wait_seconds"], (
+            "elapsed_seconds must measure the command only, not the queue wait "
+            f"(elapsed={result['elapsed_seconds']!r}, "
+            f"slot_wait={result['slot_wait_seconds']!r})"
+        )
+
+    def test_cache_served_failure_is_classified_without_an_elapsed_time(
+        self, tmp_path
+    ) -> None:
+        """A cached non-zero result is classified, and its elapsed stays null.
+
+        Nothing executes on a cache hit, so the execution time is unknown:
+        reporting ``0`` would read as an instantaneous suite.
+        """
+        cached_failure = {
+            "stdout": "",
+            "stderr": "error TS5023: unknown compiler option",
+            "exit_code": 3,
+            "cached": True,
+            "scope": "full",
+        }
+        with mock.patch.object(run_tests, "run_cached", return_value=cached_failure):
+            result = run_suite("all", cwd=_repo(tmp_path), use_cache=True)
+
+        assert result["notice_code"] == fx.NOTICE_UNPARSED_FAILURE
+        assert result["exit_code"] == 3
+        assert result["elapsed_seconds"] is None, (
+            "a cache hit has no elapsed time — report null, never 0"
+        )
+
+
+def test_structured_failures_are_never_classified_as_infrastructure(
+    tmp_path,
+) -> None:
+    """Precedence guard: a real code failure is never reclassified.
+
+    Passes today and must keep passing — the new codes apply only when no
+    failure could be parsed.
+    """
+    result = _run_fixture_suite(_slow_then(fx.structured_failure()), tmp_path)
+
+    assert result["notice_code"] == ""
+    assert result["failures"], "the parsable failure must be reported"
+    assert result["returncode"] != 0
+
+
+def test_published_notice_codes_match_the_runner_constants() -> None:
+    """The fixture vocabulary *is* the runner's contract, not a copy of it."""
+    assert fx.NOTICE_SUITE_TIMEOUT == run_tests.NOTICE_SUITE_TIMEOUT
+    assert fx.NOTICE_SLOT_BUSY == run_tests.NOTICE_SLOT_BUSY
+
+
+def test_new_notice_codes_are_exported_by_the_runner() -> None:
+    """``killed`` and ``unparsed_failure`` are stable exported codes."""
+    assert run_tests.NOTICE_KILLED == fx.NOTICE_KILLED
+    assert run_tests.NOTICE_UNPARSED_FAILURE == fx.NOTICE_UNPARSED_FAILURE
+
+
+def test_run_all_aggregates_elapsed_and_slot_wait_separately(monkeypatch) -> None:
+    """Aggregation keeps elapsed and queue wait as distinct sums."""
+    suites = {
+        "all": {
+            "success": True,
+            "returncode": 0,
+            "command": "pytest -q skill/test/tests/",
+            "failures": [],
+            "notice": "",
+            "notice_code": "",
+            "elapsed_seconds": 12.5,
+            "slot_wait_seconds": 30.0,
+            "scope": "full",
+            "type": "full",
+            "changed_files": [],
+        },
+        "node": {
+            "success": False,
+            "returncode": -9,
+            "command": "npm --silent test",
+            "failures": [],
+            "notice": "suite killed by signal 9",
+            "notice_code": fx.NOTICE_KILLED,
+            "signal": 9,
+            "elapsed_seconds": 7.5,
+            "slot_wait_seconds": 0.0,
+            "scope": "full",
+            "type": "full",
+            "changed_files": [],
+        },
+    }
+    monkeypatch.setattr(run_tests, "run_suite", lambda name, **kw: suites[name])
+
+    result = run_all(("all", "node"), use_cache=False)
+
+    assert result["elapsed_seconds_total"] == pytest.approx(20.0), (
+        "aggregate elapsed is the sum of command executions only"
+    )
+    assert result["slot_wait_seconds"] == pytest.approx(30.0), (
+        "queue wait is aggregated separately and never folded into elapsed"
+    )
+    assert result["notice_codes"] == [fx.NOTICE_KILLED]
+
+
+# ---------------------------------------------------------------------------
+# Queue wait vs the per-command timeout budget (SA-0MVU8XSGI003DBWR)
+#
+# Parent AC4: time spent queued for a host test slot is neither charged to a
+# suite's per-command timeout nor hidden inside its elapsed time. The slot
+# acquisition is stubbed (no host semaphore is touched) and the command is a
+# real subprocess, so the timeout under test is the production one.
+# ---------------------------------------------------------------------------
+
+
+class TestQueueWaitIsOutsideTheTimeoutBudget:
+    """A blocking slot wait never consumes the suite's timeout budget."""
+
+    #: Runtime of the suite command the timeout below must cover.
+    COMMAND_SECONDS = 0.4
+
+    #: Queue wait that would blow the timeout if it were charged to it.
+    SLOT_WAIT_SECONDS = 1.2
+
+    #: Per-command timeout: above ``COMMAND_SECONDS``, well below
+    #: ``COMMAND_SECONDS + SLOT_WAIT_SECONDS``.
+    TIMEOUT_SECONDS = 1
+
+    def _repo_with_sleeping_suite(self, tmp_path: Path) -> Path:
+        """A repo whose suite command really runs, for ``COMMAND_SECONDS``."""
+        repo = tmp_path / "sleepy-repo"
+        repo.mkdir()
+        (repo / ".pi").mkdir()
+        (repo / ".pi" / "test-config.json").write_text(
+            json.dumps({"suiteCommands": [f"bash -c 'sleep {self.COMMAND_SECONDS}'"]}),
+            encoding="utf-8",
+        )
+        return repo
+
+    def test_blocking_slot_wait_does_not_consume_the_timeout_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """The command still succeeds although wait + runtime exceeds it.
+
+        If the queue wait were inside the timed region, the 0.4 s command would
+        be killed at the 1.0 s timeout after waiting 1.2 s for the slot.
+        """
+        waits: list[float] = []
+        with mock.patch.object(
+            run_tests,
+            "_test_concurrency_slot",
+            lambda: fx.slot_acquisition(wait=self.SLOT_WAIT_SECONDS, waits=waits),
+        ):
+            result = run_suite(
+                "all",
+                cwd=self._repo_with_sleeping_suite(tmp_path),
+                use_cache=False,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+
+        assert waits == [self.SLOT_WAIT_SECONDS], (
+            "the stubbed slot supplied the delay — no host semaphore was touched"
+        )
+        assert result["success"] is True, (
+            "the queue wait must not count against the suite's timeout budget "
+            f"(notice={result['notice']!r}, stderr={result['stderr']!r})"
+        )
+        assert result["configured_timeout"] == self.TIMEOUT_SECONDS, (
+            "the report must still name the timeout that applied to the command"
+        )
+
+    def test_wait_is_reported_separately_from_the_measured_elapsed_time(
+        self, tmp_path: Path
+    ) -> None:
+        """``slot_wait_seconds`` and ``elapsed_seconds`` measure different spans."""
+        with mock.patch.object(
+            run_tests,
+            "_test_concurrency_slot",
+            lambda: fx.slot_acquisition(wait=self.SLOT_WAIT_SECONDS),
+        ):
+            result = run_suite(
+                "all",
+                cwd=self._repo_with_sleeping_suite(tmp_path),
+                use_cache=False,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+
+        assert result["slot_wait_seconds"] >= self.SLOT_WAIT_SECONDS * 0.8, (
+            f"the wait must be reported (got {result['slot_wait_seconds']!r})"
+        )
+        assert result["elapsed_seconds"] < self.TIMEOUT_SECONDS, (
+            "elapsed_seconds must stay within the command's own timeout, i.e. "
+            f"exclude the wait (got {result['elapsed_seconds']!r})"
+        )
+        assert result["elapsed_seconds"] < result["slot_wait_seconds"], (
+            "the two durations must be distinguishable, never the same span "
+            f"(elapsed={result['elapsed_seconds']!r}, "
+            f"slot_wait={result['slot_wait_seconds']!r})"
+        )

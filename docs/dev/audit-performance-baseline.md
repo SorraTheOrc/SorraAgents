@@ -392,8 +392,106 @@ epic's rule "record the shortfall and open a follow-up rather than weaken the
 gate", the ≤ 10 min gate is **not** waived — the parent AC6 ≥ 50 % gate is
 met on this evidence, and a follow-up child covers the residual.
 
+## Clean-room re-measurement (SA-0MVQ6OXOA003RQFU) — 2026-10-31
+
+Single-item re-measurement after the parent-screen rework
+(SA-0MVJ3Q662006RDJR), run to decide whether the residual serial-model
+throughput still breaches the ≤ 10 min gate. **No runner change was made for
+this measurement**: this record is verification-only (the parent's "Lane A"
+first slice of SA-0MVKXNWRS005EKBM).
+
+Every figure below is re-derived from the committed run fixture by the
+committed harness — `skill/audit/tests/test_audit_performance_gate_record.py`
+fails if this table, the total or the verdict stops matching the fixture:
+
+```bash
+python3 scripts/measure_audit_performance.py \
+  --root skill/audit/tests/fixtures/audit_clean_room_run --json
+```
+
+| Field | Value |
+|---|---|
+| Run date (UTC) | 2026-10-31T04:47:26Z – 2026-10-31T04:51:22Z |
+| Commit | `a979602c8` (`dev` at run time; runner invoked from the SA-0MVQ6OXOA003RQFU worktree) |
+| Command | `python3 skill/audit/scripts/audit_runner.py issue SA-0MVI3608M0080QLW --do-not-persist --force --json --green-run HEAD --worklog-dir /home/rgardler/projects/SorraAgents/.worklog --debug-log <tmp>/debug.jsonl` |
+| Target | `SA-0MVI3608M0080QLW` — 6 acceptance criteria, no children |
+| Host | `rgardler-AI-Laptop`, shared 2-slot local proxy |
+| Model served | `Local Proxy/plan` (`DEFAULT_MODEL`) |
+| Slot status at launch | `available_slots=1 total_slots=2` (`GET /llama/local/status`) |
+| Ceiling | `ceiling=1 source=slots available_slots=1 total_slots=2` — slot-query derived, not the `source=env` / `source=static` fallback |
+| Concurrency | cross-project audits were live on the shared proxy during the run; this run never waited for a slot (`concurrency_waits=0`, `wait_seconds=0.00` on both calls), so contention can only have inflated the figures below |
+
+Per-call profile (from the run's `Per-call timing:` lines):
+
+| Context | calls | elapsed (s) | note |
+|---|---:|---:|---|
+| `parent` | 1 | 164.30 | Phase 1 parent AC screen, `input_tokens=3018` |
+| `phase2_deep` | 1 | 63.36 | 6 ACs, mean 10.56 s/AC, `input_tokens=3314` |
+| **Total** | **2** | **227.66** | −85 % vs the 2026-10-23 run (1538.68 s / 3 calls) |
+
+`AUDIT_RELIABILITY_SUMMARY calls=2 parse_ok=2 parse_failed=0 timeouts=0
+child_skips=0 provider_errors=0 concurrency_waits=0 verdict_reasks=0
+child_screen_timeouts=0 parent_screen_timeouts=0 elapsed_seconds=230.25`
+
+Gate verdict: **MET** — total 227.66 s vs the unchanged 600 s gate.
+
+End-to-end wall clock (secondary context, not the gate): **236 s**.
+
+> **Gate metric — producer confirmation.** The regression gate's headline
+> definition (§ Regression gate) reads "end to end", while this item's gate
+> (AC1 wording) measures **total LLM wall clock**. The verdict above (gate
+> MET at 227.66 s) uses total LLM wall clock — the measure the parent epic's
+> AC6 gate enforces — with end-to-end recorded solely as secondary context.
+> This divergence is an OPEN QUESTION flagged here for the producer to
+> confirm or override at review; the gate metric is recorded, never silently
+> redefined (parent SA-0MVKXNWRS005EKBM, lane-A child AC4).
+
+### Why this run made two calls, not three
+
+The single-item profile is `false-positive-screen` → `parent` → `phase2_deep`.
+This run reported zero ruff findings (`code_quality.total_findings=0`), so the
+false-positive screen was never issued — there was nothing to classify. The
+2026-10-23 profile (519.8 s / 575.8 s / 434.3 s) was a three-call profile; the
+comparison above is therefore like-for-like on the two shared calls
+(`parent` 575.8 s → 164.3 s, `phase2_deep` 434.3 s → 63.4 s) and the third call
+is absent rather than faster. A run that again finds ruff findings would add
+one screen call; at this run's per-call latency that still lands well inside
+the 600 s gate.
+
+### Validity notes
+
+- The slot-status query succeeded, so the ceiling came from the live proxy
+  capacity (`source=slots`) rather than the static fallback — the failure mode
+  that made the 2026-10-23 record an invalid clean-room run.
+- The run was **not** fully isolated: this host runs a continuous chain of
+  cross-project audits (other `audit_runner.py` processes and other `pi`
+  sessions share the same 2 proxy slots), so the "no concurrent audit/`pi`
+  session" condition could not be held for the run's full duration. The run
+  itself never queued (`concurrency_waits=0`, both calls `wait_seconds=0.00`)
+  and reported no degraded call (`parse_failed=0`, `timeouts=0`,
+  `parent_screen_timeouts=0`, `verdict_reasks=0`), and concurrent load can only
+  *inflate* a measured wall clock — so a MET verdict under contention is
+  conservative, never optimistic.
+- Earlier attempts on the same day that failed these checks were discarded, not
+  recorded: one ran with `source=static` (slot query timed out) and another
+  degraded the parent screen (`parse_failed=1`, `parent_screen_timeouts=1`).
+
+### Gate assessment
+
+| Gate | Required | Measured | Verdict |
+|---|---|---|---|
+| Single-item total LLM wall clock | ≤ 600 s | **227.66 s** (2 calls, slot-derived ceiling, no degraded call) | **MET** |
+| Gate definition unchanged | no relaxation | the gate above is untouched; no timeout was raised and no `met` / `unmet` / `partial` / `adjusted` semantics changed | **MET** |
+
 ## Changelog
 
+- **2026-10-31** — Single-item re-measurement recorded (SA-0MVQ6OXOA003RQFU):
+  the ≤ 10 min single-item gate is now **MET** — 227.66 s total LLM wall
+  clock (2 calls: `parent` 164.30 s, `phase2_deep` 63.36 s) against the
+  unchanged 600 s gate, down from 1538.68 s on 2026-10-23. The run used a
+  slot-query-derived ceiling and reported no degraded call; the false-positive
+  screen was not issued because the run found zero ruff findings. Gate
+  definition, timeouts and verdict semantics are unchanged.
 - **2026-10-23** — Re-measurement after the parent-screen child recorded
   (SA-0MVJ3Q662006RDJR): parent AC6 ≥ 50 % gate now **MET** (−65 %, 4419.8 s
   → 1538.7 s; `partial`-fallback rate not increased; closure criteria
