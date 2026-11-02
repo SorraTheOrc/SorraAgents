@@ -1671,6 +1671,11 @@ class RecordingReset:
 
     def __init__(self, mod):
         self.mod = mod
+        # The real implementation, snapped at construction: when this recorder
+        # is installed as a mock ``side_effect`` (drive-path tests), re-reading
+        # ``mod._reset_child_worktree`` would hit the mock and recurse — the
+        # wrapped call must go through the original it captured.
+        self._original = mod._reset_child_worktree
         self.calls: list[tuple[tuple, dict]] = []
         self.commands: list[list[str]] = []
 
@@ -1681,14 +1686,15 @@ class RecordingReset:
         ran are recorded on this instance.
         """
         self.calls.append(((worktree_path, parent_branch), kwargs))
-        original = self.mod.run_cmd
+        original = self._original
+        original_run_cmd = self.mod.run_cmd
 
         def _recorded(cmd, **kw):
             self.commands.append(list(cmd))
-            return original(cmd, **kw)
+            return original_run_cmd(cmd, **kw)
 
         with mock.patch.object(self.mod, "run_cmd", side_effect=_recorded):
-            return self.mod._reset_child_worktree(
+            return original(
                 worktree_path, parent_branch, **kwargs
             )
 
