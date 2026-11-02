@@ -345,7 +345,6 @@ def test_timeout_killed_child_releases_the_assignee(
         [
             "wl", "--worklog-dir", str(project.worklog_dir), "update", child_id,
             "--status", "in-progress",
-            "--stage", "in_progress",
             "--assignee", "implement",
             "--json",
         ],

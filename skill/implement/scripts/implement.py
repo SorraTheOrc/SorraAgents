@@ -78,6 +78,13 @@ import tempfile
 import time
 import traceback
 
+#: Bound at import time so a test that patches ``implement.subprocess`` with
+#: a Mock (replacing the whole module) cannot break `except` clauses that
+#: reference it — a MagicMock attribute is not an exception class and would
+#: raise ``TypeError: catching classes that do not inherit from
+#: BaseException`` (SA-0MVVF75ZA007XNKB).
+_SUBPROCESS_TIMEOUT_EXPIRED = subprocess.TimeoutExpired
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX
@@ -8830,7 +8837,7 @@ def _invoke_implement(
             timeout=_resolve_test_timeout(repo_root),
             env=env,
         )
-    except subprocess.TimeoutExpired:
+    except _SUBPROCESS_TIMEOUT_EXPIRED:
         # A finish that overruns its bound is killed (``subprocess.run``
         # SIGKILLs the child before raising), so the killed phase never runs
         # its own release. Report the failure as ``None`` so the caller's

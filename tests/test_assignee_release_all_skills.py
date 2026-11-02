@@ -1325,8 +1325,14 @@ def _exercise_implement_orphaned_claim_release(store: FakeWorklogStore) -> None:
     run the killed session's own exit hook (a drive/spawn timeout is a
     ``SIGKILL``). The helper keeps the status so the finish/finalise recovery
     still applies.
+
+    ``_release_orphaned_child_claim`` writes through the shared
+    ``StatusLifecycle`` helper, so the in-memory store's runner must be
+    injected into that seam too (``_inject_store_runner``) — otherwise the
+    release would target the live worklog instead of the fixture store.
     """
     with (
+        _inject_store_runner(store),
         patch.object(implement, "wl_show", side_effect=store.show),
         patch.object(implement, "wl_add_comment", return_value=True),
     ):
