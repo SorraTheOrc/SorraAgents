@@ -3986,6 +3986,220 @@ def _resolve_origin_parent_tip(
     )
 
 
+# ---------------------------------------------------------------------------
+# Finish-failure classification vocabulary (LP-0MVWEP1MM0097RAT)
+# ---------------------------------------------------------------------------
+#
+# The single, table-driven classifier that turns a failing ``finish``
+# subprocess report into ``{kind, step, reason, message}`` so
+# ``phase_drive`` can tell a transient infrastructure refusal from a genuine
+# gate failure (parent epic LP-0MVVYQ1U3006GDWT AC1). The constants live
+# BESIDE the emitters (``_fast_forward_local_dev_for_push`` and
+# ``phase_finish``) intentionally:
+#
+# **Drift rule** — every ``(step, reason)`` pair the shipped ``finish`` code
+# can emit must be listed in the vocabulary below in the same commit that
+# introduces it (a new ``_refuse`` reason or failure exit that is not listed
+# silently classifies as ``unknown`` — fail-safe, never ``infrastructure``,
+# but hidden from the operator). The table test in
+# ``tests/test_implement_drive_recovery.py`` enumerates the emitted pairs
+# against this vocabulary.
+
+#: The three failure kinds :func:`classify_finish_failure` can return.
+FINISH_FAILURE_KINDS: tuple[str, ...] = (
+    "infrastructure",
+    "gate",
+    "unknown",
+)
+
+#: Wildcard reason matched against :data:`FINISH_GATE_REFUSALS`: an entry
+#: ``("step", "*")`` classifies as ``gate`` for any reason under that step
+#: (e.g. ``("worktree_placement", "*")`` — the placement violation is a
+#: gate failure regardless of the specific reason the exit records).
+FINISH_REASON_WILDCARD = "*"
+
+#: Allow-list of ``(step, reason)`` pairs classified as **infrastructure** —
+#: transient refusals that self-clear (a concurrent session's fast-forward,
+#: a held main-checkout lock, a dropped push connection, a failed ancestry
+#: assertion) and are retried by drive on a separate budget instead of
+#: consuming the finish-attempt gate bound (parent epic LP-0MVVYQ1U3006GDWT
+#: Assumptions).
+FINISH_INFRA_REFUSALS: frozenset[tuple[str, str]] = frozenset({
+    ("local_dev_fast_forward", "local_dev_diverged"),
+    ("local_dev_fast_forward", "commit_not_based_on_remote_tip"),
+    ("local_dev_fast_forward", "fetch_failed"),
+    ("local_dev_fast_forward", "checkout_failed"),
+    ("local_dev_fast_forward", "no_remote_tracking_ref"),
+    ("main_checkout_lock", "lock_held"),
+    ("main_checkout_guard", "fail"),
+    ("push", "timeout"),
+    ("push", "connection_closed"),
+    ("push", "transport"),
+    ("ancestry_assertion", "ancestry_failed"),
+})
+
+#: Explicit ``(step, reason)`` pairs classified as **gate** failures —
+#: genuine failures that consume the finish-attempt budget and are never
+#: retried as infrastructure. Recorded for documentation/consistency AND
+#: used by the classifier; anything not listed in either set is
+#: ``unknown`` (fail-safe). A ``FINISH_REASON_WILDCARD`` entry matches any
+#: reason under the step.
+FINISH_GATE_REFUSALS: frozenset[tuple[str, str]] = frozenset({
+    ("tests", "tests_failed"),
+    ("build", "build_failed"),
+    ("worktree_placement", FINISH_REASON_WILDCARD),
+    ("diff", "no_changes"),
+})
+
+#: Consultation order for the structured ``steps`` payload of a failing
+#: ``finish`` report. When several steps failed, the first in this order is
+#: the primary cause; the mandated prefix (``main_checkout_lock`` → … →
+#: ``ancestry_assertion``) is followed by the two vocabulary steps that
+#: return before the lock step (``worktree_placement``, ``diff``).
+FINISH_STEP_PRECEDENCE: tuple[str, ...] = (
+    "main_checkout_lock",
+    "main_checkout_guard",
+    "local_dev_fast_forward",
+    "push",
+    "build",
+    "tests",
+    "ancestry_assertion",
+    "worktree_placement",
+    "diff",
+)
+
+
+def _failing_step_reason(step: str, entry: Any) -> Any | None:
+    """Extract the reason code of a failing *entry*, or ``None`` when pass.
+
+    Each ``finish`` step records its outcome in a different shape;
+    this maps every shape onto a stable ``(step, reason)`` pair so the
+    classifier never parses ``report["message"]`` prose
+    (LP-0MVWEP1MM0097RAT AC5).
+    """
+    if step == "tests":
+        # The tests step is a list of per-attempt gate records.
+        attempts = entry if isinstance(entry, list) else []
+        if any(
+            isinstance(a, dict) and a.get("success") is False
+            for a in attempts
+        ):
+            return "tests_failed"
+        return None
+    if not isinstance(entry, dict):
+        return None
+    if step == "main_checkout_lock":
+        return "lock_held" if entry.get("acquired") is False else None
+    if step == "main_checkout_guard":
+        return "fail" if entry.get("verdict") == "fail" else None
+    if step == "local_dev_fast_forward":
+        if entry.get("method") == "refused":
+            return entry.get("reason") or "refused"
+        return None
+    if step == "diff":
+        if entry.get("success") is False:
+            return entry.get("reason") or "no_changes"
+        return None
+    # Generic shape: build / push / ancestry_assertion / worktree_placement.
+    if entry.get("success") is False:
+        return entry.get("reason") or f"{step}_failed"
+    return None
+
+
+def _first_failing_step(steps: Any) -> tuple[str, Any] | None:
+    """Return the first failing ``(step, reason)`` in precedence order.
+
+    A step "fails" when its structured entry records a non-passing outcome
+    (``acquired: False`` for the lock, ``verdict: "fail"`` for the guard,
+    ``method: "refused"`` for the fast-forward, ``success: False`` for the
+    rest). Returns ``None`` when no precedence step fails — the report then
+    classifies as ``unknown`` (fail-safe).
+    """
+    if not isinstance(steps, dict):
+        return None
+    for step in FINISH_STEP_PRECEDENCE:
+        entry = steps.get(step)
+        if entry is None:
+            continue
+        reason = _failing_step_reason(step, entry)
+        if reason is not None:
+            return step, reason
+    return None
+
+
+def _finish_failure_kind(step: str, reason: Any) -> str:
+    """Map a resolved ``(step, reason)`` onto a failure kind.
+
+    Allow-list driven: ``infrastructure`` for an explicit infra allow-list
+    hit, ``gate`` for an explicit gate-list hit (a wildcard reason matches
+    any reason under the step), otherwise ``unknown`` — an unlisted pair is
+    never ``infrastructure`` (parent epic LP-0MVVYQ1U3006GDWT AC1).
+    """
+    pair = (step, str(reason))
+    if pair in FINISH_INFRA_REFUSALS:
+        return "infrastructure"
+    if pair in FINISH_GATE_REFUSALS or (
+        step, FINISH_REASON_WILDCARD,
+    ) in FINISH_GATE_REFUSALS:
+        return "gate"
+    return "unknown"
+
+
+def classify_finish_failure(
+    finish_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Classify a failing ``finish`` subprocess report into a failure kind.
+
+    The single, table-driven classifier for ``finish`` failures (parent epic
+    LP-0MVVYQ1U3006GDWT AC1). It turns the structured ``steps`` payload of
+    a failed ``finish`` report into ``{kind, step, reason, message}`` so
+    ``phase_drive`` can tell a transient infrastructure refusal from a
+    genuine gate failure without excavating subprocess stdout.
+
+    Resolution rules:
+
+    * ``(step, reason)`` is resolved from the report's structured ``steps``
+      entries in :data:`FINISH_STEP_PRECEDENCE` order — never from
+      ``report["message"]`` prose;
+    * ``kind == "infrastructure"`` only for an explicit allow-list hit in
+      :data:`FINISH_INFRA_REFUSALS`;
+    * ``kind == "gate"`` only for an explicit :data:`FINISH_GATE_REFUSALS`
+      hit (a ``("step", "*")`` entry is a wildcard matching any reason
+      under that step);
+    * anything else — including ``None``, ``{}`` and non-dict input — is
+      ``kind == "unknown"`` (fail-safe: ``unknown`` is never
+      ``infrastructure``, so drive can never retry a genuine gate failure
+      as infrastructure).
+
+    Args:
+        finish_report: The parsed ``finish`` subprocess JSON report, or
+            ``None`` when no report could be parsed.
+
+    Returns:
+        ``{"kind", "step", "reason", "message"}`` where ``step``/``reason``
+        are ``None`` when no structured failing step resolves.
+    """
+    fail_safe: dict[str, Any] = {
+        "kind": "unknown",
+        "step": None,
+        "reason": None,
+        "message": None,
+    }
+    if not isinstance(finish_report, dict):
+        return dict(fail_safe)
+    message = finish_report.get("message")
+    resolved = _first_failing_step(finish_report.get("steps"))
+    if resolved is None:
+        return {**fail_safe, "message": message}
+    step, reason = resolved
+    return {
+        "kind": _finish_failure_kind(step, reason),
+        "step": step,
+        "reason": reason,
+        "message": message,
+    }
+
+
 def _fast_forward_local_dev_for_push(
     repo_root: str,
     commit_hash: str,
@@ -7344,6 +7558,13 @@ def phase_finish(
         report["success"] = False
         report["message"] = msg
         report["worktree_enforcement"] = True
+        # AC5 (LP-0MVWEP1MM0097RAT): the placement violation records a
+        # structured step so the classifier resolves it as a gate failure
+        # without parsing prose (``worktree_placement`` + any reason).
+        report["steps"]["worktree_placement"] = {
+            "success": False,
+            "reason": "placement_violation",
+        }
         wl_add_comment(
             work_item_id,
             "Finish phase refused: implementation changes found outside the "
@@ -7677,6 +7898,12 @@ def phase_finish(
             commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"
             LOG.info("Committing changes...")
             if not git_commit(worktree_path, commit_msg):
+                # AC5 (LP-0MVWEP1MM0097RAT): structured steps entry so the
+                # classifier never needs the ``report["message"]`` prose.
+                report["steps"]["commit"] = {
+                    "success": False,
+                    "reason": "commit_failed",
+                }
                 raise RuntimeError("git commit failed")
 
             commit_hash = git_get_commit_hash(worktree_path)
@@ -7955,6 +8182,18 @@ def phase_finish(
         msg = str(e)
         report["success"] = False
         report["message"] = msg
+        # AC5 (LP-0MVWEP1MM0097RAT): every finish failure exit records a
+        # structured steps entry so no classification path depends on
+        # ``report["message"]`` prose. Specific steps (push, commit, ancestry,
+        # guard) already record their own entries where they are raised; a
+        # generic runtime error that escapes without one is recorded under
+        # ``finish`` and classifies as ``unknown`` (fail-safe — never
+        # ``infrastructure``).
+        report["steps"]["finish"] = {
+            "success": False,
+            "reason": "runtime_error",
+            "exception": type(e).__name__,
+        }
         # Status was restored to original by StatusLifecycle; override to open
         try:
             StatusLifecycle.update_status(work_item_id, "open", assignee="")
@@ -7976,6 +8215,17 @@ def phase_finish(
             # AC2: the push claimed success but the commit never reached
             # origin/dev. Record the refusal (and the retained recovery
             # state) on the work item; the status reset above keeps it open.
+            # AC5 (LP-0MVWEP1MM0097RAT): the exit that previously carried no
+            # structured steps entry now records one under
+            # ``ancestry_assertion`` (classifies as ``infrastructure``,
+            # matching the parent epic's allow-list).
+            report["steps"]["ancestry_assertion"] = {
+                "success": False,
+                "reason": "ancestry_failed",
+                "commit": e.resolved_commit or e.commit_hash,
+                "target_ref": e.target_ref,
+                "target_tip": e.target_tip,
+            }
             wl_add_comment(
                 work_item_id,
                 "Finish refused: ancestry assertion failed.\n"
@@ -8905,18 +9155,28 @@ def phase_parent(
         return report
 
     def _run_finish(cid: str, title: str = "") -> dict[str, Any] | None:
-        """Run the finish subprocess for *cid* (None on failure)."""
+        """Run the finish subprocess for *cid* (None on failure).
+
+        ``parse_on_failure=True`` surfaces the ``finish`` report's structured
+        ``steps`` even when the subprocess exits non-zero, so a failing
+        ``finish`` is classified into ``{kind, step, reason}`` here — the
+        parent report carries it as ``finish_failure`` for the caller
+        (``phase_drive``). The ``None`` sentinel is preserved: a failure —
+        parsed report or not — still returns ``None``.
+        """
         LOG.info("Child %s has changes — running finish subprocess...", cid)
         finish_result = _invoke_implement(
             "finish", cid, no_refactor=no_refactor, verbose=verbose,
+            parse_on_failure=True,
         )
-        if finish_result is None:
+        if finish_result is None or not finish_result.get("success", False):
             msg = f"Failed to finish child {cid}"
             LOG.error(msg)
             report["success"] = False
             report["message"] = msg
             report["next_child"] = cid
             report["finishing_failed"] = True
+            report["finish_failure"] = classify_finish_failure(finish_result)
             report["children_processed"] = child_results
             if json_output:
                 print(format_json_output(report))

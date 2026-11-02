@@ -535,6 +535,44 @@ The human rendering uses a distinct `🕓` icon for `terminal-reconciled` and
 for retry: N` counts. All additions are additive: the existing keys keep
 their meaning and types.
 
+### Finish-failure classification vocabulary
+
+`phase_parent._run_finish` runs every `finish` subprocess with
+`parse_on_failure=True` and annotates the parent report with
+`finish_failure = classify_finish_failure(<parsed finish report>)` —
+`{kind, step, reason, message}` — before surfacing a failure. The `None`
+sentinel is preserved: a failure (parsed report or not) still returns
+`None` from `_run_finish`. The classifier resolves the failing
+`(step, reason)` from the report's structured `steps` payload (precedence:
+`main_checkout_lock` → `main_checkout_guard` → `local_dev_fast_forward` →
+`push` → `build` → `tests` → `ancestry_assertion` → `worktree_placement` →
+`diff`), never from `report["message"]` prose — every `finish` failure exit
+records a structured `steps` entry for this purpose. `kind` is one of
+`infrastructure`, `gate`, `unknown`:
+
+| `(step, reason)` | kind |
+|---|---|
+| `local_dev_fast_forward` + `local_dev_diverged` / `commit_not_based_on_remote_tip` / `fetch_failed` / `checkout_failed` / `no_remote_tracking_ref` | `infrastructure` |
+| `main_checkout_lock` refusal (`lock_held`) | `infrastructure` |
+| `main_checkout_guard` verdict `fail` | `infrastructure` |
+| `push` + `timeout` / `connection_closed` / `transport` | `infrastructure` |
+| `ancestry_assertion` + `ancestry_failed` | `infrastructure` |
+| `tests` + `tests_failed` | `gate` |
+| `build` + `build_failed` | `gate` |
+| `worktree_placement` + any reason | `gate` |
+| `diff` + `no_changes` | `gate` |
+| anything else | `unknown` (never `infrastructure`) |
+
+The vocabulary lives in `FINISH_INFRA_REFUSALS` / `FINISH_GATE_REFUSALS`
+beside the emitters (`_fast_forward_local_dev_for_push`, `phase_finish`) in
+`skill/implement/scripts/implement.py`; `classify_finish_failure` is the
+single consumer. **Drift rule:** any new `_refuse` reason or failure exit the
+shipped `finish` code emits must be added to the table in the same commit —
+an unlisted pair still classifies as `unknown` (fail-safe, never
+`infrastructure`), but it stays invisible to the operator unless listed. The
+drive retry/`wip`-preservation semantics built on top of this vocabulary are
+completed by sibling slices.
+
 ### Invariants
 
 - **Terminal children are never touched.** The existing `skip-terminal`

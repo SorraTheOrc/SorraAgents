@@ -309,6 +309,444 @@ def finishing_failed_parent_runner():
     return _make
 
 
+def failing_finish_report(step: str, reason: str | None = None,
+                          message: str = "Finishing failed") -> dict:
+    """Script a ``finish`` subprocess failure report for one structured step.
+
+    Mirrors the ``phase_finish`` failure exits: each exit records its
+    ``(step, reason)`` in ``report["steps"]`` and the classifier resolves
+    the failure from that structure — never from ``report["message"]``
+    prose (LP-0MVWEP1MM0097RAT AC5).
+    """
+    report = {
+        "phase": "finish",
+        "work_item_id": "SA-CHILD1",
+        "success": False,
+        "message": message,
+    }
+    entry: dict = {"success": False}
+    if step == "main_checkout_lock":
+        entry = {"acquired": False, "holder": None}
+    elif step == "main_checkout_guard":
+        entry = {"verdict": "fail", "verifies": []}
+    elif step == "local_dev_fast_forward":
+        entry = {"method": "refused", "reason": reason or "local_dev_diverged"}
+    elif step == "push":
+        entry["reason"] = reason or "timeout"
+    elif step == "tests":
+        report["steps"] = {
+            step: [{"attempt": 1, "success": False, "failures": [],
+                    "scope": "changed"}],
+        }
+        return report
+    elif step == "build":
+        entry = {"success": False, "exit_code": 1, "skipped": False}
+    elif step in ("ancestry_assertion", "worktree_placement", "diff",
+                  "commit", "finish"):
+        entry["reason"] = reason or f"{step}_failed"
+    else:
+        entry["reason"] = reason or "generic"
+    report["steps"] = {step: entry}
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Classifier: finish refusal vocabulary and threading (LP-0MVWEP1MM0097RAT)
+# ---------------------------------------------------------------------------
+
+
+class TestFinishFailureClassifier:
+    """Table-driven tests for ``classify_finish_failure``.
+
+    AC1/AC2: the module-level vocabulary constants beside the emitters are
+    the table; ``classify_finish_failure`` maps each listed ``(step,
+    reason)`` onto its kind and every unlisted pair onto ``unknown``
+    (fail-safe, never ``infrastructure``). AC3: ``None``/``{}``/non-dict
+    input returns ``kind="unknown"`` without raising.
+    """
+
+    @pytest.mark.parametrize(
+        "step_reason",
+        [
+            pytest.param(
+                ("local_dev_fast_forward", "local_dev_diverged"),
+                id="fast-forward-diverged",
+            ),
+            pytest.param(
+                ("local_dev_fast_forward", "commit_not_based_on_remote_tip"),
+                id="fast-forward-not-based",
+            ),
+            pytest.param(
+                ("local_dev_fast_forward", "fetch_failed"),
+                id="fast-forward-fetch-failed",
+            ),
+            pytest.param(
+                ("local_dev_fast_forward", "checkout_failed"),
+                id="fast-forward-checkout-failed",
+            ),
+            pytest.param(
+                ("local_dev_fast_forward", "no_remote_tracking_ref"),
+                id="fast-forward-no-tracking-ref",
+            ),
+            pytest.param(("main_checkout_lock", "lock_held"), id="lock-held"),
+            pytest.param(
+                ("main_checkout_guard", "fail"), id="guard-fail",
+            ),
+            pytest.param(("push", "timeout"), id="push-timeout"),
+            pytest.param(
+                ("push", "connection_closed"), id="push-connection-closed",
+            ),
+            pytest.param(("push", "transport"), id="push-transport"),
+            pytest.param(
+                ("ancestry_assertion", "ancestry_failed"),
+                id="ancestry-failed",
+            ),
+        ],
+    )
+    def test_infra_vocabulary_pairs_classify_infrastructure(
+        self, implement_mod, step_reason,  # noqa: F811 — fixture param
+    ):
+        """Every allow-listed (step, reason) classifies as infrastructure."""
+        step, reason = step_reason
+        assert (step, reason) in implement_mod.FINISH_INFRA_REFUSALS
+        result = implement_mod.classify_finish_failure(
+            failing_finish_report(step, reason)
+        )
+        assert result["kind"] == "infrastructure"
+        assert result["kind"] in implement_mod.FINISH_FAILURE_KINDS
+        assert result["step"] == step
+        assert result["reason"] == reason
+
+    @pytest.mark.parametrize(
+        "step_reason",
+        [
+            pytest.param(("tests", "tests_failed"), id="tests-failed"),
+            pytest.param(("build", "build_failed"), id="build-failed"),
+            pytest.param(
+                ("worktree_placement", "*"), id="worktree-placement-any",
+            ),
+            pytest.param(("diff", "no_changes"), id="diff-no-changes"),
+        ],
+    )
+    def test_gate_vocabulary_pairs_classify_gate(
+        self, implement_mod, step_reason,  # noqa: F811 — fixture param
+    ):
+        """Every listed gate (step, reason) pair classifies as gate."""
+        step, reason = step_reason
+        assert (step, reason) in implement_mod.FINISH_GATE_REFUSALS
+        result = implement_mod.classify_finish_failure(
+            failing_finish_report(step, reason)
+        )
+        assert result["kind"] == "gate"
+        assert result["kind"] in implement_mod.FINISH_FAILURE_KINDS
+        assert result["step"] == step
+
+    @pytest.mark.parametrize(
+        "step_reason",
+        [
+            pytest.param(
+                ("local_dev_fast_forward", "mystery_refusal"),
+                id="fast-forward-unlisted",
+            ),
+            pytest.param(("push", "push_failed"), id="push-failed"),
+            pytest.param(
+                ("push", "non_fast_forward"), id="push-non-fast-forward",
+            ),
+        ],
+    )
+    def test_unlisted_reasons_are_unknown_never_infrastructure(
+        self, implement_mod, step_reason,  # noqa: F811 — fixture param
+    ):
+        """AC2 fail-safe: a resolvable (step, reason) pair that is not
+        listed never classifies as infrastructure."""
+        step, reason = step_reason
+        result = implement_mod.classify_finish_failure(
+            failing_finish_report(step, reason)
+        )
+        assert result["kind"] == "unknown"
+        assert result["kind"] in implement_mod.FINISH_FAILURE_KINDS
+        assert result["step"] == step
+        assert result["reason"] == reason
+
+    @pytest.mark.parametrize(
+        "step_reason",
+        [
+            pytest.param(("unknown_step", "anything"), id="unknown-step"),
+            pytest.param(("commit", "commit_failed"), id="commit-failed"),
+            pytest.param(("finish", "runtime_error"), id="finish-runtime"),
+        ],
+    )
+    def test_steps_outside_the_vocabulary_are_unknown(
+        self, implement_mod, step_reason,  # noqa: F811 — fixture param
+    ):
+        """AC2/AC5 fail-safe: a step the precedence vocabulary does not
+        resolve (e.g. the AC5 ``commit``/``finish`` exits) is ``unknown``
+        with no step/reason — never ``infrastructure``."""
+        step, reason = step_reason
+        result = implement_mod.classify_finish_failure(
+            failing_finish_report(step, reason)
+        )
+        assert result["kind"] == "unknown"
+        assert result["kind"] in implement_mod.FINISH_FAILURE_KINDS
+        assert result["step"] is None
+        assert result["reason"] is None
+
+    def test_gate_steps_classify_gate_despite_noise(
+        self, implement_mod,  # noqa: F811 — fixture param
+    ):
+        """Build/tests failures still classify as gate with extra noise.
+
+        The derived reasons for a failing ``build``/``tests`` step are the
+        canonical listed pairs, even when the entry carries extra fields
+        (exit code) and the report's prose says otherwise."""
+        build = failing_finish_report("build", message="Push timed out")
+        build["steps"]["build"]["exit_code"] = 9
+        result = implement_mod.classify_finish_failure(build)
+        assert result["kind"] == "gate"
+        assert result["step"] == "build"
+        assert result["reason"] == "build_failed"
+
+        tests = failing_finish_report("tests", message="Local connect refused")
+        result = implement_mod.classify_finish_failure(tests)
+        assert result["kind"] == "gate"
+        assert result["step"] == "tests"
+        assert result["reason"] == "tests_failed"
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            pytest.param(None, id="none"),
+            pytest.param({}, id="empty-dict"),
+            pytest.param("not a dict", id="string"),
+            pytest.param(42, id="int"),
+            pytest.param([], id="list"),
+        ],
+    )
+    def test_malformed_inputs_default_to_unknown(
+        self, implement_mod, malformed,  # noqa: F811 — fixture param
+    ):
+        """AC3: None/{}/non-dict input returns unknown without raising."""
+        result = implement_mod.classify_finish_failure(malformed)
+        assert result["kind"] == "unknown"
+        assert result["step"] is None
+        assert result["reason"] is None
+        assert result["message"] is None
+
+    def test_failure_resolved_from_structure_not_prose(
+        self, implement_mod,  # noqa: F811 — fixture param
+    ):
+        """AC5: classification reads ``steps``, never ``message`` prose.
+
+        A report whose message names a gate failure but whose structured
+        steps carry the transient fast-forward refusal classifies as
+        infrastructure — and vice versa."""
+        report = failing_finish_report(
+            "local_dev_fast_forward", "local_dev_diverged",
+            message="Build failed (exit code 1)",
+        )
+        result = implement_mod.classify_finish_failure(report)
+        assert result == {
+            "kind": "infrastructure",
+            "step": "local_dev_fast_forward",
+            "reason": "local_dev_diverged",
+            "message": "Build failed (exit code 1)",
+        }
+        # Prose-only report (no structured steps) is unknown, never gate.
+        prose_only = {
+            "phase": "finish",
+            "success": False,
+            "message": "Build failed (exit code 1)",
+            "steps": {},
+        }
+        assert implement_mod.classify_finish_failure(prose_only)["kind"] == (
+            "unknown"
+        )
+
+    def test_precedence_resolution_uses_first_failing_step(
+        self, implement_mod,  # noqa: F811 — fixture param
+    ):
+        """When several steps fail, the first in precedence order wins."""
+        report = failing_finish_report("push", "timeout")
+        report["steps"]["local_dev_fast_forward"] = {
+            "method": "refused", "reason": "local_dev_diverged",
+        }
+        report["steps"]["build"] = {"success": False, "exit_code": 1}
+        result = implement_mod.classify_finish_failure(report)
+        assert result["kind"] == "infrastructure"
+        assert result["step"] == "local_dev_fast_forward"
+        assert result["reason"] == "local_dev_diverged"
+
+    def test_emitted_pairs_stay_in_sync_with_vocabulary(
+        self, implement_mod,  # noqa: F811 — fixture param
+    ):
+        """Drift rule: every emitted reason has a documented kind.
+
+        The refusals ``_fast_forward_local_dev_for_push`` can emit and the
+        structured failure reasons ``phase_finish`` exits record are all
+        either listed in the vocabulary or fail safe as ``unknown``."""
+        emitted_fast_forward_refusals = {
+            "local_dev_diverged",
+            "commit_not_based_on_remote_tip",
+            "fetch_failed",
+            "checkout_failed",
+            "no_remote_tracking_ref",
+        }
+        for reason in emitted_fast_forward_refusals:
+            pair = ("local_dev_fast_forward", reason)
+            assert pair in implement_mod.FINISH_INFRA_REFUSALS, pair
+        # push: timeout is infra, push_failed / non_fast_forward fail safe.
+        assert (
+            "push", "timeout",
+        ) in implement_mod.FINISH_INFRA_REFUSALS
+        for reason in ("push_failed", "non_fast_forward"):
+            result = implement_mod.classify_finish_failure(
+                failing_finish_report("push", reason)
+            )
+            assert result["kind"] == "unknown"
+        # tests / build are documented as gate failures.
+        assert ("tests", "tests_failed") in implement_mod.FINISH_GATE_REFUSALS
+        assert ("build", "build_failed") in implement_mod.FINISH_GATE_REFUSALS
+
+
+class TestRunFinishFailureThreading:
+    """AC4: ``phase_parent._run_finish`` threads the parsed report through.
+
+    The finish subprocess runs with ``parse_on_failure=True``, the ``None``
+    sentinel is preserved on failure (parsed or not), and the parent report
+    carries ``finish_failure`` = ``classify_finish_failure(parsed)``.
+    """
+
+    def test_run_finish_uses_parse_on_failure_and_records_finish_failure(
+        self, implement_mod, monkeypatch,  # noqa: F811 — fixture param
+    ):
+        """The parent report carries the classifier payload for a scripted
+        failing finish report, and the ``None`` sentinel is preserved."""
+        child = _child("SA-CHILD1")
+        parsed = failing_finish_report(
+            "local_dev_fast_forward", "local_dev_diverged",
+        )
+        captured: list[dict] = []
+
+        def _fake_finish(*args, **kwargs):
+            captured.append(kwargs)
+            return parsed
+
+        monkeypatch.setattr(implement_mod, "wl_show",
+                            lambda wid: {"id": wid, "status": "in_progress"})
+        monkeypatch.setattr(implement_mod, "wl_show_children",
+                            lambda wid: [child])
+        monkeypatch.setattr(
+            implement_mod, "_outbound_gate",
+            lambda wid: {"blocked": False, "blockers": [],
+                         "coordination_blockers": []},
+        )
+        monkeypatch.setattr(implement_mod, "wl_dep_blockers", lambda cid: [])
+        monkeypatch.setattr(implement_mod, "_probe_child_lock", lambda cid: None)
+        monkeypatch.setattr(
+            implement_mod, "_discover_worktree", lambda cid: "/wt/SA-CHILD1",
+        )
+        monkeypatch.setattr(implement_mod, "_has_worktree_changes",
+                            lambda *a: True)
+        monkeypatch.setattr(implement_mod, "wl_add_comment",
+                            lambda *a, **k: True)
+        monkeypatch.setattr(implement_mod, "_invoke_implement", _fake_finish)
+
+        report = implement_mod.phase_parent("SA-PARENT")
+
+        assert [c["action"] for c in captured] == ["finish"]
+        assert captured[0]["parse_on_failure"] is True
+        assert report["success"] is False
+        assert report["finishing_failed"] is True
+        assert report["next_child"] == "SA-CHILD1"
+        assert report["finish_failure"] == {
+            "kind": "infrastructure",
+            "step": "local_dev_fast_forward",
+            "reason": "local_dev_diverged",
+            "message": "Finishing failed",
+        }
+
+    def test_run_finish_keeps_none_sentinel_for_unparseable_failure(
+        self, implement_mod, monkeypatch,  # noqa: F811 — fixture param
+    ):
+        """A finish subprocess that fails without a parseable report still
+        yields the ``None`` sentinel and an ``unknown`` finish_failure."""
+        child = _child("SA-CHILD1")
+        monkeypatch.setattr(implement_mod, "wl_show",
+                            lambda wid: {"id": wid, "status": "in_progress"})
+        monkeypatch.setattr(implement_mod, "wl_show_children",
+                            lambda wid: [child])
+        monkeypatch.setattr(
+            implement_mod, "_outbound_gate",
+            lambda wid: {"blocked": False, "blockers": [],
+                         "coordination_blockers": []},
+        )
+        monkeypatch.setattr(implement_mod, "wl_dep_blockers", lambda cid: [])
+        monkeypatch.setattr(implement_mod, "_probe_child_lock", lambda cid: None)
+        monkeypatch.setattr(
+            implement_mod, "_discover_worktree", lambda cid: "/wt/SA-CHILD1",
+        )
+        monkeypatch.setattr(implement_mod, "_has_worktree_changes",
+                            lambda *a: True)
+        monkeypatch.setattr(implement_mod, "wl_add_comment",
+                            lambda *a, **k: True)
+        monkeypatch.setattr(
+            implement_mod, "_invoke_implement",
+            lambda *args, **kwargs: None,
+        )
+
+        report = implement_mod.phase_parent("SA-PARENT")
+
+        assert report["success"] is False
+        assert report["finishing_failed"] is True
+        assert report["next_child"] == "SA-CHILD1"
+        assert report["finish_failure"]["kind"] == "unknown"
+
+    def test_run_finish_success_path_unaffected(
+        self, implement_mod, monkeypatch,  # noqa: F811 — fixture param
+    ):
+        """A green finish keeps the pre-existing success semantics."""
+        child = _child("SA-CHILD1")
+        status_updates: list[dict] = []
+        monkeypatch.setattr(implement_mod, "wl_show",
+                            lambda wid: {"id": wid, "status": "in_progress"})
+        monkeypatch.setattr(implement_mod, "wl_show_children",
+                            lambda wid: [child])
+        monkeypatch.setattr(
+            implement_mod, "_outbound_gate",
+            lambda wid: {"blocked": False, "blockers": [],
+                         "coordination_blockers": []},
+        )
+        monkeypatch.setattr(implement_mod, "wl_dep_blockers", lambda cid: [])
+        monkeypatch.setattr(implement_mod, "_probe_child_lock", lambda cid: None)
+        monkeypatch.setattr(
+            implement_mod, "_discover_worktree", lambda cid: "/wt/SA-CHILD1",
+        )
+        monkeypatch.setattr(implement_mod, "_has_worktree_changes",
+                            lambda *a: True)
+        monkeypatch.setattr(implement_mod, "wl_add_comment",
+                            lambda *a, **k: True)
+        monkeypatch.setattr(
+            implement_mod, "_invoke_implement",
+            lambda *args, **kwargs: {"phase": "finish", "success": True},
+        )
+
+        def _update_status(work_item_id, status, *args, **kwargs):
+            status_updates.append({"id": work_item_id, "status": status})
+            return {"success": True}
+
+        monkeypatch.setattr(
+            implement_mod.StatusLifecycle, "update_status", _update_status,
+        )
+
+        report = implement_mod.phase_parent("SA-PARENT")
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert "finishing_failed" not in report
+        assert "finish_failure" not in report
+        assert status_updates[-1]["status"] == "completed"
+
+
 # ---------------------------------------------------------------------------
 # AC2: the finishing_failed report is the livelock entry point
 # ---------------------------------------------------------------------------
