@@ -24,6 +24,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { hermeticGitEnv } from '../helpers/hermeticGitEnv.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCRIPT_PATH = join(
@@ -37,7 +38,9 @@ const { regenerateDerivedFiles, readBuildScript } = await import(SCRIPT_PATH);
 
 /** Run a git command in *dir*, throwing on a non-zero exit. */
 function git(dir, args) {
-  const res = spawnSync('git', args, { cwd: dir, encoding: 'utf-8' });
+  // Hermetic: a fixture must never inherit the finish gate's GIT_INDEX_FILE
+  // (SA-0MVYS34QF000AWQX) — it would write into the gate's index.
+  const res = spawnSync('git', args, { cwd: dir, encoding: 'utf-8', env: hermeticGitEnv() });
   if (res.status !== 0) {
     throw new Error(`git ${args.join(' ')} failed: ${res.stderr || res.stdout}`);
   }
@@ -55,7 +58,7 @@ function gitFile(dir, args) {
   const res = spawnSync('git', ['-c', 'protocol.file.allow=always', ...args], {
     cwd: dir,
     encoding: 'utf-8',
-    env: { ...process.env, GIT_ALLOW_PROTOCOL: 'file', GIT_TERMINAL_PROMPT: '0' },
+    env: { ...hermeticGitEnv(), GIT_ALLOW_PROTOCOL: 'file', GIT_TERMINAL_PROMPT: '0' },
   });
   if (res.status !== 0) {
     throw new Error(`git ${args.join(' ')} failed: ${res.stderr || res.stdout}`);

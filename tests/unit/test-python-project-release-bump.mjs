@@ -34,6 +34,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hermeticGitEnv } from '../helpers/hermeticGitEnv.mjs';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const RELEASE_SCRIPTS = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'release');
@@ -57,7 +58,9 @@ const PACKAGE_JSON = `{
 `;
 
 function git(cwd, ...args) {
-  return spawnSync('git', args, { cwd, encoding: 'utf-8' });
+  // Hermetic: never inherit the finish gate's GIT_INDEX_FILE
+  // (SA-0MVYS34QF000AWQX) — fixture repos need their own index.
+  return spawnSync('git', args, { cwd, encoding: 'utf-8', env: hermeticGitEnv() });
 }
 
 /** Copy the release scripts the merge script needs into a fixture repo. */
@@ -141,7 +144,7 @@ function runMerge(repoDir, binDir, args = []) {
       encoding: 'utf-8',
       timeout: 120_000,
       env: {
-        ...process.env,
+        ...hermeticGitEnv(),
         PATH: `${binDir}:${process.env.PATH}`,
         // The full-suite gate would run this repository's suite against the
         // fixture repo; it is covered separately (tests/test_release_full_suite_gate.py).

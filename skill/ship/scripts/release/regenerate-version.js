@@ -46,6 +46,7 @@ import { readFileSync, existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { gitEnvForRepo } from '../../../shared/git_env.mjs';
 
 // ── Pure helpers ────────────────────────────────────────────────────────────
 
@@ -98,6 +99,7 @@ function unstageSubmodulePointers(repoRoot) {
     cwd: repoRoot,
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: gitEnvForRepo(repoRoot),
   });
   const gitlinks = index
     .split('\0')
@@ -115,6 +117,7 @@ function unstageSubmodulePointers(repoRoot) {
   execFileSync('git', ['restore', '--staged', '--', ...gitlinks], {
     cwd: repoRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: gitEnvForRepo(repoRoot),
   });
   return gitlinks;
 }
@@ -160,7 +163,11 @@ export function regenerateDerivedFiles({
 
   // Stage tracked modifications only (`git add -u`): untracked build
   // droppings such as `dist/` are deliberately not staged.
-  execFileSync('git', ['add', '-u'], { cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'] });
+  execFileSync('git', ['add', '-u'], {
+    cwd: repoRoot,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: gitEnvForRepo(repoRoot),
+  });
 
   // The build may also have advanced a submodule checkout (e.g. main-street's
   // `engine:sync`), which `git add -u` stages as a gitlink change. Restore
@@ -174,6 +181,7 @@ export function regenerateDerivedFiles({
     cwd: repoRoot,
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: gitEnvForRepo(repoRoot),
   }).trim();
 
   if (!staged) {
@@ -187,6 +195,7 @@ export function regenerateDerivedFiles({
   execFileSync('git', ['commit', '-m', subject], {
     cwd: repoRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: gitEnvForRepo(repoRoot),
   });
 
   return { ran: true, success: true, committed: true, reason: 'committed', files };
