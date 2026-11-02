@@ -628,7 +628,7 @@ class TestRunFinishFailureThreading:
         captured: list[dict] = []
 
         def _fake_finish(*args, **kwargs):
-            captured.append(kwargs)
+            captured.append({"args": args, "kwargs": kwargs})
             return parsed
 
         monkeypatch.setattr(implement_mod, "wl_show",
@@ -653,8 +653,9 @@ class TestRunFinishFailureThreading:
 
         report = implement_mod.phase_parent("SA-PARENT")
 
-        assert [c["action"] for c in captured] == ["finish"]
-        assert captured[0]["parse_on_failure"] is True
+        assert [c["args"][0] for c in captured] == ["finish"]
+        assert captured[0]["args"][1] == "SA-CHILD1"
+        assert captured[0]["kwargs"]["parse_on_failure"] is True
         assert report["success"] is False
         assert report["finishing_failed"] is True
         assert report["next_child"] == "SA-CHILD1"
