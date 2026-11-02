@@ -653,6 +653,8 @@ each child keeps its own clean context window and its own worktree. Options:
 `--json` (machine-readable per-child report), `--max-child-sessions N`
 (default 1) to bound retries, `--finish-attempt-limit N` (default: the
 `--max-child-sessions` value) to bound failing `finish` retries,
+`--infra-retry-limit N` (default `5`) to bound transient
+infrastructure-refusal `finish` retries on a separate budget with backoff,
 `--child-timeout S` (default 3600),
 `--finalise-stranded` (opt-in, evidence-gated finalisation of stranded
 children — see below). When no Pi executable is available it stops with
@@ -699,24 +701,58 @@ lists them in `report["finalised_children"]`.
 **A failing `finish` is bounded, reconciled, then reset
 (SA-0MVLIZ33M009C5QY).** A child whose worktree is dirty after a dead session
 makes `phase_parent` re-run the same failing `finish`, which used to livelock
-the epic. `phase_drive` now (1) counts failing finish executions per child and
-retries only up to `--finish-attempt-limit` (default
-`--max-child-sessions`); (2) re-fetches the child with `wl show` and records
-`terminal-reconciled` when it reached a terminal state anyway; (3) otherwise
-resets the child's **own** worktree to the parent-branch HEAD (`git reset
---hard <parent_branch>` + `git clean -fd`, isolation-gated) and its status to
-`open` via `StatusLifecycle`, with an audit comment naming the failure, the
-reset and the discarded file list (never a commit hash — `reset-for-retry`
-is limited to uncommitted WIP; a commit-carrying worktree is preserved on
-`refs/wip/<id>` instead), then continues with a fresh session
-(`reset-for-retry`, at most once
-per child per invocation). Every verdict — `infra-retry`,
-`reset-for-retry`, `terminal-reconciled` and the chain-stop messages —
-names the real failing `finish` step and reason (`"<step>: <reason>"`, e.g.
-`local_dev_fast_forward: local_dev_diverged`), plus the main-checkout lock
-holder and/or the guard's offending paths and competing work item when the
-failing `finish` report carries them, instead of a bare
-`Failed to finish child <id>` (LP-0MVWEP37K000JU0O, parent AC5).
+the epic. Every failing `finish` is first **classified** by the single,
+table-driven classifier `classify_finish_failure` into one of three kinds:
+
+- `infrastructure` — a transient refusal that self-clears (a concurrent
+  session's local-`dev` fast-forward, a held main-checkout lock, a dropped
+  push connection, a failed ancestry assertion);
+- `gate` — a genuine failure (red tests, a failed build, a
+  worktree-placement violation, an empty diff);
+- `unknown` — anything not listed in either vocabulary, which **fails
+  safe**: it is never `infrastructure`, so drive can never retry an
+  unclassified failure as infrastructure.
+
+`phase_drive` recovers within per-child bounds, in this order:
+
+- **1. Infrastructure retries — `--infra-retry-limit N`** (default `5`): a
+   refusal classified `infrastructure` is retried on its **own** bounded
+   budget with exponential backoff (2 s doubling to a 30 s cap) — it never
+   consumes the finish-attempt budget and **never spawns a session**: the
+   loop just re-runs `parent`. Each retry records a `children_driven` entry
+   with `result: "infra-retry"` (plus `step`/`reason`).
+- **2. Bounded finish retries — `--finish-attempt-limit N`** (default: the
+   `--max-child-sessions` value): genuine failing `finish` executions are
+   counted per child in `finish_attempts` and never exceed the bound.
+- **3. Terminal reconciliation — `terminal-reconciled`**: when the bound is
+   exhausted the child is re-fetched with `wl show`; a child that reached a
+   terminal state anyway is recorded as done — never finished, reset or
+   re-spawned.
+- **4. Reset for retry — `reset-for-retry`** (at most once per child per
+   invocation): a genuinely non-terminal child's **own** worktree is reset
+   to the parent-branch HEAD (`git reset --hard <parent_branch>` + `git
+   clean -fd`, isolation-gated) and its status set back to `open` via
+   `StatusLifecycle`, with an audit comment naming the failure (with the
+   classified failing `finish` step/reason when available), the reset and
+   the discarded file list (never a commit hash). `reset-for-retry` is
+   limited to **uncommitted** WIP: a worktree that carries commits is
+   **preserved** — the **commit-preservation gate** parks its tip on
+   `refs/wip/<id>` before any destructive command runs, refuses the reset,
+   reports the preservation in `report["preserved_refs"]`
+   (`{id, ref, commit}`) and stops the chain — a committed slice is never
+   discarded by the recovery path.
+
+Every verdict — `infra-retry`, `reset-for-retry`, `terminal-reconciled` and
+the chain-stop messages — names the real failing `finish` step and reason
+(`"<step>: <reason>"`, e.g. `local_dev_fast_forward: local_dev_diverged`),
+plus the main-checkout lock holder and/or the guard's offending paths and
+competing work item when the failing `finish` report carries them, instead of
+a bare `Failed to finish child <id>` (LP-0MVWEP37K000JU0O, parent AC5). The
+report surface grows accordingly: the failing parent report carries
+`finish_failure` (`{kind, step, reason, message, steps}`); the drive report
+adds `infra_retries` (per-child retry counts), `infra_retry_limit` (the
+applied bound) and `preserved_refs` (the preservation entries) — all
+additions are additive, existing keys keep their meaning and types.
 `parent_advanced: false` therefore always means
 real non-terminal or blocked work remains. Full contract:
 [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#drive-failure-recovery-bounded-finish-attempts-reconciliation-and-reset).

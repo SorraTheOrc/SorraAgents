@@ -525,20 +525,38 @@ the identical failing `finish`. Recorded evidence (2026-10-19): 29+ drive
 runs, each exiting 1 after 600–890 s with `Failed to finish child
 AH-0MVDV4PNZ004ZWOZ`, `sessions_spawned: 0`, `parent_advanced: false`.
 
-### The three recovery tiers
+### The recovery tiers
 
-Once a `finishing_failed` parent report is seen, `phase_drive` applies the
-following tiers in order. Every tier is bounded and records its outcome in
-`children_driven`:
+Once a `finishing_failed` parent report is seen, `phase_drive` **first
+classifies** the failure with `classify_finish_failure` (see the
+classification vocabulary below) before any retry accounting, then applies
+the following tiers in order. Every tier is bounded and records its outcome
+in `children_driven`:
 
-1. **Bounded retry — `--finish-attempt-limit N`** (default: the
+1. **Infrastructure retries — `--infra-retry-limit N`** (default `5`). A
+   failure classified `infrastructure` — a transient refusal that
+   self-clears: a concurrent session's local-`dev` fast-forward, a held
+   main-checkout lock, a dropped push connection, a failed ancestry
+   assertion — is retried on its **own** bounded budget, `infra_retries`
+   (a counter distinct from `finish_attempts` below). Each retry waits the
+   exponential backoff schedule `[2, 4, 8, 16, 30, 30, …]` seconds (2 s
+   doubling, capped at 30 s, `_drive_infra_backoff_delay`) and re-runs
+   `parent` **without spawning a session**; it records a `children_driven`
+   entry with `result: "infra-retry"` (plus the classified `step`/`reason`)
+   and a durable child comment naming the real failing step/reason. It
+   **never** consumes the finish-attempt budget: a refusal that clears
+   within the infra budget is absorbed there, and a spent budget falls
+   through to the finish-attempt bound below with the failure evidence
+   appended to the stopping message.
+2. **Bounded retry — `--finish-attempt-limit N`** (default: the
    `--max-child-sessions` value, so the default is one attempt and behaviour
-   is unchanged from before this feature). Failing finish executions are
-   counted **per child** in `finish_attempts` (a counter distinct from the
-   session-spawn attempts). While the count is below the bound the loop
+   is unchanged from before this feature). Genuine failing finish executions
+   (classified `gate` or `unknown`) are counted **per child** in
+   `finish_attempts` (a counter distinct from the session-spawn attempts and
+   from `infra_retries`). While the count is below the bound the loop
    re-runs `parent`, which retries the `finish`; the same child's failing
    `finish` is never executed beyond the bound within one drive invocation.
-2. **Terminal reconciliation — `terminal-reconciled`.** When the bound is
+3. **Terminal reconciliation — `terminal-reconciled`.** When the bound is
    exhausted the child is re-fetched with a read-only `wl show` and
    classified with `_is_terminal_child` (status `completed`/`done`/
    `in_review`/`deleted`, or stage `in_review`). A child that reached a
@@ -605,7 +623,20 @@ refusal is reported in `preserved_refs` (`{id, ref, commit}`), commented on
 the child, and it stops the drive chain — spawning a session would race work
 that was deliberately preserved. `refs/wip/<id>` is a fully qualified ref
 outside `refs/heads/`, so it never appears in `git branch` or `git worktree
-list` output.
+list` output. The ref is **not** cleaned up automatically: an operator who
+has triaged the preserved slice removes it manually once its work has been
+re-landed (or is known to be superseded):
+
+```bash
+git log --oneline -1 refs/wip/<child-id>   # inspect the preserved tip
+git update-ref -d refs/wip/<child-id>      # delete the ref (manual cleanup)
+```
+
+Inspection is always read-only: `git rev-parse refs/wip/<child-id>` resolves
+the parked commit and `git log -1 refs/wip/<child-id>` shows it. Deletion is
+deliberately not performed by the recovery path — a preserved ref is the
+only copy of a committed slice whose reset was refused, so automatic cleanup
+could silently destroy work the operator has not yet recovered.
 
 Marking the invariant complete: because the gate runs first, a successful
 `_reset_child_worktree` result always carries `commits_ahead: 0`, so
@@ -620,6 +651,7 @@ values):
 
 | `result` | Meaning |
 |---|---|
+| `infra-retry` | The child's `finish` was refused for a transient **infrastructure** reason; the loop retried `parent` on the separate `--infra-retry-limit` budget with backoff and no session spawn. Carries `step`, `reason`, `attempt` and the finish-failure `message`. |
 | `finished` | The child's session exited successfully. |
 | `terminal-reconciled` | The child's `finish` failed but the child was already terminal; recorded as done, the chain continues. Carries `status`, `stage`, `evidence` and `finish_attempts`. |
 | `reset-for-retry` | The child was non-terminal after the finish bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Carries `reset: true`, `status`, `stage`, `evidence`, `finish_attempts` and `discarded_paths` (the uncommitted files the reset removed — never a commit). |
@@ -629,11 +661,30 @@ values):
 
 Additional report fields:
 
-- `finish_attempts` — map of child id → failing `finish` executions observed;
+- `finish_failure` — the classified failing-`finish` payload
+  (`{kind, step, reason, message, steps}`) carried on the **failing parent
+  report** (`finishing_failed`); drive reads it from there and never parses
+  prose (LP-0MVWEP1MM0097RAT AC5);
+- `finish_attempts` — map of child id → failing `finish` executions observed
+  (the finish-attempt bound accounting);
 - `finish_attempt_limit` — the bound applied to this invocation;
+- `infra_retries` — map of child id → infrastructure-refusal retries taken on
+  the separate `--infra-retry-limit` budget;
+- `infra_retry_limit` — the infra-retry bound applied to this invocation;
+- `preserved_refs` — list of `{id, ref, commit}` entries for commit-carrying
+  worktrees parked on `refs/wip/<id>` (the reset was refused);
 - `terminal_reconciled` — count of children recorded as done after a failed
   finish;
 - `reset_for_retry` — count of children reset for a fresh session.
+
+These additions are the full report-surface delta for the recovery work:
+`finish_failure`, `infra_retries`, `infra_retry_limit` and `preserved_refs`
+are new (the last three top-level on the drive report, the first on the
+failing parent report), and every pre-existing key keeps its meaning and
+type. There are no forward-looking keys: every documented field is emitted
+by the shipped `phase_drive`, so a field the docs promise and the code does
+not emit (or a result value that is not a shipped verdict) would fail the
+doc↔code consistency test.
 
 The human rendering uses a distinct `🕓` icon for `terminal-reconciled` and
 `♻` for `reset-for-retry`, and prints the `Terminal-reconciled: N` / `Reset
@@ -645,7 +696,7 @@ their meaning and types.
 `phase_parent._run_finish` runs every `finish` subprocess with
 `parse_on_failure=True` and annotates the parent report with
 `finish_failure = classify_finish_failure(<parsed finish report>)` —
-`{kind, step, reason, message}` — before surfacing a failure. The `None`
+`{kind, step, reason, message, steps}` — before surfacing a failure. The `None`
 sentinel is preserved: a failure (parsed report or not) still returns
 `None` from `_run_finish`. The classifier resolves the failing
 `(step, reason)` from the report's structured `steps` payload (precedence:
@@ -704,10 +755,15 @@ worktree is reset).
 
 ### Reinstall after landing
 
-The canonical source is this repository's `skill/` tree. Once the change is
-on `dev`, run `scripts/install_pi.sh` so the installed
-`~/.pi/agent/skills/implement/` copy matches it — never edit the installed
-tree directly (repository-boundary rule).
+The canonical source is this repository's `skill/implement/` tree
+(`~/projects/SorraAgents/skill/implement/`). Once the change is on `dev`,
+run `scripts/install_pi.sh` from the canonical checkout so the installed
+runtime copy `~/.pi/agent/skills/implement/` matches it — the installed tree
+is a generated copy that must **never be edited directly** (repository-
+boundary rule): edit only the canonical `~/projects/SorraAgents/skill/implement/`
+and reinstall. The runtime copy is refreshed on the next
+`scripts/install_pi.sh` run, which is why a docs/code change to the
+implement skill always follows this landing → reinstall order.
 
 ## Build step for repos without a build script
 
