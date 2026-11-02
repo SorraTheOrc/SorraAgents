@@ -1900,3 +1900,211 @@ class TestTerminalChildRegression:
         assert implement_mod._classify_child(_child("SA-T", **overrides)) == (
             "skip-terminal"
         )
+
+
+# ---------------------------------------------------------------------------
+# Parent AC3: commit-preservation gate before any reset (LP-0MVWEP2KB002WMRY)
+# ---------------------------------------------------------------------------
+
+
+class TestPreservationGate:
+    """A worktree that carries commits is never reset — the tip is parked
+    on ``refs/wip/<child-id>`` before any destructive command can run.
+
+    Uses the :func:`commit_carrying_worktree` fixture (a real in-repo
+    worktree one commit ahead of the parent branch) and the
+    :func:`recording_reset` recorder, which runs the *real* implementation
+    while recording every ``git`` command — so "no destructive command ran"
+    is proven by the recorder, never a mocked reset.
+    """
+
+    def test_committed_worktree_refuses_reset_and_preserves_tip(
+        self, recording_reset, commit_carrying_worktree,
+    ):
+        """AC1: ahead-of-parent worktree yields a refused result with the
+        preservation ref and the tip — and no destructive command ran."""
+        fixture = commit_carrying_worktree
+        recorder = recording_reset()
+
+        result = recorder(fixture["worktree"], "dev", child_id="SA-C1")
+
+        assert result["success"] is False
+        assert result["reset"] is False
+        assert result["preserved_ref"] == "refs/wip/SA-C1"
+        assert result["preserved_commit"] == fixture["head_rev"]
+        assert "refs/wip/SA-C1" in result["reason"]
+        # Neither `git reset --hard` nor `git clean -fd` ran (AC1, AC3).
+        assert recorder.destructive(str(fixture["worktree"])) == []
+
+    def test_preserved_ref_resolves_and_commit_stays_reachable(
+        self, recording_reset, commit_carrying_worktree,
+    ):
+        """AC2: after the refused reset the wip ref resolves to the tip,
+        the commit is still on the worktree branch, and the ref is invisible
+        to ``git branch`` and ``git worktree list``."""
+        fixture = commit_carrying_worktree
+        worktree = fixture["worktree"]
+        recorder = recording_reset()
+
+        result = recorder(worktree, "dev", child_id="SA-C1")
+        assert result["success"] is False
+
+        assert _git("rev-parse", "refs/wip/SA-C1", cwd=worktree
+                    ).stdout.strip() == fixture["head_rev"]
+        assert _git("rev-parse", "HEAD", cwd=worktree
+                    ).stdout.strip() == fixture["head_rev"]
+        # The preservation ref is a fully qualified ref outside refs/heads/:
+        # it never appears in `git branch` or `git worktree list` output.
+        branch_output = _git("branch", "--list", cwd=fixture["repo"]).stdout
+        assert "refs/wip/" not in branch_output
+        worktree_list = _git(
+            "worktree", "list", cwd=fixture["repo"],
+        ).stdout
+        assert "refs/wip/" not in worktree_list
+        # The committed slice work is still present and the tree is clean
+        # (AC2/AC3 byte-identical).
+        assert (worktree / "feature.txt").read_text() \
+            == "committed slice work\n"
+        assert _git(
+            "status", "--porcelain=v1", cwd=worktree,
+        ).stdout.strip() == ""
+
+    def test_preservation_ref_created_before_any_destructive_command(
+        self, recording_reset, commit_carrying_worktree,
+    ):
+        """AC3: the preservation ref exists the moment the refused reset
+        returns; the only ref-writing command was ``update-ref`` and no
+        destructive reset/clean ran against the worktree."""
+        fixture = commit_carrying_worktree
+        recorder = recording_reset()
+
+        result = recorder(fixture["worktree"], "dev", child_id="SA-C1")
+
+        assert result["success"] is False
+        assert any("update-ref" in cmd for cmd in recorder.commands)
+        assert _git(
+            "rev-parse", "refs/wip/SA-C1", cwd=fixture["worktree"],
+        ).stdout.strip() == fixture["head_rev"]
+        # Byte-identical working tree: git reports no changes and the slice
+        # commit is still there.
+        assert _git(
+            "status", "--porcelain=v1", cwd=fixture["worktree"],
+        ).stdout.strip() == ""
+        assert (fixture["worktree"] / "feature.txt").exists()
+        assert recorder.destructive(str(fixture["worktree"])) == []
+
+    def test_uncommitted_dirty_worktree_still_resets_without_x_flag(
+        self, recording_reset, child_worktree,
+    ):
+        """AC4: an only-uncommitted-dirty worktree takes the existing reset
+        path unchanged — and ``git clean -fd`` still omits ``-x`` so ignored
+        files (e.g. the ``node_modules`` symlink) survive."""
+        worktree = child_worktree["worktree"]
+        (worktree / ".gitignore").write_text("ignored.txt\n")
+        ignored = worktree / "ignored.txt"
+        ignored.write_text("keep me\n")
+        recorder = recording_reset()
+
+        result = recorder(worktree, "dev")
+
+        assert result["success"] is True
+        assert result["reset"] is True
+        destructive = recorder.destructive(str(worktree))
+        assert ["git", "-C", str(worktree), "reset", "--hard", "dev"] \
+            in destructive
+        assert ["git", "-C", str(worktree), "clean", "-fd"] in destructive
+        # No `-x` flag anywhere (the flag-level assertion AC4 asks for).
+        assert all("-x" not in cmd for cmd in recorder.commands)
+        # `clean -fd` without -x leaves ignored files in place.
+        assert ignored.read_text() == "keep me\n"
+        # The abandoned uncommitted WIP was discarded as before.
+        status = _git("status", "--porcelain=v1", cwd=worktree).stdout
+        assert "wip.txt" not in status
+
+    def test_commit_carrying_worktree_without_child_id_refuses_safely(
+        self, recording_reset, commit_carrying_worktree,
+    ):
+        """A commit-carrying worktree is still never reset when no child id
+        names the preservation ref — fail-safe, nothing destructive runs."""
+        recorder = recording_reset()
+
+        result = recorder(commit_carrying_worktree["worktree"], "dev")
+
+        assert result["success"] is False
+        assert result["reset"] is False
+        assert "no child id" in result["reason"]
+        assert recorder.destructive(
+            str(commit_carrying_worktree["worktree"])
+        ) == []
+
+    def test_undecidable_ahead_state_refuses_without_destroying(
+        self, recording_reset, child_worktree,
+    ):
+        """Tri-state fail-closed: when the ahead-of-parent relationship
+        cannot be determined (unresolvable parent ref), the reset is refused
+        — 'unknown' is never interpreted as 'safe' by a destroyer."""
+        worktree = child_worktree["worktree"]
+        recorder = recording_reset()
+
+        result = recorder(worktree, "no-such-branch", child_id="SA-C1")
+
+        assert result["success"] is False
+        assert result["reset"] is False
+        assert "could not determine" in result["reason"]
+        assert recorder.destructive(str(worktree)) == []
+        # The abandoned WIP is untouched (never discarded).
+        assert (worktree / "wip.txt").exists()
+
+    def test_drive_preserves_ref_comments_and_stops_chain(
+        self, drive_harness, commit_carrying_worktree,
+    ):
+        """AC5/parent AC3: when the exhausted-budget reset is refused with a
+        ``preserved_ref``, phase_drive records ``preserved_refs``, comments
+        the wip ref + commit on the child, spawns **no** session for it and
+        stops the chain naming the failing ``finish`` step and reason."""
+        worktree = commit_carrying_worktree["worktree"]
+        fixture_tip = commit_carrying_worktree["head_rev"]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report(
+                    "SA-C1", step="tests",  # gate kind — not infra-retried
+                ) for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path=str(worktree),
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["sessions_spawned"] == 0
+        assert harness.spawn_calls == []
+        assert report["reset_for_retry"] == 0
+        assert harness.status_updates == []
+        preserved = report.get("preserved_refs", [])
+        assert len(preserved) == 1
+        assert preserved[0] == {
+            "id": "SA-C1",
+            "ref": "refs/wip/SA-C1",
+            "commit": fixture_tip,
+        }
+        # The child is commented with the wip ref and the commit hash
+        # (AC5) — but only once (the preservation comment, not a
+        # reset-for-retry discard comment).
+        child_comments = [
+            text for wid, text in harness.comments if wid == "SA-C1"
+        ]
+        assert len(child_comments) == 1
+        assert "refs/wip/SA-C1" in child_comments[0]
+        assert fixture_tip in child_comments[0]
+        # The chain-stop message names the real failing finish step/reason.
+        assert "tests" in report["message"]
+        assert "tests_failed" in report["message"]
+        # The worktree genuinely survived: still ahead, wip ref in place.
+        assert _git("rev-parse", "HEAD", cwd=worktree
+                    ).stdout.strip() == fixture_tip
+        assert _git(
+            "rev-parse", "refs/wip/SA-C1", cwd=worktree,
+        ).stdout.strip() == fixture_tip

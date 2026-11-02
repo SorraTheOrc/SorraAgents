@@ -9786,9 +9786,81 @@ def _reconcile_finish_failure(
     return result
 
 
+def _worktree_ahead_of_parent(
+    worktree_path: Path, parent_branch: str,
+) -> tuple[bool | None, int | None]:
+    """Whether the worktree's ``HEAD`` carries commits the parent lacks.
+
+    The preservation gate's ahead-of-parent check: a worktree whose ``HEAD``
+    carries commits the parent branch does not have would lose them to a
+    ``git reset --hard <parent_branch>``, so the reset must be refused
+    (parent AC3, LP-0MVWEP2KB002WMRY).
+
+    Primary computation: ``git rev-list --count <parent_branch>..HEAD`` — a
+    positive count means the child's own commits would be lost. Falls back to
+    ``git merge-base --is-ancestor <parent_branch> HEAD`` when the count
+    cannot be computed (e.g. an unresolvable parent ref), guarded against the
+    ``HEAD == parent`` equality case so an exactly-at-parent worktree is never
+    misclassified as ahead.
+
+    **Tri-state, fail-closed.** ``None`` means undecidable (the parent ref
+    does not resolve, or ``HEAD`` is unreadable). A destroyer must never
+    interpret "unknown" as "safe": the caller refuses the reset on ``None``
+    rather than discarding commits it could not enumerate.
+
+    Args:
+        worktree_path: The linked worktree path (git runs with ``-C``).
+        parent_branch: The parent branch to measure against (``dev``).
+
+    Returns:
+        ``(is_ahead, count)`` where ``is_ahead`` is ``True``/``False`` when
+        decided and ``None`` when undecidable; ``count`` is the number of
+        commits ahead when the primary computation succeeded, otherwise
+        ``None``.
+    """
+    count = run_cmd(
+        [
+            "git", "-C", str(worktree_path), "rev-list", "--count",
+            f"{parent_branch}..HEAD",
+        ],
+        check=False,
+    )
+    if count.returncode == 0:
+        text = count.stdout.strip()
+        if text.isdigit():
+            n = int(text)
+            return n > 0, n
+    # Fallback: is the parent branch an ancestor of HEAD? (A == B passes, so
+    # guard the equality case explicitly — an exactly-at-parent worktree is
+    # never "ahead".)
+    parent_rev = run_cmd(
+        ["git", "-C", str(worktree_path), "rev-parse", "--verify", "--quiet",
+         f"{parent_branch}^{{commit}}"],
+        check=False,
+    )
+    head_rev = run_cmd(
+        ["git", "-C", str(worktree_path), "rev-parse", "HEAD"], check=False,
+    )
+    if parent_rev.returncode != 0 or head_rev.returncode != 0:
+        return None, None
+    if parent_rev.stdout.strip() == head_rev.stdout.strip():
+        return False, None
+    ancestor = run_cmd(
+        ["git", "-C", str(worktree_path), "merge-base", "--is-ancestor",
+            parent_branch, "HEAD"],
+        check=False,
+    )
+    if ancestor.returncode == 0:
+        return False, None
+    if ancestor.returncode == 1:
+        return True, None
+    return None, None
+
+
 def _reset_child_worktree(
     worktree_path: str,
     parent_branch: str = DEFAULT_PARENT_BRANCH,
+    child_id: str = "",
 ) -> dict[str, Any]:
     """Reset a child's **own** worktree to the parent-branch HEAD.
 
@@ -9808,16 +9880,30 @@ def _reset_child_worktree(
     3. only ``git reset --hard <parent_branch>`` and ``git clean -fd`` run —
        the clean is never run on a shared/main path.
 
+    **Preservation gate** (parent AC3, LP-0MVWEP2KB002WMRY) — runs after the
+    isolation gates and **before** any destructive command: when the worktree
+    carries commits ahead of the parent branch (``_worktree_ahead_of_parent``),
+    the tip is parked on ``refs/wip/<child-id>`` with ``git update-ref`` and
+    the reset is refused without running ``git reset --hard`` / ``git clean
+    -fd``. A commit-carrying worktree is therefore never reset, no matter how
+    many finish attempts failed — the committed slice cannot be discarded.
+
     ``git clean -fd`` deliberately omits ``-x``: ignored files (notably the
     ``node_modules`` symlink) survive the reset.
 
     Args:
         worktree_path: The child's worktree path (never the main checkout).
         parent_branch: Ref to reset to (default: ``dev``).
+        child_id: The child work-item id; names the preservation ref
+            (``refs/wip/<child-id>``). When empty, a commit-carrying worktree
+            is still refused — fail-safe, nothing destructive runs.
 
     Returns:
         A dict with ``success`` (bool), ``reset`` (bool), ``ref`` (the ref
-        reset to) and ``reason`` (failure explanation, empty on success).
+        reset to) and ``reason`` (failure explanation, empty on success). On
+        a refused preservation the dict additionally carries ``preserved``
+        (True), ``preserved_ref`` (``refs/wip/<child-id>``) and
+        ``preserved_commit`` (the worktree tip).
     """
     result: dict[str, Any] = {
         "success": False,
@@ -9852,6 +9938,64 @@ def _reset_child_worktree(
         result["reason"] = (
             f"refusing to reset {worktree_path}: git reports a different "
             "worktree root"
+        )
+        return result
+
+    # Preservation gate: a worktree that carries commits ahead of the parent
+    # branch is never reset. Park the tip on refs/wip/<child-id> BEFORE any
+    # destructive command and refuse (parent AC3, LP-0MVWEP2KB002WMRY).
+    ahead, ahead_count = _worktree_ahead_of_parent(wt, parent_branch)
+    if ahead is None:
+        result["reason"] = (
+            f"refusing to reset {worktree_path}: could not determine whether "
+            f"the worktree is ahead of {parent_branch} (unresolvable ref or "
+            "unreadable HEAD); a destroyer must not assume 'safe'"
+        )
+        return result
+    if ahead:
+        tip = run_cmd(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"], check=False,
+        )
+        tip_commit = tip.stdout.strip() if tip.returncode == 0 else ""
+        if not child_id:
+            result["reason"] = (
+                f"refusing to reset {worktree_path}: the worktree is "
+                f"{ahead_count if ahead_count is not None else '1+'}"
+                f" commit(s) ahead of {parent_branch} and no child id was "
+                "given to name a preservation ref; committed work would be "
+                "discarded"
+            )
+            return result
+        if not tip_commit:
+            result["reason"] = (
+                f"refusing to reset {worktree_path}: could not resolve the "
+                "worktree HEAD; committed work would be discarded"
+            )
+            return result
+        preserved_ref = f"refs/wip/{child_id}"
+        update_ref = run_cmd(
+            ["git", "-C", str(wt), "update-ref", preserved_ref, tip_commit],
+            check=False,
+        )
+        if update_ref.returncode != 0:
+            result["reason"] = (
+                f"refusing to reset {worktree_path}: could not create "
+                f"preservation ref {preserved_ref} "
+                f"({(update_ref.stderr or '').strip()}); committed work "
+                "would be discarded"
+            )
+            return result
+        result["success"] = False
+        result["reset"] = False
+        result["preserved"] = True
+        result["preserved_ref"] = preserved_ref
+        result["preserved_commit"] = tip_commit
+        result["reason"] = (
+            f"refusing to reset {worktree_path}: the worktree is "
+            f"{ahead_count if ahead_count is not None else '1+'}"
+            f" commit(s) ahead of {parent_branch}; the tip was preserved "
+            f"at {preserved_ref} ({tip_commit}) and no destructive command "
+            "ran"
         )
         return result
 
@@ -9918,6 +10062,73 @@ def _reset_for_retry_comment(
     return "\n".join(lines)
 
 
+def _step_reason_suffix(finish_failure: dict[str, Any]) -> str:
+    """Render the failing ``finish`` step/reason as a message suffix.
+
+    Naming the real step and reason in the chain-stop message keeps the
+    stopping verdict actionable (LP-0MVWEP292000ODBS AC5 semantics): a
+    producer can tell a genuine gate failure from a transient refusal without
+    reading the child's log. Empty when the failure could not be classified
+    into a structured step.
+
+    Args:
+        finish_failure: The classified ``finish_failure`` payload, if any.
+
+    Returns:
+        ``"; failing finish step: <step> (<reason>)"``, or ``""``.
+    """
+    if not isinstance(finish_failure, dict):
+        return ""
+    step = finish_failure.get("step")
+    if not step:
+        return ""
+    reason = finish_failure.get("reason")
+    return f"; failing finish step: {step} ({reason or 'unspecified'})"
+
+
+def _preserved_ref_comment(
+    child_id: str,
+    preserved: dict[str, Any],
+    reconciliation: dict[str, Any],
+    finish_failure: dict[str, Any] | None = None,
+) -> str:
+    """Build the durable record that a commit-carrying worktree was preserved.
+
+    A reset was *refused*, not performed: the child's committed slice is still
+    on its branch and its tip is parked on ``refs/wip/<child-id>``. The
+    comment names the ref and commit so the owner can recover the work, and
+    states explicitly that nothing was discarded (the inverse of
+    :func:`_reset_for_retry_comment`).
+
+    Args:
+        child_id: The child whose worktree was preserved.
+        preserved: The ``{id, ref, commit}`` preservation entry.
+        reconciliation: The non-terminal reconciliation payload.
+        finish_failure: The classified ``finish_failure`` payload, if any.
+
+    Returns:
+        The comment body.
+    """
+    failure = finish_failure if isinstance(finish_failure, dict) else {}
+    step = failure.get("step") or "unknown"
+    reason = failure.get("reason") or "unknown"
+    lines = [
+        f"Drive refused to reset this child's worktree (`{child_id}`) "
+        "because it carries commits.",
+        "",
+        f"- Worktree tip preserved at: `{preserved.get('ref')}`",
+        f"- Preserved commit: `{preserved.get('commit')}`",
+        f"- Child state: {reconciliation.get('evidence') or 'unknown'}",
+        f"- Failing `finish` step: `{step}` (reason: `{reason}`)",
+        "",
+        "No `git reset --hard` or `git clean -fd` was run, so no committed "
+        "work was discarded. Recover the slice from the preserved ref "
+        f"(`git branch <name> {preserved.get('ref')}`), or delete it once it "
+        f"is no longer needed (`git update-ref -d {preserved.get('ref')}`).",
+    ]
+    return "\n".join(lines)
+
+
 def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
     """Emit a drive report as JSON or a concise human summary."""
     if json_output:
@@ -9977,6 +10188,13 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         )
     if report.get("reset_for_retry"):
         print(f"  Reset for retry: {report['reset_for_retry']}")
+    if report.get("preserved_refs"):
+        print(f"  Preserved (never reset): {len(report['preserved_refs'])}")
+        for preserved in report["preserved_refs"]:
+            print(
+                f"     {preserved.get('id')}: {preserved.get('ref')} "
+                f"({preserved.get('commit')})"
+            )
     if report.get("infra_retries"):
         print(f"  Infra retries: {report.get('infra_retries')}")
     if report.get("finalised_children"):
@@ -10790,7 +11008,10 @@ def phase_drive(
         children recorded as done after their finish failed
         (SA-0MVLJXTYY005XQDV); ``reset_for_retry`` counts non-terminal
         children whose worktree was reset for a fresh session
-        (SA-0MVLJXVND0015LPW). A child whose per-work-item lock is held by
+        (SA-0MVLJXVND0015LPW); ``preserved_refs`` lists the children whose
+        reset was **refused** because their worktree carries commits, each as
+        ``{id, ref, commit}`` with the tip parked on ``refs/wip/<id>``
+        (parent AC3, LP-0MVWEP2KB002WMRY). A child whose per-work-item lock is held by
         another live session is reported with ``action: "skipped-held"``,
         ``skipped_held: True``, ``held_by`` and ``held_children`` — and no
         session is spawned for it (SA-0MVQ5AXLF002PAQ3). Worktree removal is
@@ -10811,6 +11032,7 @@ def phase_drive(
         "completed_late": 0,
         "terminal_reconciled": 0,
         "reset_for_retry": 0,
+        "preserved_refs": [],
         "finish_attempts": {},
         "finish_attempt_limit": None,
         "infra_retries": {},
@@ -11132,8 +11354,50 @@ def phase_drive(
                     or ""
                 )
                 reset_result = _reset_child_worktree(
-                    reset_worktree, parent_branch,
+                    reset_worktree, parent_branch, child_id=failed_cid,
                 )
+                if reset_result.get("preserved_ref"):
+                    # The worktree carries commits the parent branch does not
+                    # have: the reset was refused and the tip parked on
+                    # refs/wip/<child-id> BEFORE any destructive command ran
+                    # (parent AC3, LP-0MVWEP2KB002WMRY). Record the
+                    # preservation, comment it on the child and stop the
+                    # chain — spawning a session would race work that was
+                    # deliberately preserved.
+                    preserved_entry = {
+                        "id": failed_cid,
+                        "ref": reset_result["preserved_ref"],
+                        "commit": reset_result["preserved_commit"],
+                    }
+                    report.setdefault("preserved_refs", []).append(
+                        preserved_entry
+                    )
+                    wl_add_comment(
+                        failed_cid,
+                        _preserved_ref_comment(
+                            failed_cid, preserved_entry, reconciliation,
+                            finish_failure,
+                        ),
+                    )
+                    LOG.error(
+                        "Refusing to reset child %s: it carries commits. "
+                        "Tip preserved at %s (%s).",
+                        failed_cid,
+                        preserved_entry["ref"],
+                        preserved_entry["commit"],
+                    )
+                    report["message"] = (
+                        f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                        f"(finish-attempt bound {finish_attempt_limit} "
+                        f"exhausted; child is still non-terminal: "
+                        f"{reconciliation['evidence'] or 'state unreadable'}; "
+                        f"reset refused because the worktree carries "
+                        f"commits — tip preserved at "
+                        f"{preserved_entry['ref']} "
+                        f"({preserved_entry['commit']}){_step_reason_suffix(finish_failure)})."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
                 if not reset_result["success"]:
                     LOG.error(
                         "Refusing to reset child %s: %s",
