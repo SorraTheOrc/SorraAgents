@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -2108,3 +2109,358 @@ class TestPreservationGate:
         assert _git(
             "rev-parse", "refs/wip/SA-C1", cwd=worktree,
         ).stdout.strip() == fixture_tip
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVWEP2VQ001NPRK: reset-for-retry is limited to uncommitted WIP, and its
+# comment names exactly what was discarded (parent AC4)
+# ---------------------------------------------------------------------------
+
+#: Any 7–40 character hex run that a reader could mistake for a commit hash.
+_COMMIT_HASH_TOKEN_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+#: The fixture's abandoned WIP — the exact files an uncommitted-only reset
+#: discards (``child_worktree``): one modified tracked file, two untracked.
+_CHILD_WORKTREE_WIP = ["README.md", "tests/test_wip.py", "wip.txt"]
+
+
+class TestResetForRetryDiscardRecord:
+    """The audit comment is an evidence-based record of the discard.
+
+    ``reset-for-retry`` only ever runs for a worktree that carried **no**
+    commits ahead of the parent branch (the preservation gate refuses a
+    commit-carrying tree), so the comment must name exactly the uncommitted
+    paths that were removed and state explicitly that no commit was
+    discarded — and it must never contain a commit-hash-shaped token that
+    could be read as "a commit was thrown away" (parent AC4).
+    """
+
+    def test_reset_helper_returns_the_discarded_paths(
+        self, implement_mod, child_worktree,  # noqa: F811 — fixture param
+    ):
+        """AC2/AC3: ``_reset_child_worktree`` reports the pre-reset
+        ``status --porcelain`` paths, so the comment is evidence-based rather
+        than inferred from ``git clean`` stdout."""
+        m = implement_mod
+        worktree = child_worktree["worktree"]
+        pre_reset = _git(
+            "status", "--porcelain=v1", "--untracked-files=all",
+            cwd=worktree,
+        ).stdout
+        assert "wip.txt" in pre_reset and "README.md" in pre_reset
+
+        result = m._reset_child_worktree(str(worktree), "dev", child_id="SA-C1")
+
+        assert result["success"] is True
+        assert result["reset"] is True
+        assert result["discarded_paths"] == _CHILD_WORKTREE_WIP
+        # The reset is an uncommitted-only reset: nothing was ahead of dev.
+        assert result["commits_ahead"] == 0
+        # Those are exactly the paths the reset actually removed/restored.
+        for path in _CHILD_WORKTREE_WIP:
+            assert not (worktree / path).exists() or path == "README.md"
+        assert (worktree / "README.md").read_text() == "# Test\n"
+
+    def test_comment_lists_each_discarded_path_individually(
+        self, implement_mod, child_worktree,  # noqa: F811 — fixture param
+    ):
+        """AC2/AC3: every discarded path appears on its own line — a file
+        list, never a commit hash — and the comment states that no commit was
+        discarded."""
+        m = implement_mod
+        reset_result = m._reset_child_worktree(
+            str(child_worktree["worktree"]), "dev", child_id="SA-C1",
+        )
+
+        comment = m._reset_for_retry_comment(
+            "SA-C1",
+            3,
+            "Failed to finish child SA-C1",
+            {"evidence": "status=open, stage=intake_complete"},
+            reset_result,
+        )
+
+        for path in _CHILD_WORKTREE_WIP:
+            assert f"  - {path}\n" in comment, (
+                f"discarded path {path!r} is not listed individually:\n"
+                f"{comment}"
+            )
+        assert "no commit was discarded" in comment
+        assert "Failed to finish child SA-C1" in comment
+        assert "`dev`" in comment
+        assert "git reset --hard" in comment
+        # AC2: no hash-shaped token anywhere in the comment body.
+        assert _COMMIT_HASH_TOKEN_RE.search(comment) is None, comment
+
+    def test_comment_never_leaks_a_commit_hash_from_the_failure_text(
+        self, implement_mod, child_worktree,  # noqa: F811 — fixture param
+    ):
+        """AC2: a failure message that carries a commit hash (the shape the
+        refused/preserved path reports) is redacted, so no reader can infer
+        that a commit was discarded — while the live file list stays
+        verbatim."""
+        m = implement_mod
+        hash_token = "dc5b1123abcdef0123456789abcdef01234567"
+        reset_result = m._reset_child_worktree(
+            str(child_worktree["worktree"]), "dev", child_id="SA-C1",
+        )
+
+        comment = m._reset_for_retry_comment(
+            "SA-C1",
+            3,
+            f"Failed to finish child SA-C1: commit {hash_token} refused",
+            {"evidence": "status=open, stage=intake_complete"},
+            reset_result,
+        )
+
+        assert hash_token not in comment
+        assert _COMMIT_HASH_TOKEN_RE.search(comment) is None, comment
+        for path in _CHILD_WORKTREE_WIP:
+            assert path in comment
+
+    def test_comment_names_the_failing_finish_step_when_classified(
+        self, implement_mod, child_worktree,  # noqa: F811 — fixture param
+    ):
+        """The discard record attributes the reset: when the failure was
+        classified, the comment names the failing ``finish`` step and
+        reason."""
+        m = implement_mod
+        reset_result = m._reset_child_worktree(
+            str(child_worktree["worktree"]), "dev", child_id="SA-C1",
+        )
+
+        comment = m._reset_for_retry_comment(
+            "SA-C1",
+            3,
+            "Finishing failed",
+            {"evidence": "status=open, stage=intake_complete"},
+            reset_result,
+            {"kind": "gate", "step": "tests", "reason": "tests_failed"},
+        )
+
+        assert "`tests`" in comment
+        assert "`tests_failed`" in comment
+
+    def test_comment_reports_no_discard_for_a_clean_worktree(
+        self, implement_mod, tmp_path,  # noqa: F811 — fixture param
+    ):
+        """A clean worktree has nothing to discard — the comment says so
+        instead of implying a discard happened."""
+        m = implement_mod
+        repo = tmp_path / "clean_repo"
+        repo.mkdir()
+        _git("init", "-q", cwd=repo)
+        _git("config", "user.email", "test@test.com", cwd=repo)
+        _git("config", "user.name", "Test", cwd=repo)
+        (repo / "README.md").write_text("# Test\n")
+        _git("add", "-A", cwd=repo)
+        _git("commit", "-q", "-m", "Initial commit", cwd=repo)
+        _git("branch", "dev", cwd=repo)
+        worktree = (tmp_path / "wt-clean").resolve()
+        _git(
+            "worktree", "add", "--track", "-b", "wl-SA-C1-clean",
+            str(worktree), "dev", cwd=repo,
+        )
+
+        reset_result = m._reset_child_worktree(
+            str(worktree), "dev", child_id="SA-C1",
+        )
+        comment = m._reset_for_retry_comment(
+            "SA-C1", 2, "Finishing failed",
+            {"evidence": "status=open, stage=intake_complete"},
+            reset_result,
+        )
+
+        assert reset_result["discarded_paths"] == []
+        assert "Discarded uncommitted paths: none" in comment
+        assert "no commit was discarded" in comment
+        assert _COMMIT_HASH_TOKEN_RE.search(comment) is None
+
+
+class TestResetForRetryInvariantGuard:
+    """``reset-for-retry`` is only recorded when the reset kept no commits
+    (parent AC4): the drive path fails closed if that ever stops holding."""
+
+    def test_violation_helper_accepts_an_uncommitted_only_reset(
+        self, implement_mod,  # noqa: F811 — fixture param
+    ):
+        result = implement_mod._reset_for_retry_violation({
+            "success": True,
+            "reset": True,
+            "ref": "dev",
+            "commits_ahead": 0,
+            "discarded_paths": ["wip.txt"],
+        })
+
+        assert result == ""
+
+    def test_violation_helper_rejects_a_commit_carrying_reset(
+        self, implement_mod,  # noqa: F811 — fixture param
+    ):
+        ahead = implement_mod._reset_for_retry_violation({
+            "success": True, "reset": True, "ref": "dev", "commits_ahead": 2,
+        })
+        preserved = implement_mod._reset_for_retry_violation({
+            "success": False,
+            "reset": False,
+            "ref": "dev",
+            "preserved_ref": "refs/wip/SA-C1",
+            "preserved_commit": "dc5b1123",
+        })
+
+        assert "ahead of the parent branch" in ahead
+        assert "preserved" in preserved
+
+    def test_drive_stops_instead_of_recording_a_commit_carrying_reset(
+        self, drive_harness,
+    ):
+        """The guard is wired into ``phase_drive``: a reset helper that
+        reports commits ahead is never turned into a ``reset-for-retry``
+        entry, and nothing is mutated or spawned."""
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(finishing_failed_report("SA-C1") for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path="/wt/SA-C1",
+        )
+        harness.patch(
+            "_reset_child_worktree",
+            return_value={
+                "success": True,
+                "reset": True,
+                "ref": "dev",
+                "reason": "",
+                "commits_ahead": 1,
+                "discarded_paths": ["wip.txt"],
+            },
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["reset_for_retry"] == 0
+        assert report["children_driven"] == []
+        assert harness.status_updates == []
+        assert harness.spawn_calls == []
+        assert "commit" in report["message"]
+
+
+class TestUncommittedOnlyResetScope:
+    """AC1/AC4: reset-for-retry is unreachable for a commit-carrying
+    worktree, and an infrastructure refusal never resets one."""
+
+    def test_commit_carrying_worktree_never_yields_reset_for_retry(
+        self, drive_harness, commit_carrying_worktree,
+    ):
+        """AC1: a commit-carrying worktree whose ``finish`` exhausts the gate
+        bound produces **no** ``reset-for-retry`` entry, spawns **no**
+        session, and reports ``preserved_refs`` for that child."""
+        worktree = commit_carrying_worktree["worktree"]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(gate_failure_report("SA-C1") for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path=str(worktree),
+        )
+
+        report = harness.run(finish_attempt_limit=3)
+
+        assert "reset-for-retry" not in [
+            entry["result"] for entry in report["children_driven"]
+        ]
+        assert report["reset_for_retry"] == 0
+        assert report["sessions_spawned"] == 0
+        assert harness.spawn_calls == []
+        assert [entry["id"] for entry in report["preserved_refs"]] == ["SA-C1"]
+
+    def test_infra_refusal_retries_finish_only_and_never_resets(
+        self, drive_harness, commit_carrying_worktree, recording_reset,
+    ):
+        """AC4: an infrastructure refusal on a commit-carrying worktree
+        re-runs ``parent`` (finish-only — ``sessions_spawned`` unchanged for
+        the retries) and never resets the worktree."""
+        fixture = commit_carrying_worktree
+        worktree = fixture["worktree"]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(infra_refusal_report("SA-C1") for _ in range(2)),
+                {"success": True, "next_child": "SA-C1",
+                 "worktree_path": str(worktree)},
+                {"success": True, "parent_advanced": True},
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path=str(worktree),
+        )
+        recorder = recording_reset()
+        harness.patch("_reset_child_worktree", side_effect=recorder)
+
+        report = harness.run(delay=lambda _s: None)
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert report["infra_retries"] == {"SA-C1": 2}
+        # finish-only retry: `parent` was re-run per refusal, no reset (the
+        # real helper, wrapped by the recorder, was never invoked), and only
+        # the eventual child session counted.
+        assert len(harness.runner.returned) == 4
+        assert recorder.calls == []
+        assert report["reset_for_retry"] == 0
+        assert report["sessions_spawned"] == 1
+        assert harness.spawn_calls == ["SA-C1"]
+        # The committed slice survived byte-identically.
+        assert _git("rev-parse", "HEAD", cwd=worktree
+                    ).stdout.strip() == fixture["head_rev"]
+        assert (worktree / "feature.txt").read_text() == "committed slice work\n"
+        assert _git(
+            "status", "--porcelain=v1", cwd=worktree,
+        ).stdout.strip() == ""
+
+    def test_exhausted_infra_budget_preserves_instead_of_resetting(
+        self, drive_harness, commit_carrying_worktree, recording_reset,
+    ):
+        """AC4: when the infra budget is spent the loop falls through to the
+        finish-attempt path, which still refuses to reset a commit-carrying
+        worktree — the tip is preserved and no session is spawned."""
+        fixture = commit_carrying_worktree
+        worktree = fixture["worktree"]
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent([
+                *(infra_refusal_report("SA-C1") for _ in range(3)),
+            ]),
+            child_states={"SA-C1": _child("SA-C1")},
+            worktree_path=str(worktree),
+        )
+        recorder = recording_reset()
+        harness.patch("_reset_child_worktree", side_effect=recorder)
+
+        report = harness.run(
+            infra_retry_limit=1,
+            finish_attempt_limit=1,
+            delay=lambda _s: None,
+        )
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["reset_for_retry"] == 0
+        assert [e["result"] for e in report["children_driven"]] == [
+            "infra-retry"
+        ]
+        assert report["preserved_refs"] == [{
+            "id": "SA-C1",
+            "ref": "refs/wip/SA-C1",
+            "commit": fixture["head_rev"],
+        }]
+        assert harness.spawn_calls == []
+        # The real helper ran once and refused; no destructive command ran.
+        assert len(recorder.calls) == 1
+        assert recorder.destructive(str(worktree)) == []
+        assert _git("rev-parse", "HEAD", cwd=worktree
+                    ).stdout.strip() == fixture["head_rev"]
+        assert (worktree / "feature.txt").exists()

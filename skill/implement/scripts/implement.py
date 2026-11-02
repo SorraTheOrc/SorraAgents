@@ -9857,6 +9857,83 @@ def _worktree_ahead_of_parent(
     return None, None
 
 
+def _status_porcelain_paths(worktree_path: str) -> list[str]:
+    """Return the paths ``git status --porcelain=v1`` reports (read-only).
+
+    Used by :func:`_reset_child_worktree` to capture the uncommitted work a
+    reset is about to discard **before** the destructive commands run, so the
+    reset-for-retry audit comment can name the discarded files exactly
+    (parent AC4, LP-0MVWEP2VQ001NPRK). Untracked directories are expanded to
+    individual files (``--untracked-files=all``) so the list names files
+    rather than a directory that a reader cannot audit. A rename/copy entry
+    is reported by its destination path.
+
+    Args:
+        worktree_path: The worktree to read (never mutated).
+
+    Returns:
+        A sorted, de-duplicated list of repository-relative paths. An
+        unreadable worktree or a failing ``git status`` (e.g. a missing
+        path) yields ``[]`` — the caller never crashes on a diagnostic read.
+    """
+    status = run_cmd(
+        [
+            "git", "-C", str(worktree_path), "status", "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        check=False,
+    )
+    if status.returncode != 0:
+        return []
+    paths: list[str] = []
+    for line in (status.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        entry = line[3:].strip()
+        if not entry:
+            continue
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        paths.append(entry.strip('"'))
+    return sorted(set(paths))
+
+
+#: A 7–40 character hex run that a reader could mistake for a commit hash.
+_COMMIT_HASH_TOKEN_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+#: Placeholder used while protecting verbatim path tokens from redaction.
+_REDACTION_SENTINEL = "\x00{}\x00"
+
+
+def _redact_commit_hash_tokens(
+    text: str, keep: tuple[str, ...] | list[str] = (),
+) -> str:
+    """Replace commit-hash-shaped tokens in *text* with a neutral marker.
+
+    The reset-for-retry comment must never imply that a **commit** was
+    discarded: it is the record of an uncommitted-only reset, so any
+    hash-shaped token (which a reader would read as a commit) is redacted.
+    Tokens listed in *keep* (the discarded file list) are left verbatim, so
+    the evidence-based file list stays byte-accurate even when a filename
+    happens to look like a hash (parent AC2/AC3, LP-0MVWEP2VQ001NPRK).
+
+    Args:
+        text: The text to sanitise.
+        keep: Tokens to preserve verbatim (paths from the discard list).
+
+    Returns:
+        The sanitised text.
+    """
+    protected = [token for token in keep if token]
+    text = text or ""
+    for index, token in enumerate(protected):
+        text = text.replace(token, _REDACTION_SENTINEL.format(index))
+    text = _COMMIT_HASH_TOKEN_RE.sub("<hash redacted>", text or "")
+    for index, token in enumerate(protected):
+        text = text.replace(_REDACTION_SENTINEL.format(index), token)
+    return text
+
+
 def _reset_child_worktree(
     worktree_path: str,
     parent_branch: str = DEFAULT_PARENT_BRANCH,
@@ -9903,7 +9980,12 @@ def _reset_child_worktree(
         reset to) and ``reason`` (failure explanation, empty on success). On
         a refused preservation the dict additionally carries ``preserved``
         (True), ``preserved_ref`` (``refs/wip/<child-id>``) and
-        ``preserved_commit`` (the worktree tip).
+        ``preserved_commit`` (the worktree tip). On a successful reset the
+        dict additionally carries ``commits_ahead`` (always 0 — the
+        uncommitted-only invariant, parent AC4 / LP-0MVWEP2VQ001NPRK) and
+        ``discarded_paths`` — the pre-reset ``git status --porcelain=v1``
+        file list (one entry per path), so the reset-for-retry audit comment
+        is evidence-based rather than inferred from ``git clean`` stdout.
     """
     result: dict[str, Any] = {
         "success": False,
@@ -9999,6 +10081,12 @@ def _reset_child_worktree(
         )
         return result
 
+    # Pre-reset uncommitted file list: the evidence the reset-for-retry audit
+    # comment reports (parent AC4, LP-0MVWEP2VQ001NPRK). Captured here, after
+    # the preservation gate and BEFORE any destructive command, so it describes
+    # exactly what the reset is about to discard.
+    discarded_paths = _status_porcelain_paths(str(wt))
+
     reset = run_cmd(
         ["git", "-C", str(wt), "reset", "--hard", parent_branch],
         check=False,
@@ -10019,6 +10107,14 @@ def _reset_child_worktree(
 
     result["success"] = True
     result["reset"] = True
+    # Uncommitted-only invariant (parent AC4, LP-0MVWEP2VQ001NPRK): the
+    # preservation gate refused a commit-carrying worktree above, so a
+    # successful reset never discarded commits. Recorded explicitly so the
+    # drive path can fail closed if that ever stops holding.
+    result["commits_ahead"] = 0
+    # The pre-reset status --porcelain file list: exactly what the reset
+    # removed (uncommitted paths only), for the audit comment.
+    result["discarded_paths"] = discarded_paths
     result["cleaned"] = (clean.stdout or "").strip()
     return result
 
@@ -10029,14 +10125,41 @@ def _reset_for_retry_comment(
     failure_message: str,
     reconciliation: dict[str, Any],
     reset_result: dict[str, Any],
+    finish_failure: dict[str, Any] | None = None,
 ) -> str:
     """Build the audit comment recording a reset-for-retry recovery.
 
-    The comment is the durable record that a child owner's WIP was discarded
-    and why: the finish failure reason, the number of failed finish attempts,
-    the child's non-terminal state and the exact reset performed.
+    The comment is the durable record that a child owner's **uncommitted**
+    WIP was discarded and why: the finish failure reason (with the classified
+    failing ``finish`` step/reason when available), the number of failed
+    finish attempts, the child's non-terminal state, the exact reset
+    performed, and the file list the reset discarded.
+
+    ``reset-for-retry`` is limited to a worktree that carried **no** commits
+    ahead of the parent branch (parent AC4, LP-0MVWEP2VQ001NPRK): committed
+    work is preserved by the refusal gate in :func:`_reset_child_worktree`,
+    never discarded. The comment therefore states explicitly that no commit
+    was discarded, and no hash-shaped token can survive in it — a reader can
+    never infer that a commit was thrown away. The discarded paths come from
+    the pre-reset ``git status --porcelain`` capture
+    (``reset_result["discarded_paths"]``), so the list is evidence-based
+    rather than inferred from ``git clean`` stdout.
+
+    Args:
+        child_id: The child whose worktree was reset.
+        finish_attempts: Number of failing finish executions observed.
+        failure_message: The parent report's failure message.
+        reconciliation: The non-terminal reconciliation payload.
+        reset_result: The :func:`_reset_child_worktree` result (carrying
+            ``ref``, ``discarded_paths`` and ``cleaned``).
+        finish_failure: The classified ``finish_failure`` payload, if any.
+
+    Returns:
+        The comment body.
     """
-    cleaned = reset_result.get("cleaned") or ""
+    discarded = list(reset_result.get("discarded_paths") or [])
+    ref = reset_result.get("ref")
+    failure = finish_failure if isinstance(finish_failure, dict) else {}
     lines = [
         f"Drive reset this child for a clean retry (`{child_id}`).",
         "",
@@ -10045,21 +10168,80 @@ def _reset_for_retry_comment(
             f"- Child state before reset: "
             f"{reconciliation.get('evidence') or 'unknown'}"
         ),
-        f"- Failure reason: {failure_message or 'unspecified'}",
         (
-            f"- Worktree reset to: `{reset_result.get('ref')}` "
+            "- Failure reason: "
+            f"{failure_message or 'unspecified'}"
+        ),
+    ]
+    if failure.get("step"):
+        lines.append(
+            f"- Failing `finish` step: `{failure.get('step')}` "
+            f"(reason: `{failure.get('reason') or 'unspecified'}`)"
+        )
+    lines.extend([
+        (
+            f"- Worktree reset to: `{ref}` "
             "(`git reset --hard`, then `git clean -fd`)"
         ),
+        (
+            "- Committed work discarded: none — no commit was discarded "
+            f"(the worktree was not ahead of `{ref}`, so there were no "
+            "commits to discard)."
+        ),
+        "",
+    ])
+    if discarded:
+        lines.append(
+            f"Discarded uncommitted paths ({len(discarded)}):"
+        )
+        lines.extend(f"  - {path}" for path in discarded)
+    else:
+        lines.append(
+            "Discarded uncommitted paths: none (the worktree was clean)."
+        )
+    lines.extend([
         "",
         (
             "Uncommitted WIP in the child's worktree was discarded so the "
             "next drive iteration can start a fresh session. Restore it from "
             "the abandoned session's log if it is still needed."
         ),
-    ]
-    if cleaned:
-        lines.insert(6, f"- Removed by `git clean`: {cleaned.replace(chr(10), ', ')}")
-    return "\n".join(lines)
+    ])
+    # Redact hash-shaped tokens (paths excepted) so the discard record can
+    # never be read as "a commit was thrown away" (AC2).
+    return _redact_commit_hash_tokens("\n".join(lines), keep=discarded)
+
+
+def _reset_for_retry_violation(reset_result: dict[str, Any]) -> str:
+    """Return why a reset result may not be recorded as ``reset-for-retry``.
+
+    ``reset-for-retry`` is limited to a worktree that carried **no commits**
+    ahead of the parent branch (parent AC4, LP-0MVWEP2VQ001NPRK). Committed
+    work is preserved by the refusal gate in :func:`_reset_child_worktree`
+    (tip parked on ``refs/wip/<child-id>``) and never discarded, so a reset
+    result that carries commits — or a preservation refusal — must never be
+    turned into a ``reset-for-retry`` entry: that would imply the committed
+    slice was discarded when it was not.
+
+    Args:
+        reset_result: The :func:`_reset_child_worktree` result.
+
+    Returns:
+        An explanation when the result violates the invariant, else ``""``.
+    """
+    if reset_result.get("preserved_ref") or reset_result.get("preserved"):
+        return (
+            "the worktree carries commits and its tip was preserved at "
+            f"{reset_result.get('preserved_ref') or '(unknown ref)'}; a "
+            "commit-preserving refusal is never a reset-for-retry"
+        )
+    commits_ahead = reset_result.get("commits_ahead")
+    if commits_ahead:
+        return (
+            f"the worktree was {commits_ahead} commit(s) ahead of the parent "
+            "branch, so the reset would have discarded committed work"
+        )
+    return ""
 
 
 def _step_reason_suffix(finish_failure: dict[str, Any]) -> str:
@@ -11412,6 +11594,29 @@ def phase_drive(
                     )
                     report["failed_child"] = failed_cid
                     break
+                # Invariant guard (parent AC4, LP-0MVWEP2VQ001NPRK):
+                # reset-for-retry is only for a worktree that carried **no**
+                # commits ahead of the parent branch. The preservation gate
+                # above refuses a commit-carrying worktree, so reaching this
+                # point with commits would mean a committed slice was
+                # discarded — fail closed instead of recording a
+                # reset-for-retry that implies an uncommitted-only reset.
+                violation = _reset_for_retry_violation(reset_result)
+                if violation:
+                    LOG.error(
+                        "Refusing to record a reset-for-retry for child "
+                        "%s: %s",
+                        failed_cid, violation,
+                    )
+                    report["message"] = (
+                        f"{parent_report.get('message', f'Failed to finish child {failed_cid}')} "
+                        f"(finish-attempt bound {finish_attempt_limit} "
+                        f"exhausted; child is still non-terminal: "
+                        f"{reconciliation['evidence'] or 'state unreadable'}; "
+                        f"reset-for-retry refused: {violation})."
+                    )
+                    report["failed_child"] = failed_cid
+                    break
                 reset_cids.add(failed_cid)
                 # Record the discard *before* changing the status, so the
                 # child owner's WIP is never discarded silently.
@@ -11423,6 +11628,7 @@ def phase_drive(
                         str(parent_report.get("message", "") or ""),
                         reconciliation,
                         reset_result,
+                        finish_failure,
                     ),
                 )
                 try:
@@ -11450,6 +11656,9 @@ def phase_drive(
                     "status": "open",
                     "stage": reconciliation["stage"],
                     "finish_attempts": finish_attempts[failed_cid],
+                    "discarded_paths": list(
+                        reset_result.get("discarded_paths") or []
+                    ),
                     "evidence": reconciliation["evidence"],
                     "reason": (
                         f"finish failed {finish_attempts[failed_cid]} "

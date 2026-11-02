@@ -680,7 +680,7 @@ child handling:
 | `finished` | The child session exited successfully. |
 | `completed-late` | The session timed out/failed **but** the child is terminal (status `completed`/`done`/`in_review`, stage `in_review`, or soft-deleted). The chain continues. |
 | `terminal-reconciled` | The child's `finish` failed but the child was already terminal; recorded as done, the chain continues. |
-| `reset-for-retry` | The child was non-terminal after its finish-attempt bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. |
+| `reset-for-retry` | The child was non-terminal after its finish-attempt bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Only reachable for **uncommitted** WIP: a worktree carrying commits is preserved on `refs/wip/<id>`, never reset. |
 | `finalised` | A stranded child was finalised via `--finalise-stranded` (verified pushed commit, still in-progress, no other agent, clean worktree). The chain continues. |
 | `failed` | The child is not terminal — the chain stops and `failed_child` is set. |
 
@@ -703,8 +703,11 @@ retries only up to `--finish-attempt-limit` (default
 `terminal-reconciled` when it reached a terminal state anyway; (3) otherwise
 resets the child's **own** worktree to the parent-branch HEAD (`git reset
 --hard <parent_branch>` + `git clean -fd`, isolation-gated) and its status to
-`open` via `StatusLifecycle`, with an audit comment naming the failure and the
-reset, then continues with a fresh session (`reset-for-retry`, at most once
+`open` via `StatusLifecycle`, with an audit comment naming the failure, the
+reset and the discarded file list (never a commit hash — `reset-for-retry`
+is limited to uncommitted WIP; a commit-carrying worktree is preserved on
+`refs/wip/<id>` instead), then continues with a fresh session
+(`reset-for-retry`, at most once
 per child per invocation). `parent_advanced: false` therefore always means
 real non-terminal or blocked work remains. Full contract:
 [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#drive-failure-recovery-bounded-finish-attempts-reconciliation-and-reset).

@@ -485,11 +485,25 @@ following tiers in order. Every tier is bounded and records its outcome in
      (`-fd` respects `.gitignore`, so the `node_modules` symlink survives);
    - the item status is set back to `open` through the shared
      `StatusLifecycle` path (`assignee=""`);
-   - an audit comment on the child records the failure reason, the failed
-     finish-attempt count, the child's non-terminal state and the reset
-     performed — abandoned WIP is never discarded silently;
+   - an audit comment on the child records the failure reason (with the
+     classified failing `finish` step/reason when available), the failed
+     finish-attempt count, the child's non-terminal state, the reset
+     performed, and the **file list** the reset discarded (captured from the
+     pre-reset `git status --porcelain` as `discarded_paths`) — abandoned WIP
+     is never discarded silently;
    - the loop then continues, so the next iteration starts a **fresh
      session** for that child (session-attempt accounting is unchanged).
+
+   **`reset-for-retry` is limited to uncommitted WIP** (parent AC4,
+   LP-0MVWEP2VQ001NPRK). The preservation gate below refuses a worktree that
+   carries commits, so the reset path is only ever reached for a worktree
+   that had none; the guard `_reset_for_retry_violation` fails the chain
+   closed if a reset result ever reports commits ahead (or a preserved tip)
+   instead of recording a reset-for-retry entry. The comment therefore states
+   explicitly that no commit was discarded and contains no commit-hash-shaped
+   token (hash-like runs are redacted, the discarded path list stays
+   verbatim), so a reader can never infer that a commit was thrown away. The
+   per-child entry carries `discarded_paths` as observability.
 
    The reset runs **at most once per child per drive invocation**: a second
    exhaustion after a successful reset stops the chain (bounded and
@@ -505,8 +519,29 @@ following tiers in order. Every tier is bounded and records its outcome in
   itself (a nested/shared path is refused);
 - only `git reset --hard <parent_branch>` and `git clean -fd` run, and only
   inside that path — `git clean` is never run on a shared or main path;
-- a refused/failed reset leaves the hard failure in place and names the
-  reason in `report["message"]`.
+- **a worktree that carries commits is refused** (see the preservation gate
+  below), and a refused/failed reset leaves the hard failure in place and
+  names the reason in `report["message"]`.
+
+### Preservation gate: a commit-carrying worktree is never reset
+
+Before any destructive command runs, `_reset_child_worktree` checks whether
+its `HEAD` is ahead of the parent branch (`_worktree_ahead_of_parent`, a
+tri-state result — an undecidable state is refused, never assumed safe). When
+it is ahead, the tip is parked on `refs/wip/<child-id>` with `git update-ref`
+and the reset is **refused**: no `git reset --hard` and no `git clean -fd`
+run, so a committed slice can never be discarded by the recovery path. The
+refusal is reported in `preserved_refs` (`{id, ref, commit}`), commented on
+the child, and it stops the drive chain — spawning a session would race work
+that was deliberately preserved. `refs/wip/<id>` is a fully qualified ref
+outside `refs/heads/`, so it never appears in `git branch` or `git worktree
+list` output.
+
+Marking the invariant complete: because the gate runs first, a successful
+`_reset_child_worktree` result always carries `commits_ahead: 0`, so
+`reset-for-retry` is only ever recorded for an uncommitted-only reset. The
+drive path pins this with `_reset_for_retry_violation` and fails the chain
+closed if a result ever reports commits ahead or a preserved tip.
 
 ### Per-child outcomes (`children_driven`)
 
@@ -517,7 +552,7 @@ values):
 |---|---|
 | `finished` | The child's session exited successfully. |
 | `terminal-reconciled` | The child's `finish` failed but the child was already terminal; recorded as done, the chain continues. Carries `status`, `stage`, `evidence` and `finish_attempts`. |
-| `reset-for-retry` | The child was non-terminal after the finish bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Carries `reset: true`, `status`, `stage`, `evidence` and `finish_attempts`. |
+| `reset-for-retry` | The child was non-terminal after the finish bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Carries `reset: true`, `status`, `stage`, `evidence`, `finish_attempts` and `discarded_paths` (the uncommitted files the reset removed — never a commit). |
 | `completed-late` | Session timeout/exit after the child reached a terminal state (see the timeout section). |
 | `finalised` | A stranded child was finalised via `--finalise-stranded`. |
 | `failed` | The child is not terminal; the chain stops and `failed_child` is set. |
