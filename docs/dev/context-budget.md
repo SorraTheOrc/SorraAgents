@@ -116,10 +116,10 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 14186,
+  "global_agents": 14346,
   "project_agents": 3285,
   "skills_prose": 2339,
-  "total": 19810
+  "total": 19970
 }
 ```
 
@@ -221,6 +221,16 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > and `skills_prose` unchanged). The addition is deliberate isolation-safety
 > guidance applied to every project, so the thresholds were regenerated to the
 > new measured surface with justification rather than dropping the guidance.
+>
+> **Global link-target bump (2026-11-02, SA-0MVZ4BECY002X81S):** making every
+> file reference in `AGENTS_GLOBAL.md` absolute (so no link dangles for a
+> reader of the installed `~/.pi/agent/AGENTS.md`, which has no `docs/` or
+> `skill/` directory) added ~160 B (`global_agents 14186` → `14346`;
+> `total 19810` → `19970`; `project_agents` and `skills_prose` unchanged).
+> The growth is the absolute path prefix on five existing links, not new
+> content; `tests/test_agents_global_links.py` now fails if a repository-relative
+> link returns, so the thresholds were regenerated to the accepted surface
+> rather than compacting normative wording.
 >
 > ### Enforcement (committed gate)
 >
