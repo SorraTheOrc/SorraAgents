@@ -148,9 +148,11 @@ except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 from test.scripts.run_tests import (
     full_suite_commands,
+    group_commands,
     paced_runner,
     parse_node_failures,
     parse_pytest_failures,
+    resolve_type_commands,
     suite_timeout_per_command,
 )
 from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
@@ -876,6 +878,36 @@ injects this block so the model MAY mark execution-dependent criteria met
 based on the executed green run. Distinct from ``AUTO_GREEN_RUN_BLOCK_HEADER``
 (read-only cache consumption) and ``GREEN-RUN ATTESTATION`` (operator
 attestation).
+"""
+
+HERDR_SUITE_GREEN_RUN_BLOCK_HEADER = "HERDR SUITE GREEN RUN"
+"""Header of the herdr package-suite verification block injected into prompts.
+
+The herdr evidence path (WL-0MVHP5NTU009PA3I / SA-0MW133H3P008TNPQ) consumes
+a green herdr package-suite run from the per-repo test cache READ-ONLY — the
+runner never executes the herdr suite itself. The block tells the model that
+an execution-dependent criterion explicitly about the **herdr package suite**
+MAY be marked met based on that verified cached result, while stating
+explicitly that it never satisfies a "full test suite passes" criterion
+(only a ``--type full`` / ``scope: full`` entry does). Distinct from
+``AUTO_GREEN_RUN_BLOCK_HEADER`` (full suite), ``TEST_SKILL_RUN_BLOCK_HEADER``
+(executed full suite) and ``GREEN-RUN ATTESTATION`` (operator attestation).
+"""
+
+HERDR_SUITE_PATH_PREFIXES = ("packages/herdr/",)
+"""Repository path prefixes whose changes make herdr evidence applicable.
+
+A work item whose resolved touched files include any path under one of these
+prefixes is a "herdr-touching" item: the audit consults the herdr package
+suite cache entries for it (WL-0MVHP5NTU009PA3I AC1).
+"""
+
+HERDR_SUITE_TEST_TYPES = ("herdr", "group:herdr")
+"""Independent cache keys under which a herdr suite run may be recorded.
+
+``--type herdr`` records ``test_type="herdr"``; ``--group herdr`` records
+``test_type="group:herdr"`` (see ``docs/dev/test-suite-baseline.md``). A
+green entry under EITHER key counts as herdr evidence (item assumption).
 """
 
 AUDIT_TEST_SKILL_RUN_TIMEOUT = 600
@@ -3117,6 +3149,231 @@ def _auto_green_run_outcome(
             file=sys.stderr,
         )
         return None, None, _FULL_SUITE_CACHE_ERROR
+    return None, None, status
+
+
+# ---------------------------------------------------------------------------
+# Herdr package-suite cache classification
+# (WL-0MVHP5NTU009PA3I / SA-0MW133H3P008TNPQ)
+# ---------------------------------------------------------------------------
+
+# Classification statuses returned by _classify_herdr_suite_cache.
+_HERDR_SUITE_CACHE_GREEN = "green"
+_HERDR_SUITE_CACHE_MISS = "miss"
+_HERDR_SUITE_CACHE_RED = "red"
+_HERDR_SUITE_CACHE_ERROR = "error"
+# The item's touched files include no packages/herdr/** path, so a herdr
+# package-suite criterion is not applicable to it.
+_HERDR_SUITE_CACHE_NOT_APPLICABLE = "not_applicable"
+# The item touches packages/herdr/** but the project defines no herdr suite
+# profile (neither --type herdr nor --group herdr), so there is nothing to
+# query. Fail-open: no evidence, never a block.
+_HERDR_SUITE_CACHE_EMPTY = "empty"
+
+
+def _touches_herdr_suite(touched_files: Sequence[str] | None) -> bool:
+    """Return True when any resolved touched path is under packages/herdr/.
+
+    *touched_files* is the ``_resolve_touched_files`` result (committed paths
+    plus Key Files). A missing/empty set means the touched set could not be
+    determined, so herdr evidence is NOT applicable (fail-open: no evidence).
+    """
+    if not touched_files:
+        return False
+    for raw in touched_files:
+        path = _normalise_repo_path(raw).replace("\\", "/")
+        if path.startswith(HERDR_SUITE_PATH_PREFIXES):
+            return True
+    return False
+
+
+def _resolve_herdr_suite_commands(
+    project_root: str | Path | None = None,
+) -> list[tuple[str, list[str]]]:
+    """Return the project's herdr suite profiles as ``(test_type, commands)``.
+
+    Both independent cache keys are resolved (``--type herdr`` and
+    ``--group herdr``). A profile that is absent or malformed is simply
+    skipped: the audit never fabricates herdr evidence from a broken config
+    (fail-open — no evidence, never a block). Returns an empty list when the
+    project defines no herdr suite profile at all.
+    """
+    root = Path(project_root or TARGET_PROJECT_ROOT).resolve()
+    candidates: list[tuple[str, list[str]]] = []
+    for test_type in HERDR_SUITE_TEST_TYPES:
+        try:
+            if test_type == "herdr":
+                commands = resolve_type_commands(root, "herdr")
+            else:
+                commands = group_commands("herdr", root) or []
+        except Exception:  # noqa: BLE001 -- absent/malformed profile => no evidence
+            commands = []
+        if commands:
+            candidates.append((test_type, list(commands)))
+    return candidates
+
+
+def _classify_herdr_suite_cache(
+    runner: Runner,
+    touched_files: Sequence[str] | None,
+    cwd: str | Path | None = None,
+) -> tuple[str, str | None, list[str], list[str]]:
+    """Classify the read-only herdr package-suite cache state at *cwd*.
+
+    The herdr evidence path (WL-0MVHP5NTU009PA3I AC1) is scoped to work items
+    whose resolved touched files include a ``packages/herdr/**`` path. For
+    such an item it queries the per-repo test cache (``query_cached``, never
+    executes) for the project's herdr suite commands under BOTH independent
+    cache keys (``test_type="herdr"`` and ``test_type="group:herdr"``).
+
+    Returns ``(status, head_sha, problems, cache_keys)``:
+
+    - ``"not_applicable"`` — the touched files include no
+      ``packages/herdr/**`` path (or the touched set is undetermined).
+    - ``"empty"`` — herdr-touching, but the project defines no herdr suite
+      profile (no ``--type herdr`` / ``--group herdr``).
+    - ``"green"`` — at least one profile has a cached entry at the audited
+      git state within ``AUDIT_CACHE_TTL_SECONDS``, every command of that
+      profile exits 0, and every entry is ``scope="full"``. ``cache_keys``
+      names the profiles that verified green.
+    - ``"miss"`` — herdr-touching with resolvable profiles, but no profile is
+      fully green and no cached entry is red (missing / changed-scope).
+    - ``"red"`` — at least one cached herdr entry exited non-zero (and none
+      is green).
+    - ``"error"`` — the audited HEAD could not be resolved.
+
+    This classification NEVER feeds the full-suite AC: a herdr entry is not
+    full-suite evidence (AC2). The full-suite classifier is untouched.
+    """
+    if not _touches_herdr_suite(touched_files):
+        return _HERDR_SUITE_CACHE_NOT_APPLICABLE, None, [], []
+
+    head_sha = _resolve_audited_head(runner)
+    if head_sha is None:
+        return _HERDR_SUITE_CACHE_ERROR, None, [], []
+
+    project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
+    candidates = _resolve_herdr_suite_commands(project_root)
+    if not candidates:
+        return _HERDR_SUITE_CACHE_EMPTY, head_sha, [
+            "the item touches packages/herdr/** but the project defines no "
+            "herdr suite profile (--type herdr / --group herdr); run the "
+            "herdr suite once via the test skill to populate the cache"
+        ], []
+
+    green_keys: list[str] = []
+    problems: list[str] = []
+    red = False
+    for test_type, commands in candidates:
+        profile_problems: list[str] = []
+        for command in commands:
+            entry = query_cached(
+                command,
+                cwd=str(project_root),
+                ttl=AUDIT_CACHE_TTL_SECONDS,
+                test_type=test_type,
+            )
+            if entry is None:
+                profile_problems.append(
+                    f"no cached {test_type} herdr suite run for '{command}' "
+                    f"at HEAD {head_sha}"
+                )
+            elif entry.get("scope", "full") != "full":
+                profile_problems.append(
+                    f"cached {test_type} herdr suite run for '{command}' is "
+                    f"changed-scope (partial); a full-scope run is required "
+                    f"at HEAD {head_sha}"
+                )
+            elif int(entry.get("exit_code", -1)) != 0:
+                red = True
+                profile_problems.append(
+                    f"cached {test_type} herdr suite run for '{command}' "
+                    f"exited non-zero ({int(entry.get('exit_code'))})"
+                )
+        if profile_problems:
+            problems.extend(profile_problems)
+        else:
+            green_keys.append(test_type)
+
+    if green_keys:
+        return _HERDR_SUITE_CACHE_GREEN, head_sha, [], green_keys
+    if red:
+        return _HERDR_SUITE_CACHE_RED, head_sha, problems, []
+    return _HERDR_SUITE_CACHE_MISS, head_sha, problems, []
+
+
+def _herdr_green_run_prompt_block(sha: str, cache_keys: Sequence[str]) -> str:
+    """Build the HERDR SUITE GREEN RUN block injected into audit prompts.
+
+    The block tells the model that a cached herdr package-suite run at *sha*
+    (== the audited HEAD) was verified green READ-ONLY (``query_cached`` never
+    executes), so an execution-dependent criterion explicitly about the herdr
+    package suite MAY be marked met. It states explicitly that this evidence
+    does NOT satisfy a "full test suite passes" criterion (WL-0MVHP5NTU009PA3I
+    AC2). Returns a string ending in a blank line so callers can splice it
+    between existing prompt sections.
+    """
+    keys = ", ".join(f"`{key}`" for key in cache_keys)
+    return (
+        f"{HERDR_SUITE_GREEN_RUN_BLOCK_HEADER} — A cached herdr package-suite "
+        f"run at commit {sha} (== current HEAD) was verified green from the "
+        f"per-repo test cache under {keys} (read-only query; the audit never "
+        "executes the herdr suite on this path). An execution-dependent "
+        "criterion explicitly about the HERDR PACKAGE SUITE (e.g. 'herdr "
+        "suite passes') MAY be marked met based on this verified cached "
+        "result. This evidence does NOT satisfy a 'full test suite passes' "
+        "criterion — that still requires a full-suite cache entry "
+        "(type 'full', scope 'full'). The audit runner manages test "
+        "execution: Do NOT execute tests yourself. Do NOT execute any other "
+        "state-modifying command (wl, git, …) — the read-only mandate "
+        "otherwise remains in force.\n\n"
+    )
+
+
+def _auto_herdr_green_run_outcome(
+    runner: Runner,
+    touched_files: Sequence[str] | None,
+    cwd: str | Path | None = None,
+) -> tuple[str | None, str | None, str]:
+    """Resolve automatically-verified herdr package-suite evidence, read-only.
+
+    Delegates the cache query to :func:`_classify_herdr_suite_cache` and maps
+    a GREEN classification onto the prompt block. Fail-closed on evidence: any
+    non-green state (miss, red, empty, error, not-applicable) yields
+    ``(None, None, status)`` — execution-dependent herdr criteria then stay
+    partial and the audit proceeds normally (never blocks).
+    """
+    try:
+        status, head_sha, problems, cache_keys = _classify_herdr_suite_cache(
+            runner, touched_files, cwd=cwd,
+        )
+    except Exception as exc:  # noqa: BLE001 -- fail-closed: never crash the audit
+        print(
+            f"Automatic herdr suite verification unavailable: {exc}. "
+            "Herdr execution-dependent criteria stay partial.",
+            file=sys.stderr,
+        )
+        return None, None, _HERDR_SUITE_CACHE_ERROR
+
+    if status == _HERDR_SUITE_CACHE_GREEN and head_sha is not None:
+        return (
+            _herdr_green_run_prompt_block(head_sha, cache_keys),
+            head_sha,
+            status,
+        )
+    if status in (
+        _HERDR_SUITE_CACHE_MISS,
+        _HERDR_SUITE_CACHE_RED,
+        _HERDR_SUITE_CACHE_EMPTY,
+    ):
+        print(
+            "Automatic herdr suite verification unavailable: "
+            + "; ".join(problems)
+            + ". Run the herdr suite once at this commit (run_tests.py "
+            "--type herdr or --group herdr) to populate the cache, then "
+            "re-audit. Herdr execution-dependent criteria stay partial.",
+            file=sys.stderr,
+        )
     return None, None, status
 
 
@@ -6007,6 +6264,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            green_run_sha: str | None = None,
                            auto_green_run_sha: str | None = None,
                            test_skill_run_sha: str | None = None,
+                           herdr_green_run_sha: str | None = None,
                            content_fingerprint: str | None = None,
                            merge_gate_evidence: str | None = None,
                            snapshot_exempt: set[str] | None = None,
@@ -6056,6 +6314,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       ``Test skill run evidence: <sha> (executed full-suite run, --run-tests)``
       line is emitted near the header so the report records the evidence
       source distinctly from the cache-consumption path.
+
+    *herdr_green_run_sha* is the herdr package-suite commit sha (when a green
+      cached herdr run was found read-only under the ``herdr`` or
+      ``group:herdr`` cache key for a herdr-touching item,
+      WL-0MVHP5NTU009PA3I). When provided, a
+      ``Herdr suite evidence: <sha> (cached herdr package-suite run)`` line is
+      emitted near the header. It is recorded separately from the full-suite
+      evidence because a herdr entry never satisfies a full-suite AC (AC2).
 
     *content_fingerprint* is the content fingerprint (a sha256 over the work
       item's own title + description payload, zero git calls, see
@@ -6220,6 +6486,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"Test skill run evidence: {test_skill_run_sha} "
                 "(executed full-suite run)"
             )
+        if herdr_green_run_sha:
+            lines.append("")
+            lines.append(
+                f"Herdr suite evidence: {herdr_green_run_sha} "
+                "(cached herdr package-suite run)"
+            )
         if content_fingerprint:
             lines.append("")
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
@@ -6245,6 +6517,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"Test skill run evidence: {test_skill_run_sha} "
                 "(executed full-suite run)"
+            )
+        if herdr_green_run_sha:
+            lines.append("")
+            lines.append(
+                f"Herdr suite evidence: {herdr_green_run_sha} "
+                "(cached herdr package-suite run)"
             )
         if content_fingerprint:
             lines.append("")
@@ -9336,6 +9614,7 @@ class _AuditContext:
     green_run_sha: str | None = None
     auto_green_run_sha: str | None = None
     test_skill_run_sha: str | None = None
+    herdr_green_run_sha: str | None = None
     original_status: str = "open"
     original_stage: str = ""
     wi: dict | None = None
@@ -10331,6 +10610,29 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     except RuntimeError:
         pass  # Fall back to safe defaults
 
+    # Herdr package-suite evidence (WL-0MVHP5NTU009PA3I): a work item whose
+    # resolved touched files include packages/herdr/** may auto-verify a
+    # "herdr suite passes" criterion from the `herdr` / `group:herdr` cache
+    # entry, read-only. This path is INDEPENDENT of the full-suite evidence
+    # above and NEVER satisfies a full-suite AC (AC2) — the injected block
+    # states that explicitly, and the full-suite classifier is untouched.
+    # The already-fetched ``wi`` is passed through so this path adds NO extra
+    # ``wl show`` (the single-fetch contract, SA-0MSL1Z7E9005TLBA).
+    herdr_green_run_sha = None
+    herdr_touched_files: list[str] | None = None
+    try:
+        herdr_touched_files = _resolve_touched_files(
+            runner, issue_id, worklog_dir=worklog_dir, work_item=wi,
+        )
+    except Exception:  # noqa: BLE001 -- fail-open: no herdr evidence
+        herdr_touched_files = None
+    herdr_block, herdr_sha, _herdr_status = _auto_herdr_green_run_outcome(
+        runner, herdr_touched_files, cwd=str(per_audit_root),
+    )
+    if herdr_sha is not None:
+        green_run_block = (green_run_block or "") + (herdr_block or "")
+        herdr_green_run_sha = herdr_sha
+
     # ------------------------------------------------------------------
     # Freshness gate: skip if a recent audit already exists
     # (before status lifecycle to avoid unnecessary in_progress transitions)
@@ -10495,6 +10797,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     ctx.green_run_sha = green_run_sha
     ctx.auto_green_run_sha = auto_green_run_sha
     ctx.test_skill_run_sha = test_skill_run_sha
+    ctx.herdr_green_run_sha = herdr_green_run_sha
     ctx.original_status = original_status
     ctx.original_stage = original_stage
     ctx.wi = wi
@@ -12993,6 +13296,7 @@ def _phase_report(ctx: _AuditContext) -> int:
     green_run_sha = ctx.green_run_sha
     auto_green_run_sha = ctx.auto_green_run_sha
     test_skill_run_sha = ctx.test_skill_run_sha
+    herdr_green_run_sha = ctx.herdr_green_run_sha
     content_fingerprint = ctx.content_fingerprint
     child_persist_results = ctx.child_persist_results
     audit_verdict = ctx.audit_verdict
@@ -13040,6 +13344,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 green_run_sha=green_run_sha,
                 auto_green_run_sha=auto_green_run_sha,
                 test_skill_run_sha=test_skill_run_sha,
+                herdr_green_run_sha=herdr_green_run_sha,
                 content_fingerprint=content_fingerprint,
                 merge_gate_evidence=ctx.merge_gate_evidence,
                 snapshot_exempt=ctx.snapshot_exempt_children,
