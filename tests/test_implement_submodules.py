@@ -319,14 +319,19 @@ class TestStructural:
         )
 
     def test_phase_start_calls_submodules_after_node_modules_symlink(self):
-        """Submodule init must run AFTER node_modules symlink (same insertion point)."""
+        """Submodule init must run AFTER node_modules preparation.
+
+        SA-0MVPI400Y001FOM1 replaced the direct ``_ensure_node_modules_symlink``
+        call at the phase_start insertion point with ``_prepare_node_modules``;
+        submodule initialisation must still follow it.
+        """
         assert self.SOURCE
-        nm_idx = self.SOURCE.index("_ensure_node_modules_symlink(abs_wt_path")
+        nm_idx = self.SOURCE.index("_prepare_node_modules(abs_wt_path")
         sub_idx = self.SOURCE.index("_ensure_submodules(abs_wt_path")
         assert nm_idx != -1
         assert sub_idx != -1
         assert sub_idx > nm_idx, (
-            "submodule init helper must be called AFTER the node_modules symlink"
+            "submodule init helper must be called AFTER node_modules preparation"
         )
 
     def test_helper_defined(self):
