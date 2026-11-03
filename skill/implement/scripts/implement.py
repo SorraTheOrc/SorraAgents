@@ -46,6 +46,11 @@ Optional flags:
                             driving (default: 5; a separate budget, never
                             consumes --finish-attempt-limit, spawns no session)
   --child-timeout N         Per-child session timeout in seconds (default: 3600)
+  --pane-sessions / --no-pane-sessions
+                            Drive children in interactive Herdr panes when Herdr
+                            is detected (default: env-driven via
+                            IMPLEMENT_DRIVE_PANE_SESSIONS)
+  --focus / --no-focus      Focus each new child pane (default: --no-focus)
   --finalise-stranded       Finalise evidence-gated stranded children when driving
   -v, --verbose             Verbose logging
 
@@ -53,6 +58,8 @@ Environment:
   IMPLEMENT_TEST_COMMAND    Override the finish test-step command (shell string)
   IMPLEMENT_DRIVE_PI_BIN    Pi executable used to spawn child sessions (default: pi)
   IMPLEMENT_DRIVE_CHILD_TIMEOUT  Per-child session timeout in seconds
+  IMPLEMENT_DRIVE_PANE_SESSIONS  Opt in to the pane-driven transport (same as
+                            --pane-sessions); needs HERDR_ENV=1 + herdr binary
 
 Exit codes:
   0 – success
@@ -65,6 +72,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import functools
 import json
 import logging
 import os
@@ -89,7 +97,7 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +114,8 @@ from import_guard import guard_shared_import
 
 try:
     from shared.code_freeze import is_code_freeze_active
+    from shared.herdr_pane import resolve_herdr_bin as _resolve_herdr_bin_path
+    from shared.herdr_session import HerdrSessionClient, agent_name_for_child
     from shared.repo_lock import DEFAULT_LOCK_RELPATH as _REPO_LOCK_RELPATH
     from shared.repo_lock import RepoLock, release_repo_lock
     from shared.skill_extensions import (
@@ -263,6 +273,22 @@ KEEP_WORKTREE_ENV = "IMPLEMENT_KEEP_WORKTREE"
 #: so the child can verify its worktree root before its first edit — ``cwd``
 #: alone does not confine an agent (it can ``cd`` to the main checkout).
 WORKTREE_ENV = "IMPLEMENT_WORKTREE_PATH"
+#: Explicit opt-in for the Herdr pane-driven transport (``--pane-sessions`` is
+#: the CLI equivalent). Same ``"1"``-style convention as
+#: :data:`DRIVE_RECURSION_ENV`. Absent/off keeps the headless ``pi -p`` path,
+#: which automated callers (downtime worker, audit dispatch, CI) rely on.
+PANE_SESSIONS_ENV = "IMPLEMENT_DRIVE_PANE_SESSIONS"
+#: Default focus behaviour for pane-driven children: never steal the caller's
+#: focus. ``--focus`` switches to each new child pane instead.
+DEFAULT_PANE_FOCUS = False
+#: Environment keys a pane child must receive explicitly (the recursion guard,
+#: the worktree marker and — when present — the per-child lock token).
+#: Deliberately an allow-list: the whole inherited environment is never
+#: forwarded through ``pane split --env`` (leaked secrets in argv, noise).
+PANE_CHILD_ENV_KEYS = (DRIVE_RECURSION_ENV, WORKTREE_ENV, ENV_LOCK_TOKEN)
+#: The driving session's identity, which must never reach a child pane: the
+#: child starts its own clean session (``_child_session_env`` removes them).
+PANE_IDENTITY_ENV_KEYS = ("PI_SESSION_ID", "PI_SESSION_FILE")
 #: Report action for a child whose per-work-item lock is held by a live
 #: holder (another driver/session). The refused party performs no work and
 #: reports the holder identity instead of racing it (SA-0MVQ5AXLF002PAQ3).
@@ -10522,6 +10548,268 @@ def _default_session_spawner(
     return result
 
 
+def _env_flag(env: Mapping | None, name: str) -> bool:
+    """True when *name* is set to a truthy value (``1``/``true``/``yes``/``on``).
+
+    Args:
+        env: Environment mapping (defaults to ``os.environ``).
+        name: Environment variable name.
+
+    Returns:
+        True when the variable holds a truthy string, else False.
+    """
+    value = (env if env is not None else os.environ).get(name)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pane_sessions_opted_in(
+    flag: bool | None = None,
+    env: Mapping | None = None,
+) -> bool:
+    """Whether the operator opted in to the pane-driven transport.
+
+    An explicit ``--pane-sessions`` / ``--no-pane-sessions`` flag always wins
+    (``--no-pane-sessions`` is an opt-out even when the env var is set). When
+    the flag is absent the decision is env-driven via
+    :data:`PANE_SESSIONS_ENV`.
+
+    Args:
+        flag: Parsed CLI flag (``None`` = not given).
+        env: Environment mapping (defaults to ``os.environ``).
+
+    Returns:
+        True when pane driving is opted in.
+    """
+    if flag is not None:
+        return bool(flag)
+    return _env_flag(env, PANE_SESSIONS_ENV)
+
+
+def _herdr_available(env: Mapping | None = None) -> bool:
+    """Whether a live Herdr session with a resolvable CLI is present.
+
+    Detection is deliberately two-part (AC5): ``HERDR_ENV=1`` (Herdr exports it
+    into every managed pane) **and** a resolvable herdr binary (reusing
+    :func:`shared.herdr_pane.resolve_herdr_bin`, so ``HERDR_BIN_PATH`` wins
+    over ``PATH`` exactly as it does for pane titles). Anything else falls
+    back to the headless spawner.
+
+    Args:
+        env: Environment mapping (defaults to ``os.environ``).
+
+    Returns:
+        True when pane driving *can* work in this environment.
+    """
+    env_map = dict(env if env is not None else os.environ)
+    if env_map.get("HERDR_ENV") != "1":
+        return False
+    return bool(_resolve_herdr_bin_path(env_map))
+
+
+def _select_session_spawner(
+    pane_sessions: bool | None = None,
+    focus: bool = DEFAULT_PANE_FOCUS,
+    env: Mapping | None = None,
+    default: Callable[..., dict[str, Any]] | None = None,
+    client: Any | None = None,
+) -> Callable[..., dict[str, Any]]:
+    """Choose the child-session transport for this ``drive`` invocation.
+
+    Pane driving is selected only when the operator opted in **and** Herdr is
+    detected; every other combination returns *default* (the headless
+    ``pi -p`` spawner) unchanged. This fail-open rule is what keeps automated
+    callers — the downtime worker, audit dispatch and CI, none of which have a
+    Herdr session — on the headless path even if a stray flag is passed.
+
+    Args:
+        pane_sessions: Parsed ``--pane-sessions``/``--no-pane-sessions`` flag
+            (``None`` = env-driven via :data:`PANE_SESSIONS_ENV`).
+        focus: Whether each new child pane takes focus (``--focus``).
+        env: Environment mapping used for detection (defaults to
+            ``os.environ``).
+        default: The headless spawner to fall back to (tests may inject one).
+        client: Injectable herdr session client bound into the pane spawner
+            (tests); ignored by the headless path.
+
+    Returns:
+        A spawner callable with the ``_default_session_spawner`` signature.
+    """
+    base = default or _default_session_spawner
+    if not _pane_sessions_opted_in(pane_sessions, env):
+        return base
+    if not _herdr_available(env):
+        LOG.info(
+            "Pane-driven sessions requested but Herdr is not available "
+            "(HERDR_ENV=1 and a resolvable herdr binary are required); "
+            "falling back to the headless `pi -p` spawner."
+        )
+        return base
+    return functools.partial(
+        _pane_session_spawner, focus=bool(focus), client=client,
+    )
+
+
+def _pane_child_env(env: Mapping | None) -> dict[str, str]:
+    """The explicit environment a pane child receives via ``pane split --env``.
+
+    Only the deliberate markers (:data:`PANE_CHILD_ENV_KEYS`) are forwarded —
+    never the whole inherited environment (which would leak secrets into the
+    recorded argv) and never the driving session's identity
+    (:data:`PANE_IDENTITY_ENV_KEYS`).
+
+    Args:
+        env: The child environment built by :func:`_child_session_env`.
+
+    Returns:
+        Ordered ``{KEY: value}`` pairs, empty entries omitted.
+    """
+    env_map = env if env is not None else os.environ
+    pairs: dict[str, str] = {}
+    for key in PANE_CHILD_ENV_KEYS:
+        if key in PANE_IDENTITY_ENV_KEYS:
+            continue
+        value = env_map.get(key)
+        if value:
+            pairs[key] = str(value)
+    return pairs
+
+
+def _pane_session_spawner(
+    child_id: str,
+    worktree_path: str,
+    timeout: int,
+    env: dict[str, str],
+    verbose: bool = False,
+    *,
+    focus: bool = DEFAULT_PANE_FOCUS,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    """Drive *child_id* as an interactive Pi TUI agent in a sibling pane.
+
+    The pane-driven counterpart of :func:`_default_session_spawner`
+    (SA-0MVPHYIIE002OBC8):
+
+    1. ``pane split --current --cwd <worktree> --env K=V… [--focus|--no-focus]``
+       — a sibling pane in the caller's tab, never a new tab/workspace.
+    2. ``agent start drive-<child> --kind pi --pane <id> -- --approve
+       --no-extensions`` — the same extensions-disabled child session shape
+       as the headless path.
+    3. ``agent prompt <name> "/skill:implement <child>" --wait --until done
+       --until blocked`` — the interactive turn that runs the leaf workflow.
+
+    The child environment is the one built by :func:`_child_session_env`: the
+    pane receives the recursion guard, the worktree marker and the lock token,
+    but not the driving session's ``PI_SESSION_ID`` / ``PI_SESSION_FILE``.
+    Because ``herdr agent start`` has no unset-environment option, the same
+    scrubbed environment is handed to the herdr CLI itself (the ``env -u
+    PI_SESSION_ID -u PI_SESSION_FILE`` equivalent), so the launched TUI cannot
+    inherit the driving session's identity from this process either.
+
+    Every herdr call is fail-open: a split/start/prompt failure is reported as
+    ``success: False`` with the herdr reason, never raised, and the chain stops
+    cleanly. When the pane was created the returned ``pane_id`` lets the caller
+    retain (or close) it — pane lifecycle handling is the next slice's job.
+
+    Args:
+        child_id: The child work item ID.
+        worktree_path: The child's pre-created worktree (the pane's cwd).
+        timeout: Per-child session budget in seconds (bounds readiness and the
+            prompt wait).
+        env: The child environment (already scrubbed by
+            :func:`_child_session_env`).
+        verbose: Accepted for signature parity with the headless spawner.
+        focus: Whether the new pane takes focus (default: do not steal focus).
+        client: Injectable herdr session client (tests); defaults to a
+            :class:`shared.herdr_session.HerdrSessionClient` over *env*.
+
+    Returns:
+        ``{"success", "returncode", "reason", "pane_id", "transport"}`` —
+        a superset of :func:`_default_session_spawner`'s result, so existing
+        ``phase_drive`` success handling is unchanged.
+    """
+    # Accepted for signature parity with ``_default_session_spawner``; the
+    # pane transport logs its own argv.
+    del verbose
+    result: dict[str, Any] = {
+        "success": False,
+        "returncode": None,
+        "reason": "",
+        "pane_id": None,
+        "transport": "pane",
+    }
+
+    herdr = client or HerdrSessionClient(env=env)
+
+    split = herdr.split_pane(worktree_path, env=_pane_child_env(env), focus=focus)
+    if not split.get("success"):
+        result["reason"] = (
+            f"Failed to split a Herdr pane for {child_id}: "
+            f"{split.get('reason') or 'unknown herdr failure'}"
+        )
+        return result
+
+    pane_id = str(split["pane_id"])
+    result["pane_id"] = pane_id
+    agent_name = agent_name_for_child(child_id)
+    result["agent_name"] = agent_name
+
+    LOG.info(
+        "Driving child %s in Herdr pane %s as agent %s (cwd=%s)",
+        child_id, pane_id, agent_name, worktree_path,
+    )
+
+    # herdr caps the readiness wait at 300s; a larger child budget must not be
+    # clamped into an invalid CLI argument.
+    readiness_ms = min(max(int(timeout), 1) * 1000, 300_000)
+    start = herdr.start_agent(
+        agent_name,
+        pane_id,
+        args=["--approve", "--no-extensions"],
+        timeout_ms=readiness_ms,
+        ready_budget_seconds=min(float(max(int(timeout), 1)), 30.0),
+    )
+    if not start.get("success"):
+        result["returncode"] = start.get("returncode")
+        result["reason"] = (
+            f"Failed to start the pane agent for {child_id}: "
+            f"{start.get('reason') or 'unknown herdr failure'}"
+        )
+        return result
+
+    prompt = herdr.prompt_agent(
+        agent_name,
+        f"/skill:implement {child_id}",
+        wait=True,
+        until=("done", "blocked"),
+        timeout_ms=max(int(timeout), 1) * 1000,
+    )
+    result["returncode"] = prompt.get("returncode")
+    result["agent_status"] = prompt.get("agent_status")
+    if not prompt.get("success"):
+        reason = prompt.get("reason") or "unknown herdr failure"
+        if prompt.get("code") == "timeout":
+            # Wording matters: ``_reconcile_spawn_failure`` classifies a
+            # timeout by the phrase and reconciles against the child's real
+            # state, so a child that finished before the wait expired is
+            # reported as completed-late, not failed.
+            reason = (
+                f"Pane agent for {child_id} timed out after {timeout}s: "
+                f"{reason}"
+            )
+        else:
+            reason = f"Pane agent for {child_id} did not complete: {reason}"
+        result["reason"] = reason
+        return result
+
+    LOG.info(
+        "Pane agent %s for %s settled with status %s",
+        agent_name, child_id, result["agent_status"],
+    )
+    result["success"] = True
+    result["returncode"] = prompt.get("returncode") or 0
+    return result
+
+
 def _reconcile_spawn_failure(
     child_id: str,
     spawn_result: dict[str, Any],
@@ -12103,8 +12391,11 @@ def phase_drive(
     child_timeout: int | None = None,
     finish_attempt_limit: int | None = None,
     infra_retry_limit: int = DEFAULT_INFRA_RETRY_LIMIT,
+    pane_sessions: bool | None = None,
+    focus: bool = DEFAULT_PANE_FOCUS,
     delay: Callable[[float], None] | None = None,
     spawn_session: Callable[..., dict[str, Any]] | None = None,
+    pane_client: Any | None = None,
     parent_runner: Callable[..., dict[str, Any] | None] | None = None,
     commit_evidence: Callable[[str], str | None] | None = None,
     finalise_stranded: bool = False,
@@ -12194,10 +12485,23 @@ def phase_drive(
             refusal that clears within the budget lets the same ``finish``
             succeed and the chain continue (LP-0MVWEP292000ODBS). A
             non-positive value is clamped to 1.
+        pane_sessions: Opt in to the Herdr pane-driven transport
+            (``--pane-sessions`` / ``--no-pane-sessions``). ``None`` (the
+            default) is env-driven via ``IMPLEMENT_DRIVE_PANE_SESSIONS``.
+            Pane driving additionally requires Herdr to be detected
+            (``HERDR_ENV=1`` and a resolvable herdr binary); otherwise the
+            headless ``pi -p`` spawner is used unchanged
+            (SA-0MVPHYIIE002OBC8).
+        focus: Whether each new child pane takes focus (``--focus``).
+            Default False so the caller's focus is never stolen.
         delay: Injectable backoff sleeper for infrastructure retries (tests
             pass a zero-cost recorder; default ``time.sleep``).
-        spawn_session: Injectable spawner (tests); defaults to
-            :func:`_default_session_spawner`.
+        spawn_session: Injectable spawner (tests); defaults to the transport
+            chosen by :func:`_select_session_spawner`
+            (:func:`_pane_session_spawner` when Herdr is detected and the
+            operator opted in, else :func:`_default_session_spawner`).
+        pane_client: Injectable ``HerdrSessionClient`` for the pane transport
+            (tests); forwarded to :func:`_pane_session_spawner`.
         parent_runner: Injectable ``parent`` runner (tests); defaults to
             :func:`_invoke_implement`.
         commit_evidence: Injectable pushed-commit evidence provider (tests)
@@ -12316,7 +12620,12 @@ def phase_drive(
             )
     else:
         runner = parent_runner
-    spawner = spawn_session or _default_session_spawner
+    spawner = spawn_session or _select_session_spawner(
+        pane_sessions=pane_sessions,
+        focus=focus,
+        env=os.environ,
+        client=pane_client,
+    )
     timeout = child_timeout or _resolve_child_session_timeout()
     max_child_sessions = max(1, int(max_child_sessions))
     finish_attempt_limit = (
@@ -13368,6 +13677,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pane-sessions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Drive each child as an interactive Pi TUI in a sibling Herdr "
+            "pane of the calling tab. Requires Herdr to be detected "
+            "(HERDR_ENV=1 and a resolvable herdr binary); otherwise the "
+            "headless `pi -p` spawner is used unchanged. ``--no-pane-sessions`` "
+            "forces the headless path. Default: env-driven via "
+            f"{PANE_SESSIONS_ENV}."
+        ),
+    )
+    parser.add_argument(
+        "--focus",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_PANE_FOCUS,
+        help=(
+            "With pane sessions, focus each new child pane. Default "
+            "--no-focus so the caller's focus is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--finalise-stranded",
         action="store_true",
         default=False,
@@ -13491,6 +13822,8 @@ def _main(argv: list[str] | None = None) -> int:
                 finish_attempt_limit=args.finish_attempt_limit,
                 infra_retry_limit=args.infra_retry_limit,
                 finalise_stranded=args.finalise_stranded,
+                pane_sessions=args.pane_sessions,
+                focus=args.focus,
             )
             _emit_timing(_root_timer)
     else:

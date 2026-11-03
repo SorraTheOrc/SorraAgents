@@ -1889,3 +1889,83 @@ creation, the `done`/`blocked`/`timeout`/`unknown` transitions, the
 `agent_not_ready` retry and exhaustion paths, every fail-open mode, and an
 end-to-end shim run asserting a full split → start → prompt → wait → close
 sequence.
+
+## Pane-driven drive transport and opt-in (SA-0MVPHYIIE002OBC8)
+
+`implement.py drive <parent>` can run each child's implementation session as an
+**interactive Pi TUI agent in a sibling Herdr pane** of the calling tab instead
+of a headless `pi -p` subprocess. The transport is chosen per invocation and
+the headless path remains the default everywhere else.
+
+### Selection (fail-open)
+
+Pane driving is selected only when **both** halves agree:
+
+| Condition | Source |
+|---|---|
+| Herdr is present | `HERDR_ENV=1` **and** a resolvable herdr binary (`HERDR_BIN_PATH`, else `herdr` on `PATH` — the same resolver `herdr_pane` uses for pane titles) |
+| The operator opted in | `--pane-sessions`, or `IMPLEMENT_DRIVE_PANE_SESSIONS=1` |
+
+`--no-pane-sessions` is an explicit opt-out and wins over an ambient
+`IMPLEMENT_DRIVE_PANE_SESSIONS=1`. Any other combination — not inside Herdr, no
+binary, no opt-in — returns the existing `_default_session_spawner` unchanged,
+so the downtime worker, audit dispatch and CI keep the headless path even if a
+stray flag is passed. `spawn_session` remains the test injection point;
+`_select_session_spawner(pane_sessions, focus, env, default, client)` is the
+production selector.
+
+### `_pane_session_spawner`
+
+`_pane_session_spawner(child_id, worktree_path, timeout, env, verbose=False,
+*, focus=False, client=None)` mirrors the headless spawner's contract and adds
+`pane_id` and `transport`:
+
+1. `pane split --current --direction right --cwd <worktree> --env K=V … --no-focus`
+   — a sibling pane in the caller's tab (never `tab create` / `workspace
+   create`).
+2. `agent start drive-<child-id> --kind pi --pane <id> -- --approve
+   --no-extensions` — the same extensions-disabled child session shape as the
+   headless path; `agent_not_ready` is retried within a 30 s readiness budget.
+3. `agent prompt <name> "/skill:implement <child>" --wait --until done --until
+   blocked --timeout <child budget>` — the interactive turn that runs the leaf
+   workflow. Completion is still decided by the next `phase_parent` stage
+   re-read; the prompt wait only occupies the session like the headless
+   process would.
+
+The result is `{"success", "returncode", "reason", "pane_id", "transport"}` — a
+superset of `_default_session_spawner`'s shape, so `phase_drive`'s existing
+success/failure handling, `completed-late` reconciliation and stranded-child
+detection are reused unchanged. Every herdr call is fail-open: a split, start
+or prompt failure is a reported `reason` (with the herdr error code), never an
+exception, and the chain stops cleanly. A prompt timeout is worded as
+`… timed out after Ns: …` so `_reconcile_spawn_failure` still classifies it as a
+bound rather than a verdict.
+
+### Environment isolation
+
+The pane child receives the environment built by `_child_session_env`:
+`IMPLEMENT_DRIVE_ACTIVE=1`, `IMPLEMENT_WORKTREE_PATH` and — when present — the
+per-child lock token. Only those markers are forwarded through `pane split
+--env` (an allow-list: the whole inherited environment never enters the
+recorded argv, so secrets cannot leak there). `PI_SESSION_ID` and
+`PI_SESSION_FILE` are removed by `_child_session_env` and never re-injected.
+Because `herdr agent start` has no unset-environment option, the same scrubbed
+environment is handed to the herdr CLI process itself — the `env -u
+PI_SESSION_ID -u PI_SESSION_FILE` equivalent — so the launched TUI cannot
+inherit the driving session's identity from this process either.
+
+### Focus
+
+`--focus` / `--no-focus` control whether each new child pane takes focus. The
+default is **`--no-focus`** so driving an epic never moves the operator's focus
+away from the session they invoked it from; the exact flag passed to `pane
+split` is asserted in the tests.
+
+### Tests
+
+`skill/implement/tests/test_drive_child_session.py` covers the spawner's exact
+herdr argv (split → start → prompt, no tab/workspace creation), the
+`--focus`/`--no-focus` flag, the env allow-list and the `env -u` equivalent,
+fail-open split/start/prompt failures (including a prompt timeout), the
+detection × opt-in selection matrix, and an end-to-end `phase_drive` run
+through the pane transport with a fake herdr CLI. No live Herdr is needed.

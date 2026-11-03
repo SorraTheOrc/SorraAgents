@@ -657,10 +657,24 @@ each child keeps its own clean context window and its own worktree. Options:
 infrastructure-refusal `finish` retries on a separate budget with backoff,
 `--child-timeout S` (default 3600),
 `--finalise-stranded` (opt-in, evidence-gated finalisation of stranded
-children — see below). When no Pi executable is available it stops with
-actionable manual instructions rather than silently skipping a child
-(`IMPLEMENT_DRIVE_PI_BIN` overrides the binary). A driven session is marked
-`IMPLEMENT_DRIVE_ACTIVE=1` and refuses to re-enter `drive`.
+children — see below), and `--pane-sessions` / `--no-pane-sessions` with
+`--focus` / `--no-focus` (default `--no-focus`). When no Pi executable is
+available it stops with actionable manual instructions rather than silently
+skipping a child (`IMPLEMENT_DRIVE_PI_BIN` overrides the binary). A driven
+session is marked `IMPLEMENT_DRIVE_ACTIVE=1` and refuses to re-enter `drive`.
+
+**Pane transport (opt-in, fail-open).** With `--pane-sessions` (or
+`IMPLEMENT_DRIVE_PANE_SESSIONS=1`) **and** Herdr detected (`HERDR_ENV=1` plus a
+resolvable herdr binary), each child is instead driven as an interactive Pi TUI
+agent in a sibling pane of the calling tab: `herdr pane split --current --cwd
+<child worktree>` → `herdr agent start … -- --approve --no-extensions` →
+`herdr agent prompt … "/skill:implement <child>" --wait`. The child pane gets
+`IMPLEMENT_DRIVE_ACTIVE=1` and `IMPLEMENT_WORKTREE_PATH` but never the driving
+session's `PI_SESSION_ID` / `PI_SESSION_FILE`. Focus never moves unless
+`--focus` is passed. Without Herdr or without the opt-in, drive uses the
+headless `pi -p` spawner unchanged — so automated callers (downtime worker,
+audit dispatch, CI) are unaffected. Child terminality is still decided by the
+next `phase_parent` stage re-read, never by process exit.
 
 **The driver owns the child's worktree (SA-0MVTE8XAJ002IUDR).** A driven
 child's `finish` defers worktree removal (the tree is that session's own cwd,
