@@ -34,7 +34,12 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
   concurrent fetch/push on a multi-agent host) is invisible to
   ``diff_snapshots`` and ``fingerprint``, while every other mutation (new /
   removed / moved non-excluded ref, local-config rewrite, working-tree
-  change) is still reported.
+  change) is still reported;
+- wl-managed ``refs/heads/worklog/*`` churn (SA-0MVV2W9610002CLW): movement of
+  ``refs/heads/worklog/data`` (every ``wl`` write / ``wl sync``) is excluded
+  from the verdict and reported as an informational note naming the excluded
+  ref, while an ordinary source-branch move still fails and ``refs/worklog/*``
+  tooling refs keep their silent-invisibility behaviour.
 """
 from __future__ import annotations
 
@@ -879,6 +884,124 @@ class TestConcurrencyExcludedRefs:
         diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
         assert diff["changed"]
         assert "intruder.txt" in diff["status"]["added"]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MVV2W9610002CLW — wl-managed ``refs/heads/worklog/*`` churn is excluded
+# from the verdict and *reported as a note* (never silently filtered)
+# ---------------------------------------------------------------------------
+# Every ``wl`` write and every ``wl sync`` moves ``refs/heads/worklog/data``,
+# the worklog store's data branch. It lives under ``refs/heads/``, so the
+# ``refs/worklog/*`` parser filter never sees it; on a multi-agent host a
+# sibling session's worklog write therefore tripped the guard. The exclusion is
+# a ref-namespace prefix (never a ``wl-*`` name heuristic, per the ownership
+# work's AC4) and the movement is surfaced as an informational note so the
+# exclusion is auditable.
+
+
+def _repo_with_worklog_branch(tmp_path: Path, name: str = "repo") -> Path:
+    """A ``dev`` checkout plus wl's own ``refs/heads/worklog/data`` ref."""
+    repo = gs.init_repo(tmp_path / name, default_branch="dev")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    gs.run_git(repo, ["update-ref", "refs/heads/worklog/data", "HEAD"], check=True)
+    return repo
+
+
+class TestWorklogHeadsRefChurn:
+    """AC1/AC2/AC3: ``refs/heads/worklog/*`` movement is excluded but noted.
+
+    AC1: only the worklog data ref moves → green run plus a note naming the
+    excluded ref. AC2: an ordinary source branch move is still a mutation.
+    AC3: ``refs/worklog/*`` tooling refs behave exactly as before (silently
+    invisible, no note).
+    """
+
+    def test_worklog_data_ref_move_is_invisible_and_noted(self, tmp_path):
+        """AC1: only refs/heads/worklog/data moved → green *and* noted."""
+        repo = _repo_with_worklog_branch(tmp_path)
+        before = gs.snapshot_repo_state(repo)
+        _advance_ref(repo, "refs/heads/worklog/data")
+        after = gs.snapshot_repo_state(repo)
+        assert (
+            after["refs"]["refs/heads/worklog/data"]
+            != before["refs"]["refs/heads/worklog/data"]
+        )
+
+        diff = gs.diff_snapshots(before, after)
+        assert diff["changed"] is False
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+        # The failure renderer must not claim a difference either.
+        assert gs.describe_diff(diff) == "  (no differences)"
+
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert gs.EXCLUDED_REF_CHURN_NOTE_PREFIX in notes[0]
+        assert "refs/heads/worklog/data" in notes[0]
+
+    def test_worklog_data_guarded_run_is_green_and_note_names_checkout(self, tmp_path):
+        """AC1: same via ``diff_guarded_roots``; the note names the checkout."""
+        repo = _repo_with_worklog_branch(tmp_path, "guarded")
+        before = gs.snapshot_guarded_roots(repo)
+        _advance_ref(repo, "refs/heads/worklog/data")
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        assert gs.describe_guarded_diff(diff) == "  (no differences)"
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert "refs/heads/worklog/data" in notes[0]
+        assert str(repo.resolve()) in notes[0]
+
+    def test_worklog_ref_creation_and_deletion_are_excluded_and_noted(self, tmp_path):
+        """AC1: creating/removing a refs/heads/worklog/* ref is churn too."""
+        repo = _repo_with_worklog_branch(tmp_path, "create-remove")
+        before = gs.snapshot_repo_state(repo)
+
+        gs.run_git(repo, ["update-ref", "refs/heads/worklog/next", "HEAD"], check=True)
+        created = gs.snapshot_repo_state(repo)
+        gs.run_git(repo, ["update-ref", "-d", "refs/heads/worklog/next"], check=True)
+        gs.run_git(repo, ["update-ref", "-d", "refs/heads/worklog/data"], check=True)
+
+        create_diff = gs.diff_snapshots(before, created)
+        assert create_diff["changed"] is False
+        create_notes = gs.excluded_churn_notes(create_diff)
+        assert any("refs/heads/worklog/next" in n for n in create_notes), create_notes
+
+        delete_diff = gs.diff_snapshots(created, gs.snapshot_repo_state(repo))
+        assert delete_diff["changed"] is False
+        delete_notes = gs.excluded_churn_notes(delete_diff)
+        assert any("refs/heads/worklog/next" in n for n in delete_notes), delete_notes
+        assert any("refs/heads/worklog/data" in n for n in delete_notes), delete_notes
+
+    def test_ordinary_source_branch_move_still_fails(self, tmp_path):
+        """AC2: a non-worklog branch move is still a mutation (and not noted)."""
+        repo = _repo_with_worklog_branch(tmp_path, "source-branch")
+        gs.run_git(repo, ["branch", "feature-x"], check=True)
+        before = gs.snapshot_repo_state(repo)
+        _advance_ref(repo, "refs/heads/feature-x")
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+
+        assert diff["changed"] is True
+        assert "refs/heads/feature-x" in diff["refs"]["moved"]
+        assert gs.excluded_churn_notes(diff) == []
+
+    def test_refs_worklog_namespace_behaviour_is_unchanged(self, tmp_path):
+        """AC3: ``refs/worklog/*`` refs stay silently invisible (no note)."""
+        repo = _repo_with_worklog_branch(tmp_path, "tooling")
+        gs.run_git(
+            repo,
+            ["update-ref", "refs/worklog/remotes/origin/worklog/data", "HEAD"],
+            check=True,
+        )
+        before = gs.snapshot_repo_state(repo)
+        assert "refs/worklog/remotes/origin/worklog/data" not in before["refs"]
+
+        _advance_ref(repo, "refs/worklog/remotes/origin/worklog/data")
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+
+        assert diff["changed"] is False
+        assert gs.excluded_churn_notes(diff) == []
 
 
 # ---------------------------------------------------------------------------

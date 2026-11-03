@@ -399,6 +399,17 @@ separately — see §8.5):
   `CONCURRENCY_EXCLUDED_REF_NAMESPACES`), derived from git plumbing
   namespaces — never a `wl-*` name pattern (which would also have excluded
   the incident's own fixture branches) and never directory names.
+- the `wl` data-branch namespace `refs/heads/worklog/*`
+  (SA-0MVV2W9610002CLW): every `wl` write and every `wl sync` moves
+  `refs/heads/worklog/data`, so a sibling agent session moves it mid-run.
+  It lives under `refs/heads/`, so the `refs/worklog/*` parser filter never
+  sees it; it is excluded as a namespace prefix in
+  `CONCURRENCY_EXCLUDED_REF_NAMESPACES` (`WORKLOG_HEADS_REF_NAMESPACE`) —
+  never a `wl-*` name heuristic. Unlike `refs/heads/dev` and
+  `refs/remotes/origin/*`, its movement is **reported as an informational
+  note** (`EXCLUDED_REF_CHURN_NOTE_PREFIX`, rendered by
+  `excluded_churn_notes()` and surfaced as `live_repo_excluded`), so the
+  exclusion is auditable rather than silent.
 
 A legitimately-created fixture branch that happens to be backed by a
 registered worktree other than the guard root is therefore excluded, as is
@@ -469,8 +480,9 @@ Regression coverage:
 
 - helper-level `excluded_refs` ownership (`TestOwnershipBasedExclusion`,
   `TestOwnershipExclusionBoundaries`), linked-worktree anchoring
-  (`TestMainCheckoutAnchoring`) and concurrency namespaces
-  (`TestConcurrencyExcludedRefs`) in
+  (`TestMainCheckoutAnchoring`), concurrency namespaces
+  (`TestConcurrencyExcludedRefs`) and wl data-branch churn
+  (`TestWorklogHeadsRefChurn`) in
   `skill/shared/tests/test_git_sandbox.py`;
 - guard-level registration, `--track` registration, removal, concurrent-`dev`
   fast-forward, linked-worktree sibling churn, the config-rewrite and
