@@ -1318,6 +1318,55 @@ def test_read_only_callers_never_touch_an_assignee(
 
 
 # ---------------------------------------------------------------------------
+# Externally pre-claimed rows: an agent pre-claim must not survive the run
+# ---------------------------------------------------------------------------
+
+#: The read-only callers whose lifecycle can *release* a pre-existing claim.
+#: ``effort-and-risk`` and ``tree-coverage`` never enter a StatusLifecycle, so
+#: they have no terminal transition to release on.
+EXTERNALLY_PRE_CLAIMED_ROWS: tuple[ReadOnlyCaller, ...] = (
+    ReadOnlyCaller(
+        name="find-related read-only analysis (externally pre-claimed)",
+        source="find-related/scripts/find_related.py",
+        exercise=_exercise_find_related,
+    ),
+    ReadOnlyCaller(
+        name="refactor read-only analysis (externally pre-claimed)",
+        source="refactor/scripts/refactor.py",
+        exercise=_exercise_refactor,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    EXTERNALLY_PRE_CLAIMED_ROWS,
+    ids=[case.name for case in EXTERNALLY_PRE_CLAIMED_ROWS],
+)
+def test_read_only_caller_releases_an_externally_set_agent_claim(
+    case: ReadOnlyCaller, tmp_path: Path
+) -> None:
+    """The workflow pre-claim is released on the run's terminal transition.
+
+    ``AGENTS_GLOBAL.md`` step 1 claims the item *before* the skill runs, so the
+    helper only clearing a hold it set itself left the agent's pre-claim behind
+    (SA-0MW0F91KN004J06U AC1). The widened rule releases any non-producer claim
+    observed on entry, while the producer ``Map`` hold stays untouched (asserted
+    by ``test_read_only_callers_never_touch_an_assignee``).
+    """
+    store = FakeWorklogStore.with_item(
+        "SA-MATRIXRO", status="open", stage="plan_complete", assignee=_AGENT
+    )
+    assert store.assignee("SA-MATRIXRO") == _AGENT
+
+    case.exercise(store, tmp_path)
+
+    assert store.assignee("SA-MATRIXRO") == "", (
+        f"{case.name}: the externally pre-set agent claim survived the run"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Release-only entry points: exercised, never assumed
 # ---------------------------------------------------------------------------
 

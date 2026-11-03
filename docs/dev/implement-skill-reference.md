@@ -296,12 +296,23 @@ report carries the release under `claim_release` / `orphaned_claim_release`.
 ### Residual window
 
 A process killed by `SIGKILL` with **no surviving supervisor** cannot write
-anything, so its claim survives until an operator (or the proposed TTL
-stale-hold reaper, precedent SA-0MVKWV2V2006JC8E) clears it. Every in-tree
-kill path now has a surviving writer — the signal handler, or `drive` /
-`phase_parent` — so the remaining case is exception-only and stays inside the
-"killed with no exit hook" scope recorded as out of scope on
-SA-0MVVEDK2Q008NDUH.
+anything, so its claim survives until the reaper clears it. The
+TTL-bounded stale-claim reaper (`skill/shared/claim_release.py::reap_stale_claims`,
+default 24 h) now closes that window: it runs after a successful `wl sync`
+through `skill/shared/worklog_sync.py`, releases only non-producer claims on
+non-terminal items older than the TTL, never touches a producer `Map` hold, a
+`needsProducerReview` item or a `completed`/`deleted` item, and records every
+release as a comment naming the previous assignee
+(SA-0MW0F91KN004J06U; reference:
+[assignee-release.md](assignee-release.md#3-stale-claim-reaper-reap_stale_claims)).
+
+Every in-tree kill path also has a surviving writer — the signal handler, or
+`drive` / `phase_parent` — and the session-end backstop
+(`release_session_claim`, invoked by the end-of-session report, plus the
+`signal_release` guard used by the read-only `refactor` / `find-related`
+lifecycles) releases a session's own claim when it ends without reaching a
+lifecycle exit. A `SIGKILL` with no supervisor is therefore bounded by the
+reaper TTL rather than unbounded.
 
 ### Tests
 

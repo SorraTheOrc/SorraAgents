@@ -59,6 +59,7 @@ def _make_wl_show_proc(
     stage: str = "idea",
     deleted_by: str = "",
     assignee: str = "",
+    needs_producer_review: bool = False,
 ):
     """Build a mock CompletedProcess for ``wl show <id> --json``.
 
@@ -67,6 +68,8 @@ def _make_wl_show_proc(
 
     ``assignee`` reports the scheduling hold already on the item (a
     pre-existing producer hold when the context manager never set one).
+    ``needs_producer_review`` marks the item as the sanctioned persistent
+    hold that must survive every release path.
     """
     data = {
         "success": True,
@@ -76,6 +79,7 @@ def _make_wl_show_proc(
             "stage": stage,
             "deletedBy": deleted_by,
             "assignee": assignee,
+            "needsProducerReview": needs_producer_review,
         },
     }
     return subprocess.CompletedProcess(
@@ -282,6 +286,83 @@ class TestStatusLifecycleUnit:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
+        assert self._release_value(calls[2]) is None
+
+    def test_success_exit_releases_externally_set_agent_claim(self, mock_run):
+        """A pre-existing **agent** claim the run never held is released.
+
+        The workflow claims (``AGENTS_GLOBAL.md`` step 1) *before* a skill
+        runs, so a pre-set agent claim must not survive the skill's own
+        terminal transition (SA-0MW0F91KN004J06U). Only the producer hold is
+        exempt.
+        """
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="in-progress", assignee="refactor-agent"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123"):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
+        assert self._release_value(calls[2]) == ""
+
+    def test_failure_exit_releases_externally_set_agent_claim(self, mock_run):
+        """A rollback also releases a pre-existing non-producer claim."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="in-progress", assignee="audit-agent"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with pytest.raises(RuntimeError):  # noqa: SIM117
+            with StatusLifecycle("TEST-123"):
+                raise RuntimeError("boom")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == [
+            "wl", "update", "TEST-123", "--status", "in-progress"
+        ]
+        assert self._release_value(calls[2]) == ""
+
+    def test_restore_on_exit_releases_externally_set_agent_claim(self, mock_run):
+        """Read-only skills release the pre-claim they never set themselves.
+
+        ``find-related`` / ``refactor`` use ``restore_on_exit=True``; before
+        the widened rule the externally pre-set claim survived the run
+        (SA-0MW0F91KN004J06U).
+        """
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", assignee="find-related-runner"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123", restore_on_exit=True):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
+        assert self._release_value(calls[2]) == ""
+
+    def test_needs_producer_review_hold_is_never_released(self, mock_run):
+        """The sanctioned ``needsProducerReview`` hold is preserved."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(
+                status="in-progress",
+                assignee="audit-agent",
+                needs_producer_review=True,
+            ),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123"):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
         assert self._release_value(calls[2]) is None
 
     def test_assignee_cleared_on_failure(self, mock_run):

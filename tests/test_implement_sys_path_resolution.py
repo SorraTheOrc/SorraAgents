@@ -86,6 +86,12 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
         _REPO_ROOT / "skill" / "shared" / "status_lifecycle.py"
     ).read_text()
     (skill_pkg / "shared" / "status_lifecycle.py").write_text(real_slc)
+    # Provide the claim-release predicate module — status_lifecycle imports
+    # ``should_release_assignee`` from it at module load (SA-0MW0F91KN004J06U).
+    real_cr = (
+        _REPO_ROOT / "skill" / "shared" / "claim_release.py"
+    ).read_text()
+    (skill_pkg / "shared" / "claim_release.py").write_text(real_cr)
     # Provide the code_freeze module (SA-0MSBU4OBU005WJNB) — implement.py
     # imports is_code_freeze_active from it at module load.
     real_cf = (_REPO_ROOT / "skill" / "shared" / "code_freeze.py").read_text()

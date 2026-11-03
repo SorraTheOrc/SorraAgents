@@ -108,6 +108,14 @@ Startup static-context budget (bytes / tokens):
 > canonical, deterministic measurement; subsequent features (F2–F6) and the
 > final verification gate use it exclusively.
 
+> **Assignee-release update (2026-11-03, SA-0MW0F91KN004J06U):** the canonical
+> [Assignee release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
+> section was widened to state that **any non-producer claim** is released on
+> a terminal outcome and to name the session backstop and the TTL-bounded
+> stale-claim reaper. That added 880 B to `AGENTS_GLOBAL.md` (14,346 B →
+> 15,226 B; total 19,970 B → 20,850 B); the committed thresholds below pin the
+> new approved budget.
+
 ## Thresholds / regression gate
 
 `docs/dev/context-budget.thresholds.json` ships the committed regression gate
@@ -116,10 +124,10 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 14346,
+  "global_agents": 15226,
   "project_agents": 3285,
   "skills_prose": 2339,
-  "total": 19970
+  "total": 20850
 }
 ```
 

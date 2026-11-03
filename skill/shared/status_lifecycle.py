@@ -21,16 +21,25 @@ The helper is idempotent — safe to call when the work item is already in the
 target state. It logs all transitions and raises exceptions on ``wl`` command
 failures so callers can handle them explicitly.
 
-Assignee release (release by default)
--------------------------------------
+Assignee release (release by default, any non-producer claim)
+-------------------------------------------------------------
 
 A non-empty ``assignee`` is a scheduling hold (``wl next`` skips a held item),
 so leaving an agent's claim behind after a run blocks re-dispatch. The helper
 therefore **releases the assignee on every exit path by default** — the
 successful (``completed``) exit, the exception/rollback exit and the
-``restore_on_exit`` exit — clearing only the assignee *it holds* (the
-``assignee=`` it set on entry). A hold the helper never established (a
-producer's ``Map`` hold on an item it merely transitions) is never wiped.
+``restore_on_exit`` exit.
+
+The release covers **any non-producer claim**, not only one the helper set
+itself: the assignee observed on entry is captured, and a non-empty,
+non-producer value is cleared on the terminal transition. That closes the gap
+where an agent's pre-claim (``AGENTS_GLOBAL.md`` step 1 claims *before* the
+skill runs) survived the skill's own terminal transition
+(SA-0MW0F91KN004J06U). The producer hold (``Map``) and a
+``needsProducerReview`` item are the sanctioned persistent holds and are never
+wiped, so the release cannot silently widen to the producer's intent. The
+producer-aware predicate is shared with the session/abort backstop and the
+stale-claim reaper (``shared.claim_release.should_release_assignee``).
 
 A caller that legitimately needs the hold to survive passes
 ``preserve_assignee_on_exit=True`` and says why in a comment. The legacy
@@ -79,6 +88,11 @@ import subprocess
 import warnings
 from collections.abc import Callable
 from pathlib import Path
+
+try:
+    from .claim_release import should_release_assignee
+except ImportError:  # pragma: no cover - top-level module layout fallback
+    from claim_release import should_release_assignee  # type: ignore[no-redef]
 
 LOG = logging.getLogger("skill.shared.status_lifecycle")
 
@@ -551,14 +565,16 @@ class StatusLifecycle:
 
     - **Normal exit:** transitions to ``completed`` (optionally advancing stage)
     - **Exception exit:** restores original status (rollback)
-    - **Assignee release (default):** any assignee the context manager holds
-      — the ``assignee=`` it set on entry — is cleared on **every** exit path:
-      the successful (``completed``) exit, the exception/rollback exit and the
-      ``restore_on_exit`` exit. This releases the scheduling hold (non-empty
-      assignee = hold; clear to release) so an item is never left on a
-      lingering agent claim that blocks re-dispatch. Only an assignee the
-      context manager itself holds is cleared: a pre-existing hold on an item
-      it merely transitions (e.g. the producer's ``Map``) is left untouched.
+    - **Assignee release (default):** any **non-producer** claim is cleared on
+      **every** exit path: the successful (``completed``) exit, the
+      exception/rollback exit and the ``restore_on_exit`` exit. This releases
+      the scheduling hold (non-empty assignee = hold; clear to release) so an
+      item is never left on a lingering agent claim that blocks re-dispatch.
+      The rule covers an externally pre-set agent claim the run did not set
+      itself (the workflow's pre-claim), as well as the ``assignee=`` set on
+      entry. The producer ``Map`` hold and a ``needsProducerReview`` item are
+      the sanctioned persistent holds and are left untouched
+      (SA-0MW0F91KN004J06U; predicate shared with ``shared.claim_release``).
     - **preserve_assignee_on_exit=True:** the documented opt-out — the
       assignee is never touched on any exit path. Legitimate uses: a caller
       that is deliberately keeping the item on a producer/scheduling hold, and
@@ -650,6 +666,12 @@ class StatusLifecycle:
         self._runner = runner or _default_runner
         self._original_status: str = "open"  # safe default
         self._did_set_in_progress: bool = False
+        # The hold observed on entry (before this run claimed anything). It is
+        # what the widened release covers: a claim set outside this context
+        # manager (the workflow pre-claim) is released on the terminal
+        # transition too (SA-0MW0F91KN004J06U).
+        self._original_assignee: str = ""
+        self._original_needs_producer_review: bool = False
 
     # ------------------------------------------------------------------
     # Public helpers (usable outside context manager too)
@@ -838,10 +860,15 @@ class StatusLifecycle:
             data = self.show(self._work_item_id, runner=self._runner)
             wi = data.get("workItem", {})
             self._original_status = wi.get("status", "open")
+            self._original_assignee = str(wi.get("assignee") or "")
+            self._original_needs_producer_review = bool(
+                wi.get("needsProducerReview")
+            )
             LOG.info(
-                "Captured original status for %s: %s",
+                "Captured original status for %s: %s (assignee=%r)",
                 self._work_item_id,
                 self._original_status,
+                self._original_assignee,
             )
         except RuntimeError:
             LOG.warning(
@@ -935,11 +962,16 @@ class StatusLifecycle:
 
         Release is the default on **every** exit path (success, rollback and
         ``restore_on_exit``), so a caller cannot reintroduce a scheduling hold
-        by omission. It stays deliberately narrow: only an assignee this
-        context manager holds — the ``assignee=`` it set on entry — is ever
-        cleared. A hold it never established (a producer's ``Map`` hold on an
-        item it merely transitions) is left untouched, so the release can
-        never silently widen to someone else's hold.
+        by omission. Two claims are covered:
+
+        * the ``assignee=`` this context manager set on entry (its own hold);
+        * a non-producer claim the run **observed on entry** but did not set
+          itself — the workflow pre-claim (``AGENTS_GLOBAL.md`` step 1 claims
+          before the skill runs), whose hold previously survived the skill's
+          terminal transition (SA-0MW0F91KN004J06U).
+
+        The producer ``Map`` hold and a ``needsProducerReview`` item are never
+        released (shared predicate: :func:`shared.claim_release.should_release_assignee`).
 
         Returns:
             ``True`` when the exit path should write ``--assignee ""``.
@@ -948,7 +980,14 @@ class StatusLifecycle:
             # Documented opt-out: the caller owns the hold (producer hold, or a
             # pre-existing assignee it restores itself).
             return False
-        return self._assignee is not None
+        if self._assignee is not None:
+            return True
+        return should_release_assignee(
+            {
+                "assignee": self._original_assignee,
+                "needsProducerReview": self._original_needs_producer_review,
+            }
+        )
 
     def _restore_original(self, *, reason: str = "failure") -> None:
         """Restore the original status (releasing a held assignee)."""

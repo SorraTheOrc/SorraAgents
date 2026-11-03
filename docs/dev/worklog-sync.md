@@ -218,6 +218,32 @@ If a claim *does* appear to revert, `wl --json sync` now names the store it
 operated on (`sync.store`) and every refused downgrade, so the next recurrence
 is diagnosable without source archaeology.
 
+### Stale-claim reaper on the sync path
+
+`skill/shared/worklog_sync.py` runs the TTL-bounded stale-claim reaper
+(`skill/shared/claim_release.py::reap_stale_claims`) after a **successful**
+sync (SA-0MW0F91KN004J06U AC3). It closes the "orphaned claim" window a
+background sync cannot: a session killed with `SIGKILL` (or abandoned without
+a supervisor) leaves its claim behind, and the sync path is the one place a
+sweep is guaranteed to run without any herdr/ContextHub change.
+
+- **TTL default 24 h**, configurable with `WORKLOG_CLAIM_REAPER_TTL_HOURS`
+  (or `reap_stale_claims(ttl_hours=…)`).
+- Only **non-producer** claims on **non-terminal** items older than the TTL
+  are released. Producer `Map` holds, `needsProducerReview` items, and
+  `completed`/`done`/`deleted` items are never touched; an item without a
+  parseable `activityAt`/`updatedAt` is never released blind.
+- Each release is a `wl update --assignee ""` plus a worklog comment naming
+  the previous assignee, so an automated cleanup is auditable and recoverable.
+  The sweep is idempotent — a second pass finds nothing to release.
+- The hook is **best-effort**: a reaper failure is logged and reported as
+  `sync_worklog()["reaper"]` but can never downgrade the sync result.
+  Disable it with `WORKLOG_CLAIM_REAPER=0` or
+  `sync_worklog(reap_stale_claims=False)`.
+
+Full reference (ownership rule, TTL semantics, CLI):
+[docs/dev/assignee-release.md](assignee-release.md).
+
 ## One store per repository (worktrees)
 
 `.worklog/config.yaml` is tracked, so every implement/audit worktree under
