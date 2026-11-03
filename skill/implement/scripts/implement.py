@@ -4009,56 +4009,463 @@ def _resolve_main_repo_root(
     return derived
 
 
+#: Workspace package consumed by path whose resolution a worktree must own
+#: (the reference case: a package that the main checkout's dependency tree
+#: links back into its own ``packages/`` tree).
+SHARED_WORKSPACE_PACKAGE_NAME = "@worklog/shared"
+
+#: Workspace-relative location of the shared package above.
+SHARED_WORKSPACE_PACKAGE_DIR = Path("packages") / "shared"
+
+
+def _read_package_json(package_dir: Path) -> dict[str, Any]:
+    """Read ``<package_dir>/package.json`` as a dict ({} when unreadable)."""
+    try:
+        with open(package_dir / "package.json", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _workspace_glob_patterns(checkout_root: Path) -> list[str]:
+    """Return the checkout's npm ``workspaces`` glob patterns.
+
+    Accepts both the array form (``"workspaces": ["packages/*"]``) and the
+    object form (``{"packages": [...]}``). Anything else is treated as "no
+    workspaces", which keeps the step a no-op for plain repositories.
+    """
+    workspaces = _read_package_json(checkout_root).get("workspaces")
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages")
+    if isinstance(workspaces, str):
+        workspaces = [workspaces]
+    if not isinstance(workspaces, list):
+        return []
+    return [pattern for pattern in workspaces if isinstance(pattern, str) and pattern]
+
+
+def _workspace_packages(checkout_root: Path) -> dict[str, Path]:
+    """Map workspace package name -> package directory inside *checkout_root*.
+
+    Discovery is workspace-aware (the ``workspaces`` globs of the checkout's
+    own ``package.json``), never hard-coded to one package name. Patterns that
+    escape the checkout (``../*``) and symlinked package directories are
+    ignored so the farm can only point at real in-tree sources.
+    """
+    root = checkout_root.resolve()
+    packages: dict[str, Path] = {}
+    for pattern in _workspace_glob_patterns(checkout_root):
+        try:
+            candidates = sorted(checkout_root.glob(pattern))
+        except (OSError, ValueError) as exc:  # pragma: no cover - defensive
+            LOG.warning("Ignoring invalid workspaces pattern %r: %s", pattern, exc)
+            continue
+        for candidate in candidates:
+            if not candidate.is_dir() or candidate.is_symlink():
+                continue
+            try:
+                resolved = candidate.resolve()
+            except OSError:  # pragma: no cover - defensive
+                continue
+            if resolved != root and root not in resolved.parents:
+                continue
+            name = _read_package_json(candidate).get("name")
+            if isinstance(name, str) and name and name not in packages:
+                packages[name] = resolved
+    return packages
+
+
+def _workspace_link_overrides(
+    worktree_path: Path, main_node_modules: Path
+) -> dict[str, Path]:
+    """Return ``node_modules``-relative package paths that must point at the worktree.
+
+    A workspace package is only overridden when the main checkout actually
+    materialises it in ``node_modules`` (a package consumed by path); repos
+    without such a package therefore keep the whole-directory symlink
+    degradation path.
+    """
+    overrides: dict[str, Path] = {}
+    for name, package_dir in _workspace_packages(worktree_path).items():
+        rel = Path(*name.split("/"))
+        if os.path.lexists(main_node_modules / rel):
+            overrides[name] = package_dir
+    return overrides
+
+
+def _create_farm_link(target: Path, link_path: Path, *, is_dir: bool) -> None:
+    """Create *link_path* pointing at *target* (junction fallback on Windows)."""
+    try:
+        os.symlink(str(target), str(link_path), target_is_directory=is_dir)
+        return
+    except (OSError, NotImplementedError) as exc:
+        if not (os.name == "nt" and is_dir):
+            raise
+        # ContextHub ``packages/herdr/scripts/link-shared.mjs`` precedent:
+        # directory symlinks need privileges on Windows, junctions do not.
+        junction = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link_path), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if junction.returncode != 0:
+            detail = junction.stderr.strip() or junction.stdout.strip()
+            raise OSError(f"symlink failed ({exc}); junction failed: {detail}") from exc
+
+
+def _remove_farm_entry(entry: Path) -> None:
+    """Remove one farm entry (link, file or directory); never fatal."""
+    try:
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        elif entry.is_dir():
+            shutil.rmtree(entry)
+    except OSError as exc:  # pragma: no cover - defensive
+        LOG.warning("Failed to remove stale link-farm entry %s: %s", entry, exc)
+
+
+def _ensure_farm_link(link_path: Path, target: Path) -> bool:
+    """Make *link_path* a link to *target*, replacing a wrong/stale entry."""
+    target_str = str(target)
+    if link_path.is_symlink():
+        try:
+            if os.readlink(link_path) == target_str:
+                return True
+        except OSError:  # pragma: no cover - defensive
+            pass
+        _remove_farm_entry(link_path)
+    elif os.path.lexists(link_path):
+        # The farm is fully managed (``npm install`` in a worktree is
+        # forbidden), so a stale real entry is replaced rather than shadowing
+        # the main checkout's dependency.
+        _remove_farm_entry(link_path)
+    try:
+        _create_farm_link(target, link_path, is_dir=target.is_dir())
+    except (OSError, NotImplementedError) as exc:
+        LOG.warning("Failed to link %s -> %s: %s", link_path, target, exc)
+        return False
+    return True
+
+
+def _is_link_farm(wt_node_modules: Path) -> bool:
+    """True when *wt_node_modules* looks like a farm created by this helper.
+
+    A farm is a real directory whose root entries are links, except scope
+    directories (``@scope``), which are real directories holding only links.
+    A real ``npm install`` (package directories) is therefore never mistaken
+    for a farm and is left untouched.
+    """
+    if wt_node_modules.is_symlink() or not wt_node_modules.is_dir():
+        return False
+    try:
+        entries = list(os.listdir(wt_node_modules))
+    except OSError:  # pragma: no cover - defensive
+        return False
+    for name in entries:
+        entry = wt_node_modules / name
+        if entry.is_symlink():
+            continue
+        if name.startswith("@") and entry.is_dir():
+            try:
+                children = list(os.listdir(entry))
+            except OSError:  # pragma: no cover - defensive
+                return False
+            if all((entry / child).is_symlink() for child in children):
+                continue
+        return False
+    return True
+
+
+def _reconcile_scope(
+    wt_scope: Path,
+    main_scope: Path,
+    overrides: dict[str, Path],
+    scope_name: str,
+) -> bool:
+    """Materialise one scope directory of per-package links; return success."""
+    if os.path.lexists(wt_scope) and (
+        wt_scope.is_symlink() or not wt_scope.is_dir()
+    ):
+        _remove_farm_entry(wt_scope)
+    if not os.path.lexists(wt_scope):
+        try:
+            wt_scope.mkdir()
+        except OSError as exc:
+            LOG.warning("Failed to create scope directory %s: %s", wt_scope, exc)
+            return False
+    try:
+        main_children = sorted(os.listdir(main_scope))
+    except OSError as exc:  # pragma: no cover - defensive
+        LOG.warning("Failed to read scope %s: %s", main_scope, exc)
+        return False
+
+    ok = True
+    for child in main_children:
+        package_name = f"{scope_name}/{child}"
+        target = overrides.get(package_name, main_scope / child)
+        if not _ensure_farm_link(wt_scope / child, target):
+            ok = False
+    try:
+        existing = list(os.listdir(wt_scope))
+    except OSError:  # pragma: no cover - defensive
+        existing = []
+    for child in existing:
+        if child not in main_children:
+            _remove_farm_entry(wt_scope / child)
+    return ok
+
+
+def _reconcile_link_farm(
+    wt_node_modules: Path,
+    main_node_modules: Path,
+    overrides: dict[str, Path],
+) -> bool:
+    """Bring an existing farm in line with the main checkout's entry set.
+
+    New dependencies are linked in, removed ones are pruned, every workspace
+    override keeps pointing at the worktree's own package, and no dependency
+    tree is ever descended into (one level, plus one scope level).
+    """
+    try:
+        main_entries = sorted(os.listdir(main_node_modules))
+    except OSError as exc:  # pragma: no cover - defensive
+        LOG.warning("Failed to read %s: %s", main_node_modules, exc)
+        return False
+
+    ok = True
+    for name in main_entries:
+        main_entry = main_node_modules / name
+        is_scope = (
+            name.startswith("@") and main_entry.is_dir() and not main_entry.is_symlink()
+        )
+        if is_scope:
+            if not _reconcile_scope(
+                wt_node_modules / name, main_entry, overrides, name
+            ):
+                ok = False
+        else:
+            target = overrides.get(name, main_entry)
+            if not _ensure_farm_link(wt_node_modules / name, target):
+                ok = False
+
+    try:
+        existing = list(os.listdir(wt_node_modules))
+    except OSError:  # pragma: no cover - defensive
+        existing = []
+    for name in existing:
+        if name not in main_entries:
+            _remove_farm_entry(wt_node_modules / name)
+    return ok
+
+
+def _materialise_link_farm(
+    wt_node_modules: Path,
+    main_node_modules: Path,
+    overrides: dict[str, Path],
+) -> bool:
+    """Create (or refresh/migrate) the worktree-local ``node_modules`` farm.
+
+    A whole-directory symlink left by the previous implementation is replaced;
+    an idempotent re-run only reconciles entries. A real ``node_modules`` the
+    helper did not create is preserved (never destroyed).
+    """
+    if wt_node_modules.is_symlink():
+        LOG.info(
+            "Replacing whole-directory node_modules symlink %s with a link farm.",
+            wt_node_modules,
+        )
+        _remove_farm_entry(wt_node_modules)
+    elif os.path.lexists(wt_node_modules):
+        if not wt_node_modules.is_dir():
+            LOG.warning(
+                "Worktree node_modules %s is not a directory; skipping link farm.",
+                wt_node_modules,
+            )
+            return False
+        if not _is_link_farm(wt_node_modules):
+            LOG.info(
+                "Worktree has a real node_modules (%s) not created by "
+                "implement.py; leaving it untouched.",
+                wt_node_modules,
+            )
+            return False
+
+    if not os.path.lexists(wt_node_modules):
+        try:
+            wt_node_modules.mkdir(parents=True)
+        except OSError as exc:
+            LOG.warning(
+                "Failed to create link farm directory %s: %s", wt_node_modules, exc
+            )
+            return False
+
+    return _reconcile_link_farm(wt_node_modules, main_node_modules, overrides)
+
+
+def _ensure_directory_symlink(wt_node_modules: Path, main_node_modules: Path) -> bool:
+    """Degradation path: the previous whole-directory ``node_modules`` symlink.
+
+    Used for repositories without a workspace package consumed by path, and
+    kept idempotent/skip-when-present exactly as before.
+    """
+    if os.path.lexists(wt_node_modules):
+        LOG.info(
+            "Worktree already has node_modules (%s); skipping symlink.",
+            wt_node_modules,
+        )
+        return False
+    try:
+        os.symlink(
+            str(main_node_modules), str(wt_node_modules), target_is_directory=True
+        )
+    except (OSError, NotImplementedError) as exc:
+        LOG.warning(
+            "Failed to symlink node_modules into worktree %s: %s",
+            wt_node_modules.parent,
+            exc,
+        )
+        return False
+    LOG.info("Symlinked %s -> %s", wt_node_modules, main_node_modules)
+    return True
+
+
 def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> bool:
-    """Auto-symlink the main checkout's node_modules into a worktree.
+    """Materialise the worktree's ``node_modules`` as a worktree-local link farm.
 
-    Git worktrees do not include gitignored directories, so tests that spawn
-    a real subprocess via an absolute worktree-relative path (e.g. CLI e2e
-    tests invoking ``<worktree>/node_modules/.bin/tsx``) fail with
-    MODULE_NOT_FOUND. Symlinking the main checkout's node_modules resolves
-    them without manual setup.
+    Git worktrees do not include gitignored directories, so tools spawned from
+    the worktree (``<worktree>/node_modules/.bin/tsx``, vitest, tsx, …) fail
+    with MODULE_NOT_FOUND. A whole-directory symlink to the main checkout's
+    ``node_modules`` fixes that but resolves workspace packages consumed by
+    path (``@worklog/shared`` → ``../../packages/shared``) back to the **main
+    checkout's** package — so a worktree's ``packages/*/src`` change is
+    invisible to its own build/test gate (false red / false green).
 
-    The symlink is created only when BOTH conditions hold:
-    - the worktree does not already have a node_modules entry (dir or
-      symlink), AND
-    - the main checkout has a node_modules directory.
+    The farm is a real ``<worktree>/node_modules`` directory holding:
 
-    Failures are logged, never fatal: the worktree remains usable and
-    dependencies can be installed inside it normally.
+    - one symlink per main-checkout entry (``.bin`` linked as a whole
+      directory),
+    - a real directory per scope (``@types``, ``@worklog``, …) holding one
+      symlink per scoped package,
+    - for every workspace package the main checkout consumes by path, a link
+      to the **worktree's own** package directory instead (discovered via the
+      ``workspaces`` field of the worktree's ``package.json``).
+
+    It never descends into a dependency tree, never writes through the farm,
+    and never installs anything. Re-running reconciles the farm with the main
+    checkout's current dependency set (refresh path), migration from the old
+    whole-directory symlink is automatic, and a real ``node_modules`` the
+    helper did not create is preserved. Repositories without a workspace
+    package consumed by path keep the previous whole-directory symlink.
+
+    Failures are logged, never fatal: the worktree stays usable.
 
     Args:
         worktree_path: Absolute path to the worktree directory.
         repo_root: Absolute path to the main checkout, or None if unknown.
 
     Returns:
-        True if the symlink was created, False otherwise (skipped/failed).
+        True if the farm (or degradation symlink) was created/refreshed, False
+        otherwise (skipped/failed).
     """
-    wt_nm = Path(worktree_path) / "node_modules"
-    if os.path.lexists(wt_nm):
-        LOG.info(
-            "Worktree already has node_modules (%s); skipping symlink.", wt_nm
-        )
-        return False
     if not repo_root:
-        LOG.info("No repo root known; skipping node_modules symlink.")
+        LOG.info("No repo root known; skipping node_modules link step.")
         return False
-    root_nm = Path(repo_root) / "node_modules"
-    if not root_nm.is_dir():
+    main_node_modules = Path(repo_root) / "node_modules"
+    if not main_node_modules.is_dir():
         LOG.info(
-            "Main checkout has no node_modules (%s); skipping symlink.", root_nm
+            "Main checkout has no node_modules (%s); skipping link step.",
+            main_node_modules,
         )
         return False
-    try:
-        os.symlink(str(root_nm), str(wt_nm), target_is_directory=True)
-    except (OSError, NotImplementedError) as exc:
-        LOG.warning(
-            "Failed to symlink node_modules into worktree %s: %s",
-            worktree_path,
-            exc,
-        )
-        return False
-    LOG.info("Symlinked %s -> %s", wt_nm, root_nm)
-    return True
+
+    wt_node_modules = Path(worktree_path) / "node_modules"
+    overrides = _workspace_link_overrides(Path(worktree_path), main_node_modules)
+    if not overrides:
+        return _ensure_directory_symlink(wt_node_modules, main_node_modules)
+
+    return _materialise_link_farm(wt_node_modules, main_node_modules, overrides)
+
+
+def _shared_package_resolution(
+    worktree_path: str, repo_root: str | None
+) -> dict[str, Any]:
+    """Report whether the worktree resolves the shared workspace package locally.
+
+    The reference case is ``@worklog/shared`` consumed by path: the main
+    checkout's ``node_modules/@worklog/shared`` is a relative symlink to its
+    own ``packages/shared``, so only a worktree-local override makes the
+    worktree's package (and its ``dist``) visible to its gate.
+
+    Returns a dict with ``applicable``, ``ok``, ``package``,
+    ``expected_root``, ``resolved_root`` and ``stale_dist`` keys. ``applicable``
+    is False (``ok`` None) when the main checkout does not declare the shared
+    workspace package — the degradation path, where the check is a no-op. A
+    missing ``node_modules`` is *stale*, not "not applicable".
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+    """
+    main = Path(repo_root) if repo_root else None
+    main_package = main / SHARED_WORKSPACE_PACKAGE_DIR if main else None
+    main_package_json = _read_package_json(main_package) if main_package else {}
+    if (
+        not main_package
+        or main_package_json.get("name") != SHARED_WORKSPACE_PACKAGE_NAME
+    ):
+        return {
+            "applicable": False,
+            "ok": None,
+            "package": SHARED_WORKSPACE_PACKAGE_NAME,
+            "expected_root": None,
+            "resolved_root": None,
+            "stale_dist": None,
+        }
+
+    wt = Path(worktree_path)
+    expected_root = (wt / SHARED_WORKSPACE_PACKAGE_DIR).resolve()
+    resolved_link = wt / "node_modules" / Path(
+        *SHARED_WORKSPACE_PACKAGE_NAME.split("/")
+    )
+    resolved_root = (
+        Path(os.path.realpath(resolved_link))
+        if os.path.lexists(resolved_link)
+        else None
+    )
+    ok = resolved_root is not None and resolved_root == expected_root
+    return {
+        "applicable": True,
+        "ok": ok,
+        "package": SHARED_WORKSPACE_PACKAGE_NAME,
+        "expected_root": str(expected_root),
+        "resolved_root": str(resolved_root) if resolved_root else None,
+        "stale_dist": (
+            None
+            if ok
+            else str((main_package / "dist").resolve())
+        ),
+    }
+
+
+def _prepare_node_modules(
+    worktree_path: str, repo_root: str | None
+) -> dict[str, Any]:
+    """Run the node_modules link step and the shared-resolution check.
+
+    Returns the ``start`` report block: ``link_created`` (whether this run
+    materialised/refreshed the farm) and ``shared_resolution`` (the
+    :func:`_shared_package_resolution` result), with ``shared_resolution_ok``
+    mirrored for convenient JSON consumption (SA-0MVPI400Y001FOM1 AC2).
+    """
+    link_created = _ensure_node_modules_symlink(worktree_path, repo_root)
+    resolution = _shared_package_resolution(worktree_path, repo_root)
+    return {
+        "link_created": link_created,
+        "shared_resolution": resolution,
+        "shared_resolution_ok": resolution["ok"],
+    }
 
 
 # Directories pruned by the nested node_modules discovery walk. ``.git`` and
@@ -4111,8 +4518,9 @@ def _ensure_nested_node_modules_symlinks(
 ) -> int:
     """Auto-symlink the main checkout's *nested* node_modules into a worktree.
 
-    Companion to :func:`_ensure_node_modules_symlink`, which only links the
-    repository-root ``node_modules``. On checkouts whose dependencies live in a
+    Companion to :func:`_ensure_node_modules_symlink`, which materialises the
+    repository-root ``node_modules`` (link farm, or the degradation
+    whole-directory symlink). On checkouts whose dependencies live in a
     nested/workspace package (for example a pi package under
     ``.pi/packages/<pkg>/node_modules``) the worktree would otherwise have no
     dependencies at all, so tools run from the worktree (``pi``, ``tsx``) fail
@@ -8042,10 +8450,28 @@ def _phase_start_locked(
                 print(format_json_output(report))
             return report
 
-    # Auto-symlink the main checkout's node_modules into the worktree so
-    # dist-spawning tests resolve dependencies without manual setup. Never
-    # fatal: skip when either side lacks node_modules (SA-0MSGS763C006SM1B).
-    _ensure_node_modules_symlink(abs_wt_path, _get_repo_root())
+    # Materialise the worktree-local node_modules link farm (or, for repos
+    # without a workspace package consumed by path, the previous
+    # whole-directory symlink) so dist-spawning tests resolve dependencies
+    # without manual setup, and report whether the shared workspace package
+    # resolves inside the worktree. Never fatal: the link step stays
+    # best-effort (SA-0MSGS763C006SM1B, SA-0MVPI400Y001FOM1).
+    node_modules_report = _prepare_node_modules(abs_wt_path, _get_repo_root())
+    report["steps"]["node_modules"] = node_modules_report
+    report["shared_resolution_ok"] = node_modules_report["shared_resolution_ok"]
+    report["shared_resolution"] = node_modules_report["shared_resolution"]
+    resolution_check = node_modules_report["shared_resolution"]
+    if resolution_check["applicable"] and not resolution_check["ok"]:
+        LOG.warning(
+            "Worktree %s does not resolve %s to its own %s (resolved: %s). "
+            "A change under that package will be refused by the finish gate "
+            "until the link step is refreshed (re-run `implement.py start` "
+            "from the main checkout).",
+            abs_wt_path,
+            SHARED_WORKSPACE_PACKAGE_NAME,
+            SHARED_WORKSPACE_PACKAGE_DIR.as_posix(),
+            resolution_check["resolved_root"] or "<missing>",
+        )
 
     # Nested/workspace packages keep their own node_modules (e.g. a pi package
     # under .pi/packages/<pkg>); symlink those too so tools run from the
