@@ -1485,13 +1485,13 @@ def select_group_from_changed_files(
     changed_files: set[str] | None = None,
     project_root: Path | None = None,
 ) -> str | None:
-    """Select the smallest sufficient group from changed files.
+    """Select the most relevant group from changed files.
 
     Maps touched paths to groups via the ``paths`` spec in each group's
-    definition.  The **smallest** (most specific, fewest commands) group
-    wins.  When multiple groups match, the one with the fewest commands is
-    selected.  When no group matches, returns ``None`` so the caller falls
-    back to ``full``.
+    definition.  The group that covers the **most changed files** wins.
+    When multiple groups tie on changed-file count, the one with the
+    fewest commands (most specific) breaks the tie.  When no group matches,
+    returns ``None`` so the caller falls back to ``full``.
 
     Args:
         changed_files: Changed file set (default: computed from repo).
@@ -1511,20 +1511,28 @@ def select_group_from_changed_files(
     if groups is None:
         return None
 
-    # Find all groups that match any changed file.
-    matching: dict[str, int] = {}
+    # Count how many changed files match each group's paths spec.
+    file_count: dict[str, int] = {}
+    # Also track command count for tie-breaking.
+    cmd_count: dict[str, int] = {}
+    for group_name, spec in groups.items():
+        if group_name == "full":
+            continue
+        cmd_count[group_name] = len(spec["commands"])
+
     for changed_file in changed_files:
         for group_name, spec in groups.items():
             if group_name == "full":
                 continue
             if _paths_match_spec(changed_file, spec["paths"]):
-                matching[group_name] = matching.get(group_name, 0) + len(spec["commands"])
+                file_count[group_name] = file_count.get(group_name, 0) + 1
 
-    if not matching:
+    if not file_count:
         return None
 
-    # Return the group with the fewest commands (most specific).
-    return min(matching, key=matching.get)
+    # Prefer the group covering the most changed files; command count
+    # (fewest) breaks ties.
+    return min(file_count, key=lambda g: (-file_count[g], cmd_count.get(g, 0)))
 
 
 def group_scope_commands(

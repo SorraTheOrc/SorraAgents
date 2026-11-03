@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MW0WN17G002IAOV
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 """Tests for named test groups (SA-0MUJKF2HP001BR51).
 
 Covers:
@@ -255,7 +261,8 @@ class TestChangedFileToGroup:
         assert result is None
 
     def test_most_specific_group_wins(self, tmp_path: Path) -> None:
-        """When multiple groups match, the one with fewest commands wins."""
+        """When multiple groups match the same number of changed files,
+        the one with fewest commands (most specific) breaks the tie."""
         groups = {
             "audit": {
                 "commands": ["pytest skill/audit/tests/"],
@@ -271,8 +278,8 @@ class TestChangedFileToGroup:
         }
         repo = _make_project(tmp_path, groups=groups)
         changed = {"skill/audit/scripts/audit_runner.py"}
-        # Both "audit" (1 command) and "all_skills" (2 commands) match.
-        # "audit" should win because it has fewer commands.
+        # Both "audit" (1 command) and "all_skills" (2 commands) match
+        # exactly 1 changed file. Tie broken by command count: audit wins.
         result = select_group_from_changed_files(changed, repo)
         assert result == "audit"
 
@@ -288,6 +295,55 @@ class TestChangedFileToGroup:
         changed = {"skill/test_cache.py"}
         result = select_group_from_changed_files(changed, repo)
         assert result == "test_cache"
+
+    def test_larger_relevant_group_wins_over_smaller_unrelated(
+        self, tmp_path: Path,
+    ) -> None:
+        """A file shared between a small unrelated group and a larger
+        relevant group: changes to multiple paths in the larger group
+        cause it to be selected over the smaller one (smallest-group-wins
+        bug fix).
+
+        Scenario from the bug report: a scene file (MainStreetScene.ts)
+        appears in both ``overlay-dialogs`` (2 commands) and
+        ``webgl-clipping`` (1 command). When changes touch multiple
+        overlay-dialog-related files, the overlay-dialogs group should
+        win despite having more commands, because it covers more changed
+        files.
+        """
+        groups = {
+            "overlay_dialogs": {
+                "commands": [
+                    "npx vitest run --project browser "
+                    "tests/overlay/dialogs.test.ts",
+                    "npx vitest run --project browser "
+                    "tests/overlay/panels.test.ts",
+                ],
+                "paths": [
+                    "src/scenes/MainStreetScene.ts",
+                    "src/scenes/overlay/**",
+                    "tests/overlay/**",
+                ],
+            },
+            "webgl_clipping": {
+                "commands": [
+                    "npx vitest run --project browser "
+                    "tests/main-street/webgl-clipping.browser.test.ts",
+                ],
+                "paths": ["src/scenes/MainStreetScene.ts"],
+            },
+        }
+        repo = _make_project(tmp_path, groups=groups)
+        # Multiple changes in the overlay-dialogs group vs one in
+        # webgl-clipping (the shared file only).
+        changed = {
+            "src/scenes/MainStreetScene.ts",
+            "src/scenes/overlay/dialog.ts",
+            "tests/overlay/dialogs.test.ts",
+        }
+        result = select_group_from_changed_files(changed, repo)
+        # overlay_dialogs covers 3 changed files; webgl_clipping covers 1.
+        assert result == "overlay_dialogs"
 
 
 class TestPathsMatchSpec:
