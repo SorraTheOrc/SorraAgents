@@ -676,6 +676,21 @@ headless `pi -p` spawner unchanged — so automated callers (downtime worker,
 audit dispatch, CI) are unaffected. Child terminality is still decided by the
 next `phase_parent` stage re-read, never by process exit.
 
+**A driven pane is closed or retained — never leaked
+(SA-0MVPHZ1CI0045QR0).** The agent's settled state
+(`agent prompt … --wait --until done --until blocked`) is a fast-path signal,
+not the verdict: once the next `phase_parent` re-read confirms the child is
+terminal, the pane is closed (`pane close <id>`). A pane whose child the parent
+still sees non-terminal is kept, titled ⚠️ and listed in
+`report["retained_panes"]` with its `herdr pane read <id>` remedy. An agent
+that reports `blocked` **stops the chain**: `blocked_child` / `blocked_pane`
+are recorded, the pane is **left open** and titled 🚫, and the message names
+it. A timeout closes the pane (after reconciling the child's real stage) and
+stops the chain; any other failed session keeps its pane as evidence.
+Completion is never inferred from process exit. Every `children_driven` entry
+carries `transport` and `pane_id` (`None` for the headless transport), and the
+human summary lists retained panes with their inspection remedy.
+
 **The driver owns the child's worktree (SA-0MVTE8XAJ002IUDR).** A driven
 child's `finish` defers worktree removal (the tree is that session's own cwd,
 so deleting it inside `finish` breaks every later command). Once the child's

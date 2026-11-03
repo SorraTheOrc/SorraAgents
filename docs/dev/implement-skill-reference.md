@@ -1935,11 +1935,54 @@ production selector.
 The result is `{"success", "returncode", "reason", "pane_id", "transport"}` — a
 superset of `_default_session_spawner`'s shape, so `phase_drive`'s existing
 success/failure handling, `completed-late` reconciliation and stranded-child
-detection are reused unchanged. Every herdr call is fail-open: a split, start
-or prompt failure is a reported `reason` (with the herdr error code), never an
-exception, and the chain stops cleanly. A prompt timeout is worded as
-`… timed out after Ns: …` so `_reconcile_spawn_failure` still classifies it as a
-bound rather than a verdict.
+detection are reused unchanged. The one addition is the pane lifecycle: the
+driver closes or retains the pane it created (see below). Every herdr call is
+fail-open: a split, start or prompt failure is a reported `reason` (with the
+herdr error code), never an exception, and the chain stops cleanly. A prompt
+timeout is worded as `… timed out after Ns: …` so `_reconcile_spawn_failure`
+still classifies it as a bound rather than a verdict.
+
+### Pane lifecycle and report parity (SA-0MVPHZ1CI0045QR0)
+
+The **agent's settled session state is a fast-path signal, never the verdict**.
+Completion of a child is decided by the next `phase_parent` stage re-read
+(`children_processed`), exactly as the deferred worktree removal is. The pane
+is disposed of by that signal:
+
+| Session outcome | Pane | Reported |
+|---|---|---|
+| `done` and the parent confirms a terminal stage | **closed** (`pane close <id>`) | entry `pane_closed: true`, `pane_cleanup` |
+| `done` but the parent still sees the child non-terminal | **retained** | `retained_panes` entry, ⚠️ title |
+| `blocked` (agent needs a human decision) | **left open**, chain stops | `blocked_child`, `blocked_pane`, `retained_panes`, 🚫 title |
+| timeout | **closed** (after reconciliation), chain stops | entry `timed_out: true`, `pane_closed: true` |
+| timeout whose child is already terminal | **closed** | `completed-late`, `pane_closed: true` |
+| other failure, child not terminal | **retained** as evidence | `retained_panes`, ⚠️ title |
+| drive ended before the parent reported the child | **retained** (reported, no title) | `retained_panes` |
+
+`blocked` is a distinct verdict (`children_driven[].result == "blocked"`,
+rendered 🚫): the drive does **not** re-spawn the child (it would immediately
+block again) and does **not** close its pane. `blocked_child` / `blocked_pane`
+name it, an actionable `herdr pane read <pane_id>` remedy is reported, and a
+comment is posted on the child. A retained pane is titled through
+`herdr_pane.update_pane_title(verdict, pane_id=…)` — `attention` (🚫) for a
+blocked child, `note` (⚠️) for a failed one — so the pane grid shows the
+verdict without opening the child's log. Titles are fail-open and never break
+the chain, and no title is applied when the drive has no verdict yet.
+
+**Report parity.** Both outputs keep their existing shape and gain additive
+keys:
+
+- every `children_driven` entry carries `transport` (`pane`/`headless`) and
+  `pane_id` (`None` on the headless path);
+- `pane_closed` / `pane_cleanup` record a close outcome;
+- `retained_panes` lists `{id, pane_id, verdict, reason, remedy}` for every
+  pane kept open;
+- `blocked_child` / `blocked_pane` record the blocked stop.
+
+The human rendering prints a `transport: pane, pane <id>` line per driven
+child and a **"Panes retained for inspection"** list with the inspection
+remedy, so an operator running `drive` in a terminal sees the same facts a
+`--json` consumer does.
 
 ### Environment isolation
 
@@ -1967,5 +2010,10 @@ split` is asserted in the tests.
 herdr argv (split → start → prompt, no tab/workspace creation), the
 `--focus`/`--no-focus` flag, the env allow-list and the `env -u` equivalent,
 fail-open split/start/prompt failures (including a prompt timeout), the
-detection × opt-in selection matrix, and an end-to-end `phase_drive` run
-through the pane transport with a fake herdr CLI. No live Herdr is needed.
+detection × opt-in selection matrix, and end-to-end `phase_drive` runs through
+the pane transport with a fake herdr CLI — including the pane lifecycle
+(closed on a terminal child, left open and reported on `blocked`).
+`tests/test_implement_drive.py` (`TestDrivePaneLifecycle`) pins the
+done/blocked/timeout/completed-late and failed-close outcomes, the close
+happening only after the terminal stage is confirmed, and the human report's
+retained-pane rendering. No live Herdr is needed.

@@ -115,6 +115,7 @@ from import_guard import guard_shared_import
 try:
     from shared.code_freeze import is_code_freeze_active
     from shared.herdr_pane import resolve_herdr_bin as _resolve_herdr_bin_path
+    from shared.herdr_pane import update_pane_title as _update_pane_title
     from shared.herdr_session import HerdrSessionClient, agent_name_for_child
     from shared.repo_lock import DEFAULT_LOCK_RELPATH as _REPO_LOCK_RELPATH
     from shared.repo_lock import RepoLock, release_repo_lock
@@ -293,6 +294,17 @@ PANE_IDENTITY_ENV_KEYS = ("PI_SESSION_ID", "PI_SESSION_FILE")
 #: holder (another driver/session). The refused party performs no work and
 #: reports the holder identity instead of racing it (SA-0MVQ5AXLF002PAQ3).
 ACTION_SKIPPED_HELD = "skipped-held"
+#: Transport labels recorded on every ``children_driven`` entry, so a
+#: ``--json`` consumer can tell a pane-driven child from a headless one
+#: (SA-0MVPHZ1CI0045QR0 AC5). ``pane_id`` is ``None`` for the headless path.
+TRANSPORT_HEADLESS = "headless"
+TRANSPORT_PANE = "pane"
+#: Verdict title status (``herdr_pane`` vocabulary) for a pane drive retains:
+#: ``attention`` (🚫) when the child reported ``blocked`` and needs a human
+#: decision, ``note`` (⚠️) when its session failed but the pane is kept as
+#: debugging evidence (SA-0MVPHZ1CI0045QR0 AC2/AC3).
+PANE_VERDICT_BLOCKED = "attention"
+PANE_VERDICT_FAILED = "note"
 
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
@@ -10810,6 +10822,257 @@ def _pane_session_spawner(
     return result
 
 
+def _pane_lifecycle_client(client: Any | None = None) -> Any:
+    """The herdr client the driver uses to close/title panes it created.
+
+    The pane spawner builds its own client from the scrubbed child
+    environment; the driver only needs the *caller's* environment (the pane id
+    and binary are ambient there). Tests inject a recording client, which is
+    returned unchanged.
+
+    Args:
+        client: Injectable client (tests); ``None`` builds a default one.
+
+    Returns:
+        A ``HerdrSessionClient``-compatible object.
+    """
+    return client if client is not None else HerdrSessionClient()
+
+
+def _driven_pane_fields(spawn_result: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``transport``/``pane_id`` report fields for a driven child entry.
+
+    Report parity (AC5): every ``children_driven`` entry carries both keys, so
+    a pane-driven child is distinguishable from a headless one in the human
+    summary and in ``--json``. A spawner that predates the pane transport (or
+    a test double) reports neither: the transport then defaults to
+    ``headless`` and ``pane_id`` is ``None``.
+
+    Args:
+        spawn_result: The spawner's result dict.
+
+    Returns:
+        ``{"transport": str, "pane_id": str | None}``.
+    """
+    transport = str(spawn_result.get("transport") or TRANSPORT_HEADLESS)
+    pane_id = spawn_result.get("pane_id")
+    return {
+        "transport": transport,
+        "pane_id": str(pane_id) if pane_id else None,
+    }
+
+
+def _pane_inspect_remedy(pane_id: str) -> str:
+    """The copy-pasteable command that inspects a retained pane."""
+    return f"herdr pane read {pane_id}"
+
+
+def _retain_driven_pane(
+    child_id: str,
+    pane_id: str,
+    verdict: str,
+    entry: dict[str, Any],
+    report: dict[str, Any],
+    reason: str,
+    *,
+    title: bool = True,
+) -> dict[str, Any]:
+    """Keep a drive-created pane open, report it and title its verdict.
+
+    A pane the driver created is never leaked silently: it is either closed
+    once its child reached a terminal stage
+    (:func:`_close_driven_pane`) or listed in ``report["retained_panes"]``
+    with an actionable inspection remedy (AC3). The title is set through
+    ``herdr_pane.update_pane_title`` (fail-open), so an operator watching the
+    pane grid sees the ``⚠️``/``🚫`` verdict without opening the child's log.
+
+    Args:
+        child_id: The child work item the pane belongs to.
+        pane_id: The pane to retain.
+        verdict: ``herdr_pane`` status (``attention`` / ``note``).
+        entry: The ``children_driven`` entry to annotate.
+        report: The drive report (receives ``retained_panes``).
+        reason: Why the pane is retained.
+        title: Whether to apply the verdict title. ``False`` for a pane the
+            drive ends without a verdict for (nothing to announce).
+
+    Returns:
+        The ``retained_panes`` entry that was recorded.
+    """
+    pane = str(pane_id)
+    entry["pane_id"] = pane
+    entry["pane_retained"] = pane
+    entry["pane_closed"] = False
+    if title:
+        try:
+            entry["pane_title"] = _update_pane_title(verdict, pane_id=pane)
+        except Exception as exc:  # noqa: BLE001 - pane updates are fail-open
+            LOG.debug("Pane title update for %s failed: %s", pane, exc)
+            entry["pane_title"] = {"updated": False, "reason": str(exc)}
+    retained = {
+        "id": child_id,
+        "pane_id": pane,
+        "verdict": verdict,
+        "reason": reason,
+        "remedy": _pane_inspect_remedy(pane),
+    }
+    report.setdefault("retained_panes", []).append(retained)
+    LOG.warning(
+        "Retained pane %s for %s (%s): %s",
+        pane, child_id, verdict, reason,
+    )
+    return retained
+
+
+def _close_driven_pane(
+    child_id: str,
+    pane_id: str,
+    entry: dict[str, Any],
+    report: dict[str, Any],
+    client: Any | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Close a drive-created pane whose child reached a terminal stage.
+
+    Fail-open: a refused/failed close retains the pane and reports it (with
+    its remedy) instead of raising, so a herdr hiccup never breaks the drive
+    chain — and the pane is never leaked silently (AC3).
+
+    Args:
+        child_id: The child work item the pane belongs to.
+        pane_id: The pane to close.
+        entry: The ``children_driven`` entry to annotate.
+        report: The drive report (receives ``retained_panes`` on failure).
+        client: Injectable herdr client (tests); defaults to the ambient one.
+        reason: Why the pane is closed (recorded in the report entry).
+
+    Returns:
+        The ``pane_cleanup`` outcome recorded on *entry*.
+    """
+    pane = str(pane_id)
+    close_reason = reason or "child reached a terminal stage"
+    try:
+        outcome = _pane_lifecycle_client(client).close_pane(pane)
+    except Exception as exc:  # noqa: BLE001 - never break the drive chain
+        outcome = {"success": False, "reason": f"close failed: {exc}"}
+
+    entry["pane_id"] = pane
+    if outcome.get("success"):
+        entry["pane_closed"] = True
+        entry["pane_cleanup"] = {
+            "pane_id": pane,
+            "closed": True,
+            "reason": close_reason,
+        }
+        LOG.info("Driver closed pane %s for %s (%s)", pane, child_id, close_reason)
+        return entry["pane_cleanup"]
+
+    failure = str(outcome.get("reason") or "unknown herdr failure")
+    entry["pane_cleanup"] = {
+        "pane_id": pane,
+        "closed": False,
+        "reason": failure,
+    }
+    _retain_driven_pane(
+        child_id,
+        pane,
+        PANE_VERDICT_FAILED,
+        entry,
+        report,
+        reason=f"pane close failed: {failure}",
+    )
+    return entry["pane_cleanup"]
+
+
+def _resolve_pending_pane_closes(
+    parent_report: dict[str, Any] | None,
+    pending: dict[str, str],
+    report: dict[str, Any],
+    client: Any | None = None,
+) -> None:
+    """Close queued child panes once the parent reports their state.
+
+    The spawn-success path queues the child's pane instead of re-fetching the
+    child: the next ``phase_parent`` report's ``children_processed`` entry is
+    the terminality signal (the same contract the deferred worktree removal
+    uses). A terminal child's pane is closed; a child the parent still sees
+    non-terminal keeps its pane open and is reported as retained (AC3).
+
+    Args:
+        parent_report: The latest ``phase_parent`` report.
+        pending: ``{child_id: pane_id}`` awaiting a terminal verdict.
+        report: The drive report (receives ``retained_panes``).
+        client: Injectable herdr client (tests).
+    """
+    processed: dict[str, dict[str, Any]] = {}
+    for item in (parent_report or {}).get("children_processed") or []:
+        cid = str(item.get("id") or "")
+        if cid:
+            processed[cid] = item
+
+    for child_id in list(pending):
+        info = processed.get(child_id)
+        if info is None:
+            continue  # the parent has not reported this child yet
+        status = str(info.get("status") or "")
+        action = str(info.get("action") or "")
+        pane_id = pending.pop(child_id)
+        entry = next(
+            (e for e in report.get("children_driven", []) if e.get("id") == child_id),
+            None,
+        )
+        if entry is None:  # pragma: no cover - defensive
+            entry = {}
+        if not (_is_terminal_status(status) or action in ("finished", "skipped-terminal")):
+            _retain_driven_pane(
+                child_id,
+                pane_id,
+                PANE_VERDICT_FAILED,
+                entry,
+                report,
+                reason="child is not terminal; pane kept open for inspection",
+            )
+            continue
+        _close_driven_pane(
+            child_id,
+            pane_id,
+            entry,
+            report,
+            client,
+            reason="child reached a terminal stage",
+        )
+
+
+def _retain_pending_panes(pending: dict[str, str], report: dict[str, Any]) -> None:
+    """Report queued panes the drive ended before resolving.
+
+    A drive that stops (failure, blocked child, advanced parent) before the
+    follow-up ``parent`` report named a child must not forget the pane it
+    created: it is listed in ``retained_panes`` with its inspection remedy so
+    the operator can find it (AC3). No verdict title is applied — the drive
+    has nothing to announce about the session yet.
+    """
+    for child_id, pane_id in pending.items():
+        entry = next(
+            (e for e in report.get("children_driven", []) if e.get("id") == child_id),
+            None,
+        )
+        if entry is None:  # pragma: no cover - defensive
+            entry = {}
+        _retain_driven_pane(
+            child_id,
+            pane_id,
+            PANE_VERDICT_FAILED,
+            entry,
+            report,
+            reason=(
+                "drive ended before the parent reported this child's state; "
+                "inspect or close the pane"
+            ),
+            title=False,
+        )
+
+
 def _reconcile_spawn_failure(
     child_id: str,
     spawn_result: dict[str, Any],
@@ -11677,12 +11940,26 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             # A transient infrastructure refusal retried on its own bounded
             # budget with backoff (LP-0MVWEP292000ODBS).
             icon = "🔁"
+        elif result == "blocked":
+            # The driven agent settled in `blocked` and needs a human
+            # decision; its pane was left open (SA-0MVPHZ1CI0045QR0 AC2).
+            icon = "🚫"
         else:
             icon = "❌"
         print(
             f"  {icon} {entry.get('id')} "
             f"(attempt {entry.get('attempt')}): {result}"
         )
+        # Report parity (AC5): the transport and, for pane-driven children,
+        # the pane the session ran in.
+        transport = entry.get("transport")
+        pane_id = entry.get("pane_id")
+        if transport or pane_id:
+            pane_note = f", pane {pane_id}" if pane_id else ""
+            print(
+                f"     transport: {transport or TRANSPORT_HEADLESS}"
+                f"{pane_note}"
+            )
         evidence = _format_timeout_evidence(entry)
         if evidence:
             print(f"     {evidence}")
@@ -11714,6 +11991,18 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         print(f"  Finalised stranded: {len(report['finalised_children'])}")
     if report.get("stranded_children"):
         print(f"  Stranded (needs finalising): {len(report['stranded_children'])}")
+    if report.get("retained_panes"):
+        print(
+            "  Panes retained for inspection: "
+            f"{len(report['retained_panes'])}"
+        )
+        for pane in report["retained_panes"]:
+            print(
+                f"     {pane.get('id')}: pane {pane.get('pane_id')} "
+                f"({pane.get('verdict')}) — {pane.get('reason', '')}"
+            )
+            if pane.get("remedy"):
+                print(f"       inspect with: {pane['remedy']}")
     print(f"  {report.get('message', '')}")
     print()
 
@@ -12549,7 +12838,15 @@ def phase_drive(
         records ``worktree_removed`` plus its ``worktree_cleanup`` outcome;
         ``retained_worktrees`` lists every tree that was kept (with a
         remedy) and ``worktree_sweep`` records the start-of-run sweep of
-        terminal children's leftover trees (SA-0MVTE8XAJ002IUDR).
+        terminal children's leftover trees (SA-0MVTE8XAJ002IUDR). Every
+        ``children_driven`` entry additionally carries ``transport`` and
+        ``pane_id`` (``None`` for the headless transport); a child whose pane
+        was closed once its terminal stage was confirmed records
+        ``pane_closed``/``pane_cleanup``, while a pane kept open is named in
+        ``retained_panes`` with its verdict and inspection remedy. A child
+        whose driven agent reported ``blocked`` sets ``blocked_child`` /
+        ``blocked_pane``, stops the chain and leaves its pane open
+        (SA-0MVPHZ1CI0045QR0 AC2/AC3/AC4/AC5).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -12653,6 +12950,11 @@ def phase_drive(
     #: ``phase_parent`` report (the success path performs no extra store
     #: fetch — SA-0MVHXWLPG007OQVN risk R1).
     pending_cleanup: dict[str, str] = {}
+    #: Panes created by this drive whose child is still awaiting the parent's
+    #: terminality verdict; resolved to a close (terminal) or a reported
+    #: retention (still non-terminal) by the next parent report
+    #: (SA-0MVPHZ1CI0045QR0 AC3).
+    pending_panes: dict[str, str] = {}
     stranded_comment_posted = False
     finaliser = finalise_child or _finalise_stranded_child
     # Hard bound on the loop: each child may consume at most
@@ -12690,6 +12992,12 @@ def phase_drive(
         # statuses before acting on anything else (SA-0MVTE8XAJ002IUDR AC5).
         _resolve_pending_worktree_cleanups(
             parent_report, pending_cleanup, report
+        )
+        # Same signal for panes: a child the parent now reports terminal has
+        # its pane closed, a still-non-terminal child keeps its pane open and
+        # is reported as retained (SA-0MVPHZ1CI0045QR0 AC3).
+        _resolve_pending_pane_closes(
+            parent_report, pending_panes, report, pane_client
         )
 
         if parent_report.get("parent_advanced"):
@@ -13142,14 +13450,70 @@ def phase_drive(
             "attempt": attempts[child_id],
             "result": "finished" if spawn_result.get("success") else "failed",
             "reason": spawn_result.get("reason", ""),
+            # Report parity (AC5): every driven child names its transport and
+            # the pane it ran in (``None`` for the headless transport).
+            **_driven_pane_fields(spawn_result),
         }
         driven.append(entry)
+        pane_id = entry.get("pane_id")
+
+        if (
+            spawn_result.get("success")
+            and spawn_result.get("agent_status") == "blocked"
+        ):
+            # The driven agent settled in ``blocked``: it needs a human
+            # decision, so the drive stops instead of re-spawning a session
+            # that would immediately block again. The pane is deliberately
+            # LEFT OPEN and named, never silently closed or abandoned
+            # (AC2).
+            entry["result"] = "blocked"
+            entry["agent_status"] = "blocked"
+            report["blocked_child"] = child_id
+            report["blocked_pane"] = pane_id
+            if pane_id:
+                _retain_driven_pane(
+                    child_id,
+                    pane_id,
+                    PANE_VERDICT_BLOCKED,
+                    entry,
+                    report,
+                    reason=(
+                        "the driven agent reported `blocked`; a human "
+                        "decision is needed"
+                    ),
+                )
+            inspect = (
+                f"its pane {pane_id} was left open for inspection "
+                f"(`{_pane_inspect_remedy(pane_id)}`)"
+                if pane_id
+                else "no pane is attached (headless transport)"
+            )
+            report["message"] = (
+                f"Child {child_id} reported `blocked`; the drive chain "
+                f"stopped — {inspect}. Resolve the blocker, then re-run drive."
+            )
+            wl_add_comment(
+                child_id,
+                f"Drive stopped: the driven session for this child reported "
+                f"`blocked` (a human decision is needed). The drive chain "
+                f"stopped and {inspect}. Resolve the blocker and re-run "
+                f"`implement.py drive`.",
+            )
+            LOG.warning(
+                "Child %s reported blocked; stopping the drive chain (pane=%s)",
+                child_id, pane_id,
+            )
+            break
 
         if spawn_result.get("success"):
             # Queue the tree for removal: the follow-up `parent` report names
             # the child's terminal state, which is the signal to remove it
             # without an extra store fetch on the hot path.
             pending_cleanup[child_id] = worktree_path
+            # The pane follows the same terminality signal: close on the
+            # confirmed terminal stage, retain (and report) otherwise (AC3).
+            if pane_id:
+                pending_panes[child_id] = pane_id
 
         if not spawn_result.get("success"):
             # A failed spawn is a bound, not a verdict: reconcile against the
@@ -13173,6 +13537,15 @@ def phase_drive(
                     "Child %s completed late (%s); continuing the drive loop.",
                     child_id, reconciliation["evidence"],
                 )
+                # Terminality is confirmed, so the pane this session ran in is
+                # no longer needed: close it (fail-open — a failed close is
+                # retained and reported, never leaked) before the deferred
+                # worktree removal (AC3/AC4).
+                if pane_id:
+                    _close_driven_pane(
+                        child_id, pane_id, entry, report, pane_client,
+                        reason="child completed late (terminal confirmed)",
+                    )
                 # This is the exact path the production incident took: the
                 # session was killed after its push, so the deferred worktree
                 # must be released here too — a hook on the success path only
@@ -13182,6 +13555,33 @@ def phase_drive(
                     child_id, worktree_path, entry, report
                 )
                 continue
+
+            # Not terminal: dispose of the pane this session created. A
+            # timeout means the wait expired and the session is gone, so its
+            # pane is closed (AC4: the timeout bound closes the pane and stops
+            # the chain). Any other failure keeps the pane open as debugging
+            # evidence and titles it with the ⚠️ verdict (AC3).
+            if pane_id:
+                if reconciliation["timed_out"]:
+                    _close_driven_pane(
+                        child_id, pane_id, entry, report, pane_client,
+                        reason=(
+                            "session timed out after "
+                            f"{reconciliation['timeout_seconds']}s"
+                        ),
+                    )
+                else:
+                    _retain_driven_pane(
+                        child_id,
+                        pane_id,
+                        PANE_VERDICT_FAILED,
+                        entry,
+                        report,
+                        reason=(
+                            "child session failed and the child is not "
+                            "terminal; pane kept open for inspection"
+                        ),
+                    )
 
             # Not terminal: the hard failure stands. The killed session could
             # not release the claim it held (a timeout kill is a SIGKILL, so
@@ -13305,6 +13705,10 @@ def phase_drive(
     # A drive that ended before the follow-up parent report resolved a child's
     # queued worktree never strands it silently (SA-0MVTE8XAJ002IUDR AC7).
     _retain_pending_worktree_cleanups(pending_cleanup, report)
+    # Panes are never leaked either: anything the terminality signal did not
+    # resolve is reported as retained with its inspection remedy
+    # (SA-0MVPHZ1CI0045QR0 AC3).
+    _retain_pending_panes(pending_panes, report)
     _emit_phase_report(report, json_output)
     return report
 

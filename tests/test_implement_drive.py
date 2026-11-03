@@ -1291,3 +1291,288 @@ class TestInfraRetryLoopBound:
         assert report["finish_attempts"] == {"SA-C1": 1}
         assert report["sessions_spawned"] == 0
         assert "exceeded its iteration bound" not in report["message"]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MVPHZ1CI0045QR0 — drive pane lifecycle and report parity
+#
+# The pane-driven transport (SA-0MVPHYIIE002OBC8) creates a Herdr pane per
+# child. This slice owns that pane's lifecycle: completion is the agent's
+# settled session state (`done`/`blocked`) reconciled against the child's real
+# `phase_parent` stage, and every pane is either CLOSED (child terminal) or
+# RETAINED and reported (blocked/failed) — never silently leaked. Report
+# parity: every driven child carries `transport` + `pane_id`, and the human
+# summary lists retained panes with an inspection remedy.
+# ---------------------------------------------------------------------------
+
+
+class RecordingPaneClient:
+    """Record `close_pane` calls; scripted close outcome (fail-open tests)."""
+
+    def __init__(self, close_success: bool = True):
+        self.closed: list[str] = []
+        self.close_success = close_success
+
+    def close_pane(self, pane_id):
+        self.closed.append(pane_id)
+        return {
+            "success": self.close_success,
+            "pane_id": pane_id,
+            "reason": "" if self.close_success else "pane_not_found",
+        }
+
+
+def _pane_result(
+    *,
+    success: bool = True,
+    status: str = "done",
+    pane: str = "w1:p1",
+    reason: str = "",
+) -> dict:
+    """A spawner result in the pane transport's shape."""
+    return {
+        "success": success,
+        "returncode": 0 if success else None,
+        "reason": reason,
+        "pane_id": pane,
+        "transport": "pane",
+        "agent_status": status,
+    }
+
+
+def _terminal_report(
+    cid: str, status: str = "completed", action: str = "finished",
+) -> dict:
+    """A parent report that names *cid*'s terminal state and advances."""
+    return {
+        "success": True,
+        "parent_advanced": True,
+        "message": "advanced",
+        "children_processed": [
+            {"id": cid, "status": status, "action": action},
+        ],
+    }
+
+
+class TestDrivePaneLifecycle:
+    """Close-or-retain every drive-created pane; report transport parity."""
+
+    def test_done_child_closes_its_pane_once_terminal(self, implement_mod):
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            _terminal_report("SA-C1"),
+        ])
+        spawner = RecordingSpawner([_pane_result()])
+        client = RecordingPaneClient()
+
+        report = _run(m, runner, spawner, [{"id": "SA-C1"}],
+                      pane_client=client)
+
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        # The pane is closed only after the parent confirmed the terminal
+        # stage — the wait itself never decides terminality.
+        assert client.closed == ["w1:p1"]
+        entry = report["children_driven"][0]
+        assert entry["result"] == "finished"
+        assert entry["transport"] == "pane"
+        assert entry["pane_id"] == "w1:p1"
+        assert entry["pane_closed"] is True
+        assert "retained_panes" not in report
+
+    def test_blocked_child_is_retained_reported_and_never_closed(
+        self, implement_mod, monkeypatch,
+    ):
+        m = implement_mod
+        titles: list[tuple] = []
+        monkeypatch.setattr(
+            m, "_update_pane_title",
+            lambda status, **kw: (
+                titles.append((status, kw.get("pane_id")))
+                or {"updated": True}
+            ),
+        )
+        runner = ScriptedParent([_child_report("SA-C1")])
+        spawner = RecordingSpawner([
+            _pane_result(status="blocked", pane="w1:p2"),
+        ])
+        client = RecordingPaneClient()
+
+        report = _run(m, runner, spawner, [{"id": "SA-C1"}],
+                      pane_client=client)
+
+        # A blocked agent stops the chain instead of being re-spawned.
+        assert report["success"] is False
+        assert report["parent_advanced"] is False
+        assert len(runner.calls) == 1
+        assert report["blocked_child"] == "SA-C1"
+        assert report["blocked_pane"] == "w1:p2"
+        # The pane is left open and named, with the 🚫 verdict title.
+        assert client.closed == []
+        assert titles == [("attention", "w1:p2")]
+        entry = report["children_driven"][0]
+        assert entry["result"] == "blocked"
+        assert entry["pane_retained"] == "w1:p2"
+        retained = report["retained_panes"]
+        assert [p["pane_id"] for p in retained] == ["w1:p2"]
+        assert retained[0]["remedy"] == "herdr pane read w1:p2"
+        assert "herdr pane read w1:p2" in report["message"]
+
+    def test_timeout_closes_the_pane_and_stops_the_chain(
+        self, implement_mod,
+    ):
+        m = implement_mod
+        runner = ScriptedParent([_child_report("SA-C1")])
+        spawner = RecordingSpawner([_pane_result(
+            success=False,
+            pane="w1:p3",
+            reason=(
+                "Pane agent for SA-C1 timed out after 60s: deadline exceeded"
+            ),
+        )])
+        client = RecordingPaneClient()
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            child_states={"SA-C1": {
+                "id": "SA-C1", "status": "in-progress",
+                "stage": "intake_complete", "assignee": "",
+            }},
+            pane_client=client,
+            child_timeout=60,
+        )
+
+        # IMPLEMENT_DRIVE_CHILD_TIMEOUT semantics: the resolved timeout is the
+        # session budget, and an expired wait closes the pane.
+        assert spawner.calls[0]["timeout"] == 60
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert client.closed == ["w1:p3"]
+        entry = report["children_driven"][0]
+        assert entry["timed_out"] is True
+        assert entry["result"] == "failed"
+        assert entry["pane_closed"] is True
+        assert "retained_panes" not in report
+        # The chain never re-spawned the child after the timeout.
+        assert len(runner.calls) == 1
+        assert report["sessions_spawned"] == 1
+
+    def test_completed_late_child_closes_its_pane(self, implement_mod):
+        """A timed-out session whose child is terminal is not a failure."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner([_pane_result(
+            success=False,
+            pane="w1:p4",
+            reason=(
+                "Pane agent for SA-C1 timed out after 60s: deadline exceeded"
+            ),
+        )])
+        client = RecordingPaneClient()
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            child_states={"SA-C1": {
+                "id": "SA-C1", "status": "completed",
+                "stage": "in_review",
+            }},
+            pane_client=client,
+            child_timeout=60,
+        )
+
+        assert report["completed_late"] == 1
+        assert report["success"] is True
+        assert client.closed == ["w1:p4"]
+        entry = report["children_driven"][0]
+        assert entry["result"] == "completed-late"
+        assert entry["pane_closed"] is True
+
+    def test_failed_close_is_reported_as_a_retained_pane(
+        self, implement_mod, monkeypatch,
+    ):
+        """A refused close never leaks the pane silently (fail-open)."""
+        m = implement_mod
+        titles: list[tuple] = []
+        monkeypatch.setattr(
+            m, "_update_pane_title",
+            lambda status, **kw: (
+                titles.append((status, kw.get("pane_id")))
+                or {"updated": True}
+            ),
+        )
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            _terminal_report("SA-C1"),
+        ])
+        spawner = RecordingSpawner([_pane_result(pane="w1:p5")])
+        client = RecordingPaneClient(close_success=False)
+
+        report = _run(m, runner, spawner, [{"id": "SA-C1"}],
+                      pane_client=client)
+
+        assert client.closed == ["w1:p5"]
+        entry = report["children_driven"][0]
+        assert entry["pane_closed"] is False
+        assert "pane_not_found" in entry["pane_cleanup"]["reason"]
+        retained = report["retained_panes"]
+        assert [p["pane_id"] for p in retained] == ["w1:p5"]
+        assert retained[0]["remedy"] == "herdr pane read w1:p5"
+        assert titles == [("note", "w1:p5")]
+
+    def test_headless_entries_carry_transport_and_pane_id(self, implement_mod):
+        """Report parity holds for the headless path too (additive keys)."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(m, runner, spawner, [{"id": "SA-C1"}])
+
+        entry = report["children_driven"][0]
+        assert entry["transport"] == "headless"
+        assert entry["pane_id"] is None
+        assert "retained_panes" not in report
+
+    def test_human_report_lists_retained_panes_and_transport(
+        self, implement_mod, capsys,
+    ):
+        m = implement_mod
+        report = {
+            "phase": "drive",
+            "work_item_id": PARENT,
+            "success": False,
+            "parent_advanced": False,
+            "sessions_spawned": 1,
+            "children_driven": [{
+                "id": "SA-C1",
+                "attempt": 1,
+                "result": "blocked",
+                "transport": "pane",
+                "pane_id": "w1:p2",
+                "pane_retained": "w1:p2",
+            }],
+            "blocked_child": "SA-C1",
+            "blocked_pane": "w1:p2",
+            "retained_panes": [{
+                "id": "SA-C1",
+                "pane_id": "w1:p2",
+                "verdict": "attention",
+                "reason": "the driven agent reported `blocked`",
+                "remedy": "herdr pane read w1:p2",
+            }],
+            "message": "Child SA-C1 reported `blocked`; chain stopped.",
+        }
+
+        m._emit_phase_report(report, json_output=False)
+        out = capsys.readouterr().out
+
+        assert "🚫 SA-C1" in out
+        assert "transport: pane, pane w1:p2" in out
+        assert "Panes retained for inspection: 1" in out
+        assert "herdr pane read w1:p2" in out

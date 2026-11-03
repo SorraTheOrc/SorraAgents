@@ -689,3 +689,85 @@ class TestPhaseDrivePaneTransport:
 
         assert spawned == [PANE_CHILD]
         assert report["parent_advanced"] is True
+
+    def test_drive_closes_the_pane_once_the_child_is_terminal(self, monkeypatch):
+        """Terminality (from the next `parent` re-read) is the close signal."""
+        monkeypatch.setenv("HERDR_ENV", "1")
+        monkeypatch.setenv("HERDR_BIN_PATH", FAKE_HERDR_BIN)
+        script = [*_pane_script(), {"stdout": fake.ok_response()}]
+        client, runner = _pane_client(script)
+        parent_reports = [
+            {"success": True, "next_child": PANE_CHILD,
+             "worktree_path": PANE_WORKTREE},
+            {"success": True, "parent_advanced": True, "message": "advanced",
+             "children_processed": [{
+                 "id": PANE_CHILD, "status": "completed", "action": "finished",
+             }]},
+        ]
+
+        with (
+            patch.object(impl_mod, "wl_show", return_value={"id": "SA-PARENT"}),
+            patch.object(impl_mod, "wl_show_children", return_value=[
+                {"id": PANE_CHILD, "status": "open", "stage": "intake_complete"},
+            ]),
+            patch.object(impl_mod, "_discover_worktree", return_value=""),
+            patch.object(impl_mod, "wl_add_comment", return_value=True),
+        ):
+            report = impl_mod.phase_drive(
+                "SA-PARENT",
+                parent_runner=lambda *a, **k: parent_reports.pop(0),
+                pane_sessions=True,
+                pane_client=client,
+            )
+
+        assert report["success"] is True
+        # The pane is closed exactly once, after the terminal confirmation.
+        assert runner.arguments()[-1] == ["pane", "close", "w1:p9"]
+        entry = report["children_driven"][0]
+        assert entry["transport"] == "pane"
+        assert entry["pane_id"] == "w1:p9"
+        assert entry["pane_closed"] is True
+        assert "retained_panes" not in report
+
+    def test_blocked_pane_is_retained_and_never_closed(
+        self, monkeypatch,
+    ):
+        """A `blocked` session stops the chain; its pane is left open."""
+        monkeypatch.setenv("HERDR_ENV", "1")
+        monkeypatch.setenv("HERDR_BIN_PATH", FAKE_HERDR_BIN)
+        monkeypatch.setattr(
+            impl_mod, "_update_pane_title",
+            lambda status, **kw: {"updated": False, "status": status},
+        )
+        client, runner = _pane_client(_pane_script(status="blocked"))
+        parent_reports = [
+            {"success": True, "next_child": PANE_CHILD,
+             "worktree_path": PANE_WORKTREE},
+        ]
+
+        with (
+            patch.object(impl_mod, "wl_show", return_value={"id": "SA-PARENT"}),
+            patch.object(impl_mod, "wl_show_children", return_value=[
+                {"id": PANE_CHILD, "status": "open", "stage": "intake_complete"},
+            ]),
+            patch.object(impl_mod, "_discover_worktree", return_value=""),
+            patch.object(impl_mod, "wl_add_comment", return_value=True),
+        ):
+            report = impl_mod.phase_drive(
+                "SA-PARENT",
+                parent_runner=lambda *a, **k: parent_reports.pop(0),
+                pane_sessions=True,
+                pane_client=client,
+            )
+
+        assert report["success"] is False
+        assert report["blocked_child"] == PANE_CHILD
+        assert report["blocked_pane"] == "w1:p9"
+        # No `pane close` was ever issued: split, start, prompt only.
+        assert [argv[:2] for argv in runner.arguments()] == [
+            ["pane", "split"], ["agent", "start"], ["agent", "prompt"],
+        ]
+        assert report["children_driven"][0]["result"] == "blocked"
+        retained = report["retained_panes"]
+        assert [p["pane_id"] for p in retained] == ["w1:p9"]
+        assert retained[0]["remedy"] == "herdr pane read w1:p9"
