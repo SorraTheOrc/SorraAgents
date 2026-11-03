@@ -292,6 +292,11 @@ def _finish_harness(tmp_path):
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
         )
+        # The push subject is the synthetic hash ``abc1234`` in this harness, so
+        # the worktree-holding guard (SA-0MVUTXJ4300301ZN) is stubbed like the
+        # push itself; it has dedicated coverage in
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``.
+        stack.enter_context(patch.object(implement, "_assert_push_subject"))
         stack.enter_context(patch.object(implement, "run_cmd", side_effect=_fake_run_cmd))
         stack.enter_context(patch.object(implement, "_record_finish_own_churn", return_value=[]))
         stack.enter_context(

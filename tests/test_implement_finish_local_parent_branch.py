@@ -524,6 +524,12 @@ def test_phase_finish_syncs_parent_branch_after_push(implement_mod, tmp_path):
         mock.patch.object(
             implement_mod, "git_push_to_dev", side_effect=_record_push
         ),
+        # The dev push now runs from the worktree and its subject guard reads
+        # the real git HEAD (SA-0MVUTXJ4300301ZN); this harness uses
+        # placeholder, non-git directories, so the guard is stubbed like the
+        # push itself. The guard has dedicated coverage in
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``.
+        mock.patch.object(implement_mod, "_assert_push_subject"),
         mock.patch.object(
             implement_mod, "_sync_parent_branch", side_effect=_record_sync
         ),

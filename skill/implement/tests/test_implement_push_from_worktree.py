@@ -19,22 +19,22 @@ hash. The non-fast-forward retry made it worse: the rebase rewrote the commit
 *inside the worktree* and then retried the push from the main checkout, which
 still held the pre-rebase commit.
 
-Pre-fix baseline (captured 2026-11-02, HEAD of this item's branch)
-------------------------------------------------------------------
-Every test in this module fails on its own assertion (never on a fixture error)
-before the fix, and each ``xfail`` reason names the sibling item that flips it:
+Pre-fix baseline and current state
+----------------------------------
+The two **push-subject** expectations
+(``test_first_push_runs_from_the_worktree_holding_the_commit``,
+``test_mismatched_push_subject_is_refused_before_pushing``) were written as
+``xfail(strict=True)`` baselines and are now **enforced**: the fixing change set
+SA-0MVUTXJ4300301ZN pushes from the worktree and added the fail-closed guard, so
+their markers are gone.
 
-- ``test_first_push_runs_from_the_worktree_holding_the_commit`` — the recorded
-  first push's cwd is the main checkout, so its ``HEAD`` is not the pushed
-  commit.
-- ``test_mismatched_push_subject_is_refused_before_pushing`` — no subject guard
-  exists, so a pushed sha that the push cwd does not hold is still pushed (the
-  recorder sees one call) instead of being refused.
-- ``test_gate_evidence_reports_cached_full_suite_on_success`` — the success
-  path logs nothing: the hook's stderr is captured with ``subprocess.PIPE`` and
-  only logged on failure, and no evidence line names the resolved tree.
-- ``test_gate_evidence_reports_executed_full_suite_when_the_gate_runs`` —
-  same, plus the classification (``executed``) is absent.
+The two **gate-evidence** expectations
+(``test_gate_evidence_reports_cached_full_suite_on_success``,
+``test_gate_evidence_reports_executed_full_suite_when_the_gate_runs``) remain
+``xfail(strict=True)`` until SA-0MVUTXJM8006PQY4 lands; that change set removes
+their markers. Before that fix the success path logs nothing: the hook's stderr
+is captured with ``subprocess.PIPE`` and only logged on failure, and no evidence
+line names the resolved tree.
 
 - ``test_fake_gate_stages_a_full_suite_entry_for_the_pushed_tree`` and
   ``test_finish_reaches_the_dev_push_with_the_recorded_subject`` are the
@@ -86,21 +86,12 @@ LOG_NAME = "implement.scripts.implement"
 #: directory after the branch.
 BRANCH = "wl-test-branch"
 
-_REASON_SUBJECT = (
-    "pre-fix baseline: finish pushes from the main checkout, so the dev-push "
-    "gate's subject is not the pushed commit — fixed by SA-0MVUTXJ4300301ZN; "
-    "remove this marker there"
-)
-
 _REASON_EVIDENCE = (
     "pre-fix baseline: git_push_to_dev logs nothing on success and emits no "
     "resolved-tree evidence — fixed by SA-0MVUTXJM8006PQY4; remove this "
     "marker there"
 )
 
-push_subject_xfail = pytest.mark.xfail(
-    strict=True, reason=_REASON_SUBJECT, raises=AssertionError
-)
 gate_evidence_xfail = pytest.mark.xfail(
     strict=True, reason=_REASON_EVIDENCE, raises=AssertionError
 )
@@ -181,13 +172,33 @@ def _tests_result() -> dict:
 
 
 def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProcess:
-    """Every stubbed git sub-command "succeeds" without touching a repository.
+    """Every stubbed git sub-command "succeeds" without touching a repository,
+    except ``rev-parse``.
 
-    The fixture's own git state is asserted with the hermetic ``git_sandbox``
-    helpers, so ``phase_finish`` must not move it: the main checkout's ``HEAD``
-    stays at the pre-feature commit, exactly the shape that made the gate
-    verify the wrong tree.
+    The push-subject guard (SA-0MVUTXJ4300301ZN) resolves the push cwd's
+    ``HEAD`` and the pushed commit against the sandbox's real commit graph, so
+    ``rev-parse`` must reach the real repository. Every command that *moves* a
+    ref (commit, fast-forward, push, worktree removal) stays stubbed, so the
+    fixture's own git state is untouched: the main checkout's ``HEAD`` stays at
+    the pre-feature commit, exactly the shape that made the gate verify the
+    wrong tree.
     """
+    if (
+        isinstance(cmd, (list, tuple))
+        and len(cmd) >= 2
+        and cmd[0] == "git"
+        and cmd[1] == "rev-parse"
+    ):
+        try:
+            return subprocess.run(
+                list(cmd),
+                cwd=kwargs.get("cwd"),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:  # pragma: no cover - best effort delegation
+            pass
     return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
 
@@ -358,7 +369,6 @@ def test_finish_reaches_the_dev_push_with_the_recorded_subject(sandbox):
 # ---------------------------------------------------------------------------
 
 
-@push_subject_xfail
 def test_first_push_runs_from_the_worktree_holding_the_commit(sandbox):
     """The first dev push's cwd is the worktree, whose HEAD is the pushed sha.
 
@@ -388,7 +398,6 @@ def test_first_push_runs_from_the_worktree_holding_the_commit(sandbox):
 # ---------------------------------------------------------------------------
 
 
-@push_subject_xfail
 def test_mismatched_push_subject_is_refused_before_pushing(sandbox):
     """A pushed sha the push cwd does not hold is refused before any push.
 

@@ -242,6 +242,12 @@ def _mocked_phase_finish(worktree_path: Path):
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
         )
+        # The dev push now runs from the worktree and its subject guard reads
+        # the real git HEAD (SA-0MVUTXJ4300301ZN); this harness uses a
+        # placeholder, non-git worktree, so the guard is stubbed like the push
+        # itself. The guard has dedicated coverage in
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``.
+        stack.enter_context(patch.object(implement, "_assert_push_subject"))
         # The post-push ancestry assertion (SA-0MVPZG7A0000N66U) resolves the
         # pushed commit and ``refs/remotes/origin/dev`` in the fixture repo.
         # This harness stubs ``git_commit`` and reports the synthetic hash

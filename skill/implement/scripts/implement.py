@@ -3520,6 +3520,43 @@ class PushNonFastForwardError(RuntimeError):
         )
 
 
+class PushSubjectMismatchError(RuntimeError):
+    """Raised when the dev push would gate a tree other than the pushed commit.
+
+    ``finish`` pushes from the worktree that holds its commit so the pre-push
+    full-suite gate measures the pushed tree. When that checkout cannot be the
+    subject (missing worktree, not a git working tree, or its ``HEAD`` is a
+    different commit), pushing anyway would let the gate verify — and cache —
+    a tree the pushed commit does not describe. The guard therefore refuses
+    before any push, naming the commit, branch, worktree and the actual
+    ``HEAD`` so a human can recover (SA-0MVTFMB7K002Y1F3 AC2/AC3).
+    """
+
+    def __init__(
+        self,
+        commit_hash: str,
+        branch: str,
+        worktree_path: str,
+        actual_head: str | None,
+        reason: str,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.worktree_path = worktree_path
+        self.actual_head = actual_head
+        self.reason = reason
+        super().__init__(
+            f"Refusing to push commit {commit_hash} on branch {branch}: the "
+            f"worktree {worktree_path} does not hold the pushed commit "
+            f"(HEAD={actual_head or 'unresolved'}; {reason}). The dev-push "
+            f"gate validates the tree of the directory the push runs from, so "
+            f"pushing from a checkout holding a different commit would gate "
+            f"the wrong tree. Recovery: check out {commit_hash} in "
+            f"{worktree_path} (or recreate the worktree from {branch}) and "
+            f"re-run finish. The commit is local on branch {branch}."
+        )
+
+
 class AncestryAssertionError(RuntimeError):
     """Raised when finish's own commit did not reach the pushed dev tip.
 
@@ -3621,7 +3658,12 @@ def git_push_to_dev(
     manual-push comment and leave recoverable state (AC3).
 
     Args:
-        cwd: Working directory (worktree root).
+        cwd: The checkout that holds the pushed commit — the worktree. The
+            pre-push hook resolves its project root with
+            ``git rev-parse --show-toplevel`` in this directory, so the
+            dev-push full-suite gate measures the pushed tree
+            (SA-0MVTFMB7K002Y1F3). Never the main checkout unless the commit
+            is checked out there.
         branch: Local branch name to push.
         commit_hash: The commit hash being pushed (used in recovery).
         timeout: Override timeout in seconds (defaults to resolved config).
@@ -4485,6 +4527,64 @@ def _resolve_origin_parent_tip(
     """Full hash of ``refs/remotes/origin/<parent_branch>``, or ``None``."""
     return _resolve_full_commit(
         repo_root, f"refs/remotes/origin/{parent_branch}"
+    )
+
+
+def _assert_push_subject(
+    push_cwd: str,
+    commit_hash: str,
+    branch: str,
+    worktree_path: str,
+) -> None:
+    """Assert *push_cwd* holds *commit_hash* before the dev push.
+
+    ``.githooks/pre-push`` runs the full suite against the tree of the
+    directory the push is launched from (``git rev-parse --show-toplevel`` in
+    the pushing cwd), not against the pushed commit. ``finish`` therefore
+    pushes from the worktree that has the commit checked out; this guard
+    proves that invariant **before** ``git push`` runs and fails closed when
+    the push directory cannot be the subject: it does not exist, is not a git
+    working tree, does not contain the commit, or its ``HEAD`` is a different
+    commit. Pushing anyway would let the gate verify (and cache) a different
+    tree than the one that lands on ``dev`` (SA-0MVTFMB7K002Y1F3 AC1/AC2).
+
+    Args:
+        push_cwd: Directory the push will run from (the worktree).
+        commit_hash: The commit being pushed (short or full hash).
+        branch: Feature branch being pushed (for the refusal message).
+        worktree_path: The worktree the push requires (for the refusal
+            message; normally equal to *push_cwd*).
+
+    Raises:
+        PushSubjectMismatchError: when *push_cwd* does not hold *commit_hash*.
+    """
+    reason = ""
+    actual_head: str | None = None
+    if not push_cwd or not Path(push_cwd).is_dir():
+        reason = "the push directory does not exist"
+    else:
+        actual_head = _resolve_full_commit(push_cwd, "HEAD")
+        if actual_head is None:
+            reason = "the push directory is not a git working tree"
+        else:
+            pushed = _resolve_full_commit(push_cwd, commit_hash)
+            if pushed is None:
+                reason = (
+                    f"the push directory does not contain commit {commit_hash}"
+                )
+            elif pushed != actual_head:
+                reason = (
+                    f"the push directory's HEAD ({actual_head}) is not the "
+                    f"pushed commit ({pushed})"
+                )
+    if not reason:
+        return
+    raise PushSubjectMismatchError(
+        commit_hash=commit_hash,
+        branch=branch,
+        worktree_path=worktree_path,
+        actual_head=actual_head,
+        reason=reason,
     )
 
 
@@ -7897,8 +7997,11 @@ def _recover_non_fast_forward_push(
     stale ref would just produce another non-fast-forward push.
 
     Args:
-        worktree_path: Worktree where *branch* is checked out.
-        repo_root: Main checkout used to push to ``refs/heads/dev``.
+        worktree_path: Worktree where *branch* is checked out and where the
+            rebased commit lives — the checkout the retry push runs from, so
+            the dev-push gate's subject is the pushed tree.
+        repo_root: Main checkout. Retained for call-site compatibility; the
+            retry push itself runs from *worktree_path* (never from here).
         branch: Feature branch to rebase and push.
         commit_hash: Commit being pushed (pre-rebase).
         exc: The original :class:`PushNonFastForwardError`.
@@ -7948,8 +8051,26 @@ def _recover_non_fast_forward_push(
     # the completion comment reference the commit that actually lands.
     new_commit = git_get_commit_hash(worktree_path) or commit_hash
 
-    # 2. Retry the push.
-    if not git_push_to_dev(repo_root, branch, new_commit):
+    # 2. Retry the push from the worktree that now holds the rebased commit —
+    #    never from the main checkout, which still holds the pre-rebase commit
+    #    and would make the dev-push gate validate the wrong tree
+    #    (SA-0MVTFMB7K002Y1F3 AC1/AC2). The subject guard fails closed when
+    #    the worktree cannot hold the rebased commit.
+    try:
+        _assert_push_subject(worktree_path, new_commit, branch, worktree_path)
+    except PushSubjectMismatchError as exc:
+        wl_add_comment(
+            work_item_id,
+            f"Retry dev push refused after the recovery rebase "
+            f"(push-subject mismatch): {exc}\n"
+            f"Branch: {branch}\nCommit: {new_commit}\n"
+            f"Worktree: {worktree_path}",
+        )
+        raise RuntimeError(
+            f"git push to dev failed after rebase (push-subject mismatch): "
+            f"{exc}"
+        ) from exc
+    if not git_push_to_dev(worktree_path, branch, new_commit):
         # Retry failed — preserve state for manual recovery.
         wl_add_comment(
             work_item_id,
@@ -8478,12 +8599,12 @@ def phase_finish(
             LOG.info("Committed at %s", commit_hash)
 
             # ── Step 5: Verified, reversible local-dev fast-forward ───────
-            # Before removing the worktree, bring the main checkout's local
-            # dev branch up to the new commit. This ensures that when the
-            # pre-push hook measures the working tree (which is the main
-            # checkout at push time), it sees the updated files — so
-            # context-budget compliant commits that modify AGENTS.md etc. no
-            # longer trigger the stale-checkout failure.
+            # Main-checkout hygiene only — never the dev-push gate's subject.
+            # Bring the main checkout's local dev branch up to the new commit
+            # so the next worktree forks from an up-to-date base. The dev push
+            # itself runs from the worktree holding the commit (Step 6), so
+            # the pre-push hook measures the pushed tree, not this checkout
+            # (SA-0MVTFMB7K002Y1F3 AC5).
             # ``repo_root`` was resolved (stale state rejected) at Step 0.75.
             #
             # The advance is *loud and reversible* (SA-0MVPZG7A0000N66U AC1):
@@ -8522,10 +8643,50 @@ def phase_finish(
             # the worktree in place for manual recovery
             # (WL-0MV533YSW004D1E1).
             # repo_root was resolved in Step 5 (fast-forward) above.
-            LOG.info("Pushing to dev...")
+            LOG.info(
+                "Pushing to dev from the worktree that holds the pushed "
+                "commit (%s)...",
+                worktree_path,
+            )
             try:
-                if not git_push_to_dev(repo_root, branch, commit_hash):
+                # AC1/AC2: the dev push runs from the checkout that holds the
+                # pushed commit (the worktree), so ``.githooks/pre-push``
+                # resolves its ``--project-root`` to the pushed tree. The
+                # guard refuses before any push when that checkout cannot be
+                # the subject, instead of silently gating a different tree.
+                _assert_push_subject(
+                    worktree_path, commit_hash, branch, worktree_path
+                )
+                if not git_push_to_dev(worktree_path, branch, commit_hash):
                     raise RuntimeError("git push to dev failed.")
+            except PushSubjectMismatchError as exc:
+                # Fail closed (AC2): nothing was pushed. Restore local dev off
+                # the unpushed commit and preserve recovery state in a comment
+                # so a human can materialise the pushed tree and retry.
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": "subject_mismatch",
+                    "hash": commit_hash,
+                    "worktree_path": worktree_path,
+                    "actual_head": exc.actual_head,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
+                wl_add_comment(
+                    work_item_id,
+                    f"Dev push refused (push-subject mismatch): {exc}\n"
+                    f"Commit: {commit_hash}\nBranch: {branch}\n"
+                    f"Worktree: {worktree_path}\n"
+                    f"Actual HEAD: {exc.actual_head or 'unresolved'}\n"
+                    f"Local dev was restored to origin/dev. The commit stays "
+                    f"on its feature branch {branch}.",
+                )
+                raise RuntimeError(
+                    f"git push to dev failed (push-subject mismatch): {exc}"
+                ) from exc
             except PushTimeoutError as exc:
                 # AC3: recoverable state — commit is safe, branch info retained.
                 # Restore local dev off the unpushed commit (AC1) so the next

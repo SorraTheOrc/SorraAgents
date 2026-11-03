@@ -26,8 +26,8 @@ Coverage:
   ``origin/dev``.
 - SA-0MVTFMB7K002Y1F3 AC1/AC2 (test-first slice SA-0MVUTXILY003DVTE) — the
   **retry push runs from the worktree that holds the rebased commit**, so the
-  dev-push gate's subject is the pushed tree. Marked ``xfail(strict=True)``
-  until SA-0MVUTXJ4300301ZN lands; that change set removes the marker.
+  dev-push gate's subject is the pushed tree. Enforced by
+  SA-0MVUTXJ4300301ZN (the marker was removed by that change set).
 """
 
 from __future__ import annotations
@@ -176,6 +176,14 @@ class TestRecoveryHelper:
             "git_push_to_dev",
             lambda *a, **k: pushes.append(a) or True,
         )
+        # This test stubs every ``run_cmd`` (a pure recorder), so the
+        # push-subject guard cannot resolve a real HEAD here; it is stubbed and
+        # its behaviour is pinned by
+        # ``test_retry_push_runs_from_the_worktree_holding_the_rebased_commit``
+        # (SA-0MVUTXJ4300301ZN).
+        monkeypatch.setattr(
+            implement_mod, "_assert_push_subject", lambda *a, **k: None
+        )
 
         exc = implement_mod.PushNonFastForwardError(
             "oldhash", "wl-branch", "rejected (non-fast-forward)", "retry",
@@ -207,16 +215,6 @@ class TestRecoveryHelper:
         # below — the pre-fix push cwd is that test's documented baseline.
         assert len(pushes) == 1, pushes
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "pre-fix baseline: the recovery retry pushes from repo_root (the "
-            "main checkout) instead of the worktree, so the push cwd's HEAD "
-            "is not the rebased commit — fixed by SA-0MVUTXJ4300301ZN; "
-            "remove this marker there"
-        ),
-    )
     def test_retry_push_runs_from_the_worktree_holding_the_rebased_commit(
         self, implement_mod, sandbox, monkeypatch, silent_comments
     ):
