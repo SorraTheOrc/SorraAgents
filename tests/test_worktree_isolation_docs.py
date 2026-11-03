@@ -33,8 +33,10 @@ def _skill_worktree_block() -> str:
     marker = "**MANDATORY — worktree requirement:**"
     start = content.find(marker)
     assert start != -1, f"{_SKILL_MD.name} must contain {marker!r}"
-    # The Step 5 blockquote runs until the node_modules auto-symlink note.
-    end = content.find("> **`node_modules` is auto-symlinked:**", start)
+    # The Step 5 blockquote runs until the node_modules resolution note
+    # (renamed from the auto-symlink note when the link farm landed,
+    # SA-0MVPI43JH005S3TP).
+    end = content.find("> **`node_modules` is a worktree-local link farm:**", start)
     assert end != -1 and end > start, "Step 5 block must precede the node_modules note"
     return " ".join(content[start:end].split())
 

@@ -611,20 +611,66 @@ git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-
 cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
-> **`node_modules` is auto-symlinked:** `implement.py start` creates
-> `<worktree>/node_modules -> <repo-root>/node_modules` when the main checkout
-> has one (SA-0MSGS763C006SM1B). It also symlinks **nested** `node_modules`
-> directories: every `<pkg>/node_modules` found in the main checkout whose
-> parent package directory already exists in the worktree gets a matching
-> symlink (`<worktree>/<pkg>/node_modules -> <main-checkout>/<pkg>/node_modules`),
-> so workspace/monorepo packages and pi packages resolve their dependencies in
-> the worktree (OSL-0MUFG3PJA00379CT). Discovery is bounded — it prunes `.git`
-> and `.worklog` and never descends into a `node_modules` tree. Existing
-> entries are never overwritten and a missing parent package directory is never
-> fabricated. **Do NOT run `npm install` inside a worktree** — writes pass
-> through the symlink, corrupting the shared tree. A branch that changes
-> `package.json` still resolves the main checkout's dependencies; reinstall in
-> the main checkout if that matters.
+> **`node_modules` is a worktree-local link farm:** `implement.py start`
+> materialises `<worktree>/node_modules` as a **real directory** (not a
+> whole-directory symlink) holding one symlink per entry of the main
+> checkout's `node_modules`. Scoped packages (`@types/*`, `@worklog/*`, …) get
+> a real scope directory with one symlink per package, and `.bin` is linked as
+> a whole directory. Workspace packages consumed by path (e.g.
+> `@worklog/shared`) are **overridden to the worktree's own `packages/*`**
+> (discovered from the `workspaces` field), so every import — tests,
+> `src/**`, and spawned CLI subprocesses — resolves to the code in *this*
+> worktree instead of the main checkout's gitignored `dist` (introduced as a
+> whole-directory symlink by SA-0MSGS763C006SM1B; superseded by this link farm
+> in SA-0MVPI400Y001FOM1).
+>
+> **Resolution order:** `<worktree>/node_modules/<pkg>` → (symlink) the main
+> checkout's `node_modules/<pkg>` for third-party dependencies, but → the
+> worktree's `packages/<pkg>` for workspace packages consumed by path. The
+> step is idempotent and re-materialises entries when the main checkout's
+> dependency set changes. It also links **nested** `node_modules` directories
+> whose parent package directory already exists in the worktree
+> (`<worktree>/<pkg>/node_modules -> <main-checkout>/<pkg>/node_modules`,
+> OSL-0MUFG3PJA00379CT). Discovery is bounded — it prunes `.git`/`.worklog`
+> and never descends into a dependency tree; existing entries are never
+> overwritten and a missing parent package directory is never fabricated.
+> Repositories without a workspace package consumed by path degrade to the
+> previous whole-directory symlink.
+>
+> **Refresh command.** After the main checkout's dependency set changes,
+> re-run the link step by running `implement.py start <work-item-id>` (or
+> `implement.py parent`/`drive`) from the **main checkout**; the step is
+> idempotent, so an existing worktree is reconciled in place. The `start`
+> JSON report records the outcome under `node_modules` (`link_created`) and
+> `shared_resolution` / `shared_resolution_ok`.
+>
+> **Stale-resolution failure signature.** If a worktree changes
+> `packages/shared/src/**` while `@worklog/shared` still resolves to the main
+> checkout's `packages/shared` (a pre-link-farm worktree, a missing farm, or
+> a stale one), the gate tests the wrong code:
+>
+> - **false red** — a correct new shared export is invisible; a test that
+>   spies on it fails with “spy never called” (the WL-0MVK6S4HM005GBCO
+>   symptom);
+> - **false green** — a broken shared change still passes.
+>
+> `implement.py finish` now **fails closed** in this case (after the build,
+> before the test gate) with a message naming the stale
+> `<main-checkout>/packages/shared/dist` path and the remediation: re-run
+> `implement.py start <work-item-id>` from the main checkout to refresh the
+> link farm, then rebuild and re-run `finish` (SA-0MVPI41SR008JYXL). Repos
+> without a workspace shared package no-op.
+>
+> **Do NOT run `npm install` inside a worktree** — writes pass through the
+> farm into the shared install and corrupt it, and the link farm needs no
+> install. A branch that changes `package.json` still resolves the main
+> checkout's dependencies; reinstall in the main checkout if that matters.
+>
+> **The manual `rsync` workaround is superseded.** Copying a worktree's
+> `packages/shared/dist` into the main checkout mutates the `dist` that the
+> live `wl` CLI and every concurrent worktree execute (the
+> WL-0MQRBT8BS00355AB incident class) and is no longer needed: the link farm
+> makes the worktree's own build visible to its gate.
 
 > **Git submodules are auto-initialised:** `implement.py start` runs
 > ``git submodule update --init --recursive`` inside the new worktree (SA-0MSN52GGN002B0AZ).
