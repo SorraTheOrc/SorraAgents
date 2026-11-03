@@ -43,6 +43,13 @@ CROSS_REFERENCING_DOCS: tuple[Path, ...] = (
     REPO_ROOT / "docs" / "dev" / "implement-skill-reference.md",
 )
 
+#: The dedicated reference for the ownership rule, the session backstop and
+#: the stale-claim reaper (SA-0MW0F91KN004J06U AC5).
+ASSIGNEE_RELEASE_REFERENCE = REPO_ROOT / "docs" / "dev" / "assignee-release.md"
+
+#: The worklog-sync reference that documents the reaper hook (AC3, AC5).
+WORKLOG_SYNC_DOC = REPO_ROOT / "docs" / "dev" / "worklog-sync.md"
+
 _CANONICAL_SECTION_RE = re.compile(
     r"^## Assignee release invariant\s*$", re.MULTILINE
 )
@@ -108,3 +115,60 @@ def test_no_deprecated_flag_in_skill_docs() -> None:
             f"{path.relative_to(REPO_ROOT)} still references the deprecated "
             "clear_assignee_on_exit flag"
         )
+
+
+# ---------------------------------------------------------------------------
+# Widened rule, session backstop and stale-claim reaper (SA-0MW0F91KN004J06U)
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_section_documents_the_widened_rule_and_backstops() -> None:
+    """The invariant must state that any non-producer claim is released.
+
+    The pre-widening wording ("only the assignee it set on entry") is the gap
+    SA-0MW0F91KN004J06U closed, so the canonical section must name the widened
+    scope and both backstops rather than the narrow rule.
+    """
+    section = _read(AGENTS_GLOBAL).split("## Assignee release invariant", 1)[1]
+    assert "non-producer claim" in section
+    assert "release_session_claim" in section
+    assert "reap_stale_claims" in section
+    assert "assignee-release.md" in section
+
+
+def test_reference_documents_ownership_backstop_and_reaper() -> None:
+    """The dedicated reference must document every enforced layer."""
+    assert ASSIGNEE_RELEASE_REFERENCE.is_file(), (
+        "docs/dev/assignee-release.md is missing (SA-0MW0F91KN004J06U AC5)"
+    )
+    content = _read(ASSIGNEE_RELEASE_REFERENCE)
+    for expected in (
+        "should_release_assignee",
+        "release_session_claim",
+        "signal_release",
+        "reap_stale_claims",
+        "WORKLOG_CLAIM_REAPER_TTL_HOURS",
+        "WORKLOG_PRODUCER_ASSIGNEE",
+        "needsProducerReview",
+        "producer `Map` hold",
+        "idempotent",
+        "SIGKILL",
+    ):
+        assert expected in content, (
+            f"docs/dev/assignee-release.md does not document {expected!r}"
+        )
+
+
+def test_worklog_sync_doc_documents_the_reaper_hook() -> None:
+    """The sync path is the reaper's entry point and must be documented."""
+    content = _read(WORKLOG_SYNC_DOC)
+    assert "reap_stale_claims" in content
+    assert "WORKLOG_CLAIM_REAPER" in content
+    assert "assignee-release.md" in content
+
+
+def test_implement_reference_residual_window_names_the_reaper() -> None:
+    """The SIGKILL residual window must reference the TTL reaper and backstop."""
+    content = _read(REPO_ROOT / "docs" / "dev" / "implement-skill-reference.md")
+    assert "reap_stale_claims" in content
+    assert "release_session_claim" in content

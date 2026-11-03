@@ -38,7 +38,15 @@ Every refusal is recorded in the sync log and in ``wl --json sync`` output
 checkouts contain a ``.worklog/`` directory without a store: always pass
 ``--worklog-dir <main-checkout>/.worklog`` from a worktree (this helper does)
 so a sync never operates on a second store for the same project prefix.
-See ``docs/dev/worklog-sync.md``.
+
+Stale-claim reaper (SA-0MW0F91KN004J06U): after a successful sync this helper
+runs the TTL-bounded ``shared.claim_release.reap_stale_claims`` sweep, which
+releases non-producer claims on non-terminal items idle longer than the TTL
+(default 24 h; ``WORKLOG_CLAIM_REAPER_TTL_HOURS``; disable with
+``WORKLOG_CLAIM_REAPER=0``). It is best-effort — reported as
+``sync_worklog()["reaper"]``, never able to downgrade the sync result — and
+never touches a producer ``Map`` hold or a ``needsProducerReview`` item.
+See ``docs/dev/assignee-release.md`` and ``docs/dev/worklog-sync.md``.
 
 Usage::
 
@@ -110,6 +118,7 @@ def sync_worklog(
     runner: Runner | None = None,
     no_sync: bool = False,
     work_item_id: str | None = None,
+    reap_stale_claims: bool | None = None,
 ) -> dict[str, Any]:
     """Sync the Worklog store from git before the caller reads/creates items.
 
@@ -125,11 +134,17 @@ def sync_worklog(
             synced. Used when the caller operates on a work item that may
             live in a sibling project's store (prefix resolution). Ignored
             when *worklog_dir* is given.
+        reap_stale_claims: Run the TTL-bounded stale-claim reaper after a
+            successful sync (SA-0MW0F91KN004J06U). ``None`` (default) follows
+            the ``WORKLOG_CLAIM_REAPER`` environment switch (enabled unless
+            set to ``0``/``false``); ``False`` skips it. The reaper is
+            best-effort: a failure is logged and reported, never raised.
 
     Returns:
         A status dict — never raises:
 
-        * ``{"status": "synced"}`` — the sync ran to completion.
+        * ``{"status": "synced", "reaper": {...}}`` — the sync ran to
+          completion (``reaper`` present when the stale-claim sweep ran).
         * ``{"status": "skipped", "reason": ...}`` — ``--no-sync``, a
           contended lock (another sync in progress), or no worklog context.
         * ``{"status": "failed", "error": ...}`` — the sync failed; the
@@ -165,4 +180,42 @@ def sync_worklog(
         return {"status": "skipped", "reason": reason}
 
     LOG.info("wl sync completed")
-    return {"status": "synced"}
+    outcome: dict[str, Any] = {"status": "synced"}
+    if _reaper_should_run(reap_stale_claims):
+        outcome["reaper"] = _run_reaper(runner or _bounded_runner, worklog_dir)
+    return outcome
+
+
+def _reaper_should_run(requested: bool | None) -> bool:
+    """Resolve whether the post-sync reaper hook runs."""
+    if requested is not None:
+        return requested
+    try:
+        from .claim_release import reaper_enabled
+    except ImportError:  # pragma: no cover - shared package always importable
+        return False
+    return reaper_enabled()
+
+
+def _run_reaper(runner: Runner, worklog_dir: str | None) -> dict[str, Any]:
+    """Best-effort stale-claim sweep after a successful sync.
+
+    A reaper failure must never downgrade the sync result, so every exception
+    is logged and reported in the returned dict rather than raised. Hooking the
+    reaper into the existing sync path is what makes the TTL sweep reachable
+    without any herdr/ContextHub change (SA-0MW0F91KN004J06U AC3).
+    """
+    try:
+        from .claim_release import reap_stale_claims as _reap
+
+        report = _reap(runner=runner, worklog_dir=worklog_dir)
+    except Exception as exc:  # noqa: BLE001 - never abort a sync for the sweep
+        LOG.warning("Stale-claim reaper failed; continuing: %s", exc)
+        return {"success": False, "error": str(exc)}
+    if report.get("released_count"):
+        LOG.info(
+            "Stale-claim reaper released %s claim(s): %s",
+            report["released_count"],
+            ", ".join(entry["id"] for entry in report.get("released", [])),
+        )
+    return report

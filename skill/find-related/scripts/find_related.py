@@ -73,6 +73,7 @@ from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
 
 try:
+    from shared.claim_release import signal_release
     from shared.status_lifecycle import (
         StatusLifecycle,
         resolve_worklog_dir,
@@ -946,7 +947,13 @@ def _main() -> None:
     #   - On exit: restores original status (restore_on_exit) — this skill
     #     is read-only and must NOT advance the item to `completed`
     #   - On exception: restores original status
-    with StatusLifecycle(args.work_item_id, restore_on_exit=True):
+    # signal_release is the session-end backstop for an interrupted run: a
+    # read-only analysis that is killed never reaches the lifecycle exit, so
+    # without it the item's claim survives the session
+    # (SA-0MW0F91KN004J06U).
+    with signal_release(
+        args.work_item_id, reason="find-related-signal"
+    ), StatusLifecycle(args.work_item_id, restore_on_exit=True):
 
         # Pin the target worklog store from the work-item id so every wl call
         # (show/update/search/probe) targets the same store regardless of the
