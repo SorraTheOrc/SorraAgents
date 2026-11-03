@@ -133,8 +133,11 @@ from shared.skill_extensions import (
 from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
+    GitStateUnavailable,
     Runner,
     _default_runner,
+    compute_git_state,
+    is_worktree_clean,
     query_cached,
     run_cached,
     summary_lines,
@@ -2942,6 +2945,191 @@ def rerun_failures(
 # ---------------------------------------------------------------------------
 
 
+#: Stable prefixes of the gate-subject provenance lines ``run_tests.py``
+#: prints on **stderr** when ``--gate-commit`` is used (SA-0MVTRBT50005DUEH).
+#: The pre-push hook echoes the ``gate-*`` lines to the pusher and parses
+#: :data:`GATE_ROOT_PREFIX` to mirror the cache of the checkout the gate
+#: actually resolved — so the format is a contract with `.githooks/pre-push`.
+GATE_SUBJECT_PREFIX = "run_tests: gate-subject "
+GATE_ROOT_PREFIX = "run_tests: gate-root "
+GATE_VERDICT_PREFIX = "run_tests: gate-verdict "
+GATE_REFUSED_PREFIX = "run_tests: gate-refused "
+
+
+class GateSubjectError(RuntimeError):
+    """The pushed commit cannot be bound to a clean checkout it can be gated in.
+
+    Raised by :func:`resolve_gate_subject` when ``--gate-commit`` names a commit
+    that is not present locally, that no checkout holds, or whose only
+    candidate checkouts are dirty. The caller refuses the push (exit code 2)
+    instead of measuring a different tree.
+    """
+
+
+def _git_output(cwd: Path, *args: str) -> str | None:
+    """Run a read-only git command in *cwd*; ``None`` when it cannot answer.
+
+    Uses :func:`shared.git_sandbox.git_env_for_repo` so a leaked ``GIT_DIR`` /
+    ``GIT_WORK_TREE`` cannot make the subject resolution describe a different
+    repository (the same scrub the fingerprint uses).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            env=git_env_for_repo(str(cwd)),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def parse_worktree_listing(output: str) -> list[tuple[Path, str]]:
+    """Return ``(path, HEAD)`` for each checkout in ``git worktree list --porcelain``.
+
+    A bare entry (``bare`` line, no ``HEAD``) is skipped: it has no working
+    tree to run a suite in. Order is git's own (the main checkout first), so a
+    deterministic candidate is picked without an arbitrary sort.
+    """
+    entries: list[tuple[Path, str]] = []
+    path: str | None = None
+    sha: str | None = None
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            if path and sha:
+                entries.append((Path(path), sha))
+            path, sha = line[len("worktree "):], None
+        elif line.startswith("HEAD "):
+            sha = line[len("HEAD "):].strip()
+    if path and sha:
+        entries.append((Path(path), sha))
+    return entries
+
+
+def resolve_gate_subject(
+    gate_commit: str, project_root: Path
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve the pushed commit to a clean checkout the gate can measure.
+
+    The gate's verdict is only evidence about the pushed commit when the tree
+    it fingerprints *is* that commit with no dirty paths folded in
+    (SA-0MVTRBT50005DUEH). Candidates, in order:
+
+    1. *project_root* itself, when its ``HEAD`` is the pushed commit and it has
+       no dirty paths (the normal ``implement.py finish`` push from the
+       worktree that holds the commit — a cheap in-place run);
+    2. a checkout listed by ``git worktree list`` whose ``HEAD`` is the pushed
+       commit and which is clean (a manual push from a dirty main checkout
+       still gates the commit, in the pusher's own clean worktree);
+    3. otherwise refuse: :class:`GateSubjectError` naming the commit, every
+       candidate tried (and why it was rejected) and the escape hatch.
+
+    Materialising a throwaway detached worktree is deliberately *not* done: a
+    fresh checkout has no installed dependencies, so suite commands could fail
+    for reasons unrelated to the pushed tree.
+
+    Returns:
+        ``(root, evidence)`` where *root* is the checkout to run/cache against
+        and *evidence* carries ``pushed`` (full sha), ``root`` and ``checkout``
+        (``"in-place"`` or ``"worktree"``).
+
+    Raises:
+        GateSubjectError: when the commit is not present locally, or no clean
+            checkout holds it.
+    """
+    root = Path(project_root).resolve()
+    commit = (gate_commit or "").strip()
+    escape = (
+        "Set TEST_SCOPE_SKIP=1 to bypass the full-suite gate "
+        "(not recommended)."
+    )
+    if not re.fullmatch(r"[0-9a-fA-F]{4,40}", commit):
+        raise GateSubjectError(
+            f"--gate-commit expects a git commit sha, got {gate_commit!r}. {escape}"
+        )
+
+    full = (
+        _git_output(root, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
+        or ""
+    ).strip()
+    if not full:
+        raise GateSubjectError(
+            f"pushed commit {commit[:12]} is not present in this repository, so it "
+            f"cannot be gated locally (fetch it and retry from a checkout that "
+            f"holds it). {escape}"
+        )
+
+    rejected: list[str] = []
+    head = (_git_output(root, "rev-parse", "HEAD") or "").strip()
+    if head == full:
+        if is_worktree_clean(root):
+            return root, {"pushed": full, "root": str(root), "checkout": "in-place"}
+        rejected.append(f"{root} (HEAD matches, but the checkout has uncommitted changes)")
+    else:
+        rejected.append(f"{root} (HEAD is {head[:12] or 'unknown'})")
+
+    listing = _git_output(root, "worktree", "list", "--porcelain") or ""
+    for candidate, candidate_head in parse_worktree_listing(listing):
+        if candidate_head != full or candidate.resolve() == root:
+            continue
+        if not candidate.is_dir():
+            rejected.append(f"{candidate} (HEAD matches, but the checkout is missing)")
+            continue
+        if is_worktree_clean(candidate):
+            return candidate.resolve(), {
+                "pushed": full,
+                "root": str(candidate.resolve()),
+                "checkout": "worktree",
+            }
+        rejected.append(
+            f"{candidate} (HEAD matches, but the checkout has uncommitted changes)"
+        )
+
+    tried = "; ".join(rejected) if rejected else "no checkout of this repository holds it"
+    raise GateSubjectError(
+        f"no clean checkout holds pushed commit {full[:12]}: {tried}. The full-suite "
+        "gate only measures a checkout of the pushed commit, so it refuses instead "
+        f"of reporting a verdict about a different tree. {escape}"
+    )
+
+
+def _emit_gate_subject(evidence: dict[str, Any]) -> None:
+    """Print the state about to be validated (AC3 provenance), one fact per line.
+
+    The root goes on its own line so a path containing spaces survives the
+    hook's parse (`.githooks/pre-push` takes the rest of the line verbatim).
+    """
+    print(
+        f"{GATE_SUBJECT_PREFIX}pushed={evidence['pushed']} "
+        f"checkout={evidence['checkout']} fingerprint_kind=worktree",
+        file=sys.stderr,
+    )
+    print(f"{GATE_ROOT_PREFIX}{evidence['root']}", file=sys.stderr)
+
+
+def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None:
+    """Print executed-vs-cached plus the cache state the verdict belongs to."""
+    try:
+        state = compute_git_state(evidence["root"], strict=True)
+    except GitStateUnavailable:
+        state = "unavailable"
+    entries = result.get("cache_entries") or []
+    kinds = sorted({entry.get("fingerprint_kind") or "" for entry in entries} - {""})
+    print(
+        f"{GATE_VERDICT_PREFIX}verdict={'cached' if result.get('cached') else 'executed'} "
+        f"sha={evidence['pushed']} git_state={state} "
+        f"fingerprint_kind={','.join(kinds) or 'worktree'} "
+        f"entries={len(entries)} cached={len(entries)}",
+        file=sys.stderr,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the full project test suite in quiet mode and report failures."
@@ -3046,6 +3234,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Base branch for changed-file detection (default: origin/dev, "
         "falling back to local 'dev' then HEAD~1).",
+    )
+    parser.add_argument(
+        "--gate-commit",
+        default=None,
+        metavar="SHA",
+        help="Release-gate subject binding (SA-0MVTRBT50005DUEH): the commit "
+        "being pushed. The gate resolves a checkout whose HEAD is SHA with no "
+        "dirty paths (in place, else a clean `git worktree list` checkout) and "
+        "runs/caches the suite there, so a cache entry computed from any other "
+        "state can never satisfy it. Refuses (exit 2) when no clean checkout "
+        "holds SHA. Omitted: historical behaviour, unchanged.",
     )
     return parser
 
@@ -3336,6 +3535,23 @@ def main(argv: list[str] | None = None) -> int:
                 print(g)
         return 0
 
+    # --gate-commit: bind the gate to the pushed commit (SA-0MVTRBT50005DUEH)
+    # before anything is resolved from the tree. The resolved checkout replaces
+    # *project_root*, so every downstream step — command resolution, timeout,
+    # suite execution and the cache key — describes the pushed commit rather
+    # than whichever checkout git happened to run the hook in. A subject that
+    # cannot be bound fails closed (exit 2, nothing executes).
+    gate_evidence: dict[str, Any] | None = None
+    if args.gate_commit:
+        try:
+            project_root, gate_evidence = resolve_gate_subject(
+                args.gate_commit, project_root
+            )
+        except GateSubjectError as exc:
+            print(f"{GATE_REFUSED_PREFIX}{exc}", file=sys.stderr)
+            return 2
+        _emit_gate_subject(gate_evidence)
+
     # --group: validate group name and route to group-based execution
     group_name = args.group
     if group_name is not None:
@@ -3467,6 +3683,9 @@ def main(argv: list[str] | None = None) -> int:
             test_type=test_type,
             group=group_name,
         )
+
+        if gate_evidence is not None:
+            _emit_gate_verdict(gate_evidence, result)
 
         if args.rerun_failures and result["failures"]:
             with Timer("rerun_failures"):

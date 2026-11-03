@@ -1026,6 +1026,22 @@ See ``../refactor/SKILL.md``.
   > main checkout's `.worklog/cache` so the pushed commit's green full-suite
   > entry stays visible to post-push verification and the audit.
 
+  > **The gate's subject is the pushed commit (SA-0MVTRBT50005DUEH).**
+  > `.githooks/pre-push` forwards git's `<local_sha>` as
+  > `run_tests.py --gate-commit <sha>`; the runner resolves a checkout whose
+  > `HEAD` is that commit with **no dirty paths** (the push cwd when it
+  > qualifies — the normal `finish` path — else any clean
+  > `git worktree list` checkout), runs/caches the full suite there, and
+  > **refuses the push** (exit 2, naming the commit and `TEST_SCOPE_SKIP=1`)
+  > when no clean checkout holds it. So "the dev push succeeded" means the
+  > full suite ran against what landed: a green `scope: full` cache entry for
+  > any other state (the main checkout's `HEAD` plus its dirty `.worklog/`
+  > churn, or another commit) cannot satisfy the gate. The runner emits
+  > `run_tests: gate-subject` / `gate-root` / `gate-verdict` lines on stderr
+  > (echoed by the hook) naming the validated checkout, its `git_state`,
+  > `fingerprint_kind` and executed-vs-cached; the hook mirrors the entry from
+  > the checkout actually gated, not merely from the push cwd.
+
 - **Post-push local parent sync (SA-0MUGX1DIT000M7S1).** `implement.py finish`
   fast-forwards the main checkout's **local parent branch** (`dev`) to the
   pushed tip *after* a successful push, so the next `implement.py parent` /

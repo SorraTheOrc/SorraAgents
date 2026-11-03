@@ -432,6 +432,29 @@ def _update_with_path_content(
         hasher.update(b"\0unreadable")
 
 
+def is_worktree_clean(cwd: str | Path) -> bool | None:
+    """Whether the checkout at *cwd* reports no dirty paths.
+
+    Cleanliness is evaluated with the same ``git status`` call
+    (:func:`_status_entries`, ``--untracked-files=all``) that
+    :func:`compute_git_state` fingerprints, so "clean" here means exactly "the
+    fingerprint is the commit's own state, with no dirty content folded in".
+    That is the property the pre-push gate needs to bind a verdict to a pushed
+    commit: a dirty checkout's fingerprint belongs to the dirty state, never to
+    the commit it happens to have checked out (SA-0MVTRBT50005DUEH).
+
+    Returns ``True`` when no path is dirty, ``False`` when at least one is, and
+    ``None`` when the state cannot be reported at all (corrupt/locked index, a
+    git timeout, a directory that is not a checkout). A caller that must not
+    accept a stale verdict treats ``None`` as "not clean" — fail closed.
+    """
+    try:
+        entries = _status_entries(str(Path(cwd).resolve()), strict=True)
+    except GitStateUnavailable:
+        return None
+    return not entries
+
+
 def _fingerprint_for_cache(cwd: str) -> str | None:
     """Return the fresh fingerprint for *cwd*, or None when indeterminate.
 

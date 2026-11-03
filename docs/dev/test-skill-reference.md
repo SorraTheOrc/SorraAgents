@@ -147,7 +147,10 @@ a run to a caller-supplied fingerprint (normally a would-be-commit tree SHA):
 - the supplied value is stored **as-is** after the run — it describes the tree
   the caller named and cannot be recomputed from a possibly-churned worktree;
 - callers that pass nothing keep the historical worktree keys byte for byte
-  (test-skill CLI, audit, pre-push).
+  (test-skill CLI, audit). The pre-push gate is the one worktree-kind caller
+  that *is* bound to a subject: it passes `--gate-commit <sha>` (see
+  *0.4 Pre-push gate subject binding* below) and its key is the pushed
+  commit's own clean worktree state.
 
 `lookup(..., fingerprint_kind=...)` and `store(..., fingerprint_kind=...)`
 expose the same distinction to callers that manage execution themselves.
@@ -168,6 +171,62 @@ TTL (and, for exactness, the recorded `scope`). Therefore:
 tree-bound entry is intentionally not visible to it (the audit's full-suite
 evidence is recorded at the pushed commit's loose state, not at a
 pre-commit staged tree).
+
+### 0.4. Pre-push gate subject binding (SA-0MVTRBT50005DUEH)
+
+SA-0MVTRBT50005DUEH. The dev-push pre-push gate is evidence about the commit
+it pushes. `git` hands the hook `<local_ref> <local_sha> <remote_ref>
+<remote_sha>` on stdin; `.githooks/pre-push` forwards `<local_sha>` as
+`run_tests.py --scope full --strict-git-env --gate-commit <sha>`, and the
+runner resolves **which checkout to measure** before anything else:
+
+1. the invocation's project root, when its `HEAD` is the pushed commit and it
+   has **no dirty paths** (`is_worktree_clean()` — the same
+   `git status --porcelain --untracked-files=all` call the fingerprint uses);
+2. else a checkout listed by `git worktree list --porcelain` whose `HEAD` is
+   the pushed commit and which is clean;
+3. else the push is **refused** (exit code 2) with the commit, every
+   candidate tried and why it was rejected, and `TEST_SCOPE_SKIP=1`.
+
+The resolved checkout replaces the project root for the whole run, so command
+resolution, the per-command timeout, the suite execution and the **cache key**
+all describe the pushed commit. A green entry recorded for any other state —
+including the main checkout's own `HEAD` plus its dirty `.worklog/` churn —
+is therefore a miss and the suite executes. No temporary worktree is
+materialised (a fresh checkout has no installed dependencies, so a suite
+failure there would not be about the pushed tree); pushing from a clean
+worktree of the commit, or from a clean checkout at it, is the supported
+remedy.
+
+The gate reports the state it validated on **stderr** (stable prefixes; the
+hook echoes them to the pusher):
+
+```text
+run_tests: gate-subject pushed=<sha> checkout=<in-place|worktree> fingerprint_kind=worktree
+run_tests: gate-root <absolute path of the resolved checkout>
+run_tests: gate-verdict verdict=<cached|executed> sha=<sha> git_state=<state> fingerprint_kind=worktree entries=<n> cached=<n>
+run_tests: gate-refused <actionable message including TEST_SCOPE_SKIP=1>
+```
+
+The `gate-root` line is a contract with `.githooks/pre-push`, which mirrors
+that checkout's cache entries into the main checkout's `.worklog/cache` —
+keys are content-addressed, so copying an entry the main cache lacks is
+always safe. Without `--gate-commit` the runner behaves exactly as before
+(no subject resolution, no refusal, no `gate-*` lines), so every other
+caller and every hook that does not forward the sha is unchanged.
+
+**Propagation is per project.** `core.hooksPath=.githooks` makes the hook a
+per-project file, so only a hook that forwards the sha is protected; the
+runner-side flag reaches every project through the global skill install but
+stays inert until its hook passes it. The verified inventory on this machine
+(2026-11-03): SorraAgents forwards `<local_sha>` (this change); llm-manager
+ships an independent v4 hook whose pushed-commit guard refuses any push whose
+cwd `HEAD` is not the pushed commit (strict in-place — a deliberate divergence
+that already binds the verdict to the commit, without the clean-worktree
+fallback); AI_Hell, ContextHub, dev-scripts and Tableau-Card-Engine ship the
+template v2 hook, which has **no** dev/main suite gate at all, so there is no
+verdict to bind until they adopt the v3-style gate. See
+`SA-0MVTRBT50005DUEH` for the recorded list.
 
 Consequence for the finish gate: no green verdict can be served for a tree
 whose suite never ran. A tree-keyed green exists only where the suite executed

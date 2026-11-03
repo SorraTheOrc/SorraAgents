@@ -146,6 +146,14 @@ This matters because every consumer of that field acts on the main checkout:
   pushed tree and validates the pushed commit (SA-0MVTFMB7K002Y1F3); a
   pre-push subject guard refuses the push when the worktree does not hold that
   commit;
+- the pre-push gate's **subject is the pushed commit**
+  (SA-0MVTRBT50005DUEH): the hook forwards `<local_sha>` as
+  `run_tests.py --gate-commit`, which measures (and cache-keys against) a
+  checkout of that commit with no dirty paths — the pusher's worktree on the
+  normal finish path, else another clean `git worktree list` checkout — and
+  refuses the push when none exists. A push from a **dirty** linked worktree
+  therefore cannot leave a green verdict behind: either another clean worktree
+  of the commit is gated, or the push is refused;
 - `_remove_worktree(..., repo_root=<value>)` refuses to remove a path that
   resolves to `repo_root`, so a worktree recorded as the root makes finish
   raise `REFUSE to remove the repository root` *after* a successful push;
