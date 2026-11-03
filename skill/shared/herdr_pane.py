@@ -353,6 +353,21 @@ def _resolve_herdr_bin(env_map: Mapping, which) -> str | None:
     return resolver("herdr")
 
 
+def resolve_herdr_bin(env_map: Mapping, which: Callable | None = None) -> str | None:
+    """Public ``HERDR_BIN_PATH``-aware herdr binary resolution.
+
+    Reused by :mod:`shared.herdr_session` (and any other pane/session helper) so
+    the override-then-``PATH`` precedence lives in exactly one place. Returns
+    ``None`` when no binary can be resolved (fail-open; the caller reports it).
+    """
+    return _resolve_herdr_bin(env_map, which)
+
+
+def subprocess_env(env: Mapping | None) -> dict | None:
+    """Public environment helper for herdr subprocesses (``None`` inherits)."""
+    return _subprocess_env(env)
+
+
 def _stdout_indicates_error(stdout: str) -> bool:
     """True when the herdr CLI emitted a JSON ``error`` object."""
     try:

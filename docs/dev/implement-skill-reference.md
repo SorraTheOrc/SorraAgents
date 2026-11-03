@@ -1807,3 +1807,85 @@ from `assignee`.
   files are not diverged). Lock-store isolation is pinned by
   `skill/implement/tests/test_phase_start_claim.py::test_child_lock_lives_in_the_isolated_store_not_the_real_one`
   and `tests/test_implement_child_lock_isolation.py`.
+
+## Herdr session boundary helper and fake CLI (SA-0MVPHXNTJ006TNFB)
+
+`skill/shared/herdr_session.py` is the single, injectable boundary the
+pane-driven `drive` transport builds on. `herdr_pane.py`
+(SA-0MTFLQEQQ0083EW1) owns *pane titles*; this helper owns the **session**
+surface an epic child needs — split a sibling pane, start an interactive agent
+in it, prompt it, wait for its lifecycle state, then close or rename the pane.
+It reuses `herdr_pane`'s `HERDR_BIN_PATH` resolution and subprocess-env
+handling (`resolve_herdr_bin`, `subprocess_env`) rather than duplicating them,
+and follows the same fail-open style.
+
+### Surface
+
+One client, `HerdrSessionClient`, whose every method returns a parsed result
+dict or a fail-open `{"success": False, "reason": ...}` — **it never raises**:
+
+| Method | herdr call |
+|---|---|
+| `split_pane(cwd, direction="right", env=None, focus=False, current=True, pane_id=None)` | `pane split --current --direction <dir> --cwd <path> [--env K=V]… --no-focus` |
+| `start_agent(name, pane_id, kind="pi", args=[...], timeout_ms=None, ready_budget_seconds=0.0)` | `agent start <name> --kind pi --pane <id> -- <args>` |
+| `prompt_agent(target, text, wait=True, until=None, timeout_ms=None)` | `agent prompt <target> <text> --wait [--until <state>]… [--timeout <ms>]` |
+| `wait_agent(target, until=None, timeout_ms=None)` | `agent wait <target> [--until <state>]… [--timeout <ms>]` |
+| `close_pane(pane_id)` | `pane close <pane_id>` |
+| `rename_pane(pane_id, label)` | `pane rename <pane_id> <label>` |
+
+Success results carry `pane_id`, `agent`, `agent_name` and `agent_status`
+parsed defensively from `.result.pane.pane_id` / `.result.agent`. An unexpected
+payload is reported as a failure (`unexpected herdr response (expected …)`)
+instead of being assumed — Herdr API drift is a recorded risk, so an unknown
+shape must stop the chain cleanly, never crash it. Failures carry the herdr
+error `code` (e.g. `agent_not_ready`, `agent_blocked`, `timeout`,
+`pane_not_found`), the exact `command` and the `returncode`.
+
+`pane split` never creates a tab or workspace: it splits the calling pane
+(`--current`) so each child appears as a sibling pane in the caller's tab.
+
+### Agent naming
+
+herdr names must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents.
+`agent_name_for_child(child_id, existing=…)` derives
+`drive-<child-id-lowercased>`, collapses unsafe characters to `-`, truncates
+deterministically to 32 characters, and appends `-2`, `-3`, … when the result
+collides with a name already in use (staying inside the same length budget).
+`start_agent` refuses an invalid name with a reported reason before invoking
+herdr, so a malformed name can never reach the CLI.
+
+### `agent_not_ready`
+
+`herdr agent start` requires the pane to be at its interactive shell prompt.
+When it is not, herdr returns `agent_not_ready`; `start_agent` retries within
+`ready_budget_seconds` (polling every `poll_interval`, both injectable clocks)
+and otherwise surfaces the code as a reported reason with `attempts`. A
+non-readiness error is never retried.
+
+### Fake CLI (test-only)
+
+`skill/shared/tests/fake_herdr_cli.py` provides both flavours of the double:
+
+- **`FakeHerdrRunner`** — an in-process `subprocess.run` replacement with
+  ordered scripted responses, recording every argv.
+- **the executable shim itself** — run the module as a script for a real
+  subprocess boundary; it records each invocation as one JSON line
+  (`{"argv": [...]}`) to `FAKE_HERDR_RECORD` and prints the next response from
+  `FAKE_HERDR_SCRIPT` (`--script`/`--record` flags override the env vars).
+
+Responses are consumed in order, so a script pins the call order while the
+record file proves the exact arguments the caller built. Response builders
+(`pane_info_response`, `agent_started_response`, `agent_prompted_response`,
+`agent_info_response`, `ok_response`, `error_response`) emit the real CLI's
+envelopes (verified against `herdr` 0.9.5), including `done`, `blocked`,
+`timeout`, `agent_not_ready` and CLI-failure transitions — no live Herdr is
+needed by any test.
+
+### Tests
+
+`skill/shared/tests/test_herdr_session.py` covers naming (valid, truncated,
+collision), the exact argv of every call, the absence of tab/workspace
+creation, the `done`/`blocked`/`timeout`/`unknown` transitions, the
+`agent_not_ready` retry and exhaustion paths, every fail-open mode, and an
+end-to-end shim run asserting a full split → start → prompt → wait → close
+sequence.
