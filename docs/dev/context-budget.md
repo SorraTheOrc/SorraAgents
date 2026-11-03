@@ -246,6 +246,18 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 >    threshold exceed blocks the push. Both run on every test-suite execution,
 >    so CI and pre-`in_review` runs fail on regression.
 >
+> **Subject of the gate:** the context-budget gate measures the tree of the
+> directory the push is executed from. `implement.py finish` now pushes from the
+> **worktree** that holds the pushed commit (SA-0MVTFMB7K002Y1F3), so the gate
+> measures the pushed files, not a stale main checkout; `finish` also fails
+> closed when the worktree cannot hold the pushed commit, and its
+> `dev-push gate evidence` line records the resolved `root`/`head`/`pushed` and
+> whether the full-suite entry was `cached`, `executed` or `no-evidence`.
+> Because a worktree's test cache is private to it, the hook's
+> `mirror_suite_cache` copies its entries into the main checkout's
+> `.worklog/cache` so post-push verification and the audit skill (F3) still see
+> the pushed commit's green full-suite entry.
+>
 > The hook is only **active** when git dispatches to it. Two supported
 > mechanisms satisfy this: (a) `core.hooksPath` points at `.githooks`
 > (recommended; `install_pi.sh` sets this idempotently), or (b) the committed

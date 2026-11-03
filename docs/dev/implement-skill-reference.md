@@ -1381,11 +1381,13 @@ Regression pins: `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`,
 ## Finish main-checkout guard (WL-0MVPADZ1Z000FOSG AC3)
 
 The test guards above protect a **test run**. But `implement.py finish`
-itself operates on the main checkout — Step-5 fast-forward, Step-6 push,
-Step-7 worktree removal — so a foreign actor mutating the main checkout
-mid-finish (the 2026-10-26 `packages/shared` wipe) could be silently
-carried into the push or committed by a subsequent `git commit -a`. The
-finish main-checkout guard closes that window:
+itself operates on the main checkout — Step-5 fast-forward, Step-6b worktree
+removal and the post-push ancestry assertion (the Step-6 dev push now runs from
+the worktree that holds the pushed commit, SA-0MVTFMB7K002Y1F3) — so a foreign
+actor mutating the main checkout mid-finish (the 2026-10-26 `packages/shared`
+wipe) could still be silently carried into the main checkout's bookkeeping or
+a subsequent `git commit -a`. The finish main-checkout guard closes that
+window:
 
 - **Snapshot at run start** (`_snapshot_main_checkout`): the main
   checkout's working-tree status surface (`git status --porcelain=v1`,
@@ -1396,8 +1398,8 @@ finish main-checkout guard closes that window:
   the pre-fast-forward HEAD → the merged commit) is attributed to finish and
   excluded; everything else that changed aborts.
 - **Verify before worktree removal** (Step 6c, `pre_worktree_removal`): a
-  mutation that appeared during the push (e.g. the pre-push hook's full
-  suite) must still abort loudly.
+  mutation that appeared while the push ran (e.g. a concurrent actor) must
+  still abort loudly.
 
 On failure `phase_finish` raises inside the `StatusLifecycle` context; the
 work item is left `open` (never `completed`/`in_review`), the abort message
@@ -1482,9 +1484,49 @@ including the bounded-wait timeout message and the `start` refresh window).
 
 ## Verified reversible local-dev sync and post-push ancestry assertion (SA-0MVPZG7A0000N66U)
 
-The pre-push fast-forward of the main checkout's local parent branch exists so
-the dev-push integration gate measures the **main checkout** with the new
-files already present (SA-0MVECQUGF0064U81). That advance is inherently
+**The dev-push gate's subject is the pushed commit, and the push runs from the
+worktree that holds it (SA-0MVTFMB7K002Y1F3).** `.githooks/pre-push` runs the
+full suite against the tree of the directory `git push` is launched from (`git
+rev-parse --show-toplevel` in the pushing cwd), not against the pushed commit,
+so `phase_finish` Step 6 calls `git_push_to_dev(worktree_path, …)` — never the
+main checkout. A pre-push subject guard (`_assert_push_subject`) refuses the
+push with `PushSubjectMismatchError` when the worktree cannot hold the pushed
+commit (missing, not a git working tree, or its `HEAD` is a different commit);
+the message names the commit, branch, worktree and actual `HEAD`, so a checkout
+holding a different commit can never silently gate the wrong tree. The
+non-fast-forward recovery re-establishes the same subject: it fetches and
+rebases inside the worktree, recomputes the rewritten commit **there**, guards
+again and retries `git_push_to_dev(worktree_path, …)` — so the rebased
+replacement hash, not the pre-rebase commit, is what the gate measures.
+
+On success `git_push_to_dev` logs the hook's `stderr` (so "the gate ran" is
+visible) and one structured line:
+
+```
+dev-push gate evidence: root=<cwd> head=<sha> pushed=<sha> full-suite=<classification>
+```
+
+The classification is derived from the **read-only** test cache for the pushed
+tree, never from wall-clock: a valid full-suite entry already present before the
+push ⇒ `cached`; none before but one after the push ⇒ `executed`; still none ⇒
+`no-evidence` (warned — never silently reported as green). The same dict is
+exposed as `report["steps"]["push"]["gate_evidence"]` (`root`, `head`,
+`pushed`, `full_suite`) for `--json` consumers. The evidence path executes no
+test command and never turns a gate-accepted push into a failure.
+
+**Cache compatibility.** Cache keys stay path-independent (command + `HEAD` sha
++ dirty-content hash), but a worktree's cache directory is private and is
+discarded with the tree. So `.githooks/pre-push`'s `mirror_suite_cache` copies
+any entries the fresh worktree cache holds that the main checkout's
+`.worklog/cache` lacks (content-addressed, so an identical key is an identical
+run). Without it, pushing from the worktree would lose the pushed commit's
+green `scope: full` entry as far as the main checkout's post-push verification
+and the audit skill (F3) are concerned.
+
+The pre-push fast-forward of the main checkout's local parent branch is
+**main-checkout hygiene only** (it keeps the next worktree's base up to date),
+never the gate subject, and may be skipped safely while the push and the
+ancestry assertion remain authoritative. That advance is inherently
 unverified — the commit is by definition not on `origin/dev` yet — so
 `phase_finish` decomposes it into three cooperating guarantees, all inside
 the per-repository lock above:
@@ -1586,6 +1628,7 @@ keys added for it are:
 | `report["steps"]["main_checkout_lock"]` | Lock path, whether it was acquired, when, and the holder description when the finish was refused |
 | `report["steps"]["local_dev_fast_forward"]` | Whether the pre-push advance ran (`advanced`), why it refused (`reason`), the pre-advance and remote tips, and the `own_churn` allow-list |
 | `report["steps"]["local_dev_restore"]` | Whether a failed push restored local `dev` to `origin/dev`, and why not when it was skipped |
+| `report["steps"]["push"]` | The dev push outcome, plus `gate_evidence` (`root`, `head`, `pushed`, `full_suite` classification) when the push succeeded (SA-0MVTFMB7K002Y1F3) |
 | `report["steps"]["ancestry_assertion"]` | The resolved commit, target ref and remote tip verified after the push |
 | `report["steps"]["status_readback"]` | Confirms the terminal `completed`/`in_review` transition actually stuck in the store |
 

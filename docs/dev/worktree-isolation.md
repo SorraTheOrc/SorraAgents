@@ -139,8 +139,13 @@ the worktree, never a path inside it.
 
 This matters because every consumer of that field acts on the main checkout:
 
-- `finish` fast-forwards `dev` in the main checkout and pushes from it;
-- `finish` posts the parent-branch sync against the main checkout;
+- `finish` fast-forwards `dev` in the main checkout (hygiene only) and posts
+  the parent-branch sync there;
+- the **dev push runs from the worktree** that holds the pushed commit — not
+  from `repo_root` — so `.githooks/pre-push` resolves its project root to the
+  pushed tree and validates the pushed commit (SA-0MVTFMB7K002Y1F3); a
+  pre-push subject guard refuses the push when the worktree does not hold that
+  commit;
 - `_remove_worktree(..., repo_root=<value>)` refuses to remove a path that
   resolves to `repo_root`, so a worktree recorded as the root makes finish
   raise `REFUSE to remove the repository root` *after* a successful push;

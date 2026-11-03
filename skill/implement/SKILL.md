@@ -1010,6 +1010,22 @@ See ``../refactor/SKILL.md``.
   > lost by skipping the sync at push time — the main checkout syncs the data
   > on its own pushes.
 
+  > **The dev push runs from the worktree (SA-0MVTFMB7K002Y1F3).** `finish`
+  > launches `git push` from the **worktree that holds the pushed commit**, on
+  > the first attempt and the non-fast-forward retry, so the pre-push
+  > full-suite gate resolves its project root with
+  > `git rev-parse --show-toplevel` in the pushed tree — the main checkout's
+  > working tree is never the gate's subject. A pre-push subject guard **fails
+  > closed** (`PushSubjectMismatchError`, naming the commit, branch, worktree
+  > and actual `HEAD`) when the worktree cannot hold the pushed commit, instead
+  > of pushing from a checkout holding a different commit. On success the hook's
+  > `stderr` is logged and one
+  > `dev-push gate evidence: root=… head=… pushed=… full-suite=<cached|executed|no-evidence>`
+  > line is emitted (also in `report["steps"]["push"]["gate_evidence"]`); the
+  > hook's `mirror_suite_cache` copies the worktree's cache entries into the
+  > main checkout's `.worklog/cache` so the pushed commit's green full-suite
+  > entry stays visible to post-push verification and the audit.
+
 - **Post-push local parent sync (SA-0MUGX1DIT000M7S1).** `implement.py finish`
   fast-forwards the main checkout's **local parent branch** (`dev`) to the
   pushed tip *after* a successful push, so the next `implement.py parent` /
