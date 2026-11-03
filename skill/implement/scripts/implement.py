@@ -8058,18 +8058,18 @@ def _recover_non_fast_forward_push(
     #    the worktree cannot hold the rebased commit.
     try:
         _assert_push_subject(worktree_path, new_commit, branch, worktree_path)
-    except PushSubjectMismatchError as exc:
+    except PushSubjectMismatchError as mismatch:
         wl_add_comment(
             work_item_id,
             f"Retry dev push refused after the recovery rebase "
-            f"(push-subject mismatch): {exc}\n"
+            f"(push-subject mismatch): {mismatch}\n"
             f"Branch: {branch}\nCommit: {new_commit}\n"
             f"Worktree: {worktree_path}",
         )
         raise RuntimeError(
             f"git push to dev failed after rebase (push-subject mismatch): "
-            f"{exc}"
-        ) from exc
+            f"{mismatch}"
+        ) from mismatch
     if not git_push_to_dev(worktree_path, branch, new_commit):
         # Retry failed — preserve state for manual recovery.
         wl_add_comment(
