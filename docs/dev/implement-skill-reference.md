@@ -1194,6 +1194,62 @@ builds and the release path keeps using `engine:verify` (the rejected remedy
 C); the pin/gitlink pair restored here is the pre-build pair, which was
 coherent, so the pair stays coherent either way.
 
+### Engine lag on a failed build (SA-0MW06FLFR009F0P4)
+
+`npm run build` in a game repo runs `engine:sync` **first**, so a build can
+advance `./core` to the tracked-branch tip and rewrite the pin — and *then*
+fail, because the item's source predates a breaking engine API change (the
+reproduced `hasChoices`/`isChoice` rename). The advance used to be invisible:
+the failure comment posted only `build_result["stderr"][:500]`, while
+`engine:sync` reports the advance (`engine:sync: core updated <from> → <to>`)
+and the pin rewrite on **stdout**. The data was already there, unused on the
+failure path: `_build_churn_baseline()` records the pre-build gitlink (the
+item's pin) and the submodule checkout `HEAD` is the engine the build actually
+compiled against.
+
+`_engine_lag()` compares the two and reports the result **additively**:
+nothing is restored, staged or committed, the churn exclusion above is
+unchanged, and `compute_git_state()` is untouched (the cache key is not
+relaxed). The field is present only on the build-failure path, in the
+returned report and in the printed JSON
+(`report["steps"]["build"]["engine_lag"]`):
+
+| Key | Meaning |
+| --- | --- |
+| `submodules` | One entry per gitlink the pre-build `HEAD` recorded (empty for a repo with no submodule). |
+| `submodules[].submodule` | Repository-relative submodule path (e.g. `core`). |
+| `submodules[].pinned_sha` | The composition staged at build start — the item's own pin when it changed the composition itself, else the committed gitlink — so an item-originated composition change is never reported as a build advance. |
+| `submodules[].composed_sha` | The submodule checkout `HEAD` the failed build compiled against (`null` when it cannot be resolved). |
+| `submodules[].advanced` | `true` only when the checkout differs from the pin. |
+| `advanced` | `true` when any submodule advanced. |
+
+An advance adds one diagnosis line per advanced submodule plus the
+`engine:sync` lines found in stdout (at most 20), and the comment reproduces
+the tail of **both** streams:
+
+```
+Build failed during finish phase (exit code 2).
+
+**Engine advanced past the item's pin during the build.** The compile errors
+below may come from engine APIs this item predates:
+- core: build ran against engine 2305f888…; the item pinned 21bedf7a… — the advance is not part of this item's commit
+
+**engine:sync output**
+engine:sync: core updated 21bedf7a8c → 2305f888d0
+
+**stdout (tail)**
+…
+
+**stderr (tail)**
+…
+```
+
+When nothing advanced — or the repo records no submodule — `advanced: false`
+and the comment carries **no** engine section: finish behaves exactly as
+before. A build with no `engine:sync` output at all (Python-only repo, skipped
+build, a sync failing before it prints) is handled without error, because the
+lag is derived from git state rather than parsed output.
+
 ## Push timeout (SA-0MUH9R74O002MQDU)
 
 `implement.py finish` pushes to `dev` via `git_push_to_dev()`.  The push

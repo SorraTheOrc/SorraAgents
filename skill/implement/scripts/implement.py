@@ -2683,6 +2683,17 @@ GITLINK_MODE = "160000"
 #: churn and is never restored by the build-churn stage.
 CHURN_EXEMPT_PREFIX = ".worklog/"
 
+#: Prefix of the ``engine:sync`` lines a game repo's build prints to stdout.
+#: They are the only record that the build advanced the engine before it
+#: compiled (SA-0MW06FLFR009F0P4).
+ENGINE_SYNC_LINE_PREFIX = "engine:sync"
+
+#: Maximum number of ``engine:sync`` lines quoted in a build-failure comment.
+ENGINE_SYNC_MAX_LINES = 20
+
+#: Characters of a build's stdout/stderr kept in a build-failure comment.
+BUILD_OUTPUT_TAIL_CHARS = 500
+
 
 def _parse_gitlink_entries(output: str, sha_field: int = 2) -> dict[str, str]:
     """Parse NUL-separated ``ls-tree``/``ls-files --stage`` output into a map.
@@ -2826,10 +2837,12 @@ def _build_churn_baseline(cwd: str) -> dict[str, Any]:
         cwd: Worktree root.
 
     Returns:
-        ``{taken_at, gitlinks, dirty_paths}`` where ``dirty_paths`` maps every
-        tracked dirty path to its :func:`_path_state_token` and ``gitlinks``
-        is ``HEAD``'s recorded composition. Outside a git work tree both are
-        empty (the churn stage is then a no-op).
+        ``{taken_at, gitlinks, index_gitlinks, dirty_paths}`` where
+        ``dirty_paths`` maps every tracked dirty path to its
+        :func:`_path_state_token`, ``gitlinks`` is ``HEAD``'s recorded
+        composition and ``index_gitlinks`` the composition staged at build
+        start (the item's own pin change, when it made one). Outside a git
+        work tree all three are empty (the churn stage is then a no-op).
     """
     gitlinks = _head_gitlinks(cwd)
     dirty = sorted(_tracked_dirty_paths(cwd))
@@ -2837,6 +2850,7 @@ def _build_churn_baseline(cwd: str) -> dict[str, Any]:
     return {
         "taken_at": datetime.now(timezone.utc).isoformat(),
         "gitlinks": gitlinks,
+        "index_gitlinks": _index_gitlinks(cwd),
         "dirty_paths": {
             path: _path_state_token(cwd, path, known) for path in dirty
         },
@@ -3111,6 +3125,157 @@ def _build_churn_refusal_message(churn: dict[str, Any]) -> str:
         "genuinely this item's, make it part of the change set *before* the "
         "build (stage or modify it yourself) so it is preserved."
     )
+
+
+def _engine_lag(cwd: str, baseline: dict[str, Any]) -> dict[str, Any]:
+    """Report a failed build's engine advance against the item's pinned engine.
+
+    A game repo's ``npm run build`` runs ``engine:sync`` first, which advances
+    the ``core`` submodule to the tracked-branch tip before the rest of the
+    build compiles the item's source. If the item predates a breaking engine
+    API change the build then fails with a compile error that has nothing to
+    do with the item's own change — and the failure message carried no trace
+    of the advance, so an engine-induced failure looked like a source failure
+    (SA-0MW06FLFR009F0P4).
+
+    The data was already available: :func:`_build_churn_baseline` records the
+    pre-build gitlink (the item's pinned engine) and the submodule checkout
+    ``HEAD`` is the engine the build actually compiled against. Comparing them
+    is additive reporting only — nothing is restored or staged here.
+
+    Args:
+        cwd: Worktree root.
+        baseline: The :func:`_build_churn_baseline` taken before the build.
+
+    Returns:
+        ``{submodules: [{submodule, pinned_sha, composed_sha, advanced}],
+        advanced}``. ``pinned_sha`` is the composition staged at build start —
+        the item's own pin when it changed the composition itself, else the
+        committed gitlink — so an item-originated composition change is never
+        reported as a build advance. A repo without a recorded submodule
+        composition reports an empty ``submodules`` list, and an unresolved
+        submodule checkout is reported with ``composed_sha: None`` and
+        ``advanced: false`` — a broken composition is never an advance.
+    """
+    gitlinks = dict(baseline.get("gitlinks") or {})
+    pins = {**gitlinks, **(baseline.get("index_gitlinks") or {})}
+    submodules: list[dict[str, Any]] = []
+    for path, recorded in sorted(gitlinks.items()):
+        pinned = pins.get(path, recorded)
+        proc = _run_git_plumbing(str(Path(cwd) / path), ["rev-parse", "HEAD"])
+        composed = proc.stdout.strip() if proc.returncode == 0 else ""
+        submodules.append(
+            {
+                "submodule": path,
+                "pinned_sha": pinned,
+                "composed_sha": composed or None,
+                "advanced": bool(composed) and composed != pinned,
+            }
+        )
+    return {
+        "submodules": submodules,
+        "advanced": any(entry["advanced"] for entry in submodules),
+    }
+
+
+def _engine_sync_lines(stdout: str, limit: int = ENGINE_SYNC_MAX_LINES) -> list[str]:
+    """The ``engine:sync`` lines a build printed to stdout.
+
+    ``engine:sync`` logs the advance (``engine:sync: core updated <from> →
+    <to>``) and the pin rewrite to **stdout**, where the old build-failure
+    comment — which posted only ``stderr`` — could never show them.
+
+    Args:
+        stdout: The build's captured stdout.
+        limit: Maximum number of lines kept.
+
+    Returns:
+        The matching lines, in order. Empty when the build produced no
+        ``engine:sync`` output at all (Python-only repos, a skipped build, or
+        a sync that failed before printing).
+    """
+    return [
+        line.strip()
+        for line in (stdout or "").splitlines()
+        if line.strip().lower().startswith(ENGINE_SYNC_LINE_PREFIX)
+    ][:limit]
+
+
+def _build_output_tail(output: str, limit: int = BUILD_OUTPUT_TAIL_CHARS) -> str:
+    """The last *limit* characters of a build output stream.
+
+    Args:
+        output: The captured stdout or stderr.
+        limit: Maximum number of characters kept.
+
+    Returns:
+        The tail, prefixed with an elision marker when truncated. Empty for
+        empty input.
+    """
+    text = (output or "").strip()
+    if len(text) <= limit:
+        return text
+    return "…(truncated)\n" + text[-limit:]
+
+
+def _engine_lag_diagnosis(engine_lag: dict[str, Any]) -> str:
+    """The operator-facing line(s) naming both SHAs of every advanced engine.
+
+    Args:
+        engine_lag: The :func:`_engine_lag` report.
+
+    Returns:
+        One bullet per advanced submodule, empty when nothing advanced.
+    """
+    return "\n".join(
+        f"- {entry['submodule']}: build ran against engine "
+        f"{entry['composed_sha']}; the item pinned {entry['pinned_sha']} — "
+        "the advance is not part of this item's commit"
+        for entry in engine_lag.get("submodules") or []
+        if entry.get("advanced")
+    )
+
+
+def _build_failure_message(
+    build_result: dict[str, Any], engine_lag: dict[str, Any]
+) -> str:
+    """The work-item comment a failed finish build posts.
+
+    Records the exit code, the engine diagnosis when the build advanced the
+    engine past the item's pin, the ``engine:sync`` lines and the tails of
+    **both** streams — stdout is where ``engine:sync`` reports the advance, so
+    stderr alone can leave the operator without the cause of a compile error
+    (SA-0MW06FLFR009F0P4).
+
+    Args:
+        build_result: The :func:`run_build` result.
+        engine_lag: The :func:`_engine_lag` report for the failed build.
+
+    Returns:
+        The comment body (Markdown).
+    """
+    sections = [
+        "Build failed during finish phase "
+        f"(exit code {build_result['exit_code']})."
+    ]
+    if engine_lag.get("advanced"):
+        sections.append(
+            "**Engine advanced past the item's pin during the build.** The "
+            "compile errors below may come from engine APIs this item "
+            "predates:\n" + _engine_lag_diagnosis(engine_lag)
+        )
+        sync_lines = _engine_sync_lines(build_result.get("stdout") or "")
+        if sync_lines:
+            sections.append(
+                "**engine:sync output**\n```\n" + "\n".join(sync_lines) + "\n```"
+            )
+    stdout_tail = _build_output_tail(build_result.get("stdout") or "")
+    if stdout_tail:
+        sections.append("**stdout (tail)**\n```\n" + stdout_tail + "\n```")
+    stderr_tail = _build_output_tail(build_result.get("stderr") or "")
+    if stderr_tail:
+        sections.append("**stderr (tail)**\n```\n" + stderr_tail + "\n```")
+    return "\n\n".join(sections)
 
 
 @dataclass
@@ -9035,17 +9200,30 @@ def phase_finish(
     build_churn_baseline = _build_churn_baseline(worktree_path)
     LOG.info("Running build...")
     build_result = run_build(worktree_path)
+    if not build_result["success"]:
+        # A failed build may itself have advanced the engine past the item's
+        # pin (``engine:sync`` runs first), so the compile errors may come
+        # from engine APIs this item predates. The lag is reported — additively
+        # — in the report and the failure comment (SA-0MW06FLFR009F0P4).
+        build_result["engine_lag"] = _engine_lag(
+            worktree_path, build_churn_baseline
+        )
     report["steps"]["build"] = build_result
     if not build_result["success"]:
         msg = f"Build failed (exit code {build_result['exit_code']})"
         LOG.error(msg)
         if build_result["stderr"]:
             LOG.error("Build stderr:\n%s", build_result["stderr"][:2000])
+        if build_result["engine_lag"].get("advanced"):
+            LOG.error(
+                "Build engine lag:\n%s",
+                _engine_lag_diagnosis(build_result["engine_lag"]),
+            )
         report["success"] = False
         report["message"] = msg
         wl_add_comment(
             work_item_id,
-            f"Build failed during finish phase.\n```\n{build_result['stderr'][:500]}\n```",
+            _build_failure_message(build_result, build_result["engine_lag"]),
         )
         try:
             StatusLifecycle.update_status(work_item_id, "open", assignee="")
