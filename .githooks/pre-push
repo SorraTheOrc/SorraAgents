@@ -81,6 +81,48 @@ while read local_ref local_sha remote_ref remote_sha; do
   esac
 done
 
+# Mirror the test-runner cache entries a worktree gate run wrote into the main
+# checkout's cache (SA-0MVTFMB7K002Y1F3 cache-compatibility constraint).
+# ``implement.py finish`` now pushes from the linked worktree holding the
+# pushed commit, so ``run_tests.py`` caches per git state under the worktree's
+# cache (``<worktree>/.worklog/cache``, else ``<git-dir>/test-cache``) —
+# invisible to the main checkout's post-push verification and the audit skill
+# (F3), which read ``<main>/.worklog/cache``. Keys are content-addressed
+# (command + git state), so copying an entry the main cache lacks is always
+# safe: an identical key is an identical run. Fail-soft — cache plumbing must
+# never decide a push.
+mirror_suite_cache() {
+  wt_root="$1"
+  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+  [ -n "$git_dir" ] && [ -d "$git_dir" ] || return 0
+  if [ -d "$wt_root/.worklog" ]; then
+    wt_cache="$wt_root/.worklog/cache"
+  else
+    wt_cache="$git_dir/test-cache"
+  fi
+  [ -d "$wt_cache" ] && [ -n "$(ls -A "$wt_cache" 2>/dev/null)" ] || return 0
+  common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  case "$common_dir" in
+    /*) main_git_dir="$common_dir" ;;
+    *) main_git_dir="$(cd "$wt_root" && pwd)/$common_dir" ;;
+  esac
+  main_root="$(dirname "$main_git_dir")"
+  [ "$main_root" != "$wt_root" ] || return 0
+  main_cache="$main_root/.worklog/cache"
+  [ -d "$main_cache" ] || return 0
+  for entry in "$wt_cache"/*; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    [ -e "$main_cache/$name" ] && continue
+    if cp -a "$entry" "$main_cache/$name" 2>/dev/null; then
+      echo "pre-push: mirrored gate cache entry $name into $main_root/.worklog/cache" >&2
+    else
+      echo "pre-push: warning: could not mirror cache entry $name into $main_root/.worklog/cache" >&2
+    fi
+  done
+  return 0
+}
+
 # Full-suite gate for pushes targeting dev/main (release gates). Partial
 # runs are never full-suite evidence, so the gate always runs scope=full.
 if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
@@ -90,6 +132,7 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
     echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env" >&2
     if python3 "$runner" --scope full --strict-git-env --json >/dev/null 2>&1; then
       echo "pre-push: full suite green (cached runs make repeat pushes cheap)" >&2
+      mirror_suite_cache "$repo_root"
     else
       echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2
       echo "  Run: python3 \"$runner\" --scope full  (or implement.py finish) and fix failures." >&2
