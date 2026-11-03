@@ -1419,6 +1419,60 @@ verdicts per stage, own-churn list, final verdict). Regression pins:
 `skill/implement/tests/test_finish_no_diff_status.py` (must stay green — a
 clean finish is unaffected).
 
+## Stale shared-package resolution gate (SA-0MVPI41SR008JYXL)
+
+A worktree resolves a path-consumed workspace package (the reference case is
+`@worklog/shared`) through its own `node_modules` link farm. When that farm is
+missing or stale, the package resolves to the **main checkout's** build output
+(`<main-checkout>/packages/shared/dist`), so the gate validates code the
+worktree does not contain: a correct shared change false-reds
+(WL-0MVK6S4HM005GBCO) and a broken one can false-green. The gate must never
+report a verdict about the wrong code, so `finish` **fails closed** in one
+narrow case instead of warning.
+
+**One detector, two phases.** `_shared_resolution_check(worktree_path,
+repo_root)` is the single source of truth for "does this worktree resolve the
+shared package to its own `packages/shared`?". It returns
+`{applicable, ok, package, expected_root, resolved_root, stale_dist}`;
+`applicable` is `False` when the main checkout declares no such workspace
+package (the degradation path) and a missing `node_modules` is *stale*, not
+"not applicable". `start` reports it in the JSON report
+(`report["steps"]["node_modules"]`, mirrored as `shared_resolution` /
+`shared_resolution_ok`) and warns; `finish` uses the same helper to decide
+whether to refuse.
+
+**When `finish` refuses.** `_stale_shared_resolution(worktree_path, repo_root,
+parent_branch)` fires only when **both** hold:
+
+1. the worktree's change set touches `packages/shared/src/**` — uncommitted
+   files *and* commits ahead of `parent_branch`'s merge-base
+   (`_worktree_change_set_paths`), and
+2. the resolution check is applicable and **not** `ok`.
+
+Either condition alone is a no-op: an unchanged shared package never blocks a
+worktree (a blanket hard-fail would block every item in a worktree created
+before the fix landed), and a stale resolution is only a hazard for a change
+the gate could not see. Repositories without the workspace shared package are
+never refused.
+
+The refusal runs **after the build and before the test gate**: `report[
+"steps"]["shared_resolution"]` records the check plus `refused`, no gate run
+happens, nothing is committed, the message names the stale
+`<main-checkout>/packages/shared/dist` path and the remediation (re-run
+`implement.py start` from the main checkout to refresh the idempotent link
+farm, then rebuild and finish again), and the work item is released to `open`.
+
+Regression pins: `skill/implement/tests/test_stale_shared_resolution.py`
+(detector unit tests plus the `phase_finish` negative path, and the two
+no-op companions — unchanged shared source and no workspace package) and
+`skill/implement/tests/test_node_modules_link_farm.py` (the helper shared with
+`start`). `docs/dev/probe_worktree_shared_resolution.py` is the repeatable
+end-to-end probe: it seeds a throwaway workspace, applies a probe change to a
+worktree's `packages/shared/src/**`, and runs the real
+`run_tests.py --type full --scope full` in three places — the worktree with
+the link farm (passes), the worktree with the pre-farm whole-directory
+symlink (fails), and the unmodified main checkout (fails).
+
 ## Single-owner per-repository lock (WL-0MVPADZ1Z000FOSG AC5, SA-0MVPZG3IQ009IJMO)
 
 `implement.py finish` serialises its main-checkout critical section (commit →

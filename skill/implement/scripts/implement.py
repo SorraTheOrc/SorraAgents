@@ -4388,7 +4388,7 @@ def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> b
     return _materialise_link_farm(wt_node_modules, main_node_modules, overrides)
 
 
-def _shared_package_resolution(
+def _shared_resolution_check(
     worktree_path: str, repo_root: str | None
 ) -> dict[str, Any]:
     """Report whether the worktree resolves the shared workspace package locally.
@@ -4397,6 +4397,12 @@ def _shared_package_resolution(
     checkout's ``node_modules/@worklog/shared`` is a relative symlink to its
     own ``packages/shared``, so only a worktree-local override makes the
     worktree's package (and its ``dist``) visible to its gate.
+
+    Single source of truth for both phases: ``start`` reports the result in
+    its JSON report (best-effort, warning only) and ``finish`` hard-fails on
+    it when the worktree's change set touches the shared source
+    (SA-0MVPI41SR008JYXL). The launch-and-read-back contract is therefore
+    identical in both places.
 
     Returns a dict with ``applicable``, ``ok``, ``package``,
     ``expected_root``, ``resolved_root`` and ``stale_dist`` keys. ``applicable``
@@ -4456,16 +4462,165 @@ def _prepare_node_modules(
 
     Returns the ``start`` report block: ``link_created`` (whether this run
     materialised/refreshed the farm) and ``shared_resolution`` (the
-    :func:`_shared_package_resolution` result), with ``shared_resolution_ok``
+    :func:`_shared_resolution_check` result), with ``shared_resolution_ok``
     mirrored for convenient JSON consumption (SA-0MVPI400Y001FOM1 AC2).
     """
     link_created = _ensure_node_modules_symlink(worktree_path, repo_root)
-    resolution = _shared_package_resolution(worktree_path, repo_root)
+    resolution = _shared_resolution_check(worktree_path, repo_root)
     return {
         "link_created": link_created,
         "shared_resolution": resolution,
         "shared_resolution_ok": resolution["ok"],
     }
+
+
+def _worktree_change_set_paths(
+    worktree_path: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> list[str] | None:
+    """List the worktree's repository-relative change-set paths (read-only).
+
+    The change set is what ``finish`` would commit: uncommitted files
+    (``git status --porcelain=v1 --untracked-files=all``) plus committed
+    changes since the parent branch's merge-base
+    (``git diff --name-only <parent_branch>...HEAD``). A rename is reported by
+    its destination path.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        parent_branch: Branch the worktree forked from (``dev``).
+
+    Returns:
+        A sorted, de-duplicated list of repository-relative paths, or ``None``
+        when the change set cannot be read (undecidable). Callers must not
+        interpret ``None`` as "no changes": the stale-resolution gate no-ops
+        on it rather than blocking every finish in a worktree whose git state
+        it cannot read.
+    """
+    status = run_cmd(
+        [
+            "git", "-C", str(worktree_path), "status", "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        check=False,
+        timeout=60,
+    )
+    if status.returncode != 0:
+        LOG.warning(
+            "Cannot read the change set of %s (git status exit %s): %s",
+            worktree_path,
+            status.returncode,
+            (status.stderr or "").strip()[:500],
+        )
+        return None
+
+    paths: set[str] = set()
+    for line in (status.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        entry = line[3:].strip()
+        if not entry:
+            continue
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        paths.add(entry.strip('"'))
+
+    committed = run_cmd(
+        [
+            "git", "-C", str(worktree_path), "diff", "--name-only",
+            "--no-renames", f"{parent_branch}...HEAD",
+        ],
+        check=False,
+        timeout=60,
+    )
+    if committed.returncode == 0:
+        paths.update(
+            path.strip()
+            for path in (committed.stdout or "").splitlines()
+            if path.strip()
+        )
+    else:
+        LOG.debug(
+            "Cannot diff %s against %s (exit %s); relying on the dirty set only",
+            worktree_path,
+            parent_branch,
+            committed.returncode,
+        )
+    return sorted(paths)
+
+
+def _touches_shared_source(paths: list[str]) -> bool:
+    """Whether any repository-relative path is under ``packages/shared/src/``."""
+    source_prefix = SHARED_WORKSPACE_PACKAGE_DIR / "src"
+    prefix = source_prefix.as_posix().rstrip("/") + "/"
+    return any(
+        path.replace("\\", "/").startswith(prefix) for path in paths
+    )
+
+
+def _stale_shared_resolution(
+    worktree_path: str,
+    repo_root: str | None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> str | None:
+    """Refusal message when shared source changed while resolution is stale.
+
+    The ``finish`` gate's detector (SA-0MVPI41SR008JYXL, parent
+    SA-0MVMZBJGT00718ZO). It fires **only** when both hold:
+
+    1. the worktree's change set touches ``packages/shared/src/**`` — a
+       committed change (ahead of the parent branch's merge-base) or an
+       uncommitted one — and
+    2. :func:`_shared_resolution_check` is applicable and not ``ok``, i.e.
+       ``@worklog/shared`` still resolves outside this worktree (typically the
+       main checkout's stale ``packages/shared/dist``).
+
+    Either condition alone is a no-op: an unchanged shared package never
+    blocks a worktree, and a stale resolution is only a hazard for a change
+    that the gate could not see. Repositories without a workspace shared
+    package take the degradation path and are never refused.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+        parent_branch: Branch the worktree forked from (``dev``).
+
+    Returns:
+        An actionable multi-line message naming the stale
+        ``<main-checkout>/packages/shared/dist`` path and the remediation, or
+        ``None`` when the gate must not fire.
+    """
+    check = _shared_resolution_check(worktree_path, repo_root)
+    if not check["applicable"] or check["ok"]:
+        return None
+
+    changed = _worktree_change_set_paths(worktree_path, parent_branch)
+    if changed is None or not _touches_shared_source(changed):
+        return None
+
+    source_rel = (SHARED_WORKSPACE_PACKAGE_DIR / "src").as_posix()
+    expected_root = check["expected_root"] or (
+        "<worktree>/" + SHARED_WORKSPACE_PACKAGE_DIR.as_posix()
+    )
+    resolved_root = check["resolved_root"] or "<unresolved: no node_modules entry>"
+    stale_dist = check["stale_dist"] or str(
+        (Path(repo_root) / SHARED_WORKSPACE_PACKAGE_DIR / "dist")
+        if repo_root
+        else SHARED_WORKSPACE_PACKAGE_DIR / "dist"
+    )
+    return (
+        f"Stale {SHARED_WORKSPACE_PACKAGE_NAME} resolution: this worktree "
+        f"changes {source_rel}/** but the package resolves outside it, so the "
+        f"test gate would validate the main checkout's stale build instead of "
+        f"the worktree's source.\n"
+        f"  resolved:    {resolved_root}\n"
+        f"  expected:    {expected_root}\n"
+        f"  stale dist:  {stale_dist}\n"
+        f"Refusing to run the gate on the wrong code — no commit was made.\n"
+        f"Remediation: re-run `python3 skill/implement/scripts/implement.py "
+        f"start <work-item-id>` from the main checkout to refresh this "
+        f"worktree's node_modules link farm (the link step is idempotent), "
+        f"then rebuild and run `implement.py finish` again."
+    )
 
 
 # Directories pruned by the nested node_modules discovery walk. ``.git`` and
@@ -8682,6 +8837,9 @@ def phase_finish(
     1. Read state to find worktree
     2. Refactor step (unless --no-refactor)
     3. Build
+    3b. Stale shared-resolution gate: refuse when the change set touches
+        ``packages/shared/src/**`` while ``@worklog/shared`` still resolves
+        outside this worktree (SA-0MVPI41SR008JYXL)
     4. Test (with fix-and-re-run loop)
     5. Commit
     6. Verified, reversible fast-forward of dev in the main checkout
@@ -8921,6 +9079,39 @@ def phase_finish(
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
             print(format_json_output(report))
+        return report
+
+    # ── Step 2c: Stale shared-resolution gate ─────────────────────
+    # The gate runs against the worktree but `@worklog/shared` (and every
+    # other path-consumed workspace package) resolves through the worktree's
+    # `node_modules` link farm. When that farm is missing or stale, the
+    # package resolves to the MAIN CHECKOUT's build output: a correct shared
+    # change false-reds (WL-0MVK6S4HM005GBCO) and a broken one can
+    # false-green. Once the change set touches `packages/shared/src/**` a
+    # stale resolution means the gate cannot see the change at all, so it
+    # fails closed here (before the test gate, after the build) rather than
+    # reporting a verdict about the wrong code (SA-0MVPI41SR008JYXL, parent
+    # AC4). Repos without a workspace shared package are a no-op.
+    stale_resolution = _stale_shared_resolution(
+        worktree_path, repo_root, parent_branch=parent_branch
+    )
+    report["steps"]["shared_resolution"] = {
+        **_shared_resolution_check(worktree_path, repo_root),
+        "refused": stale_resolution is not None,
+    }
+    if stale_resolution:
+        LOG.error("Stale shared resolution — refusing to run the gate")
+        report["success"] = False
+        report["message"] = stale_resolution
+        wl_add_comment(work_item_id, stale_resolution)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {stale_resolution}\n")
         return report
 
     # ── Step 3: Test with fix-and-re-run loop ──────────────────────

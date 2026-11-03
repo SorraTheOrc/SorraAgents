@@ -47,13 +47,14 @@ broken one can false-green. The gate must never silently pass on the wrong
 code, so detection is **fail-closed** once the diff touches shared source
 while the link step stays best-effort.
 
-Tracer-bullet convention
-------------------------
-Expectations the sibling slices do not provide yet are marked
-``xfail(strict=True)``; their implementing change sets remove the markers.
-Two ``finish`` tests are **unmarked companions** that pass today and must
-stay green — they are the guard against the failure mode of a *blanket*
-hard-fail:
+Tracer-bullet history
+---------------------
+F1 (SA-0MVPI3JSP009BZ55) wrote these expectations as ``xfail(strict=True)``
+tracer bullets; F3 (SA-0MVPI41SR008JYXL) removed the markers when it landed
+the stale-resolution gate, so every case below is now a plain regression
+test. Two ``finish`` tests were **unmarked companions** from the start and
+must stay green — they are the guard against the failure mode of a
+*blanket* hard-fail:
 
 - ``test_finish_proceeds_when_shared_source_is_unchanged_despite_stale_resolution``
 - ``test_finish_proceeds_for_a_repo_without_a_workspace_shared_package``
@@ -72,6 +73,7 @@ import contextlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,8 +95,6 @@ SHARED_NAME = "@worklog/shared"
 SHARED_REL = Path("packages") / "shared"
 SHARED_SRC_REL = SHARED_REL / "src" / "index.js"
 SHARED_DIST_REL = SHARED_REL / "dist"
-
-_XFAIL_F3 = "F3 SA-0MVPI41SR008JYXL lands the stale-resolution gate"
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +197,6 @@ def _real(path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_resolution_check_reports_stale_through_a_directory_symlink(tmp_path):
     """A whole-directory symlink resolves ``@worklog/shared`` to the main copy."""
     main, wt = _workspace_repo(tmp_path)
@@ -213,7 +212,6 @@ def test_resolution_check_reports_stale_through_a_directory_symlink(tmp_path):
     assert _real(Path(check["stale_dist"])) == _real(main / SHARED_DIST_REL)
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_resolution_check_reports_worktree_local_with_the_link_farm(tmp_path):
     """The link farm makes the resolved package root the worktree's own copy."""
     main, wt = _workspace_repo(tmp_path)
@@ -227,7 +225,6 @@ def test_resolution_check_reports_worktree_local_with_the_link_farm(tmp_path):
     assert check["stale_dist"] in (None, "")
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_resolution_check_reports_stale_when_node_modules_is_missing(tmp_path):
     """No ``node_modules`` at all is stale, not "not applicable"."""
     main, wt = _workspace_repo(tmp_path)
@@ -240,7 +237,6 @@ def test_resolution_check_reports_stale_when_node_modules_is_missing(tmp_path):
     assert _real(Path(check["stale_dist"])) == _real(main / SHARED_DIST_REL)
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_resolution_check_is_not_applicable_without_a_workspace_shared_package(
     tmp_path,
 ):
@@ -257,7 +253,6 @@ def test_resolution_check_is_not_applicable_without_a_workspace_shared_package(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_staleness_refusal_names_the_stale_dist_and_the_remediation(tmp_path):
     """Shared source changed + stale resolution → actionable refusal message."""
     main, wt = _workspace_repo(tmp_path)
@@ -271,7 +266,6 @@ def test_staleness_refusal_names_the_stale_dist_and_the_remediation(tmp_path):
     assert "implement.py start" in message
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_staleness_detector_no_ops_with_a_worktree_local_farm(tmp_path):
     """Shared source changed but resolution is worktree-local → no refusal."""
     main, wt = _workspace_repo(tmp_path)
@@ -281,7 +275,6 @@ def test_staleness_detector_no_ops_with_a_worktree_local_farm(tmp_path):
     assert implement._stale_shared_resolution(str(wt), str(main)) is None
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_staleness_detector_no_ops_when_shared_source_is_unchanged(tmp_path):
     """Stale resolution alone is not a failure: nothing shared changed."""
     main, wt = _workspace_repo(tmp_path)
@@ -291,7 +284,6 @@ def test_staleness_detector_no_ops_when_shared_source_is_unchanged(tmp_path):
     assert implement._stale_shared_resolution(str(wt), str(main)) is None
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_staleness_detector_ignores_non_src_shared_files(tmp_path):
     """Only ``packages/shared/src/**`` triggers detection, not any shared edit."""
     main, wt = _workspace_repo(tmp_path)
@@ -301,7 +293,6 @@ def test_staleness_detector_ignores_non_src_shared_files(tmp_path):
     assert implement._stale_shared_resolution(str(wt), str(main)) is None
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_staleness_detector_sees_committed_shared_source_changes(tmp_path):
     """A committed (clean-tree) shared-source change is still detected."""
     main, wt = _workspace_repo(tmp_path)
@@ -317,7 +308,6 @@ def test_staleness_detector_sees_committed_shared_source_changes(tmp_path):
     assert _stale_dist(main) in message
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_staleness_detector_no_ops_without_a_workspace_shared_package(tmp_path):
     """Degradation: repos without a workspace shared package are never refused."""
     main, wt = _workspace_repo(tmp_path, workspace_shared=False)
@@ -325,6 +315,57 @@ def test_staleness_detector_no_ops_without_a_workspace_shared_package(tmp_path):
     (wt / "README.md").write_text("# Unrelated change\n", encoding="utf-8")
 
     assert implement._stale_shared_resolution(str(wt), str(main)) is None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end observation of the change (AC3)
+# ---------------------------------------------------------------------------
+
+
+def _observed_shared_version(cwd: Path) -> str:
+    """The ``VERSION`` a process started in *cwd* actually loads (real Node)."""
+    result = subprocess.run(
+        [
+            "node", "-e",
+            "process.stdout.write(require('@worklog/shared').VERSION)",
+        ],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None,
+    reason="node is required to observe workspace package resolution",
+)
+def test_worktree_observes_its_own_shared_build_through_the_link_farm(tmp_path):
+    """AC3: the loaded module is the worktree's build, not the main checkout's.
+
+    The companion to the realpath assertions in
+    ``test_node_modules_link_farm.py``: this asserts what a gate subprocess
+    *loads*, so a resolution that passes a path comparison but still executes
+    the main checkout's stale ``dist`` cannot slip through. The stale
+    whole-directory symlink is the negative control.
+    """
+    main, wt = _workspace_repo(tmp_path)
+    _install_stale_symlink(wt, main)
+    # Stands in for the worktree's own `npm run build`.
+    (wt / SHARED_DIST_REL).mkdir(parents=True, exist_ok=True)
+    (wt / SHARED_DIST_REL / "index.js").write_text(
+        "exports.VERSION = 'worktree-built';\n", encoding="utf-8"
+    )
+
+    assert _observed_shared_version(wt) == "main-stale-dist"
+
+    assert implement._ensure_node_modules_symlink(str(wt), str(main)) is True
+
+    assert _observed_shared_version(wt) == "worktree-built"
+    # ... and the main checkout never sees the worktree's build.
+    assert _observed_shared_version(main) == "main-stale-dist"
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +506,6 @@ def _finish_harness(wt: Path, main: Path):
         )
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_finish_refuses_when_shared_source_changed_and_resolution_is_stale(
     tmp_path,
 ):
@@ -500,7 +540,6 @@ def test_finish_refuses_when_shared_source_changed_and_resolution_is_stale(
     ), harness.lifecycle.call_args_list
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_F3)
 def test_finish_proceeds_with_a_worktree_local_farm(tmp_path):
     """A worktree-local resolution passes the check and finishes normally."""
     main, wt = _workspace_repo(tmp_path)
