@@ -21,25 +21,22 @@ still held the pre-rebase commit.
 
 Pre-fix baseline and current state
 ----------------------------------
-The two **push-subject** expectations
-(``test_first_push_runs_from_the_worktree_holding_the_commit``,
-``test_mismatched_push_subject_is_refused_before_pushing``) were written as
-``xfail(strict=True)`` baselines and are now **enforced**: the fixing change set
-SA-0MVUTXJ4300301ZN pushes from the worktree and added the fail-closed guard, so
-their markers are gone.
+All four ``xfail(strict=True)`` baselines are now **enforced** and their
+markers are gone:
 
-The two **gate-evidence** expectations
-(``test_gate_evidence_reports_cached_full_suite_on_success``,
-``test_gate_evidence_reports_executed_full_suite_when_the_gate_runs``) remain
-``xfail(strict=True)`` until SA-0MVUTXJM8006PQY4 lands; that change set removes
-their markers. Before that fix the success path logs nothing: the hook's stderr
-is captured with ``subprocess.PIPE`` and only logged on failure, and no evidence
-line names the resolved tree.
+- the two **push-subject** expectations (first-push cwd, subject-mismatch
+  refusal) — enforced by SA-0MVUTXJ4300301ZN (worktree push + fail-closed
+  guard);
+- the two **gate-evidence** expectations (``cached`` / ``executed``) — enforced
+  by SA-0MVUTXJM8006PQY4 (success-path hook logging + a structured evidence
+  line carrying the executed-vs-cached classification), plus
+  ``test_gate_evidence_reports_no_evidence_when_the_gate_produced_none`` for
+  the third classification.
 
 - ``test_fake_gate_stages_a_full_suite_entry_for_the_pushed_tree`` and
   ``test_finish_reaches_the_dev_push_with_the_recorded_subject`` are the
   **companions** that keep those baselines unambiguous: they pass before and
-  after the fix, so a failing xfail test can only be failing on the behaviour
+  after the fix, so a failing test can only be failing on the behaviour
   under test (the preconditions — a real push, a real gate run, a reachable
   finish push — are proven separately, not smuggled into the baseline).
 
@@ -85,17 +82,6 @@ LOG_NAME = "implement.scripts.implement"
 #: branch from the worktree's directory name, so the fixture names the
 #: directory after the branch.
 BRANCH = "wl-test-branch"
-
-_REASON_EVIDENCE = (
-    "pre-fix baseline: git_push_to_dev logs nothing on success and emits no "
-    "resolved-tree evidence — fixed by SA-0MVUTXJM8006PQY4; remove this "
-    "marker there"
-)
-
-gate_evidence_xfail = pytest.mark.xfail(
-    strict=True, reason=_REASON_EVIDENCE, raises=AssertionError
-)
-
 
 # ---------------------------------------------------------------------------
 # Hermetic fixture: main checkout + linked worktree holding a commit
@@ -222,6 +208,18 @@ def _stubbed_finish(sandbox: dict, pushed_commit: str, pushes: list[tuple]):
 
     def recording_push(cwd, branch, commit_hash=None, **kwargs):
         pushes.append((cwd, branch, commit_hash))
+        # Mirror the real helper's ``evidence_out`` contract so the machine-
+        # readable wiring (AC5) can be asserted through ``phase_finish``.
+        evidence_out = kwargs.get("evidence_out")
+        if evidence_out is not None:
+            evidence_out.update(
+                {
+                    "root": str(cwd),
+                    "head": sandbox["feature"],
+                    "pushed": sandbox["feature"],
+                    "full_suite": "cached",
+                }
+            )
         return True
 
     with contextlib.ExitStack() as stack:
@@ -355,6 +353,9 @@ def test_finish_reaches_the_dev_push_with_the_recorded_subject(sandbox):
     drives finish through commit → push (status green, branch derived from the
     worktree) so the baseline's failure is the push *cwd*, not a fixture or
     harness problem. Deliberately silent about the cwd itself.
+
+    It also pins AC5: the gate evidence the push helper reports is exposed in
+    ``report["steps"]["push"]["gate_evidence"]`` for ``--json`` consumers.
     """
     report, pushes = _run_finish(sandbox, sandbox["feature_short"])
 
@@ -362,6 +363,9 @@ def test_finish_reaches_the_dev_push_with_the_recorded_subject(sandbox):
     assert pushes, "finish must push to dev"
     assert pushes[0][1] == BRANCH, pushes
     assert report["steps"]["push"]["hash"] == sandbox["feature_short"]
+    evidence = report["steps"]["push"]["gate_evidence"]
+    assert evidence["full_suite"] == "cached", evidence
+    assert evidence["root"] == str(sandbox["wt"]), evidence
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +542,6 @@ def test_fake_gate_stages_a_full_suite_entry_for_the_pushed_tree(sandbox):
     assert _rev(sandbox["remote"], "dev") == sandbox["feature"]
 
 
-@gate_evidence_xfail
 def test_gate_evidence_reports_cached_full_suite_on_success(sandbox, caplog):
     """A warm cache yields ``full-suite=cached`` evidence naming the pushed tree.
 
@@ -561,7 +564,6 @@ def test_gate_evidence_reports_cached_full_suite_on_success(sandbox, caplog):
     assert evidence["classification"] == "cached", evidence
 
 
-@gate_evidence_xfail
 def test_gate_evidence_reports_executed_full_suite_when_the_gate_runs(sandbox, caplog):
     """A cold cache plus a gate run yields ``full-suite=executed``.
 
@@ -592,3 +594,30 @@ def test_gate_evidence_reports_executed_full_suite_when_the_gate_runs(sandbox, c
     assert evidence["classification"] == "executed", evidence
     # The gate really staged the full-suite entry the classification reports.
     assert test_cache.query_cached(commands[0], cwd=str(sandbox["wt"])) is not None
+
+
+def test_gate_evidence_reports_no_evidence_when_the_gate_produced_none(sandbox, caplog):
+    """A push with no gate run and no cache entry yields ``no-evidence`` (warned).
+
+    The sandbox installs no ``pre-push`` hook, so nothing stages a full-suite
+    entry: the push still succeeds (failing the push is not this helper's job),
+    but the evidence line must say so and warn — never report a silent green.
+    """
+    commands = _full_suite_commands(sandbox)
+    assert test_cache.query_cached(commands[0], cwd=str(sandbox["wt"])) is None, (
+        "the cache must be cold for the no-evidence classification"
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=LOG_NAME):
+        assert implement.git_push_to_dev(
+            str(sandbox["wt"]), BRANCH, sandbox["feature_short"]
+        ) is True
+
+    evidence = _gate_evidence(caplog.text)
+    assert evidence["root"] == str(sandbox["wt"]), evidence
+    assert _names_commit(evidence["head"], sandbox["feature"]), evidence
+    assert _names_commit(evidence["pushed"], sandbox["feature"]), evidence
+    assert evidence["classification"] == "no-evidence", evidence
+    assert "no full-suite cache entry" in caplog.text, caplog.text
+    # Nothing was fabricated into the cache by the evidence path either.
+    assert test_cache.query_cached(commands[0], cwd=str(sandbox["wt"])) is None

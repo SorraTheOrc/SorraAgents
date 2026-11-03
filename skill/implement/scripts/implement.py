@@ -203,7 +203,7 @@ except ImportError:
         "test concurrency slot busy:"
     )
 
-from test_cache import run_cached
+from test_cache import query_cached, run_cached
 from test_runner import canonicalize_quiet_test_command
 
 # Canonical quiet full-suite commands — identical cache keys to the test
@@ -3645,8 +3645,92 @@ def _assert_remote_name_only(remote: str) -> None:
         )
 
 
+def _full_suite_cache_present(cwd: str) -> bool:
+    """Whether a valid full-suite cache entry exists for *cwd*'s git state.
+
+    Read-only: queries the test cache for each full-suite command the repo
+    resolves and executes nothing. A missing suite, an unreadable command or
+    an indeterminate git state is a miss — never a silent green. Fail-soft:
+    evidence plumbing may never decide a push's outcome
+    (SA-0MVUTXJM8006PQY4 AC3/AC4).
+    """
+    try:
+        commands = _resolve_full_suite_commands(cwd) or []
+    except Exception:  # noqa: BLE001 - evidence must never break a push
+        return False
+    for command in commands:
+        try:
+            if query_cached(command, cwd=cwd) is not None:
+                return True
+        except Exception:  # noqa: BLE001 - a corrupt entry is a miss
+            continue
+    return False
+
+
+def _dev_push_gate_evidence(
+    cwd: str, commit_hash: str | None, before_present: bool,
+) -> dict[str, Any]:
+    """Classify the dev-push gate's verdict for the pushed tree (evidence).
+
+    ``.githooks/pre-push`` runs the full suite before the push contacts the
+    remote, so a successful ``git push`` means the gate ran — but the captured
+    output is only visible if it is logged, and whether the run was
+    *executed* or served from the *cache* is only observable in the test
+    cache. This resolves the gate's tree (root + ``HEAD``), the pushed sha and
+    the classification from the read-only cache API:
+
+    * a valid full-suite entry already present before the push → ``cached``;
+    * no entry before but one after the push → ``executed``;
+    * still none after a successful push → ``no-evidence`` (warned — never
+      silently reported as green).
+
+    Args:
+        cwd: The push cwd (the pushed tree).
+        commit_hash: The pushed commit (short or full).
+        before_present: Whether a valid full-suite entry existed pre-push.
+
+    Returns:
+        Dict with ``root``, ``head``, ``pushed`` and ``full_suite``.
+    """
+    root = str(Path(cwd).resolve())
+    head = _resolve_full_commit(cwd, "HEAD") or "unknown"
+    pushed = (
+        _resolve_full_commit(cwd, commit_hash) if commit_hash else None
+    ) or (commit_hash or "unknown")
+    after_present = _full_suite_cache_present(cwd)
+    if before_present:
+        classification = "cached"
+    elif after_present:
+        classification = "executed"
+    else:
+        classification = "no-evidence"
+    evidence = {
+        "root": root,
+        "head": head,
+        "pushed": pushed,
+        "full_suite": classification,
+    }
+    line = (
+        f"dev-push gate evidence: root={root} head={head} "
+        f"pushed={pushed} full-suite={classification}"
+    )
+    if classification == "no-evidence":
+        LOG.warning(
+            "%s — no full-suite cache entry exists for the pushed tree, so "
+            "the dev-push gate produced no evidence that it ran",
+            line,
+        )
+    else:
+        LOG.info("%s", line)
+    return evidence
+
+
 def git_push_to_dev(
-    cwd: str, branch: str, commit_hash: str | None = None, timeout: int | None = None,
+    cwd: str,
+    branch: str,
+    commit_hash: str | None = None,
+    timeout: int | None = None,
+    evidence_out: dict[str, Any] | None = None,
 ) -> bool:
     """Push the current branch into the dev branch on origin.
 
@@ -3667,6 +3751,9 @@ def git_push_to_dev(
         branch: Local branch name to push.
         commit_hash: The commit hash being pushed (used in recovery).
         timeout: Override timeout in seconds (defaults to resolved config).
+        evidence_out: Optional dict populated on success with the gate's
+            ``root``, ``head``, ``pushed`` and ``full_suite`` classification
+            (SA-0MVUTXJM8006PQY4 AC5). Untouched on failure.
 
     Returns:
         True if the push succeeded.
@@ -3685,6 +3772,11 @@ def git_push_to_dev(
     # worktree machine (SA-0MVX1M6HH004YPX2). The guard runs on every push;
     # the constant pins the name that carries dev-push integration.
     _assert_remote_name_only(PUSH_REMOTE_NAME)
+
+    # Snapshot the full-suite cache before the push so the gate's
+    # executed-vs-cached verdict is observable afterwards (AC3). Read-only and
+    # fail-soft: it never decides the push.
+    before_present = _full_suite_cache_present(cwd)
 
     # Spawn the push in its own process group so that a timeout kills the
     # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
@@ -3713,8 +3805,8 @@ def git_push_to_dev(
             raise PushTimeoutError(
                 commit_hash or "unknown", branch, timeout,
             ) from None
+        stderr_str = stderr.decode(errors="replace").strip()
         if proc.returncode != 0:
-            stderr_str = stderr.decode(errors="replace").strip()
             # Detect non-fast-forward errors (dev advanced concurrently).
             # AC1/AC2: raise a recoverable exception so the caller can rebase
             # and retry instead of failing with information loss.  Remotes
@@ -3736,6 +3828,17 @@ def git_push_to_dev(
                 )
             LOG.error("git push to dev failed: %s", stderr_str)
             return False
+        # Success: surface the pre-push hook's output (AC3). It was previously
+        # captured and dropped, so "the gate ran" and "the gate never ran"
+        # were indistinguishable. Then classify executed-vs-cached from the
+        # read-only test cache for the pushed tree.
+        if stderr_str:
+            for hook_line in stderr_str.splitlines():
+                LOG.info("git push to dev hook: %s", hook_line)
+        evidence = _dev_push_gate_evidence(cwd, commit_hash, before_present)
+        if evidence_out is not None:
+            evidence_out.clear()
+            evidence_out.update(evidence)
         return True
     except Exception as exc:
         if isinstance(exc, (PushTimeoutError, PushNonFastForwardError)):
@@ -7984,6 +8087,7 @@ def _recover_non_fast_forward_push(
     commit_hash: str,
     exc: PushNonFastForwardError,
     work_item_id: str,
+    evidence_out: dict[str, Any] | None = None,
 ) -> str:
     """Recover from a non-fast-forward push by rebasing and retrying.
 
@@ -8006,6 +8110,8 @@ def _recover_non_fast_forward_push(
         commit_hash: Commit being pushed (pre-rebase).
         exc: The original :class:`PushNonFastForwardError`.
         work_item_id: Work item to comment on for the recovery audit trail.
+        evidence_out: Optional dict populated on a successful retry with the
+            gate evidence (passed through to :func:`git_push_to_dev`).
 
     Returns:
         The (possibly rewritten) commit hash that was pushed.
@@ -8070,7 +8176,9 @@ def _recover_non_fast_forward_push(
             f"git push to dev failed after rebase (push-subject mismatch): "
             f"{mismatch}"
         ) from mismatch
-    if not git_push_to_dev(worktree_path, branch, new_commit):
+    if not git_push_to_dev(
+        worktree_path, branch, new_commit, evidence_out=evidence_out
+    ):
         # Retry failed — preserve state for manual recovery.
         wl_add_comment(
             work_item_id,
@@ -8648,6 +8756,9 @@ def phase_finish(
                 "commit (%s)...",
                 worktree_path,
             )
+            # Evidence captured by the push (AC3/AC5): the gate's resolved
+            # tree and executed-vs-cached verdict, exposed in --json output.
+            push_evidence: dict[str, Any] = {}
             try:
                 # AC1/AC2: the dev push runs from the checkout that holds the
                 # pushed commit (the worktree), so ``.githooks/pre-push``
@@ -8657,7 +8768,12 @@ def phase_finish(
                 _assert_push_subject(
                     worktree_path, commit_hash, branch, worktree_path
                 )
-                if not git_push_to_dev(worktree_path, branch, commit_hash):
+                if not git_push_to_dev(
+                    worktree_path,
+                    branch,
+                    commit_hash,
+                    evidence_out=push_evidence,
+                ):
                     raise RuntimeError("git push to dev failed.")
             except PushSubjectMismatchError as exc:
                 # Fail closed (AC2): nothing was pushed. Restore local dev off
@@ -8740,6 +8856,7 @@ def phase_finish(
                     commit_hash=commit_hash,
                     exc=exc,
                     work_item_id=work_item_id,
+                    evidence_out=push_evidence,
                 )
                 # The rebase rewrote HEAD; keep the reported commit in sync.
                 report["steps"]["commit"]["hash"] = commit_hash
@@ -8747,6 +8864,7 @@ def phase_finish(
                     "success": True,
                     "recovered": "non_fast_forward",
                     "hash": commit_hash,
+                    "gate_evidence": push_evidence,
                 }
             except RuntimeError:
                 # A generic push failure: nothing reached origin. Undo our own
@@ -8768,6 +8886,7 @@ def phase_finish(
                 report["steps"]["push"] = {
                     "success": True,
                     "hash": commit_hash,
+                    "gate_evidence": push_evidence,
                 }
             LOG.info("Push to dev succeeded")
 
