@@ -691,6 +691,18 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 python3 $(skill_path implement)/scripts/implement.py drive <parent-id>
 ```
 
+Pane-driving flags and variables (opt-in; headless `pi -p` stays the
+default for every caller that does not opt in):
+
+| Flag / variable | Effect |
+|---|---|
+| `--pane-sessions` | Drive each child as an interactive Pi TUI agent in a sibling Herdr pane of the calling tab. Requires Herdr (`HERDR_ENV=1` **and** a resolvable herdr binary). |
+| `--no-pane-sessions` | Force the headless `pi -p` spawner; wins over an ambient `IMPLEMENT_DRIVE_PANE_SESSIONS=1`. |
+| `IMPLEMENT_DRIVE_PANE_SESSIONS=1` | Environment equivalent of `--pane-sessions` (for a repeated/scripted drive). |
+| `--focus` / `--no-focus` | Whether each new child pane takes focus (**default `--no-focus`**: driving an epic never moves the operator's focus). |
+| `IMPLEMENT_DRIVE_ACTIVE=1` | Set by the driver on the child session (recursion guard; it also defers that child's worktree removal to the driver). |
+| `IMPLEMENT_WORKTREE_PATH` | Set on the child session to its own worktree root, so the child can verify where it writes. |
+
 `phase_drive()` loops over `phase_parent` reports and, for every startable
 child, spawns a **fresh Pi session** (`pi -p "/skill:implement <child>"`) in
 that child's own worktree, waits for it to exit, then continues. A single
@@ -730,12 +742,42 @@ terminal, the pane is closed (`pane close <id>`). A pane whose child the parent
 still sees non-terminal is kept, titled ⚠️ and listed in
 `report["retained_panes"]` with its `herdr pane read <id>` remedy. An agent
 that reports `blocked` **stops the chain**: `blocked_child` / `blocked_pane`
-are recorded, the pane is **left open** and titled 🚫, and the message names
-it. A timeout closes the pane (after reconciling the child's real stage) and
-stops the chain; any other failed session keeps its pane as evidence.
+are recorded, the pane is **deliberately left open for inspection** and titled
+🚫, and the message names it. A timeout closes the pane (after reconciling the
+child's real stage) and stops the chain; any other failed session keeps its
+pane as evidence.
 Completion is never inferred from process exit. Every `children_driven` entry
 carries `transport` and `pane_id` (`None` for the headless transport), and the
 human summary lists retained panes with their inspection remedy.
+
+**Worked example — driving an epic in a Herdr tab.** From a Pi session running
+in a Herdr pane, in the epic's project:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py drive SA-0MVLKHY27005UK40 --pane-sessions
+```
+
+What the operator sees: one sibling pane opens to the **right** of the calling
+pane for each child (never a new tab or workspace), running an interactive Pi
+TUI agent named `drive-<child-id>`; focus stays in the invoking pane because
+the default is `--no-focus`. The invoking pane prints a `transport: pane, pane
+<id>` line per driven child, and closes that child's pane once the next
+`phase_parent` re-read confirms the child is terminal.
+
+A child agent that settles **`blocked`** needs a human decision: the chain
+stops, `report["blocked_child"]` / `report["blocked_pane"]` name it, the pane
+is **left open** and titled 🚫, and the message names the pane to look at. Read
+it with the reported remedy:
+
+```bash
+herdr pane read <pane_id>     # retained_panes[].remedy prints this exact command
+```
+
+After intervening (answering in that pane, or resolving the blocker with
+`wl`), re-run the **same** `drive` command. Terminal children are skipped and
+the chain resumes at the first child with work left; a pane session that is
+still alive holds its child's per-child lock, so the re-run reports that child
+as `skipped-held` (naming the holder) instead of racing it.
 
 **The driver owns the child's worktree (SA-0MVTE8XAJ002IUDR).** A driven
 child's `finish` defers worktree removal (the tree is that session's own cwd,

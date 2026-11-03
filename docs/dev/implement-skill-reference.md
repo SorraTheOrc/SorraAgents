@@ -2063,7 +2063,7 @@ is disposed of by that signal:
 |---|---|---|
 | `done` and the parent confirms a terminal stage | **closed** (`pane close <id>`) | entry `pane_closed: true`, `pane_cleanup` |
 | `done` but the parent still sees the child non-terminal | **retained** | `retained_panes` entry, ⚠️ title |
-| `blocked` (agent needs a human decision) | **left open**, chain stops | `blocked_child`, `blocked_pane`, `retained_panes`, 🚫 title |
+| `blocked` (agent needs a human decision) | **left open** (deliberately, for inspection), chain stops | `blocked_child`, `blocked_pane`, `retained_panes`, 🚫 title |
 | timeout | **closed** (after reconciliation), chain stops | entry `timed_out: true`, `pane_closed: true` |
 | timeout whose child is already terminal | **closed** | `completed-late`, `pane_closed: true` |
 | other failure, child not terminal | **retained** as evidence | `retained_panes`, ⚠️ title |
@@ -2113,6 +2113,69 @@ inherit the driving session's identity from this process either.
 default is **`--no-focus`** so driving an epic never moves the operator's focus
 away from the session they invoked it from; the exact flag passed to `pane
 split` is asserted in the tests.
+
+### Worked example: driving an epic in a Herdr tab
+
+An operator in a Pi session running inside a Herdr pane drives a three-child
+epic:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py drive SA-0MVLKHY27005UK40 --pane-sessions
+```
+
+**What the operator sees.** A sibling pane appears to the **right** of the
+calling pane for each driven child — `pane split --current`, never a new tab or
+workspace — running an interactive Pi TUI agent named `drive-<child-id>` with
+`/skill:implement <child-id>` as its prompt. Focus stays in the invoking pane
+(the default is `--no-focus`). The invoking pane prints, as the chain advances:
+
+```text
+  ✅ SA-…C1 (attempt 1): finished
+     transport: pane, pane w1:p7
+...
+  Panes retained for inspection: 1
+     SA-…C2: pane w1:p9 (attention) — the driven agent reported `blocked`; a human decision is needed
+       inspect with: herdr pane read w1:p9
+```
+
+Each child's pane is closed once the next `phase_parent` re-read confirms that
+child reached a terminal stage, so a green chain leaves no panes behind.
+
+**A blocked child.** When a child agent settles `blocked` — it needs a person to
+answer something — the drive stops rather than re-spawning a session that would
+block again. `--json` reports `blocked_child` and `blocked_pane`; the human
+output lists the pane under **Panes retained for inspection** with its remedy.
+The pane is **deliberately left open** and titled 🚫, so the operator can see
+which pane to look at without guessing. Read it with the printed remedy:
+
+```bash
+herdr pane read w1:p9
+```
+
+and a comment on the child work item records the same instruction.
+
+**Resuming after intervening.** Answer the question in the blocked pane, or
+resolve the blocker outside it (a `wl` update, a missing decision on the child
+the agent asked about), then re-run the **same** command:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py drive SA-0MVLKHY27005UK40 --pane-sessions
+```
+
+`phase_parent` skips children that are already terminal and takes up the first
+child that still has work. A pane session that is still alive holds that
+child's per-child lock, so the re-run reports the child as `skipped-held`,
+names the holder (`agent`, `pid`, `session_id`, `started_at`) and spawns
+nothing — finish or close that pane session first instead of racing it. Panes
+retained by an earlier `drive` invocation are not tracked by the new one, so
+close any you no longer need (they are listed in the earlier report).
+
+**Without Herdr, or from an automated caller.** The same command run outside
+Herdr (no `HERDR_ENV=1`, no resolvable binary), without `--pane-sessions`, or
+with `--no-pane-sessions` uses the headless `pi -p` spawner unchanged and
+reports `transport: headless` with `pane_id: null`. The downtime worker, audit
+dispatch and CI therefore keep the headless path even if a stray flag is
+passed.
 
 ### Tests
 
