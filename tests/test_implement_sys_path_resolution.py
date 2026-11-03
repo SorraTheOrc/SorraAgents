@@ -126,6 +126,14 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
     # implement.py imports guard_shared_import at module load.
     real_ig = (_REPO_ROOT / "skill" / "import_guard.py").read_text()
     (skill_pkg / "import_guard.py").write_text(real_ig)
+    # Provide the Herdr pane/session helpers (SA-0MVPHYIIE002OBC8) —
+    # implement.py imports the pane-session client and the shared herdr-binary
+    # resolver at module load for the drive pane transport.
+    for herdr_module in ("herdr_pane.py", "herdr_session.py"):
+        real_herdr = (
+            _REPO_ROOT / "skill" / "shared" / herdr_module
+        ).read_text()
+        (skill_pkg / "shared" / herdr_module).write_text(real_herdr)
     (skill_pkg / "__init__.py").touch()
     (skill_pkg / "shared" / "__init__.py").touch()
 
