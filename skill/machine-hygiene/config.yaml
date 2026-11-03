@@ -76,18 +76,80 @@ zombie_processes:
 
 # ---------------------------------------------------------------------------
 # Swap Usage (percentage of swap space in use)
+#   Swap is a HISTORICAL figure: pages accumulate over days of paging and
+#   stay in swap after pressure has passed. The warning/critical levels below
+#   are only applied when memory is under *current* pressure — either
+#   memory_usage is at/above its own warning threshold, or the PSI memory
+#   "full" line (memory_pressure) is at/above its warning threshold. Swap
+#   above 30 % with memory_usage below 80 % and no memory stalls is reported
+#   low (historical accumulation, not actionable). A warning-level swap
+#   reading is escalated to critical when memory_usage is critical. If PSI
+#   memory data is unavailable, the capacity figure (memory_usage) is the
+#   sole signal.
 # ---------------------------------------------------------------------------
 swap_usage:
   low: 0
-  warning: 30   # >30% swap used — moderate memory pressure
-  critical: 70  # >70% swap used — severe memory starvation
+  warning: 30   # >30% swap used AND current memory pressure — moderate pressure
+  critical: 70  # >70% swap used AND current memory pressure — severe
 
 # ---------------------------------------------------------------------------
 # Runnable Process Count
 #   Number of processes in D (uninterruptible sleep) or R (runnable) state.
-#   Warning when count exceeds core count * multiplier.
+#   Warning when count exceeds core count * multiplier. This is scheduler
+#   saturation, NOT total process count — do not reuse it for process_count.
 # ---------------------------------------------------------------------------
 runnable_processes:
   low: 0
   warning_multiplier: 2.0   # warning = cores * 2
   critical_multiplier: 4.0  # critical = cores * 4
+
+# ---------------------------------------------------------------------------
+# Process Count
+#   Total processes across the host. On a multi-agent host each pi/herdr
+#   session (plus its test/build children) legitimately adds dozens of
+#   processes, so this is calibrated per core rather than as a single-user
+#   absolute figure. Warning = cores * 48, critical = cores * 96.
+#   e.g. on a 16-core host: warning 768, critical 1536 (a herdr host with
+#   16-21 concurrent sessions runs ~520-580 processes at rest → green;
+#   a genuine process explosion (>1536) still alarms).
+#   Independently overridable — this block is separate from thread_count.
+# ---------------------------------------------------------------------------
+process_count:
+  low: 0
+  warning_multiplier: 48.0   # warning = cores * 48
+  critical_multiplier: 96.0  # critical = cores * 96
+
+# ---------------------------------------------------------------------------
+# Thread Count
+#   Total threads across all processes. Each pi/node agent session carries
+#   ~100+ threads, so thread-heavy multi-agent hosts need a much higher
+#   per-core allowance than process_count. Warning = cores * 160,
+#   critical = cores * 320.
+#   e.g. on a 16-core host: warning 2560, critical 5120 (16-21 sessions run
+#   ~1700-2300 threads → green; a genuine thread explosion (>5120) still
+#   alarms). Kept as its own block so it can be tuned independently of
+#   process_count.
+# ---------------------------------------------------------------------------
+thread_count:
+  low: 0
+  warning_multiplier: 160.0   # warning = cores * 160
+  critical_multiplier: 320.0  # critical = cores * 320
+
+# ---------------------------------------------------------------------------
+# Stale-lock detection (/var/lock)
+#   A regular file in /var/lock counts as stale only when ALL of these hold:
+#     1. it is not a known kernel-owned boot lock (asound.state.lock,
+#        card0.lock, card1.lock, card2.lock — ALSA kernel locks present from
+#        boot), and
+#     2. it is not root-owned (root-owned locks are system/operator-managed),
+#        and
+#     3. it is older than 24 h (a recently touched lock is treated as active),
+#        and
+#     4. it records no live owning PID (a bare PID in the file whose /proc
+#        entry exists means the lock is held).
+#   Only genuinely stale locks feed the stale_lock_files metric and the
+#   pressure-analysis prune proposal. actions.py additionally refuses to
+#   remove stale locks automatically ("operator-managed"), as defence in
+#   depth. The 24 h age threshold is a module constant
+#   (metrics.DEFAULT_STALE_LOCK_AGE_SECONDS) rather than a config key.
+# ---------------------------------------------------------------------------

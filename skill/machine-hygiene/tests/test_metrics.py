@@ -11,8 +11,11 @@ Covers:
 
 import importlib.util
 import io
+import os
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
 
@@ -460,6 +463,230 @@ class TestCategoryBoundaries(unittest.TestCase):
         self.assertEqual(metrics.classify_metric(11.0, thresholds)["status"], "low")
         self.assertEqual(metrics.classify_metric(11.2, thresholds)["status"], "warning")
         self.assertEqual(metrics.classify_metric(24.0, thresholds)["status"], "critical")
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent host recalibration (AC1/AC2)
+# ---------------------------------------------------------------------------
+
+class TestProcessAndThreadThresholds(unittest.TestCase):
+    """AC1/AC2: process_count and thread_count use dedicated core-derived blocks."""
+
+    def setUp(self):
+        self.cfg = metrics.load_config()
+
+    def _thresholds(self, metric, cores=16):
+        return metrics._multiplier_thresholds(self.cfg[metric], cores)
+
+    def test_dedicated_blocks_have_expected_16_core_bounds(self):
+        process = self._thresholds("process_count")
+        thread = self._thresholds("thread_count")
+        self.assertEqual((process["warning"], process["critical"]), (768.0, 1536.0))
+        self.assertEqual((thread["warning"], thread["critical"]), (2560.0, 5120.0))
+
+    def test_multi_agent_profile_classifies_low(self):
+        """AC2: 560 processes / 2250 threads on 16 cores are green."""
+        process = self._thresholds("process_count")
+        thread = self._thresholds("thread_count")
+        self.assertEqual(metrics.classify_metric(560, process)["status"], "low")
+        self.assertEqual(metrics.classify_metric(2250, thread)["status"], "low")
+
+    def test_above_critical_multiplier_still_classifies_critical(self):
+        """AC2: the alarm is recalibrated, not disabled."""
+        process = self._thresholds("process_count")
+        thread = self._thresholds("thread_count")
+        self.assertEqual(
+            metrics.classify_metric(16 * 96 + 1, process)["status"], "critical"
+        )
+        self.assertEqual(
+            metrics.classify_metric(16 * 320 + 1, thread)["status"], "critical"
+        )
+
+    def test_collect_metrics_does_not_reuse_runnable_thresholds(self):
+        """AC1: collect_metrics no longer passes runnable thresholds to either."""
+        with mock.patch.object(metrics, "_get_core_count", return_value=16), \
+             mock.patch.object(
+                 metrics, "_get_process_counts", return_value=(560, 2250)
+             ):
+            result = metrics.collect_metrics()
+
+        self.assertEqual(result["process_count"]["status"], "low")
+        self.assertEqual(result["thread_count"]["status"], "low")
+        # Under the borrowed runnable thresholds (cores*2 / cores*4) the same
+        # profile would have been critical for both — proving the reuse is
+        # gone rather than the numbers merely loosened.
+        runnable = self._thresholds("runnable_processes")
+        self.assertEqual(metrics.classify_metric(560, runnable)["status"], "critical")
+        self.assertEqual(metrics.classify_metric(2250, runnable)["status"], "critical")
+
+    def test_descriptions_report_their_own_bounds(self):
+        with mock.patch.object(metrics, "_get_core_count", return_value=16), \
+             mock.patch.object(
+                 metrics, "_get_process_counts", return_value=(560, 2250)
+             ):
+            result = metrics.collect_metrics()
+        self.assertIn("warn: 768", result["process_count"]["description"])
+        self.assertIn("crit: 1536", result["process_count"]["description"])
+        self.assertIn("warn: 2560", result["thread_count"]["description"])
+        self.assertIn("crit: 5120", result["thread_count"]["description"])
+
+
+# ---------------------------------------------------------------------------
+# Swap/memory cross-check (AC5)
+# ---------------------------------------------------------------------------
+
+class TestSwapUsageGating(unittest.TestCase):
+    """AC5: swap warns only when memory is under current pressure."""
+
+    def setUp(self):
+        self.cfg = metrics.load_config()
+
+    def _swap(self, swap_pct, mem_pct, mem_pressure):
+        return metrics._classify_swap_usage(
+            swap_pct, mem_pct, mem_pressure, self.cfg
+        )
+
+    def test_swap_without_memory_pressure_is_low(self):
+        """69 % swap with 35 % RAM and no stalls is historical accumulation."""
+        result = self._swap(69.0, 35.0, 0.0)
+        self.assertEqual(result["status"], "low")
+        self.assertTrue(result["gated"])
+
+    def test_unavailable_psi_degrades_to_memory_usage(self):
+        """Graceful degradation when PSI memory data is unavailable."""
+        self.assertEqual(self._swap(69.0, 35.0, None)["status"], "low")
+        self.assertEqual(self._swap(69.0, 85.0, None)["status"], "warning")
+
+    def test_both_elevated_warns(self):
+        result = self._swap(45.0, 85.0, 0.0)
+        self.assertEqual(result["status"], "warning")
+        self.assertFalse(result["gated"])
+
+    def test_high_memory_escalates_swap_to_critical(self):
+        result = self._swap(45.0, 96.0, 0.0)
+        self.assertEqual(result["status"], "critical")
+        self.assertTrue(result["escalated"])
+
+    def test_memory_pressure_psi_alone_warns(self):
+        """Capacity is low but the PSI full line is elevated → swap warns."""
+        result = self._swap(45.0, 50.0, 10.0)
+        self.assertEqual(result["status"], "warning")
+
+    def test_low_swap_stays_low_even_under_memory_pressure(self):
+        self.assertEqual(self._swap(10.0, 90.0, 10.0)["status"], "low")
+
+    def test_collect_metrics_gates_swap_on_memory(self):
+        """The 2025-10-21 host profile: swap 69 %, memory 35 %, no stalls."""
+        mem_info = {
+            "total_mb": 16000.0, "free_mb": 1000.0, "available_mb": 10400.0,
+            "buffers_mb": 0.0, "cached_mb": 0.0,
+            "swap_total_mb": 8000.0, "swap_free_mb": 2480.0,
+        }
+        psi = {("cpu", "some"): 11.58, ("memory", "full"): 0.0, ("io", "full"): 0.0}
+
+        def fake_read(key, which="some"):
+            return psi[(key, which)]
+
+        with mock.patch.object(metrics, "_get_memory_info", return_value=mem_info), \
+             mock.patch.object(metrics, "_read_proc_pressure", side_effect=fake_read):
+            result = metrics.collect_metrics()
+
+        self.assertEqual(result["swap_usage"]["value"], 69.0)
+        self.assertEqual(result["swap_usage"]["status"], "low")
+        self.assertIn("historical accumulation", result["swap_usage"]["description"])
+
+
+# ---------------------------------------------------------------------------
+# Stale-lock validation (AC4)
+# ---------------------------------------------------------------------------
+
+class TestStaleLockValidation(unittest.TestCase):
+    """AC4: /var/lock entries are validated by age, ownership and liveness."""
+
+    OLD_SECONDS = 2 * 24 * 60 * 60
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.now = time.time()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, name, content="", age_seconds=0):
+        path = self.dir / name
+        path.write_text(content, encoding="utf-8")
+        stamp = self.now - age_seconds
+        os.utime(path, (stamp, stamp))
+        return str(path)
+
+    def _inspect(self, **kwargs):
+        return metrics._inspect_lock_files(str(self.dir), now=self.now, **kwargs)
+
+    def _stale_names(self, **kwargs):
+        return sorted(
+            d["path"].rsplit("/", 1)[-1]
+            for d in metrics._find_stale_lock_files(
+                str(self.dir), now=self.now, **kwargs
+            )
+        )
+
+    def test_boot_time_alsa_kernel_locks_are_not_stale(self):
+        for name in ("asound.state.lock", "card0.lock", "card1.lock", "card2.lock"):
+            self._write(name, "", age_seconds=30 * 24 * 60 * 60)
+        details = self._inspect()
+        self.assertEqual(len(details), 4)
+        self.assertEqual(self._stale_names(), [])
+        for detail in details:
+            self.assertFalse(detail["stale"])
+            self.assertIn("kernel-owned", detail["reason"])
+
+    def test_synthetic_stale_lock_is_reported(self):
+        self._write("leftover.lock", "999999\n", age_seconds=self.OLD_SECONDS)
+        self.assertEqual(self._stale_names(), ["leftover.lock"])
+        stale = metrics._find_stale_lock_files(str(self.dir), now=self.now)
+        self.assertIn("dead", stale[0]["reason"])
+        self.assertEqual(stale[0]["pid"], 999999)
+
+    def test_recent_lock_is_not_stale(self):
+        self._write("fresh.lock", "999999\n", age_seconds=60)
+        self.assertEqual(self._stale_names(), [])
+
+    def test_lock_with_live_owner_is_not_stale(self):
+        self._write("held.lock", f"{os.getpid()}\n", age_seconds=self.OLD_SECONDS)
+        self.assertEqual(self._stale_names(), [])
+
+    def test_root_owned_lock_is_not_stale(self):
+        self._write("root.lock", "999999\n", age_seconds=self.OLD_SECONDS)
+        fake = SimpleNamespace(st_uid=0, st_mtime=self.now - self.OLD_SECONDS)
+        details = self._inspect(stat_fn=lambda _p: fake)
+        self.assertEqual(len(details), 1)
+        self.assertFalse(details[0]["stale"])
+        self.assertIn("root-owned", details[0]["reason"])
+
+    def test_old_lock_without_pid_is_stale(self):
+        self._write("anonymous.lock", "", age_seconds=self.OLD_SECONDS)
+        stale = metrics._find_stale_lock_files(str(self.dir), now=self.now)
+        self.assertEqual(len(stale), 1)
+        self.assertIn("no owning PID", stale[0]["reason"])
+
+    def test_missing_lock_dir_is_not_fatal(self):
+        missing = str(self.dir / "does-not-exist")
+        self.assertEqual(metrics._find_stale_lock_files(missing), [])
+
+    def test_detect_stale_devices_returns_only_stale_locks(self):
+        for name in ("asound.state.lock", "card0.lock", "card1.lock", "card2.lock"):
+            self._write(name, "", age_seconds=30 * 24 * 60 * 60)
+        self._write("leftover.lock", "", age_seconds=self.OLD_SECONDS)
+        # Scan the fixture lock dir instead of the real /var/lock.
+        result = metrics._detect_stale_devices(lock_dir=str(self.dir))
+        self.assertEqual(
+            [p.rsplit("/", 1)[-1] for p in result["lock_files"]],
+            ["leftover.lock"],
+        )
+        self.assertEqual(result["lock_files_inspected"], 5)
 
 
 if __name__ == "__main__":

@@ -401,6 +401,13 @@ def propose_remediations_from_metrics(
     lock_info = metrics.get("stale_lock_files") or {}
     lock_count = lock_info.get("value") or 0
     if lock_count:
+        # ``stale_lock_files`` only counts *genuinely* stale locks: the
+        # metrics layer excludes known kernel-owned boot locks (the ALSA
+        # ``asound.state.lock`` / ``card*.lock`` files), root-owned locks,
+        # recently touched files and locks whose recorded owning PID is
+        # still alive. A prune is therefore never proposed for a kernel lock
+        # (AC6). ``actions.py`` additionally refuses to remove stale locks
+        # ("operator-managed"), as defence in depth.
         actions.append(_action(
             "prune",
             {"scope": "stale-lock-files", "count": lock_count},

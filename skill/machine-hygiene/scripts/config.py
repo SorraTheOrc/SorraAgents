@@ -61,6 +61,23 @@ _DEFAULTS: dict[str, Any] = {
         "warning_multiplier": 2.0,
         "critical_multiplier": 4.0,
     },
+    # Total process count. Calibrated for multi-agent hosts (each pi/herdr
+    # session plus its test/build children adds dozens of processes), so it
+    # is deliberately much looser than the runnable_processes scheduler
+    # thresholds it used to borrow. Independently overridable per host.
+    "process_count": {
+        "low": 0,
+        "warning_multiplier": 48.0,
+        "critical_multiplier": 96.0,
+    },
+    # Total thread count. Agent hosts are thread-heavy (~100+ threads per pi
+    # session), so this gets a larger per-core allowance than process_count.
+    # Kept as its own block so it can be tuned independently.
+    "thread_count": {
+        "low": 0,
+        "warning_multiplier": 160.0,
+        "critical_multiplier": 320.0,
+    },
 }
 
 

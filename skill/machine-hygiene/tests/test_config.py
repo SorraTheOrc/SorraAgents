@@ -96,6 +96,20 @@ class TestDefaults(unittest.TestCase):
         self.assertEqual(cfg["warning_multiplier"], 2.0)
         self.assertEqual(cfg["critical_multiplier"], 4.0)
 
+    def test_process_count_defaults(self):
+        """AC1: process_count has its own core-derived block (Option A)."""
+        cfg = _DEFAULTS["process_count"]
+        self.assertEqual(cfg["low"], 0)
+        self.assertEqual(cfg["warning_multiplier"], 48.0)
+        self.assertEqual(cfg["critical_multiplier"], 96.0)
+
+    def test_thread_count_defaults(self):
+        """AC1: thread_count has its own, independently overridable block."""
+        cfg = _DEFAULTS["thread_count"]
+        self.assertEqual(cfg["low"], 0)
+        self.assertEqual(cfg["warning_multiplier"], 160.0)
+        self.assertEqual(cfg["critical_multiplier"], 320.0)
+
     def test_shipped_config_matches_defaults(self):
         """AC3: the shipped config.yaml encodes the documented defaults."""
         import yaml
@@ -205,6 +219,38 @@ class TestLoadConfig(unittest.TestCase):
         self.assertIn("zombie_processes", cfg)
         self.assertIn("swap_usage", cfg)
         self.assertIn("runnable_processes", cfg)
+        self.assertIn("process_count", cfg)
+        self.assertIn("thread_count", cfg)
+
+    @mock.patch("machine_hygiene_config._config_path")
+    def test_process_and_thread_blocks_override_independently(self, mock_path):
+        """AC3: per-host blocks override defaults; absent keys fall back."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False
+        ) as fh:
+            fh.write(
+                "process_count:\n"
+                "  warning_multiplier: 10\n"
+                "  critical_multiplier: 20\n"
+                "thread_count:\n"
+                "  warning_multiplier: 30\n"
+            )
+            temp_path = fh.name
+
+        try:
+            mock_path.return_value = temp_path
+            cfg = load_config()
+            self.assertEqual(cfg["process_count"]["warning_multiplier"], 10)
+            self.assertEqual(cfg["process_count"]["critical_multiplier"], 20)
+            self.assertEqual(cfg["thread_count"]["warning_multiplier"], 30)
+            # Absent keys fall back to the built-in defaults.
+            self.assertEqual(cfg["thread_count"]["critical_multiplier"], 320.0)
+            # The two blocks are independent: tuning thread_count does not
+            # change process_count and vice versa.
+            self.assertEqual(cfg["process_count"]["warning_multiplier"], 10)
+            self.assertEqual(cfg["runnable_processes"]["warning_multiplier"], 2.0)
+        finally:
+            os.unlink(temp_path)
 
     def test_real_config_loads(self):
         """AC4: load_config() reads the shipped config.yaml."""
