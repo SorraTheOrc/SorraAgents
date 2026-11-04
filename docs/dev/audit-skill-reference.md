@@ -223,7 +223,7 @@ The item's integration evidence is derived from the item itself:
 - **No baseline:** an owning repo with neither `origin/dev` nor a local `dev` has no integration target — recorded as non-blocking (never an integration trigger).
 - **Integrate (when evidence exists, not merged, baseline present):** fetch `dev`; fresh detached worktree at `origin/dev`; merge `--no-ff` the feature branch (or cherry-pick each candidate NOT already in `dev`); symlink the owning repo's `node_modules` (implement-skill convention — never npm-install inside a worktree); build (`npm run build`, **skipped when the repo has no `scripts.build` entry** — docs-only/Python-only repos, SA-0MT9607Q5009JA2V); run the project test suite (test-skill runner, `run_suite("all")`); then push `HEAD:refs/heads/dev` — NEVER `main`. Post-merge the pushed sha is re-verified as an ancestor of `origin/dev`.
 - **Conditional build (SA-0MT9607Q5009JA2V):** `_has_build_script()` reads the root `package.json` directly (no npm needed) and skips the build step when the file is missing or has no `scripts.build` entry, recording "No build script … — skipped" as a non-blocking evidence note. Malformed JSON or a non-object `scripts` value counts as "no build script" (fail-open — a broken manifest never blocks the gate). A repo WITH a build script runs `npm run build` unchanged and still fails the gate on a non-zero exit. Mirrors the implement skill's `run_build()` / `_has_build_script()` convention (SA-0MSM6JHG9002CZA1).
-- **Fail closed (AC3):** when integration cannot complete (fetch/ref failure, conflicts, build/test failure, push failure, or any unexpected error after evidence resolution) the gate emits "Ready to close: No" (+ `--needs-producer-review yes` via the lifecycle's no-verdict branch) — the pipeline never proceeds past Phase 1 with unmerged work. No rest of Phase 1 screening and no Phase 2 run (assessment would be misleading against unmerged code).
+- **Fail closed (AC3):** when integration cannot complete (fetch/ref failure, conflicts, build/test failure, push failure, or any unexpected error after evidence resolution) the gate emits "Ready to close: No" (+ `--needs-producer-review yes` via the independent no-verdict branch — a cascade-demotion-suppressed `No` leaves the flag untouched, see *Producer-review flag lifecycle*) — the pipeline never proceeds past Phase 1 with unmerged work. No rest of Phase 1 screening and no Phase 2 run (assessment would be misleading against unmerged code).
 - **Fail open (never blockers):** items with NO resolvable evidence (docs/admin items — no feature branch, no referenced commits) and repos with NO dev baseline proceed with the gate recorded as a note.
 
 ### Stale-audit-base guard (SA-0MT9EK1UU000DT1R)
@@ -297,6 +297,90 @@ effect on the output. It exists because the ship gates
 callers instead of failing with ``unrecognized arguments: --json``.
 
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). Children use the **same simplified item-data-only fingerprint**: a child whose stored audit carries an unchanged v2 fingerprint AND a parseable verdict is reused — its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
+
+## Producer-review flag lifecycle (SA-0MVR9B1UH002BUST, Option B+)
+
+`needsProducerReview` is a bare boolean, so it cannot answer *"was this
+reviewed?"*. This section defines exactly when the audit runner writes it.
+
+### Truth table
+
+| Verdict | Item | Review signal | `needsProducerReview` after the run |
+|---|---|---|---|
+| `Yes` | top-level | prior passing audit whose v2 fingerprint == current, flag `false` | **preserved** (writes no flag) |
+| `Yes` | top-level | never reviewed / prior audit not passing / content changed / signal unavailable | **`yes`** |
+| `No` | top-level, independent | either | **`yes`** |
+| `No` | top-level, cascade-demotion-suppressed | either | **untouched** (producer decision Q2) |
+| `No` | child (has a parent) | either | **untouched** (SA-0MSSVKYEW008PJ9H) |
+| any | any | infrastructure failure / unparseable verdict / tainted `No` | **untouched** (producer decision Q3) |
+
+The runner **never** writes `--needs-producer-review no` on any path: it may
+preserve a stored `false`, but it never clears a review.
+
+### Where the signal comes from
+
+At audit start the runner captures the item's stored audit record
+(`_fetch_prior_audit` / the freshness gate's own fetch via
+`_check_audit_freshness(..., audit_sink=...)`) and normalises it with
+`_summarise_prior_audit` to
+`{readyToClose, fingerprint, auditedAt}`. The current (pre-audit) content
+fingerprint is attached with `_compute_content_fingerprint` using the
+already-fetched work item.
+
+The pure predicate `_producer_review_preserved(wi, prior_audit)` returns `True`
+only when **all** of the following hold: the item is top-level, its
+`needsProducerReview` is falsy, the stored audit passed, and its v2 content
+fingerprint equals the current one. That combination can only mean a producer
+cleared the flag after a passing audit of identical content.
+
+Because the v2 fingerprint hashes only the item's own `title` + `description`
+(SA-0MVIDI8E00063OOP), the signal is **content-scoped**: comments, lifecycle
+flips and unrelated commits never invalidate a review; a material content
+change does (a fresh review is then required).
+
+### Fail-safe direction
+
+Every ambiguous case resolves to **flag**, never to preserve: no prior audit, a
+prior non-passing audit, a legacy/fingerprint-less report, or a failed
+`wl audit-show`. A spurious review request is a nuisance; a silently discarded
+review gate is a release-safety defect.
+
+### Cost
+
+No new `wl` invocation on the hot path: the non-forced path reuses the
+freshness gate's `wl audit-show`. The forced path (`--force` /
+`--refresh-audits` / batch drains), which bypasses that gate, adds exactly one
+`wl audit-show`.
+
+### Recording the decision (durable + auditable)
+
+`_resolve_producer_review_decision` resolves the action **once**, before
+persistence, and the terminal lifecycle (`_apply_terminal_lifecycle`) reuses
+it, so the flag write and the record can never disagree. The report that is
+persisted carries an explicit metadata line:
+
+```
+Producer review: preserved (content fingerprint <sha256>)
+Producer review: required (<reason>; previous content fingerprint <sha256>)
+Producer review: untouched (<reason>)
+```
+
+Inspect it with `wl audit-show <id> --json` (the line is inside the stored
+report), so a later run or a human can see *why* the flag was set or
+preserved. A `--do-not-persist` dry run still applies the flag rules but
+stores no report, so the line is not written.
+
+### Design note: why Option B+ (not a durable marker)
+
+Option A-lite (a `producer_reviewed_at` + fingerprint marker written on every
+`true → false` transition) was rejected by the producer: it requires a
+ContextHub schema + CLI migration, a cross-repo blocking dependency, and
+hooks on every clear path (`wl reviewed`, `wl update --needs-producer-review
+false`, the ship remediation/override paths). Option B+ satisfies the
+content-scoped requirement with existing state and no cross-repo change, and
+upgrades cleanly to Option A-lite later. Accepted edge: a flag cleared by an
+automated override is indistinguishable from a human review — both are
+intentional clears and preserving them is the correct outcome.
 
 ## Re-audit coordination check
 

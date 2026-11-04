@@ -2098,7 +2098,8 @@ def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
 
 def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None,
-                           work_item: dict | None = None) -> str | None:
+                           work_item: dict | None = None,
+                           audit_sink: dict | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
@@ -2132,6 +2133,12 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     caller already fetched the work item (SA-0MSL1Z7E9005TLBA): it is used
     for the fingerprint computation and the time-gate ``updatedAt``. When
     omitted, the work item is fetched via ``wl show``.
+
+    *audit_sink* (SA-0MVR9B1UH002BUST) is an optional in-place capture: when
+    the gate's own ``wl audit-show`` returns an audit record, its normalised
+    pre-audit summary (``_summarise_prior_audit``) is written into the dict.
+    The producer-review rule reuses this fetch on the non-forced path so the
+    hot path adds no extra ``wl`` invocation.
     """
 
     try:
@@ -2146,6 +2153,11 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     audit = data.get("audit")
     if not audit:
         return None  # No prior audit
+
+    if audit_sink is not None:
+        summary = _summarise_prior_audit(audit)
+        if summary is not None:
+            audit_sink.update(summary)
 
     audited_at = audit.get("auditedAt")
     raw_output = audit.get("rawOutput")
@@ -2210,6 +2222,293 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return raw_output
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Producer-review flag lifecycle (SA-0MVR9B1UH002BUST, Option B+)
+# ---------------------------------------------------------------------------
+# ``needsProducerReview`` is a bare boolean, so it cannot answer "was this
+# reviewed?". Option B+ infers the answer from existing, content-scoped
+# state: a *passing* stored audit whose v2 content fingerprint equals the
+# item's current fingerprint, combined with a currently-cleared flag, can
+# only mean a producer cleared the review after that audit of identical
+# content. The runner then PRESERVES the flag (writes nothing) instead of
+# re-arming it. Every ambiguous case fails safe and flags.
+
+#: Prefix of the persisted-report metadata line recording the producer-review
+#: decision (AC4: durable, human-inspectable, content-scoped). Greppable via
+#: ``wl audit-show`` so a later run can see *why* the flag was set/preserved.
+PRODUCER_REVIEW_REPORT_PREFIX = "Producer review: "
+
+#: Decision actions. ``preserved`` writes nothing (keeps the cleared flag),
+#: ``required`` writes ``--needs-producer-review yes``, ``untouched`` writes
+#: no flag at all (children, cascade-suppressed ``No``, infra failures).
+PRODUCER_REVIEW_PRESERVED = "preserved"
+PRODUCER_REVIEW_REQUIRED = "required"
+PRODUCER_REVIEW_UNTOUCHED = "untouched"
+
+
+def _audit_record_passed(ready_to_close: object) -> bool:
+    """Normalise a stored audit's ``readyToClose`` value to a pass boolean.
+
+    ``wl audit-show --json`` exposes ``audit.readyToClose`` as a boolean;
+    legacy stores/tools may emit ``1`` or ``"yes"``/``"true"``. Anything
+    else (``None``, ``0``, ``"no"``, garbage) is a non-pass, so the review
+    predicate fails safe and flags the item.
+    """
+    if isinstance(ready_to_close, bool):
+        return ready_to_close
+    if isinstance(ready_to_close, (int, float)):
+        return ready_to_close == 1
+    if isinstance(ready_to_close, str):
+        return ready_to_close.strip().lower() in ("yes", "true", "1")
+    return False
+
+
+def _summarise_prior_audit(audit: object) -> dict | None:
+    """Normalise a ``wl audit-show`` audit object for the review predicate.
+
+    Returns ``{"readyToClose": bool, "fingerprint": str | None,
+    "auditedAt": str | None}`` (no ``currentFingerprint`` yet — the caller
+    attaches it once the pre-audit work item is known), or ``None`` when no
+    audit record exists. The fingerprint is the stored report's v2 content
+    fingerprint; a legacy/manual fingerprint-less report yields ``None`` so
+    the predicate fails safe and flags (Constraint: fail-safe direction).
+    """
+    if not isinstance(audit, dict):
+        return None
+    raw_output = audit.get("rawOutput") or audit.get("summary") or ""
+    return {
+        "readyToClose": _audit_record_passed(audit.get("readyToClose")),
+        "fingerprint": _extract_content_fingerprint(raw_output),
+        "auditedAt": audit.get("auditedAt"),
+    }
+
+
+def _fetch_prior_audit(runner: Runner, issue_id: str,
+                       worklog_dir: str | None = None) -> dict | None:
+    """Fetch the item's pre-audit audit record (one ``wl audit-show`` call).
+
+    Used on the FORCED path (``--force`` / ``--refresh-audits`` / batch
+    drains) where the freshness gate does not run. The non-forced path
+    reuses the freshness gate's own fetch via
+    ``_check_audit_freshness(..., audit_sink=...)`` so no extra ``wl``
+    invocation is added to the hot path. Any failure returns ``None``: the
+    caller fails safe and flags the item.
+    """
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return None
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None
+    return _summarise_prior_audit(data.get("audit"))
+
+
+def _producer_review_preserved(wi: dict | None,
+                               prior_audit: dict | None) -> bool:
+    """Whether a passing re-audit must preserve a producer's review.
+
+    Pure truth table — no ``wl`` calls and no I/O, so it is unit-testable
+    without a model (AC1/AC2/AC4):
+
+    ==============================  ===================================
+    state                           result
+    ==============================  ===================================
+    ``needsProducerReview`` truthy  False — the runner never clears a flag
+    no prior audit                  False — never reviewed → flag (AC2)
+    prior audit not passing         False — no passing review → flag
+    fingerprint missing/legacy      False — ambiguous → fail safe → flag
+    prior passing audit AND stored
+      fingerprint == current        True — producer cleared it over
+                                    unchanged content (AC1)
+    prior passing audit AND stored
+      fingerprint != current        False — content changed → fresh
+                                    review required (AC4)
+    ==============================  ===================================
+
+    ``prior_audit`` carries the stored ``fingerprint`` and the
+    pre-audit ``currentFingerprint`` (both v2, item-data-only sha256 over
+    title + description), so the decision is content-scoped: a comment, a
+    lifecycle flip or an unrelated commit never invalidates a review.
+    """
+    if not isinstance(wi, dict) or not isinstance(prior_audit, dict):
+        return False
+    if wi.get("needsProducerReview"):
+        return False  # already flagged — never cleared by the runner
+    if not prior_audit.get("readyToClose"):
+        return False
+    stored = prior_audit.get("fingerprint")
+    current = prior_audit.get("currentFingerprint")
+    if not stored or not current:
+        return False  # legacy/manual/ambiguous → fail safe → flag
+    return stored == current
+
+
+def _compute_fallback_tainted(ctx: _AuditContext,
+                              verdict: str | None) -> bool:
+    """Whether *verdict* is tainted by an infrastructure-failure fallback.
+
+    Single implementation shared by the terminal lifecycle and the
+    producer-review decision so both agree: a ``No`` produced solely from
+    infra fallbacks must restore, never demote or flag
+    (SA-0MSG9SLGI002OF7V). The evidence-marker scan is a backstop for a
+    future fallback site that forgot to set the flag.
+    """
+    tainted = ctx.ac_fallback_used.is_set()
+    if verdict == "no" and not tainted:
+        tainted = _evidence_has_infra_failure_markers(
+            ctx.ac_results, ctx.child_results,
+        )
+    return tainted
+
+
+def _producer_review_required_reason(wi: dict | None,
+                                     prior_audit: dict | None) -> str:
+    """Human-readable reason a passing top-level audit must flag (AC4)."""
+    if not isinstance(wi, dict):
+        return "no prior passing audit of unchanged content"
+    if wi.get("needsProducerReview"):
+        return "producer-review flag already set"
+    if not isinstance(prior_audit, dict):
+        return "no prior passing audit of unchanged content"
+    if not prior_audit.get("readyToClose"):
+        return "no prior passing audit of unchanged content"
+    if (not prior_audit.get("fingerprint")
+            or not prior_audit.get("currentFingerprint")):
+        return "review state unavailable (fail-safe)"
+    return "content changed since the last passing audit"
+
+
+def _resolve_producer_review_decision(ctx: _AuditContext,
+                                      verdict: str | None) -> dict:
+    """Resolve the producer-review flag action for this audit run.
+
+    Returns ``{"action", "reason", "fingerprint"}`` where ``action`` is
+    ``preserved`` / ``required`` / ``untouched``. Truth table:
+
+    - ``Yes`` + top-level + reviewed unchanged → ``preserved`` (AC1)
+    - ``Yes`` + top-level + never reviewed / content changed → ``required``
+      (AC2)
+    - ``No`` + independent (not cascade-demotion-suppressed) + top-level →
+      ``required`` regardless of ``merge_gate_blocker`` (AC3)
+    - ``No`` + cascade-demotion-suppressed → ``untouched`` (producer Q2)
+    - any verdict + child item → ``untouched`` (AC6, SA-0MSSVKYEW008PJ9H)
+    - infrastructure failure / unparseable verdict / tainted ``No`` →
+      ``untouched`` (producer Q3: neither set nor cleared)
+
+    Resolved once before persistence (so the persisted report records the
+    decision) and reused by ``_apply_terminal_lifecycle`` so the flag write
+    can never disagree with the recorded decision.
+    """
+    prior = ctx.prior_audit if isinstance(ctx.prior_audit, dict) else None
+    fingerprint = (prior or {}).get("fingerprint")
+    wi = ctx.wi
+    top_level = not wi or not wi.get("parentId")
+
+    if verdict is None or ctx.script_failure is not None:
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": (
+                "infrastructure failure / unparseable verdict — "
+                "flag untouched"
+            ),
+            "fingerprint": fingerprint,
+        }
+
+    if verdict == "no" and _compute_fallback_tainted(ctx, verdict):
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": (
+                "infrastructure-failure fallback 'No' — flag untouched"
+            ),
+            "fingerprint": fingerprint,
+        }
+
+    if verdict == "yes":
+        if not top_level:
+            return {
+                "action": PRODUCER_REVIEW_UNTOUCHED,
+                "reason": "child item — covered by the parent's review",
+                "fingerprint": fingerprint,
+            }
+        if _producer_review_preserved(wi, prior):
+            return {
+                "action": PRODUCER_REVIEW_PRESERVED,
+                "reason": (
+                    "producer review preserved over an unchanged "
+                    "passing audit"
+                ),
+                "fingerprint": fingerprint,
+            }
+        return {
+            "action": PRODUCER_REVIEW_REQUIRED,
+            "reason": _producer_review_required_reason(wi, prior),
+            "fingerprint": fingerprint,
+        }
+
+    # verdict == "no" — only an INDEPENDENT failing audit surfaces the item
+    # to the producer (producer decision Q2). A parent-triggered cascade
+    # re-audit of an already in_review/done item suppresses the demotion and
+    # therefore leaves the flag untouched, including when merge_gate_blocker
+    # is set (the next independent audit re-surfaces it).
+    if _is_cascade_audit() and ctx.original_stage in ("in_review", "done"):
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": (
+                "cascade-demotion-suppressed 'No' — flag untouched"
+            ),
+            "fingerprint": fingerprint,
+        }
+    if not top_level:
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": "child item — covered by the parent's review",
+            "fingerprint": fingerprint,
+        }
+    return {
+        "action": PRODUCER_REVIEW_REQUIRED,
+        "reason": "failing audit (Ready to close: No)",
+        "fingerprint": fingerprint,
+    }
+
+
+def _format_producer_review_line(decision: dict | None) -> str | None:
+    """Render the persisted-report metadata line for *decision*, if any."""
+    if not isinstance(decision, dict):
+        return None
+    action = decision.get("action")
+    reason = decision.get("reason") or ""
+    fingerprint = decision.get("fingerprint")
+    if action == PRODUCER_REVIEW_PRESERVED:
+        detail = (f"content fingerprint {fingerprint}" if fingerprint
+                  else reason)
+        return f"{PRODUCER_REVIEW_REPORT_PREFIX}preserved ({detail})"
+    if action == PRODUCER_REVIEW_REQUIRED:
+        detail = reason
+        if fingerprint:
+            detail += f"; previous content fingerprint {fingerprint}"
+        return f"{PRODUCER_REVIEW_REPORT_PREFIX}required ({detail})"
+    if action == PRODUCER_REVIEW_UNTOUCHED:
+        return f"{PRODUCER_REVIEW_REPORT_PREFIX}untouched ({reason})"
+    return None
+
+
+def _append_producer_review_metadata(report: str,
+                                     decision: dict | None) -> str:
+    """Append the producer-review decision line to a report to persist.
+
+    Idempotent: a report already carrying a ``Producer review:`` line is
+    returned unchanged, so reassembly/re-ask paths never duplicate it.
+    """
+    line = _format_producer_review_line(decision)
+    if not line:
+        return report
+    if any(existing.startswith(PRODUCER_REVIEW_REPORT_PREFIX)
+           for existing in report.splitlines()):
+        return report
+    return report.rstrip("\n") + "\n\n" + line + "\n"
 
 
 def _extract_content_fingerprint(report_text: str) -> str | None:
@@ -9618,6 +9917,20 @@ class _AuditContext:
     original_status: str = "open"
     original_stage: str = ""
     wi: dict | None = None
+    prior_audit: dict | None = None
+    """Pre-audit stored audit record for the producer-review rule
+    (SA-0MVR9B1UH002BUST, Option B+).
+
+    Normalised by ``_summarise_prior_audit`` to ``{readyToClose,
+    fingerprint, auditedAt, currentFingerprint}``; ``None`` when there is no
+    prior audit or it could not be read (the review predicate then fails
+    safe and flags the item).
+    """
+    producer_review: dict | None = None
+    """Producer-review flag decision for this run (resolved once before
+    persistence so the persisted report can record it and the terminal
+    lifecycle applies the same rule). See
+    ``_resolve_producer_review_decision``."""
     script_failure: dict | None = None
 
     # Pipeline state
@@ -10634,13 +10947,30 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
         herdr_green_run_sha = herdr_sha
 
     # ------------------------------------------------------------------
+    # Pre-audit audit-record capture for the producer-review rule
+    # (SA-0MVR9B1UH002BUST, Option B+). The freshness gate below already
+    # runs ``wl audit-show`` on the non-forced path, so it captures the
+    # record through ``audit_sink`` — no extra ``wl`` invocation is added
+    # on the hot path. The forced path (``--force`` / ``--refresh-audits``
+    # / batch drains) bypasses that gate and therefore performs exactly one
+    # explicit ``wl audit-show`` here.
+    # ------------------------------------------------------------------
+    prior_audit_sink: dict = {}
+    prior_audit: dict | None = (
+        _fetch_prior_audit(runner, issue_id, worklog_dir=worklog_dir)
+        if force else None
+    )
+
+    # ------------------------------------------------------------------
     # Freshness gate: skip if a recent audit already exists
     # (before status lifecycle to avoid unnecessary in_progress transitions)
     # ------------------------------------------------------------------
     if not force:
         fresh_report = _check_audit_freshness(runner, issue_id,
                                               worklog_dir=worklog_dir,
-                                              work_item=wi)
+                                              work_item=wi,
+                                              audit_sink=prior_audit_sink)
+        prior_audit = prior_audit_sink or None
         if fresh_report is not None:
             # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
             # the fresh audit so a redundant re-audit is stopped before the
@@ -10801,6 +11131,16 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     ctx.original_status = original_status
     ctx.original_stage = original_stage
     ctx.wi = wi
+    # Attach the current (pre-audit) content fingerprint so the review
+    # predicate can compare it with the stored passing audit's fingerprint
+    # (AC4 content scope). ``_compute_content_fingerprint`` uses the already
+    # fetched ``wi`` — zero extra ``wl`` calls.
+    if prior_audit is not None:
+        prior_audit = dict(prior_audit)
+        prior_audit["currentFingerprint"] = _compute_content_fingerprint(
+            runner, issue_id, worklog_dir=worklog_dir, work_item=wi,
+        )
+    ctx.prior_audit = prior_audit
     ctx.ac_fallback_used = ac_fallback_used
     ctx.ac_results = ac_results
     ctx.child_results = child_results
@@ -13384,6 +13724,23 @@ def _phase_report(ctx: _AuditContext) -> int:
         # completed successfully (no script failures).
         audit_verdict = _parse_ready_to_close(report)
 
+        # Producer-review flag decision (SA-0MVR9B1UH002BUST): resolved ONCE
+        # here, before persistence, so the persisted report records the
+        # decision (AC4) and the terminal lifecycle applies exactly the same
+        # rule. The report line is skipped for a --do-not-persist dry run
+        # (no report is stored); the flag rules themselves still apply.
+        ctx.producer_review = _resolve_producer_review_decision(
+            ctx, audit_verdict,
+        )
+        if ctx.producer_review["action"] != PRODUCER_REVIEW_UNTOUCHED:
+            review_line = _format_producer_review_line(ctx.producer_review)
+            if review_line:
+                print(review_line, file=sys.stderr)
+        if persist:
+            report = _append_producer_review_metadata(
+                report, ctx.producer_review,
+            )
+
         if json_mode:
             payload = _build_issue_json(
                 work_item, ac_results, child_results,
@@ -13432,6 +13789,15 @@ def _phase_report(ctx: _AuditContext) -> int:
                     # repaired verdicts still demotes (SA-0MSGMR7CX00588TZ AC4).
                     ac_fallback_used.clear()
                     report = _assemble_report()
+                    # The re-asked verdicts may change the overall verdict, so
+                    # re-resolve the review decision against the reassembled
+                    # report and re-apply the metadata line (idempotent).
+                    ctx.producer_review = _resolve_producer_review_decision(
+                        ctx, _parse_ready_to_close(report),
+                    )
+                    report = _append_producer_review_metadata(
+                        report, ctx.producer_review,
+                    )
                     persist_rc = persist_audit(
                         issue_id, report, worklog_dir=worklog_dir
                     )
@@ -13906,20 +14272,21 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         # fallback on some AC evidence (e.g. a read-only test skip with a
         # variance note) leaves the overall 'Ready to close: Yes' verdict
         # trustworthy, so the item still moves to the review queue.
-        fallback_tainted = ctx.ac_fallback_used.is_set()
+        fallback_tainted = _compute_fallback_tainted(ctx, ctx.audit_verdict)
+        # Producer-review flag decision (SA-0MVR9B1UH002BUST). Reuse the
+        # decision resolved before persistence when present, so the flag
+        # write can never disagree with the persisted report's recorded
+        # decision; recompute for callers that reach the lifecycle directly
+        # (unit tests, early-abort paths).
+        producer_review = ctx.producer_review or (
+            _resolve_producer_review_decision(ctx, ctx.audit_verdict)
+        )
         # Every terminal write below is a raw ``wl update`` — this phase does
         # not use ``StatusLifecycle`` — so the helper's release-by-default exit
         # hook cannot clear the audit claim. The ``--assignee ""`` on each
         # command is therefore required and must not be dropped as redundant
         # (assignee-hold convention; pinned by
         # ``tests/test_assignee_release_all_skills.py``).
-        if ctx.audit_verdict == "no" and not fallback_tainted:
-            # Evidence-marker backstop: if any AC evidence carries a known
-            # infra-failure diagnostic, treat the "No" as fallback-tainted
-            # even if a future fallback site forgot to set the flag.
-            fallback_tainted = _evidence_has_infra_failure_markers(
-                ctx.ac_results, ctx.child_results,
-            )
         if (ctx.script_failure is not None or not ctx.audit_completed
                 or ctx.audit_verdict is None
                 or (ctx.audit_verdict == "no" and fallback_tainted)):
@@ -13965,12 +14332,16 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6 / Q2=C): a
             # top-level item is flagged `--needs-producer-review yes` so the
             # release gate blocks it until the producer explicitly reviews
-            # it. Child items are covered by their parent's review, so they
-            # are NOT flagged — the flag would flood the producer queue with
-            # redundant approvals (SA-0MSSVKYEW008PJ9H). In both cases the
-            # audit agent's own assignee claim is CLEARED (status-neutral
-            # claim, WL-0MV85WCJJ0087VMP / WL-0MV7W77AY005MGBL fix). Flags
-            # are inserted before the trailing --json (file convention:
+            # it — EXCEPT when the producer already reviewed this exact
+            # content (AC1: a prior passing audit with an unchanged v2
+            # content fingerprint), in which case the stored `false` is
+            # preserved and nothing is written. Child items are covered by
+            # their parent's review, so they are NOT flagged — the flag
+            # would flood the producer queue with redundant approvals
+            # (SA-0MSSVKYEW008PJ9H). In both cases the audit agent's own
+            # assignee claim is CLEARED (status-neutral claim,
+            # WL-0MV85WCJJ0087VMP / WL-0MV7W77AY005MGBL fix). Flags are
+            # inserted before the trailing --json (file convention:
             # --json last).
             # This is the sole authorisation for the descendant cascade
             # below — a passing verdict, not status/stage (AC3).
@@ -13981,7 +14352,13 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             else:
                 cmd += ["--status", "completed", "--stage", "in_review"]
             cmd += ["--assignee", ""]
-            if not ctx.wi or not ctx.wi.get("parentId"):
+            if (not ctx.wi or not ctx.wi.get("parentId")) and (
+                producer_review["action"] != PRODUCER_REVIEW_PRESERVED
+            ):
+                # A producer review of unchanged content is preserved
+                # (SA-0MVR9B1UH002BUST AC1); every other top-level pass
+                # still enters the producer queue (AC2). The runner never
+                # clears the flag — it only writes "yes" or nothing.
                 cmd += ["--needs-producer-review", "yes"]
             cmd.append("--json")
             restore_cmd = cmd
@@ -14032,13 +14409,14 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                     "--assignee", "", "--json",
                 ]
                 expected_status, expected_stage = "open", "plan_complete"
-                # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
-                # integration fails the audit closed and flags the item for
-                # producer review so the producer investigates and integrates
-                # manually — never proceed past Phase 1 with unmerged work.
-                # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6): flag the
-                # item for producer review, and clear the audit claim.
-                if ctx.merge_gate_blocker:
+                # Independent failing audit flags the producer queue
+                # (SA-0MVR9B1UH002BUST AC3): every independent top-level
+                # 'No' — merge-gate-blocked or ordinary — surfaces the item,
+                # never clears an existing review. The cascade-suppressed
+                # 'No' (handled above) and child items stay untouched
+                # (producer Q2 / AC6). The decision drives the write so the
+                # persisted report and the flag never disagree.
+                if producer_review["action"] == PRODUCER_REVIEW_REQUIRED:
                     restore_cmd = [
                         "wl", "update", ctx.issue_id,
                         "--status", "open", "--stage", "plan_complete",
@@ -14497,7 +14875,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # misleading with the work unmerged.
             ctx.audit_verdict = "no"
             ctx.audit_completed = True
-            fail_report = _build_merge_gate_failure_report(ctx)
+            # Resolve the producer-review decision before persisting so the
+            # fail-closed report records why the flag was (or was not) set
+            # (SA-0MVR9B1UH002BUST AC3/AC4).
+            ctx.producer_review = _resolve_producer_review_decision(ctx, "no")
+            fail_report = _append_producer_review_metadata(
+                _build_merge_gate_failure_report(ctx), ctx.producer_review,
+            )
             if ctx.json_mode:
                 print(json.dumps({
                     "merge_gate": {

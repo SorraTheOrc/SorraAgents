@@ -1454,10 +1454,11 @@ class TestStatusLifecycle:
             f"Top-level yes verdict must set the restored --needs-producer-review yes, got: {final_update}"
         )
 
-    def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):
-        """When audit verdict is NOT ready-to-close, the status update must NOT
-        include --needs-producer-review (AC3: only set for a yes verdict on a
-        top-level item). The AC screen returns 'unmet' so the audit lands on a
+    def test_no_verdict_flags_needs_producer_review(self, monkeypatch):
+        """When the audit verdict is NOT ready-to-close, an independent
+        top-level ``No`` now flags the item for producer review
+        (SA-0MVR9B1UH002BUST AC3) — the flag is no longer reserved for the
+        yes verdict. The AC screen returns 'unmet' so the audit lands on a
         genuine 'Ready to close: No' verdict."""
         calls = []
 
@@ -1473,10 +1474,17 @@ class TestStatusLifecycle:
         cmd_issue("SA-NPR2", runner=self._fake_runner_with_calls(calls, has_acs=True), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR2"]]
+        final_update = wl_updates[-1] if wl_updates else []
+        assert "--needs-producer-review" in final_update and "yes" in final_update, (
+            f"Independent No verdict must flag the item for producer review, got: {final_update}"
+        )
+        # The runner must never clear a review.
         for update in wl_updates:
-            assert "--needs-producer-review" not in update, (
-                f"Status update should NOT include --needs-producer-review, got: {update}"
-            )
+            if "--needs-producer-review" in update:
+                idx = update.index("--needs-producer-review")
+                assert update[idx + 1] == "yes", (
+                    f"The runner must never write --needs-producer-review no, got: {update}"
+                )
 
     def test_no_needs_producer_review_on_exception(self, monkeypatch):
         """When audit fails with an exception, the status update must NOT
