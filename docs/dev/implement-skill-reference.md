@@ -1637,6 +1637,44 @@ verdicts per stage, own-churn list, final verdict). Regression pins:
 `skill/implement/tests/test_finish_no_diff_status.py` (must stay green — a
 clean finish is unaffected).
 
+## Write-surface confinement audit (SA-0MVXVC0KB004XDH0)
+
+The guard and the cleanup path are safety mechanisms, so their *own* write
+surfaces were audited: every write must land inside `repo_root`, inside the own
+worktree, or in the worklog store — never in another checkout and never in an
+unrelated directory. The table is the contract; every row is pinned by a test
+that asserts observable behaviour (no source greps).
+
+| Surface | Writes | Resolved root | Confinement | Evidence |
+|---|---|---|---|---|
+| `_snapshot_main_checkout` / `_main_checkout_status_map` | nothing — `git status --porcelain=v1` read only | `repo_root` | confined (read-only) | `test_finish_write_surface_confinement.py::test_guard_surfaces_leave_the_checkout_byte_identical` |
+| `_verify_main_checkout` / `_main_checkout_guard_violations` | nothing — re-snapshot plus an in-memory verdict | `repo_root` | confined (read-only; never restores a foreign deletion) | `test_finish_write_surface_confinement.py::test_guard_verify_reports_a_foreign_deletion_without_touching_it` |
+| `_main_checkout_actor_evidence` | nothing — `.implement_state.json` and `/proc/<pid>/cwd` reads | `repo_root` | confined (read-only) | `test_finish_write_surface_confinement.py::test_guard_surfaces_leave_the_checkout_byte_identical` |
+| `_fast_forward_local_dev_for_push` | `git fetch` / `checkout` / `merge --ff-only` — refs and working tree | `repo_root` | confined — every git call uses `cwd=repo_root` | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |
+| `_restore_local_dev_after_failed_push` | `git reset --merge` / `git update-ref` | `repo_root` | confined — same `cwd` rule | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |
+| `_sync_parent_branch` | `git fetch` / `merge --ff-only` on the shared branch | `repo_root` | confined — same `cwd` rule | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |
+| `git_push_to_dev` | remote refs plus the checkout's remote-tracking refs | the checkout holding the pushed commit (the worktree) | confined | `skill/implement/tests/test_implement_push_from_worktree.py` |
+| `cleanup_worktree_processes` / `wl cleanup-worktree` | signals only PIDs the CLI registered under the exact path; no filesystem writes; spawned with `cwd` outside the target and in its own session | the named worktree | confined to the named worktree, invoker excluded | `tests/test_implement_cleanup_worktree_self_exclusion.py` |
+| `write_state` / `remove_state` | `<worktree>/.implement_state.json` | the own worktree | confined | `test_finish_write_surface_confinement.py::test_state_file_surface_stays_inside_the_worktree` |
+| `_remove_worktree` | `git worktree remove` plus a manual `shutil.rmtree` fallback | `repo_root` / the named worktree | **not confined — fixed here**: the fallback ran unconditionally and deleted any directory outside the repo that lacked `.git/`; a new gate refuses every target git does not register as a worktree of `repo_root` (and fails closed when the registry is unreadable) | `test_finish_write_surface_confinement.py::test_remove_worktree_refuses_a_directory_outside_the_repository`, `test_finish_write_surface_confinement.py::test_remove_worktree_refuses_when_ownership_cannot_be_proven`, `test_finish_write_surface_confinement.py::test_remove_worktree_removes_only_the_registered_worktree` |
+| `acquire_main_checkout_lock` | `<repo_root>/.worklog/locks/main-checkout.lock` | `repo_root` | confined | `skill/implement/tests/test_finish_main_checkout_lock.py` |
+| `would_be_commit_index` / `_remove_gate_index` | a temporary index inside the checkout's git directory | `repo_root/.git` | confined | `skill/implement/tests/test_finish_gate_temp_index.py` |
+| `wl_add_comment` (the guard's fail-loud comment) | the worklog store, through the `wl` CLI | n/a (store, not a checkout) | confined — no checkout file is touched | `test_finish_write_surface_confinement.py::test_wl_add_comment_writes_the_worklog_store_not_the_checkout` |
+| `StatusLifecycle` / `_safety_reset_if_in_progress` | the worklog store | n/a (store, not a checkout) | confined — no checkout file is touched | `tests/test_assignee_release_all_skills.py` |
+
+Two consequences of the audit are worth naming:
+
+- **A removal refusal never fails a finish or an abort.** A confinement refusal
+  retains the tree and is reported (`report["steps"]["worktree_removal"]
+  ["refused"]`, `report["worktree_refused"]` on abort) instead of turning an
+  already-pushed finish into a failure.
+- **Read-only means read-only.** The guard reports a foreign mutation and
+  aborts; it never restores, reverts or "fixes" the offending path — the
+  recovery command belongs to the operator.
+
+Cross-repo *locking* is out of scope here (WL-0MVPE2DA7007WF84 /
+WL-0MVWK20DK004TQZM); this section audits confinement only.
+
 ## Stale shared-package resolution gate (SA-0MVPI41SR008JYXL)
 
 A worktree resolves a path-consumed workspace package (the reference case is

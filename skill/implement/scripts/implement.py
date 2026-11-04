@@ -5852,6 +5852,47 @@ def _worktree_cleanup_command(work_item_id: str) -> str:
     )
 
 
+def _registered_worktree_paths(repo_root: str | None) -> set[str] | None:
+    """Return the resolved paths git registers as worktrees of *repo_root*.
+
+    This is the ownership record a removal surface must be confined to: a
+    directory git does not list as a worktree of this repository is not ours
+    to delete, however it was named (SA-0MVXVC0KB004XDH0). The list includes
+    the main working tree itself, which the callers refuse separately.
+
+    Args:
+        repo_root: The main checkout root to ask git about, or ``None`` when
+            no root could be resolved.
+
+    Returns:
+        The set of resolved absolute worktree paths, or ``None`` when the
+        registry cannot be read (no root, not a git working tree, or git
+        unavailable) — callers treat ``None`` as "cannot prove ownership"
+        and fail closed.
+    """
+    if not repo_root:
+        return None
+    result = run_cmd(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    paths: set[str] = set()
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        candidate = line[len("worktree "):].strip()
+        if not candidate:
+            continue
+        try:
+            paths.add(str(Path(candidate).resolve()))
+        except OSError:
+            continue
+    return paths
+
+
 def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
     """Remove a worktree directory gracefully.
 
@@ -5862,7 +5903,13 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
        otherwise it is derived from the current directory, resolving to the
        MAIN checkout root even when the current directory is inside a linked
        worktree (see ``_get_repo_root``).
-    2. Before manual (shutil) removal, checks that the target does
+    2. Refuses any target git does not register as a worktree of that root
+       (:func:`_registered_worktree_paths`) — the surface is confined to the
+       named worktree, so a mistyped/stale path can never delete an unrelated
+       directory that merely happens to be outside the repository and free of
+       a ``.git/`` directory (SA-0MVXVC0KB004XDH0). A target that no longer
+       exists is a no-op success (nothing to remove), preserving idempotency.
+    3. Before manual (shutil) removal, checks that the target does
        NOT contain a ``.git/`` directory (which would mean it's the
        main working tree).
 
@@ -5875,8 +5922,9 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
         True if removal succeeded.
 
     Raises:
-        RuntimeError: If the target path matches the repo root or
-            contains a ``.git`` directory (main working tree).
+        RuntimeError: If the target path matches the repo root, is not a
+            worktree registered with that root, or contains a ``.git``
+            directory (main working tree).
     """
     resolved_path = str(Path(worktree_path).resolve())
 
@@ -5890,6 +5938,34 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
         )
         LOG.critical(msg)
         raise RuntimeError(msg)
+
+    # ── Safety gate 2: refuse anything this repository does not own ──
+    # ``git worktree remove`` refuses a non-worktree on its own, but the
+    # manual ``shutil.rmtree`` fallback below ran unconditionally — so a
+    # path outside the repository with no ``.git/`` directory was deleted
+    # outright. Confine the surface to the worktrees git registers here.
+    if Path(resolved_path).exists():
+        registered = _registered_worktree_paths(repo_root)
+        if registered is None or resolved_path not in registered:
+            owner = repo_root or "the resolved repository root"
+            msg = (
+                f"REFUSE to remove {resolved_path}: it is not a worktree "
+                f"registered with {owner}. Removal is confined to the named "
+                f"worktree; an unregistered directory is never deleted. If "
+                f"the worktree registration is stale, run `git worktree "
+                f"prune` first."
+            )
+            LOG.critical(msg)
+            raise RuntimeError(msg)
+    else:
+        # Nothing to delete, but the registration may still be stale: prune
+        # (from the resolved root only) so the registry matches reality.
+        if repo_root:
+            run_cmd(["git", "worktree", "prune"], cwd=repo_root, check=False)
+        LOG.info(
+            "Worktree already absent, nothing to remove: %s", resolved_path
+        )
+        return True
 
     # If the current directory is inside the worktree being removed, step
     # out to the repo root first. A deleted cwd breaks os.getcwd() and
@@ -5918,7 +5994,7 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
             result.stderr.strip(),
         )
 
-        # ── Safety gate 2: refuse if target has a .git/ directory ──
+        # ── Safety gate 3: refuse if target has a .git/ directory ──
         target = Path(resolved_path)
         git_dir = target / ".git"
         if git_dir.is_dir():
@@ -10833,13 +10909,23 @@ def phase_finish(
             if not defer_removal:
                 LOG.info("Removing worktree...")
                 remove_state(worktree_path)
-                report["steps"]["worktree_removed"] = bool(
-                    _remove_worktree(
-                        worktree_path,
-                        repo_root=repo_root,
+                try:
+                    removed = bool(
+                        _remove_worktree(
+                            worktree_path,
+                            repo_root=repo_root,
+                        )
                     )
-                )
-                if not report["steps"]["worktree_removed"]:
+                except RuntimeError as exc:
+                    # A confinement refusal (the path is not a worktree this
+                    # repository registers) must never turn a successful,
+                    # already-pushed finish into a failure: the tree is
+                    # retained and reported instead (SA-0MVXVC0KB004XDH0).
+                    removed = False
+                    report["steps"]["worktree_removal"]["refused"] = str(exc)
+                    LOG.warning("Worktree removal refused: %s", exc)
+                report["steps"]["worktree_removed"] = removed
+                if not removed:
                     LOG.warning(
                         "Failed to remove worktree at %s", worktree_path
                     )
@@ -11216,7 +11302,13 @@ def phase_abort(
         LOG.info("Cleaning up worktree at %s...", worktree_path)
         cleanup_worktree_processes(worktree_path)
         remove_state(worktree_path)
-        _remove_worktree(worktree_path)
+        try:
+            _remove_worktree(worktree_path)
+        except RuntimeError as exc:
+            # A confinement refusal retains the tree; an abort never fails
+            # because of it (SA-0MVXVC0KB004XDH0).
+            report["worktree_refused"] = str(exc)
+            LOG.warning("Worktree removal refused during abort: %s", exc)
         report["worktree_path"] = worktree_path
 
     # ── Step 3: Restore repo state ─────────────────────────────────
