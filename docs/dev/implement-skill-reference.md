@@ -341,6 +341,104 @@ The matrix in `tests/test_assignee_release_all_skills.py` additionally
 exercises `_release_orphaned_child_claim` as a release-only entry point, and
 the discovery guard keeps any future assignee-mutating entry point classified.
 
+## Finalisation ordering and the audit-dispatch hold (SA-0MVXUSK02003ZMDN)
+
+Parent **SA-0MVWFPI31000HP3H** (Only mark as complete when fully complete).
+
+### The race this ordering closes
+
+The herdr downtime dispatcher selects an audit candidate from items that are
+terminal (`completed` / `in_review`) and not on an assignee hold
+(`selectAuditCandidate` → `isAssigneeHeld`, ContextHub
+`packages/herdr/src/downtime-worker.selection.ts`). The implement skill's only
+hold mechanism is that non-empty `assignee`; a terminal item with an empty
+assignee is dispatchable.
+
+`phase_finish` used to write the terminal `completed`/`in_review` transition
+and release the assignee inside its `StatusLifecycle` block and then return,
+while the completion comment, the worktree cleanup and the belt-and-suspenders
+post-push full-suite verification still ran **after** the transition. In that
+window the item was a valid audit candidate, so the dispatcher could dispatch
+an audit that raced a still-running implement session, producing duplicate or
+conflicting work and audit records.
+
+### The contract
+
+Design A (verify-then-transition, decided in SA-0MVXUSED6008J04R) makes the
+terminal write **and** the assignee release the implement run's **last
+lifecycle action**:
+
+- Every step that can still change the work item — the read-only post-push
+  verification, the completion comment and the (non-deferred) worktree
+  removal — runs **inside** the held, non-terminal `StatusLifecycle` window.
+  The item is `in_progress` with the assignee held throughout, so it is never
+  an audit-dispatch candidate while the run is unfinished.
+- `finish` therefore returns only when the run is **fully complete**: a
+  returned `finish` means the store already holds `completed` / `in_review`
+  with an empty assignee.
+- The read-only terminal-status read-back (`_assert_terminal_status`,
+  OSL-0MVME1PI5005WU58) runs after the write and before `finish` returns; a
+  lost write still fails loudly.
+
+The hold is the ordinary assignee claim — no new hold type and no dispatcher
+change. It is released exactly once, by the `StatusLifecycle` exit that writes
+the terminal status, so the
+[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
+is preserved: a finished item is never left on a hold.
+
+### Ordered finalisation steps
+
+`phase_finish` performs, in order (all inside the `StatusLifecycle` window
+until the terminal write):
+
+1. build → changed-scope test gate → commit → dev push (pre-existing)
+2. local `dev` fast-forward and post-push ancestry assertion (pre-existing)
+3. **read-only post-push verification** — resolve the full-suite verdict for
+   the pushed tree from the test cache; never executes a suite. `green` /
+   `not_applicable` permit the transition; `red` / `missing` **refuse** it —
+   the item is released to `open`, the failure is routed to triage, and the
+   pushed commit is retained, never reverted (SA-0MVXUSJ2P009T97H AC4)
+4. worktree removal (deferred when the tree is a driven child's cwd or
+   `--keep-worktree` was passed — ownership passes to the driver/caller, so
+   the deferred cleanup is **not** a remaining lifecycle step)
+5. post-push parent-branch sync (pre-existing)
+6. **completion comment** (commit hash, branch, verdict provenance, retained
+   tree) — before the terminal write, so no comment follows it and the
+   audit-freshness ordering rule holds (SA-0MTHC710X003ORZM)
+7. **terminal write** — `completed` / `in_review` + assignee release, issued
+   by `StatusLifecycle.__exit__`: the run's last lifecycle action
+8. terminal-status read-back (`_assert_terminal_status`)
+
+The same ordering applies to the two other implement paths that advance an
+item: `phase_parent` posts its per-child summary **before** the parent's
+terminal write, and `_finalise_stranded_child` posts its finalisation comment
+before the stranded child's write (design A §3).
+
+### Interruption semantics
+
+An interruption before step 7 leaves the item non-terminal — see
+[Recoverable interruption and idempotent re-run](#recoverable-interruption-and-idempotent-re-run-sa-0mvxusjjy009hmq0).
+An interruption **after** the terminal write cannot regress the item: no
+lifecycle-relevant work remains, and the read-only read-back plus the
+stale-claim reaper bound the residual window.
+
+### The regression test that pins the invariant
+
+`skill/implement/tests/test_finish_finalisation_ordering.py` drives the real
+`phase_finish` state machine (only its external boundaries patched) and
+asserts:
+
+- the ordered timeline: the post-push verification, the completion comment
+  and the cleanup all precede the terminal write; the read-back is the
+  phase's last action;
+- audit candidacy at each post-push checkpoint (the item is never a valid
+  candidate there) and the single post-terminal candidate transition;
+- the final store state — `completed` / `in_review` with an empty assignee;
+- the post-push verification's cache-only semantics and its `red` / `missing`
+  refusal (SA-0MVXUSJ2P009T97H AC4);
+- the comment-before-write ordering for `phase_parent` and
+  `_finalise_stranded_child`.
+
 ## Recoverable interruption and idempotent re-run (SA-0MVXUSJJY009HMQ0)
 
 An implement run interrupted **after** a commit/push but **before** its final
@@ -409,7 +507,7 @@ and verify the pushed commit (evidence: driven child sessions
 | Flow | Who removes the worktree | When |
 |---|---|---|
 | Driven child session (`IMPLEMENT_DRIVE_ACTIVE=1`) | `implement.py drive` | After that child's session has exited, and only when the child is terminal and the tree is clean |
-| Plain leaf session that opted in (`--keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session (or an operator) | After the completion comment, the report and the post-push verification — as the session's **last** bash command |
+| Plain leaf session that opted in (`--keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session (or an operator) | After the completion comment, the report and the post-push verification — as the session's **last** bash command. The comment and verification already ran inside `finish`, before the terminal write (SA-0MVXUSK02003ZMDN) |
 | Plain leaf session (default) | `finish` | Immediately after a successful dev push (unchanged) |
 | Parent/parent-phase flow | `phase_parent` (its own `finish` subprocess per child) | Each child is finished in its own subprocess and its worktree removed there — no session-level cleanup instruction applies |
 | Aborted item | `abort` | Unconditionally — an aborted item is abandoned, not resumed |

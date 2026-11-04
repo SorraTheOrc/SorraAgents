@@ -182,14 +182,16 @@ Regression coverage (real temp git repo plus linked worktree, no
 A worktree must never be deleted out from under the session that owns it as
 its cwd: doing so makes every later `bash` call fail with `Working directory
 does not exist` (absolute-path file tools keep working), exactly when the
-session still has to write its completion comment, render its report and
-verify the pushed commit (SA-0MVTE8XAJ002IUDR). Exactly one owner removes a
-worktree, decided by context:
+session still has to render its end-of-session report (SA-0MVTE8XAJ002IUDR).
+The completion comment and the read-only post-push verification are no longer
+session steps: they run inside `finish`, before the terminal write
+(SA-0MVXUSK02003ZMDN). Exactly one owner removes a worktree, decided by
+context:
 
 | Flow | Owner | When |
 |---|---|---|
 | Driven child session (`IMPLEMENT_DRIVE_ACTIVE=1`) | `implement.py drive` | After the child's session exits; terminal child, clean tree only |
-| Opted-in plain leaf (`finish --keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session itself (or an operator) | The session's **last** bash command, after the comment, report and post-push verification |
+| Opted-in plain leaf (`finish --keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session itself (or an operator) | The session's **last** bash command, after the report (the comment and verification already ran inside `finish`, SA-0MVXUSK02003ZMDN) |
 | Plain leaf (default) | `finish` | Immediately after a successful dev push |
 | Parent/parent-phase flow | `phase_parent` (its own `finish` subprocess per child) | Each child is finished in its own subprocess and its worktree removed there — no session-level cleanup instruction applies |
 | Aborted item | `abort` | Unconditionally |

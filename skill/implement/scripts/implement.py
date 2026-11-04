@@ -9883,7 +9883,9 @@ def phase_finish(
     verification, the completion comment and the (non-deferred) worktree
     removal — runs inside the held, non-terminal ``StatusLifecycle`` window,
     so the item never becomes an audit-dispatch candidate while the run is
-    unfinished (parent SA-0MVWFPI31000HP3H AC1/AC2).
+    unfinished (parent SA-0MVWFPI31000HP3H AC1/AC2; documented by
+    SA-0MVXUSK02003ZMDN, pinned by
+    ``tests/test_finish_finalisation_ordering.py``).
 
     **Interruption and re-run (SA-0MVXUSJJY009HMQ0).** Every exit that fails
     after the commit — the classified ``RuntimeError`` branches, the
@@ -10710,6 +10712,11 @@ def phase_finish(
             # or force-removed: the refusal releases the item to ``open`` and
             # names the commit, the retained branch/worktree and the
             # remediation.
+            #
+            # Ordering invariant (SA-0MVXUSK02003ZMDN): this verification is a
+            # *finalisation* step, not a post-``in_review`` session step — it
+            # runs inside the held, non-terminal ``StatusLifecycle`` window so
+            # the item is never an audit-dispatch candidate while it runs.
             post_push_verification = _resolve_post_push_verification(
                 worktree_path, repo_root
             )
@@ -10747,6 +10754,11 @@ def phase_finish(
             # ``IMPLEMENT_KEEP_WORKTREE=1`` hands ownership to the caller.
             # Removing it here would delete the finishing session's own cwd
             # and leave it unable to run any later command.
+            #
+            # Ordering invariant (SA-0MVXUSK02003ZMDN): a *deferred* removal
+            # is not a remaining lifecycle step — ownership has passed to the
+            # driver/caller and it can no longer change the work item. Only
+            # the non-deferred removal runs here, before the terminal write.
             defer_removal, defer_reason = _should_defer_worktree_removal(
                 keep_worktree
             )
@@ -10852,6 +10864,11 @@ def phase_finish(
             # passed audit's freshness window). Verdict provenance is included
             # so the accepted green is attributable from the work item alone
             # (SA-0MVQHVJEX0071R7G).
+            #
+            # Ordering invariant (SA-0MVXUSK02003ZMDN): the completion comment
+            # is the last store write *before* the terminal transition; posting
+            # it after the terminal write would bump ``updatedAt`` on an
+            # already audit-ready item (and race the dispatcher).
             verdict_lines = "\n".join(_verdict_provenance_lines(report))
             completion_comment = (
                 f"Implementation complete.\n- Commit: {commit_hash}\n"
@@ -10917,6 +10934,12 @@ def phase_finish(
 
             # StatusLifecycle.__exit__ sets status=completed, stage=in_review
             # — the run's LAST lifecycle action (assignee released with it).
+            # Ordering invariant (SA-0MVXUSK02003ZMDN): the terminal write and
+            # the assignee release are inseparable and last; every step that
+            # can still change the work item (the read-only post-push
+            # verification, the completion comment, the non-deferred worktree
+            # removal) has already run above, so the item becomes an
+            # audit-dispatch candidate only when the run is fully complete.
 
         # ── Step 8b: Terminal-status read-back assertion ──────────────
         # (OSL-0MVME1PI5005WU58) The terminal write above must have stuck
@@ -10925,6 +10948,11 @@ def phase_finish(
         # still non-terminal is a silent lifecycle lie (recorded on
         # OSL-0MVMB44C9008IXZX). Runs only after the confirmed successful
         # push (Step 6) — a genuine push failure can never reach here.
+        #
+        # Ordering invariant (SA-0MVXUSK02003ZMDN): this read-only read-back
+        # is the phase's last action. It observes the terminal state but never
+        # changes it, so it cannot reopen the audit-dispatch window the
+        # terminal write just closed.
         report["steps"]["status_readback"] = _assert_terminal_status(
             work_item_id
         )
@@ -11275,9 +11303,11 @@ def phase_cleanup(
     **Ordering contract: run this as the session's LAST bash command.**
     Removal deletes the tree the invoking session stands in (the plain leaf
     flow's cwd *is* the worktree), so nothing that needs the worktree cwd may
-    follow it: every later command would fail with a deleted cwd. Write the
-    worklog comment, render the report and run any post-push verification
-    first, then call this action last.
+    follow it: every later command would fail with a deleted cwd. Render the
+    end-of-session report first, then call this action last. The completion
+    comment and the read-only post-push verification are **not** session
+    steps: they already ran inside ``finish``, before the terminal write
+    (SA-0MVXUSK02003ZMDN).
 
     Gates, in order — a failure at any of them **retains** the tree and is
     reported (never forced past, never silent):

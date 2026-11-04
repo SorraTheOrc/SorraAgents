@@ -1118,6 +1118,18 @@ See ``../refactor/SKILL.md``.
 
 9. Commit, Push to dev and mark in_review
 
+> **Ordering contract (SA-0MVXUSK02003ZMDN).** `finish` returns only when the
+> run is **fully complete**: it performs the read-only post-push verification,
+> the completion comment and (unless deferred) the worktree removal *before*
+> the terminal write, and the terminal `completed`/`in_review` write plus the
+> assignee release are its **last lifecycle action** (design A,
+> SA-0MVXUSED6008J04R). The item stays `in_progress` with the assignee held
+> for that whole window, so the herdr downtime dispatcher can never dispatch
+> an audit that races a still-running implement run. Do **not** perform a
+> lifecycle-relevant step after `finish` returns; only the non-lifecycle
+> worktree cleanup and the end-of-session report remain. Full contract:
+> [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#finalisation-ordering-and-the-audit-dispatch-hold-sa-0mvxusk02003zmdn).
+
 - **Plain leaf flow — run the finish with the deferral flag:**
 
   ```bash
@@ -1126,7 +1138,8 @@ See ``../refactor/SKILL.md``.
 
   `--keep-worktree` (or `IMPLEMENT_KEEP_WORKTREE=1`) defers `finish`'s own
   worktree removal, so the worktree — this session's cwd — survives for the
-  worklog comment, the end-of-session report and the post-push verification.
+  end-of-session report (the completion comment and the post-push
+  verification already ran inside `finish`, before the terminal write).
   The session then removes it itself with `implement.py cleanup <work-item-id>`
   as its **last** bash command (see
   [Worktree removal ownership](#worktree-removal-ownership-sa-0mvte8xaj002iudr)
@@ -1134,8 +1147,9 @@ See ``../refactor/SKILL.md``.
   at the end of this file). Driven child sessions never pass the flag:
   `IMPLEMENT_DRIVE_ACTIVE=1` defers automatically and `implement.py drive`
   removes the tree after the session exits. `finish` itself builds, tests,
-  commits, pushes to `dev` and marks the item `in_review`; the manual steps
-  below are the reference for what it does.
+  commits, pushes to `dev`, runs the read-only post-push verification and
+  marks the item `in_review`; the manual steps below are the reference for
+  what it does, in the order it does them.
 - Follow the mandatory build → test → commit order before committing.
 - **Do NOT create a Pull Request to `main`** — work is integrated into `dev`; the `dev`→`main` promotion is handled by the release process.
 - Push the feature branch into `dev` via the ship skill (`pushToDev()` from `$(skill_path ship)/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
@@ -1217,9 +1231,8 @@ See ``../refactor/SKILL.md``.
   - **Plain leaf flow** — the session removes its own tree with
     `implement.py cleanup <work-item-id>` as its **last** bash command (see
     the [final cleanup step](#final-cleanup-step-remove-the-retained-worktree-plain-leaf-sessions)
-    below), after the worklog comment, the end-of-session report and the
-    post-push verification. After that command no bash works in the session
-    (the cwd is gone by design).
+    below), after the end-of-session report. After that command no bash works
+    in the session (the cwd is gone by design).
   - **Driven child session** (`IMPLEMENT_DRIVE_ACTIVE=1`) — **do not remove
     your own worktree:** `implement.py drive` removes it once this session
     has exited (terminal child, clean tree only, SA-0MVTE8XAJ002IUDR).
@@ -1249,38 +1262,41 @@ See ``../refactor/SKILL.md``.
   and [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md#worktree-removal-ownership).
 
   > **Why rebuild?** `dist/` is gitignored; `git pull` does not update it. See [[concepts/git-worktree-best-practices-for-agent-workflows]].
-- Add a work-item comment with the commit hash: `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
+- **The completion comment is posted by `finish` before the terminal write**
+  (commit hash, branch, verdict provenance, retained tree), so no separate
+  post-`finish` comment is required. A manual comment added after `finish`
+  returns bumps `updatedAt` on an already-audit-ready item and can invalidate
+  a fresh audit's freshness window — avoid it; if you must record context, do
+  so before the audit is persisted.
 
   > **Ordering vs. audit persistence (SA-0MTHC710X003ORZM):** when closing an audited work item, do NOT add a post-audit comment *after* the audit has been persisted (`wl audit-set` / `persist_audit.py`). A `wl comment add` bumps `workItem.updatedAt` (via `touchWorkItemUpdatedAt()`); if that bump falls after `auditedAt` it can invalidate the runner's 60 s freshness gate and the TUI shows a stale icon (⏳) on a passed audit. Record any audit-result commentary **before** calling `persist_audit.py`, or rely on the persisted audit report itself as the record — the runner's `_apply_terminal_lifecycle` plus the audit skill's Persistence Procedure ordering contract already cover this (see the audit skill docs and `$(skill_path audit)/scripts/audit_runner.py:_check_audit_freshness` / `persist_audit.py:_run_audit_text_update`).
 - Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 
   > **Parent/epic items already advanced at Step 6.1:** skip the status update.
-  > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
+  > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`. `finish` already performs this terminal write as its last lifecycle action, so run it manually only when `finish` was not used — never as a step *after* `finish` returns.
 
   > The item stays `in_review` until release promotes `dev` to `main` (see `../ship/SKILL.md`).
 
-- **Read-only post-push verification (belt-and-suspenders, post-push,
-  post-`in_review`):** verify, WITHOUT executing a suite, that the full
-  suite is green at the exact pushed commit. The dev-push pre-push hook ran
-  it moments ago (full suite, `--scope full`) and cached it in the
-  main-checkout `.worklog/cache`; this step asserts that green entry exists
-  (SA-0MVECQUGF0064U81):
+- **Read-only post-push verification (inside `finish`, before the terminal
+  write — SA-0MVXUSK02003ZMDN):** `finish` verifies, WITHOUT executing a
+  suite, that the full suite is green at the exact pushed commit. The dev-push
+  pre-push hook ran it moments ago (full suite, `--scope full`) and cached it;
+  the verification resolves the cache entry for the pushed tree
+  (SA-0MVECQUGF0064U81). `green` or `not_applicable` permits the terminal
+  write; `red` or `missing` **refuses** it — `finish` releases the item to
+  `open`, retains (never reverts) the pushed commit, records the refusal on
+  the work item and routes the failure to triage (SA-0MVXUSJ2P009T97H AC4).
+  The session does **not** run this check again after `finish` returns.
 
-  ```bash
-  python3 $(skill_path test)/scripts/run_tests.py --summary --suite all --json
-  ```
-
-  - A `missing` result means no cached full-suite entry exists for HEAD
-    (e.g. TTL expired or the push bypassed the hook) — then, and only then,
-    run the suite to generate the evidence:
-    `python3 $(skill_path test)/scripts/run_tests.py --scope full --json`
-    (or `/skill:test`).
-  - A non-green summary (cached failures) or a genuinely failing run →
-    triage helper:
+  - **If `finish` refused on the verification**, generate the evidence through
+    the test skill and re-run `finish` (idempotent — the no-diff path
+    converges):
+    `python3 $(skill_path test)/scripts/run_tests.py --scope full` then
+    `python3 $(skill_path implement)/scripts/implement.py finish <work-item-id>`.
+  - A genuinely failing suite → triage helper:
     `python3 $(skill_path triage)/scripts/check_or_create.py
     '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...",
-    "parent_work_item_id":"<this-work-item-id>"}'` → fix → re-run.
-  - All green → close your response.
+    "parent_work_item_id":"<this-work-item-id>"}'` → fix → re-run `finish`.
   - **Parent/epic runs:** parent/epic items are validated per child at each
     child's Step 9; the parent itself is covered by the per-child test runs
     at Step 6.1.
@@ -1289,7 +1305,9 @@ Finish lock, verified sync and refusal recovery
 -----------------------------------------------
 
 `finish`'s main-checkout critical section — commit → local `dev` fast-forward
-→ push → worktree removal → post-push parent-branch sync — is serialised by a
+→ push → ancestry assertion → read-only post-push verification → worktree
+removal → post-push parent-branch sync → completion comment → terminal write —
+is serialised by a
 **per-repository exclusive advisory lock**
 (`<main-checkout>/.worklog/locks/main-checkout.lock`,
 `$(skill_path shared)/repo_lock.py`). `start`'s pre-worktree parent-branch refresh
@@ -1413,7 +1431,7 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 |-------|-----------|--------|-------|
 | Claim (Step 1) | `update_status(id, "in_progress", assignee="<AGENT>")` / `phase_start()` (status-only; stage unchanged) | in_progress | unchanged |
 | Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review", assignee="")` | completed | in_review |
-| Final (Step 9) | `with StatusLifecycle(id, assignee="<AGENT>", target_stage="in_review"):` / `phase_finish()` (release is the helper's default) | completed | in_review |
+| Final (Step 9) | `with StatusLifecycle(id, assignee="<AGENT>", target_stage="in_review"):` / `phase_finish()` (release is the helper's default). The terminal write is the run's **last lifecycle action**: the read-only post-push verification, the completion comment and the (non-deferred) worktree removal precede it (SA-0MVXUSK02003ZMDN) | completed | in_review |
 | Abort (dirty/gate/user/error/termination) | `update_status(id, "open", assignee="")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
 | Interrupted after the commit/push (signal or failure before the terminal write) | `_safety_reset_if_in_progress()` / the failure handler's `update_status(id, "open", assignee="")`, plus one deduplicated `Run interrupted:` record naming the commit and resume command (SA-0MVXUSJJY009HMQ0) | open | unchanged |
 
@@ -1567,9 +1585,8 @@ re-summarize the report in a different format — the report is the summary. Whe
 
 A plain leaf session that ran `implement.py finish <work-item-id> --keep-worktree`
 (or exported `IMPLEMENT_KEEP_WORKTREE=1`) owns the removal of its own
-worktree — no one else will do it. Run it after the worklog comment, the
-end-of-session report above and the post-push verification, as the session's
-**very last** bash command:
+worktree — no one else will do it. Run it after the end-of-session report
+above, as the session's **very last** bash command:
 
 ```bash
 python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --json
@@ -1577,10 +1594,11 @@ python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --js
 
 This must be the session's **last** bash command: `cleanup` deletes the tree
 this session stands in (its cwd), so every later bash call would fail with
-`Working directory does not exist` — which is why the comment, the report and
-the verification all come **first**. After `cleanup` returns you may still
-render the final response text (that is not a bash command), but you cannot
-run another command.
+`Working directory does not exist` — which is why the report comes **first**.
+After `cleanup` returns you may still render the final response text (that is
+not a bash command), but you cannot run another command. The post-push
+verification is not repeated here: it already ran inside `finish`, before the
+terminal write (SA-0MVXUSK02003ZMDN).
 
 **When `cleanup` reports `retained_dirty` or `retained_non_terminal`:** the
 tree was kept on purpose — never force it (the action has no force switch).

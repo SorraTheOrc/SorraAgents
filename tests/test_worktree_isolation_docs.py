@@ -289,9 +289,14 @@ class TestWorktreeRemovalOwnership:
     def test_skill_documents_the_cleanup_final_step(self) -> None:
         """SA-0MVTHJ7QX005PXRG AC2: a new final step — explicitly the
         session's last bash command — runs `implement.py cleanup <id>` after
-        the worklog comment, the end-of-session report and the post-push
-        verification, including what to do on `retained_dirty` /
+        the end-of-session report, including what to do on `retained_dirty` /
         `retained_non_terminal` (record in a comment; never force).
+
+        Ordering (SA-0MVXUSK02003ZMDN): the worklog comment and the post-push
+        verification are no longer session steps. `finish` runs them before
+        the terminal write, so the final step follows only the report (the
+        module still names the verification to explain why it is not repeated
+        here).
         """
         content = _read(_SKILL_MD)
         start = content.find("## Final cleanup step: remove the retained worktree")
@@ -299,9 +304,11 @@ class TestWorktreeRemovalOwnership:
         step = " ".join(content[start:].split())
         assert "implement.py cleanup <work-item-id>" in step
         assert "last" in step.lower()
-        assert "worklog comment" in step
         assert "end-of-session report" in step
-        assert "post-push verification" in step
+        # The completion comment and the post-push verification moved inside
+        # `finish`, before the terminal write (SA-0MVXUSK02003ZMDN).
+        assert "inside `finish`" in step
+        assert "before the terminal write" in step
         # The retained-outcome handling: record in a comment, never force.
         assert "retained_dirty" in step
         assert "retained_non_terminal" in step
