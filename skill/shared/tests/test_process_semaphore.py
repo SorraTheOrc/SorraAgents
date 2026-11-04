@@ -10,6 +10,8 @@ by the guard suite.
 
 import random
 import sys
+import threading
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -25,6 +27,7 @@ from shared.process_semaphore import (
     ENV_MAX_WORKERS,
     Semaphore,
     jittered_deadline,
+    nested_semaphore_dir,
 )
 
 
@@ -176,3 +179,121 @@ def test_jittered_acquire_acquires_once_slot_frees():
     )
     assert waiter.acquire() is True
     waiter.release()
+
+
+# ---------------------------------------------------------------------------
+# Arrival-ordered turnstile (SA-0MVSJX5HS002DJHI) — caller compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_fail_fast_acquires_immediately_when_a_slot_is_free():
+    """timeout=0 succeeds at once (audit_runner's semantics are preserved)."""
+    sem = Semaphore("unit-failfast-free", max_workers=1, timeout=0)
+
+    t0 = time.monotonic()
+    assert sem.acquire() is True
+    elapsed = time.monotonic() - t0
+    sem.release()
+
+    assert elapsed < 1.0, f"fail-fast acquire queued for {elapsed:.2f}s"
+    assert sem.last_ticket is None, "fail-fast callers are exempt from the turnstile"
+
+
+def test_fail_fast_does_not_queue_behind_an_outstanding_ticket():
+    """A fail-fast caller must not block behind a queued waiter's ticket."""
+    name = "unit-failfast-busy"
+    holder = Semaphore(name, max_workers=1, timeout=5)
+    holder.acquire()
+    queued = Semaphore(name, max_workers=1, timeout=5)
+    finished: list[bool] = []
+
+    def _wait() -> None:
+        try:
+            queued.acquire()
+            finished.append(True)
+            queued.release()
+        except TimeoutError:
+            finished.append(False)
+
+    thread = threading.Thread(target=_wait, daemon=True)
+    try:
+        thread.start()
+        # Wait until the queued waiter holds a ticket (it is genuinely waiting).
+        deadline = time.monotonic() + 5.0
+        while queued.last_ticket is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert queued.last_ticket is not None, "waiter never took a ticket"
+
+        fast = Semaphore(name, max_workers=1, timeout=0)
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            fast.acquire()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, (
+            f"fail-fast caller queued behind a ticket for {elapsed:.2f}s"
+        )
+    finally:
+        holder.release()
+        thread.join(timeout=10)
+
+    # The queued waiter acquired once the holder released the slot (no deadlock).
+    assert finished == [True]
+
+
+def test_nested_namespace_never_queues_in_the_host_turnstile(tmp_path, monkeypatch):
+    """A nested run isolated via PI_SEMAPHORE_DIR must not see host tickets."""
+    name = "unit-nested"
+    host = Semaphore(name, max_workers=1, timeout=5)
+    host.acquire()
+    host_waiters: list[bool] = []
+    host_waiter = Semaphore(name, max_workers=1, timeout=10)
+
+    def _wait() -> None:
+        try:
+            host_waiter.acquire()
+            host_waiters.append(True)
+            host_waiter.release()
+        except TimeoutError:
+            host_waiters.append(False)
+
+    thread = threading.Thread(target=_wait, daemon=True)
+    try:
+        thread.start()
+        deadline = time.monotonic() + 5.0
+        while host_waiter.last_ticket is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert host_waiter.last_ticket is not None
+
+        # The nested namespace has its own slots AND its own turnstile.
+        monkeypatch.setenv(ENV_LOCK_DIR, str(nested_semaphore_dir(tmp_path / "nested")))
+        nested = Semaphore(name, max_workers=1, timeout=2)
+        t0 = time.monotonic()
+        assert nested.acquire() is True
+        nested.release()
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 1.0, (
+            f"nested run queued in the host turnstile for {elapsed:.2f}s"
+        )
+        assert nested._slot_dir != host._slot_dir
+        assert str(nested._slot_dir).startswith(str(tmp_path / "nested"))
+    finally:
+        host.release()
+        thread.join(timeout=10)
+
+    assert host_waiters == [True]
+
+
+def test_turnstile_reclaims_a_lower_ticket_left_by_a_dead_waiter(tmp_path):
+    """A stale (unlocked) lower ticket must not block a later waiter."""
+    sem = Semaphore("unit-reclaim", max_workers=1, timeout=2)
+    sem._ensure_slots()
+    stale = sem._turnstile_dir / "0"
+    stale.write_text("", encoding="utf-8")  # created, never locked: dead waiter
+
+    t0 = time.monotonic()
+    assert sem.acquire() is True
+    sem.release()
+
+    assert time.monotonic() - t0 < 1.0
+    assert not stale.exists(), "an unlocked lower ticket must be reclaimed"

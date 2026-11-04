@@ -272,6 +272,31 @@ Recovery: push manually from the main checkout:
 git push origin <branch>:refs/heads/dev
 ```
 
+### Dev-push gate reason and transport retry (SA-0MVSJX5HS002DJHI)
+
+The dev push used to report `git push to dev failed` for every non-zero exit,
+so an agent could not tell *fix the code* from *retry later*.
+
+- **The hook names its reason.** `.githooks/pre-push` consumes the runner's
+  `--json` aggregate and prints a stable `gate_reason=<code>` line plus a
+  distinct diagnostic: `slot_contention`, `timeout`, `killed`, `unparsed`,
+  `test_failure`, `infrastructure` or `unknown`. `finish` parses the line and
+  records `report["steps"]["push"]["reason"]` and posts the reason with its
+  remedy on the work item, instead of the generic failure. The red-suite
+  `test_failure` message is unchanged in substance.
+- **Transient transport closes retry.** `Connection … closed by remote host`,
+  `Connection reset by peer`, `remote end hung up unexpectedly` and
+  `kex_exchange_identification` are retried up to 3 attempts with jittered
+  exponential backoff from the **same cwd**, so the gate re-runs and serves its
+  cached full-suite entry. Auth, branch-policy and non-fast-forward errors are
+  never retried (non-fast-forward keeps its dedicated rebase recovery), and a
+  timeout still raises `PushTimeoutError` immediately.
+- **Fairness, not capacity.** `process_semaphore`'s arrival-ordered turnstile
+  grants a free slot to the lowest outstanding ticket, so a waiter is bounded
+  by its queue position instead of being overtaken indefinitely;
+  `TEST_MAX_CONCURRENCY` is unchanged. See
+  [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
+
 ### Reading a gate failure: `reason` and its facts (SA-0MVTET8KQ0031R6Z)
 
 A red finish gate reports a machine-readable `reason` plus the facts that

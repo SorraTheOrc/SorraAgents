@@ -177,13 +177,14 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
 
   if [ -n "$repo_root" ] && [ -f "$runner" ]; then
     gate_err="$(mktemp 2>/dev/null || echo "/tmp/pre-push-gate.$$")"
+    gate_out="$(mktemp 2>/dev/null || echo "/tmp/pre-push-gate-out.$$")"
     # `set -e` is disabled for commands in an `if` condition: the gate's own
     # non-zero exit is a verdict, not a hook failure, so it is classified below.
     if [ -n "$gate_commit" ]; then
       echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env --gate-commit $gate_commit" >&2
       if python3 "$runner" --scope full --strict-git-env --json \
         --project-root "$repo_root" --gate-commit "$gate_commit" \
-        >/dev/null 2>"$gate_err"; then
+        >"$gate_out" 2>"$gate_err"; then
         gate_status=0
       else
         gate_status=$?
@@ -191,7 +192,7 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
     else
       echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env" >&2
       if python3 "$runner" --scope full --strict-git-env --json \
-        --project-root "$repo_root" >/dev/null 2>"$gate_err"; then
+        --project-root "$repo_root" >"$gate_out" 2>"$gate_err"; then
         gate_status=0
       else
         gate_status=$?
@@ -206,16 +207,69 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
       # a worktree other than this one) into the main checkout's cache.
       gate_root="$(sed -n 's/^run_tests: gate-root //p' "$gate_err" | head -1)"
       mirror_suite_cache "${gate_root:-$repo_root}"
-      rm -f "$gate_err"
+      rm -f "$gate_err" "$gate_out"
     else
-      echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2
+      # AC3: classify the failure from the runner's machine-readable result so
+      # the pusher is told *why* — no free slot, timeout, killed/unparsed run
+      # versus a genuine red suite — and `implement.py finish` can report the
+      # stable `gate_reason=<code>` line. Never fail open: every path exits 1.
+      gate_diag=""
+      if ! gate_diag="$(python3 - "$gate_out" "$gate_err" "$(dirname "$runner")" <<'PY'
+import json
+import sys
+
+out_path, err_path, scripts_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, scripts_dir)
+try:
+    from gate_reason import classify_gate_result, render_gate_diagnostic
+except Exception:  # classifier unavailable -> fail closed, still name it
+    print("gate_reason=unknown")
+    print("The gate failed and the reason classifier was unavailable.")
+    raise SystemExit(0)
+
+result = None
+try:
+    with open(out_path, encoding="utf-8") as handle:
+        result = json.load(handle)
+except (OSError, ValueError):
+    result = None
+
+if result is None:
+    try:
+        with open(err_path, encoding="utf-8") as handle:
+            err = handle.read()
+    except OSError:
+        err = ""
+    # A gate-subject refusal is an infrastructure condition, not a test
+    # failure: the gate refused to bind the pushed commit.
+    if "run_tests: gate-refused" in err or "not found" in err:
+        reason = "infrastructure"
+    else:
+        reason = "unknown"
+else:
+    reason = classify_gate_result(result)
+print(render_gate_diagnostic(reason))
+PY
+)"; then
+        gate_diag="gate_reason=unknown
+The gate failed and its machine-readable result could not be classified."
+      fi
+      # Preserve the historical message substance for an unclassifiable run
+      # (no structured reason available); classified infrastructure reasons
+      # get their own distinct diagnostic below (AC3).
+      case "$gate_diag" in
+        gate_reason=unknown*)
+          echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2
+          ;;
+      esac
+      printf '%s\n' "$gate_diag" >&2
       if [ -n "$gate_commit" ]; then
         echo "  gated commit: $gate_commit${gated_ref_shas:+ (from:$gated_ref_shas)}" >&2
       fi
-      echo "  Run: python3 \"$runner\" --scope full  (or implement.py finish) and fix failures." >&2
+      echo "  Run: python3 \"$runner\" --scope full  (or implement.py finish) and fix/retry." >&2
       echo "  Set TEST_SCOPE_SKIP=1 to bypass (not recommended)." >&2
       tail -n 20 "$gate_err" | sed 's/^/    /' >&2 || true
-      rm -f "$gate_err"
+      rm -f "$gate_err" "$gate_out"
       exit 1
     fi
   else

@@ -346,3 +346,224 @@ def test_lock_released_after_worker_killed():
     with sem:
         pass
     assert time.monotonic() - t0 < 3.0, "stale lock blocked acquisition"
+
+
+# ---------------------------------------------------------------------------
+# Arrival-ordered turnstile (SA-0MVSJX5HS002DJHI)
+#
+# Fairness is *ordering*, not capacity: with one slot, waiters must be served
+# in arrival (ticket) order, so a waiter at queue position N is bounded by
+# N x the hold time instead of being overtaken indefinitely by later
+# arrivals. Each worker records the ticket it was granted and the instant it
+# acquired, so the ordering is asserted from recorded sequence — never from
+# sleep durations.
+# ---------------------------------------------------------------------------
+
+#: A worker that starts only when its start-file exists, then records the
+#: ticket it was granted and the acquisition timestamp. Printing "arrived"
+#: (just before calling acquire) lets the harness launch the next worker only
+#: once its predecessor is ready, so launch order is controlled.
+ORDERED_WORKER_TEMPLATE = r"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.environ["REPO_ROOT"])
+sys.path.insert(0, os.environ["SKILLS_ROOT"])
+
+from shared.process_semaphore import Semaphore  # noqa: E402
+
+name = os.environ["SEM_NAME"]
+max_workers = int(os.environ.get("SEM_MAX", "1"))
+timeout = float(os.environ.get("SEM_TIMEOUT", "30"))
+hold = float(os.environ.get("SEM_HOLD", "0.15"))
+start_file = os.environ["SEM_START_FILE"]
+
+result = {"ticket": None, "acquired": None, "released": None, "error": None}
+sem = Semaphore(name, max_workers=max_workers, timeout=timeout)
+# Wait until the harness releases this worker to arrive.
+deadline = time.time() + 30
+while not os.path.exists(start_file):
+    if time.time() > deadline:
+        print(json.dumps({**result, "error": "start timeout"}))
+        sys.exit(1)
+    time.sleep(0.005)
+print("arrived", file=sys.stderr, flush=True)
+try:
+    with sem:
+        result["acquired"] = time.time()
+        result["ticket"] = sem.last_ticket
+        time.sleep(hold)
+        result["released"] = time.time()
+except Exception as exc:  # noqa: BLE001
+    result["error"] = f"{type(exc).__name__}: {exc}"
+
+print(json.dumps(result))
+sys.exit(0 if result["acquired"] is not None else 1)
+"""
+
+
+def _run_ordered_workers(n, sem_name, tmp_path, max_workers=1, hold=0.15, timeout=30):
+    """Launch *n* workers one at a time, in a controlled launch order.
+
+    Worker *i* is released only once worker *i-1* has reported it is about to
+    call ``acquire()``, so the arrivals are strictly ordered in practice. Each
+    result carries the granted ticket and the acquisition timestamp.
+    """
+    procs = []
+    results = []
+    for i in range(n):
+        start_file = tmp_path / f"start-{i}"
+        start_file.write_text("go", encoding="utf-8")
+        env = dict(os.environ)
+        env.update(
+            {
+                "REPO_ROOT": str(REPO_ROOT),
+                "SKILLS_ROOT": str(REPO_ROOT / "skill"),
+                "SEM_NAME": sem_name,
+                "SEM_MAX": str(max_workers),
+                "SEM_HOLD": str(hold),
+                "SEM_TIMEOUT": str(timeout),
+                "SEM_START_FILE": str(start_file),
+            }
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", ORDERED_WORKER_TEMPLATE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        procs.append(proc)
+        # Wait until this worker has arrived (about to enter acquire) before
+        # launching the next, so the launch order is deterministic.
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            line = proc.stderr.readline()
+            if line.strip() == "arrived":
+                break
+        else:  # pragma: no cover - worker failed to start
+            proc.kill()
+            proc.wait(timeout=10)
+            raise RuntimeError(f"ordered worker {i} never arrived")
+
+    for proc in procs:
+        out, err = proc.communicate(timeout=timeout + 30)
+        try:
+            results.append(json.loads(out.strip()))
+        except json.JSONDecodeError:
+            results.append({"error": f"bad output: {out} {err}"})
+    return results
+
+
+def test_slots_are_granted_in_arrival_order(tmp_path):
+    """One slot, four ordered waiters: no later arrival overtakes an earlier."""
+    name = f"guard-fifo-{int(time.time())}"
+    results = _run_ordered_workers(4, name, tmp_path, max_workers=1, hold=0.15)
+
+    assert all(r.get("error") is None for r in results), results
+    assert all(r.get("acquired") is not None for r in results), results
+    tickets = [r["ticket"] for r in results]
+    assert all(t is not None for t in tickets), (
+        f"every waiting acquire must report the ticket it was granted: {results}"
+    )
+    assert len(set(tickets)) == 4, f"tickets must be distinct arrivals: {tickets}"
+
+    # The fairness contract: a lower ticket (earlier arrival) always acquires
+    # before a higher ticket (later arrival). There is exactly one slot, so
+    # there is no legitimate overlap.
+    ordered = sorted(results, key=lambda r: r["ticket"])
+    acquisitions = [r["acquired"] for r in ordered]
+    assert acquisitions == sorted(acquisitions), (
+        "a later arrival overtook an earlier one: "
+        f"tickets={tickets} acquisitions={acquisitions}"
+    )
+
+
+def test_killed_queued_waiter_does_not_hold_its_turn(tmp_path):
+    """SIGKILLing a queued waiter must not strand the next waiter.
+
+    The killed waiter holds the lowest outstanding ticket while queued; its
+    ``flock`` is released by the kernel, so the next waiter must reclaim the
+    turn and acquire within a bounded time (no stale tickets, no PID
+    bookkeeping).
+    """
+    name = f"guard-fifo-kill-{int(time.time())}"
+    start = tmp_path / "start-kill"
+    start.write_text("go", encoding="utf-8")
+    env = dict(os.environ)
+    env.update(
+        {
+            "REPO_ROOT": str(REPO_ROOT),
+            "SKILLS_ROOT": str(REPO_ROOT / "skill"),
+            "SEM_NAME": name,
+            "SEM_MAX": "1",
+            "SEM_HOLD": "30",
+            "SEM_TIMEOUT": "60",
+            "SEM_START_FILE": str(start),
+        }
+    )
+    # A holder takes (and keeps) the only slot.
+    holder_env = dict(os.environ)
+    holder_env.update(
+        {
+            "REPO_ROOT": str(REPO_ROOT),
+            "SKILLS_ROOT": str(REPO_ROOT / "skill"),
+            "SEM_NAME": name,
+            "SEM_MAX": "1",
+            "SEM_HOLD": "30",
+            "SEM_TIMEOUT": "60",
+        }
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", WORKER_TEMPLATE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=holder_env,
+    )
+    try:
+        # Wait until the holder reports acquisition.
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            line = holder.stderr.readline()
+            if line.strip() and "acquired" in line:
+                break
+        # A second waiter queues behind the holder (lowest outstanding ticket).
+        queued = subprocess.Popen(
+            [sys.executable, "-c", ORDERED_WORKER_TEMPLATE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            line = queued.stderr.readline()
+            if line.strip() == "arrived":
+                break
+        # Let it allocate its ticket and enter the wait, then kill it in place.
+        time.sleep(0.3)
+        queued.kill()
+        queued.wait(timeout=10)
+
+        # Free the slot: the next waiter must not be blocked by the dead turn.
+        holder.kill()
+        holder.wait(timeout=10)
+
+        t0 = time.monotonic()
+        sem = Semaphore(name, max_workers=1, timeout=10)
+        with sem:
+            pass
+        elapsed = time.monotonic() - t0
+        assert elapsed < 5.0, (
+            "a killed queued waiter must not hold its turn; "
+            f"next acquisition took {elapsed:.1f}s"
+        )
+    finally:
+        for proc in (holder,):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+

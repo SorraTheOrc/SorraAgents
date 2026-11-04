@@ -374,6 +374,20 @@ silently reclassify a genuine test failure as infrastructure contention.
 The slot-busy notice text itself is anchored to the exported
 `SLOT_BUSY_NOTICE_PREFIX` constant.
 
+**The pre-push gate names its reason (SA-0MVSJX5HS002DJHI).**
+`.githooks/pre-push` no longer discards the runner's `--json` aggregate: on
+failure it prints a stable `gate_reason=<code>` line plus a distinct human
+diagnostic — `slot_contention`, `timeout`, `killed`, `unparsed`,
+`test_failure`, `infrastructure` or `unknown`. Classification is delegated to
+the shared `skill/test/scripts/gate_reason.py` classifier (the same one
+`implement.py`'s changed-scope gate uses), which maps the published
+`notice_codes` above onto those reasons — the codes are consumed, never
+re-defined. The hook never fails open: an unparsable result is reported as
+`gate_reason=unknown` and the push still exits non-zero, and a red suite keeps
+`gate_reason=test_failure` with the unchanged "Full test suite failed" wording.
+`implement.py finish` reads the line from the push stderr and reports the
+reason with its remedy instead of a generic "git push to dev failed".
+
 **From codes to remedies.** The finish gate maps these codes onto the reasons it
 reports (`timeout`, `killed`, `unparsed`, `slot_contention`, `test_failure`,
 `infrastructure`) and attaches the deciding facts (`configured_timeout`,
@@ -444,6 +458,27 @@ bounded wait is staggered per waiter:
 (no stagger) for callers that prefer it. The jitter only affects the `"test"`
 semaphore namespace — audit/`audit-host` semaphores keep `jitter=0.0`
 byte-identical behaviour unless a caller opts in explicitly.
+
+**Arrival-ordered turnstile (SA-0MVSJX5HS002DJHI).** Jitter only staggers
+*deadlines*; it never orders arrivals. The slot pool alone grants a free slot
+to whichever waiter polls next, so under a herd a late arrival can overtake a
+waiter that has been queuing for hours (measured: one gate waited 2 h 9 min
+before expiring with `slot_busy`). `process_semaphore.Semaphore` therefore
+takes a monotonic ticket on every bounded/indefinite wait and only the waiter
+holding the **lowest outstanding ticket** may attempt a slot. Tickets are
+`flock`-held, so a waiter that acquires, times out, raises or dies (including
+`SIGKILL`) releases its turn automatically from the kernel — a killed waiter's
+turn is reclaimed within one retry cadence, with no stale tickets and no PID
+bookkeeping. The wait is bounded by queue position: a waiter at position *N*
+is served after at most *N* expected slot-hold times (plus one retry cadence).
+Two compatibility guarantees are preserved: `timeout=0` fail-fast callers
+(`audit_runner`) bypass the turnstile entirely (an immediate attempt still
+succeeds when a slot is free and raises at once when the pool is full), and a
+run isolated through `PI_SEMAPHORE_DIR` / `nested_semaphore_dir()` has its own
+namespace and never queues in the host-wide turnstile. `TEST_MAX_CONCURRENCY`
+is unchanged — fairness is about **ordering**, not capacity — and the fast path
+adds one counter `flock` per acquire plus a single non-blocking scan when no
+lower ticket is outstanding.
 
 **Cache hits never block:** the semaphore is acquired ONLY when an actual
 execution is about to happen (cache miss path). A cached result is served

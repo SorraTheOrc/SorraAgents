@@ -76,6 +76,7 @@ import functools
 import json
 import logging
 import os
+import random
 import re
 import shlex
 import shutil
@@ -213,6 +214,21 @@ except ImportError:
     _SLOT_BUSY_NOTICE_PREFIX = (  # type: ignore[assignment]
         "test concurrency slot busy:"
     )
+
+try:
+    # Single shared gate-failure classifier (SA-0MVSJX5HS002DJHI AC3): the
+    # pre-push hook and this module must never fork the reason vocabulary.
+    # Imported separately so an older test skill degrades to the local
+    # fallback body in ``_gate_failure_kind`` instead of breaking the import.
+    from test.scripts.gate_reason import (
+        GATE_REMEDIATION as _GATE_REMEDIATION,
+    )
+    from test.scripts.gate_reason import (
+        classify_gate_result as _classify_gate_result,
+    )
+except ImportError:  # pragma: no cover - older test skill
+    _classify_gate_result = None  # type: ignore[assignment]
+    _GATE_REMEDIATION = {}  # type: ignore[assignment]
 
 from test_cache import query_cached, run_cached
 from test_runner import canonicalize_quiet_test_command
@@ -4671,6 +4687,124 @@ def _post_push_verification_refusal(
     return message, comment
 
 
+PUSH_TRANSPORT_RETRY_PATTERNS: tuple[str, ...] = (
+    "closed by remote host",
+    "connection reset by peer",
+    "remote end hung up unexpectedly",
+    "kex_exchange_identification",
+)
+#: Bounded retry policy (AC4): the initial attempt plus two retries with
+#: jittered exponential backoff. A retry re-runs the identical argv/cwd/env, so
+#: the pre-push gate runs again and serves its cached full-suite entry.
+PUSH_RETRY_MAX_ATTEMPTS = 3
+PUSH_RETRY_BASE_SECONDS = 2.0
+PUSH_RETRY_CAP_SECONDS = 30.0
+
+_GATE_REASON_LINE_RE = re.compile(r"^gate_reason=([a-z_]+)\s*$", re.MULTILINE)
+
+
+class PushGateFailureError(RuntimeError):
+    """A dev push refused by the pre-push gate, carrying its reason code.
+
+    Carries the hook's stable ``gate_reason=<code>`` so ``phase_finish`` can
+    report *why* the push failed (slot contention / timeout / killed / red
+    suite) instead of a generic "git push to dev failed"
+    (SA-0MVSJX5HS002DJHI AC2).
+    """
+
+    def __init__(
+        self,
+        gate_reason: str,
+        stderr_tail: str,
+        commit_hash: str,
+        branch: str,
+    ) -> None:
+        self.gate_reason = gate_reason
+        self.stderr_tail = stderr_tail
+        self.commit_hash = commit_hash
+        self.branch = branch
+        super().__init__(
+            f"Push to dev refused by the gate ({gate_reason}): {stderr_tail}. "
+            f"Commit {commit_hash} on branch {branch} is local."
+        )
+
+
+def _is_retryable_push_transport(stderr: str) -> bool:
+    """Whether *stderr* names a transient transport close (retryable).
+
+    Only the recognised transport patterns retry. Auth failures, branch-policy
+    refusals and non-fast-forward errors must fail as they do today — masking
+    them behind a retry would turn a real error into a slow one.
+    """
+    lower = (stderr or "").lower()
+    return any(pattern in lower for pattern in PUSH_TRANSPORT_RETRY_PATTERNS)
+
+
+def _push_transport_backoff(
+    attempt: int, rng: random.Random | None = None
+) -> float:
+    """Jittered exponential backoff (seconds) for the *attempt*-th retry.
+
+    *attempt* is 1-based (1 = the delay after the first failed push). The base
+    doubles per retry and is capped, with +/-25% jitter so concurrent pushers do
+    not retry in lockstep.
+    """
+    rng = rng if rng is not None else random
+    base = PUSH_RETRY_BASE_SECONDS * (2 ** (max(1, attempt) - 1))
+    capped = min(base, PUSH_RETRY_CAP_SECONDS)
+    return capped * (0.75 + rng.random() * 0.5)
+
+
+def _push_retry_sleep(seconds: float) -> None:
+    """Sleep seam for the transport backoff (monkeypatched in tests)."""
+    time.sleep(seconds)
+
+
+def _parse_gate_reason(stderr: str) -> str | None:
+    """The last stable ``gate_reason=<code>`` line the hook printed, if any."""
+    matches = _GATE_REASON_LINE_RE.findall(stderr or "")
+    return matches[-1] if matches else None
+
+
+def _stderr_tail(text: str, limit: int = 20) -> str:
+    """The last *limit* lines of a push/gate stderr (bounded for comments)."""
+    lines = (text or "").strip().splitlines()
+    return "\n".join(lines[-limit:])
+
+
+def _push_gate_remediation(gate_reason: str | None) -> str:
+    """The operator remedy for a dev-push gate reason (never empty)."""
+    if gate_reason and _GATE_REMEDIATION.get(gate_reason):
+        return str(_GATE_REMEDIATION[gate_reason])
+    return (
+        "Read the gate output above, resolve the condition, then re-run "
+        "finish (idempotent — a no-diff push converges)."
+    )
+
+
+def _dev_push_gate_failure_comment(
+    gate_reason: str,
+    stderr_tail: str,
+    commit_hash: str,
+    branch: str,
+    worktree_path: str,
+) -> str:
+    """Build the work-item comment for a dev push refused by the gate (AC2)."""
+    lines = [
+        f"Dev push failed (gate reason: {gate_reason}).",
+        _push_gate_remediation(gate_reason),
+        "",
+        f"Commit: {commit_hash}",
+        f"Branch: {branch}",
+        f"Worktree: {worktree_path}",
+        "Local dev was restored to origin/dev (the commit stays on its "
+        "feature branch).",
+    ]
+    if stderr_tail:
+        lines.extend(["", "Gate output (tail):", stderr_tail])
+    return "\n".join(lines)
+
+
 def git_push_to_dev(
     cwd: str,
     branch: str,
@@ -4687,6 +4821,14 @@ def git_push_to_dev(
     carrying the commit hash and branch so the caller can post a
     manual-push comment and leave recoverable state (AC3).
 
+    A **transient transport close** (``Connection ... closed by remote
+    host``, ``Connection reset by peer``, ``remote end hung up
+    unexpectedly``, ``kex_exchange_identification``) is retried up to
+    ``PUSH_RETRY_MAX_ATTEMPTS`` attempts with jittered exponential
+    backoff from the *same cwd*, so the gate runs again and serves its
+    cached full-suite entry (SA-0MVSJX5HS002DJHI AC4). Auth, branch-policy
+    and non-fast-forward failures are never retried.
+
     Args:
         cwd: The checkout that holds the pushed commit — the worktree. The
             pre-push hook resolves its project root with
@@ -4697,9 +4839,11 @@ def git_push_to_dev(
         branch: Local branch name to push.
         commit_hash: The commit hash being pushed (used in recovery).
         timeout: Override timeout in seconds (defaults to resolved config).
-        evidence_out: Optional dict populated on success with the gate's
-            ``root``, ``head``, ``pushed`` and ``full_suite`` classification
-            (SA-0MVUTXJM8006PQY4 AC5). Untouched on failure.
+        evidence_out: Optional dict populated with the gate's ``root``,
+            ``head``, ``pushed`` and ``full_suite`` classification on success
+            (SA-0MVUTXJM8006PQY4 AC5), or with ``success: False``,
+            ``gate_reason`` and ``stderr_tail`` on failure
+            (SA-0MVSJX5HS002DJHI — additive; the success keys are unchanged).
 
     Returns:
         True if the push succeeded.
@@ -4707,6 +4851,8 @@ def git_push_to_dev(
     Raises:
         ``PushTimeoutError``: push timed out — carries commit_hash/branch
             so the caller can produce a recovery comment.
+        ``PushNonFastForwardError``: dev advanced concurrently — the caller
+            rebases and retries.
     """
     if timeout is None:
         timeout = _resolve_test_timeout(cwd)
@@ -4719,46 +4865,63 @@ def git_push_to_dev(
     # the constant pins the name that carries dev-push integration.
     _assert_remote_name_only(PUSH_REMOTE_NAME)
 
-    # Snapshot the full-suite cache before the push so the gate's
+    # Snapshot the full-suite cache before the FIRST push attempt so the gate's
     # executed-vs-cached verdict is observable afterwards (AC3). Read-only and
-    # fail-soft: it never decides the push.
+    # fail-soft: it never decides the push. Taken once so a transport retry is
+    # never misreported as "cached" merely because the first attempt executed.
     before_present = _full_suite_cache_present(cwd)
 
-    # Spawn the push in its own process group so that a timeout kills the
-    # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
-    try:
-        proc = subprocess.Popen(
-            ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,  # new process group
-            env={**os.environ},
-        )
+    for attempt in range(1, PUSH_RETRY_MAX_ATTEMPTS + 1):
+        # Spawn the push in its own process group so that a timeout kills the
+        # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
         try:
-            _stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Kill the entire process group so orphaned hook children don't
-            # survive and deadlock subsequent push attempts.
-            _kill_process_group(proc.pid)
-            proc.wait()
-            LOG.error(
-                "git push to dev timed out after %d s (pre-push hook still "
-                "running).",
-                timeout,
+            proc = subprocess.Popen(
+                ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,  # new process group
+                env={**os.environ},
             )
-            # Raise with recoverable-state info (AC3)
-            raise PushTimeoutError(
-                commit_hash or "unknown", branch, timeout,
-            ) from None
-        stderr_str = stderr.decode(errors="replace").strip()
-        if proc.returncode != 0:
-            # Detect non-fast-forward errors (dev advanced concurrently).
-            # AC1/AC2: raise a recoverable exception so the caller can rebase
-            # and retry instead of failing with information loss.  Remotes
-            # word this differently: SSH/HTTPS report "non-fast-forward",
-            # while local/file remotes report "fetch first" /
-            # "remote contains work that you do not have locally".
+            try:
+                _stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the entire process group so orphaned hook children don't
+                # survive and deadlock subsequent push attempts.
+                _kill_process_group(proc.pid)
+                proc.wait()
+                LOG.error(
+                    "git push to dev timed out after %d s (pre-push hook still "
+                    "running).",
+                    timeout,
+                )
+                # Raise with recoverable-state info (AC3). A timeout is a bound,
+                # not a transport close: never retried here.
+                raise PushTimeoutError(
+                    commit_hash or "unknown", branch, timeout,
+                ) from None
+            stderr_str = stderr.decode(errors="replace").strip()
+            if proc.returncode == 0:
+                # Success: surface the pre-push hook's output (AC3). It was
+                # previously captured and dropped, so "the gate ran" and "the
+                # gate never ran" were indistinguishable. Then classify
+                # executed-vs-cached from the read-only test cache for the
+                # pushed tree.
+                if stderr_str:
+                    for hook_line in stderr_str.splitlines():
+                        LOG.info("git push to dev hook: %s", hook_line)
+                evidence = _dev_push_gate_evidence(cwd, commit_hash, before_present)
+                if evidence_out is not None:
+                    evidence_out.clear()
+                    evidence_out.update(evidence)
+                return True
+
+            # Failure: detect non-fast-forward errors (dev advanced
+            # concurrently). AC1/AC2: raise a recoverable exception so the
+            # caller can rebase and retry instead of failing with information
+            # loss. Remotes word this differently: SSH/HTTPS report
+            # "non-fast-forward", while local/file remotes report "fetch
+            # first" / "remote contains work that you do not have locally".
             lower = stderr_str.lower()
             if (
                 "non-fast-forward" in lower
@@ -4772,25 +4935,60 @@ def git_push_to_dev(
                 raise PushNonFastForwardError(
                     commit_hash or "unknown", branch, stderr_str, rebase_cmd,
                 )
-            LOG.error("git push to dev failed: %s", stderr_str)
+
+            # Transient transport close: retry from the SAME cwd (the worktree
+            # that holds the pushed commit), so the gate re-runs against the
+            # identical tree and serves its cached entry.
+            if (
+                _is_retryable_push_transport(stderr_str)
+                and attempt < PUSH_RETRY_MAX_ATTEMPTS
+            ):
+                delay = _push_transport_backoff(attempt)
+                LOG.warning(
+                    "git push to dev attempt %d/%d failed with a transient "
+                    "transport error; retrying in %.1fs from the same cwd %s. "
+                    "stderr: %s",
+                    attempt,
+                    PUSH_RETRY_MAX_ATTEMPTS,
+                    delay,
+                    cwd,
+                    _stderr_tail(stderr_str),
+                )
+                _push_retry_sleep(delay)
+                continue
+
+            gate_reason = _parse_gate_reason(stderr_str)
+            if evidence_out is not None:
+                evidence_out.clear()
+                evidence_out.update(
+                    {
+                        "success": False,
+                        "gate_reason": gate_reason,
+                        "stderr_tail": _stderr_tail(stderr_str),
+                    }
+                )
+            LOG.error(
+                "git push to dev failed (attempt %d/%d, gate_reason=%s): %s",
+                attempt,
+                PUSH_RETRY_MAX_ATTEMPTS,
+                gate_reason or "none",
+                stderr_str,
+            )
             return False
-        # Success: surface the pre-push hook's output (AC3). It was previously
-        # captured and dropped, so "the gate ran" and "the gate never ran"
-        # were indistinguishable. Then classify executed-vs-cached from the
-        # read-only test cache for the pushed tree.
-        if stderr_str:
-            for hook_line in stderr_str.splitlines():
-                LOG.info("git push to dev hook: %s", hook_line)
-        evidence = _dev_push_gate_evidence(cwd, commit_hash, before_present)
-        if evidence_out is not None:
-            evidence_out.clear()
-            evidence_out.update(evidence)
-        return True
-    except Exception as exc:
-        if isinstance(exc, (PushTimeoutError, PushNonFastForwardError)):
-            raise
-        LOG.error("git push to dev error: %s", exc)
-        return False
+        except Exception as exc:
+            if isinstance(
+                exc,
+                (
+                    PushTimeoutError,
+                    PushNonFastForwardError,
+                    PushGateFailureError,
+                ),
+            ):
+                raise
+            LOG.error("git push to dev error: %s", exc)
+            return False
+
+    return False
 
 
 def git_get_commit_hash(cwd: str) -> str:
@@ -7976,6 +8174,12 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
     """
     if test_result.get("failures"):
         return GATE_FAILURE_TESTS
+    # Single shared classifier (SA-0MVSJX5HS002DJHI): the pre-push hook and
+    # this gate must never fork the reason vocabulary. The local body below is
+    # a compatibility fallback for an older test skill that predates the
+    # shared module.
+    if _classify_gate_result is not None:
+        return _classify_gate_result(test_result)
     notice_codes = [str(c) for c in (test_result.get("notice_codes") or [])]
     if _NOTICE_SLOT_BUSY in notice_codes:
         return GATE_FAILURE_SLOT_CONTENTION
@@ -10637,6 +10841,17 @@ def phase_finish(
                     commit_hash,
                     evidence_out=push_evidence,
                 ):
+                    gate_reason = push_evidence.get("gate_reason")
+                    if gate_reason:
+                        # AC2: the hook named *why* (slot contention, timeout,
+                        # killed, red suite, ...); report that reason rather
+                        # than a generic push failure.
+                        raise PushGateFailureError(
+                            str(gate_reason),
+                            str(push_evidence.get("stderr_tail") or ""),
+                            commit_hash,
+                            branch,
+                        )
                     raise RuntimeError("git push to dev failed.")
             except PushSubjectMismatchError as exc:
                 # Fail closed (AC2): nothing was pushed. Restore local dev off
@@ -10732,6 +10947,36 @@ def phase_finish(
                 # An interruption from here on names the rebased replacement
                 # hash, which is the commit that actually landed.
                 _set_finish_progress(commit=commit_hash, pushed=True)
+            except PushGateFailureError as exc:
+                # AC2: the pre-push gate said *why* the push failed. Report the
+                # machine-readable reason in the finish report and post it on
+                # the work item with the matching remediation, instead of the
+                # generic "git push to dev failed".
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": exc.gate_reason,
+                    "hash": commit_hash,
+                    "gate_stderr_tail": exc.stderr_tail,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
+                wl_add_comment(
+                    work_item_id,
+                    _dev_push_gate_failure_comment(
+                        exc.gate_reason,
+                        exc.stderr_tail,
+                        commit_hash,
+                        branch,
+                        worktree_path,
+                    ),
+                )
+                raise RuntimeError(
+                    f"git push to dev failed (gate reason: {exc.gate_reason}). "
+                    f"{_push_gate_remediation(exc.gate_reason)}"
+                ) from exc
             except RuntimeError:
                 # A generic push failure: nothing reached origin. Undo our own
                 # fast-forward so local dev never stays on the unpushed commit

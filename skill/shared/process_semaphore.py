@@ -54,6 +54,44 @@ Timeout semantics
 - ``timeout=0`` — fail fast: raise ``TimeoutError`` immediately if full.
 - ``timeout>0`` — bounded wait; raise ``TimeoutError`` at the deadline.
 
+Arrival-ordered turnstile (SA-0MVSJX5HS002DJHI)
+-----------------------------------------
+The slot pool alone grants a free slot to whichever waiter happens to poll
+next, so under a herd a late arrival can overtake a waiter that has been
+queuing for hours (measured: one gate waited 2 h 9 min before expiring with
+``slot_busy``). Fairness is therefore **ordering**, not capacity: an
+arrival-ordered turnstile sits in front of the pool and only the waiter
+holding the **lowest outstanding ticket** may attempt a slot.
+
+Protocol (all kernel-``flock`` based, no PID bookkeeping):
+
+- A waiter allocates a strictly increasing ticket from a counter file (the
+  counter lock is held only for the allocation) and, **while still holding
+  it**, creates and flocks its own ticket file. A later allocator therefore
+  never observes an announced-but-unlocked ticket.
+- A waiter attempts the slot pool only when no lower-numbered ticket is
+  *locked*. Lower ticket files that are not locked belong to a waiter that
+  already acquired, timed out or died; they are reclaimed (unlinked).
+- The ticket is released when the waiter acquires a slot, times out, raises,
+  or dies: the kernel drops the ``flock`` on process exit (including
+  ``SIGKILL``), so a killed waiter's turn is reclaimed within one retry
+  cadence — no stale tickets and no PID bookkeeping.
+- **Bound:** a waiter at queue position *N* acquires within roughly *N* x the
+  expected slot-hold time (plus one retry cadence), because every waiter
+  ahead of it is served first. The bound is per namespace.
+
+Compatibility guarantees:
+
+- **Fail-fast callers** (``timeout=0``, as ``audit_runner`` uses) bypass the
+  turnstile entirely: an immediate attempt must still succeed when a slot is
+  free and must raise immediately when the pool is full — a turnstile must
+  never deadlock a non-queuing caller.
+- **Nested-run isolation** is preserved: the turnstile lives under the
+  namespace directory, so a run isolated with :func:`nested_semaphore_dir`
+  (``PI_SEMAPHORE_DIR``) never queues in the host-wide turnstile.
+- **Staggered-wait jitter** (SA-0MVEDOF7A004TSWD) still applies to the retry
+  cadence and deadline; ordering complements it rather than replacing it.
+
 Staggered-wait jitter (SA-0MVEDOF7A004TSWD)
 -------------------------------------------
 Bounded-wait consumers under a herd (the test skill's ``"test"`` semaphore)
@@ -112,6 +150,11 @@ ENV_LOCK_DIR = "PI_SEMAPHORE_DIR"
 #: Subdirectory (under a caller-provided base) that names an isolated
 #: namespace for a nested (already-paced) run invocation.
 NESTED_SEMAPHORE_SUBDIR = "pi-semaphores"
+#: Subdirectory of a semaphore's slot directory that holds the arrival-ordered
+#: turnstile (ticket files + the allocation counter).
+_TURNSTILE_SUBDIR = "turnstile"
+#: Name of the ticket-allocation counter file inside the turnstile directory.
+_TURNSTILE_COUNTER = "next"
 _RETRY_DELAY_SECONDS = 0.05
 
 _NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -231,7 +274,14 @@ class Semaphore:
 
         self.name = name
         self._slot_dir = _default_lock_dir() / _sanitize_name(name)
+        self._turnstile_dir = self._slot_dir / _TURNSTILE_SUBDIR
         self._held_fd: int | None = None
+        #: The ticket number taken by the most recent ``acquire()`` (None when
+        #: the acquire was fail-fast or re-entrant). A read-only diagnostic:
+        #: the fairness contract is that lower tickets are granted first, and
+        #: this lets a caller (or a test) attribute an acquisition to its
+        #: arrival position without adding a second timer or log channel.
+        self.last_ticket: int | None = None
         self.timeout = timeout
 
         self.jitter = float(jitter)
@@ -257,6 +307,7 @@ class Semaphore:
     def _ensure_slots(self) -> None:
         """Create slot lock files up to ``max_workers`` (idempotent)."""
         self._slot_dir.mkdir(parents=True, exist_ok=True)
+        self._turnstile_dir.mkdir(parents=True, exist_ok=True)
         for i in range(self.max_workers):
             path = self._slot_path(i)
             try:
@@ -284,6 +335,107 @@ class Semaphore:
         return None
 
     # ------------------------------------------------------------------
+    # Arrival-ordered turnstile (SA-0MVSJX5HS002DJHI)
+    # ------------------------------------------------------------------
+
+    def _allocate_ticket(self) -> tuple[int, int]:
+        """Take the next monotonic ticket and hold its ``flock``.
+
+        The counter lock serialises number allocation; the ticket file is
+        created **and locked** before the counter lock is released, so a
+        later allocator can never observe its own higher ticket next to an
+        announced-but-unlocked lower one.
+
+        Returns:
+            ``(ticket_number, ticket_fd)`` — the caller owns *ticket_fd* and
+            must pass it to :meth:`_release_ticket`.
+        """
+        counter_path = self._turnstile_dir / _TURNSTILE_COUNTER
+        counter_fd = os.open(counter_path, os.O_CREAT | os.O_RDWR, 0o644)
+        ticket_fd: int | None = None
+        try:
+            fcntl.flock(counter_fd, fcntl.LOCK_EX)
+            os.lseek(counter_fd, 0, os.SEEK_SET)
+            raw = os.read(counter_fd, 64).decode("ascii", "ignore").strip()
+            try:
+                next_ticket = int(raw)
+            except ValueError:  # missing/corrupt counter — recover from files
+                next_ticket = 0
+            # Never reuse a number still named by a surviving ticket file, so
+            # a crash mid-allocation cannot make two waiters share a ticket.
+            for name in os.listdir(self._turnstile_dir):
+                if name.isdigit():
+                    next_ticket = max(next_ticket, int(name) + 1)
+            os.lseek(counter_fd, 0, os.SEEK_SET)
+            os.ftruncate(counter_fd, 0)
+            os.write(counter_fd, str(next_ticket + 1).encode("ascii"))
+            ticket_path = self._turnstile_dir / str(next_ticket)
+            ticket_fd = os.open(ticket_path, os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(ticket_fd, fcntl.LOCK_EX)
+            return next_ticket, ticket_fd
+        finally:
+            try:
+                fcntl.flock(counter_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(counter_fd)
+
+    def _release_ticket(self, ticket: int, ticket_fd: int) -> None:
+        """Release a ticket: unlock, close and unlink it (idempotent)."""
+        try:
+            try:
+                fcntl.flock(ticket_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(ticket_fd)
+        finally:
+            try:
+                os.unlink(self._turnstile_dir / str(ticket))
+            except OSError:
+                pass
+
+    def _lower_ticket_active(self, ticket: int) -> bool:
+        """Whether any lower-numbered ticket is still held by a waiter.
+
+        A lower ticket file that can be locked is no longer held (its waiter
+        acquired, timed out or died — the kernel releases ``flock`` on process
+        death), so it is reclaimed here. Returns True as soon as an active
+        lower ticket is found; otherwise False once the outstanding set has
+        been scanned.
+        """
+        try:
+            names = os.listdir(self._turnstile_dir)
+        except OSError:  # pragma: no cover - namespace removed concurrently
+            return False
+        for name in names:
+            if not name.isdigit():
+                continue
+            other = int(name)
+            if other >= ticket:
+                continue
+            path = self._turnstile_dir / name
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except OSError:
+                continue  # reclaimed by its owner mid-scan
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                os.close(fd)
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    return True  # an older waiter still holds its turn
+                raise
+            # Not held: the owner acquired, timed out or died — reclaim it.
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:  # pragma: no cover - defensive
+                pass
+            os.close(fd)
+            try:
+                os.unlink(path)
+            except OSError:  # pragma: no cover - raced with another reclaimer
+                pass
+        return False
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -305,6 +457,14 @@ class Semaphore:
 
         effective_timeout = self.timeout if timeout is None else timeout
         self._ensure_slots()
+        self.last_ticket = None
+
+        # Fail-fast callers (audit_runner's timeout=0) are exempt from the
+        # turnstile: an immediate attempt must still succeed when a slot is
+        # free, and must raise immediately when the pool is full — queueing it
+        # behind outstanding tickets would deadlock a non-waiting caller.
+        if effective_timeout == 0:
+            return self._fail_fast_acquire(effective_timeout)
 
         if effective_timeout is None:
             deadline: float | None = None
@@ -317,21 +477,42 @@ class Semaphore:
             # never exceeds the configured bound — it only staggers earlier.
             deadline = jittered_deadline(now, float(effective_timeout), self.jitter, self._rng)
 
-        while True:
-            fd = self._try_acquire_slot()
-            if fd is not None:
-                self._held_fd = fd
-                return True
+        ticket, ticket_fd = self._allocate_ticket()
+        self.last_ticket = ticket
+        try:
+            while True:
+                # Only the lowest outstanding ticket may attempt the pool, so
+                # a later arrival can never overtake an earlier waiter and the
+                # wait is bounded by the queue position (SA-0MVSJX5HS002DJHI).
+                if not self._lower_ticket_active(ticket):
+                    fd = self._try_acquire_slot()
+                    if fd is not None:
+                        self._held_fd = fd
+                        return True
 
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"semaphore '{self.name}' busy: no slot free within "
-                    f"{effective_timeout}s (max_workers={self.max_workers})"
-                )
-            if self.jitter > 0:
-                time.sleep(_jittered_retry_delay(self._rng))
-            else:
-                time.sleep(_RETRY_DELAY_SECONDS)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"semaphore '{self.name}' busy: no slot free within "
+                        f"{effective_timeout}s (max_workers={self.max_workers}, "
+                        f"ticket={ticket})"
+                    )
+                if self.jitter > 0:
+                    time.sleep(_jittered_retry_delay(self._rng))
+                else:
+                    time.sleep(_RETRY_DELAY_SECONDS)
+        finally:
+            self._release_ticket(ticket, ticket_fd)
+
+    def _fail_fast_acquire(self, effective_timeout: float | None) -> bool:
+        """Single immediate slot attempt for a ``timeout=0`` caller."""
+        fd = self._try_acquire_slot()
+        if fd is not None:
+            self._held_fd = fd
+            return True
+        raise TimeoutError(
+            f"semaphore '{self.name}' busy: no slot free within "
+            f"{effective_timeout}s (max_workers={self.max_workers})"
+        )
 
     def release(self) -> None:
         """Release the held slot. Idempotent (safe to call after failure)."""

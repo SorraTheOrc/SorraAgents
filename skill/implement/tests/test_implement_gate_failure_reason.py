@@ -544,3 +544,65 @@ class TestQueueWaitAtTheGateBoundary:
             "execution time to report — a missing fact must stay missing "
             "(never 0, never the wait)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Dev-push gate reason reporting (SA-0MVSJX5HS002DJHI AC2)
+#
+# The changed-scope gate above and the dev-push gate share one reason
+# vocabulary (``skill/test/scripts/gate_reason.py``). These tests pin the
+# finish-side contract for a dev push refused by the pre-push gate: the reason
+# is carried on the error, the work-item comment names it and the remedy.
+# ---------------------------------------------------------------------------
+
+
+class TestDevPushGateReasonReported:
+    def test_error_carries_the_hook_reason(self) -> None:
+        exc = implement.PushGateFailureError(
+            implement.GATE_FAILURE_SLOT_CONTENTION,
+            "gate output tail",
+            "abc1234",
+            "wl-test",
+        )
+
+        assert exc.gate_reason == implement.GATE_FAILURE_SLOT_CONTENTION
+        assert "slot_contention" in str(exc)
+        assert "abc1234" in str(exc)
+
+    def test_comment_names_reason_remedy_commit_and_gate_output(self) -> None:
+        comment = implement._dev_push_gate_failure_comment(
+            implement.GATE_FAILURE_SLOT_CONTENTION,
+            "gate_reason=slot_contention\nERROR: No free test slot",
+            "abc1234",
+            "wl-test",
+            "/tmp/worktree",
+        )
+
+        assert implement.GATE_FAILURE_SLOT_CONTENTION in comment
+        assert "TEST_LOCK_TIMEOUT" in comment, (
+            "the comment must carry the remedy an operator needs"
+        )
+        assert "abc1234" in comment
+        assert "/tmp/worktree" in comment
+        assert "No free test slot" in comment
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            implement.GATE_FAILURE_TESTS,
+            implement.GATE_FAILURE_SLOT_CONTENTION,
+            implement.GATE_FAILURE_TIMEOUT,
+            implement.GATE_FAILURE_KILLED,
+            implement.GATE_FAILURE_UNPARSED,
+            implement.GATE_FAILURE_INFRASTRUCTURE,
+            implement.GATE_FAILURE_UNKNOWN,
+        ],
+    )
+    def test_every_reason_has_a_non_empty_remediation(self, reason: str) -> None:
+        remediation = implement._push_gate_remediation(reason)
+
+        assert remediation.strip()
+        assert reason not in (None, "")
+
+    def test_unknown_reason_still_gets_an_actionable_remediation(self) -> None:
+        assert implement._push_gate_remediation(None).strip()

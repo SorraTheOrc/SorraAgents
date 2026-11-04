@@ -1441,6 +1441,46 @@ Recovery from the manual-push comment:
 git push origin <branch>:refs/heads/dev
 ```
 
+### Push transport retry (SA-0MVSJX5HS002DJHI AC4)
+
+A transient transport close — `Connection to <host> closed by remote host`,
+`Connection reset by peer`, `remote end hung up unexpectedly` or
+`kex_exchange_identification` — used to abort an otherwise-green push with no
+retry. `git_push_to_dev()` now retries those stderr patterns up to
+`PUSH_RETRY_MAX_ATTEMPTS = 3` attempts (the initial push plus two retries)
+with jittered exponential backoff (`PUSH_RETRY_BASE_SECONDS = 2.0`, doubling,
+capped at `PUSH_RETRY_CAP_SECONDS = 30.0`, +/-25% jitter).
+
+- **Same cwd, same argv:** the retry re-runs the identical
+  `git push origin <branch>:refs/heads/dev` from the same checkout, so the
+  pre-push gate runs again against the same tree and serves its cached
+  full-suite entry. Nothing bypasses the gate.
+- **Everything else fails as before:** auth failures (`Permission denied`),
+  branch-policy refusals and a non-fast-forward rejection are never retried.
+  A non-fast-forward keeps its dedicated rebase-and-retry recovery, and a
+  push timeout raises `PushTimeoutError` immediately.
+- **Observable:** every attempt logs `attempt N/3`, the delay and the same cwd;
+  the attempt bound and backoff are module constants, and the sleep is the
+  `_push_retry_sleep()` seam used by the hermetic tests.
+
+### Dev-push gate reason reporting (SA-0MVSJX5HS002DJHI AC2)
+
+`.githooks/pre-push` prints a stable `gate_reason=<code>` line on failure,
+derived from the runner's machine-readable aggregate via the shared
+`skill/test/scripts/gate_reason.py` classifier. When the push fails,
+`git_push_to_dev()` parses that line into
+`evidence_out = {success: False, gate_reason, stderr_tail}` and
+`phase_finish` raises `PushGateFailureError` carrying it. The finish report
+then records `report["steps"]["push"]["reason"] = <code>` (for example
+`slot_contention` or `test_failure`) and posts a work-item comment naming the
+reason, the remedy and the gate output tail — instead of the generic
+`reason: push_failed` / "git push to dev failed" that told an agent nothing
+about fix-versus-retry. The reason vocabulary is the same one the
+changed-scope gate reports (see
+[gate failure diagnostics](#gate-failure-diagnostics-wl-0mvgut787000lndg));
+the hook only consumes the runner's published notice codes, never re-defines
+them.
+
 ### Process-group kill (AC2)
 
 `_kill_process_group(pid)` calls `os.killpg(os.getpgid(pid), signal.SIGKILL)`;

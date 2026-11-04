@@ -644,3 +644,55 @@ def test_gate_evidence_reports_no_evidence_when_the_gate_produced_none(sandbox, 
     assert "no full-suite cache entry" in caplog.text, caplog.text
     # Nothing was fabricated into the cache by the evidence path either.
     assert test_cache.query_cached(commands[0], cwd=str(sandbox["wt"])) is None
+
+
+# ---------------------------------------------------------------------------
+# AC2 (SA-0MVSJX5HS002DJHI) — a gate infrastructure refusal is reported with
+# its reason and a remedy, not as a generic "push failed"
+# ---------------------------------------------------------------------------
+
+
+def test_push_gate_infrastructure_reason_is_reported_and_commented(sandbox):
+    """``phase_finish`` reports the hook's ``gate_reason`` and posts a remedy.
+
+    A transient infrastructure refusal (no free test slot) is not a code
+    failure: the finish report's ``steps.push.reason`` must name it and the
+    work-item comment must carry the matching remediation. Pre-fix: the push
+    path reported ``reason: push_failed`` with no cause.
+    """
+    comments: list[str] = []
+
+    def failing_push(cwd, branch, commit_hash=None, **kwargs):
+        evidence = kwargs.get("evidence_out")
+        if evidence is not None:
+            evidence.update(
+                {
+                    "success": False,
+                    "gate_reason": "slot_contention",
+                    "stderr_tail": (
+                        "gate_reason=slot_contention\n"
+                        "ERROR: No free test slot — the full-suite gate never "
+                        "started"
+                    ),
+                }
+            )
+        return False
+
+    pushes: list[tuple] = []
+    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
+        with patch.object(implement, "git_push_to_dev", side_effect=failing_push):
+            with patch.object(
+                implement,
+                "wl_add_comment",
+                side_effect=lambda *args, **kwargs: comments.append(args[1]) or True,
+            ):
+                report = implement.phase_finish(
+                    "SA-TEST", json_output=True, no_refactor=True
+                )
+
+    assert report["success"] is False, report
+    assert report["steps"]["push"]["reason"] == "slot_contention", report["steps"]["push"]
+    assert any(
+        "slot_contention" in comment and "TEST_LOCK_TIMEOUT" in comment
+        for comment in comments
+    ), f"the work-item comment must name the reason and remedy; got {comments}"
