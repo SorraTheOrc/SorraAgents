@@ -15,7 +15,18 @@ Covered here:
   against a real git checkout),
 - ``phase_finish`` behaviour: foreign deletion aborts with the path named and
   the item reset to ``open``; own fast-forward churn does not abort; a clean
-  finish reports the guard step with snapshot/verify times and a pass verdict.
+  finish reports the guard step with snapshot/verify times and a pass verdict,
+- **failure-path verify points** (SA-0MVXVBYG00075CIQ): every pre-push abort
+  (build failure, gate failure in JSON mode, retries exhausted, interactive
+  user abort) records a verify entry, so a foreign deletion is reported loudly
+  instead of leaving ``verifies: []`` — the 2026-10-31 shape, where 37 foreign
+  deletions in the main checkout were never evaluated. This is the **test-first
+  slice**: the verify points are wired by the sibling item
+  SA-0MVXVBYXI000QMXM, so the five guard assertions below are
+  ``xfail(strict=True)`` until that wiring lands. The unmarked companion
+  ``test_each_pre_push_abort_path_returns_a_failure_report`` proves the harness
+  really reaches each abort path, so a failure of the marked tests means
+  "verify point absent", never "harness broken".
 """
 
 from __future__ import annotations
@@ -25,6 +36,8 @@ import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) in sys.path:
@@ -313,13 +326,19 @@ def _finish_harness(tmp_path):
                 return_value={"method": "skipped", "success": True},
             )
         )
-        stack.enter_context(patch.object(implement, "wl_add_comment", return_value=True))
+        wl_add_comment = MagicMock(return_value=True)
+        stack.enter_context(patch.object(implement, "wl_add_comment", wl_add_comment))
         stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
         stack.enter_context(
             patch.object(implement.StatusLifecycle, "update_status", update_status)
         )
         stack.enter_context(patch.object(implement.StatusLifecycle, "show", show))
-        yield {"update_status": update_status, "extra": extra, "stack": stack}
+        yield {
+            "update_status": update_status,
+            "wl_add_comment": wl_add_comment,
+            "extra": extra,
+            "stack": stack,
+        }
 
 
 def _snapshots(statuses: list[dict[str, str]]):
@@ -438,3 +457,328 @@ def test_finish_abort_before_worktree_removal_leaves_item_open(tmp_path):
     pre_removal = [v for v in guard["verifies"] if v["stage"] == "pre_worktree_removal"]
     assert pre_removal and pre_removal[0]["verdict"] == "fail"
     assert mocks["update_status"].call_args_list[-1].args[1] == "open"
+
+
+# ---------------------------------------------------------------------------
+# Failure-path verify points (SA-0MVXVBYG00075CIQ — test-first slice)
+# ---------------------------------------------------------------------------
+#
+# The guard snapshots the main checkout at Step 0.75 but originally verified
+# only at ``pre_push`` and ``pre_worktree_removal``. Every pre-push abort
+# (build failure, gate failure in JSON mode, retries exhausted, interactive
+# user abort) returned before either point, so ``verifies`` stayed ``[]`` and
+# foreign deletions in the main checkout went unreported (2026-10-31: 37
+# deletions, ``verifies: []``). The sibling item SA-0MVXVBYXI000QMXM wires one
+# verify into each of those paths; the tests below pin that contract.
+
+#: The failing-stage label each abort path records in ``guard["verifies"]``
+#: (the wiring sibling's contract). Pinned so a report consumer can tell a
+#: failure-path verify from the two push-path stages.
+_FAILURE_VERIFY_STAGE = {
+    "build_failure": "build_failure",
+    "gate_json": "gate_failure",
+    "gate_retries": "gate_failure",
+    "user_abort": "user_abort",
+}
+
+#: The two verify stages that already existed before the failure-path wiring.
+_PUSH_PATH_STAGES = ("pre_push", "pre_worktree_removal")
+
+#: Statuses that mean the item was advanced instead of released.
+_TERMINAL_STATUSES = {"completed", "in_review", "done"}
+
+#: A foreign deletion in the main checkout — the 2026-10-31 defect class.
+_FOREIGN_DELETION = "packages/shared/src/database.ts"
+
+_FAILURE_PATH_XFAIL = (
+    "Pre-fix tree: the pre-push abort path returns before any guard verify, so "
+    "verifies is empty and the foreign deletion is never reported. Unmark when "
+    "SA-0MVXVBYXI000QMXM wires the failure-path verify points."
+)
+
+
+def _failing_gate_result() -> dict:
+    """A parsed gate failure (a genuine test failure, not infrastructure)."""
+    return {
+        "success": False,
+        "failures": ["tests/test_thing.py::test_thing - AssertionError: boom"],
+        "skipped": False,
+        "tooling": "pytest",
+        "scope": "changed",
+        "notices": [],
+        "notice_codes": [],
+    }
+
+
+def _failed_build_result() -> dict:
+    return {
+        "success": False,
+        "stdout": "",
+        "stderr": "src/index.ts(3,1): error TS2304: Cannot find name 'x'.",
+        "exit_code": 2,
+        "skipped": False,
+    }
+
+
+def _comment_bodies(mocks) -> list[str]:
+    """Bodies of every ``wl_add_comment`` call, in call order."""
+    return [
+        call.args[1]
+        for call in mocks["wl_add_comment"].call_args_list
+        if len(call.args) >= 2
+    ]
+
+
+def _guard_abort_comments(mocks) -> list[str]:
+    """The main-checkout guard abort comments posted so far."""
+    return [b for b in _comment_bodies(mocks) if "Main-checkout mutation detected" in b]
+
+
+def _assert_released_to_open(mocks, *, expect_status_write: bool = True) -> None:
+    """The abort path never advances the item and releases it to ``open``.
+
+    No abort path may leave the item ``completed``/``in_review``; the last
+    status write must be ``open``. The JSON-mode gate early return is the one
+    nuance about *who* writes it: it hands the reset to the orchestrating
+    agent loop (it writes no status itself), so that path asserts the weaker —
+    still fail-honest — "never advanced to a terminal status".
+    """
+    writes = [
+        call.args[1]
+        for call in mocks["update_status"].call_args_list
+        if len(call.args) >= 2
+    ]
+    assert not [w for w in writes if w in _TERMINAL_STATUSES], writes
+    if expect_status_write:
+        assert writes, "the abort path must release the work item"
+    if writes:
+        assert writes[-1] == "open", writes
+
+
+def _failure_verify(report) -> dict:
+    """The failure-path verify entry (the last one, excluding push-path stages)."""
+    verifies = report["steps"]["main_checkout_guard"]["verifies"]
+    assert verifies, "the failure path recorded no main-checkout verify at all"
+    failure_entries = [v for v in verifies if v["stage"] not in _PUSH_PATH_STAGES]
+    assert failure_entries, (
+        "no failure-path verify entry; recorded stages: "
+        f"{[v['stage'] for v in verifies]}"
+    )
+    return failure_entries[-1]
+
+
+def _run_failure_path(tmp_path, *, kind: str, snapshots: list[dict[str, str]]):
+    """Drive one pre-push abort path through the real ``phase_finish``.
+
+    ``kind`` selects the abort: ``build_failure`` (Step 2), ``gate_json``
+    (Step 3 JSON-mode early return), ``gate_retries`` ("Tests failed after N
+    retries") or ``user_abort`` (the interactive ``abort`` choice).
+    ``snapshots`` scripts ``_snapshot_main_checkout``: the baseline snapshot
+    first, then the failure-path verify (the fake repeats the last map).
+
+    Only the abort input is scripted — the guard, the report shape, the status
+    transition and the comments are production code.
+    """
+    failing_gate = (_failing_gate_result(), {"available": True, "tree": "failed"})
+    with _finish_harness(tmp_path) as mocks:
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    implement,
+                    "_snapshot_main_checkout",
+                    side_effect=_snapshots(snapshots),
+                )
+            )
+            if kind == "build_failure":
+                stack.enter_context(
+                    patch.object(
+                        implement, "run_build", return_value=_failed_build_result()
+                    )
+                )
+            elif kind in {"gate_json", "gate_retries", "user_abort"}:
+                stack.enter_context(
+                    patch.object(implement, "run_gate_suite", return_value=failing_gate)
+                )
+            else:  # pragma: no cover - guard against a typo'd test
+                raise AssertionError(f"unknown failure path: {kind}")
+            if kind == "gate_retries":
+                stack.enter_context(patch("builtins.input", return_value=""))
+            elif kind == "user_abort":
+                stack.enter_context(patch("builtins.input", return_value="abort"))
+            report = implement.phase_finish(
+                "WL-TEST",
+                json_output=(kind == "gate_json"),
+                no_refactor=True,
+                max_retry=1 if kind == "gate_retries" else implement.DEFAULT_MAX_RETRY,
+            )
+    return report, mocks
+
+
+def test_each_pre_push_abort_path_returns_a_failure_report(tmp_path):
+    """Harness canary: every abort path really is reached (unmarked companion).
+
+    Green before and after the failure-path wiring. If it ever fails, a
+    marked test below is failing for the wrong reason (the harness never
+    reached the abort), not because the guard verify is absent.
+    """
+    # Every abort except the JSON-mode gate posts its own failure comment; the
+    # JSON mode hands the failure back in the report instead (the agent loop
+    # drives the fix-and-re-run externally), so it is asserted on
+    # ``report["message"]``/``report["test_phase"]``.
+    expected_failure_comment = {
+        "build_failure": "Build failed during finish phase",
+        "gate_retries": "Tests failed after 1 retries",
+        "user_abort": "Aborted by user during test fix loop",
+    }
+    for kind, fragment in expected_failure_comment.items():
+        report, mocks = _run_failure_path(
+            tmp_path / kind, kind=kind, snapshots=[{}, {}]
+        )
+        assert report["success"] is False, (kind, report.get("message"))
+        bodies = _comment_bodies(mocks)
+        assert any(fragment in body for body in bodies), (kind, bodies)
+        _assert_released_to_open(mocks)
+
+    report, mocks = _run_failure_path(
+        tmp_path / "gate_json", kind="gate_json", snapshots=[{}, {}]
+    )
+    assert report["success"] is False
+    assert report["message"].startswith("Test run 1/")
+    assert report["test_phase"]["reason"] == "test_failure"
+    assert _comment_bodies(mocks) == []
+    _assert_released_to_open(mocks, expect_status_write=False)
+
+
+@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
+def test_gate_json_abort_verifies_main_checkout(tmp_path):
+    """Gate failure in JSON mode still verifies and reports a foreign deletion."""
+    report, mocks = _run_failure_path(
+        tmp_path, kind="gate_json", snapshots=[{}, {_FOREIGN_DELETION: " D"}]
+    )
+
+    assert report["success"] is False
+    entry = _failure_verify(report)
+    assert entry["stage"] == _FAILURE_VERIFY_STAGE["gate_json"]
+    assert entry["verdict"] == "fail"
+    assert entry["offending"] == [f"{_FOREIGN_DELETION} [ D]"]
+    assert report["steps"]["main_checkout_guard"]["verdict"] == "fail"
+
+    guard_comments = _guard_abort_comments(mocks)
+    assert guard_comments, _comment_bodies(mocks)
+    assert any(
+        _FOREIGN_DELETION in body
+        and "git checkout --" in body
+        and "Concurrent actor evidence:" in body
+        for body in guard_comments
+    ), guard_comments
+    # The JSON mode reports the gate failure in the report rather than a
+    # comment; adding the guard comment must not swallow that report.
+    assert report["message"].startswith("Test run 1/")
+    _assert_released_to_open(mocks, expect_status_write=False)
+
+
+@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
+def test_gate_retries_exhausted_verifies_main_checkout(tmp_path):
+    """The "Tests failed after N retries" exit still verifies the main checkout."""
+    report, mocks = _run_failure_path(
+        tmp_path, kind="gate_retries", snapshots=[{}, {_FOREIGN_DELETION: " D"}]
+    )
+
+    assert report["success"] is False
+    entry = _failure_verify(report)
+    assert entry["stage"] == _FAILURE_VERIFY_STAGE["gate_retries"]
+    assert entry["verdict"] == "fail"
+    assert entry["offending"] == [f"{_FOREIGN_DELETION} [ D]"]
+    assert report["steps"]["main_checkout_guard"]["verdict"] == "fail"
+
+    guard_comments = _guard_abort_comments(mocks)
+    assert guard_comments, _comment_bodies(mocks)
+    assert any(
+        _FOREIGN_DELETION in body
+        and "git checkout --" in body
+        and "Concurrent actor evidence:" in body
+        for body in guard_comments
+    ), guard_comments
+    assert any(
+        "Tests failed after 1 retries" in body for body in _comment_bodies(mocks)
+    ), "the pre-existing retries-exhausted comment must still be posted"
+    _assert_released_to_open(mocks)
+
+
+@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
+def test_build_failure_verifies_main_checkout(tmp_path):
+    """A Step-2 build failure still verifies the main checkout."""
+    report, mocks = _run_failure_path(
+        tmp_path, kind="build_failure", snapshots=[{}, {_FOREIGN_DELETION: " D"}]
+    )
+
+    assert report["success"] is False
+    entry = _failure_verify(report)
+    assert entry["stage"] == _FAILURE_VERIFY_STAGE["build_failure"]
+    assert entry["verdict"] == "fail"
+    assert entry["offending"] == [f"{_FOREIGN_DELETION} [ D]"]
+    assert report["steps"]["main_checkout_guard"]["verdict"] == "fail"
+
+    guard_comments = _guard_abort_comments(mocks)
+    assert guard_comments, _comment_bodies(mocks)
+    assert any(
+        _FOREIGN_DELETION in body
+        and "git checkout --" in body
+        and "Concurrent actor evidence:" in body
+        for body in guard_comments
+    ), guard_comments
+    assert any(
+        "Build failed during finish phase" in body for body in _comment_bodies(mocks)
+    ), "the pre-existing build failure comment must still be posted"
+    _assert_released_to_open(mocks)
+
+
+@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
+def test_user_abort_verifies_main_checkout(tmp_path):
+    """The interactive fix-loop ``abort`` still verifies the main checkout."""
+    report, mocks = _run_failure_path(
+        tmp_path, kind="user_abort", snapshots=[{}, {_FOREIGN_DELETION: " D"}]
+    )
+
+    assert report["success"] is False
+    entry = _failure_verify(report)
+    assert entry["stage"] == _FAILURE_VERIFY_STAGE["user_abort"]
+    assert entry["verdict"] == "fail"
+    assert entry["offending"] == [f"{_FOREIGN_DELETION} [ D]"]
+    assert report["steps"]["main_checkout_guard"]["verdict"] == "fail"
+
+    guard_comments = _guard_abort_comments(mocks)
+    assert guard_comments, _comment_bodies(mocks)
+    assert any(
+        _FOREIGN_DELETION in body
+        and "git checkout --" in body
+        and "Concurrent actor evidence:" in body
+        for body in guard_comments
+    ), guard_comments
+    assert any(
+        "Aborted by user during test fix loop" in body
+        for body in _comment_bodies(mocks)
+    ), "the pre-existing user-abort comment must still be posted"
+    _assert_released_to_open(mocks)
+
+
+@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
+def test_clean_gate_abort_records_passing_failure_verify(tmp_path):
+    """A clean abort records a *passing* failure-path verify and no abort.
+
+    The SA-0MUIJAHXS003M7BG false-positive class must not regress: adding
+    verify points to failure paths may not turn benign churn (or no churn at
+    all) into a main-checkout abort. The item is still released to ``open``
+    by the pre-existing failure handling.
+    """
+    report, mocks = _run_failure_path(tmp_path, kind="gate_json", snapshots=[{}, {}])
+
+    assert report["success"] is False
+    entry = _failure_verify(report)
+    assert entry["stage"] == _FAILURE_VERIFY_STAGE["gate_json"]
+    assert entry["verdict"] == "pass"
+    assert "offending" not in entry
+    assert report["steps"]["main_checkout_guard"]["verdict"] == "pass"
+    assert _guard_abort_comments(mocks) == []
+    assert report["message"].startswith("Test run 1/")
+    _assert_released_to_open(mocks, expect_status_write=False)
