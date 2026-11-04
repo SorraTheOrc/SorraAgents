@@ -719,6 +719,16 @@ export async function sendReleaseNotification({ version, prUrl, projectRoot }, o
   }
 
   const section = extractChangelogSection(changelog || '', version);
+  if (!section) {
+    // Explicit, version-naming warning (SA-0MVXY0VPC002B0MO AC4): a missing
+    // section silently stripped both the release focus and the notes from the
+    // embed. Still non-blocking — the notification continues with the
+    // "No changelog available" fallback.
+    console.warn(
+      `⚠ Discord release notification: no "## v${version}" section found in CHANGELOG.md ` +
+      '— the embed will omit the release notes and release focus (non-blocking — release continues).',
+    );
+  }
 
   // Extract (and remove) the release-focus marker so the focus is its own
   // paragraph and never duplicated in the changelog body (focus AC3).
