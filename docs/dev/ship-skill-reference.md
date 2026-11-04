@@ -24,6 +24,7 @@ All scripts below are internal implementation details — they are not exposed a
 |--------|---------|
 | `./skill/ship/scripts/run-release.js` | Release wrapper (includes gating, post-release dev sync) |
 | `./skill/ship/scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
+| `./skill/ship/scripts/release/changelog-merge.js` | CHANGELOG.md dev→main merge helper and post-merge release-section guard (`extractReleaseSection`, `insertReleaseSection`, `mergeReleaseSection`, `guardReleaseSection`; SA-0MVXY0VPC002B0MO) |
 | `./skill/ship/scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement workflow |
 | `./skill/ship/scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
 | `./skill/ship/scripts/check-unmerged-branches.js` | Unmerged branch detection |
@@ -227,6 +228,46 @@ Steps:
    **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** before this step, `snapshotReleaseTags()` captures the pre-run tag list; `isNewlyCreatedTag(version, preRunTags)` requires `v<version>` to be absent from it. A stale tag (or an unreadable snapshot) aborts with **exit code 14** and runs no post-release step, so an old reachable tag read by `git describe` can never trigger a close.
 10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
 11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures. **Close verification (SA-0MUXA5ZNZ0019QY5):** every attempted close is re-read through the injectable `getCloseStateFn` boundary (default `getItemLifecycle`); an item is counted as closed only when the persisted lifecycle is `status: completed` **and** `stage: done`. A close that exits 0 but does not persist — the concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried exactly once and re-verified; if still not terminal (or the read throws/returns `null` — fail-safe) the item is listed in `unclosedCount`/`unclosedItems`, `success` is `false`, and the summary never claims blanket success. The step remains non-blocking.
+
+### CHANGELOG release-section preservation (SA-0MVXY0VPC002B0MO)
+
+`merge-dev-to-main.sh` generates the release's `## v<version> (YYYY-MM-DD)`
+CHANGELOG.md section (including the `> **Release focus:** …` marker) on the
+release branch **before** merging `origin/dev`, and that section must survive
+the merge.
+
+**Ordering.** The generation step (and its `Update CHANGELOG.md for v<version>`
+commit) runs before `git merge --no-ff origin/dev`. Because dev carries its own
+top-of-file history (an `## Unreleased` block and previously released
+sections), the merge conflicts on `CHANGELOG.md`.
+
+**Preservation.** On that conflict the script takes dev's version
+(`git checkout --theirs CHANGELOG.md`) as the baseline — keeping dev's content
+— and then re-inserts the generated section through
+`release/changelog-merge.js` (`mergeReleaseSection`): it extracts the generated
+`## v<version>` section from the release branch's copy of the file and inserts
+it after the top-level heading, exactly where `generate-changelog.js` would
+have written it. The merged file therefore contains both the generated release
+section (with its focus marker) **and** dev's `## Unreleased` block and
+history. The old resolution took dev's whole file and discarded the generated
+section — the v0.1.23 regression that left `main` without a `## v0.1.23`
+heading and stripped both the release focus and the release notes from the
+Discord notification.
+
+**Abort on loss.** After the merge (conflicted or clean) the script runs
+`changelog-merge.js guard` (`guardReleaseSection`) when a section was
+successfully generated. If the merged tree is missing the `## v<version>`
+section, the release aborts with a non-zero exit **before the tag is created**
+and prints an actionable message naming the recovery source; a release can
+never be tagged without its release notes. A *failed* generation keeps the
+existing non-fatal contract: the generation step logs a warning, the release
+continues, and the guard does not fire because no section was ever produced.
+
+**Notification.** `discord-notify.js` logs an explicit warning naming the
+version when the `## v<version>` section is absent, so a lost section is
+visible in the release log instead of silently producing an embed with no
+release focus and no changelog body (still non-blocking — the notification
+continues).
 
 ### Version source convention (SA-0MVN2B0DJ00135W0)
 
