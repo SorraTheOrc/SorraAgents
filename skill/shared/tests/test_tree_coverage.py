@@ -24,10 +24,12 @@ if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
 import json
 
 from shared.tree_coverage import (
+    apply_coverage_review,
     compute_coverage,
     extract_acceptance_criteria,
     extract_acs_from_item,
     fetch_descendant_tree,
+    is_triage_generated_child,
     jaccard_similarity,
     order_by_dependencies,
     resolve_coverage_gaps,
@@ -1206,6 +1208,257 @@ class TestRunCoverageReview:
         result = run_coverage_review("SA-01", runner=_custom_runner)
         assert result["recommendation"] == "proceed"
         assert result["warnings"] == []
+
+
+class TestTriageGeneratedChildExemption:
+    """Triage-generated children are excluded from AC coverage (AC1-AC3).
+
+    Triage-created children carry the ``test-failure`` tag and are incident
+    fixes re-parented from elsewhere, not a decomposition of the parent's
+    acceptance criteria. They must not block ``plan_complete`` (AC1), while
+    genuine feature children stay coverage-checked (AC2). A closed child is
+    exempt only when it also carries the tag, so closing an uncovered feature
+    child cannot weaken the gate (AC3 default).
+    """
+
+    _PARENT_DESCRIPTION = (
+        "## Acceptance Criteria\n"
+        "- The gate treats triage children as non-decompositions\n"
+        "- Genuine feature children stay coverage-checked\n"
+    )
+    _TRIAGE_DESCRIPTION = (
+        "## Acceptance Criteria\n"
+        "1. The test passes when run against the latest dev.\n"
+        "2. All related documentation is updated.\n"
+        "3. Full project test suite passes.\n"
+    )
+    _UNRELATED_FEATURE_DESCRIPTION = (
+        "## Acceptance Criteria\n"
+        "- User can view their profile picture\n"
+    )
+
+    @staticmethod
+    def _make_runner(children: list[dict], descriptions: dict[str, str]):
+        """Serve *children* and per-item *descriptions* to the helper."""
+
+        def runner(cmd):
+            target = next((c for c in cmd if c.startswith("SA-")), None)
+            if "update" in cmd:
+                return _FakeResult(json.dumps({"success": True}))
+            if "--parent" in cmd:
+                return _FakeResult(
+                    json.dumps({"success": True, "workItems": children})
+                )
+            if "dep" in cmd and "list" in cmd:
+                return _FakeResult(
+                    json.dumps({"success": True, "inbound": [], "outbound": []})
+                )
+            if "show" in cmd and target in descriptions:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {"description": descriptions[target]},
+                        }
+                    )
+                )
+            return _FakeResult("{}", returncode=1)
+
+        return runner
+
+    # -- AC1: triage-only children proceed ---------------------------------
+
+    def test_triage_only_children_proceed(self):
+        """A parent whose only children are triage items reaches ``proceed``."""
+        children = [
+            {
+                "id": "SA-02",
+                "title": "[test-failure] flaky suite",
+                "tags": ["test-failure"],
+                "status": "open",
+            },
+            {
+                "id": "SA-03",
+                "title": "[test-failure] slow suite",
+                "tags": ["test-failure"],
+                "status": "open",
+            },
+        ]
+        descriptions = {
+            "SA-01": self._PARENT_DESCRIPTION,
+            "SA-02": self._TRIAGE_DESCRIPTION,
+            "SA-03": self._TRIAGE_DESCRIPTION,
+        }
+        result = run_coverage_review(
+            "SA-01", runner=self._make_runner(children, descriptions)
+        )
+        assert result["recommendation"] == "proceed"
+        assert result["coverage"]["fully_covered"] is True
+        assert result["unresolvable_conflicts"] == []
+        assert {c["id"] for c in result["excluded_children"]} == {"SA-02", "SA-03"}
+        # Excluded children stay visible in the summary but are not compared.
+        for entry in result["child_summary"]:
+            assert entry["excluded"] is True
+            assert entry["ac_count"] == 0
+
+    def test_triage_only_children_advance_stage(self):
+        """``apply_coverage_review`` advances a triage-only parent (AC1)."""
+        children = [
+            {
+                "id": "SA-02",
+                "title": "[test-failure] flaky suite",
+                "tags": ["test-failure"],
+                "status": "open",
+            },
+        ]
+        descriptions = {
+            "SA-01": self._PARENT_DESCRIPTION,
+            "SA-02": self._TRIAGE_DESCRIPTION,
+        }
+        result = apply_coverage_review(
+            "SA-01",
+            target_stage="plan_complete",
+            runner=self._make_runner(children, descriptions),
+        )
+        assert result["action"] == "proceed"
+        assert result["advanced"] is True
+        assert result["conflicts"] == []
+
+    # -- AC2: genuine feature children still coverage-checked -------------
+
+    def test_mixed_triage_and_feature_children_evaluate_feature(self):
+        """With a triage child present, an unrelated feature child still
+        produces ``stop`` (it is genuinely evaluated, not exempted)."""
+        children = [
+            {
+                "id": "SA-02",
+                "title": "[test-failure] flaky suite",
+                "tags": ["test-failure"],
+                "status": "open",
+            },
+            {
+                "id": "SA-04",
+                "title": "Feature: implement the gate",
+                "tags": [],
+                "status": "open",
+            },
+        ]
+        descriptions = {
+            "SA-01": self._PARENT_DESCRIPTION,
+            "SA-02": self._TRIAGE_DESCRIPTION,
+            "SA-04": self._UNRELATED_FEATURE_DESCRIPTION,
+        }
+        result = run_coverage_review(
+            "SA-01", runner=self._make_runner(children, descriptions)
+        )
+        assert result["recommendation"] == "stop"
+        assert result["unresolvable_conflicts"]
+        assert {c["id"] for c in result["excluded_children"]} == {"SA-02"}
+        feature = next(c for c in result["child_summary"] if c["id"] == "SA-04")
+        assert feature["excluded"] is False
+        assert feature["ac_count"] == 1
+
+    def test_mixed_triage_and_feature_children_proceed_when_feature_covers(self):
+        """A triage child is ignored while a covering feature child keeps the
+        review at ``proceed``."""
+        children = [
+            {
+                "id": "SA-02",
+                "title": "[test-failure] flaky suite",
+                "tags": ["test-failure"],
+                "status": "open",
+            },
+            {
+                "id": "SA-04",
+                "title": "Feature: implement the gate",
+                "tags": [],
+                "status": "open",
+            },
+        ]
+        descriptions = {
+            "SA-01": self._PARENT_DESCRIPTION,
+            "SA-02": self._TRIAGE_DESCRIPTION,
+            # Feature child restates the parent ACs, so coverage is complete.
+            "SA-04": self._PARENT_DESCRIPTION,
+        }
+        result = run_coverage_review(
+            "SA-01", runner=self._make_runner(children, descriptions)
+        )
+        assert result["recommendation"] == "proceed"
+        assert {c["id"] for c in result["excluded_children"]} == {"SA-02"}
+
+    # -- AC3: closed children ---------------------------------------------
+
+    def test_closed_triage_child_is_exempt(self):
+        """A closed child that carries the ``test-failure`` tag is exempt."""
+        children = [
+            {
+                "id": "SA-02",
+                "title": "[test-failure] flaky suite",
+                "tags": ["test-failure"],
+                "status": "completed",
+            },
+        ]
+        descriptions = {
+            "SA-01": self._PARENT_DESCRIPTION,
+            "SA-02": self._TRIAGE_DESCRIPTION,
+        }
+        result = run_coverage_review(
+            "SA-01", runner=self._make_runner(children, descriptions)
+        )
+        assert result["recommendation"] == "proceed"
+        assert {c["id"] for c in result["excluded_children"]} == {"SA-02"}
+
+    def test_closed_feature_child_still_participates(self):
+        """A closed tag-less feature child is still coverage-checked, so
+        closing an uncovered feature child cannot weaken the gate (AC3
+        documented default)."""
+        children = [
+            {
+                "id": "SA-05",
+                "title": "Feature: implement the gate",
+                "tags": [],
+                "status": "completed",
+            },
+        ]
+        descriptions = {
+            "SA-01": self._PARENT_DESCRIPTION,
+            "SA-05": self._UNRELATED_FEATURE_DESCRIPTION,
+        }
+        result = run_coverage_review(
+            "SA-01", runner=self._make_runner(children, descriptions)
+        )
+        assert result["recommendation"] == "stop"
+        assert result["excluded_children"] == []
+        feature = next(c for c in result["child_summary"] if c["id"] == "SA-05")
+        assert feature["excluded"] is False
+        assert feature["ac_count"] == 1
+
+
+class TestIsTriageGeneratedChild:
+    """The triage marker is the ``test-failure`` tag, never the title/status."""
+
+    def test_tagged_child_is_triage_generated(self):
+        assert is_triage_generated_child({"tags": ["test-failure"]}) is True
+
+    def test_untagged_child_is_not_triage_generated(self):
+        assert is_triage_generated_child({"tags": []}) is False
+        assert is_triage_generated_child({}) is False
+
+    def test_other_tags_do_not_exempt(self):
+        assert is_triage_generated_child({"tags": ["flaky", "frontend"]}) is False
+
+    def test_title_prefix_without_tag_is_not_exempt(self):
+        """The ``[test-failure]`` title prefix alone is not the marker."""
+        assert (
+            is_triage_generated_child(
+                {"title": "[test-failure] something", "tags": []}
+            )
+            is False
+        )
+
+    def test_comma_separated_tag_string_is_accepted(self):
+        assert is_triage_generated_child({"tags": "flaky,test-failure"}) is True
 
 
 class TestExtractAcsFromItem:

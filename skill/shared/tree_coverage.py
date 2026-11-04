@@ -53,6 +53,18 @@ AUTO_CLOSE_SIMILARITY_THRESHOLD = 0.2
 #: Stable marker embedded in coverage-review comments so re-runs are idempotent.
 COVERAGE_COMMENT_MARKER = "[tree-coverage-review]"
 
+#: Tag carried by work items auto-created by the ``triage`` skill
+#: (``skill/triage/scripts/check_or_create.py``). A child with this tag is an
+#: incident fix re-parented from elsewhere, not a decomposition of its
+#: parent's acceptance criteria, so it is excluded from the AC-coverage
+#: comparison (AH-0MVWNR4XF007FX5T).
+TRIAGE_TAG = "test-failure"
+
+#: Human-readable reason recorded for an excluded triage-generated child.
+TRIAGE_EXCLUSION_REASON = (
+    "triage-generated (test-failure tag); not a plan decomposition"
+)
+
 #: Diagnostic used when an ``## Acceptance Criteria`` section exists but no
 #: entries could be parsed (fail-closed guard).
 AC_SECTION_UNPARSEABLE_MESSAGE = (
@@ -375,6 +387,29 @@ _CODE_FENCE_RE = re.compile(r"^(```|~~~)")
 
 # A lone list marker or a thematic break: an entry boundary, never AC text.
 _AC_BOUNDARY_RE = re.compile(r"^(?:[-+*]|\d+[.)])$|^(?:[-*_]\s*){3,}$")
+
+
+def is_triage_generated_child(child: dict) -> bool:
+    """Return True when *child* was auto-created by the ``triage`` skill.
+
+    Triage-created children carry the ``test-failure`` tag (see
+    ``skill/triage/scripts/check_or_create.py``). They are incident fixes
+    re-parented from a failing-test scan, not a decomposition of the parent's
+    acceptance criteria, so the AC-coverage review excludes them from the
+    parent-vs-child comparison rather than treating their boilerplate ACs
+    ("the test passes on latest ``dev``", "all related documentation is
+    updated", "full project test suite passes") as uncovered parent
+    requirements (AH-0MVWNR4XF007FX5T).
+
+    The marker is the tag, not the ``[test-failure]`` title prefix, and not
+    the child's status: a closed child is exempt only when it also carries the
+    tag, so closing an uncovered feature child cannot weaken the gate.
+    """
+    tags = child.get("tags") or []
+    if isinstance(tags, str):
+        # Defensive: accept a comma-separated string as well as a list.
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    return TRIAGE_TAG in tags
 
 
 def extract_acceptance_criteria(description: str) -> list[str]:
@@ -762,6 +797,11 @@ def run_coverage_review(
           - ``work_item_id``: the reviewed work item
           - ``parent_acs``: extracted parent ACs
           - ``child_summary``: list of dicts with child ID, title, AC count
+            and an ``excluded`` flag (triage-generated children are listed
+            but not compared)
+          - ``excluded_children``: triage-generated children left out of the
+            AC comparison (``id``/``title``/``reason``), kept for the audit
+            trail
           - ``coverage``: result from ``compute_coverage``
           - ``resolved_gaps``: list of gap resolutions (from ``resolve_coverage_gaps``)
           - ``unresolvable_conflicts``: list of conflict descriptions
@@ -802,6 +842,7 @@ def run_coverage_review(
             "work_item_id": work_item_id,
             "parent_acs": parent_acs,
             "child_summary": [],
+            "excluded_children": [],
             "coverage": {
                 "coverage_map": {},
                 "uncovered": [],
@@ -817,21 +858,56 @@ def run_coverage_review(
     # Order children by dependencies
     ordered_children = order_by_dependencies(children_data, work_item_id, runner=runner)
 
-    # Extract child ACs
+    # Partition children. Triage-generated children (tagged ``test-failure``)
+    # are incident fixes re-parented from elsewhere, not a decomposition of
+    # this item's ACs, so they are excluded from the AC-coverage comparison
+    # (AH-0MVWNR4XF007FX5T). Only the tag exempts a child, never its status: a
+    # closed tag-less feature child still takes part and cannot weaken the
+    # gate.
+    excluded_children: list[dict] = []
+    evaluated_children: list[dict] = []
+    for child in ordered_children:
+        if is_triage_generated_child(child):
+            excluded_children.append(child)
+        else:
+            evaluated_children.append(child)
+
+    # Extract child ACs (evaluated children only) and build the summary for
+    # every direct child, so exempt children stay visible in the audit trail.
     child_acs_flat: list[str] = []
     child_acs_list: list[list[str]] = []
     child_summary: list[dict] = []
 
+    evaluated_ids = {c["id"] for c in evaluated_children}
     for child in ordered_children:
         cid = child["id"]
-        c_acs = extract_acs_from_item(cid, runner=runner)
-        child_acs_list.append(c_acs)
-        child_acs_flat.extend(c_acs)
-        child_summary.append({
-            "id": cid,
+        if cid in evaluated_ids:
+            c_acs = extract_acs_from_item(cid, runner=runner)
+            child_acs_list.append(c_acs)
+            child_acs_flat.extend(c_acs)
+            child_summary.append({
+                "id": cid,
+                "title": child.get("title", ""),
+                "ac_count": len(c_acs),
+                "excluded": False,
+            })
+        else:
+            child_summary.append({
+                "id": cid,
+                "title": child.get("title", ""),
+                "ac_count": 0,
+                "excluded": True,
+                "exclusion_reason": TRIAGE_EXCLUSION_REASON,
+            })
+
+    excluded_summary = [
+        {
+            "id": child["id"],
             "title": child.get("title", ""),
-            "ac_count": len(c_acs),
-        })
+            "reason": TRIAGE_EXCLUSION_REASON,
+        }
+        for child in excluded_children
+    ]
 
     if ac_section_unparseable:
         result = _fail_closed_review(
@@ -839,8 +915,31 @@ def run_coverage_review(
             child_summary,
             warnings,
             AC_SECTION_UNPARSEABLE_MESSAGE,
+            excluded_children=excluded_summary,
         )
         return result
+
+    # When every direct child is exempt there is no decomposition left to
+    # check, so coverage is vacuously complete — the same outcome as a parent
+    # with no children. This is what lets a parent whose only children are
+    # reparented triage items reach ``plan_complete`` (AC1).
+    if not evaluated_children:
+        return {
+            "work_item_id": work_item_id,
+            "parent_acs": parent_acs,
+            "child_summary": child_summary,
+            "excluded_children": excluded_summary,
+            "coverage": {
+                "coverage_map": {},
+                "uncovered": [],
+                "fully_covered": True,
+                "coverage_pct": 100.0,
+            },
+            "resolved_gaps": [],
+            "unresolvable_conflicts": [],
+            "warnings": warnings,
+            "recommendation": "proceed",
+        }
 
     # Compute coverage
     coverage = compute_coverage(parent_acs, child_acs_list)
@@ -884,6 +983,7 @@ def run_coverage_review(
         "work_item_id": work_item_id,
         "parent_acs": parent_acs,
         "child_summary": child_summary,
+        "excluded_children": excluded_summary,
         "coverage": coverage,
         "resolved_gaps": resolved_gaps,
         "unresolvable_conflicts": unresolvable_conflicts,
@@ -897,6 +997,7 @@ def _fail_closed_review(
     child_summary: list[dict],
     warnings: list[str],
     message: str,
+    excluded_children: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Build a fail-closed coverage-review result.
 
@@ -909,6 +1010,7 @@ def _fail_closed_review(
         "work_item_id": work_item_id,
         "parent_acs": [],
         "child_summary": child_summary,
+        "excluded_children": excluded_children or [],
         "coverage": {
             "coverage_map": {},
             "uncovered": [],

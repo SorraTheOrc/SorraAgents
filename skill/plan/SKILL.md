@@ -326,6 +326,8 @@ Then output a summary of what each stage checked/found.
    - `result["action"] == "auto_close"` → unambiguous gaps were closed by creating covering children (each restating the uncovered parent AC); a comment records what was auto-closed.
    - `result["action"] == "stop"` → unresolvable conflicts exist; **do NOT advance the stage**. The item is left `open` with a comment describing the conflicts and which parent ACs are uncovered.
 
+   Direct children tagged `test-failure` (auto-created by the triage skill) are excluded from the parent-vs-child AC comparison — they are incident fixes, not a decomposition. They stay visible in `result["review"]["excluded_children"]`, and a parent whose only children are triage items therefore reaches `proceed`. Tag-less feature children stay gated exactly as before; a closed child is exempt only when it is also tagged `test-failure`. See [plan-skill-reference.md](../../docs/dev/plan-skill-reference.md#ac-coverage-review-triage-generated-children-are-excluded) (AH-0MVWNR4XF007FX5T).
+
 7. Update work items (agent)
 
    - **Guard (SA-0MTFTFUIH000UWM9):** before any mutation in this step, assert `StatusLifecycle.require_claimed(<work-item-id>)` — fails closed if the item is `open` (the 2026-08-30 gap left AH-0MTFPDKDU006QUDC `open` while creating 3 children). On in-session approval resume, `StatusLifecycle.ensure_claimed(<work-item-id>)` first.
