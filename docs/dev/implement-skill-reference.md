@@ -341,6 +341,59 @@ The matrix in `tests/test_assignee_release_all_skills.py` additionally
 exercises `_release_orphaned_child_claim` as a release-only entry point, and
 the discovery guard keeps any future assignee-mutating entry point classified.
 
+## Recoverable interruption and idempotent re-run (SA-0MVXUSJJY009HMQ0)
+
+An implement run interrupted **after** a commit/push but **before** its final
+lifecycle action (the terminal `completed`/`in_review` write, design A —
+SA-0MVXUSED6008J04R) must never leave the item stuck in a terminal state for
+work that did not finish. Every such exit releases the item and records what
+survived, once:
+
+| Interruption | Status after | Assignee | Record |
+|---|---|---|---|
+| `SIGTERM` / `SIGINT` during `finish` (after the commit) | `open` | cleared | `Run interrupted: SIGTERM during the finish phase.` comment naming the commit, branch, worktree fate and resume command |
+| classified `RuntimeError` exit after the commit (push, ancestry, guard, verification refusal, sync, failed read-back) | `open` | cleared | one `Run interrupted: finish failed (…)` comment |
+| unexpected exception after the commit | `open` | cleared | one `Run interrupted: unexpected error (…)` comment |
+| `phase_abort` | `open` | cleared | `Implementation aborted.` (worktree removed, unchanged) |
+
+Two stable markers make the records idempotent:
+`COMPLETION_COMMENT_MARKER` (`Implementation complete.`) and
+`INTERRUPTION_COMMENT_MARKER` (`Run interrupted`). Each is deduplicated on the
+marker **plus the commit hash**, read from the item's comments via
+`StatusLifecycle.show` (fail-open: an unreadable store posts the record rather
+than dropping it), so retrying an interrupted `finish` never stacks a second
+completion comment and a repeated signal never stacks a second interruption
+record.
+
+The retained-state record answers the three questions a recovery needs —
+what state was retained (`open`, empty assignee, stage unchanged, hence not
+an audit-dispatch candidate), whether work was published (the commit, marked
+`pushed to dev` or `committed locally, not pushed`), and how to resume:
+
+```bash
+python3 skill/implement/scripts/implement.py finish <id>
+# tree already removed (the plain signal path): recreate it first
+python3 skill/implement/scripts/implement.py start <id>
+```
+
+Re-running `finish` converges through the **existing** paths rather than a new
+state machine: a commit that already reached `dev` makes the branch diff-free,
+so the run takes the ordinary no-op-push path (commit → push no-op → ancestry
+→ read-only post-push verification → completion comment → terminal write).
+Recreating the tree with `start` forks from `dev`, which now contains the
+pushed commit, so the same no-diff path applies. The report carries
+`steps.completion_comment` (`posted` / `deduplicated` / `commit`) and
+`steps.interruption_comment` (`recorded` / `deduplicated` / `commit`) as
+structured evidence of both decisions.
+
+Scope limit: the interruption context
+(`_finish_progress_global` — work item, worktree, branch, commit, pushed) is
+recorded from the commit step onwards and cleared when `phase_finish` leaves
+its critical section, so an interruption **before** the commit records no
+retained-state comment (nothing was published; the existing start-phase and
+abort records cover it). A `SIGKILL` with no surviving supervisor still cannot
+write: that window is bounded by the stale-claim reaper (above).
+
 ## Worktree removal ownership (SA-0MVTE8XAJ002IUDR)
 
 Exactly one owner removes a worktree, decided by context. `finish` used to

@@ -243,6 +243,18 @@ DEFAULT_PARENT_BRANCH = "dev"
 DEFAULT_WORKTREE_DIR = ".worklog/worktrees"
 DEFAULT_MAX_RETRY = 3
 
+#: Stable marker carried by the completion comment. A re-run of ``finish``
+#: deduplicates on it (plus the commit hash) so an interrupted run converges
+#: without posting the same completion record twice
+#: (SA-0MVXUSJJY009HMQ0 AC4).
+COMPLETION_COMMENT_MARKER = "Implementation complete."
+
+#: Stable marker carried by an interruption comment. Every interruption path
+#: records the retained state once per commit and deduplicates on this marker
+#: (plus the commit hash), so a recovered interruption is never re-recorded
+#: (SA-0MVXUSJJY009HMQ0 AC2/AC4).
+INTERRUPTION_COMMENT_MARKER = "Run interrupted"
+
 #: Max fresh sessions spawned per child by ``phase_drive`` before it stops.
 DEFAULT_MAX_CHILD_SESSIONS = 1
 #: Max infrastructure-refusal retries per child in one ``phase_drive``
@@ -403,6 +415,13 @@ _child_lock_global: WorkItemLock | None = None
 #: opted out of it (SA-0MVTE8XAJ002IUDR AC4).
 _keep_worktree_global = False
 _cleanup_done = False
+#: Progress of the running ``finish`` phase (work item, worktree, branch, the
+#: commit once it exists and whether it reached ``dev``). Kept module-level so
+#: the SIGTERM/SIGINT handler can name the retained state — including the
+#: pushed commit and the resume command — in its interruption comment instead
+#: of releasing the item unexplained (SA-0MVXUSJJY009HMQ0 AC1/AC2). Cleared at
+#: the start of every ``phase_finish`` and when its critical section is left.
+_finish_progress_global: dict[str, Any] = {}
 
 
 def _handle_signal_cleanup(signum: int) -> None:
@@ -414,6 +433,13 @@ def _handle_signal_cleanup(signum: int) -> None:
     state — is directly testable without terminating the interpreting
     process.
 
+    The item is never released silently once a finish is in flight: a signal
+    during ``phase_finish`` after the commit records the retained state —
+    the published (or local) commit, the branch, whether the worktree
+    survives and the command that resumes — through
+    :func:`_record_interruption_comment`, deduplicated per commit
+    (SA-0MVXUSJJY009HMQ0 AC1/AC2).
+
     Args:
         signum: The signal number that triggered the cleanup.
     """
@@ -422,6 +448,15 @@ def _handle_signal_cleanup(signum: int) -> None:
         wt = _worktree_path_global
         wid = _work_item_id_global
         rr = _repo_root_global
+
+        # A session that owns the worktree as its cwd must not lose it to an
+        # interrupt either: the same deferral predicate as ``finish`` applies
+        # (SA-0MVTE8XAJ002IUDR AC4). The item is released below regardless, so
+        # an interrupted run never leaves an orphaned ``in_progress`` claim.
+        # Resolved before the comment so the record names the tree's real fate.
+        deferred, defer_reason = _should_defer_worktree_removal(
+            bool(_keep_worktree_global)
+        )
 
         # Reset the work item status FIRST: this is the critical invariant.
         # A failure in later cleanup steps must not prevent the item from
@@ -451,14 +486,30 @@ def _handle_signal_cleanup(signum: int) -> None:
                         "Failed to record the %s interruption on %s: %s",
                         signame, wid, exc,
                     )
+            elif _finish_progress_global.get("work_item_id") == wid:
+                # An interrupted finish is never unexplained either: record
+                # the retained state — the pushed commit, the branch, whether
+                # the tree survives — and the command that resumes, so the
+                # released item is recoverable and the re-run converges
+                # (SA-0MVXUSJJY009HMQ0 AC1/AC2). ``_record_interruption_comment``
+                # deduplicates on the marker plus commit, so a repeat signal or
+                # a re-run never stacks records.
+                try:
+                    _record_interruption_comment(
+                        wid,
+                        f"{signame} during the finish phase",
+                        # The tree survives only under the deferral predicate:
+                        # the plain path removes it immediately below, and the
+                        # record must say so (the resume then recreates it).
+                        worktree_retained=bool(deferred),
+                        worktree_path=wt,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never block cleanup
+                    LOG.error(
+                        "Failed to record the %s interruption on %s: %s",
+                        signame, wid, exc,
+                    )
 
-        # A session that owns the worktree as its cwd must not lose it to an
-        # interrupt either: the same deferral predicate as ``finish`` applies
-        # (SA-0MVTE8XAJ002IUDR AC4). The item is still released above, so an
-        # interrupted run never leaves an orphaned ``in_progress`` claim.
-        deferred, defer_reason = _should_defer_worktree_removal(
-            bool(_keep_worktree_global)
-        )
         if deferred:
             LOG.info(
                 "Signal cleanup: worktree removal deferred (%s); the session "
@@ -527,6 +578,30 @@ def _set_keep_worktree_global(enabled: bool) -> None:
     """Record the ``--keep-worktree`` decision for the signal handler."""
     global _keep_worktree_global
     _keep_worktree_global = bool(enabled)
+
+
+def _set_finish_progress(**fields: Any) -> None:
+    """Record finish-phase progress for the interruption comment.
+
+    Idempotent: each call merges the supplied fields into the module-level
+    context, so the phase can accumulate (worktree, branch) at the start and
+    the commit/push facts as they become true without re-stating the rest.
+
+    Args:
+        **fields: Progress facts (``work_item_id``, ``worktree_path``,
+            ``branch``, ``commit``, ``pushed``).
+    """
+    _finish_progress_global.update(fields)
+
+
+def _clear_finish_progress() -> None:
+    """Forget finish-phase progress once the phase leaves its critical section.
+
+    A cleared context means a later signal has no half-stated finish to
+    report: either the run had not reached the commit (nothing was published)
+    or the phase already converged.
+    """
+    _finish_progress_global.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +907,182 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
         LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
     else:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
+
+
+def _work_item_comment_bodies(work_item_id: str) -> list[str]:
+    """Return the comment bodies recorded on a work item (fail-open).
+
+    Read through :meth:`StatusLifecycle.show` (``wl show --json``), which
+    returns the full payload — ``workItem``, ``comments``, ``children`` — so
+    the idempotence checks below need no extra ``wl`` invocation. An
+    unreadable store, a malformed payload or a harness stub without comments
+    yields an empty list: the caller then records its comment rather than
+    silently skipping it (the safe direction for a recovery record).
+
+    Args:
+        work_item_id: The work item whose comments to read.
+
+    Returns:
+        The comment bodies, in store order (empty on any read failure).
+    """
+    try:
+        data = StatusLifecycle.show(work_item_id)
+    except RuntimeError as exc:
+        LOG.warning("Could not read the comments of %s: %s", work_item_id, exc)
+        return []
+    comments = data.get("comments") if isinstance(data, dict) else None
+    if not isinstance(comments, list):
+        return []
+    bodies: list[str] = []
+    for entry in comments:
+        if not isinstance(entry, dict):
+            continue
+        body = entry.get("comment")
+        if isinstance(body, str):
+            bodies.append(body)
+    return bodies
+
+
+def _comment_already_recorded(work_item_id: str, *needles: str) -> bool:
+    """Whether a comment containing **every** needle already exists.
+
+    The idempotence primitive for the re-run convergence path
+    (SA-0MVXUSJJY009HMQ0 AC4) and the interruption record (AC2): a stable
+    marker plus the commit hash identifies the record, so re-running ``finish``
+    in a fresh process never duplicates it.
+
+    Args:
+        work_item_id: The work item whose comments to search.
+        *needles: Substrings that must all appear in one comment body.
+
+    Returns:
+        True when such a comment exists; False otherwise (including an
+        unreadable store — never suppress a recovery record silently).
+    """
+    if not needles:
+        return False
+    for body in _work_item_comment_bodies(work_item_id):
+        if all(needle in body for needle in needles):
+            return True
+    return False
+
+
+def _interruption_state_comment(
+    work_item_id: str,
+    reason: str,
+    progress: dict[str, Any] | None = None,
+    *,
+    worktree_retained: bool = False,
+    worktree_path: str | None = None,
+) -> str:
+    """Build the comment that names an interruption's retained state.
+
+    The record answers the three questions an operator (or the next agent)
+    needs after an interrupted run (SA-0MVXUSJJY009HMQ0 AC1/AC2): what state
+    was retained, whether any work was published, and which command resumes.
+
+    Args:
+        work_item_id: The interrupted work item.
+        reason: Human-readable interruption reason (signal or failure).
+        progress: The finish-phase progress facts; defaults to the module-level
+            context.
+        worktree_retained: Whether the worktree survives the interruption.
+        worktree_path: The worktree path, when known.
+
+    Returns:
+        The comment body (starts with :data:`INTERRUPTION_COMMENT_MARKER`).
+    """
+    facts = _finish_progress_global if progress is None else progress
+    commit = str(facts.get("commit") or "")
+    pushed = bool(facts.get("pushed"))
+    branch = str(facts.get("branch") or "")
+    path = str(worktree_path or facts.get("worktree_path") or "")
+
+    lines = [
+        f"{INTERRUPTION_COMMENT_MARKER}: {reason}.",
+        "Retained state:",
+        (
+            "- Status: open, assignee cleared (the claim is released). The item "
+            "is not in_review, so it is not an audit-dispatch candidate."
+        ),
+        "- Stage: unchanged — the terminal transition never ran.",
+    ]
+    if commit:
+        published = "pushed to dev" if pushed else "committed locally, not pushed"
+        target = f" on branch {branch}" if branch else ""
+        lines.append(f"- Commit: {commit} ({published}{target}).")
+    else:
+        lines.append(
+            "- Commit: none — no commit was created before the interruption."
+        )
+    if path:
+        if worktree_retained:
+            lines.append(f"- Worktree: retained at {path} (resume onto it directly).")
+        else:
+            lines.append(
+                f"- Worktree: removed ({path}); the work that reached dev is "
+                "unaffected."
+            )
+    lines.append("Resume with:")
+    if path and not worktree_retained:
+        lines.append(
+            "  python3 skill/implement/scripts/implement.py start "
+            f"{work_item_id}"
+        )
+    lines.append(
+        "  python3 skill/implement/scripts/implement.py finish "
+        f"{work_item_id}"
+    )
+    lines.append(
+        "Re-running finish is idempotent: it converges to completed / "
+        "in_review, releases the assignee and does not duplicate this comment "
+        "or the completion comment."
+    )
+    return "\n".join(lines)
+
+
+def _record_interruption_comment(
+    work_item_id: str,
+    reason: str,
+    *,
+    worktree_retained: bool = False,
+    worktree_path: str | None = None,
+) -> dict[str, Any]:
+    """Record an interruption's retained state, at most once per commit.
+
+    Never raises: a comment failure must not pre-empt the status release that
+    precedes it. The outcome is returned so the caller can surface it in its
+    report.
+
+    Args:
+        work_item_id: The interrupted work item.
+        reason: Human-readable interruption reason.
+        worktree_retained: Whether the worktree survives the interruption.
+        worktree_path: The worktree path, when known.
+
+    Returns:
+        Dict with ``recorded`` (bool), ``deduplicated`` (bool) and ``commit``.
+    """
+    commit = str(_finish_progress_global.get("commit") or "")
+    commit_needle = f"Commit: {commit}" if commit else "Commit: none"
+    if _comment_already_recorded(
+        work_item_id, INTERRUPTION_COMMENT_MARKER, commit_needle
+    ):
+        LOG.info(
+            "Interruption comment for %s (commit %s) already recorded; not "
+            "duplicating it.",
+            work_item_id,
+            commit or "none",
+        )
+        return {"recorded": False, "deduplicated": True, "commit": commit}
+    body = _interruption_state_comment(
+        work_item_id,
+        reason,
+        worktree_retained=worktree_retained,
+        worktree_path=worktree_path,
+    )
+    recorded = wl_add_comment(work_item_id, body)
+    return {"recorded": bool(recorded), "deduplicated": False, "commit": commit}
 
 
 # ---------------------------------------------------------------------------
@@ -9404,6 +9655,17 @@ def phase_finish(
     so the item never becomes an audit-dispatch candidate while the run is
     unfinished (parent SA-0MVWFPI31000HP3H AC1/AC2).
 
+    **Interruption and re-run (SA-0MVXUSJJY009HMQ0).** Every exit that fails
+    after the commit — the classified ``RuntimeError`` branches, the
+    unexpected-exception branch and the SIGTERM/SIGINT cleanup — releases the
+    item (``open``, empty assignee) and records the retained state once per
+    commit: the published (or local) commit, the branch, whether the worktree
+    survives and the resume command. Re-running ``finish`` then converges to
+    ``completed`` / ``in_review`` through the ordinary no-diff/no-op-push
+    path, and the completion comment (Step 9) is deduplicated on the marker
+    plus commit hash — so a recovered interruption never leaves a duplicate
+    completion comment or a second terminal transition in one run.
+
     All implementation work MUST be done inside the worktree created by
     ``phase_start``. If the current directory is outside the worktree and the
     main checkout holds uncommitted changes, finish refuses (step 0).
@@ -9428,6 +9690,9 @@ def phase_finish(
         "steps": {},
         "message": "",
     }
+    # A stale context from an earlier run in this process must never be used to
+    # describe this run's interruption (SA-0MVXUSJJY009HMQ0 AC2).
+    _clear_finish_progress()
 
     # ── Step 0: Find worktree (from state or directory scan) ──────
     worktree_path = _discover_worktree(work_item_id)
@@ -9984,6 +10249,17 @@ def phase_finish(
                 "message": commit_msg,
             }
             LOG.info("Committed at %s", commit_hash)
+            # Interruption context (SA-0MVXUSJJY009HMQ0 AC2): a signal from
+            # here on names the committed (and, after Step 6, published) work
+            # in its retained-state record instead of releasing the item
+            # unexplained. ``pushed`` is set once Step 6 confirms the push.
+            _set_finish_progress(
+                work_item_id=work_item_id,
+                worktree_path=worktree_path,
+                branch=branch,
+                commit=commit_hash,
+                pushed=False,
+            )
 
             # ── Step 5: Verified, reversible local-dev fast-forward ───────
             # Main-checkout hygiene only — never the dev-push gate's subject.
@@ -10145,6 +10421,9 @@ def phase_finish(
                     "hash": commit_hash,
                     "gate_evidence": push_evidence,
                 }
+                # An interruption from here on names the rebased replacement
+                # hash, which is the commit that actually landed.
+                _set_finish_progress(commit=commit_hash, pushed=True)
             except RuntimeError:
                 # A generic push failure: nothing reached origin. Undo our own
                 # fast-forward so local dev never stays on the unpushed commit
@@ -10167,6 +10446,10 @@ def phase_finish(
                     "hash": commit_hash,
                     "gate_evidence": push_evidence,
                 }
+                # The commit is now on dev: the interruption record must say
+                # so (AC2), so a released item is never mistaken for
+                # unpublished work.
+                _set_finish_progress(commit=commit_hash, pushed=True)
             LOG.info("Push to dev succeeded")
 
             # ── Step 6a: Post-push ancestry assertion (AC2) ───────────────
@@ -10376,7 +10659,31 @@ def phase_finish(
                     f"  manual fallback: git worktree remove {worktree_path} "
                     f"&& git worktree prune"
                 )
-            wl_add_comment(work_item_id, completion_comment)
+            # AC4 (SA-0MVXUSJJY009HMQ0): a re-run after an interruption
+            # converges without duplicating this record. A prior run may have
+            # posted it before its terminal write was lost; the stable marker
+            # plus the commit hash identifies that record, so the re-run only
+            # completes the lifecycle instead of stacking a second completion
+            # comment.
+            completion_already_recorded = _comment_already_recorded(
+                work_item_id,
+                COMPLETION_COMMENT_MARKER,
+                f"Commit: {commit_hash}",
+            )
+            report["steps"]["completion_comment"] = {
+                "posted": not completion_already_recorded,
+                "deduplicated": completion_already_recorded,
+                "commit": commit_hash,
+            }
+            if completion_already_recorded:
+                LOG.info(
+                    "Completion comment for %s (commit %s) is already "
+                    "recorded; skipping the duplicate on the re-run.",
+                    work_item_id,
+                    commit_hash,
+                )
+            else:
+                wl_add_comment(work_item_id, completion_comment)
 
             # StatusLifecycle.__exit__ sets status=completed, stage=in_review
             # — the run's LAST lifecycle action (assignee released with it).
@@ -10452,6 +10759,33 @@ def phase_finish(
                 "pushed (rebase onto the remote branch if the push is "
                 "rejected).",
             )
+        # AC2 (SA-0MVXUSJJY009HMQ0): once a commit exists, every failure exit
+        # records the retained state — status open, assignee cleared, the
+        # commit (published or local) and the resume command — so an
+        # interrupted run is never released without an explanation. It runs
+        # after the specific comments above and deduplicates on the marker
+        # plus commit, so it is recorded once per commit however many times
+        # finish is retried.
+        if (
+            _finish_progress_global.get("work_item_id") == work_item_id
+            and _finish_progress_global.get("commit")
+        ):
+            try:
+                report["steps"]["interruption_comment"] = (
+                    _record_interruption_comment(
+                        work_item_id,
+                        f"finish failed ({msg.splitlines()[0][:200]})",
+                        worktree_retained=bool(
+                            worktree_path and Path(worktree_path).exists()
+                        ),
+                        worktree_path=worktree_path,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - never mask the failure
+                LOG.error(
+                    "Failed to record the interruption on %s: %s",
+                    work_item_id, exc,
+                )
         if json_output:
             print(format_json_output(report))
         else:
@@ -10479,6 +10813,29 @@ def phase_finish(
                 "error",
                 work_item_id,
             )
+        # AC2 (SA-0MVXUSJJY009HMQ0): the same retained-state record as the
+        # classified path — an unexpected crash after the commit/push must
+        # still name what survived and how to resume.
+        if (
+            _finish_progress_global.get("work_item_id") == work_item_id
+            and _finish_progress_global.get("commit")
+        ):
+            try:
+                report["steps"]["interruption_comment"] = (
+                    _record_interruption_comment(
+                        work_item_id,
+                        f"unexpected error ({type(exc).__name__})",
+                        worktree_retained=bool(
+                            worktree_path and Path(worktree_path).exists()
+                        ),
+                        worktree_path=worktree_path,
+                    )
+                )
+            except Exception as record_exc:  # noqa: BLE001 - never mask it
+                LOG.error(
+                    "Failed to record the interruption on %s: %s",
+                    work_item_id, record_exc,
+                )
         if json_output:
             print(format_json_output(report))
         return report
@@ -10487,6 +10844,10 @@ def phase_finish(
         # RuntimeError, or an escaping exception): the kernel also releases
         # the flock if this process dies.
         _release_main_checkout_lock(lock_fd)
+        # The interruption context only ever describes a half-finished run:
+        # clear it so a later signal cannot misreport a converged phase
+        # (SA-0MVXUSJJY009HMQ0 AC2).
+        _clear_finish_progress()
 
     # ── Step 10: Success reporting ───────────────────────────────
     # The completion comment already ran inside the lifecycle window

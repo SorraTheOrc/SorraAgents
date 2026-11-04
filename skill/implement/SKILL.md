@@ -348,6 +348,27 @@ If the operator cancels after Step 2: reset to `open`
 (`StatusLifecycle.update_status(<work-item-id>, "open")`), return control, and
 document: `wl comment add <work-item-id> --comment "Aborted by operator" --author "<AGENT>" --json`.
 
+### Recoverable interruption (interrupted after the push)
+
+An `implement.py finish` interrupted **after** its commit/push but **before**
+the final lifecycle write leaves the item `open` with the assignee cleared —
+never `completed`/`in_review` for unfinished work — and records one comment
+starting `Run interrupted:` that names the commit (marked `pushed to dev` or
+`committed locally, not pushed`), the branch, whether the worktree survived,
+and the command that resumes (SA-0MVXUSJJY009HMQ0). Retry with:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py finish <id>   # tree retained
+python3 $(skill_path implement)/scripts/implement.py start <id>    # tree removed; then finish
+python3 $(skill_path implement)/scripts/implement.py finish <id>
+```
+
+A commit that already reached `dev` makes the branch diff-free, so the retry
+converges through the ordinary no-op-push path. Both the interruption record
+and the completion comment are deduplicated on a stable marker plus the
+commit hash, so a recovery never stacks a duplicate completion comment or a
+second terminal transition in one run.
+
 ## Handling Assets
 
 - **Graphics/audio:** create in `assets/images/` or `assets/audio/` with a `placeholder_` prefix; reference in comments and commit; optimize size/performance; only use assets you have rights to distribute (attribute where required).
@@ -1394,6 +1415,7 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 | Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review", assignee="")` | completed | in_review |
 | Final (Step 9) | `with StatusLifecycle(id, assignee="<AGENT>", target_stage="in_review"):` / `phase_finish()` (release is the helper's default) | completed | in_review |
 | Abort (dirty/gate/user/error/termination) | `update_status(id, "open", assignee="")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
+| Interrupted after the commit/push (signal or failure before the terminal write) | `_safety_reset_if_in_progress()` / the failure handler's `update_status(id, "open", assignee="")`, plus one deduplicated `Run interrupted:` record naming the commit and resume command (SA-0MVXUSJJY009HMQ0) | open | unchanged |
 
 > **All abort/failure transitions reset to `open` and clear the assignee.** Never leave a work item in `in_progress` unless actively implementing; never leave a completed or released item on an assignee hold.
 
